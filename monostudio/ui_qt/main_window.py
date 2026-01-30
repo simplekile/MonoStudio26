@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QActionGroup
-from PySide6.QtWidgets import QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter
 
 from monostudio.core.fs_reader import build_project_index
 from monostudio.core.models import Asset, Department, ProjectIndex, Shot
@@ -75,10 +75,12 @@ class MainWindow(QMainWindow):
 
         self._sidebar.context_changed.connect(self._on_context_switched)
         self._sidebar.context_clicked.connect(self._on_context_clicked)
+        self._sidebar.context_menu_requested.connect(self._on_sidebar_context_menu_requested)
         self._main_view.valid_selection_changed.connect(self._on_valid_selection_changed)
         self._main_view.item_activated.connect(self._on_item_activated)
         self._main_view.refresh_requested.connect(self._on_refresh_requested)
         self._main_view.root_context_menu_requested.connect(self._on_root_context_menu_requested)
+        self._main_view.copy_inventory_requested.connect(self._on_copy_item_inventory_requested)
 
         # Initial population is driven by project-root restore (scan trigger) and current context.
         self._reload_main_view()
@@ -101,6 +103,11 @@ class MainWindow(QMainWindow):
         open_project_root_action.triggered.connect(self._open_project_root)
         file_menu.addAction(open_project_root_action)
 
+        tools_menu = self.menuBar().addMenu("Tools")
+        copy_inventory_action = QAction("Copy Project Inventory", self)
+        copy_inventory_action.triggered.connect(self._copy_project_inventory)
+        tools_menu.addAction(copy_inventory_action)
+
         # Project switching via menu (no combo box).
         self._project_menu = self.menuBar().addMenu("Project")
         self._project_menu.aboutToShow.connect(self._rebuild_project_menu)
@@ -117,6 +124,110 @@ class MainWindow(QMainWindow):
         self._view_list.triggered.connect(lambda: self._main_view.set_view_mode("list"))
         view_menu.addAction(self._view_tile)
         view_menu.addAction(self._view_list)
+
+    def _copy_project_inventory(self) -> None:
+        """
+        v1.2 Candidate 3:
+        - Explicit trigger only (Tools menu)
+        - Read-only: uses current in-memory project index ONLY
+        - Writes clipboard ONLY (plain text)
+        - Silent no-op on failure
+        """
+        text = self._inventory_text_project(include_assets=True, include_shots=True)
+        if text is None:
+            return
+        self._copy_to_clipboard(text)
+
+    def _inventory_project_name(self) -> str | None:
+        if self._project_root is None:
+            return None
+        # Prefer already-discovered workspace project name (no filesystem reads here).
+        for p in self._workspace_projects:
+            if p.root == self._project_root:
+                return p.name
+        return self._project_root.name
+
+    def _inventory_text_project(self, *, include_assets: bool, include_shots: bool) -> str | None:
+        """
+        Deterministic plain-text inventory from in-memory index only.
+        Formatting matches existing Tools -> Copy Project Inventory output when both sections included.
+        """
+        if self._project_index is None:
+            return None
+        project_name = self._inventory_project_name()
+        if project_name is None:
+            return None
+
+        lines: list[str] = []
+        lines.append(f"Project: {project_name}")
+
+        if include_assets:
+            lines.append("")
+            lines.append("Assets:")
+            for asset in self._project_index.assets:
+                lines.append(f"  {asset.name}")
+                for dept in asset.departments:
+                    lines.append(f"    - {dept.name}")
+
+        if include_shots:
+            lines.append("")
+            lines.append("Shots:")
+            for shot in self._project_index.shots:
+                lines.append(f"  {shot.name}")
+                for dept in shot.departments:
+                    lines.append(f"    - {dept.name}")
+
+        return "\n".join(lines).strip() + "\n"
+
+    def _inventory_text_item(self, kind: str, name: str, departments: list[str]) -> str:
+        lines: list[str] = [f"{kind}: {name}"]
+        for d in departments:
+            lines.append(f"  - {d}")
+        return "\n".join(lines).strip() + "\n"
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        cb = QApplication.clipboard()
+        if cb is None:
+            return
+        cb.setText(text)
+
+    def _on_sidebar_context_menu_requested(self, context_text: str, global_pos) -> None:
+        # Contextual inventory (read-only) from existing in-memory index only.
+        if self._project_index is None:
+            return
+        if context_text not in ("Assets", "Shots"):
+            return
+
+        menu = QMenu(self)
+        if context_text == "Assets":
+            act = menu.addAction("Copy Assets Inventory")
+        else:
+            act = menu.addAction("Copy Shots Inventory")
+
+        chosen = menu.exec(global_pos)
+        if chosen != act:
+            return
+
+        if context_text == "Assets":
+            text = self._inventory_text_project(include_assets=True, include_shots=False)
+        else:
+            text = self._inventory_text_project(include_assets=False, include_shots=True)
+        if text is None:
+            return
+        self._copy_to_clipboard(text)
+
+    def _on_copy_item_inventory_requested(self, item: ViewItem) -> None:
+        # Item-level contextual inventory (asset/shot only).
+        if self._project_index is None:
+            return
+        if item.kind == ViewItemKind.ASSET and isinstance(item.ref, Asset):
+            depts = [d.name for d in item.ref.departments]
+            self._copy_to_clipboard(self._inventory_text_item("Asset", item.ref.name, depts))
+            return
+        if item.kind == ViewItemKind.SHOT and isinstance(item.ref, Shot):
+            depts = [d.name for d in item.ref.departments]
+            self._copy_to_clipboard(self._inventory_text_item("Shot", item.ref.name, depts))
+            return
 
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)

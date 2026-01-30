@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QFormLayout, QLineEdit, QStackedLayout, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QFormLayout, QLineEdit, QMenu, QStackedLayout, QVBoxLayout, QWidget
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,7 @@ class InspectorPanel(QWidget):
         self._asset_absolute_path = QLineEdit()
         self._asset_absolute_path.setReadOnly(True)
         self._asset_absolute_path.setClearButtonEnabled(False)
+        self._install_copy_full_path_menu(self._asset_absolute_path)
         self._asset_created_date = QLabel("")
         self._asset_last_modified = QLabel("")
 
@@ -79,10 +80,12 @@ class InspectorPanel(QWidget):
         self._dept_work_path = QLineEdit()
         self._dept_work_path.setReadOnly(True)
         self._dept_work_path.setClearButtonEnabled(False)
+        self._install_copy_full_path_menu(self._dept_work_path)
 
         self._dept_publish_path = QLineEdit()
         self._dept_publish_path.setReadOnly(True)
         self._dept_publish_path.setClearButtonEnabled(False)
+        self._install_copy_full_path_menu(self._dept_publish_path)
 
         dept_form = QFormLayout()
         dept_form.setContentsMargins(0, 0, 0, 0)
@@ -126,6 +129,30 @@ class InspectorPanel(QWidget):
         self._stack = root
 
         self.set_empty_state()
+
+    def _install_copy_full_path_menu(self, field: QLineEdit) -> None:
+        # Candidate 1: Inspector right-click on path field -> Copy Full Path
+        field.setContextMenuPolicy(Qt.CustomContextMenu)
+        field.customContextMenuRequested.connect(lambda pos, f=field: self._show_path_menu(f, pos))
+
+    def _show_path_menu(self, field: QLineEdit, pos) -> None:
+        menu = QMenu(self)
+        act_copy_full = menu.addAction("Copy Full Path")
+        menu.addSeparator()
+
+        # Keep standard actions (Copy) available; read-only prevents edits anyway.
+        std = field.createStandardContextMenu()
+        menu.addActions(std.actions())
+
+        chosen = menu.exec(field.mapToGlobal(pos))
+        if chosen == act_copy_full:
+            text = field.text()
+            if not text:
+                return
+            cb = QApplication.clipboard()
+            if cb is None:
+                return
+            cb.setText(text)
 
     def clear(self) -> None:
         # Clear displayed values (does not change empty-state visibility).

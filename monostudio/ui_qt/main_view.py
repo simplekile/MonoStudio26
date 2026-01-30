@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QStandardItem, QStandardItemModel
+from pathlib import Path
+
+from PySide6.QtCore import QSettings, QSize, Qt, QTimer, Signal, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -9,6 +11,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListView,
     QMenu,
+    QApplication,
     QSizePolicy,
     QStyle,
     QStackedWidget,
@@ -45,6 +48,7 @@ class MainView(QWidget):
     item_activated = Signal(object)  # emits ViewItem
     refresh_requested = Signal()
     root_context_menu_requested = Signal(object)  # emits global QPoint
+    copy_inventory_requested = Signal(object)  # emits ViewItem (asset/shot only)
 
     _SETTINGS_KEY_VIEW_MODE = "main_view/mode"  # "tile" | "list" (persistent)
     _THUMBNAIL_SIZE_PX = 96
@@ -399,14 +403,11 @@ class MainView(QWidget):
         item = index.data(Qt.UserRole)
         if not isinstance(item, ViewItem):
             return
-        if item.kind.value not in ("asset", "shot"):
+        menu = self._build_item_context_menu(item)
+        if menu is None:
             return
-
-        menu = QMenu(self)
-        refresh = menu.addAction("Refresh")
         chosen = menu.exec(self._tile_view.viewport().mapToGlobal(pos))
-        if chosen == refresh:
-            self.refresh_requested.emit()
+        self._dispatch_item_context_action(chosen, item)
 
     def _on_list_context_menu(self, pos) -> None:
         index = self._list_view.indexAt(pos)
@@ -416,14 +417,96 @@ class MainView(QWidget):
         item = index.data(Qt.UserRole)
         if not isinstance(item, ViewItem):
             return
-        if item.kind.value not in ("asset", "shot"):
+        menu = self._build_item_context_menu(item)
+        if menu is None:
             return
+        chosen = menu.exec(self._list_view.viewport().mapToGlobal(pos))
+        self._dispatch_item_context_action(chosen, item)
+
+    def _build_item_context_menu(self, item: ViewItem) -> QMenu | None:
+        # Candidate 1 + 2 helpers (explicit, silent).
+        # Asset / Shot / Department only.
+        if item.kind.value not in ("asset", "shot", "department"):
+            return None
 
         menu = QMenu(self)
-        refresh = menu.addAction("Refresh")
-        chosen = menu.exec(self._list_view.viewport().mapToGlobal(pos))
-        if chosen == refresh:
+
+        copy_inventory = None
+        if item.kind.value in ("asset", "shot"):
+            copy_inventory = menu.addAction("Copy Inventory")
+            menu.addSeparator()
+
+        copy_full_path = menu.addAction("Copy Full Path")
+        open_folder = menu.addAction("Open Folder")
+
+        menu.addSeparator()
+
+        refresh_action = None
+        open_work = None
+        open_publish = None
+
+        if item.kind.value in ("asset", "shot"):
+            # Existing v1 behavior: Refresh on Asset/Shot items.
+            refresh_action = menu.addAction("Refresh")
+        elif item.kind.value == "department":
+            # Optional (already meaningful in UI): open work/publish folders
+            open_work = menu.addAction("Open Work Folder")
+            open_publish = menu.addAction("Open Publish Folder")
+
+        # Store action ids on the menu for dispatch without global state
+        menu.setProperty("_act_copy_full_path", copy_full_path)
+        menu.setProperty("_act_open_folder", open_folder)
+        menu.setProperty("_act_copy_inventory", copy_inventory)
+        menu.setProperty("_act_refresh", refresh_action)
+        menu.setProperty("_act_open_work", open_work)
+        menu.setProperty("_act_open_publish", open_publish)
+        return menu
+
+    def _dispatch_item_context_action(self, chosen, item: ViewItem) -> None:
+        if chosen is None:
+            return
+
+        # Compare by label text; labels are fixed by spec.
+        text = getattr(chosen, "text", lambda: "")()
+
+        if text == "Copy Inventory":
+            # v1.2 extension: delegate generation to MainWindow (in-memory index)
+            self.copy_inventory_requested.emit(item)
+            return
+        if text == "Copy Full Path":
+            self._copy_full_path(str(item.path))
+            return
+        if text == "Open Folder":
+            self._open_folder(Path(item.path))
+            return
+        if text == "Refresh":
             self.refresh_requested.emit()
+            return
+        if text == "Open Work Folder":
+            if hasattr(item, "ref") and item.ref is not None and hasattr(item.ref, "work_path"):
+                self._open_folder(Path(item.ref.work_path))
+            return
+        if text == "Open Publish Folder":
+            if hasattr(item, "ref") and item.ref is not None and hasattr(item.ref, "publish_path"):
+                self._open_folder(Path(item.ref.publish_path))
+            return
+
+    def _copy_full_path(self, path_text: str) -> None:
+        if not path_text:
+            return
+        cb = QApplication.clipboard()
+        if cb is None:
+            return
+        cb.setText(path_text)
+
+    def _open_folder(self, folder: Path) -> None:
+        # Silent no-op if missing/invalid.
+        try:
+            if not folder.exists():
+                return
+        except OSError:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _schedule_thumbnail_prefetch(self) -> None:
         # Lazy loading: only attempt thumbnails for visible tile items.

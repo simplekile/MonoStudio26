@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QListWidget, QListWidgetItem, QStyle
 
 
@@ -19,12 +19,16 @@ class Sidebar(QListWidget):
 
     context_changed = Signal(str)  # emitted when selection changes (Assets <-> Shots)
     context_clicked = Signal(str)  # emitted when clicking already-selected item (reload)
+    context_menu_requested = Signal(str, object)  # (context_text, global_pos)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setSelectionMode(QListWidget.SingleSelection)
         self.setUniformItemSizes(True)
         self._last_context_text: str | None = None
+
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu_requested)
 
         assets_item = QListWidgetItem(SidebarContext.ASSETS.value)
         shots_item = QListWidgetItem(SidebarContext.SHOTS.value)
@@ -53,4 +57,10 @@ class Sidebar(QListWidget):
         # Keep autoscan triggers strict: only emit "clicked" when re-clicking same selection.
         if item.text() == self._last_context_text:
             self.context_clicked.emit(item.text())
+
+    def _on_context_menu_requested(self, pos) -> None:
+        item = self.itemAt(pos)
+        if item is None:
+            return
+        self.context_menu_requested.emit(item.text(), self.viewport().mapToGlobal(pos))
 
