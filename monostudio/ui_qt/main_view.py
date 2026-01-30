@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -47,7 +46,7 @@ class MainView(QWidget):
     refresh_requested = Signal()
     root_context_menu_requested = Signal(object)  # emits global QPoint
 
-    _SETTINGS_KEY_VIEW_MODE = "main_view/mode"  # "tile" | "list"
+    _SETTINGS_KEY_VIEW_MODE = "main_view/mode"  # "tile" | "list" (persistent)
     _THUMBNAIL_SIZE_PX = 96
     _THUMB_STATE_ROLE = Qt.UserRole + 1  # per-item state in tile model ("loaded"|"missing")
 
@@ -60,37 +59,32 @@ class MainView(QWidget):
         self._thumb_cache = ThumbnailCache(size_px=self._THUMBNAIL_SIZE_PX)
         self._thumb_prefetch_scheduled = False
 
-        self._mode = QComboBox()
-        self._mode.addItem("Tile", userData="tile")
-        self._mode.addItem("List", userData="list")
-        self._mode.currentIndexChanged.connect(self._on_mode_changed)
+        self._view_mode: str = "tile"
 
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search")
+        # v1.1: expectation reset (UI copy only; behavior remains simple substring match on name)
+        self._search.setPlaceholderText("Filter")
         self._search.setClearButtonEnabled(True)
+        self._search.setToolTip("Filters by name only")
+        self._search.textChanged.connect(self._on_filter_text_changed)
 
-        self._filter_type = QComboBox()
-        self._filter_type.addItem("Type", userData=None)
-        self._filter_type.addItem("char", userData="char")
-        self._filter_type.addItem("prop", userData="prop")
-        self._filter_type.addItem("env", userData="env")
-        self._filter_type.addItem("shot", userData="shot")
-
-        self._filter_department = QComboBox()
-        self._filter_department.addItem("Department", userData=None)
-        self._filter_department.addItem("anim", userData="anim")
-        self._filter_department.addItem("model", userData="model")
-        self._filter_department.addItem("comp", userData="comp")
+        self._filter_help = QLabel("Filters by name only")
+        self._filter_help.setStyleSheet("color: #A9ABB0; font-size: 11px;")
 
         header = QWidget()
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 12, 12, 0)
         header_layout.setSpacing(10)
-        header_layout.addWidget(self._search, 1)
-        header_layout.addWidget(self._filter_type, 0)
-        header_layout.addWidget(self._filter_department, 0)
+
+        filter_block = QWidget()
+        filter_layout = QVBoxLayout(filter_block)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.setSpacing(5)  # input -> helper (4–6px)
+        filter_layout.addWidget(self._search)
+        filter_layout.addWidget(self._filter_help)
+
+        header_layout.addWidget(filter_block, 1)
         header_layout.addStretch(1)
-        header_layout.addWidget(self._mode, 0)
 
         # Tile view (IconMode) skeleton
         self._tile_model = QStandardItemModel(self)
@@ -187,6 +181,8 @@ class MainView(QWidget):
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
 
+        self._all_items: list[ViewItem] = []
+
     def set_context_title(self, title: str) -> None:
         # Spec does not define a visible title bar; this is a no-op for Phase 0.
         _ = title
@@ -216,10 +212,27 @@ class MainView(QWidget):
             ]
         )
         self._list_view.setColumnHidden(3, True)  # Path hidden by default (spec)
+        self._all_items = []
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
+        self._schedule_thumbnail_prefetch()
 
     def set_items(self, items: list[ViewItem]) -> None:
+        # Populate from scan results, then apply the current name filter locally (no scans).
+        self._all_items = items
+        self._apply_name_filter()
+
+    def _apply_name_filter(self) -> None:
+        query = self._search.text().strip()
+        if not query:
+            visible = self._all_items
+        else:
+            q = query.lower()
+            visible = [it for it in self._all_items if q in it.name.lower()]
+
+        self._populate_views(visible)
+
+    def _populate_views(self, items: list[ViewItem]) -> None:
         # Populate both Tile and List representations from the same items.
         self._tile_view.clearSelection()
         self._list_view.clearSelection()
@@ -252,6 +265,10 @@ class MainView(QWidget):
             dept_cell = QStandardItem("" if item.departments_count is None else str(item.departments_count))
             path_cell = QStandardItem(str(item.path))
 
+            if item.departments_count is not None:
+                dept_cell.setToolTip("Number of department folders present.")
+                dept_cell.setForeground(QColor("#A9ABB0"))
+
             for cell in (name_cell, type_cell, dept_cell, path_cell):
                 cell.setEditable(False)
                 cell.setData(item, Qt.UserRole)
@@ -262,44 +279,70 @@ class MainView(QWidget):
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
 
+    def _on_filter_text_changed(self) -> None:
+        # v1.1: no smart search, no fuzzy, no indexing.
+        self._apply_name_filter()
+
     def _icon_for_item(self, item: ViewItem):
-        # Spec: placeholder icon by type. Use standard icons (no custom art in v1).
+        # v1.1: Neutral placeholder tile for Assets/Shots when no thumbnail exists.
         st = self.style()
         if item.kind.value in ("asset", "shot"):
-            return st.standardIcon(QStyle.SP_DirIcon)
+            return self._neutral_placeholder_icon(item.name)
         return st.standardIcon(QStyle.SP_DirOpenIcon)
+
+    def _neutral_placeholder_icon(self, name: str) -> QIcon:
+        size = self._THUMBNAIL_SIZE_PX
+        pix = QPixmap(size, size)
+        pix.fill(QColor("#2B2D30"))
+
+        p = QPainter(pix)
+        try:
+            p.setRenderHint(QPainter.Antialiasing, True)
+            # Flat, minimal, low-contrast placeholder.
+            p.fillRect(0, 0, size, size, QColor("#26282B"))
+            p.setPen(QPen(QColor("#3A3D41"), 1))
+            p.drawRect(0, 0, size - 1, size - 1)
+
+            # Optional: first letter of item name (subtle).
+            letter = (name.strip()[:1] or "").upper()
+            if letter:
+                p.setPen(QColor("#A9ABB0"))
+                font = QFont()
+                font.setPointSize(20)
+                font.setBold(True)
+                p.setFont(font)
+                p.drawText(pix.rect(), Qt.AlignCenter, letter)
+        finally:
+            p.end()
+
+        return QIcon(pix)
 
     def _restore_view_mode(self) -> None:
         mode = self._settings.value(self._SETTINGS_KEY_VIEW_MODE, "tile")
-        if mode == "list":
-            self._mode.setCurrentIndex(1)
-        else:
-            self._mode.setCurrentIndex(0)
+        self.set_view_mode("list" if mode == "list" else "tile", save=False)
 
-    def _on_mode_changed(self) -> None:
-        mode = self._mode.currentData()
-        if mode == "list":
-            self._content.setCurrentIndex(1)
-            self._settings.setValue(self._SETTINGS_KEY_VIEW_MODE, "list")
-        else:
-            self._content.setCurrentIndex(0)
-            self._settings.setValue(self._SETTINGS_KEY_VIEW_MODE, "tile")
+    def set_view_mode(self, mode: str, *, save: bool = True) -> None:
+        # Persistent, explicit state (stored in QSettings).
+        if mode not in ("tile", "list"):
+            return
+        self._view_mode = mode
+        self._content.setCurrentIndex(1 if mode == "list" else 0)
+        if save:
+            self._settings.setValue(self._SETTINGS_KEY_VIEW_MODE, mode)
 
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
 
     def has_valid_selection(self) -> bool:
-        mode = self._mode.currentData()
-        if mode == "list":
+        if self._view_mode == "list":
             sm = self._list_view.selectionModel()
             return bool(sm and sm.hasSelection())
         sm = self._tile_view.selectionModel()
         return bool(sm and sm.hasSelection())
 
     def selected_view_item(self) -> ViewItem | None:
-        mode = self._mode.currentData()
-        if mode == "list":
+        if self._view_mode == "list":
             sm = self._list_view.selectionModel()
             if sm is None:
                 return None
@@ -323,10 +366,12 @@ class MainView(QWidget):
 
     def _update_empty_states(self) -> None:
         # Spec: empty states use placeholders; no popup.
-        if self._project_root:
+        if self._empty_override:
+            empty_text = self._empty_override
+        elif self._project_root:
             empty_text = "Empty assets / shots"
         else:
-            empty_text = self._empty_override or "Select a project root to begin"
+            empty_text = "Select a project root to begin"
 
         self._tile_placeholder.setText(empty_text)
         self._list_placeholder.setText(empty_text)
@@ -391,7 +436,7 @@ class MainView(QWidget):
         self._thumb_prefetch_scheduled = False
 
         # Tile-only integration
-        if self._mode.currentData() != "tile":
+        if self._view_mode != "tile":
             return
         if self._tile_model.rowCount() == 0:
             return

@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QComboBox, QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter
+from PySide6.QtGui import QAction, QActionGroup
+from PySide6.QtWidgets import QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter
 
 from monostudio.core.fs_reader import build_project_index
 from monostudio.core.models import Asset, Department, ProjectIndex, Shot
@@ -49,15 +49,14 @@ class MainWindow(QMainWindow):
         self._inspector = InspectorPanel()
         self._inspector.setMinimumWidth(240)
 
-        self._project_switcher = QComboBox()
-        self._project_switcher.setEditable(False)
-        self._project_switcher.setMinimumWidth(220)
-        self._project_switcher.setPlaceholderText("Project")
-        self._project_switcher.currentIndexChanged.connect(self._on_project_switcher_changed)
-
         self._build_menu()
         self._restore_workspace_root()
         self._restore_project_root()
+        # Sync view menu checks to persisted state
+        if self._settings.value("main_view/mode", "tile") == "list":
+            self._view_list.setChecked(True)
+        else:
+            self._view_tile.setChecked(True)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -102,8 +101,22 @@ class MainWindow(QMainWindow):
         open_project_root_action.triggered.connect(self._open_project_root)
         file_menu.addAction(open_project_root_action)
 
-        # Project switcher (top-level, non-intrusive)
-        self.menuBar().setCornerWidget(self._project_switcher, Qt.TopRightCorner)
+        # Project switching via menu (no combo box).
+        self._project_menu = self.menuBar().addMenu("Project")
+        self._project_menu.aboutToShow.connect(self._rebuild_project_menu)
+
+        # View mode via menu (no combo box).
+        view_menu = self.menuBar().addMenu("View")
+        self._view_mode_group = QActionGroup(self)
+        self._view_mode_group.setExclusive(True)
+        self._view_tile = QAction("Tile", self, checkable=True)
+        self._view_list = QAction("List", self, checkable=True)
+        self._view_mode_group.addAction(self._view_tile)
+        self._view_mode_group.addAction(self._view_list)
+        self._view_tile.triggered.connect(lambda: self._main_view.set_view_mode("tile"))
+        self._view_list.triggered.connect(lambda: self._main_view.set_view_mode("list"))
+        view_menu.addAction(self._view_tile)
+        view_menu.addAction(self._view_list)
 
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)
@@ -216,7 +229,7 @@ class MainWindow(QMainWindow):
         # After selecting a folder: keep layout stable, show neutral empty-state.
         self._inspector.set_empty_state()
 
-        self._sync_project_switcher_to_current_project()
+        self._sync_project_menu_title()
 
     def _apply_workspace_root(self, folder: str | None, *, save: bool) -> None:
         # No validation. Read-only discovery.
@@ -225,7 +238,6 @@ class MainWindow(QMainWindow):
 
         self._workspace_root = Path(folder) if folder else None
         self._workspace_projects = discover_projects(self._workspace_root) if self._workspace_root else []
-        self._populate_project_switcher(self._workspace_projects)
         self._new_project_action.setEnabled(self._workspace_root is not None)
 
         if not self._workspace_projects:
@@ -233,7 +245,8 @@ class MainWindow(QMainWindow):
         else:
             self._main_view.set_empty_override(None)
 
-        self._sync_project_switcher_to_current_project()
+        # Menu will reflect current state on open; also update title now.
+        self._sync_project_menu_title()
 
     def _rescan_project(self) -> None:
         # Autoscan must be deterministic and synchronous.
@@ -312,6 +325,13 @@ class MainWindow(QMainWindow):
                             )
                         )
 
+        # v1.1 clarity: if department list is empty, explain it inline (no warnings, no auto-creation).
+        if self._project_root is not None and self._entered_parent is not None and len(items) == 0:
+            self._main_view.set_empty_override("Departments appear when folders exist on disk.")
+        elif self._project_root is not None:
+            # In a project, use default empty states unless overridden by other flows.
+            self._main_view.set_empty_override(None)
+
         self._main_view.set_items(items)
 
     def _on_item_activated(self, item: ViewItem) -> None:
@@ -332,47 +352,14 @@ class MainWindow(QMainWindow):
             self._inspector.set_empty_state()
             return
 
-    def _populate_project_switcher(self, projects: list[DiscoveredProject]) -> None:
-        # No scanning here; only populate from discovery results.
-        self._project_switcher.blockSignals(True)
-        try:
-            self._project_switcher.clear()
-            for p in projects:
-                self._project_switcher.addItem(p.name, userData=str(p.root))
-            self._project_switcher.setEnabled(bool(projects))
-            self._project_switcher.setCurrentIndex(-1)
-        finally:
-            self._project_switcher.blockSignals(False)
-
-    def _sync_project_switcher_to_current_project(self) -> None:
-        if not self._workspace_projects or self._project_root is None:
-            self._project_switcher.blockSignals(True)
-            try:
-                self._project_switcher.setCurrentIndex(-1)
-            finally:
-                self._project_switcher.blockSignals(False)
+    def _sync_project_menu_title(self) -> None:
+        # Keep it short and stable.
+        if not hasattr(self, "_project_menu"):
             return
-
-        current = str(self._project_root)
-        self._project_switcher.blockSignals(True)
-        try:
-            idx = -1
-            for i in range(self._project_switcher.count()):
-                if self._project_switcher.itemData(i) == current:
-                    idx = i
-                    break
-            self._project_switcher.setCurrentIndex(idx)
-        finally:
-            self._project_switcher.blockSignals(False)
-
-    def _on_project_switcher_changed(self, index: int) -> None:
-        if index < 0:
+        if self._project_root is None:
+            self._project_menu.setTitle("Project")
             return
-        path = self._project_switcher.itemData(index)
-        if not isinstance(path, str) or not path:
-            return
-        # Switching project is explicit: set project/root and reuse existing autoscan logic.
-        self._apply_project_root(path, save=True)
+        self._project_menu.setTitle(f"Project: {self._project_root.name}")
 
     def _new_project(self) -> None:
         if self._workspace_root is None:
@@ -420,10 +407,37 @@ class MainWindow(QMainWindow):
         # Do NOT rescan workspace from scratch; append to existing list.
         created = DiscoveredProject(name=name, root=project_root)
         self._workspace_projects.append(created)
-        self._populate_project_switcher(self._workspace_projects)
-
         # Auto-switch to new project (sets project/root, triggers existing autoscan, resets Inspector).
-        self._project_switcher.setCurrentIndex(self._project_switcher.findData(str(project_root)))
+        self._apply_project_root(str(project_root), save=True)
+
+    def _rebuild_project_menu(self) -> None:
+        # Rebuild dynamically when menu opens (no background work).
+        self._project_menu.clear()
+        self._sync_project_menu_title()
+
+        if not self._workspace_projects:
+            empty = QAction("No projects", self)
+            empty.setEnabled(False)
+            self._project_menu.addAction(empty)
+            return
+
+        group = QActionGroup(self._project_menu)
+        group.setExclusive(True)
+        current = str(self._project_root) if self._project_root else None
+
+        for proj in self._workspace_projects:
+            act = QAction(proj.name, self._project_menu, checkable=True)
+            act.setData(str(proj.root))
+            act.setChecked(current == str(proj.root))
+            act.triggered.connect(lambda checked=False, p=str(proj.root): self._switch_project(p))
+            group.addAction(act)
+            self._project_menu.addAction(act)
+
+    def _switch_project(self, project_root: str) -> None:
+        if not project_root:
+            return
+        self._apply_project_root(project_root, save=True)
+        self._sync_project_menu_title()
 
     def _on_root_context_menu_requested(self, global_pos) -> None:
         # Entry points (context menu only):

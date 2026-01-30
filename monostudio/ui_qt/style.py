@@ -41,13 +41,13 @@ def apply_dark_theme(app: QApplication) -> None:
         """
         QWidget { font-size: 12px; }
         QSplitter::handle { background: #26282B; }
-        QLineEdit, QComboBox {
+        QLineEdit {
             padding: 6px 8px;
             border: 1px solid #3A3D41;
             border-radius: 6px;
             background: #2B2D30;
         }
-        QLineEdit:focus, QComboBox:focus {
+        QLineEdit:focus {
             border: 1px solid #3DAEE9;
         }
         QListWidget, QTableView, QTreeView, QListView {

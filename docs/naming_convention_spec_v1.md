@@ -154,9 +154,15 @@ Ví dụ hợp lệ:
 model
 rig
 anim
+fx
 lookdev
 lighting
 comp
+
+Custom names are allowed (team convention), ví dụ:
+
+cloth
+groom
 
 6. WORK / PUBLISH
 Chuẩn thư mục:

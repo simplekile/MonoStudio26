@@ -294,3 +294,79 @@ Duyệt nhanh hơn Explorer
 
 Publish không gây sợ
 
+
+❌ QComboBox — Absolute NO Rules (MonoStudio 26)
+
+Tuyệt đối KHÔNG dùng QComboBox khi:
+
+Giá trị không được lưu như một state thực
+
+Không ghi vào filesystem
+
+Không ghi vào config rõ ràng
+
+Không có Apply / Confirm
+
+Inspector là read-only
+
+Chỉ hiển thị thông tin
+
+Không thay đổi dữ liệu
+
+Không tạo side effect
+
+Hành động là one-shot
+
+Mở
+
+Copy
+
+Switch
+
+Filter tạm thời
+→ dùng Menu / Context Menu
+
+Thay đổi không có hậu quả lâu dài
+
+Đổi rồi refresh là mất
+
+Không ảnh hưởng project thực
+→ QComboBox gây hiểu nhầm
+
+Control tồn tại chỉ để “cho tiện”
+
+Không có spec state rõ ràng
+
+Không có ownership rõ ràng
+→ Không được dùng
+
+Không thể giải thích bằng 1 câu ngắn
+
+“Cái này là gì?”
+
+“Nó có lưu không?”
+→ FAIL UX → cấm dùng
+
+Patch-level (v1.x)
+
+Pain-point patch
+
+Polish
+
+UX clarity
+→ Không introduce ComboBox mới
+
+✅ Thay thế đúng
+
+Menu / Context Menu → hành động explicit
+
+Label + Tooltip → thông tin
+
+Button → trigger rõ ràng
+
+Read-only field → dữ liệu thật
+
+🧠 Design Principle Summary (1 dòng)
+
+If it doesn’t represent a persistent, explicit, user-owned state — do not use QComboBox.
+

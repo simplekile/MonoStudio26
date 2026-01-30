@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QFormLayout, QStackedLayout, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QFormLayout, QLineEdit, QStackedLayout, QVBoxLayout, QWidget
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,9 @@ class InspectorPanel(QWidget):
         # Page: Asset / Shot
         self._asset_name = QLabel("")
         self._asset_type = QLabel("")
-        self._asset_absolute_path = QLabel("")
+        self._asset_absolute_path = QLineEdit()
+        self._asset_absolute_path.setReadOnly(True)
+        self._asset_absolute_path.setClearButtonEnabled(False)
         self._asset_created_date = QLabel("")
         self._asset_last_modified = QLabel("")
 
@@ -74,8 +76,13 @@ class InspectorPanel(QWidget):
 
         # Page: Department / Version
         self._dept_name = QLabel("")
-        self._dept_work_path = QLabel("")
-        self._dept_publish_path = QLabel("")
+        self._dept_work_path = QLineEdit()
+        self._dept_work_path.setReadOnly(True)
+        self._dept_work_path.setClearButtonEnabled(False)
+
+        self._dept_publish_path = QLineEdit()
+        self._dept_publish_path.setReadOnly(True)
+        self._dept_publish_path.setClearButtonEnabled(False)
 
         dept_form = QFormLayout()
         dept_form.setContentsMargins(0, 0, 0, 0)
@@ -125,12 +132,15 @@ class InspectorPanel(QWidget):
         self._asset_name.setText("")
         self._asset_type.setText("")
         self._asset_absolute_path.setText("")
+        self._asset_absolute_path.setToolTip("")
         self._asset_created_date.setText("")
         self._asset_last_modified.setText("")
 
         self._dept_name.setText("")
         self._dept_work_path.setText("")
+        self._dept_work_path.setToolTip("")
         self._dept_publish_path.setText("")
+        self._dept_publish_path.setToolTip("")
 
         self._status_work_exists.setText("")
         self._status_publish_exists.setText("")
@@ -142,6 +152,7 @@ class InspectorPanel(QWidget):
         self._asset_name.setText(data.name)
         self._asset_type.setText(data.type)
         self._asset_absolute_path.setText(data.absolute_path)
+        self._asset_absolute_path.setToolTip(data.absolute_path)
         self._asset_created_date.setText(data.created_date)
         self._asset_last_modified.setText(data.last_modified)
 
@@ -149,7 +160,9 @@ class InspectorPanel(QWidget):
         self._stack.setCurrentIndex(2)
         self._dept_name.setText(data.department_name)
         self._dept_work_path.setText(data.work_path)
+        self._dept_work_path.setToolTip(data.work_path)
         self._dept_publish_path.setText(data.publish_path)
+        self._dept_publish_path.setToolTip(data.publish_path)
 
         self._status_work_exists.setText(status.work_exists)
         self._status_publish_exists.setText(status.publish_exists)
