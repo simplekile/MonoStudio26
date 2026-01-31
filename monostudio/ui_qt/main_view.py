@@ -49,6 +49,7 @@ class MainView(QWidget):
     refresh_requested = Signal()
     root_context_menu_requested = Signal(object)  # emits global QPoint
     copy_inventory_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    delete_requested = Signal(object)  # emits ViewItem (asset/shot only)
 
     _SETTINGS_KEY_VIEW_MODE = "main_view/mode"  # "tile" | "list" (persistent)
     _THUMBNAIL_SIZE_PX = 96
@@ -441,6 +442,7 @@ class MainView(QWidget):
 
         menu.addSeparator()
 
+        delete_action = None
         refresh_action = None
         open_work = None
         open_publish = None
@@ -448,6 +450,7 @@ class MainView(QWidget):
         if item.kind.value in ("asset", "shot"):
             # Existing v1 behavior: Refresh on Asset/Shot items.
             refresh_action = menu.addAction("Refresh")
+            delete_action = menu.addAction("Delete…")
         elif item.kind.value == "department":
             # Optional (already meaningful in UI): open work/publish folders
             open_work = menu.addAction("Open Work Folder")
@@ -458,6 +461,7 @@ class MainView(QWidget):
         menu.setProperty("_act_open_folder", open_folder)
         menu.setProperty("_act_copy_inventory", copy_inventory)
         menu.setProperty("_act_refresh", refresh_action)
+        menu.setProperty("_act_delete", delete_action)
         menu.setProperty("_act_open_work", open_work)
         menu.setProperty("_act_open_publish", open_publish)
         return menu
@@ -481,6 +485,9 @@ class MainView(QWidget):
             return
         if text == "Refresh":
             self.refresh_requested.emit()
+            return
+        if text == "Delete…":
+            self.delete_requested.emit(item)
             return
         if text == "Open Work Folder":
             if hasattr(item, "ref") and item.ref is not None and hasattr(item.ref, "work_path"):

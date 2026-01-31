@@ -1,0 +1,29 @@
+{
+  "types": {
+    "shot": {
+      "id": "shot",
+      "name": "Shot",
+      "short_name": "sh",
+      "departments": ["layout", "anim", "fx", "lighting"]
+    },
+    "character": {
+      "id": "character",
+      "name": "Character",
+      "short_name": "char",
+      "departments": ["model", "rig", "anim"]
+    },
+    "prop": {
+      "id": "prop",
+      "name": "Prop",
+      "short_name": "prop",
+      "departments": ["model"]
+    },
+    "environment": {
+      "id": "environment",
+      "name": "Environment",
+      "short_name": "env",
+      "departments": ["layout", "model", "lighting"]
+    }
+  }
+}
+

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import QByteArray, Qt, QSettings
 from PySide6.QtGui import QAction, QActionGroup
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter, QToolBar
 
 from monostudio.core.fs_reader import build_project_index
 from monostudio.core.models import Asset, Department, ProjectIndex, Shot
 from monostudio.core.workspace_reader import DiscoveredProject, discover_projects
+from monostudio.core.pipeline_types_and_presets import ensure_pipeline_bootstrap
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
 from monostudio.ui_qt.inspector import (
     AssetShotInspectorData,
@@ -19,8 +23,10 @@ from monostudio.ui_qt.inspector import (
 )
 from monostudio.ui_qt.main_view import MainView
 from monostudio.ui_qt.new_project_dialog import NewProjectDialog
+from monostudio.ui_qt.settings_dialog import SettingsDialog
 from monostudio.ui_qt.sidebar import Sidebar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
+from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog
 
 
 class MainWindow(QMainWindow):
@@ -35,6 +41,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("MonoStudio 26")
+        ensure_pipeline_bootstrap()
+
+        # Mandatory minimum size (locked requirement).
+        self.setMinimumSize(1920, 1080)
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
         self._workspace_root: Path | None = None
@@ -50,8 +60,10 @@ class MainWindow(QMainWindow):
         self._inspector.setMinimumWidth(240)
 
         self._build_menu()
+        self._build_global_create_button()
         self._restore_workspace_root()
         self._restore_project_root()
+        self._restore_window_geometry()
         # Sync view menu checks to persisted state
         if self._settings.value("main_view/mode", "tile") == "list":
             self._view_list.setChecked(True)
@@ -81,10 +93,48 @@ class MainWindow(QMainWindow):
         self._main_view.refresh_requested.connect(self._on_refresh_requested)
         self._main_view.root_context_menu_requested.connect(self._on_root_context_menu_requested)
         self._main_view.copy_inventory_requested.connect(self._on_copy_item_inventory_requested)
+        self._main_view.delete_requested.connect(self._on_delete_requested)
 
         # Initial population is driven by project-root restore (scan trigger) and current context.
         self._reload_main_view()
         self._inspector.set_empty_state()
+        self._sync_global_create_enabled()
+
+    def _build_global_create_button(self) -> None:
+        """
+        Global Create entry (context-aware):
+        - Always visible
+        - Routes to existing Create dialogs only
+        - Depends ONLY on active context (Assets/Shots)
+        """
+        toolbar = QToolBar("Create", self)
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.addToolBar(Qt.TopToolBarArea, toolbar)
+
+        self._global_create_action = QAction("+ Create", self)
+        self._global_create_action.triggered.connect(self._on_global_create_triggered)
+        toolbar.addAction(self._global_create_action)
+
+    def _sync_global_create_enabled(self) -> None:
+        if not hasattr(self, "_global_create_action"):
+            return
+        context = self._sidebar.currentItem().text() if self._sidebar.currentItem() else "Assets"
+        enabled = self._project_root is not None and context in ("Assets", "Shots")
+        self._global_create_action.setEnabled(enabled)
+
+    def _on_global_create_triggered(self) -> None:
+        # Routing only; no intermediate menu, no guessing beyond active context.
+        if self._project_root is None:
+            return
+        context = self._sidebar.currentItem().text() if self._sidebar.currentItem() else "Assets"
+        if context == "Assets":
+            self._create_asset()
+            return
+        if context == "Shots":
+            self._create_shot()
+            return
 
     def _build_menu(self) -> None:
         # Minimal menu bar per requirement.
@@ -111,6 +161,11 @@ class MainWindow(QMainWindow):
         # Project switching via menu (no combo box).
         self._project_menu = self.menuBar().addMenu("Project")
         self._project_menu.aboutToShow.connect(self._rebuild_project_menu)
+
+        settings_menu = self.menuBar().addMenu("Settings")
+        open_settings = QAction("Settings…", self)
+        open_settings.triggered.connect(self._open_settings)
+        settings_menu.addAction(open_settings)
 
         # View mode via menu (no combo box).
         view_menu = self.menuBar().addMenu("View")
@@ -229,6 +284,51 @@ class MainWindow(QMainWindow):
             self._copy_to_clipboard(self._inventory_text_item("Shot", item.ref.name, depts))
             return
 
+    def _on_delete_requested(self, item: ViewItem) -> None:
+        """
+        Guarded delete (asset/shot only):
+        - Confirmation requires typing exact folder name
+        - Deletes folder recursively from disk
+        - On success: update in-memory index and refresh UI (NO rescan)
+        - On failure: silent no-op (log only)
+        """
+        if self._project_index is None:
+            return
+        if item.kind.value not in ("asset", "shot"):
+            return
+
+        path = item.path
+        name = path.name
+        kind_label = "Asset" if item.kind.value == "asset" else "Shot"
+
+        dialog = DeleteConfirmDialog(kind_label=kind_label, folder_name=name, absolute_path=path, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        try:
+            if not path.exists():
+                return
+        except OSError:
+            return
+
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            logging.getLogger(__name__).exception("Failed to delete folder: %s", str(path))
+            return
+
+        # Success: update in-memory index (NO rescan)
+        if item.kind.value == "asset":
+            assets = tuple(a for a in self._project_index.assets if a.path != path)
+            self._project_index = ProjectIndex(root=self._project_index.root, assets=assets, shots=self._project_index.shots)
+        else:
+            shots = tuple(s for s in self._project_index.shots if s.path != path)
+            self._project_index = ProjectIndex(root=self._project_index.root, assets=self._project_index.assets, shots=shots)
+
+        self._entered_parent = None
+        self._reload_main_view()
+        self._inspector.set_empty_state()
+
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)
         self._apply_workspace_root(path or None, save=False)
@@ -268,6 +368,7 @@ class MainWindow(QMainWindow):
         self._rescan_project()
         self._reload_main_view()
         self._inspector.set_empty_state()
+        self._sync_global_create_enabled()
 
     def _on_context_clicked(self, context_name: str) -> None:
         # Spec: click reloads Main View. (No autoscan trigger unless it was a switch.)
@@ -275,6 +376,7 @@ class MainWindow(QMainWindow):
         self._entered_parent = None
         self._reload_main_view()
         self._inspector.set_empty_state()
+        self._sync_global_create_enabled()
 
     def _on_valid_selection_changed(self, has_selection: bool) -> None:
         if not has_selection:
@@ -341,6 +443,7 @@ class MainWindow(QMainWindow):
         self._inspector.set_empty_state()
 
         self._sync_project_menu_title()
+        self._sync_global_create_enabled()
 
     def _apply_workspace_root(self, folder: str | None, *, save: bool) -> None:
         # No validation. Read-only discovery.
@@ -544,6 +647,56 @@ class MainWindow(QMainWindow):
             group.addAction(act)
             self._project_menu.addAction(act)
 
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(parent=self)
+        dialog.exec()
+
+    @staticmethod
+    def _app_settings_path() -> Path:
+        repo_root = Path(__file__).resolve().parents[2]
+        return repo_root / "monostudio26" / "config" / "app_settings.json"
+
+    def _restore_window_geometry(self) -> None:
+        """
+        Restore saved window geometry BEFORE showing the window.
+        Storage: monostudio26/config/app_settings.json (app-level only)
+        """
+        path = self._app_settings_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = None
+
+        restored = False
+        if isinstance(data, dict):
+            b64 = data.get("window_geometry_b64")
+            if isinstance(b64, str) and b64.strip():
+                try:
+                    raw = base64.b64decode(b64.encode("ascii"), validate=False)
+                    restored = bool(self.restoreGeometry(QByteArray(raw)))
+                except (OSError, ValueError):
+                    restored = False
+
+        if not restored:
+            # First launch / no saved geometry: open at >= minimum size.
+            self.resize(1920, 1080)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """
+        Save window geometry on close (size + position).
+        Silent failure on IO errors.
+        """
+        path = self._app_settings_path()
+        payload = {
+            "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        super().closeEvent(event)
+
     def _switch_project(self, project_root: str) -> None:
         if not project_root:
             return
@@ -595,28 +748,45 @@ class MainWindow(QMainWindow):
         if self._project_root is None:
             return
 
-        dialog = CreateAssetDialog(self)
+        dialog = CreateAssetDialog(self._project_root, self)
         if dialog.exec() != QDialog.Accepted:
             return
 
         asset_type = dialog.asset_type()
         asset_name = dialog.asset_name()
-        if not self._is_safe_single_folder_name(asset_type) or not self._is_safe_single_folder_name(asset_name):
-            QMessageBox.critical(self, "Create Asset", "Names must be non-empty.")
+        departments = dialog.selected_departments()
+        create_subfolders = dialog.create_subfolders()
+        if not asset_type or not asset_name:
             return
 
         target = self._project_root / "assets" / asset_type / asset_name
         if target.exists():
-            QMessageBox.critical(self, "Create Asset", "Target folder already exists.")
             return
 
+        created: list[Path] = []
         try:
-            target.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            QMessageBox.critical(self, "Create Asset", "Target folder already exists.")
-            return
+            to_create: list[Path] = [target]
+            for d in departments:
+                dept_dir = target / d
+                to_create.append(dept_dir)
+                if create_subfolders:
+                    to_create.append(dept_dir / "work")
+                    to_create.append(dept_dir / "publish")
+
+            for p in to_create:
+                try:
+                    p.mkdir(parents=True, exist_ok=False)
+                    created.append(p)
+                except FileExistsError:
+                    # Folder already exists: skip silently.
+                    continue
         except OSError:
-            QMessageBox.critical(self, "Create Asset", "Failed to create asset folder.")
+            # Best-effort rollback inside target only (no dialogs).
+            for p in reversed(created):
+                try:
+                    p.rmdir()
+                except OSError:
+                    pass
             return
 
         # After creation, trigger existing autoscan logic (Phase 1) for current project.
@@ -629,27 +799,42 @@ class MainWindow(QMainWindow):
         if self._project_root is None:
             return
 
-        dialog = CreateShotDialog(self)
+        dialog = CreateShotDialog(self._project_root, self)
         if dialog.exec() != QDialog.Accepted:
             return
 
         shot_name = dialog.shot_name()
-        if not self._is_safe_single_folder_name(shot_name):
-            QMessageBox.critical(self, "Create Shot", "Name must be non-empty.")
+        departments = dialog.selected_departments()
+        create_subfolders = dialog.create_subfolders()
+        if not shot_name:
             return
 
         target = self._project_root / "shots" / shot_name
         if target.exists():
-            QMessageBox.critical(self, "Create Shot", "Target folder already exists.")
             return
 
+        created: list[Path] = []
         try:
-            target.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            QMessageBox.critical(self, "Create Shot", "Target folder already exists.")
-            return
+            to_create: list[Path] = [target]
+            for d in departments:
+                dept_dir = target / d
+                to_create.append(dept_dir)
+                if create_subfolders:
+                    to_create.append(dept_dir / "work")
+                    to_create.append(dept_dir / "publish")
+
+            for p in to_create:
+                try:
+                    p.mkdir(parents=True, exist_ok=False)
+                    created.append(p)
+                except FileExistsError:
+                    continue
         except OSError:
-            QMessageBox.critical(self, "Create Shot", "Failed to create shot folder.")
+            for p in reversed(created):
+                try:
+                    p.rmdir()
+                except OSError:
+                    pass
             return
 
         # After creation, trigger existing autoscan logic (Phase 1) for current project.
