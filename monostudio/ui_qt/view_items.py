@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 class ViewItemKind(str, Enum):
+    PROJECT = "project"
     ASSET = "asset"
     SHOT = "shot"
     DEPARTMENT = "department"

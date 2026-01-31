@@ -1,0 +1,30 @@
+---
+description: Typography & font stack rules (Inter + JetBrains Mono)
+alwaysApply: true
+---
+
+# Typography & Font Stack (v1)
+
+## Font stack
+- **UI font (sans)**: Inter (default for all UI text)
+- **Technical font (mono)**: JetBrains Mono (paths, IDs, log-like values)
+
+## Typography hierarchy (sizes are px)
+- **Level 1 (App/Project title)**: 14–16, 700, uppercase, tracking-tight, Zinc-100/White
+- **Level 2 (Section/Sidebar)**: 10–11, 800, uppercase, tracking-widest, Zinc-500
+- **Level 3 (Primary navigation label)**: 13, 600, tracking-tight (no uppercase). Use for main nav like Sidebar items (Assets/Shots).
+- **Data labels**: 11, 600, uppercase, tracking-wider, Zinc-500 (e.g. STATUS/DEPARTMENT)
+- **Body/values**: 13, 500, Zinc-300 (or Zinc-200 on hover/active)
+- **Technical data**: mono, Zinc-400
+
+## Interaction colors
+- **Active**: Blue-400 or White + subtle highlight background
+- **Muted**: Zinc-600 for low-importance info (dates, old versions)
+
+## Layout metrics
+- **8px grid**
+- **Default line-height**: 1.5
+
+## Enforcement in code
+- Default QApp font: Inter
+- Any path/ID/log value fields must be styled/marked as monospace (JetBrains Mono)

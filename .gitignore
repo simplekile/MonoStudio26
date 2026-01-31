@@ -8,3 +8,10 @@ env/
 .DS_Store
 Thumbs.db
 
+# Runtime app settings (user machine)
+monostudio_data/config/
+monostudio26/config/
+
+# Temporary working folders
+.tmp_*/
+

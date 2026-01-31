@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QByteArray, Qt, QSettings
 from PySide6.QtGui import QAction, QActionGroup
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter, QToolBar
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter
 
 from monostudio.core.fs_reader import build_project_index
 from monostudio.core.models import Asset, Department, ProjectIndex, Shot
@@ -40,11 +40,11 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("MonoStudio 26")
+        self.setWindowTitle("MONOS")
         ensure_pipeline_bootstrap()
 
-        # Mandatory minimum size (locked requirement).
-        self.setMinimumSize(1920, 1080)
+        # Minimum window size (usability floor).
+        self.setMinimumSize(640, 480)
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
         self._workspace_root: Path | None = None
@@ -60,15 +60,9 @@ class MainWindow(QMainWindow):
         self._inspector.setMinimumWidth(240)
 
         self._build_menu()
-        self._build_global_create_button()
         self._restore_workspace_root()
         self._restore_project_root()
         self._restore_window_geometry()
-        # Sync view menu checks to persisted state
-        if self._settings.value("main_view/mode", "tile") == "list":
-            self._view_list.setChecked(True)
-        else:
-            self._view_tile.setChecked(True)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -80,7 +74,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 15)
         splitter.setStretchFactor(1, 60)
         splitter.setStretchFactor(2, 25)
-        splitter.setSizes([150, 600, 250])
+        splitter.setSizes([256, 600, 250])
 
         # Use splitter directly as the central widget
         self.setCentralWidget(splitter)
@@ -88,53 +82,66 @@ class MainWindow(QMainWindow):
         self._sidebar.context_changed.connect(self._on_context_switched)
         self._sidebar.context_clicked.connect(self._on_context_clicked)
         self._sidebar.context_menu_requested.connect(self._on_sidebar_context_menu_requested)
+        self._sidebar.settings_requested.connect(self._open_settings)
         self._main_view.valid_selection_changed.connect(self._on_valid_selection_changed)
         self._main_view.item_activated.connect(self._on_item_activated)
         self._main_view.refresh_requested.connect(self._on_refresh_requested)
         self._main_view.root_context_menu_requested.connect(self._on_root_context_menu_requested)
         self._main_view.copy_inventory_requested.connect(self._on_copy_item_inventory_requested)
         self._main_view.delete_requested.connect(self._on_delete_requested)
+        self._main_view.primary_action_requested.connect(self._on_primary_action_requested)
+        self._main_view.view_mode_changed.connect(self._sync_view_menu_checks)
 
         # Initial population is driven by project-root restore (scan trigger) and current context.
         self._reload_main_view()
         self._inspector.set_empty_state()
-        self._sync_global_create_enabled()
+        self._sync_primary_action()
+        self._sync_view_menu_checks()
 
-    def _build_global_create_button(self) -> None:
-        """
-        Global Create entry (context-aware):
-        - Always visible
-        - Routes to existing Create dialogs only
-        - Depends ONLY on active context (Assets/Shots)
-        """
-        toolbar = QToolBar("Create", self)
-        toolbar.setMovable(False)
-        toolbar.setFloatable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.addToolBar(Qt.TopToolBarArea, toolbar)
-
-        self._global_create_action = QAction("+ Create", self)
-        self._global_create_action.triggered.connect(self._on_global_create_triggered)
-        toolbar.addAction(self._global_create_action)
-
-    def _sync_global_create_enabled(self) -> None:
-        if not hasattr(self, "_global_create_action"):
+    def _sync_view_menu_checks(self) -> None:
+        if not hasattr(self, "_view_tile") or not hasattr(self, "_view_list"):
             return
-        context = self._sidebar.currentItem().text() if self._sidebar.currentItem() else "Assets"
-        enabled = self._project_root is not None and context in ("Assets", "Shots")
-        self._global_create_action.setEnabled(enabled)
+        mode = getattr(self._main_view, "_view_mode", "tile")
+        self._view_tile.setChecked(mode == "tile")
+        self._view_list.setChecked(mode == "list")
 
-    def _on_global_create_triggered(self) -> None:
-        # Routing only; no intermediate menu, no guessing beyond active context.
-        if self._project_root is None:
+    def _sync_primary_action(self) -> None:
+        context = self._sidebar.current_context()
+        if context == "Projects":
+            enabled = self._workspace_root is not None
+            tooltip = None if enabled else "Open Workspace… to create a new project"
+            self._main_view.set_primary_action(label="New Project", enabled=enabled, tooltip=tooltip)
+            self._main_view.set_browser_context("project")
             return
-        context = self._sidebar.currentItem().text() if self._sidebar.currentItem() else "Assets"
+        if context == "Shots":
+            enabled = self._project_root is not None
+            tooltip = None if enabled else "Select a project to create a new shot"
+            self._main_view.set_primary_action(label="New Shot", enabled=enabled, tooltip=tooltip)
+            self._main_view.set_browser_context("shot")
+            return
         if context == "Assets":
-            self._create_asset()
+            enabled = self._project_root is not None
+            tooltip = None if enabled else "Select a project to create a new asset"
+            self._main_view.set_primary_action(label="New Asset", enabled=enabled, tooltip=tooltip)
+            self._main_view.set_browser_context("asset")
+            return
+
+        # Non-browser areas: keep the button visible but disabled.
+        self._main_view.set_context_title(context)
+        self._main_view.set_primary_action(label="", enabled=False, tooltip=f"{context} does not support creation yet.")
+
+    def _on_primary_action_requested(self) -> None:
+        context = self._sidebar.current_context()
+        if context == "Projects":
+            self._new_project()
             return
         if context == "Shots":
             self._create_shot()
             return
+        if context == "Assets":
+            self._create_asset()
+            return
+        return
 
     def _build_menu(self) -> None:
         # Minimal menu bar per requirement.
@@ -171,7 +178,7 @@ class MainWindow(QMainWindow):
         view_menu = self.menuBar().addMenu("View")
         self._view_mode_group = QActionGroup(self)
         self._view_mode_group.setExclusive(True)
-        self._view_tile = QAction("Tile", self, checkable=True)
+        self._view_tile = QAction("Grid", self, checkable=True)
         self._view_list = QAction("List", self, checkable=True)
         self._view_mode_group.addAction(self._view_tile)
         self._view_mode_group.addAction(self._view_list)
@@ -362,21 +369,40 @@ class MainWindow(QMainWindow):
         self._apply_workspace_root(folder, save=True)
 
     def _on_context_switched(self, context_name: str) -> None:
-        # Trigger: user switches between Assets / Shots -> rescan synchronously.
+        # Trigger: user switches between top-level contexts.
         self._main_view.set_context_title(context_name)
         self._entered_parent = None
-        self._rescan_project()
-        self._reload_main_view()
+        if context_name in ("Assets", "Shots"):
+            # Deterministic autoscan trigger (locked rule).
+            self._rescan_project()
+            self._reload_main_view()
+        else:
+            # Non-project-browser areas are placeholders (no scans, no side effects).
+            self._main_view.clear()
+            self._main_view.set_empty_override(self._empty_message_for_context(context_name))
         self._inspector.set_empty_state()
-        self._sync_global_create_enabled()
+        self._sync_primary_action()
 
     def _on_context_clicked(self, context_name: str) -> None:
         # Spec: click reloads Main View. (No autoscan trigger unless it was a switch.)
         self._main_view.set_context_title(context_name)
         self._entered_parent = None
-        self._reload_main_view()
+        if context_name in ("Assets", "Shots"):
+            self._reload_main_view()
+        else:
+            self._main_view.clear()
+            self._main_view.set_empty_override(self._empty_message_for_context(context_name))
         self._inspector.set_empty_state()
-        self._sync_global_create_enabled()
+        self._sync_primary_action()
+
+    def _empty_message_for_context(self, context_name: str) -> str:
+        if context_name == "Projects":
+            if self._workspace_root is None:
+                return "Open Workspace… to discover projects."
+            if not self._workspace_projects:
+                return "No projects found in this workspace"
+            return "Use Project menu to switch projects."
+        return f"{context_name} is not available yet."
 
     def _on_valid_selection_changed(self, has_selection: bool) -> None:
         if not has_selection:
@@ -438,12 +464,13 @@ class MainWindow(QMainWindow):
             self._project_index = build_project_index(self._project_root)
             self._entered_parent = None
             self._reload_main_view()
+        self._sidebar.set_project_index(self._project_index)
 
         # After selecting a folder: keep layout stable, show neutral empty-state.
         self._inspector.set_empty_state()
 
         self._sync_project_menu_title()
-        self._sync_global_create_enabled()
+        self._sync_primary_action()
 
     def _apply_workspace_root(self, folder: str | None, *, save: bool) -> None:
         # No validation. Read-only discovery.
@@ -453,6 +480,7 @@ class MainWindow(QMainWindow):
         self._workspace_root = Path(folder) if folder else None
         self._workspace_projects = discover_projects(self._workspace_root) if self._workspace_root else []
         self._new_project_action.setEnabled(self._workspace_root is not None)
+        self._sidebar.set_projects_count(len(self._workspace_projects) if self._workspace_root is not None else None)
 
         if not self._workspace_projects:
             self._main_view.set_empty_override("No projects found in this workspace")
@@ -466,8 +494,10 @@ class MainWindow(QMainWindow):
         # Autoscan must be deterministic and synchronous.
         if self._project_root is None:
             self._project_index = None
+            self._sidebar.set_project_index(None)
             return
         self._project_index = build_project_index(self._project_root)
+        self._sidebar.set_project_index(self._project_index)
 
     def _on_refresh_requested(self) -> None:
         # Trigger: user clicks Refresh (context menu) -> rescan synchronously.
@@ -475,14 +505,32 @@ class MainWindow(QMainWindow):
         self._rescan_project()
         self._reload_main_view()
         self._inspector.set_empty_state()
+        self._sync_primary_action()
 
     def _reload_main_view(self) -> None:
+        context = self._sidebar.current_context()
+        items: list[ViewItem] = []
+
+        # Projects context: show workspace discovery results (read-only).
+        if context == "Projects":
+            for proj in self._workspace_projects:
+                items.append(
+                    ViewItem(
+                        kind=ViewItemKind.PROJECT,
+                        name=proj.name,
+                        type_badge="project",
+                        path=proj.root,
+                        departments_count=None,
+                        ref=proj,
+                    )
+                )
+            self._main_view.set_empty_override(None if items else "No projects found in this workspace")
+            self._main_view.set_items(items)
+            return
+
         if self._project_index is None:
             self._main_view.clear()
             return
-
-        context = self._sidebar.currentItem().text() if self._sidebar.currentItem() else "Assets"
-        items: list[ViewItem] = []
 
         if context == "Assets":
             if self._entered_parent is None:
@@ -511,7 +559,7 @@ class MainWindow(QMainWindow):
                                 ref=dept,
                             )
                         )
-        else:  # Shots
+        elif context == "Shots":
             if self._entered_parent is None:
                 for shot in self._project_index.shots:
                     items.append(
@@ -538,6 +586,10 @@ class MainWindow(QMainWindow):
                                 ref=dept,
                             )
                         )
+        else:
+            self._main_view.clear()
+            self._main_view.set_empty_override(self._empty_message_for_context(context))
+            return
 
         # v1.1 clarity: if department list is empty, explain it inline (no warnings, no auto-creation).
         if self._project_root is not None and self._entered_parent is not None and len(items) == 0:
@@ -547,13 +599,18 @@ class MainWindow(QMainWindow):
             self._main_view.set_empty_override(None)
 
         self._main_view.set_items(items)
+        self._sidebar.set_project_index(self._project_index)
 
     def _on_item_activated(self, item: ViewItem) -> None:
         # Spec: Double click -> enter (asset/shot -> departments).
+        if item.kind == ViewItemKind.PROJECT:
+            # Explicit action: open/switch project by double-clicking a project card.
+            self._switch_project(str(item.path))
+            return
         if self._project_index is None:
             return
 
-        context = self._sidebar.currentItem().text() if self._sidebar.currentItem() else "Assets"
+        context = self._sidebar.current_context()
         if context == "Assets" and item.kind == ViewItemKind.ASSET and isinstance(item.ref, Asset):
             self._entered_parent = item.ref
             self._reload_main_view()
@@ -654,7 +711,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _app_settings_path() -> Path:
         repo_root = Path(__file__).resolve().parents[2]
-        return repo_root / "monostudio26" / "config" / "app_settings.json"
+        return repo_root / "monostudio_data" / "config" / "app_settings.json"
 
     def _restore_window_geometry(self) -> None:
         """
@@ -678,7 +735,7 @@ class MainWindow(QMainWindow):
                     restored = False
 
         if not restored:
-            # First launch / no saved geometry: open at >= minimum size.
+            # First launch / no saved geometry: default size.
             self.resize(1920, 1080)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -714,14 +771,16 @@ class MainWindow(QMainWindow):
         if self._entered_parent is not None:
             return
 
-        context = self._sidebar.currentItem().text() if self._sidebar.currentItem() else "Assets"
+        context = self._sidebar.current_context()
+        if context not in ("Assets", "Shots"):
+            return
         menu = QMenu(self)
         create_asset = None
         create_shot = None
 
         if context == "Assets":
             create_asset = menu.addAction("Create Asset…")
-        else:
+        elif context == "Shots":
             create_shot = menu.addAction("Create Shot…")
 
         chosen = menu.exec(global_pos)

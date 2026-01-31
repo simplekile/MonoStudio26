@@ -54,6 +54,7 @@ class InspectorPanel(QWidget):
         self._asset_absolute_path = QLineEdit()
         self._asset_absolute_path.setReadOnly(True)
         self._asset_absolute_path.setClearButtonEnabled(False)
+        self._asset_absolute_path.setProperty("mono", True)
         self._install_copy_full_path_menu(self._asset_absolute_path)
         self._asset_created_date = QLabel("")
         self._asset_last_modified = QLabel("")
@@ -80,11 +81,13 @@ class InspectorPanel(QWidget):
         self._dept_work_path = QLineEdit()
         self._dept_work_path.setReadOnly(True)
         self._dept_work_path.setClearButtonEnabled(False)
+        self._dept_work_path.setProperty("mono", True)
         self._install_copy_full_path_menu(self._dept_work_path)
 
         self._dept_publish_path = QLineEdit()
         self._dept_publish_path.setReadOnly(True)
         self._dept_publish_path.setClearButtonEnabled(False)
+        self._dept_publish_path.setProperty("mono", True)
         self._install_copy_full_path_menu(self._dept_publish_path)
 
         dept_form = QFormLayout()

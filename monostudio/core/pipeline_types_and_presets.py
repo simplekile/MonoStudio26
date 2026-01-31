@@ -20,7 +20,7 @@ class PipelineTypesAndPresets:
 
 def pipeline_root() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "monostudio26" / "pipeline"
+    return repo_root / "monostudio_data" / "pipeline"
 
 
 def pipeline_types_and_presets_path() -> Path:
