@@ -2,10 +2,12 @@
   "layout",
   "model",
   "rig",
-  "anim",
-  "fx",
-  "lighting",
+  "surfacing",
+  "grooming",
   "lookdev",
-  "comp"
+  "anim",
+  "lighting",
+  "comp",
+  "fx"
 ]
 

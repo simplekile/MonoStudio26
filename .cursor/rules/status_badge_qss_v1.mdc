@@ -1,0 +1,68 @@
+---
+description: Status badge rule (QSS + dynamic properties) for MONOS
+globs: monostudio/ui_qt/**/*
+alwaysApply: false
+---
+
+# MONOS — Status Badge Rule (v1)
+
+Use **one shared QSS badge style** and switch colors via a **dynamic property** (`status`) on a single `QLabel`.
+
+## QSS (Style Sheet)
+
+```css
+/* Base badge */
+QLabel#StatusBadge {
+  font-family: "Inter";
+  font-size: 10px;
+  font-weight: bold;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  /* Qt Widgets: simulate glass with rgba */
+  background-color: rgba(255, 255, 255, 100); /* prefer higher alpha for readability over thumbnails */
+}
+
+QLabel#StatusBadge[status="ready"] {
+  color: #10b981;
+  background-color: rgba(16, 185, 129, 100);
+  border: 1px solid rgba(16, 185, 129, 50);
+}
+QLabel#StatusBadge[status="progress"] {
+  color: #3b82f6;
+  background-color: rgba(59, 130, 246, 100);
+  border: 1px solid rgba(59, 130, 246, 50);
+}
+QLabel#StatusBadge[status="blocked"] {
+  color: #ef4444;
+  background-color: rgba(239, 68, 68, 100);
+  border: 1px solid rgba(239, 68, 68, 50);
+}
+QLabel#StatusBadge[status="waiting"] {
+  color: #71717a;
+  background-color: rgba(113, 113, 122, 100);
+  border: 1px solid rgba(113, 113, 122, 50);
+}
+```
+
+## Python usage (Qt Widgets)
+
+```python
+badge = QLabel(parent)
+badge.setObjectName("StatusBadge")
+
+# QSS can't do uppercase/tracking reliably
+badge.setText(status_text.upper())
+f = badge.font()
+f.setLetterSpacing(QFont.PercentageSpacing, 95)  # tracking-tighter
+badge.setFont(f)
+
+badge.setProperty("status", status_key)  # "ready"|"progress"|"blocked"|"waiting"
+badge.style().unpolish(badge)
+badge.style().polish(badge)
+```
+
+## Notes
+
+- Qt Widgets does **not** support true backdrop-blur over pixmaps; use rgba with higher alpha instead.
+- Keep this **read-only**: no dropdown/select in the Inspector by default.

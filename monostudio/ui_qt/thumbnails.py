@@ -24,7 +24,16 @@ class ThumbnailCache:
         self._cache: dict[str, _CachedPixmap] = {}
 
     def resolve_thumbnail_file(self, item_root: Path) -> Path | None:
-        # Spec: try thumbnail.png then thumbnail.jpg only.
+        # Spec (v1.2): prefer explicit user override, then auto/default.
+        # - User override: thumbnail.user.(png|jpg)
+        # - Auto/default:  thumbnail.(png|jpg)
+        user_png = item_root / "thumbnail.user.png"
+        if user_png.is_file():
+            return user_png
+        user_jpg = item_root / "thumbnail.user.jpg"
+        if user_jpg.is_file():
+            return user_jpg
+
         png = item_root / "thumbnail.png"
         if png.is_file():
             return png
@@ -32,6 +41,13 @@ class ThumbnailCache:
         if jpg.is_file():
             return jpg
         return None
+
+    def invalidate_file(self, file_path: Path) -> None:
+        # Best-effort; safe if missing.
+        try:
+            self._cache.pop(str(file_path), None)
+        except Exception:
+            pass
 
     def load_thumbnail_pixmap(self, file_path: Path) -> QPixmap | None:
         key = str(file_path)

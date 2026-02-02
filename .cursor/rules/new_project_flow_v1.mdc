@@ -1,0 +1,45 @@
+---
+description: New Project flow (safe) + automatic immutable Project ID generation
+globs: monostudio/ui_qt/new_project_dialog.py
+alwaysApply: false
+---
+
+# MONOS — New Project Flow (v1)
+
+Project creation is a **SAFE** operation. The flow must be clean, predictable, and future-proof for later role-based permissions.
+
+## Context
+
+- No user/role system yet: assume one trusted local user.
+- Architecture must allow adding permission checks later (Lead/Admin) without rewrites.
+
+## Dialog Inputs (only)
+
+Collect exactly:
+
+1. **Project Name** (required)
+   - Human-readable display name
+   - May contain spaces and mixed case
+2. **Start Date** (required)
+   - Calendar input
+
+Do **NOT** ask the user for:
+- Project ID
+- Folder name
+- Filesystem path (unless multiple roots are supported later)
+
+## Project ID generation (automatic, immutable)
+
+Project ID must be generated automatically at creation time and remain immutable afterward.
+
+Format:
+
+`YYMMDD_<SANITIZED_PROJECT_NAME>`
+
+Rules:
+- Use **created date (today)** for the prefix (NOT the start date).
+- Sanitize project name:
+  - trim leading/trailing whitespace
+  - collapse multiple spaces into a single underscore
+  - enforce machine-safe characters (lowercase, digits, underscore)
+

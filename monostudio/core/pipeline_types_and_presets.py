@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class DepartmentDef:
+    dept_id: str
+    name: str
+    short_name: str
+    icon_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -11,11 +19,13 @@ class TypeDef:
     name: str
     short_name: str
     departments: list[str]
+    icon_name: str | None = None
 
 
 @dataclass(frozen=True)
 class PipelineTypesAndPresets:
-    types: dict[str, TypeDef]
+    types: dict[str, TypeDef] = field(default_factory=dict)
+    departments: dict[str, DepartmentDef] = field(default_factory=dict)
 
 
 def pipeline_root() -> Path:
@@ -47,12 +57,25 @@ def ensure_pipeline_bootstrap() -> None:
         return
 
     payload = {
+        "departments": {
+            "layout": {"name": "Layout", "short_name": "lay", "icon_name": "layout-dashboard"},
+            "model": {"name": "Modeling", "short_name": "mdl", "icon_name": "box"},
+            "rig": {"name": "Rigging", "short_name": "rig", "icon_name": "bone"},
+            "surfacing": {"name": "Surfacing", "short_name": "surf", "icon_name": "palette"},
+            "grooming": {"name": "Grooming", "short_name": "grm", "icon_name": "scissors"},
+            "lookdev": {"name": "Lookdev", "short_name": "ldv", "icon_name": "sparkles"},
+            "anim": {"name": "Animation", "short_name": "anim", "icon_name": "clapperboard"},
+            "fx": {"name": "FX", "short_name": "fx", "icon_name": "zap"},
+            "lighting": {"name": "Lighting", "short_name": "lgt", "icon_name": "lightbulb"},
+            "comp": {"name": "Comp", "short_name": "comp", "icon_name": "sliders-horizontal"},
+        },
         "types": {
             # Shots (type_id == "shot" or "shot_*")
             "shot": {
                 "id": "shot",
                 "name": "Shot",
                 "short_name": "sh",
+                "icon_name": "clapperboard",
                 "departments": ["layout", "anim", "fx", "lighting"],
             },
             # Assets (any type_id not shot/shot_*)
@@ -60,19 +83,22 @@ def ensure_pipeline_bootstrap() -> None:
                 "id": "character",
                 "name": "Character",
                 "short_name": "char",
-                "departments": ["model", "rig", "anim"],
+                "icon_name": "user",
+                "departments": ["model", "rig", "surfacing", "grooming", "lookdev"],
             },
             "prop": {
                 "id": "prop",
                 "name": "Prop",
                 "short_name": "prop",
-                "departments": ["model"],
+                "icon_name": "package",
+                "departments": ["model", "surfacing", "grooming", "lookdev"],
             },
             "environment": {
                 "id": "environment",
                 "name": "Environment",
                 "short_name": "env",
-                "departments": ["layout", "model", "lighting"],
+                "icon_name": "trees",
+                "departments": ["layout", "model", "lighting", "lookdev"],
             },
         }
     }
@@ -88,16 +114,39 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return PipelineTypesAndPresets(types={})
+        return PipelineTypesAndPresets()
 
     if not isinstance(data, dict):
-        return PipelineTypesAndPresets(types={})
+        return PipelineTypesAndPresets()
+
+    depts_raw = data.get("departments")
+    out_depts: dict[str, DepartmentDef] = {}
+    if isinstance(depts_raw, dict):
+        for dept_id, node in depts_raw.items():
+            if not isinstance(dept_id, str) or not dept_id.strip():
+                continue
+            if not isinstance(node, dict):
+                continue
+            name = node.get("name")
+            short_name = node.get("short_name")
+            icon_name = node.get("icon_name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if not isinstance(short_name, str) or not short_name.strip():
+                continue
+            icon = icon_name.strip() if isinstance(icon_name, str) and icon_name.strip() else None
+            out_depts[dept_id] = DepartmentDef(
+                dept_id=dept_id,
+                name=name.strip(),
+                short_name=short_name.strip(),
+                icon_name=icon,
+            )
 
     types_raw = data.get("types")
     if not isinstance(types_raw, dict):
-        return PipelineTypesAndPresets(types={})
+        return PipelineTypesAndPresets(types={}, departments=out_depts)
 
-    out: dict[str, TypeDef] = {}
+    out_types: dict[str, TypeDef] = {}
     for type_id, node in types_raw.items():
         if not isinstance(type_id, str) or not type_id:
             continue
@@ -109,10 +158,12 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
             continue
         name = node.get("name")
         short_name = node.get("short_name")
+        icon_name = node.get("icon_name")
         if not isinstance(name, str) or not name.strip():
             continue
         if not isinstance(short_name, str) or not short_name.strip():
             continue
+        icon = icon_name.strip() if isinstance(icon_name, str) and icon_name.strip() else None
 
         # New schema: departments: [ ... ]
         # Back-compat: department_presets: { "Default": [ ... ], ... } -> pick "Default" if present, else first preset.
@@ -128,27 +179,52 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
                 if isinstance(chosen, list):
                     departments = [d for d in chosen if isinstance(d, str) and d.strip()]
 
-        out[type_id] = TypeDef(
+        out_types[type_id] = TypeDef(
             type_id=type_id,
             name=name.strip(),
             short_name=short_name.strip(),
             departments=departments,
+            icon_name=icon,
         )
 
-    return PipelineTypesAndPresets(types=out)
+    # Back-compat: if departments metadata is missing, synthesize minimal defs from observed department ids.
+    if not out_depts:
+        seen: set[str] = set()
+        for t in out_types.values():
+            for d in t.departments:
+                if isinstance(d, str) and d.strip() and d not in seen:
+                    seen.add(d)
+                    out_depts[d] = DepartmentDef(dept_id=d, name=d, short_name=d, icon_name=None)
+
+    return PipelineTypesAndPresets(types=out_types, departments=out_depts)
 
 
 def save_pipeline_types_and_presets(config: PipelineTypesAndPresets) -> bool:
     ensure_pipeline_bootstrap()
-    payload: dict = {"types": {}}
+    payload: dict = {"types": {}, "departments": {}}
+
+    depts_out: dict[str, dict] = {}
+    for dept_id, d in config.departments.items():
+        node: dict[str, object] = {
+            "name": d.name,
+            "short_name": d.short_name,
+        }
+        if d.icon_name:
+            node["icon_name"] = d.icon_name
+        depts_out[dept_id] = node
+    payload["departments"] = depts_out
+
     types_out: dict[str, dict] = {}
     for type_id, t in config.types.items():
-        types_out[type_id] = {
+        node: dict[str, object] = {
             "id": type_id,
             "name": t.name,
             "short_name": t.short_name,
             "departments": t.departments,
         }
+        if t.icon_name:
+            node["icon_name"] = t.icon_name
+        types_out[type_id] = node
     payload["types"] = types_out
 
     try:
@@ -166,21 +242,33 @@ def load_department_vocabulary() -> list[str]:
     """
     Pipeline vocabulary file (optional):
       monostudio26/pipeline/department_vocabulary.json
-    Missing/invalid => empty list (no vocabulary constraints).
+
+    If the file is missing/invalid/empty, fall back to departments defined in
+    types_and_presets.json (single source of truth).
     """
     ensure_pipeline_bootstrap()
     path = pipeline_department_vocabulary_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
+        data = None
     if not isinstance(data, list):
-        return []
+        data = None
     out: list[str] = []
     seen: set[str] = set()
-    for x in data:
-        if isinstance(x, str) and x.strip() and x not in seen:
-            seen.add(x)
-            out.append(x)
+    if isinstance(data, list):
+        for x in data:
+            if isinstance(x, str) and x.strip() and x not in seen:
+                seen.add(x)
+                out.append(x)
+    if out:
+        return out
+
+    # Fallback: departments metadata keys.
+    cfg = load_pipeline_types_and_presets()
+    for dept_id in sorted(cfg.departments.keys(), key=lambda s: str(s).lower()):
+        if isinstance(dept_id, str) and dept_id.strip() and dept_id not in seen:
+            seen.add(dept_id)
+            out.append(dept_id)
     return out
 

@@ -6,27 +6,26 @@ import logging
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt, QSettings
-from PySide6.QtGui import QAction, QActionGroup
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMenu, QMessageBox, QSplitter
+from PySide6.QtCore import QByteArray, Qt, QSettings, Signal
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QMessageBox, QSplitter, QVBoxLayout, QWidget
 
 from monostudio.core.fs_reader import build_project_index
-from monostudio.core.models import Asset, Department, ProjectIndex, Shot
-from monostudio.core.workspace_reader import DiscoveredProject, discover_projects
-from monostudio.core.pipeline_types_and_presets import ensure_pipeline_bootstrap
+from monostudio.core.models import Asset, ProjectIndex, Shot
+from monostudio.core.workspace_reader import DiscoveredProject, ProjectQuickStats, discover_projects, read_project_quick_stats
+from monostudio.core.project_create import create_new_project
+from monostudio.core.pipeline_types_and_presets import ensure_pipeline_bootstrap, load_pipeline_types_and_presets
+from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
-from monostudio.ui_qt.inspector import (
-    AssetShotInspectorData,
-    DepartmentInspectorData,
-    DepartmentStatusData,
-    InspectorPanel,
-)
+from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
 from monostudio.ui_qt.new_project_dialog import NewProjectDialog
 from monostudio.ui_qt.settings_dialog import SettingsDialog
 from monostudio.ui_qt.sidebar import Sidebar
+from monostudio.ui_qt.top_bar import TopBar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog
+from monostudio.ui_qt.app_controller import AppController
 
 
 class MainWindow(QMainWindow):
@@ -38,6 +37,9 @@ class MainWindow(QMainWindow):
     - No database
     """
 
+    departmentChanged = Signal(object)  # str | None
+    typeChanged = Signal(object)  # str | None
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("MONOS")
@@ -47,69 +49,197 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(640, 480)
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
+        repo_root = Path(__file__).resolve().parents[2]
+        self._controller = AppController(settings=self._settings, repo_root=repo_root, parent=self)
         self._workspace_root: Path | None = None
         self._workspace_projects: list[DiscoveredProject] = []
+        self._workspace_project_status: dict[str, str] = {}
 
         self._project_root: Path | None = None
         self._project_index: ProjectIndex | None = None
         self._entered_parent: Asset | Shot | None = None
 
+        # Centralized filter state (UI-only; no filtering engine yet)
+        self.current_department: str | None = None
+        self.current_type: str | None = None
+        meta = load_pipeline_types_and_presets()
+        self._type_name_by_id: dict[str, str] = {k: v.name for k, v in meta.types.items()}
+        # Type aliases allow robust matching against filesystem folder names:
+        # e.g. "environment" may appear as "env" or "Environment" in legacy projects.
+        self._type_aliases_by_id: dict[str, set[str]] = {}
+        for type_id, t in meta.types.items():
+            aliases_raw = [type_id, t.name, t.short_name]
+            aliases = {self._norm(a) for a in aliases_raw if isinstance(a, str) and a.strip()}
+            if aliases:
+                self._type_aliases_by_id[self._norm(type_id)] = aliases
+
         self._sidebar = Sidebar()
+        # Persist sidebar filter selections per page (assets/shots).
+        try:
+            self._sidebar.filters().set_settings(self._settings)
+        except Exception:
+            pass
         self._main_view = MainView()
         self._inspector = InspectorPanel()
         self._inspector.setMinimumWidth(240)
+        self._top_bar = TopBar(self)
+        self._clipboard_thumbs = ClipboardThumbnailHandler(parent=self)
 
-        self._build_menu()
+        # Topbar replaces the menu bar (no menus).
+        try:
+            self.menuBar().hide()
+        except Exception:
+            pass
         self._restore_workspace_root()
         self._restore_project_root()
         self._restore_window_geometry()
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._sidebar)
-        splitter.addWidget(self._main_view)
-        splitter.addWidget(self._inspector)
+        # L1: Main layout (horizontal) -> [Sidebar] + [Right container]
+        # L2: Right container (vertical) -> [Topbar] + [Main content]
+        right_container = QWidget(self)
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        right_layout.addWidget(self._top_bar, 0)
 
-        # Initial ratio: Sidebar 15%, Main 60%, Inspector 25% (when visible).
-        splitter.setStretchFactor(0, 15)
-        splitter.setStretchFactor(1, 60)
-        splitter.setStretchFactor(2, 25)
-        splitter.setSizes([256, 600, 250])
+        content_splitter = QSplitter(Qt.Horizontal)
+        content_splitter.setChildrenCollapsible(False)
+        content_splitter.addWidget(self._main_view)
+        content_splitter.addWidget(self._inspector)
+        content_splitter.setStretchFactor(0, 70)
+        content_splitter.setStretchFactor(1, 30)
+        content_splitter.setSizes([800, 320])
+        right_layout.addWidget(content_splitter, 1)
 
-        # Use splitter directly as the central widget
-        self.setCentralWidget(splitter)
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.addWidget(self._sidebar)
+        main_splitter.addWidget(right_container)
+        main_splitter.setStretchFactor(0, 20)
+        main_splitter.setStretchFactor(1, 80)
+        main_splitter.setSizes([256, 1100])
+
+        self.setCentralWidget(main_splitter)
 
         self._sidebar.context_changed.connect(self._on_context_switched)
         self._sidebar.context_clicked.connect(self._on_context_clicked)
         self._sidebar.context_menu_requested.connect(self._on_sidebar_context_menu_requested)
         self._sidebar.settings_requested.connect(self._open_settings)
+        # Metadata-driven filter sidebar (UI-only; wiring stub).
+        self._sidebar.filters().departmentClicked.connect(self._controller.on_department_clicked)
+        self._sidebar.filters().typeClicked.connect(self._controller.on_type_clicked)
+        self._controller.departmentChanged.connect(lambda v: self._set_current_department(v, toggle_if_same=False))
+        self._controller.typeChanged.connect(lambda v: self._set_current_type(v, toggle_if_same=False))
+        self._controller.departmentChanged.connect(lambda _v: self._main_view.set_active_department(self._controller.current_department))
+        self.departmentChanged.connect(self._on_filter_state_changed)
+        self.typeChanged.connect(self._on_filter_state_changed)
+        self._top_bar.project_switch_requested.connect(self._switch_project)
+        self._inspector.close_requested.connect(self._main_view.clear_selection)
+        self._inspector.paste_thumbnail_requested.connect(self._on_paste_thumbnail_requested)
         self._main_view.valid_selection_changed.connect(self._on_valid_selection_changed)
         self._main_view.item_activated.connect(self._on_item_activated)
         self._main_view.refresh_requested.connect(self._on_refresh_requested)
         self._main_view.root_context_menu_requested.connect(self._on_root_context_menu_requested)
         self._main_view.copy_inventory_requested.connect(self._on_copy_item_inventory_requested)
+
+        # Clipboard thumbnail overrides: refresh UI after successful paste.
+        self._clipboard_thumbs.thumbnailUpdated.connect(self._on_thumbnail_updated)
         self._main_view.delete_requested.connect(self._on_delete_requested)
         self._main_view.primary_action_requested.connect(self._on_primary_action_requested)
-        self._main_view.view_mode_changed.connect(self._sync_view_menu_checks)
 
         # Initial population is driven by project-root restore (scan trigger) and current context.
         self._reload_main_view()
-        self._inspector.set_empty_state()
+        self._inspector.set_item(None)
         self._sync_primary_action()
-        self._sync_view_menu_checks()
+        self._sync_top_bar()
+        self._sync_filter_state_from_sidebar()
 
-    def _sync_view_menu_checks(self) -> None:
-        if not hasattr(self, "_view_tile") or not hasattr(self, "_view_list"):
+    @staticmethod
+    def _norm(s: str | None) -> str:
+        return (s or "").strip().casefold()
+
+    def filter_assets(self, assets: list[Asset], department: str | None, type_id: str | None) -> list[Asset]:
+        """
+        AND-only filtering for assets.
+        - If department is None → allow all
+        - If type is None → allow all
+        - Asset must satisfy BOTH if both are set
+        """
+        out: list[Asset] = []
+        dept_key = self._norm(department) if department is not None else ""
+        type_key = self._norm(type_id) if type_id is not None else ""
+        type_aliases = self._type_aliases_by_id.get(type_key) if type_id is not None else None
+        if type_id is not None and not type_aliases:
+            # Fallback: match exact normalized id only.
+            type_aliases = {type_key}
+
+        for a in assets:
+            if type_id is not None:
+                asset_type_key = self._norm(a.asset_type)
+                if asset_type_key not in type_aliases:
+                    continue
+            if department is not None:
+                if not any(self._norm(d.name) == dept_key for d in a.departments):
+                    continue
+            out.append(a)
+        return out
+
+    # Filter click handlers now live in AppController.
+
+    def _on_filter_state_changed(self, _value=None) -> None:
+        # UI-only: rebuild grid/list from existing in-memory data (no rescans).
+        if self._sidebar.current_context() != "Assets":
             return
-        mode = getattr(self._main_view, "_view_mode", "tile")
-        self._view_tile.setChecked(mode == "tile")
-        self._view_list.setChecked(mode == "list")
+        if self._entered_parent is not None:
+            return
+        self._reload_main_view()
+
+    def _set_current_department(self, department, *, toggle_if_same: bool) -> None:
+        new = department if isinstance(department, str) and department.strip() else None
+        if toggle_if_same and new is not None and new == self.current_department:
+            new = None
+        if new == self.current_department:
+            return
+        self.current_department = new
+        self.departmentChanged.emit(new)
+
+    def _set_current_type(self, type_id, *, toggle_if_same: bool) -> None:
+        new = type_id if isinstance(type_id, str) and type_id.strip() else None
+        if toggle_if_same and new is not None and new == self.current_type:
+            new = None
+        if new == self.current_type:
+            return
+        self.current_type = new
+        self.typeChanged.emit(new)
+
+    def _sync_filter_state_from_sidebar(self) -> None:
+        """
+        Keep centralized filter state in sync with the SidebarWidget selection
+        when switching pages (Assets vs Shots) where SidebarWidget restores per-page state.
+        """
+        ctx = self._sidebar.current_context()
+        if ctx not in ("Assets", "Shots"):
+            self._set_current_department(None, toggle_if_same=False)
+            self._set_current_type(None, toggle_if_same=False)
+            return
+        filters = self._sidebar.filters()
+        self._controller.sync_filter_state(
+            department=filters.current_department(),
+            type_id=filters.current_type(),
+        )
+
+    def _current_type_name(self) -> str | None:
+        if self.current_type is None:
+            return None
+        key = self._norm(self.current_type)
+        # Prefer exact id match first, then normalized lookup fallback.
+        return self._type_name_by_id.get(self.current_type) or self._type_name_by_id.get(key) or self.current_type
 
     def _sync_primary_action(self) -> None:
         context = self._sidebar.current_context()
         if context == "Projects":
             enabled = self._workspace_root is not None
-            tooltip = None if enabled else "Open Workspace… to create a new project"
+            tooltip = None if enabled else "Open Workspace… in Settings → App → Workspace to create a new project"
             self._main_view.set_primary_action(label="New Project", enabled=enabled, tooltip=tooltip)
             self._main_view.set_browser_context("project")
             return
@@ -143,54 +273,17 @@ class MainWindow(QMainWindow):
             return
         return
 
-    def _build_menu(self) -> None:
-        # Minimal menu bar per requirement.
-        file_menu = self.menuBar().addMenu("File")
-
-        open_workspace_action = QAction("Open Workspace…", self)
-        open_workspace_action.triggered.connect(self._open_workspace)
-        file_menu.addAction(open_workspace_action)
-
-        self._new_project_action = QAction("New Project…", self)
-        self._new_project_action.setEnabled(False)
-        self._new_project_action.triggered.connect(self._new_project)
-        file_menu.addAction(self._new_project_action)
-
-        open_project_root_action = QAction("Open Project Root…", self)
-        open_project_root_action.triggered.connect(self._open_project_root)
-        file_menu.addAction(open_project_root_action)
-
-        tools_menu = self.menuBar().addMenu("Tools")
-        copy_inventory_action = QAction("Copy Project Inventory", self)
-        copy_inventory_action.triggered.connect(self._copy_project_inventory)
-        tools_menu.addAction(copy_inventory_action)
-
-        # Project switching via menu (no combo box).
-        self._project_menu = self.menuBar().addMenu("Project")
-        self._project_menu.aboutToShow.connect(self._rebuild_project_menu)
-
-        settings_menu = self.menuBar().addMenu("Settings")
-        open_settings = QAction("Settings…", self)
-        open_settings.triggered.connect(self._open_settings)
-        settings_menu.addAction(open_settings)
-
-        # View mode via menu (no combo box).
-        view_menu = self.menuBar().addMenu("View")
-        self._view_mode_group = QActionGroup(self)
-        self._view_mode_group.setExclusive(True)
-        self._view_tile = QAction("Grid", self, checkable=True)
-        self._view_list = QAction("List", self, checkable=True)
-        self._view_mode_group.addAction(self._view_tile)
-        self._view_mode_group.addAction(self._view_list)
-        self._view_tile.triggered.connect(lambda: self._main_view.set_view_mode("tile"))
-        self._view_list.triggered.connect(lambda: self._main_view.set_view_mode("list"))
-        view_menu.addAction(self._view_tile)
-        view_menu.addAction(self._view_list)
+    def _sync_top_bar(self) -> None:
+        self._top_bar.set_projects(
+            self._workspace_projects,
+            current_root=self._project_root,
+            status_by_root=self._workspace_project_status,
+        )
 
     def _copy_project_inventory(self) -> None:
         """
         v1.2 Candidate 3:
-        - Explicit trigger only (Tools menu)
+        - Explicit trigger only
         - Read-only: uses current in-memory project index ONLY
         - Writes clipboard ONLY (plain text)
         - Silent no-op on failure
@@ -291,6 +384,50 @@ class MainWindow(QMainWindow):
             self._copy_to_clipboard(self._inventory_text_item("Shot", item.ref.name, depts))
             return
 
+    def _on_paste_thumbnail_requested(self, item: object) -> None:
+        """
+        Explicit override only:
+        - Available only from Inspector thumbnail UI / preview context menu.
+        - Reads image from clipboard, normalizes, writes thumbnail.user.(png|jpg).
+        """
+        if not isinstance(item, ViewItem):
+            return
+        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+
+        kind = "asset" if item.kind == ViewItemKind.ASSET else "shot"
+        try:
+            # Use absolute path as a stable item id for refresh routing.
+            self._clipboard_thumbs.paste_thumbnail(item_root=item.path, kind=kind, item_id=str(item.path), fmt="png")
+        except Exception as e:
+            # Explicit error; do not crash app.
+            QMessageBox.critical(self, "Paste Thumbnail", str(e))
+            return
+
+        # Refresh Inspector + grid immediately.
+        self._inspector.refresh_thumbnail()
+        self._main_view.invalidate_thumbnail(item.path)
+
+    def _on_thumbnail_updated(self, item_id: object) -> None:
+        """
+        UI refresh hook for explicit thumbnail overrides.
+        Current convention: item_id is an absolute path string.
+        """
+        if not isinstance(item_id, str) or not item_id.strip():
+            return
+        try:
+            p = Path(item_id)
+        except Exception:
+            return
+        self._main_view.invalidate_thumbnail(p)
+        # If Inspector is currently showing this item, refresh it too.
+        try:
+            cur = self._main_view.selected_view_item()
+            if cur and cur.path == p:
+                self._inspector.refresh_thumbnail()
+        except Exception:
+            pass
+
     def _on_delete_requested(self, item: ViewItem) -> None:
         """
         Guarded delete (asset/shot only):
@@ -334,7 +471,7 @@ class MainWindow(QMainWindow):
 
         self._entered_parent = None
         self._reload_main_view()
-        self._inspector.set_empty_state()
+        self._inspector.set_item(None)
 
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)
@@ -344,30 +481,6 @@ class MainWindow(QMainWindow):
         path = self._settings.value("project/root", "", str)
         self._apply_project_root(path or None, save=False)
 
-    def _open_project_root(self) -> None:
-        start_dir = self._settings.value("project/root", "", str)
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Open Project Root",
-            start_dir or "",
-        )
-        if not folder:
-            return
-
-        self._apply_project_root(folder, save=True)
-
-    def _open_workspace(self) -> None:
-        start_dir = self._settings.value("workspace/root", "", str)
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Open Workspace",
-            start_dir or "",
-        )
-        if not folder:
-            return
-
-        self._apply_workspace_root(folder, save=True)
-
     def _on_context_switched(self, context_name: str) -> None:
         # Trigger: user switches between top-level contexts.
         self._main_view.set_context_title(context_name)
@@ -376,75 +489,46 @@ class MainWindow(QMainWindow):
             # Deterministic autoscan trigger (locked rule).
             self._rescan_project()
             self._reload_main_view()
+        elif context_name == "Projects":
+            # Projects browser: read-only workspace view (no project rescan).
+            self._reload_main_view()
         else:
             # Non-project-browser areas are placeholders (no scans, no side effects).
             self._main_view.clear()
             self._main_view.set_empty_override(self._empty_message_for_context(context_name))
-        self._inspector.set_empty_state()
+        self._inspector.set_item(None)
         self._sync_primary_action()
+        self._sync_filter_state_from_sidebar()
 
     def _on_context_clicked(self, context_name: str) -> None:
         # Spec: click reloads Main View. (No autoscan trigger unless it was a switch.)
         self._main_view.set_context_title(context_name)
         self._entered_parent = None
-        if context_name in ("Assets", "Shots"):
+        if context_name in ("Assets", "Shots", "Projects"):
             self._reload_main_view()
         else:
             self._main_view.clear()
             self._main_view.set_empty_override(self._empty_message_for_context(context_name))
-        self._inspector.set_empty_state()
+        self._inspector.set_item(None)
         self._sync_primary_action()
+        self._sync_filter_state_from_sidebar()
 
     def _empty_message_for_context(self, context_name: str) -> str:
         if context_name == "Projects":
             if self._workspace_root is None:
-                return "Open Workspace… to discover projects."
+                return "Open Workspace… in Settings → App → Workspace."
             if not self._workspace_projects:
                 return "No projects found in this workspace"
-            return "Use Project menu to switch projects."
+            return "Select a project using the project switcher in the top bar."
         return f"{context_name} is not available yet."
 
     def _on_valid_selection_changed(self, has_selection: bool) -> None:
         if not has_selection:
-            self._inspector.set_empty_state()
+            self._inspector.set_item(None)
             return
 
         selected = self._main_view.selected_view_item()
-        if selected is None:
-            self._inspector.set_empty_state()
-            return
-
-        # Phase 2a: derive from existing in-memory scan results only.
-        if selected.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
-            self._inspector.set_asset_shot(
-                AssetShotInspectorData(
-                    name=selected.name,
-                    type=selected.type_badge,
-                    absolute_path=str(selected.path),
-                    created_date="—",
-                    last_modified="—",
-                )
-            )
-            return
-
-        if selected.kind == ViewItemKind.DEPARTMENT and isinstance(selected.ref, Department):
-            dept = selected.ref
-            self._inspector.set_department(
-                DepartmentInspectorData(
-                    department_name=dept.name,
-                    work_path=str(dept.work_path),
-                    publish_path=str(dept.publish_path),
-                ),
-                DepartmentStatusData(
-                    work_exists="Yes" if dept.work_exists else "No",
-                    publish_exists="Yes" if dept.publish_exists else "No",
-                    latest_version=dept.latest_publish_version or "—",
-                    version_count=str(dept.publish_version_count),
-                ),
-            )
-            return
-
-        self._inspector.set_empty_state()
+        self._inspector.set_item(selected)
 
     def _apply_project_root(self, folder: str | None, *, save: bool) -> None:
         # No validation (per rules). Store path and reload UI.
@@ -452,6 +536,7 @@ class MainWindow(QMainWindow):
             self._settings.setValue("project/root", folder or "")
 
         self._project_root = Path(folder) if folder else None
+        self._controller.set_project_root(self._project_root)
         self._main_view.set_project_root(folder)
         self._main_view.set_empty_override(None)
 
@@ -467,10 +552,10 @@ class MainWindow(QMainWindow):
         self._sidebar.set_project_index(self._project_index)
 
         # After selecting a folder: keep layout stable, show neutral empty-state.
-        self._inspector.set_empty_state()
+        self._inspector.set_item(None)
 
-        self._sync_project_menu_title()
         self._sync_primary_action()
+        self._sync_top_bar()
 
     def _apply_workspace_root(self, folder: str | None, *, save: bool) -> None:
         # No validation. Read-only discovery.
@@ -479,7 +564,13 @@ class MainWindow(QMainWindow):
 
         self._workspace_root = Path(folder) if folder else None
         self._workspace_projects = discover_projects(self._workspace_root) if self._workspace_root else []
-        self._new_project_action.setEnabled(self._workspace_root is not None)
+        self._workspace_project_status = {}
+        for proj in self._workspace_projects:
+            try:
+                stats = read_project_quick_stats(proj.root)
+                self._workspace_project_status[str(proj.root)] = stats.status
+            except Exception:
+                continue
         self._sidebar.set_projects_count(len(self._workspace_projects) if self._workspace_root is not None else None)
 
         if not self._workspace_projects:
@@ -487,8 +578,8 @@ class MainWindow(QMainWindow):
         else:
             self._main_view.set_empty_override(None)
 
-        # Menu will reflect current state on open; also update title now.
-        self._sync_project_menu_title()
+        self._sync_primary_action()
+        self._sync_top_bar()
 
     def _rescan_project(self) -> None:
         # Autoscan must be deterministic and synchronous.
@@ -504,7 +595,7 @@ class MainWindow(QMainWindow):
         self._entered_parent = None
         self._rescan_project()
         self._reload_main_view()
-        self._inspector.set_empty_state()
+        self._inspector.set_item(None)
         self._sync_primary_action()
 
     def _reload_main_view(self) -> None:
@@ -514,6 +605,11 @@ class MainWindow(QMainWindow):
         # Projects context: show workspace discovery results (read-only).
         if context == "Projects":
             for proj in self._workspace_projects:
+                stats: ProjectQuickStats | None
+                try:
+                    stats = read_project_quick_stats(proj.root)
+                except Exception:
+                    stats = None
                 items.append(
                     ViewItem(
                         kind=ViewItemKind.PROJECT,
@@ -521,7 +617,7 @@ class MainWindow(QMainWindow):
                         type_badge="project",
                         path=proj.root,
                         departments_count=None,
-                        ref=proj,
+                        ref=stats,
                     )
                 )
             self._main_view.set_empty_override(None if items else "No projects found in this workspace")
@@ -533,104 +629,70 @@ class MainWindow(QMainWindow):
             return
 
         if context == "Assets":
-            if self._entered_parent is None:
-                for asset in self._project_index.assets:
-                    items.append(
-                        ViewItem(
-                            kind=ViewItemKind.ASSET,
-                            name=asset.name,
-                            type_badge=asset.asset_type,
-                            path=asset.path,
-                            departments_count=len(asset.departments),
-                            ref=asset,
-                        )
+            filtered_assets = self.filter_assets(
+                list(self._project_index.assets),
+                self.current_department,
+                self.current_type,
+            )
+            for asset in filtered_assets:
+                items.append(
+                    ViewItem(
+                        kind=ViewItemKind.ASSET,
+                        name=asset.name,
+                        type_badge=asset.asset_type,
+                        path=asset.path,
+                        departments_count=len(asset.departments),
+                        ref=asset,
                     )
-            else:
-                parent = self._entered_parent
-                if isinstance(parent, Asset):
-                    for dept in parent.departments:
-                        items.append(
-                            ViewItem(
-                                kind=ViewItemKind.DEPARTMENT,
-                                name=dept.name,
-                                type_badge="Department",
-                                path=dept.path,
-                                departments_count=None,
-                                ref=dept,
-                            )
-                        )
+                )
         elif context == "Shots":
-            if self._entered_parent is None:
-                for shot in self._project_index.shots:
-                    items.append(
-                        ViewItem(
-                            kind=ViewItemKind.SHOT,
-                            name=shot.name,
-                            type_badge="shot",
-                            path=shot.path,
-                            departments_count=len(shot.departments),
-                            ref=shot,
-                        )
+            for shot in self._project_index.shots:
+                items.append(
+                    ViewItem(
+                        kind=ViewItemKind.SHOT,
+                        name=shot.name,
+                        type_badge="shot",
+                        path=shot.path,
+                        departments_count=len(shot.departments),
+                        ref=shot,
                     )
-            else:
-                parent = self._entered_parent
-                if isinstance(parent, Shot):
-                    for dept in parent.departments:
-                        items.append(
-                            ViewItem(
-                                kind=ViewItemKind.DEPARTMENT,
-                                name=dept.name,
-                                type_badge="Department",
-                                path=dept.path,
-                                departments_count=None,
-                                ref=dept,
-                            )
-                        )
+                )
         else:
             self._main_view.clear()
             self._main_view.set_empty_override(self._empty_message_for_context(context))
             return
 
-        # v1.1 clarity: if department list is empty, explain it inline (no warnings, no auto-creation).
-        if self._project_root is not None and self._entered_parent is not None and len(items) == 0:
-            self._main_view.set_empty_override("Departments appear when folders exist on disk.")
-        elif self._project_root is not None:
+        if self._project_root is not None:
             # In a project, use default empty states unless overridden by other flows.
             self._main_view.set_empty_override(None)
+
+        # Header context: show active department inline with title.
+        if context in ("Assets", "Shots"):
+            self._main_view.set_active_department(self._controller.current_department)
+        else:
+            self._main_view.set_active_department(None)
 
         self._main_view.set_items(items)
         self._sidebar.set_project_index(self._project_index)
 
     def _on_item_activated(self, item: ViewItem) -> None:
-        # Spec: Double click -> enter (asset/shot -> departments).
+        # NOTE: "Enter departments" navigation has been removed.
+        # Double click / Enter will be repurposed by a different function later.
         if item.kind == ViewItemKind.PROJECT:
             # Explicit action: open/switch project by double-clicking a project card.
             self._switch_project(str(item.path))
             return
-        if self._project_index is None:
+        if item.kind == ViewItemKind.ASSET and isinstance(item.ref, Asset):
+            dept = self._controller.current_department
+            if dept is None:
+                QMessageBox.information(self, "Open DCC", "Select a Department filter first.")
+                return
+            try:
+                self._controller.handle_department_activated(asset=item.ref, department=dept)
+            except Exception as e:
+                QMessageBox.critical(self, "Open DCC", str(e))
             return
-
-        context = self._sidebar.current_context()
-        if context == "Assets" and item.kind == ViewItemKind.ASSET and isinstance(item.ref, Asset):
-            self._entered_parent = item.ref
-            self._reload_main_view()
-            self._inspector.set_empty_state()
-            return
-
-        if context == "Shots" and item.kind == ViewItemKind.SHOT and isinstance(item.ref, Shot):
-            self._entered_parent = item.ref
-            self._reload_main_view()
-            self._inspector.set_empty_state()
-            return
-
-    def _sync_project_menu_title(self) -> None:
-        # Keep it short and stable.
-        if not hasattr(self, "_project_menu"):
-            return
-        if self._project_root is None:
-            self._project_menu.setTitle("Project")
-            return
-        self._project_menu.setTitle(f"Project: {self._project_root.name}")
+        return
 
     def _new_project(self) -> None:
         if self._workspace_root is None:
@@ -640,33 +702,14 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return
 
-        name = dialog.project_name()
-        location = dialog.location_dir()
-
-        # Minimal, explicit safety: prevent path traversal / separators.
-        if any(ch in name for ch in ("/", "\\", ":", "\n", "\r", "\t")):
-            QMessageBox.critical(self, "New Project", "Invalid project name.")
-            return
-
-        if not location.is_dir():
-            QMessageBox.critical(self, "New Project", "Location folder does not exist.")
-            return
-
-        project_root = location / name
-        if project_root.exists():
-            QMessageBox.critical(self, "New Project", "Target project folder already exists.")
-            return
+        display_name = dialog.project_name()
+        start_date = dialog.start_date_iso()
 
         try:
-            # Create only inside the new project folder.
-            (project_root / "assets").mkdir(parents=True, exist_ok=False)
-            (project_root / "shots").mkdir(parents=True, exist_ok=False)
-            monostudio_dir = project_root / ".monostudio"
-            monostudio_dir.mkdir(parents=True, exist_ok=False)
-            manifest = monostudio_dir / "project.json"
-            manifest.write_text(
-                json.dumps({"name": name, "schema": 1}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            created = create_new_project(
+                workspace_root=self._workspace_root,
+                display_name=display_name,
+                start_date=start_date,
             )
         except FileExistsError:
             QMessageBox.critical(self, "New Project", "Target project folder already exists.")
@@ -674,39 +717,40 @@ class MainWindow(QMainWindow):
         except OSError:
             QMessageBox.critical(self, "New Project", "Failed to create project.")
             return
-
-        # Do NOT rescan workspace from scratch; append to existing list.
-        created = DiscoveredProject(name=name, root=project_root)
-        self._workspace_projects.append(created)
-        # Auto-switch to new project (sets project/root, triggers existing autoscan, resets Inspector).
-        self._apply_project_root(str(project_root), save=True)
-
-    def _rebuild_project_menu(self) -> None:
-        # Rebuild dynamically when menu opens (no background work).
-        self._project_menu.clear()
-        self._sync_project_menu_title()
-
-        if not self._workspace_projects:
-            empty = QAction("No projects", self)
-            empty.setEnabled(False)
-            self._project_menu.addAction(empty)
+        except Exception:
+            QMessageBox.critical(self, "New Project", "Failed to create project.")
             return
 
-        group = QActionGroup(self._project_menu)
-        group.setExclusive(True)
-        current = str(self._project_root) if self._project_root else None
-
-        for proj in self._workspace_projects:
-            act = QAction(proj.name, self._project_menu, checkable=True)
-            act.setData(str(proj.root))
-            act.setChecked(current == str(proj.root))
-            act.triggered.connect(lambda checked=False, p=str(proj.root): self._switch_project(p))
-            group.addAction(act)
-            self._project_menu.addAction(act)
+        # Do NOT rescan workspace from scratch; append to existing list.
+        discovered = DiscoveredProject(name=created.display_name, root=created.root)
+        self._workspace_projects.append(discovered)
+        # Auto-switch to new project (sets project/root, triggers existing autoscan, resets Inspector).
+        self._apply_project_root(str(created.root), save=True)
 
     def _open_settings(self) -> None:
-        dialog = SettingsDialog(parent=self)
+        dialog = SettingsDialog(workspace_root=self._workspace_root, project_root=self._project_root, parent=self)
+        dialog.workspace_root_selected.connect(lambda p: self._apply_workspace_root(p, save=True))
+        dialog.project_root_selected.connect(lambda p: self._apply_project_root(p, save=True))
         dialog.exec()
+
+        renamed_to = dialog.project_root_renamed_to()
+        if renamed_to is None:
+            return
+
+        old = self._project_root
+        # Switch project to renamed root (explicit, no background work).
+        self._apply_project_root(str(renamed_to), save=True)
+
+        # Update in-memory workspace project list (best-effort).
+        if old is not None:
+            updated: list[DiscoveredProject] = []
+            for p in self._workspace_projects:
+                if p.root == old:
+                    updated.append(DiscoveredProject(name=p.name, root=renamed_to))
+                else:
+                    updated.append(p)
+            self._workspace_projects = updated
+            self._sync_top_bar()
 
     @staticmethod
     def _app_settings_path() -> Path:
@@ -758,7 +802,7 @@ class MainWindow(QMainWindow):
         if not project_root:
             return
         self._apply_project_root(project_root, save=True)
-        self._sync_project_menu_title()
+        self._sync_top_bar()
 
     def _on_root_context_menu_requested(self, global_pos) -> None:
         # Entry points (context menu only):
@@ -852,7 +896,7 @@ class MainWindow(QMainWindow):
         self._entered_parent = None
         self._rescan_project()
         self._reload_main_view()
-        self._inspector.set_empty_state()
+        self._inspector.set_item(None)
 
     def _create_shot(self) -> None:
         if self._project_root is None:
@@ -900,5 +944,5 @@ class MainWindow(QMainWindow):
         self._entered_parent = None
         self._rescan_project()
         self._reload_main_view()
-        self._inspector.set_empty_state()
+        self._inspector.set_item(None)
 

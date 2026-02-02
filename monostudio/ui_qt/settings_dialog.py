@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QRegularExpression
+from PySide6.QtCore import Qt, QRegularExpression, Signal
 from PySide6.QtGui import QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -30,6 +33,7 @@ from monostudio.core.pipeline_types_and_presets import (
     load_pipeline_types_and_presets,
     save_pipeline_types_and_presets,
 )
+from monostudio.ui_qt.force_rename_project_id_dialog import ForceRenameProjectIdDialog
 
 
 def _is_valid_type_id(type_id: str) -> bool:
@@ -55,6 +59,7 @@ class SettingsDialog(QDialog):
     Settings UI (REQUIRED STRUCTURE):
       Settings
         - App
+          - Workspace
           - UI (placeholder)
           - Behavior (placeholder)
         - Pipeline
@@ -64,10 +69,17 @@ class SettingsDialog(QDialog):
           - Integrations (placeholder)
     """
 
-    def __init__(self, parent=None) -> None:
+    workspace_root_selected = Signal(str)
+    project_root_selected = Signal(str)
+
+    def __init__(self, *, workspace_root: Path | None = None, project_root: Path | None = None, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
+
+        self._workspace_root = workspace_root
+        self._project_root = project_root
+        self._project_root_renamed_to: Path | None = None
 
         self._vocab = load_department_vocabulary()
         self._vocab_set = set(self._vocab)
@@ -103,10 +115,74 @@ class SettingsDialog(QDialog):
         layout.setSpacing(12)
 
         tabs = QTabWidget()
+        tabs.addTab(self._build_app_workspace_tab(), "Workspace")
         tabs.addTab(self._placeholder("App → UI (placeholder)"), "UI")
         tabs.addTab(self._placeholder("App → Behavior (placeholder)"), "Behavior")
         layout.addWidget(tabs)
         return root
+
+    def _build_app_workspace_tab(self) -> QWidget:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        grp = QGroupBox("Workspace & Project")
+        form = QFormLayout(grp)
+        form.setContentsMargins(12, 12, 12, 12)
+        form.setSpacing(10)
+
+        self._workspace_path = QLineEdit(str(self._workspace_root) if self._workspace_root else "", self)
+        self._workspace_path.setReadOnly(True)
+        self._workspace_path.setProperty("mono", True)
+
+        btn_workspace = QPushButton("Open Workspace…", self)
+        btn_workspace.clicked.connect(self._pick_workspace_root)
+
+        row_ws = QWidget(self)
+        row_ws_l = QHBoxLayout(row_ws)
+        row_ws_l.setContentsMargins(0, 0, 0, 0)
+        row_ws_l.setSpacing(8)
+        row_ws_l.addWidget(self._workspace_path, 1)
+        row_ws_l.addWidget(btn_workspace, 0)
+        form.addRow("Workspace Root", row_ws)
+
+        self._project_path = QLineEdit(str(self._project_root) if self._project_root else "", self)
+        self._project_path.setReadOnly(True)
+        self._project_path.setProperty("mono", True)
+
+        btn_project = QPushButton("Open Project Root…", self)
+        btn_project.clicked.connect(self._pick_project_root)
+
+        row_prj = QWidget(self)
+        row_prj_l = QHBoxLayout(row_prj)
+        row_prj_l.setContentsMargins(0, 0, 0, 0)
+        row_prj_l.setSpacing(8)
+        row_prj_l.addWidget(self._project_path, 1)
+        row_prj_l.addWidget(btn_project, 0)
+        form.addRow("Project Root", row_prj)
+
+        layout.addWidget(grp)
+        layout.addStretch(1)
+        return root
+
+    def _pick_workspace_root(self) -> None:
+        start = str(self._workspace_root) if self._workspace_root else ""
+        folder = QFileDialog.getExistingDirectory(self, "Open Workspace", start)
+        if not folder:
+            return
+        self._workspace_root = Path(folder)
+        self._workspace_path.setText(folder)
+        self.workspace_root_selected.emit(folder)
+
+    def _pick_project_root(self) -> None:
+        start = str(self._project_root) if self._project_root else ""
+        folder = QFileDialog.getExistingDirectory(self, "Open Project Root", start)
+        if not folder:
+            return
+        self._project_root = Path(folder)
+        self._project_path.setText(folder)
+        self.project_root_selected.emit(folder)
 
     def _build_pipeline_tab(self) -> QWidget:
         root = QWidget()
@@ -128,8 +204,53 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(self._placeholder("Project → Overview (placeholder)"), "Overview")
         tabs.addTab(self._placeholder("Project → Integrations (placeholder)"), "Integrations")
+        tabs.addTab(self._build_project_advanced_tab(), "Advanced")
         layout.addWidget(tabs)
         return root
+
+    def _build_project_advanced_tab(self) -> QWidget:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        title = QLabel("Advanced (dangerous)")
+        title.setStyleSheet("font-weight: 700;")
+        desc = QLabel(
+            "Force Rename Project ID is a migration-level operation.\n"
+            "It can break external references and cached data.\n"
+            "Use only when you understand the impact."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #A1A1AA;")
+
+        btn = QPushButton("⚠️ Force Rename Project ID…")
+        btn.setEnabled(self._project_root is not None)
+        if self._project_root is None:
+            btn.setToolTip("Select a project to use advanced operations.")
+        btn.clicked.connect(self._open_force_rename_project_id)
+
+        layout.addWidget(title, 0)
+        layout.addWidget(desc, 0)
+        layout.addWidget(btn, 0)
+        layout.addStretch(1)
+        return root
+
+    def _open_force_rename_project_id(self) -> None:
+        if self._project_root is None:
+            return
+        dlg = ForceRenameProjectIdDialog(project_root=self._project_root, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        renamed_to = dlg.renamed_to()
+        if renamed_to is None:
+            return
+        # Persist result for caller (MainWindow) to refresh state.
+        self._project_root_renamed_to = renamed_to
+        self._project_root = renamed_to
+
+    def project_root_renamed_to(self) -> Path | None:
+        return self._project_root_renamed_to
 
     @staticmethod
     def _placeholder(text: str) -> QWidget:
@@ -313,7 +434,13 @@ class SettingsDialog(QDialog):
             short = type_short_field.text().strip()
             if not name or not short:
                 return
-            self._config.types[tid] = TypeDef(type_id=tid, name=name, short_name=short, departments=t.departments)
+            self._config.types[tid] = TypeDef(
+                type_id=tid,
+                name=name,
+                short_name=short,
+                departments=t.departments,
+                icon_name=t.icon_name,
+            )
             refresh_types(select=tid)
 
         def on_create_type() -> None:
@@ -339,7 +466,7 @@ class SettingsDialog(QDialog):
             short = (short or "").strip()
             if not short:
                 return
-            self._config.types[type_id] = TypeDef(type_id=type_id, name=name, short_name=short, departments=[])
+            self._config.types[type_id] = TypeDef(type_id=type_id, name=name, short_name=short, departments=[], icon_name=None)
             refresh_types(select=type_id)
 
         def on_delete_type() -> None:
@@ -377,7 +504,13 @@ class SettingsDialog(QDialog):
             if t is None:
                 return
             selected = [d for d, cb in dept_checkboxes.items() if cb.isChecked() and d in self._vocab_set]
-            self._config.types[tid] = TypeDef(type_id=tid, name=t.name, short_name=t.short_name, departments=selected)
+            self._config.types[tid] = TypeDef(
+                type_id=tid,
+                name=t.name,
+                short_name=t.short_name,
+                departments=selected,
+                icon_name=t.icon_name,
+            )
 
         # wiring
         types_list.currentItemChanged.connect(lambda _c, _p: on_type_selected())

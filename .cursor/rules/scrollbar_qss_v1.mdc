@@ -1,0 +1,42 @@
+---
+description: MONOS scrollbar QSS (dark/minimal/DPI-safe) for all scrollbars
+alwaysApply: true
+---
+
+# MONOS Scrollbar QSS (Dark · Minimal · DPI-safe)
+
+## Principles
+- Scrollbar là **tool**, không phải UI element
+- **No arrows**
+- **Hover** mới hiện rõ hơn
+- Không chiếm thị giác, hợp nền dark `#121214` → `#1b1b1b`
+- DPI-safe ở 100%–200% (width/height **8px**, min handle **28px**)
+
+## Required implementation (global)
+- **Luôn** style scrollbar bằng **global app stylesheet** (vd `monostudio/ui_qt/style.py`), không viết QSS rải rác theo widget.
+- **Luôn** kèm cleanup cho `QAbstractScrollArea` để tránh viền/khung mặc định của Qt.
+
+```css
+/* ScrollArea / Viewport cleanup */
+QAbstractScrollArea { background: transparent; border: none; }
+QAbstractScrollArea::corner { background: transparent; }
+
+/* Vertical */
+QScrollBar:vertical { background: transparent; width: 8px; margin: 0px; }
+QScrollBar::handle:vertical { background: rgba(255,255,255,0.22); min-height: 28px; border-radius: 4px; }
+QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.45); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; width: 0px; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+
+/* Horizontal */
+QScrollBar:horizontal { background: transparent; height: 8px; margin: 0px; }
+QScrollBar::handle:horizontal { background: rgba(255,255,255,0.22); min-width: 28px; border-radius: 4px; }
+QScrollBar::handle:horizontal:hover { background: rgba(255,255,255,0.45); }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { height: 0px; width: 0px; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
+```
+
+## Optional variant (“Ultra-subtle”)
+- Nếu scrollbar vẫn hơi nổi, giảm alpha handle:
+  - `0.22 → 0.16`
+  - `0.45 → 0.38`

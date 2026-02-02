@@ -2,26 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (
-    QDialog,
-    QDialogButtonBox,
-    QFileDialog,
-    QFormLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtCore import QDate, Qt
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QVBoxLayout
+
+from monostudio.core.project_id import generate_project_id
 
 
 class NewProjectDialog(QDialog):
     """
-    Minimal dialog:
-    - Project Name (required)
-    - Location (default workspace root, changeable via folder picker)
+    New Project (MONOS v1):
+    - Project Name (required, display name)
+    - Start Date (required)
+    - Project ID is auto-generated (read-only) and immutable after creation
     """
 
     def __init__(self, workspace_root: Path, parent=None) -> None:
@@ -29,31 +22,40 @@ class NewProjectDialog(QDialog):
         self.setWindowTitle("New Project")
         self.setModal(True)
 
-        self._location = workspace_root
+        self._workspace_root = workspace_root
 
         self._name = QLineEdit()
-        self._name.setPlaceholderText("e.g. Project_ForestSpirit")
+        self._name.setPlaceholderText("e.g. Forest Spirit")
         self._name.textChanged.connect(self._update_ok_enabled)
+        self._name.textChanged.connect(self._sync_preview)
 
-        self._location_label = QLabel(str(self._location))
-        self._location_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._start_date = QDateEdit(self)
+        self._start_date.setCalendarPopup(True)
+        self._start_date.setDate(QDate.currentDate())
+        self._start_date.dateChanged.connect(lambda _d: self._update_ok_enabled())
 
-        self._browse = QPushButton("Browse…")
-        self._browse.clicked.connect(self._browse_location)
+        self._project_id_preview = QLineEdit("")
+        self._project_id_preview.setReadOnly(True)
+        self._project_id_preview.setProperty("mono", True)
+        f = QFont(self._project_id_preview.font())
+        f.setLetterSpacing(QFont.PercentageSpacing, 97)
+        self._project_id_preview.setFont(f)
 
-        location_row = QWidget()
-        location_layout = QHBoxLayout(location_row)
-        location_layout.setContentsMargins(0, 0, 0, 0)
-        location_layout.setSpacing(10)
-        location_layout.addWidget(self._location_label, 1)
-        location_layout.addWidget(self._browse, 0)
+        self._workspace_label = QLabel(str(self._workspace_root))
+        self._workspace_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._workspace_label.setStyleSheet("color: #71717a;")
+
+        workspace_hint = QLabel("Workspace Root (fixed)")
+        workspace_hint.setStyleSheet("color: #71717a; font-size: 11px;")
 
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(10)
         form.addRow("Project Name", self._name)
-        form.addRow("Location", location_row)
+        form.addRow("Start Date", self._start_date)
+        form.addRow("Project ID (auto)", self._project_id_preview)
+        form.addRow(workspace_hint, self._workspace_label)
 
         self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self._buttons.accepted.connect(self.accept)
@@ -65,28 +67,28 @@ class NewProjectDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(self._buttons)
 
+        self._sync_preview()
         self._update_ok_enabled()
 
     def project_name(self) -> str:
         return self._name.text().strip()
 
-    def location_dir(self) -> Path:
-        return self._location
+    def start_date_iso(self) -> str:
+        # YYYY-MM-DD
+        d = self._start_date.date()
+        return f"{d.year():04d}-{d.month():02d}-{d.day():02d}"
 
-    def _browse_location(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(
-            self,
-            "Choose Location",
-            str(self._location),
-        )
-        if not chosen:
-            return
-        self._location = Path(chosen)
-        self._location_label.setText(str(self._location))
+    def project_id(self) -> str:
+        # Created date is today (not start date) per spec.
+        return generate_project_id(self.project_name())
 
     def _update_ok_enabled(self) -> None:
         ok = self._buttons.button(QDialogButtonBox.Ok)
         if ok is None:
             return
-        ok.setEnabled(bool(self.project_name()))
+        ok.setEnabled(bool(self.project_name()) and bool(self.start_date_iso()))
+
+    def _sync_preview(self) -> None:
+        name = self.project_name()
+        self._project_id_preview.setText(generate_project_id(name) if name else "")
 

@@ -1,0 +1,71 @@
+---
+description: Advanced operation: Force Rename Project ID (dangerous, migration-level)
+globs: monostudio/**/*
+alwaysApply: false
+---
+
+# MONOS — Force Rename Project ID (Advanced / Dangerous) (v1)
+
+This feature **renames the project root folder (Project ID)**. Treat as a **migration-level** action with **risk assessment** and **explicit confirmation**.
+
+## Non‑negotiables
+
+- **Project Name** (display) is editable/safe; **Project ID** (folder name) is normally immutable.
+- **Force Rename Project ID…** exists only as an explicit override with warnings.
+- No React/QML. No inline edits inside Inspector. No silent operations.
+- No auto-fixing external DCC references.
+- If any step fails: **abort safely** (no partial rename state).
+
+## Entry point (UI)
+
+- Location: **Project Settings → Advanced → ⚠️ Force Rename Project ID…**
+- Not exposed in main toolbar, quick actions, or context menus.
+
+## Risk assessment (data-driven, cannot override)
+
+Compute metrics before enabling action:
+- `asset_count`
+- `shot_count`
+- `total_publish_versions`
+- `has_external_references` (best-effort heuristic; may be Unknown)
+
+Derive `risk_level`:
+- **SAFE**: 0 assets AND 0 shots
+- **MEDIUM**: assets/shots exist AND 0 publish versions
+- **HIGH**: any publish versions exist
+- **CRITICAL**: external references detected OR evaluation is Unknown/unsafe
+
+## Dialog spec
+
+Title: `⚠️ Force Rename Project ID`
+
+Fields:
+- Current Project ID (read-only, monospace)
+- New Project ID (default: current date + sanitized project name; user editable)
+- Impact Analysis: Assets / Shots / Publish versions / External references (Yes/No/Unknown)
+- Risk Level with semantic color (Green/Amber/Orange/Red)
+
+Confirmations:
+- Checkbox: “I understand this may break references and cached data”
+- Text confirm: user must type CURRENT Project ID exactly
+- Force Rename disabled until both satisfied
+
+## Implementation outline (Qt / Python)
+
+- Provide a future hook (no-op for now): `can_force_rename_project() -> bool`
+- Steps (transactional mindset):
+  1. Compute metrics + risk level (block if CRITICAL unless user completes confirmations).
+  2. Preflight: target path must not exist; paths must be safe folder names.
+  3. Perform rename: `old_root.rename(new_root)` (atomic on same volume best-effort).
+  4. Update internal metadata references (project files that store project root/id, if any).
+  5. Refresh workspace/project selection to new root.
+  6. On any exception: abort; if rename already happened and metadata update fails, attempt rollback rename back to old root.
+
+## Logging (required)
+
+Append to a **project-level log file** (local):
+- `from_project_id`, `to_project_id`, `risk_level`, `timestamp`
+- `asset_count`, `shot_count`, `publish_version_count`, `external_refs` (Yes/No/Unknown)
+
+Keep logs deterministic and append-only.
+
