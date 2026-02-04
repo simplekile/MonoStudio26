@@ -1,45 +1,105 @@
 {
-  "departments": {
-    "layout": { "name": "Layout", "short_name": "lay", "icon_name": "layout-dashboard" },
-    "model": { "name": "Modeling", "short_name": "mdl", "icon_name": "box" },
-    "rig": { "name": "Rigging", "short_name": "rig", "icon_name": "bone" },
-    "surfacing": { "name": "Surfacing", "short_name": "surf", "icon_name": "palette" },
-    "grooming": { "name": "Grooming", "short_name": "grm", "icon_name": "scissors" },
-    "lookdev": { "name": "Lookdev", "short_name": "ldv", "icon_name": "sparkles" },
-    "anim": { "name": "Animation", "short_name": "anim", "icon_name": "clapperboard" },
-    "fx": { "name": "FX", "short_name": "fx", "icon_name": "zap" },
-    "lighting": { "name": "Lighting", "short_name": "lgt", "icon_name": "lightbulb" },
-    "comp": { "name": "Comp", "short_name": "comp", "icon_name": "sliders-horizontal" }
-  },
   "types": {
     "shot": {
       "id": "shot",
       "name": "Shot",
       "short_name": "sh",
-      "icon_name": "clapperboard",
-      "departments": ["layout", "anim", "fx", "lighting"]
+      "departments": [
+        "layout",
+        "anim",
+        "fx",
+        "lighting"
+      ],
+      "icon_name": "clapperboard"
     },
     "character": {
-      "id": "character",
+      "id": "_characters",
       "name": "Character",
       "short_name": "char",
-      "icon_name": "user",
-      "departments": ["model", "rig", "surfacing", "grooming", "lookdev"]
+      "departments": [
+        "model",
+        "rig",
+        "surfacing",
+        "grooming",
+        "lookdev"
+      ],
+      "icon_name": "user"
     },
     "prop": {
-      "id": "prop",
+      "id": "_props",
       "name": "Prop",
       "short_name": "prop",
-      "icon_name": "package",
-      "departments": ["model", "surfacing", "grooming", "lookdev"]
+      "departments": [
+        "model",
+        "surfacing",
+        "grooming",
+        "lookdev"
+      ],
+      "icon_name": "package"
     },
     "environment": {
-      "id": "environment",
+      "id": "_environment",
       "name": "Environment",
       "short_name": "env",
-      "icon_name": "trees",
-      "departments": ["layout", "model", "lighting", "lookdev"]
+      "departments": [
+        "layout",
+        "model",
+        "lighting",
+        "lookdev"
+      ],
+      "icon_name": "trees"
+    }
+  },
+  "departments": {
+    "layout": {
+      "name": "Layout",
+      "short_name": "lay",
+      "icon_name": "layout-dashboard"
+    },
+    "model": {
+      "name": "Modeling",
+      "short_name": "mdl",
+      "icon_name": "box"
+    },
+    "rig": {
+      "name": "Rigging",
+      "short_name": "rig",
+      "icon_name": "bone"
+    },
+    "surfacing": {
+      "name": "Surfacing",
+      "short_name": "surf",
+      "icon_name": "palette"
+    },
+    "grooming": {
+      "name": "Grooming",
+      "short_name": "grm",
+      "icon_name": "scissors"
+    },
+    "lookdev": {
+      "name": "Lookdev",
+      "short_name": "ldv",
+      "icon_name": "sparkles"
+    },
+    "anim": {
+      "name": "Animation",
+      "short_name": "anim",
+      "icon_name": "clapperboard"
+    },
+    "fx": {
+      "name": "FX",
+      "short_name": "fx",
+      "icon_name": "zap"
+    },
+    "lighting": {
+      "name": "Lighting",
+      "short_name": "lgt",
+      "icon_name": "lightbulb"
+    },
+    "comp": {
+      "name": "Comp",
+      "short_name": "comp",
+      "icon_name": "sliders-horizontal"
     }
   }
 }
-

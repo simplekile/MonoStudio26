@@ -10,7 +10,6 @@ from PySide6.QtCore import Qt, QTimer, QRegularExpression
 from PySide6.QtGui import QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QCheckBox,
-    QDialog,
     QDialogButtonBox,
     QFormLayout,
     QGroupBox,
@@ -26,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.project_risk import ExternalReferencesStatus, ProjectRenameImpact, RiskLevel, assess_force_rename_project_id
 from monostudio.core.project_rename import force_rename_project_id
-from monostudio.ui_qt.style import MONOS_COLORS
+from monostudio.ui_qt.style import MonosDialog, monos_font
 
 
 _SAFE_ID_RE = re.compile(r"^[a-z0-9_]+$")
@@ -79,9 +78,9 @@ class _ImpactRow(QWidget):
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(8)
         self._k = QLabel(label, self)
-        self._k.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
+        self._k.setObjectName("DialogLabelMeta")
         self._v = QLabel("—", self)
-        self._v.setStyleSheet(f"color: {MONOS_COLORS['text_primary']};")
+        self._v.setObjectName("DialogLabelPrimary")
         l.addWidget(self._k, 1)
         l.addWidget(self._v, 0, Qt.AlignRight)
 
@@ -89,7 +88,7 @@ class _ImpactRow(QWidget):
         self._v.setText(text or "—")
 
 
-class ForceRenameProjectIdDialog(QDialog):
+class ForceRenameProjectIdDialog(MonosDialog):
     """
     UI-only dialog for the dangerous operation: Force Rename Project ID.
     (The actual rename execution is handled elsewhere.)
@@ -127,8 +126,7 @@ class ForceRenameProjectIdDialog(QDialog):
 
         self._risk_badge = QLabel("—", self)
         self._risk_badge.setObjectName("RiskBadge")
-        f = QFont("Inter", 10)
-        f.setWeight(QFont.Weight.Bold)
+        f = monos_font("Inter", 10, QFont.Weight.Bold)
         f.setLetterSpacing(QFont.PercentageSpacing, 95)  # tracking-tighter
         self._risk_badge.setFont(f)
         self._risk_badge.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -174,7 +172,7 @@ class ForceRenameProjectIdDialog(QDialog):
         risk_l.setContentsMargins(0, 0, 0, 0)
         risk_l.setSpacing(8)
         risk_label = QLabel("Risk Level", self)
-        risk_label.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
+        risk_label.setObjectName("DialogLabelMeta")
         risk_l.addWidget(risk_label, 1)
         risk_l.addWidget(self._risk_badge, 0, Qt.AlignRight)
 

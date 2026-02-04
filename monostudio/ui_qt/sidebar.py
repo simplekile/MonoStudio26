@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS
+from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 
 
 class SidebarContext(str, Enum):
@@ -175,8 +175,7 @@ class _SidebarNavItemWidget(QWidget):
 
         self._label = QLabel(context_name, left)
         self._label.setObjectName("SidebarNavLabel")
-        f_label = QFont("Inter", 13)
-        f_label.setWeight(QFont.Weight.DemiBold)
+        f_label = monos_font("Inter", 13, QFont.Weight.DemiBold)
         f_label.setLetterSpacing(QFont.PercentageSpacing, 97)  # tracking-tight
         self._label.setFont(f_label)
 
@@ -185,8 +184,9 @@ class _SidebarNavItemWidget(QWidget):
 
         self._badge = QLabel("", self)
         self._badge.setObjectName("SidebarNavBadge")
-        f_badge = QFont("Inter", 10)
-        f_badge.setWeight(QFont.Weight.DemiBold)
+        self._badge.setAlignment(Qt.AlignCenter)
+        self._badge.setProperty("shape", "pill")
+        f_badge = monos_font("Inter", 10, QFont.Weight.DemiBold)
         self._badge.setFont(f_badge)
         self._badge.setVisible(False)
 
@@ -219,8 +219,16 @@ class _SidebarNavItemWidget(QWidget):
         if value is None:
             self._badge.setVisible(False)
             self._badge.setText("")
+            self._badge.setProperty("shape", "pill")
+            self.style().unpolish(self._badge)
+            self.style().polish(self._badge)
             return
-        self._badge.setText(str(value))
+        s = str(int(value))
+        self._badge.setText(s)
+        # 1-digit: dot badge (1:1). 2+ digits: pill badge.
+        self._badge.setProperty("shape", "dot" if len(s) == 1 else "pill")
+        self.style().unpolish(self._badge)
+        self.style().polish(self._badge)
         self._badge.setVisible(True)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
@@ -273,8 +281,7 @@ class SidebarWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
-        f_h = QFont("Inter", 10)
-        f_h.setWeight(QFont.Weight.ExtraBold)  # 800
+        f_h = monos_font("Inter", 10, QFont.Weight.ExtraBold)  # 800
         f_h.setLetterSpacing(QFont.PercentageSpacing, 112)  # tracking-widest-ish
 
         # --- Header rows (label + "+" button, right-aligned)
@@ -723,11 +730,10 @@ class SidebarWidget(QWidget):
         w.setFixedHeight(rows * row_h + extra)
 
 
-class _FilterPickDialog(QDialog):
+class _FilterPickDialog(MonosDialog):
     """
-    UI-only picker dialog for Departments / Types.
-    - Click to select/deselect (checkbox)
-    - Max selection enforced (default 5)
+    Picker dialog for Departments / Types.
+    Selectable list (multi-select), same style as department preset in Settings.
     """
 
     def __init__(
@@ -743,14 +749,15 @@ class _FilterPickDialog(QDialog):
         self.setWindowTitle(title)
         self.setModal(True)
         self.setObjectName("SidebarFilterPickDialog")
+        # Force QSS background to paint (otherwise dialog can appear black on Windows).
+        self.setAttribute(Qt.WA_StyledBackground, True)
 
         self._items: list[tuple[str, str, str | None]] = [
             (i, lbl, (ic.strip() if isinstance(ic, str) and ic.strip() else None))
             for (i, lbl, ic) in items
             if isinstance(i, str) and i.strip() and isinstance(lbl, str) and lbl.strip()
         ]
-        self._selected = set(selected)
-        self._block = False
+        _selected = set(selected)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -760,14 +767,13 @@ class _FilterPickDialog(QDialog):
         self._hint.setObjectName("SidebarFilterPickHint")
 
         self._list = QListWidget(self)
-        self._list.setObjectName("SidebarFilterPickList")
-        self._list.setSelectionMode(QAbstractItemView.NoSelection)
-        self._list.setFocusPolicy(Qt.NoFocus)
-        # Dialog can scroll if needed; sidebar lists remain no-scroll.
+        self._list.setObjectName("SelectableListMulti")
+        self._list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self._list.setFocusPolicy(Qt.StrongFocus)
         self._list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._list.setIconSize(QSize(16, 16))
-        self._list.itemChanged.connect(self._on_item_changed)
+        self._list.selectionModel().selectionChanged.connect(self._sync_hint)
 
         for item_id, label, icon_name in self._items:
             it = QListWidgetItem(label)
@@ -777,9 +783,9 @@ class _FilterPickDialog(QDialog):
                 if ic.isNull():
                     ic = lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"])
                 it.setIcon(ic)
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Checked if item_id in self._selected else Qt.Unchecked)
             self._list.addItem(it)
+            if item_id in _selected:
+                it.setSelected(True)
 
         # Buttons
         btn_row = QWidget(self)
@@ -804,31 +810,19 @@ class _FilterPickDialog(QDialog):
         self._sync_hint()
 
     def selected_items(self) -> list[str]:
-        # Preserve original order from items list.
+        """Return selected item ids in list order."""
         out: list[str] = []
-        for item_id, _label, _icon in self._items:
-            if item_id in self._selected:
-                out.append(item_id)
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it and it.isSelected():
+                v = it.data(Qt.UserRole)
+                if isinstance(v, str) and v:
+                    out.append(v)
         return out
 
-    def _on_item_changed(self, item: QListWidgetItem) -> None:
-        if self._block:
-            return
-        v = item.data(Qt.UserRole)
-        key = v if isinstance(v, str) else None
-        if key is None:
-            return
-
-        want_checked = item.checkState() == Qt.Checked
-        if want_checked and key not in self._selected:
-            self._selected.add(key)
-        elif (not want_checked) and key in self._selected:
-            self._selected.remove(key)
-
-        self._sync_hint()
-
     def _sync_hint(self) -> None:
-        self._hint.setText(f"Selected {len(self._selected)}")
+        n = len(self.selected_items())
+        self._hint.setText(f"Selected {n}")
 
 
 class Sidebar(QWidget):
@@ -882,8 +876,7 @@ class Sidebar(QWidget):
 
         brand_label = QLabel("MONOS", brand)
         brand_label.setObjectName("SidebarBrandLabel")
-        f_brand = QFont("Inter", 16)
-        f_brand.setWeight(QFont.Weight.ExtraBold)  # 800
+        f_brand = monos_font("Inter", 16, QFont.Weight.ExtraBold)  # 800
         f_brand.setLetterSpacing(QFont.PercentageSpacing, 97)  # tracking-tight
         brand_label.setFont(f_brand)
 
@@ -928,8 +921,7 @@ class Sidebar(QWidget):
         scroll_layout.setContentsMargins(16, 0, 16, 16)  # side padding only
         scroll_layout.setSpacing(24)  # mt-6 between sections
 
-        f_h = QFont("Inter", 10)
-        f_h.setWeight(QFont.Weight.ExtraBold)  # 800
+        f_h = monos_font("Inter", 10, QFont.Weight.ExtraBold)  # 800
         f_h.setLetterSpacing(QFont.PercentageSpacing, 112)  # tracking-widest-ish
 
         # Section: FILTERS (metadata-driven; mock data for now)
@@ -967,6 +959,10 @@ class Sidebar(QWidget):
         self._settings_btn = QPushButton("Global Settings", bottom)
         self._settings_btn.setObjectName("SidebarSettingsButton")
         self._settings_btn.setCursor(Qt.PointingHandCursor)
+        _settings_icon = lucide_icon("sliders-horizontal", size=16, color_hex=MONOS_COLORS["text_label"])
+        if not _settings_icon.isNull():
+            self._settings_btn.setIcon(_settings_icon)
+            self._settings_btn.setIconSize(QSize(16, 16))
         self._settings_btn.clicked.connect(self.settings_requested.emit)
 
         bottom_layout.addWidget(self._settings_btn, 0)

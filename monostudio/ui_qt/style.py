@@ -2,8 +2,219 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import (
+    QBitmap,
+    QBrush,
+    QColor,
+    QFont,
+    QFontDatabase,
+    QPainter,
+    QPalette,
+    QPainterPath,
+    QPen,
+)
+from PySide6.QtWidgets import QApplication, QDialog, QMenu, QWidget
+
+
+# Dialog panel: background, radius, border (paintEvent draws with antialiasing for smooth corners)
+_MONOS_DIALOG_BG = "#18181b"
+_MONOS_DIALOG_RADIUS = 12
+# Border: solid light so it's always visible (lighter than #18181b)
+_MONOS_DIALOG_BORDER = "#3f3f46"
+# Overlay behind modal dialog: white 15% opacity
+_MONOS_DIALOG_OVERLAY_CSS = "background: rgba(255, 255, 255, 0.15);"
+
+# Menu popup: same round-corner standard (radius 12, border lighter than bg)
+_MONOS_MENU_BG = "#1c1c1f"
+_MONOS_MENU_RADIUS = 12
+_MONOS_MENU_BORDER = "#3f3f46"
+
+
+class _DialogBorderOverlay(QWidget):
+    """Vẽ viền bo góc luôn nằm trên cùng, không bị content đè khi repaint."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+    def paintEvent(self, event) -> None:
+        r = self.rect()
+        if r.isEmpty():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(_MONOS_DIALOG_BORDER), 2))
+        rect = r.adjusted(1, 1, -1, -1)
+        painter.drawRoundedRect(rect, _MONOS_DIALOG_RADIUS - 1, _MONOS_DIALOG_RADIUS - 1)
+        painter.end()
+
+
+class MonosMenu(QMenu):
+    """
+    QMenu bo góc chuẩn MONOS: Frameless + mask + paintEvent.
+    Dùng nền opaque (không WA_TranslucentBackground) để tránh lỗi UpdateLayeredWindowIndirect
+    trên Windows (dirty rect offset âm). setMask vẫn cắt shape bo góc.
+    rounded=False: vẽ chữ nhật không bo góc (vd. ProjectSwitchMenu).
+    """
+
+    def __init__(self, parent=None, *, rounded: bool = True) -> None:
+        super().__init__(parent)
+        self._menu_rounded = rounded
+        self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        pal = self.palette()
+        pal.setColor(pal.ColorRole.Window, QColor(_MONOS_MENU_BG))
+        pal.setColor(pal.ColorRole.Base, QColor(_MONOS_MENU_BG))
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+
+    def paintEvent(self, event) -> None:
+        r = self.rect()
+        if r.isEmpty():
+            super().paintEvent(event)
+            return
+        rect = r.adjusted(0, 0, -1, -1)
+        radius = _MONOS_MENU_RADIUS if self._menu_rounded else 0
+        overflow = 2 if self._menu_rounded else 0
+        fill_rect = rect.adjusted(-overflow, -overflow, overflow, overflow)
+        radius_tràn = radius + overflow if self._menu_rounded else 0
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        bg = QColor(_MONOS_MENU_BG)
+        painter.setBrush(QBrush(bg))
+        painter.setPen(Qt.PenStyle.NoPen)
+        if radius_tràn > 0:
+            painter.drawRoundedRect(fill_rect, radius_tràn, radius_tràn)
+        else:
+            painter.drawRect(fill_rect)
+        painter.end()
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        border_rect = rect.adjusted(1, 1, -1, -1)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(_MONOS_MENU_BORDER), 1))
+        if radius > 0:
+            painter.drawRoundedRect(border_rect, radius - 1, radius - 1)
+        else:
+            painter.drawRect(border_rect)
+        painter.end()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._update_rounded_mask()
+
+    def _update_rounded_mask(self) -> None:
+        r = self.rect()
+        if r.isEmpty():
+            return
+        w, h = r.width(), r.height()
+        bitmap = QBitmap(w, h)
+        bitmap.fill(Qt.GlobalColor.color0)
+        painter = QPainter(bitmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.GlobalColor.color1)
+        painter.setPen(Qt.PenStyle.NoPen)
+        mask_rect = r.adjusted(0, 0, -1, -1)
+        if self._menu_rounded:
+            painter.drawRoundedRect(mask_rect, _MONOS_MENU_RADIUS, _MONOS_MENU_RADIUS)
+        else:
+            painter.drawRect(mask_rect)
+        painter.end()
+        self.setMask(bitmap)
+
+
+class MonosDialog(QDialog):
+    """
+    Base dialog for MONOS: borderless window, rounded corners, border,
+    and a 15% white overlay behind the dialog when shown.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._overlay: QWidget | None = None
+        self._border_overlay: _DialogBorderOverlay | None = None
+        flags = self.windowFlags()
+        self.setWindowFlags(
+            (flags | Qt.FramelessWindowHint) & ~Qt.WindowContextHelpButtonHint
+        )
+        # Transparent background so we draw rounded rect in paintEvent with antialiasing (smooth corners)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        pal = self.palette()
+        pal.setColor(pal.ColorRole.Window, QColor(0, 0, 0, 0))
+        pal.setColor(pal.ColorRole.Base, QColor(_MONOS_DIALOG_BG))
+        self.setPalette(pal)
+        self.setAutoFillBackground(False)
+        self.finished.connect(self._hide_overlay)
+
+    def paintEvent(self, event) -> None:
+        # 1) Fill rounded background (antialiased).
+        r = self.rect()
+        if not r.isEmpty():
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            rect = r.adjusted(0, 0, -1, -1)
+            painter.setBrush(QBrush(QColor(_MONOS_DIALOG_BG)))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(rect, _MONOS_DIALOG_RADIUS, _MONOS_DIALOG_RADIUS)
+            painter.end()
+        # 2) Draw content (children) on top of background.
+        super().paintEvent(event)
+
+    def _update_rounded_mask(self) -> None:
+        # Frameless + WA_TranslucentBackground + mask bo góc (QBitmap + drawRoundedRect).
+        # Mask phải set sau khi dialog đã có kích thước (showEvent / resizeEvent).
+        r = self.rect()
+        if r.isEmpty():
+            return
+        w, h = r.width(), r.height()
+        bitmap = QBitmap(w, h)
+        bitmap.fill(Qt.GlobalColor.color0)
+        painter = QPainter(bitmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.GlobalColor.color1)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(r, _MONOS_DIALOG_RADIUS, _MONOS_DIALOG_RADIUS)
+        painter.end()
+        self.setMask(bitmap)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_rounded_mask()
+        if self._border_overlay is not None:
+            self._border_overlay.setGeometry(self.rect())
+            self._border_overlay.raise_()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._update_rounded_mask()
+        # Viền vẽ bằng overlay luôn nằm trên content, không bị repaint đè
+        if self._border_overlay is None:
+            self._border_overlay = _DialogBorderOverlay(self)
+        self._border_overlay.setGeometry(self.rect())
+        self._border_overlay.raise_()
+        self._border_overlay.show()
+        parent = self.parent()
+        if isinstance(parent, QWidget) and parent.isWidgetType():
+            if self._overlay is None:
+                self._overlay = QWidget(parent)
+                self._overlay.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
+                self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+            self._overlay.setGeometry(0, 0, parent.width(), parent.height())
+            self._overlay.raise_()
+            self._overlay.show()
+
+    def _hide_overlay(self) -> None:
+        if self._overlay is not None:
+            self._overlay.hide()
+            self._overlay.deleteLater()
+            self._overlay = None
 
 
 MONOS_COLORS: dict[str, str] = {
@@ -54,6 +265,27 @@ THUMB_TAG_STYLE: dict[str, object] = {
 }
 
 
+def monos_font(
+    family: str = "Inter",
+    point_size: int = 13,
+    weight: QFont.Weight | None = None,
+    italic: bool = False,
+) -> QFont:
+    """
+    QFont với hinting + antialiasing chuẩn MONOS (giảm răng cưa).
+    - PreferVerticalHinting: chữ sắc trên màn hình, layout vẫn scale được.
+    - PreferAntialias: bật khử răng cưa.
+    """
+    f = QFont(family, point_size)
+    if weight is not None:
+        f.setWeight(weight)
+    if italic:
+        f.setItalic(True)
+    f.setHintingPreference(QFont.HintingPreference.PreferVerticalHinting)
+    f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    return f
+
+
 def _install_fonts(app: QApplication) -> None:
     """
     Typography v1:
@@ -71,10 +303,7 @@ def _install_fonts(app: QApplication) -> None:
         except OSError:
             pass
 
-    font = QFont("Inter", 13)
-    font.setWeight(QFont.Weight.Medium)  # 13px @ 500 (Inter renders cleaner in Qt)
-    font.setHintingPreference(QFont.PreferFullHinting)
-    font.setStyleStrategy(QFont.PreferAntialias)
+    font = monos_font("Inter", 13, QFont.Weight.Medium)
     app.setFont(font)
 
 
@@ -185,18 +414,67 @@ def apply_dark_theme(app: QApplication) -> None:
             background: none;
         }
 
+        /* ---------- MONOS :: Context Menu (Deep Dark, Electric Blue) ---------- */
+        QMenu {
+            background-color: #18181b;
+            border: 1px solid #2a2a2d;
+            border-radius: 13px;
+            padding: 5px 0px;
+        }
+        QMenu::item {
+            background-color: transparent;
+            padding: 6px 28px 6px 24px;
+            color: #e2e2e2;
+            font-size: 13px;
+            min-width: 180px;
+        }
+        QMenu::item:selected {
+            background-color: #2563eb;
+            color: white;
+        }
+        QMenu::item:selected:disabled {
+            background-color: transparent;
+        }
+        QMenu::separator {
+            height: 1px;
+            background: #2a2a2d;
+            margin: 4px 8px;
+        }
+        QMenu::icon {
+            padding-left: 10px;
+        }
+        QMenu::right-arrow {
+            width: 10px;
+            height: 10px;
+            padding-right: 10px;
+        }
+        QMenu::item:disabled {
+            color: #555555;
+        }
+        QMenu::indicator {
+            width: 14px;
+            height: 14px;
+            margin-left: 8px;
+        }
+        QMenu::item[class="danger-action"]:selected {
+            background-color: #ef4444;
+        }
+
         QWidget#TopBar {
             background-color: #18181b; /* Zinc-900 */
             border-bottom: 1px solid rgba(39, 39, 42, 0.50);
         }
         QToolButton#ProjectSwitch {
             padding: 6px 12px;
-            border-radius: 8px;
-            border: 1px solid #27272a;
+            border: none;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            border-bottom-left-radius: 0;
+            border-bottom-right-radius: 0;
             background: #1c1c1f;
-            color: #e2e2e2; /* off-white */
+            color: #e2e2e2;
             font-family: "Inter", "Inter UI", "Segoe UI", "San Francisco", sans-serif;
-            font-size: 12px; /* px only */
+            font-size: 24px; /* x2 from 12px */
             font-weight: 500;
             -qt-subpixel-positioned: true;
             text-align: left;
@@ -213,20 +491,21 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#ProjectSwitch:disabled {
             color: rgba(161, 161, 170, 0.55);
             background: rgba(28, 28, 31, 0.65);
-            border: 1px solid rgba(39, 39, 42, 0.60);
+            border: none;
         }
         QToolButton#ProjectSwitch:hover {
             background: #27272a; /* Zinc-800 */
-            color: #ffffff;
+            color: #60a5fa; /* Blue-400 */
         }
         QToolButton#ProjectSwitch::menu-indicator {
             image: none;
             width: 0px;
         }
+        /* ProjectSwitchMenu: nền/viền vẽ trong MonosMenu.paintEvent (bỏ round) */
         QMenu#ProjectSwitchMenu {
-            background: #1c1c1f;
-            border: 1px solid #27272a;
-            border-radius: 12px;
+            background-color: transparent;
+            border: none;
+            border-radius: 0;
             padding: 4px;
             margin-top: 8px;
             font-family: "Inter", "Inter UI", "Segoe UI", "San Francisco", sans-serif;
@@ -317,6 +596,49 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #60a5fa;
         }
 
+        /* --- MONOS Deep Dark Table (Pipeline: Departments, Types mapping) --- */
+        QTableWidget, QTableView {
+            background-color: #121214;
+            border: 1px solid #2a2a2c;
+            gridline-color: #2a2a2c;
+            color: #eeeeee;
+            font-size: 12px;
+            selection-background-color: rgba(37, 99, 235, 0.15);
+            selection-color: #2563eb;
+            outline: none;
+        }
+        QHeaderView::section {
+            background-color: #0d0d0f;
+            color: #4a4a4c;
+            padding: 10px 15px;
+            border: none;
+            border-bottom: 2px solid #2a2a2c;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        QHeaderView::section:hover {
+            background-color: #1e1e20;
+            color: #888888;
+        }
+        QTableWidget::item, QTableView::item {
+            padding: 8px 15px;
+            border-bottom: 1px solid #1e1e20;
+        }
+        QTableWidget::item:hover, QTableView::item:hover {
+            background-color: rgba(255, 255, 255, 0.02);
+        }
+        QTableWidget::item:selected, QTableView::item:selected {
+            background-color: rgba(37, 99, 235, 0.1);
+            color: #ffffff;
+            border-bottom: 1px solid #2563eb;
+        }
+        QTableCornerButton::section {
+            background-color: #0d0d0f;
+            border: none;
+            border-bottom: 2px solid #2a2a2c;
+        }
+
         /* --- MainView Asset Browser header --- */
         QWidget#MainViewHeader {
             background-color: #151518;
@@ -324,7 +646,17 @@ def apply_dark_theme(app: QApplication) -> None:
             border-bottom: 1px solid rgba(39, 39, 42, 0.50);
         }
         QLabel#MainViewContextTitle {
-            color: #fafafa;
+            color: #cccccc;
+            font-weight: 700;
+        }
+        QWidget#MainViewDepartmentBadge {
+            background: rgba(59, 130, 246, 0.26);  /* Blue-400, more prominent */
+            border: 1px solid rgba(63, 63, 70, 0.80);
+            border-radius: 6px;
+        }
+        QLabel#MainViewDepartmentBadgeLabel {
+            color: #a1a1aa;
+            font-weight: 700;
         }
         QToolButton {
             padding: 6px 10px;
@@ -338,6 +670,11 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid rgba(37, 99, 235, 0.50); /* Blue-600 */
             color: #60a5fa; /* Blue-400 action text */
         }
+        QToolButton:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(63, 63, 70, 0.80);
+            color: #e4e4e7; /* Zinc-200 */
+        }
         QPushButton#MainViewPrimaryAction {
             padding: 8px 12px;
             border-radius: 8px;
@@ -345,6 +682,11 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(37, 99, 235, 0.22); /* Blue-600 */
             color: #fafafa;
             text-align: center;
+        }
+        QPushButton#MainViewPrimaryAction:hover {
+            background: rgba(37, 99, 235, 0.45);
+            border: 1px solid rgba(96, 165, 250, 0.70); /* Blue-400 */
+            color: #ffffff;
         }
         QPushButton#MainViewPrimaryAction:disabled {
             border: 1px solid rgba(39, 39, 42, 0.50);
@@ -378,9 +720,14 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#InspectorCloseButton {
             padding: 6px;
             border-radius: 8px;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            background: rgba(24, 24, 27, 0.35);
+            color: #a1a1aa;
         }
         QToolButton#InspectorCloseButton:hover {
-            background: rgba(255, 255, 255, 0.04);
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(63, 63, 70, 0.80);
+            color: #e4e4e7;
         }
         QFrame#InspectorMiniCard,
         QFrame#InspectorDeptCard {
@@ -391,8 +738,19 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#InspectorManageButton {
             color: #a1a1aa;
         }
+        QToolButton#InspectorManageButton:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(63, 63, 70, 0.80);
+            color: #e4e4e7; /* Zinc-200 */
+        }
         QToolButton#InspectorManageButton:disabled {
             color: rgba(161, 161, 170, 0.45);
+        }
+        /* All tool buttons inside Inspector: ensure hover is visible */
+        QWidget#InspectorPanel QToolButton:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(63, 63, 70, 0.80);
+            color: #e4e4e7;
         }
 
         /* --- Badges (QSS + dynamic properties) --- */
@@ -454,6 +812,503 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #ef4444;
             background-color: rgba(239, 68, 68, 100);
             border: 1px solid rgba(239, 68, 68, 50);
+        }
+
+        /* --- Dialogs (MONOS): background + border drawn in MonosDialog.paintEvent (antialiased) --- */
+        QDialog {
+            background-color: transparent;
+        }
+        QDialog#SidebarFilterPickDialog {
+            background-color: transparent;
+        }
+        QLabel#DialogHint {
+            color: #a1a1aa;
+            font-size: 11px;
+        }
+        /* Open Resolver: DCC selection cards */
+        QFrame#DccCard {
+            background-color: #1e1e20;
+            border: 1px solid #2a2a2d;
+            border-radius: 8px;
+        }
+        QFrame#DccCard:hover {
+            background-color: #27272a;
+            border-color: #3f3f46;
+        }
+        QFrame#DccCard[selected="true"] {
+            border: 2px solid #2563eb;
+            background-color: rgba(37, 99, 235, 0.12);
+        }
+        QFrame#DccCard[selected="true"]:hover {
+            background-color: rgba(37, 99, 235, 0.18);
+        }
+        QLabel#DccCardLabel {
+            color: #e4e4e7;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        QScrollArea#OpenResolverScroll {
+            background: transparent;
+            border: none;
+        }
+        QLabel#DialogHelper {
+            color: #a1a1aa;
+            font-size: 11px;
+        }
+        QLabel#DialogLabelMeta {
+            color: #71717a;
+        }
+        QLabel#DialogLabelPrimary {
+            color: #fafafa;
+        }
+        QLabel#DialogSectionTitle {
+            font-weight: 700;
+            color: #fafafa;
+        }
+        QLabel#DialogPrefixChip {
+            padding: 6px 10px;
+            border: 1px solid rgba(39, 39, 42, 0.70);
+            border-radius: 6px;
+            background: #27272a;
+            color: #a1a1aa;
+        }
+        QDialog QGroupBox {
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 8px;
+            background: #121214;
+            padding-top: 12px;
+            margin-top: 8px;
+        }
+        QDialog QGroupBox::title {
+            color: #a1a1aa;
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            padding: 0 6px;
+            left: 8px;
+        }
+        /* Categories (Asset/Shot Depts): groupbox + title giống nhau cho cả hai trang */
+        QGroupBox#SettingsCategoryGroup {
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 8px;
+            background: #121214;
+            padding-top: 12px;
+            margin-top: 8px;
+        }
+        QGroupBox#SettingsCategoryGroup::title {
+            color: #a1a1aa;
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            padding: 0 6px;
+            left: 8px;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        /* Dialog: tabs (MONOS) — same as Tier 2 (font to, đậm) */
+        QDialog QTabWidget::pane {
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-top: none;
+            border-radius: 0 0 8px 8px;
+            background: #121214;
+            top: -1px;
+            padding: 12px;
+        }
+        QDialog QTabWidget::tab-bar {
+            alignment: left;
+        }
+        QDialog QTabWidget::tab {
+            background: #18181b;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-bottom: none;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            padding: 8px 16px;
+            margin-right: 2px;
+            color: #a1a1aa;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        QDialog QTabWidget::tab:selected {
+            background: #121214;
+            color: #fafafa;
+            border-color: rgba(39, 39, 42, 0.50);
+        }
+        QDialog QTabWidget::tab:hover:!selected {
+            background: #1f1f22;
+            color: #fafafa;
+        }
+        QDialog QTabWidget::tab:selected:focus {
+            outline: none;
+        }
+        QDialog QTabWidget QTabBar {
+            outline: none;
+        }
+        QDialog QTabWidget QTabBar:focus {
+            outline: none;
+            border: none;
+        }
+
+        /* Settings Tier 2: horizontal module tabs (General/Pipeline/Project) — inherits QDialog QTabWidget, same spec */
+        QTabWidget#SettingsTier2Tabs::pane {
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-top: none;
+            border-radius: 0 0 8px 8px;
+            background: #121214;
+            top: -1px;
+            padding: 12px;
+        }
+        QTabWidget#SettingsTier2Tabs::tab-bar {
+            alignment: left;
+        }
+        QTabWidget#SettingsTier2Tabs::tab {
+            background: #18181b;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-bottom: none;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            padding: 8px 16px;
+            margin-right: 2px;
+            color: #a1a1aa;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        QTabWidget#SettingsTier2Tabs::tab:selected {
+            background: #121214;
+            color: #fafafa;
+            border-color: rgba(39, 39, 42, 0.50);
+        }
+        QTabWidget#SettingsTier2Tabs::tab:hover:!selected {
+            background: #1f1f22;
+            color: #fafafa;
+        }
+        QTabWidget#SettingsTier2Tabs::tab:selected:focus {
+            outline: none;
+        }
+        QTabWidget#SettingsTier2Tabs QTabBar {
+            outline: none;
+        }
+        QTabWidget#SettingsTier2Tabs QTabBar:focus {
+            outline: none;
+            border: none;
+        }
+
+        /* Settings Tier 3: Segmented Control (The Filter) — one bar, segments joined */
+        QTabWidget#SettingsPillTabs::pane {
+            border: 1px solid rgba(39, 39, 42, 0.40);
+            border-radius: 8px;
+            background: #18181b;
+            margin-top: 8px;
+            padding: 12px;
+        }
+        QTabWidget#SettingsPillTabs::tab-bar {
+            alignment: left;
+        }
+        QTabWidget#SettingsPillTabs::tab {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(39, 39, 42, 0.45);
+            border-right: none;
+            border-radius: 0;
+            padding: 6px 14px;
+            margin-right: 0;
+            color: #a1a1aa;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        QTabWidget#SettingsPillTabs::tab:first {
+            border-top-left-radius: 6px;
+            border-bottom-left-radius: 6px;
+        }
+        QTabWidget#SettingsPillTabs::tab:last {
+            border-right: 1px solid rgba(39, 39, 42, 0.45);
+            border-top-right-radius: 6px;
+            border-bottom-right-radius: 6px;
+        }
+        QTabWidget#SettingsPillTabs::tab:selected {
+            background: rgba(59, 130, 246, 0.18);
+            border-color: rgba(37, 99, 235, 0.45);
+            color: #60a5fa;
+        }
+        QTabWidget#SettingsPillTabs::tab:selected:first {
+            border-right: none;
+        }
+        QTabWidget#SettingsPillTabs::tab:selected:last {
+            border-right: 1px solid rgba(37, 99, 235, 0.45);
+        }
+        QTabWidget#SettingsPillTabs::tab:hover:!selected {
+            background: rgba(255, 255, 255, 0.08);
+            color: #fafafa;
+        }
+
+        /* Settings Tier 2: page tabs (underline style) */
+        QWidget#SettingsPageButtonBar {
+            background: transparent;
+            border: none;
+        }
+        QPushButton#Tier2Tab {
+            background: transparent;
+            border: none;
+            border-radius: 0px;
+            color: #888888;
+            font-weight: bold;
+            font-size: 14px;
+            padding-bottom: 8px;
+        }
+        QPushButton#Tier2Tab:checked {
+            color: #fafafa;
+            border-bottom: 2px solid #2563eb;
+        }
+        QPushButton#Tier2Tab:hover:!checked {
+            color: #a1a1aa;
+        }
+
+        /* Settings Tier 3: pill container + pills (Asset Depts | Shot Depts) */
+        QWidget#Tier3Container {
+            background-color: #1e1e20;
+            border-radius: 15px;
+        }
+        QPushButton#Tier3Pill {
+            background: transparent;
+            border: none;
+            border-radius: 13px;
+            color: #888888;
+            padding: 5px 15px;
+            font-size: 11px;
+            min-height: 22px;
+        }
+        QPushButton#Tier3Pill:checked {
+            background-color: #2a2a2c;
+            border: none;
+            border-radius: 13px;
+            color: #fafafa;
+        }
+        QPushButton#Tier3Pill:hover:!checked {
+            border: none;
+            border-radius: 13px;
+            color: #a1a1aa;
+        }
+
+        QStackedWidget#SettingsPageStack {
+            background: #121214;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        /* Selectable List (Settings — Departments, Types list) */
+        QListWidget#SelectableList, QListView#SelectableList {
+            background-color: #0d0d0f;
+            border: none;
+            outline: none;
+            padding: 5px;
+        }
+        QListWidget#SelectableList::item, QListView#SelectableList::item {
+            background-color: transparent;
+            color: #888888;
+            padding: 8px 12px;
+            margin-bottom: 2px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            border-left: 3px solid transparent;
+        }
+        QListWidget#SelectableList::item:hover, QListView#SelectableList::item:hover {
+            background-color: rgba(255, 255, 255, 0.03);
+            color: #eeeeee;
+        }
+        QListWidget#SelectableList::item:selected, QListView#SelectableList::item:selected {
+            background-color: rgba(37, 99, 235, 0.10);
+            color: #2563eb;
+            border-left: 3px solid #2563eb;
+            font-weight: 700;
+        }
+        QListWidget#SelectableList QScrollBar:vertical, QListView#SelectableList QScrollBar:vertical {
+            border: none;
+            background: #0d0d0f;
+            width: 8px;
+            margin: 0px;
+        }
+        QListWidget#SelectableList QScrollBar::handle:vertical, QListView#SelectableList QScrollBar::handle:vertical {
+            background: #2a2a2c;
+            min-height: 20px;
+            border-radius: 4px;
+        }
+        QListWidget#SelectableList QScrollBar::handle:vertical:hover, QListView#SelectableList QScrollBar::handle:vertical:hover {
+            background: #3a3a3c;
+        }
+        QListWidget#SelectableList QScrollBar::add-line:vertical, QListWidget#SelectableList QScrollBar::sub-line:vertical,
+        QListView#SelectableList QScrollBar::add-line:vertical, QListView#SelectableList QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+
+        /* Selectable List (multi-select): checkbox icon at start, no border-left */
+        QListWidget#SelectableListMulti, QListView#SelectableListMulti {
+            background-color: #0d0d0f;
+            border: none;
+            outline: none;
+            padding: 5px;
+        }
+        QListWidget#SelectableListMulti::item, QListView#SelectableListMulti::item {
+            background-color: transparent;
+            color: #888888;
+            padding: 8px 12px;
+            margin-bottom: 2px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        QListWidget#SelectableListMulti::item:hover, QListView#SelectableListMulti::item:hover {
+            background-color: rgba(255, 255, 255, 0.03);
+            color: #eeeeee;
+        }
+        QListWidget#SelectableListMulti::item:selected, QListView#SelectableListMulti::item:selected {
+            background-color: rgba(37, 99, 235, 0.10);
+            color: #2563eb;
+            font-weight: 700;
+        }
+        QListWidget#SelectableListMulti QScrollBar:vertical, QListView#SelectableListMulti QScrollBar:vertical {
+            border: none;
+            background: #0d0d0f;
+            width: 8px;
+            margin: 0px;
+        }
+        QListWidget#SelectableListMulti QScrollBar::handle:vertical, QListView#SelectableListMulti QScrollBar::handle:vertical {
+            background: #2a2a2c;
+            min-height: 20px;
+            border-radius: 4px;
+        }
+        QListWidget#SelectableListMulti QScrollBar::handle:vertical:hover, QListView#SelectableListMulti QScrollBar::handle:vertical:hover {
+            background: #3a3a3c;
+        }
+        QListWidget#SelectableListMulti QScrollBar::add-line:vertical, QListWidget#SelectableListMulti QScrollBar::sub-line:vertical,
+        QListView#SelectableListMulti QScrollBar::add-line:vertical, QListView#SelectableListMulti QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+
+        /* Dialog: buttons (MONOS) */
+        QDialog QPushButton {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            background: rgba(24, 24, 27, 0.35);
+            color: #a1a1aa;
+        }
+        QDialog QPushButton:hover {
+            background: rgba(24, 24, 27, 0.55);
+            border-color: rgba(39, 39, 42, 0.70);
+            color: #fafafa;
+        }
+        QDialog QPushButton:disabled {
+            color: rgba(161, 161, 170, 0.5);
+            background: rgba(24, 24, 27, 0.25);
+        }
+        QPushButton#DialogPrimaryButton {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(37, 99, 235, 0.70);
+            background: rgba(37, 99, 235, 0.22);
+            color: #fafafa;
+        }
+        QPushButton#DialogPrimaryButton:hover {
+            background: rgba(37, 99, 235, 0.35);
+            border-color: rgba(59, 130, 246, 0.80);
+        }
+        QPushButton#DialogPrimaryButton:disabled {
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            background: rgba(24, 24, 27, 0.35);
+            color: rgba(250, 250, 250, 0.45);
+        }
+        /* Categories (Asset/Shot Depts): nút Create/Delete Type — style giống nhau cho cả hai trang */
+        QPushButton#SettingsCategoryActionButton {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            background: rgba(24, 24, 27, 0.35);
+            color: #a1a1aa;
+        }
+        QPushButton#SettingsCategoryActionButton:hover {
+            background: rgba(24, 24, 27, 0.55);
+            border-color: rgba(39, 39, 42, 0.70);
+            color: #fafafa;
+        }
+        QPushButton#SettingsCategoryActionButton:disabled {
+            color: rgba(161, 161, 170, 0.5);
+            background: rgba(24, 24, 27, 0.25);
+        }
+
+        /* --- Settings dialog: page-style nav (like main UI sidebar) --- */
+        QFrame#SettingsNavFrame {
+            background-color: #121214;
+            border-right: 1px solid rgba(39, 39, 42, 0.50);
+        }
+        QListWidget#SettingsNav {
+            border: none;
+            border-radius: 0;
+            background: transparent;
+            padding: 8px 0;
+            outline: none;
+        }
+        QListWidget#SettingsNav:focus {
+            outline: none;
+            border: none;
+        }
+        QListWidget#SettingsNav::item {
+            height: 36px;
+            padding-left: 16px;
+            border-radius: 8px;
+            margin: 2px 8px;
+            color: #a1a1aa;
+        }
+        QListWidget#SettingsNav::item:hover {
+            background: rgba(255, 255, 255, 0.04);
+            color: #fafafa;
+        }
+        QListWidget#SettingsNav::item:selected {
+            background: rgba(59, 130, 246, 0.12);
+            color: #60a5fa;
+            border: none;
+            outline: none;
+        }
+        QListWidget#SettingsNav::item:selected:focus {
+            border: none;
+            outline: none;
+        }
+
+        /* Settings dialog: sub-nav (second column, same pattern as nav) */
+        QFrame#SettingsSubNavFrame {
+            background-color: #121214;
+            border-right: 1px solid rgba(39, 39, 42, 0.50);
+        }
+        QListWidget#SettingsSubNav {
+            border: none;
+            border-radius: 0;
+            background: transparent;
+            padding: 8px 0;
+            outline: none;
+        }
+        QListWidget#SettingsSubNav:focus {
+            outline: none;
+            border: none;
+        }
+        QListWidget#SettingsSubNav::item {
+            height: 36px;
+            padding-left: 16px;
+            border-radius: 8px;
+            margin: 2px 8px;
+            color: #a1a1aa;
+        }
+        QListWidget#SettingsSubNav::item:hover {
+            background: rgba(255, 255, 255, 0.04);
+            color: #fafafa;
+        }
+        QListWidget#SettingsSubNav::item:selected {
+            background: rgba(59, 130, 246, 0.12);
+            color: #60a5fa;
+            border: none;
+            outline: none;
+        }
+        QListWidget#SettingsSubNav::item:selected:focus {
+            border: none;
+            outline: none;
         }
 
         /* --- MONOS Sidebar (fixed 256px) --- */
@@ -528,11 +1383,17 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #fafafa;
         }
         QLabel#SidebarNavBadge {
-            padding-left: 6px;
-            padding-right: 6px;
-            border-radius: 6px;
+            min-height: 18px;
+            padding: 0px 6px;
+            border-radius: 9px; /* pill */
             background: rgba(255, 255, 255, 0.06);
             color: #a1a1aa;
+        }
+        QLabel#SidebarNavBadge[shape="dot"] {
+            min-width: 18px;
+            max-width: 18px;
+            padding: 0px;
+            border-radius: 9px; /* circle */
         }
         QWidget#SidebarNavItem[active="true"] QLabel#SidebarNavBadge {
             background: rgba(59, 130, 246, 0.10); /* active glow */
@@ -557,9 +1418,9 @@ def apply_dark_theme(app: QApplication) -> None:
 
         /* Sidebar filter lists (replaces Hierarchy tree) */
         QListWidget#SidebarFilterList {
-            border: 1px solid rgba(39, 39, 42, 0.50);
+
             border-radius: 10px;
-            background: rgba(24, 24, 27, 0.35);
+
             color: #a1a1aa; /* Zinc-400 */
             padding: 6px;
         }
@@ -579,16 +1440,17 @@ def apply_dark_theme(app: QApplication) -> None:
         }
 
         QToolButton#SidebarFilterAddButton {
-            width: 24px;
-            height: 24px;
+            width: 16px;
+            height: 16px;
             border-radius: 8px;
-            border: 1px solid rgba(39, 39, 42, 0.50);
+            border: 0px solid rgba(39, 39, 42, 0.50);
             background: rgba(24, 24, 27, 0.35);
             color: #a1a1aa;
             font-weight: 700;
+            font-size: 18px;
         }
         QToolButton#SidebarFilterAddButton:hover {
-            background: rgba(24, 24, 27, 0.55);
+            background: rgba(64, 64, 74, 0.55);
             border: 1px solid rgba(39, 39, 42, 0.70);
             color: #fafafa;
         }
@@ -640,6 +1502,7 @@ def apply_dark_theme(app: QApplication) -> None:
         QPushButton#SidebarSettingsButton:hover {
             background: rgba(24, 24, 27, 0.55);
             border: 1px solid rgba(39, 39, 42, 0.70);
+            color: #fafafa;
         }
 
         /* --- Metadata-driven navigation (SidebarWidget + AssetGridWidget) --- */

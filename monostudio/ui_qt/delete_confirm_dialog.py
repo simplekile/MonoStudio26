@@ -4,7 +4,6 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
     QDialogButtonBox,
     QLabel,
     QLineEdit,
@@ -12,8 +11,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from monostudio.ui_qt.style import MonosDialog
 
-class DeleteConfirmDialog(QDialog):
+
+class DeleteConfirmDialog(MonosDialog):
     """
     Guarded delete confirmation (explicit, boring):
     - User must type exact folder name to enable Delete
@@ -37,6 +38,7 @@ class DeleteConfirmDialog(QDialog):
         body.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         prompt = QLabel("Type the name to confirm:")
+        prompt.setObjectName("DialogHint")
         prompt.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         self._input = QLineEdit()

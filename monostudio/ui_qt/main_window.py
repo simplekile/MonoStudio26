@@ -10,12 +10,19 @@ from PySide6.QtCore import QByteArray, Qt, QSettings, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QMessageBox, QSplitter, QVBoxLayout, QWidget
 
+from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.fs_reader import build_project_index
 from monostudio.core.models import Asset, ProjectIndex, Shot
+from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.workspace_reader import DiscoveredProject, ProjectQuickStats, discover_projects, read_project_quick_stats
 from monostudio.core.project_create import create_new_project
-from monostudio.core.pipeline_types_and_presets import ensure_pipeline_bootstrap, load_pipeline_types_and_presets
+from monostudio.core.pipeline_types_and_presets import (
+    ensure_pipeline_bootstrap,
+    load_pipeline_types_and_presets,
+    seed_project_from_user_default,
+)
 from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
+from monostudio.core.item_status import read_item_status, write_item_status
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
 from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
@@ -26,6 +33,8 @@ from monostudio.ui_qt.top_bar import TopBar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog
 from monostudio.ui_qt.app_controller import AppController
+from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.style import MONOS_COLORS
 
 
 class MainWindow(QMainWindow):
@@ -51,6 +60,10 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
         repo_root = Path(__file__).resolve().parents[2]
         self._controller = AppController(settings=self._settings, repo_root=repo_root, parent=self)
+        # Guard: context switches must never trigger Open DCC flows or spawn dialogs.
+        self._context_switch_in_progress: bool = False
+        # Guard: filter (department/type) changes must never trigger Open DCC flows or spawn dialogs.
+        self._filter_switch_in_progress: bool = False
         self._workspace_root: Path | None = None
         self._workspace_projects: list[DiscoveredProject] = []
         self._workspace_project_status: dict[str, str] = {}
@@ -141,11 +154,20 @@ class MainWindow(QMainWindow):
         self._main_view.refresh_requested.connect(self._on_refresh_requested)
         self._main_view.root_context_menu_requested.connect(self._on_root_context_menu_requested)
         self._main_view.copy_inventory_requested.connect(self._on_copy_item_inventory_requested)
+        self._main_view.open_requested.connect(self._on_open_requested)
+        self._main_view.open_with_requested.connect(self._on_open_with_requested)
 
         # Clipboard thumbnail overrides: refresh UI after successful paste.
         self._clipboard_thumbs.thumbnailUpdated.connect(self._on_thumbnail_updated)
         self._main_view.delete_requested.connect(self._on_delete_requested)
+        self._main_view.status_set_requested.connect(self._on_status_set_requested)
         self._main_view.primary_action_requested.connect(self._on_primary_action_requested)
+
+        # Inspector intents (explicit)
+        self._inspector.open_requested.connect(self._on_inspector_open_requested)
+        self._inspector.open_with_requested.connect(self._on_inspector_open_with_requested)
+        self._inspector.department_focus_changed.connect(self._on_inspector_department_focus_changed)
+        self._inspector.status_change_requested.connect(self._on_status_set_requested)
 
         # Initial population is driven by project-root restore (scan trigger) and current context.
         self._reload_main_view()
@@ -187,12 +209,24 @@ class MainWindow(QMainWindow):
     # Filter click handlers now live in AppController.
 
     def _on_filter_state_changed(self, _value=None) -> None:
+        # Filter changes can cause selection/model churn; never allow it to trigger Open flows.
+        if getattr(self, "_filter_switch_in_progress", False):
+            return
         # UI-only: rebuild grid/list from existing in-memory data (no rescans).
         if self._sidebar.current_context() != "Assets":
             return
         if self._entered_parent is not None:
             return
-        self._reload_main_view()
+        self._filter_switch_in_progress = True
+        try:
+            self._reload_main_view()
+        finally:
+            self._filter_switch_in_progress = False
+            # Sync inspector exactly once after the filter switch settles.
+            try:
+                self._on_valid_selection_changed(self._main_view.has_valid_selection())
+            except Exception:
+                pass
 
     def _set_current_department(self, department, *, toggle_if_same: bool) -> None:
         new = department if isinstance(department, str) and department.strip() else None
@@ -355,9 +389,9 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         if context_text == "Assets":
-            act = menu.addAction("Copy Assets Inventory")
+            act = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Assets Inventory")
         else:
-            act = menu.addAction("Copy Shots Inventory")
+            act = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Shots Inventory")
 
         chosen = menu.exec(global_pos)
         if chosen != act:
@@ -457,21 +491,32 @@ class MainWindow(QMainWindow):
 
         try:
             shutil.rmtree(path)
-        except OSError:
-            logging.getLogger(__name__).exception("Failed to delete folder: %s", str(path))
+        except OSError as e:
+            logging.warning("Delete failed: %s", e)
             return
 
-        # Success: update in-memory index (NO rescan)
-        if item.kind.value == "asset":
-            assets = tuple(a for a in self._project_index.assets if a.path != path)
-            self._project_index = ProjectIndex(root=self._project_index.root, assets=assets, shots=self._project_index.shots)
-        else:
-            shots = tuple(s for s in self._project_index.shots if s.path != path)
-            self._project_index = ProjectIndex(root=self._project_index.root, assets=self._project_index.assets, shots=shots)
-
-        self._entered_parent = None
+        self._project_index = build_project_index(self._project_index.root, project_root=self._project_index.root)
         self._reload_main_view()
-        self._inspector.set_item(None)
+        cur = self._main_view.selected_view_item()
+        if cur and cur.path == path:
+            self._inspector.set_item(None)
+        self._sync_primary_action()
+
+    def _on_status_set_requested(self, item: ViewItem, status: str) -> None:
+        """Write user-set status to .monostudio/status.json and refresh list (no rescan)."""
+        if item.kind.value not in ("asset", "shot"):
+            return
+        try:
+            write_item_status(Path(item.path), status)
+        except (ValueError, OSError) as e:
+            logging.warning("Failed to write item status: %s", e)
+            return
+        self._reload_main_view()
+        if self._main_view.select_item_by_path(item.path):
+            cur = self._main_view.selected_view_item()
+            if cur:
+                self._inspector.set_item(cur)
+        self._sync_primary_action()
 
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)
@@ -483,35 +528,63 @@ class MainWindow(QMainWindow):
 
     def _on_context_switched(self, context_name: str) -> None:
         # Trigger: user switches between top-level contexts.
-        self._main_view.set_context_title(context_name)
-        self._entered_parent = None
-        if context_name in ("Assets", "Shots"):
-            # Deterministic autoscan trigger (locked rule).
-            self._rescan_project()
-            self._reload_main_view()
-        elif context_name == "Projects":
-            # Projects browser: read-only workspace view (no project rescan).
-            self._reload_main_view()
-        else:
-            # Non-project-browser areas are placeholders (no scans, no side effects).
-            self._main_view.clear()
-            self._main_view.set_empty_override(self._empty_message_for_context(context_name))
-        self._inspector.set_item(None)
-        self._sync_primary_action()
-        self._sync_filter_state_from_sidebar()
+        self._context_switch_in_progress = True
+        try:
+            # Close any stray popup menus to avoid accidental triggers during switch.
+            try:
+                p = QApplication.activePopupWidget()
+                if p is not None:
+                    p.close()
+            except Exception:
+                pass
+
+            self._main_view.set_context_title(context_name)
+            self._entered_parent = None
+            # Clear selection first; selection churn during model resets is a common source of re-entrant UI.
+            try:
+                self._main_view.clear_selection()
+            except Exception:
+                pass
+            self._inspector.set_item(None)
+
+            if context_name in ("Assets", "Shots"):
+                # Deterministic autoscan trigger (locked rule).
+                self._rescan_project()
+                self._reload_main_view()
+            elif context_name == "Projects":
+                # Projects browser: read-only workspace view (no project rescan).
+                self._reload_main_view()
+            else:
+                # Non-project-browser areas are placeholders (no scans, no side effects).
+                self._main_view.clear()
+                self._main_view.set_empty_override(self._empty_message_for_context(context_name))
+
+            self._sync_primary_action()
+            self._sync_filter_state_from_sidebar()
+        finally:
+            self._context_switch_in_progress = False
 
     def _on_context_clicked(self, context_name: str) -> None:
         # Spec: click reloads Main View. (No autoscan trigger unless it was a switch.)
-        self._main_view.set_context_title(context_name)
-        self._entered_parent = None
-        if context_name in ("Assets", "Shots", "Projects"):
-            self._reload_main_view()
-        else:
-            self._main_view.clear()
-            self._main_view.set_empty_override(self._empty_message_for_context(context_name))
-        self._inspector.set_item(None)
-        self._sync_primary_action()
-        self._sync_filter_state_from_sidebar()
+        self._context_switch_in_progress = True
+        try:
+            self._main_view.set_context_title(context_name)
+            self._entered_parent = None
+            try:
+                self._main_view.clear_selection()
+            except Exception:
+                pass
+            self._inspector.set_item(None)
+
+            if context_name in ("Assets", "Shots", "Projects"):
+                self._reload_main_view()
+            else:
+                self._main_view.clear()
+                self._main_view.set_empty_override(self._empty_message_for_context(context_name))
+            self._sync_primary_action()
+            self._sync_filter_state_from_sidebar()
+        finally:
+            self._context_switch_in_progress = False
 
     def _empty_message_for_context(self, context_name: str) -> str:
         if context_name == "Projects":
@@ -523,12 +596,28 @@ class MainWindow(QMainWindow):
         return f"{context_name} is not available yet."
 
     def _on_valid_selection_changed(self, has_selection: bool) -> None:
+        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            # During context switches we intentionally keep Inspector cleared and avoid re-entrant UI updates.
+            self._inspector.set_item(None)
+            try:
+                self._controller.on_inspector_item_changed(None)
+            except Exception:
+                pass
+            return
         if not has_selection:
             self._inspector.set_item(None)
+            try:
+                self._controller.on_inspector_item_changed(None)
+            except Exception:
+                pass
             return
 
         selected = self._main_view.selected_view_item()
         self._inspector.set_item(selected)
+        try:
+            self._controller.on_inspector_item_changed(selected.path if isinstance(selected, ViewItem) else None)
+        except Exception:
+            pass
 
     def _apply_project_root(self, folder: str | None, *, save: bool) -> None:
         # No validation (per rules). Store path and reload UI.
@@ -629,12 +718,15 @@ class MainWindow(QMainWindow):
             return
 
         if context == "Assets":
+            type_reg = TypeRegistry.for_project(self._project_root) if self._project_root else None
             filtered_assets = self.filter_assets(
                 list(self._project_index.assets),
                 self.current_department,
                 self.current_type,
             )
             for asset in filtered_assets:
+                type_folder = (type_reg.get_type_folder(asset.asset_type) or "").strip() if type_reg else ""
+                user_status = read_item_status(asset.path)
                 items.append(
                     ViewItem(
                         kind=ViewItemKind.ASSET,
@@ -643,10 +735,13 @@ class MainWindow(QMainWindow):
                         path=asset.path,
                         departments_count=len(asset.departments),
                         ref=asset,
+                        type_folder=type_folder,
+                        user_status=user_status,
                     )
                 )
         elif context == "Shots":
             for shot in self._project_index.shots:
+                user_status = read_item_status(shot.path)
                 items.append(
                     ViewItem(
                         kind=ViewItemKind.SHOT,
@@ -655,6 +750,7 @@ class MainWindow(QMainWindow):
                         path=shot.path,
                         departments_count=len(shot.departments),
                         ref=shot,
+                        user_status=user_status,
                     )
                 )
         else:
@@ -676,6 +772,8 @@ class MainWindow(QMainWindow):
         self._sidebar.set_project_index(self._project_index)
 
     def _on_item_activated(self, item: ViewItem) -> None:
+        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            return
         # NOTE: "Enter departments" navigation has been removed.
         # Double click / Enter will be repurposed by a different function later.
         if item.kind == ViewItemKind.PROJECT:
@@ -683,16 +781,81 @@ class MainWindow(QMainWindow):
             self._switch_project(str(item.path))
             return
         if item.kind == ViewItemKind.ASSET and isinstance(item.ref, Asset):
-            dept = self._controller.current_department
-            if dept is None:
-                QMessageBox.information(self, "Open DCC", "Select a Department filter first.")
-                return
             try:
-                self._controller.handle_department_activated(asset=item.ref, department=dept)
+                self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
+            except Exception as e:
+                QMessageBox.critical(self, "Open DCC", str(e))
+            return
+        if item.kind == ViewItemKind.SHOT and isinstance(item.ref, Shot):
+            try:
+                self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
             except Exception as e:
                 QMessageBox.critical(self, "Open DCC", str(e))
             return
         return
+
+    def _on_open_requested(self, item: object) -> None:
+        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            return
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            self._controller.smart_open(item=ref, force_dialog=False, parent=self)
+        except Exception as e:
+            QMessageBox.critical(self, "Open DCC", str(e))
+
+    def _on_open_with_requested(self, item: object) -> None:
+        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            return
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            self._controller.smart_open(item=ref, force_dialog=True, parent=self)
+        except Exception as e:
+            QMessageBox.critical(self, "Open With…", str(e))
+
+    def _on_inspector_open_requested(self, item: object) -> None:
+        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            return
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            self._controller.smart_open(item=ref, force_dialog=False, parent=self)
+        except Exception as e:
+            QMessageBox.critical(self, "Open DCC", str(e))
+
+    def _on_inspector_open_with_requested(self, item: object) -> None:
+        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            return
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            self._controller.smart_open(item=ref, force_dialog=True, parent=self)
+        except Exception as e:
+            QMessageBox.critical(self, "Open With…", str(e))
+
+    def _on_inspector_department_focus_changed(self, item: object, department: object) -> None:
+        if not isinstance(item, ViewItem):
+            return
+        dep = department if isinstance(department, str) else ""
+        if not dep.strip():
+            return
+        try:
+            self._controller.on_inspector_department_focused(item_path=item.path, department=dep)
+        except Exception:
+            return
 
     def _new_project(self) -> None:
         if self._workspace_root is None:
@@ -721,6 +884,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "New Project", "Failed to create project.")
             return
 
+        seed_project_from_user_default(created.root)
+
         # Do NOT rescan workspace from scratch; append to existing list.
         discovered = DiscoveredProject(name=created.display_name, root=created.root)
         self._workspace_projects.append(discovered)
@@ -728,7 +893,12 @@ class MainWindow(QMainWindow):
         self._apply_project_root(str(created.root), save=True)
 
     def _open_settings(self) -> None:
-        dialog = SettingsDialog(workspace_root=self._workspace_root, project_root=self._project_root, parent=self)
+        dialog = SettingsDialog(
+            workspace_root=self._workspace_root,
+            project_root=self._project_root,
+            settings=self._settings,
+            parent=self,
+        )
         dialog.workspace_root_selected.connect(lambda p: self._apply_workspace_root(p, save=True))
         dialog.project_root_selected.connect(lambda p: self._apply_project_root(p, save=True))
         dialog.exec()
@@ -823,9 +993,9 @@ class MainWindow(QMainWindow):
         create_shot = None
 
         if context == "Assets":
-            create_asset = menu.addAction("Create Asset…")
+            create_asset = menu.addAction(lucide_icon("box", size=16, color_hex=MONOS_COLORS["text_label"]), "Create Asset…")
         elif context == "Shots":
-            create_shot = menu.addAction("Create Shot…")
+            create_shot = menu.addAction(lucide_icon("clapperboard", size=16, color_hex=MONOS_COLORS["text_label"]), "Create Shot…")
 
         chosen = menu.exec(global_pos)
         if chosen is None:
@@ -862,7 +1032,10 @@ class MainWindow(QMainWindow):
         if not asset_type or not asset_name:
             return
 
-        target = self._project_root / "assets" / asset_type / asset_name
+        type_reg = TypeRegistry.for_project(self._project_root)
+        dept_reg = DepartmentRegistry.for_project(self._project_root)
+        type_folder = type_reg.get_type_folder(asset_type)
+        target = self._project_root / "assets" / type_folder / asset_name
         if target.exists():
             return
 
@@ -870,7 +1043,8 @@ class MainWindow(QMainWindow):
         try:
             to_create: list[Path] = [target]
             for d in departments:
-                dept_dir = target / d
+                dept_folder = dept_reg.get_department_folder(d, "asset")
+                dept_dir = target / dept_folder
                 to_create.append(dept_dir)
                 if create_subfolders:
                     to_create.append(dept_dir / "work")
@@ -916,11 +1090,13 @@ class MainWindow(QMainWindow):
         if target.exists():
             return
 
+        dept_reg = DepartmentRegistry.for_project(self._project_root)
         created: list[Path] = []
         try:
             to_create: list[Path] = [target]
             for d in departments:
-                dept_dir = target / d
+                dept_folder = dept_reg.get_department_folder(d, "shot")
+                dept_dir = target / dept_folder
                 to_create.append(dept_dir)
                 if create_subfolders:
                     to_create.append(dept_dir / "work")

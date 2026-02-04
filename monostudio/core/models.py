@@ -11,6 +11,10 @@ class Department:
     work_path: Path
     publish_path: Path
     work_exists: bool
+    # True only when a recognized work file exists under work_path (e.g. <item>.blend).
+    work_file_exists: bool
+    # Resolved DCC id for the work file (e.g. "blender"). None if unknown.
+    work_file_dcc: str | None
     publish_exists: bool
     latest_publish_version: str | None
     publish_version_count: int

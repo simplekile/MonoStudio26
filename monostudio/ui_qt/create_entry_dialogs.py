@@ -18,15 +18,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtWidgets import (
-    QDialog,
     QDialogButtonBox,
     QLineEdit,
     QVBoxLayout,
 )
 
 from monostudio.core.pipeline_types_and_presets import TypeDef, load_department_vocabulary, load_pipeline_types_and_presets
-
-_MUTED_HELPER_STYLE = "color: #A9ABB0; font-size: 11px;"
+from monostudio.ui_qt.style import MonosDialog
 
 
 def _debug_dialogs_enabled() -> bool:
@@ -79,7 +77,7 @@ def _field_block_with_preview(label_text: str, field: QWidget, preview: QLabel, 
 
     helper = QLabel(helper_text)
     helper.setWordWrap(True)
-    helper.setStyleSheet(_MUTED_HELPER_STYLE)
+    helper.setObjectName("DialogHelper")
     helper.setTextInteractionFlags(Qt.TextSelectableByMouse)
     helper.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
@@ -110,7 +108,7 @@ def _field_block(label_text: str, field: QWidget, helper_text: str) -> QWidget:
 
     helper = QLabel(helper_text)
     helper.setWordWrap(True)
-    helper.setStyleSheet(_MUTED_HELPER_STYLE)
+    helper.setObjectName("DialogHelper")
     helper.setTextInteractionFlags(Qt.TextSelectableByMouse)
     helper.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
@@ -136,7 +134,7 @@ def _name_block_with_prefix_preview(label_text: str, field: QLineEdit, preview: 
 
     helper = QLabel(helper_text)
     helper.setWordWrap(True)
-    helper.setStyleSheet(_MUTED_HELPER_STYLE)
+    helper.setObjectName("DialogHelper")
     helper.setTextInteractionFlags(Qt.TextSelectableByMouse)
     helper.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
@@ -154,7 +152,7 @@ def _name_block_with_prefix_preview(label_text: str, field: QLineEdit, preview: 
     return block
 
 
-class CreateAssetDialog(QDialog):
+class CreateAssetDialog(MonosDialog):
     """
     Unified Type + Department Preset System (project settings driven).
 
@@ -181,7 +179,7 @@ class CreateAssetDialog(QDialog):
         self._type_preview = QLabel("")
         self._type_preview.setVisible(False)
         self._type_preview.setWordWrap(True)
-        self._type_preview.setStyleSheet(_MUTED_HELPER_STYLE)
+        self._type_preview.setObjectName("DialogHelper")
 
         self._type_button = QToolButton()
         self._type_button.setPopupMode(QToolButton.InstantPopup)
@@ -200,7 +198,7 @@ class CreateAssetDialog(QDialog):
         self._final_name_preview = QLabel("")
         self._final_name_preview.setVisible(False)
         self._final_name_preview.setWordWrap(True)
-        self._final_name_preview.setStyleSheet(_MUTED_HELPER_STYLE)
+        self._final_name_preview.setObjectName("DialogHelper")
 
         self._subfolders = QCheckBox("Create work/ and publish/ inside departments")
         self._subfolders.setChecked(True)  # user request: default ON
@@ -342,7 +340,7 @@ class CreateAssetDialog(QDialog):
         )
 
 
-class CreateShotDialog(QDialog):
+class CreateShotDialog(MonosDialog):
     """
     Unified Type + Department Preset System (project settings driven).
 
@@ -388,13 +386,13 @@ class CreateShotDialog(QDialog):
         self._final_name_preview = QLabel("")
         self._final_name_preview.setVisible(False)
         self._final_name_preview.setWordWrap(True)
-        self._final_name_preview.setStyleSheet(_MUTED_HELPER_STYLE)
+        self._final_name_preview.setObjectName("DialogHelper")
 
         # Type departments preview (read-only)
         self._type_preview = QLabel("")
         self._type_preview.setVisible(False)
         self._type_preview.setWordWrap(True)
-        self._type_preview.setStyleSheet(_MUTED_HELPER_STYLE)
+        self._type_preview.setObjectName("DialogHelper")
 
         self._subfolders = QCheckBox("Create work/ and publish/ inside departments")
         self._subfolders.setChecked(True)  # user request: default ON
@@ -434,9 +432,7 @@ class CreateShotDialog(QDialog):
 
         self._prefix_label = QLabel("")
         self._prefix_label.setAlignment(Qt.AlignCenter)
-        self._prefix_label.setStyleSheet(
-            "padding: 6px 10px; border: 1px solid #3A3D41; border-radius: 6px; background: #2B2D30;"
-        )
+        self._prefix_label.setObjectName("DialogPrefixChip")
         self._prefix_label.setTextInteractionFlags(Qt.NoTextInteraction)
         self._prefix_label.setVisible(False)
         name_row_layout.addWidget(self._prefix_label, 0)

@@ -36,10 +36,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.ui_qt.view_items import ViewItem
+from monostudio.ui_qt.view_items import ViewItem, display_name_for_item
 from monostudio.ui_qt.thumbnails import ThumbnailCache
-from monostudio.ui_qt.style import MONOS_COLORS, THUMB_TAG_STYLE
+from monostudio.ui_qt.style import MONOS_COLORS, THUMB_TAG_STYLE, monos_font
+from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.workspace_reader import ProjectQuickStats
 from monostudio.core.models import Asset, Shot
 
@@ -73,6 +75,7 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._hovered_row: int | None = None
         self._card_size = QSize(320, 260)
         self._gap_px = 24
+        self._active_department: str | None = None
 
         # Theme cache (no per-paint parsing / allocations)
         self._c_card_bg = QColor(MONOS_COLORS["card_bg"])
@@ -88,19 +91,21 @@ class _GridCardDelegate(QStyledItemDelegate):
 
         # Font cache (no per-paint allocations)
         # Shared thumb tag style (status + filter tags): same geometry, only color differs.
-        self._font_thumb_tag = QFont("Inter", int(THUMB_TAG_STYLE["font_size"]))
-        self._font_thumb_tag.setWeight(QFont.Weight(int(THUMB_TAG_STYLE["font_weight"])))
-        self._font_name = QFont("Inter", 13)
-        self._font_name.setWeight(QFont.Weight.Medium)
-        self._font_mono = QFont("JetBrains Mono", 8)
+        self._font_thumb_tag = monos_font("Inter", int(THUMB_TAG_STYLE["font_size"]), QFont.Weight(int(THUMB_TAG_STYLE["font_weight"])))
+        self._font_name = monos_font("Inter", 13, QFont.Weight.Medium)
+        self._font_mono = monos_font("JetBrains Mono", 8)
         # Shared meta style (mono) for ALL cards.
         self._font_meta_mono = QFont(self._font_mono)
-        self._font_meta = QFont("Inter", 11)
+        self._font_meta = monos_font("Inter", 11)
 
         st = view.style()
         self._icon_eye = lucide_icon("eye", size=16, color_hex=MONOS_COLORS["text_primary"])
         self._icon_download = lucide_icon("download", size=16, color_hex=MONOS_COLORS["text_primary"])
         self._icon_more = lucide_icon("ellipsis", size=16, color_hex=MONOS_COLORS["text_primary"])
+
+    @staticmethod
+    def _norm(s: str | None) -> str:
+        return (s or "").strip().casefold()
 
     def set_hovered_index(self, index) -> None:
         row = index.row() if index and index.isValid() else None
@@ -118,6 +123,13 @@ class _GridCardDelegate(QStyledItemDelegate):
         if gap_px > 0 and gap_px != self._gap_px:
             self._gap_px = gap_px
             self._view.viewport().update()
+
+    def set_active_department(self, department: str | None) -> None:
+        dep = (department or "").strip() or None
+        if dep == self._active_department:
+            return
+        self._active_department = dep
+        self._view.viewport().update()
 
     @staticmethod
     def _rounded_rect(p: QPainter, r: QRect, radius: int, *, fill: QColor, pen: QPen | None = None) -> None:
@@ -184,7 +196,9 @@ class _GridCardDelegate(QStyledItemDelegate):
                     p.drawPixmap(thumb, crop)
 
             def status_key() -> str:
-                # Lowercase key for styling parity with QSS rule.
+                # User-set status overrides computed (asset/shot only).
+                if item.kind.value in ("asset", "shot") and getattr(item, "user_status", None):
+                    return (item.user_status or "").strip().lower() or "waiting"
                 if item.kind.value == "project":
                     stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
                     return (stats.status if stats else "WAITING").lower()
@@ -241,18 +255,92 @@ class _GridCardDelegate(QStyledItemDelegate):
                 p.drawText(r2, Qt.AlignCenter, t)
                 return r2
 
-            # Status tag (top-left) for projects/assets/shots
+            # Status dot (right of thumb) — colored circle only, no text
             k = status_key()
-            txt = k.upper()
-            text_c, bg_c, border_c = status_style(k)
-            badge = draw_thumb_tag(
-                x=thumb.left() + 12,
-                y=thumb.top() + 12,
-                text=txt,
-                text_color=text_c,
-                bg_color=bg_c,
-                border_color=border_c,
-            )
+            _text_c, _bg_c, border_c = status_style(k)
+            dot_radius = 5
+            dot_x = thumb.right() - 12 - dot_radius
+            dot_y = thumb.top() + 12 + dot_radius
+            p.setPen(QPen(border_c, 1))
+            p.setBrush(border_c)
+            p.drawEllipse(QPoint(dot_x, dot_y), dot_radius, dot_radius)
+
+            # Type tag (top-left) — asset/shot type badge (CHAR, PROP, SEQ, …)
+            type_badge_text = (item.type_badge or "").strip()
+            if type_badge_text:
+                a_bg = int(THUMB_TAG_STYLE["bg_alpha"])
+                a_border = int(THUMB_TAG_STYLE["border_alpha"])
+                type_key = str(THUMB_TAG_STYLE.get("type_color_key", "emerald_500"))
+                type_c = QColor(MONOS_COLORS.get(type_key, MONOS_COLORS["text_meta"]))
+
+                def with_alpha(base: QColor, a: int) -> QColor:
+                    c2 = QColor(base)
+                    c2.setAlpha(int(a))
+                    return c2
+
+                type_bg = with_alpha(type_c, a_bg)
+                type_border = with_alpha(type_c, a_border)
+                draw_thumb_tag(
+                    x=thumb.left() + 12,
+                    y=thumb.top() + 12,
+                    text=type_badge_text,
+                    text_color=type_c,
+                    bg_color=type_bg,
+                    border_color=type_border,
+                )
+
+            # DCC badge (bottom-right of thumb) — only when Department context is explicit (active department)
+            def dcc_badge_for_item() -> tuple[QIcon | None, str | None]:
+                dep = (self._active_department or "").strip()
+                if not dep:
+                    return None, None
+                ref = item.ref
+                if not isinstance(ref, (Asset, Shot)):
+                    return None, None
+                # Find matching department object on the item.
+                dept_obj = None
+                for d in getattr(ref, "departments", ()) or ():
+                    try:
+                        if self._norm(getattr(d, "name", "")) == self._norm(dep):
+                            dept_obj = d
+                            break
+                    except Exception:
+                        continue
+                if dept_obj is None:
+                    return None, None
+                if not getattr(dept_obj, "work_file_exists", False):
+                    return None, None
+                dcc_id = getattr(dept_obj, "work_file_dcc", None)
+                dcc_id = dcc_id.strip() if isinstance(dcc_id, str) else ""
+                if not dcc_id:
+                    return None, None
+
+                # Registry is the single source of truth for DCC identity + branding.
+                try:
+                    info = get_default_dcc_registry().get_dcc_info(dcc_id)
+                except Exception:
+                    info = None
+
+                slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+                color = info.get("brand_color_hex") if isinstance(info, dict) else None
+                if isinstance(slug, str) and slug.strip():
+                    return brand_icon(slug.strip(), size=16, color_hex=(color if isinstance(color, str) else None)), dcc_id
+                return lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]), dcc_id
+
+            dcc_icon, _dcc_id = dcc_badge_for_item()
+            if dcc_icon is not None and not dcc_icon.isNull():
+                size = 18
+                pad = 6
+                chip_h = size + pad * 2
+                bx = thumb.right() - 12 - chip_h
+                by = thumb.bottom() - 12 - chip_h
+                bg_rect = QRect(bx, by, chip_h, chip_h)
+                # Subtle chip for readability over thumbnails
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(0, 0, 0, 140))
+                p.drawRoundedRect(bg_rect, 10, 10)
+                pix = dcc_icon.pixmap(size, size)
+                p.drawPixmap(bx + pad, by + pad, pix)
 
             # Stop clipping before text to avoid rounded-corner cropping issues
             p.setClipping(False)
@@ -272,7 +360,7 @@ class _GridCardDelegate(QStyledItemDelegate):
             else:
                 p.setPen(self._c_text_primary)
             name_rect = QRect(x, y, w, 20)
-            p.drawText(name_rect, Qt.AlignLeft | Qt.AlignVCenter, item.name)
+            p.drawText(name_rect, Qt.AlignLeft | Qt.AlignVCenter, display_name_for_item(item))
 
             if item.kind.value == "project":
                 stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
@@ -319,6 +407,9 @@ class MainView(QWidget):
     root_context_menu_requested = Signal(object)  # emits global QPoint
     copy_inventory_requested = Signal(object)  # emits ViewItem (asset/shot only)
     delete_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    open_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    open_with_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    status_set_requested = Signal(object, str)  # (ViewItem, status: ready|progress|waiting|blocked)
     primary_action_requested = Signal()  # header primary action
     view_mode_changed = Signal(str)  # "tile" | "list"
 
@@ -353,28 +444,54 @@ class MainView(QWidget):
         header_layout.setContentsMargins(12, 12, 12, 12)
         header_layout.setSpacing(12)
 
-        self._context_title = QLabel("Asset", header)
+        title_row = QWidget(header)
+        title_row.setObjectName("MainViewTitleRow")
+        title_row_l = QHBoxLayout(title_row)
+        title_row_l.setContentsMargins(0, 0, 0, 0)
+        title_row_l.setSpacing(8)
+
+        self._context_title = QLabel("Asset", title_row)
         self._context_title.setObjectName("MainViewContextTitle")
-        self._context_title.setTextFormat(Qt.RichText)
-        f_title = QFont("Inter", 14)
-        f_title.setWeight(QFont.Weight.DemiBold)
+        f_title = monos_font("Inter", 16, QFont.Weight.Bold)
         self._context_title.setFont(f_title)
 
-        # Center: View toggle (Grid | List)
+        self._department_badge = QWidget(title_row)
+        self._department_badge.setObjectName("MainViewDepartmentBadge")
+        self._department_badge.setAttribute(Qt.WA_StyledBackground, True)
+        self._department_badge.setVisible(False)
+        badge_l = QHBoxLayout(self._department_badge)
+        badge_l.setContentsMargins(8, 4, 10, 4)
+        badge_l.setSpacing(6)
+        self._department_icon = QLabel(self._department_badge)
+        self._department_icon.setScaledContents(False)
+        self._department_icon.setFixedSize(16, 16)
+        dep_font = monos_font("Inter", 13, QFont.Weight.Bold)
+        self._department_label = QLabel(self._department_badge)
+        self._department_label.setObjectName("MainViewDepartmentBadgeLabel")
+        self._department_label.setFont(dep_font)
+        badge_l.addWidget(self._department_icon, 0, Qt.AlignVCenter)
+        badge_l.addWidget(self._department_label, 0, Qt.AlignVCenter)
+        title_row_l.addWidget(self._context_title, 0, Qt.AlignVCenter)
+        title_row_l.addWidget(self._department_badge, 0, Qt.AlignVCenter)
+
+        # Center: View toggle (Grid | List) — pill UI same as Settings Tier3 (Asset Depts | Shot Depts)
         toggle = QWidget(header)
+        toggle.setObjectName("Tier3Container")
+        toggle.setAttribute(Qt.WA_StyledBackground, True)
+        toggle.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         toggle_layout = QHBoxLayout(toggle)
-        toggle_layout.setContentsMargins(0, 0, 0, 0)
-        toggle_layout.setSpacing(6)
+        toggle_layout.setContentsMargins(6, 6, 6, 6)
+        toggle_layout.setSpacing(4)
 
-        self._btn_grid = QToolButton(toggle)
-        self._btn_grid.setText("Grid")
+        self._btn_grid = QPushButton("Grid", toggle)
+        self._btn_grid.setObjectName("Tier3Pill")
         self._btn_grid.setCheckable(True)
-        self._btn_grid.setAutoRaise(True)
+        self._btn_grid.setFlat(True)
 
-        self._btn_list = QToolButton(toggle)
-        self._btn_list.setText("List")
+        self._btn_list = QPushButton("List", toggle)
+        self._btn_list.setObjectName("Tier3Pill")
         self._btn_list.setCheckable(True)
-        self._btn_list.setAutoRaise(True)
+        self._btn_list.setFlat(True)
 
         self._view_toggle_group = QButtonGroup(self)
         self._view_toggle_group.setExclusive(True)
@@ -383,8 +500,8 @@ class MainView(QWidget):
         self._btn_grid.clicked.connect(lambda: self.set_view_mode("tile", save=True))
         self._btn_list.clicked.connect(lambda: self.set_view_mode("list", save=True))
 
-        toggle_layout.addWidget(self._btn_grid)
-        toggle_layout.addWidget(self._btn_list)
+        toggle_layout.addWidget(self._btn_grid, 0)
+        toggle_layout.addWidget(self._btn_list, 0)
 
         # Right: Card size (Small/Medium/Large) for grid mode
         self._card_size_menu = QMenu(self)
@@ -430,8 +547,8 @@ class MainView(QWidget):
         self._tile_view.setUniformItemSizes(True)
         # Use explicit gap in grid sizing (prevents "stuck together" rendering).
         self._tile_view.setSpacing(0)
-        # Keep viewport width stable to avoid oscillation when scrollbar appears/disappears.
-        self._tile_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        # Scrollbar only when content overflows (auto-hide when list not clipped).
+        self._tile_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._tile_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._tile_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._tile_view.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -503,7 +620,7 @@ class MainView(QWidget):
         self._list_view.verticalHeader().setVisible(False)
         self._list_view.verticalHeader().setDefaultSectionSize(28)
         self._list_view.setShowGrid(False)
-        self._list_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self._list_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._list_view.doubleClicked.connect(self._on_list_activated)
         self._list_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_view.customContextMenuRequested.connect(self._on_list_context_menu)
@@ -534,7 +651,7 @@ class MainView(QWidget):
         layout.addWidget(header, 0)
         layout.addWidget(self._content, 1)
 
-        header_layout.addWidget(self._context_title, 0, Qt.AlignVCenter)
+        header_layout.addWidget(title_row, 0, Qt.AlignVCenter)
         header_layout.addStretch(1)
         header_layout.addWidget(toggle, 0, Qt.AlignVCenter)
         header_layout.addStretch(1)
@@ -625,24 +742,30 @@ class MainView(QWidget):
     def set_active_department(self, department: str | None) -> None:
         self._active_department = (department or "").strip() or None
         self.update_title(base_title=self._base_title or self._context_title.text(), department=self._active_department)
+        try:
+            self._grid_delegate.set_active_department(self._active_department)
+        except Exception:
+            pass
 
     def update_title(self, *, base_title: str, department: str | None) -> None:
         """
         Title formatting:
-        - Base title always shown (uppercased)
-        - If department active: append " · DEPARTMENT" in visually-secondary style
+        - Base title always shown (uppercased, bold)
+        - If department active: show badge with icon + department name (bold, BG + border)
         """
         base = (base_title or "").strip()
         self._base_title = base
         base_up = base.upper() if base else ""
+        self._context_title.setText(base_up)
         dep = (department or "").strip()
         if not dep:
-            self._context_title.setText(base_up)
+            self._department_badge.setVisible(False)
             return
         dep_up = dep.upper()
-        # Visually secondary: reuse text_label color (no badge/background).
-        secondary = MONOS_COLORS.get("text_label", "#a1a1aa")
-        self._context_title.setText(f'{base_up}<span style="color:{secondary};"> · {dep_up}</span>')
+        icon = lucide_icon("layers", size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
+        self._department_icon.setPixmap(icon.pixmap(16, 16))
+        self._department_label.setText(dep_up)
+        self._department_badge.setVisible(True)
 
     def set_primary_action(self, *, label: str, enabled: bool, tooltip: str | None) -> None:
         # Always visible; enabled and tooltip reflect current context requirements.
@@ -704,6 +827,20 @@ class MainView(QWidget):
         self._all_items = items
         self._populate_views(items)
 
+    def select_item_by_path(self, path: Path) -> bool:
+        """Select the row whose item has the given path; returns True if found and selected."""
+        path = Path(path)
+        for row in range(self._tile_model.rowCount()):
+            idx = self._tile_model.index(row, 0)
+            if not idx.isValid():
+                continue
+            item = idx.data(Qt.UserRole)
+            if isinstance(item, ViewItem) and item.path == path:
+                self._tile_view.setCurrentIndex(idx)
+                self._list_view.setCurrentIndex(self._list_model.index(row, 0))
+                return True
+        return False
+
     def invalidate_thumbnail(self, item_root: Path) -> None:
         """
         Force a thumbnail refresh for a specific item.
@@ -748,11 +885,11 @@ class MainView(QWidget):
         self._list_model.setHorizontalHeaderLabels(self._list_headers())
         self._apply_list_column_defaults()
 
-        mono = QFont("JetBrains Mono", 11)
+        mono = monos_font("JetBrains Mono", 11)
 
         for idx, item in enumerate(items, start=1):
             # Tile: Name only; metadata painted via icon and secondary lines (delegate-friendly).
-            tile_entry = QStandardItem(item.name)
+            tile_entry = QStandardItem(display_name_for_item(item))
             tile_entry.setEditable(False)
             tile_entry.setData(item, Qt.UserRole)
             tile_entry.setData(None, self._THUMB_STATE_ROLE)
@@ -767,7 +904,7 @@ class MainView(QWidget):
                 updated = "—" if not stats or not stats.last_modified else stats.last_modified
 
                 c_index = QStandardItem(str(idx))
-                c_name = QStandardItem(item.name)
+                c_name = QStandardItem(display_name_for_item(item))
                 c_status = QStandardItem(status)
                 c_shots = QStandardItem(shots)
                 c_assets = QStandardItem(assets)
@@ -783,7 +920,7 @@ class MainView(QWidget):
             else:
                 # List (high-density): Index, Name, Status, Version, Assignee, Last Updated
                 c_index = QStandardItem(str(idx))
-                c_name = QStandardItem(item.name)
+                c_name = QStandardItem(display_name_for_item(item))
                 status = "WAITING"
                 if isinstance(item.ref, (Asset, Shot)):
                     if any(d.publish_version_count > 0 for d in item.ref.departments):
@@ -856,12 +993,13 @@ class MainView(QWidget):
             pass
 
     def _icon_for_item(self, item: ViewItem):
-        # v1.1: Neutral placeholder tile for Assets/Shots when no thumbnail exists.
+        # Placeholder by kind when no thumbnail: asset/shot/project get type icon, not text.
         if item.kind.value in ("asset", "shot", "project"):
-            return self._neutral_placeholder_icon(item.name)
+            return self._placeholder_icon_for_kind(item.kind.value)
         return lucide_icon("folder", size=20, color_hex=MONOS_COLORS["text_label"])
 
-    def _neutral_placeholder_icon(self, name: str) -> QIcon:
+    def _placeholder_icon_for_kind(self, kind: str) -> QIcon:
+        """Icon placeholder for tile when user has not set thumbnail or image file is missing."""
         size = self._THUMBNAIL_SIZE_PX
         pix = QPixmap(size, size)
         pix.fill(QColor("#2B2D30"))
@@ -870,20 +1008,17 @@ class MainView(QWidget):
         try:
             p.setRenderHint(QPainter.Antialiasing, True)
             p.setRenderHint(QPainter.TextAntialiasing, True)
-            # Flat, minimal, low-contrast placeholder.
             p.fillRect(0, 0, size, size, QColor("#26282B"))
             p.setPen(QPen(QColor("#3A3D41"), 1))
             p.drawRect(0, 0, size - 1, size - 1)
 
-            # Optional: first letter of item name (subtle).
-            letter = (name.strip()[:1] or "").upper()
-            if letter:
-                p.setPen(QColor("#A9ABB0"))
-                font = QFont()
-                font.setPointSize(20)
-                font.setBold(True)
-                p.setFont(font)
-                p.drawText(pix.rect(), Qt.AlignCenter, letter)
+            icon_name = "box" if kind == "asset" else "clapperboard" if kind == "shot" else "layout-dashboard"
+            icon = lucide_icon(icon_name, size=128, color_hex="#A9ABB0")
+            src = icon.pixmap(128, 128)
+            if not src.isNull():
+                x = (size - 128) // 2
+                y = (size - 128) // 2
+                p.drawPixmap(x, y, src)
         finally:
             p.end()
 
@@ -1013,13 +1148,18 @@ class MainView(QWidget):
 
         menu = QMenu(self)
 
+        open_action = None
+        open_with_action = None
         copy_inventory = None
         if item.kind.value in ("asset", "shot"):
-            copy_inventory = menu.addAction("Copy Inventory")
+            open_action = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open")
+            open_with_action = menu.addAction(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]), "Open With…")
+            menu.addSeparator()
+            copy_inventory = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Inventory")
             menu.addSeparator()
 
-        copy_full_path = menu.addAction("Copy Full Path")
-        open_folder = menu.addAction("Open Folder")
+        copy_full_path = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Full Path")
+        open_folder = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Folder")
 
         menu.addSeparator()
 
@@ -1029,18 +1169,28 @@ class MainView(QWidget):
         open_publish = None
 
         if item.kind.value in ("asset", "shot"):
+            # Set status submenu (user override)
+            set_status_menu = QMenu("Set status", menu)
+            for label, key in (("Ready", "ready"), ("Progress", "progress"), ("Waiting", "waiting"), ("Blocked", "blocked")):
+                act = set_status_menu.addAction(label)
+                act.setData(key)
+            menu.addMenu(set_status_menu)
             # Existing v1 behavior: Refresh on Asset/Shot items.
-            refresh_action = menu.addAction("Refresh")
-            delete_action = menu.addAction("Delete…")
+            refresh_action = menu.addAction(lucide_icon("download", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
+            delete_action = menu.addAction(lucide_icon("x", size=16, color_hex=MONOS_COLORS["text_label"]), "Delete…")
+            if delete_action is not None:
+                delete_action.setProperty("class", "danger-action")
         elif item.kind.value == "department":
             # Optional (already meaningful in UI): open work/publish folders
-            open_work = menu.addAction("Open Work Folder")
-            open_publish = menu.addAction("Open Publish Folder")
+            open_work = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Work Folder")
+            open_publish = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Publish Folder")
 
         # Store action ids on the menu for dispatch without global state
         menu.setProperty("_act_copy_full_path", copy_full_path)
         menu.setProperty("_act_open_folder", open_folder)
         menu.setProperty("_act_copy_inventory", copy_inventory)
+        menu.setProperty("_act_open", open_action)
+        menu.setProperty("_act_open_with", open_with_action)
         menu.setProperty("_act_refresh", refresh_action)
         menu.setProperty("_act_delete", delete_action)
         menu.setProperty("_act_open_work", open_work)
@@ -1051,12 +1201,24 @@ class MainView(QWidget):
         if chosen is None:
             return
 
+        # User-set status (submenu action carries data)
+        status_val = chosen.data() if hasattr(chosen, "data") else None
+        if isinstance(status_val, str) and status_val in ("ready", "progress", "waiting", "blocked"):
+            self.status_set_requested.emit(item, status_val)
+            return
+
         # Compare by label text; labels are fixed by spec.
         text = getattr(chosen, "text", lambda: "")()
 
         if text == "Copy Inventory":
             # v1.2 extension: delegate generation to MainWindow (in-memory index)
             self.copy_inventory_requested.emit(item)
+            return
+        if text == "Open":
+            self.open_requested.emit(item)
+            return
+        if text == "Open With…":
+            self.open_with_requested.emit(item)
             return
         if text == "Copy Full Path":
             self._copy_full_path(str(item.path))

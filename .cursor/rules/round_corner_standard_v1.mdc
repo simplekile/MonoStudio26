@@ -1,0 +1,63 @@
+---
+description: MONOS — Chuẩn bo góc cho top-level window (dialog, menu popup)
+globs: monostudio/ui_qt/style.py, monostudio/ui_qt/**/*.py
+alwaysApply: false
+---
+
+# MONOS — Round Corner Standard (v1)
+
+Công thức thống nhất để cửa sổ/popup **bo góc thật** (không góc đen, không phụ thuộc chỉ QSS): **Frameless + WA_TranslucentBackground + mask bo góc**.
+
+## Tại sao không chỉ dùng QSS?
+
+- QSS `border-radius` chỉ áp dụng cho **nội bộ widget**; với top-level (QDialog, QMenu popup), OS vẫn vẽ nền/viền window → góc dễ bị **đen** hoặc vuông.
+- Cần **tắt khung OS** và **cho phép trong suốt**, rồi **tự vẽ shape** bằng mask + paint.
+
+## Công thức bắt buộc
+
+| Yêu cầu | Cách làm |
+|--------|----------|
+| Tắt khung OS | `setWindowFlags(windowFlags() \| Qt.FramelessWindowHint)` |
+| Cho phép trong suốt | `setAttribute(Qt.WA_TranslucentBackground, True)` |
+| Bo góc thật (shape) | Tạo mask bằng **QBitmap** + `drawRoundedRect`, rồi `setMask(bitmap)` |
+| Khi nào set mask | Sau khi widget **đã có kích thước**: trong **showEvent** và **resizeEvent** |
+| Vẽ nền/viền mượt | Trong **paintEvent**: vẽ rounded rect (Antialiasing), rồi `super().paintEvent(event)` |
+
+## Tạo mask (QBitmap)
+
+```cpp
+// Pseudocode — trong showEvent / resizeEvent, khi rect() đã có size:
+QBitmap bitmap(width, height);
+bitmap.fill(Qt::color0);   // vùng trong suốt
+QPainter p(&bitmap);
+p.setRenderHint(QPainter::Antialiasing);
+p.setBrush(Qt::color1);
+p.setPen(Qt::NoPen);
+p.drawRoundedRect(rect(), radius, radius);
+setMask(bitmap);
+```
+
+Trong Python (PySide6): `QBitmap(w, h)`, `fill(Qt.GlobalColor.color0)`, vẽ `color1` rounded rect, `setMask(bitmap)`.
+
+## Vẽ nền + viền (paintEvent)
+
+- Nền: vẽ **rounded rect** với màu panel (vd `#18181b` dialog, `#1c1c1f` menu), bật **Antialiasing**.
+- Sau đó gọi **super().paintEvent(event)** để vẽ content.
+- Viền: có thể vẽ thêm rounded rect (stroke) **sau** content, hoặc dùng **overlay widget** (border luôn trên cùng) để không bị content repaint đè.
+
+## Áp dụng
+
+- **QDialog**: dùng base class `MonosDialog` (trong `style.py`) — đã có mask, paintEvent, overlay viền, overlay nền trắng 15% khi modal.
+- **QMenu popup**: dùng base class `MonosMenu` (trong `style.py`) — Frameless, WA_TranslucentBackground, mask trong showEvent, paintEvent vẽ nền bo góc; QSS đặt `background-color: transparent` cho menu.
+
+## Số liệu MONOS (đồng bộ)
+
+- **Radius**: 12px (dialog và menu).
+- **Viền**: sáng hơn nền (vd `#3f3f46` hoặc `rgba(255,255,255,0.28)`), vẽ inset hoặc overlay để không bị mask cắt.
+
+## Tóm tắt
+
+1. **FramelessWindowHint** + **WA_TranslucentBackground**.
+2. **setMask(QBitmap)** với rounded rect, gọi trong **showEvent** / **resizeEvent**.
+3. **paintEvent**: vẽ nền rounded (antialiasing) → super().paintEvent() → (tùy chọn) vẽ viền trên cùng hoặc overlay.
+4. QSS cho widget đó: **background transparent** để không vẽ đè lên paintEvent.

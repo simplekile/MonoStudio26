@@ -1,0 +1,14 @@
+{
+  "departments": {
+    "layout": {"label": "Layout", "folder": "layout", "shot_folder": "layout", "asset_folder": "layout", "order": 1},
+    "model": {"label": "Modeling", "folder": "model", "shot_folder": "model", "asset_folder": "01_modeling", "order": 2},
+    "rig": {"label": "Rigging", "folder": "rig", "shot_folder": "rig", "asset_folder": "02_rigging", "order": 3},
+    "surfacing": {"label": "Surfacing", "folder": "surfacing", "shot_folder": "surfacing", "asset_folder": "03_surfacing", "order": 4},
+    "grooming": {"label": "Grooming", "folder": "grooming", "shot_folder": "grooming", "asset_folder": "05_groom", "order": 5},
+    "lookdev": {"label": "Lookdev", "folder": "lookdev", "shot_folder": "lookdev", "asset_folder": "04_lookdev", "order": 6},
+    "anim": {"label": "Animation", "folder": "anim", "shot_folder": "01_anim", "asset_folder": "06_anim", "order": 7},
+    "fx": {"label": "FX", "folder": "fx", "shot_folder": "02_fx", "asset_folder": "07_fx", "order": 8},
+    "lighting": {"label": "Lighting", "folder": "lighting", "shot_folder": "03_lighting", "asset_folder": "08_lighting", "order": 9},
+    "comp": {"label": "Comp", "folder": "comp", "shot_folder": "04_comp", "asset_folder": "comp", "order": 10}
+  }
+}

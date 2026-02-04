@@ -1,0 +1,114 @@
+---
+description: MONOS Deep Dark table QSS and PySide6 config for high-density pipeline tables
+globs: monostudio/ui_qt/**/*.py
+alwaysApply: false
+---
+
+# MONOS Table — Deep Dark (High-Density Pipeline)
+
+Để phù hợp với giao diện MONOS (mật độ thông tin cao, phong cách Deep Dark), Table trong Qt cần được tối ưu để hiển thị hàng trăm dòng dữ liệu mà không gây mỏi mắt.
+
+## 1. QSS (Deep Dark Table Style)
+
+Áp dụng qua **global app stylesheet** (vd `monostudio/ui_qt/style.py`), không viết QSS rải rác theo widget.
+
+```css
+/* Tổng thể Table */
+QTableWidget, QTableView {
+    background-color: #121214;
+    border: 1px solid #2a2a2c;
+    gridline-color: #2a2a2c;
+    color: #eeeeee;
+    font-size: 12px;
+    selection-background-color: rgba(37, 99, 235, 0.15);
+    selection-color: #2563eb;
+    outline: none;
+}
+
+/* Header (Tiêu đề cột) */
+QHeaderView::section {
+    background-color: #0d0d0f;
+    color: #4a4a4c;
+    padding: 10px 15px;
+    border: none;
+    border-bottom: 2px solid #2a2a2c;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+QHeaderView::section:hover {
+    background-color: #1e1e20;
+    color: #888888;
+}
+
+/* Ô dữ liệu */
+QTableWidget::item, QTableView::item {
+    padding: 8px 15px;
+    border-bottom: 1px solid #1e1e20;
+}
+
+QTableWidget::item:hover, QTableView::item:hover {
+    background-color: rgba(255, 255, 255, 0.02);
+}
+
+QTableWidget::item:selected, QTableView::item:selected {
+    background-color: rgba(37, 99, 235, 0.1);
+    color: #ffffff;
+    border-bottom: 1px solid #2563eb;
+}
+
+/* Góc bảng (nút chọn tất cả) */
+QTableCornerButton::section {
+    background-color: #0d0d0f;
+    border: none;
+    border-bottom: 2px solid #2a2a2c;
+}
+```
+
+## 2. PySide6 — Cấu hình nâng cao
+
+- **Selection**: `setSelectionBehavior(QAbstractItemView.SelectRows)`, `setSelectionMode` theo nhu cầu (SingleSelection / MultiSelection).
+- **Grid**: `setShowGrid(False)` để giao diện tối giản.
+- **Focus**: `setFocusPolicy(Qt.NoFocus)` nếu không cần focus ring.
+- **Alternating rows**: `setAlternatingRowColors(False)` — MONOS dùng border-bottom thay vì màu xen kẽ.
+- **Header**: `QHeaderView.Interactive`, `setStretchLastSection(True)`, alignment `Qt.AlignLeft | Qt.AlignVCenter`.
+- **Vertical header**: `setVisible(False)`, `setDefaultSectionSize(40)` cho chiều cao hàng vừa phải (high density).
+
+## 3. Column Tiering (Visual Anchor)
+
+Nếu mọi cột giống nhau, mắt Artist sẽ "trôi" khi nhìn bảng 500 dòng. Phân tầng cột tạo **Visual Anchor** (điểm neo thị giác):
+
+| Tier | Vai trò | Ví dụ | Style |
+|------|--------|--------|--------|
+| **Tier 1** | Primary Key (định danh) | Name, Thumbnail | Chữ #EEEEEE, Bold, font lớn hơn 1px — cột "mắt tìm đầu tiên". |
+| **Tier 2** | Metadata / Operational | Status, Department, Category | Không dùng text thuần: dùng **Badges/Tags** màu định danh (Electric Blue Dept, Emerald Category). |
+| **Tier 3** | Secondary Info | Version, Task ID, Frame Count | Chữ #888888, **JetBrains Mono**, số thẳng hàng dễ so sánh. |
+| **Tier 4** | Action/Utility | Launch DCC, Open Folder, Delete | Chỉ icon, màu Ghost #4A4A4C, sáng lên khi hover hàng. |
+
+**Triển khai**: Không chỉ QSS — khi đổ dữ liệu, set font/màu/widget riêng theo cột:
+- Tier 1: `setFont(QFont("Inter", 11, QFont.Bold))`, `setForeground(QColor("#EEEEEE"))`.
+- Tier 2: `setCellWidget(row, col, QLabel)` với QSS badge (background rgba blue/emerald, border-radius 4px, font-size 10px, padding 2px 6px).
+- Tier 3: `setFont(QFont("JetBrains Mono", 10))`, `setForeground(QColor("#888888"))`, `setTextAlignment(Qt.AlignRight)` hoặc `AlignCenter` cho số.
+- Tier 4: Icon xám, hoặc delegate vẽ icon chỉ sáng khi hover.
+
+## 4. Zebra Tiering (Phân cấp theo hàng)
+
+Dùng **border-bottom** thay vì alternating row colors để giữ Deep Dark sạch:
+
+```css
+QTableWidget::item, QTableView::item {
+    border-bottom: 1px solid #1e1e20;
+    padding: 10px;
+}
+```
+
+**Cột đầu tiên (Tier 1 anchor)**: Khi chọn hàng, vạch xanh bên trái chỉ xuất hiện ở cột đầu để não bộ nhận diện đối tượng đang thao tác. Qt QSS có thể không hỗ trợ `:first-column` — nếu cần, dùng **Item Delegate** vẽ `border-left: 2px solid #2563eb` chỉ cho column 0 khi selected.
+
+## 5. UX Guidelines & Width
+
+- **Information density**: Font 12px hoặc 11px (Inter / JetBrains Mono cho mã).
+- **Alignment**: Text (Name, Dept) canh trái; số canh phải hoặc giữa; Badge/Status canh giữa.
+- **Visual hierarchy**: Header #0d0d0f tối hơn thân bảng để cố định khi cuộn.
+- **Độ rộng cột (Tier ngầm)**: Cột Tên/ID ~30%, cột Badge ~15%, còn lại cho metadata. Phân bổ width cũng là cách "set Tier" ngầm định.
+- **Lợi ích**: Scanning nhanh (lướt 100 hàng tập trung vào Badge màu); Focus rõ (vạch xanh cột 1 báo đối tượng đang chọn); Hierarchy tách định danh vs trạng thái.

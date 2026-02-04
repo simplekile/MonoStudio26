@@ -4,12 +4,13 @@ from pathlib import Path
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QVBoxLayout
+from PySide6.QtWidgets import QDateEdit, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QVBoxLayout
 
 from monostudio.core.project_id import generate_project_id
+from monostudio.ui_qt.style import MonosDialog
 
 
-class NewProjectDialog(QDialog):
+class NewProjectDialog(MonosDialog):
     """
     New Project (MONOS v1):
     - Project Name (required, display name)
@@ -43,10 +44,10 @@ class NewProjectDialog(QDialog):
 
         self._workspace_label = QLabel(str(self._workspace_root))
         self._workspace_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self._workspace_label.setStyleSheet("color: #71717a;")
+        self._workspace_label.setObjectName("DialogLabelMeta")
 
         workspace_hint = QLabel("Workspace Root (fixed)")
-        workspace_hint.setStyleSheet("color: #71717a; font-size: 11px;")
+        workspace_hint.setObjectName("DialogHint")
 
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)

@@ -2,19 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
-    QMenu,
     QToolButton,
     QWidget,
 )
 
 from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.style import MonosMenu
 
 
 class TopBar(QWidget):
@@ -26,9 +26,8 @@ class TopBar(QWidget):
         # Ensure QSS background is painted for this container.
         self.setAttribute(Qt.WA_StyledBackground, True)
 
-        self._project_menu = QMenu(self)
+        self._project_menu = MonosMenu(self, rounded=False)
         self._project_menu.setObjectName("ProjectSwitchMenu")
-        self._project_menu.setAttribute(Qt.WA_TranslucentBackground)
         self._project_menu.setWindowOpacity(1.0)
 
         shadow = QGraphicsDropShadowEffect(self._project_menu)
@@ -39,13 +38,13 @@ class TopBar(QWidget):
 
         self._project_switch = QToolButton(self)
         self._project_switch.setObjectName("ProjectSwitch")
-        self._project_switch.setText("Select Project")
         self._project_switch.setProperty("state", "empty")
         self._project_switch.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self._project_switch.setLayoutDirection(Qt.RightToLeft)  # icon on the right
         self._project_switch.setIcon(lucide_icon("chevron-down", size=12, color_hex="#a1a1aa"))
-        self._project_switch.setMenu(self._project_menu)
+        self._project_switch.setText("SELECT PROJECT")
         self._project_switch.setPopupMode(QToolButton.InstantPopup)
+        self._project_switch.clicked.connect(self._show_project_menu_left_aligned)
         try:
             bf = self._project_switch.font()
             bf.setLetterSpacing(QFont.AbsoluteSpacing, 0.2)  # px (tight but readable)
@@ -58,6 +57,12 @@ class TopBar(QWidget):
         layout.setSpacing(12)
         layout.addWidget(self._project_switch, 0, Qt.AlignLeft | Qt.AlignVCenter)
         layout.addStretch(1)
+
+    def _show_project_menu_left_aligned(self) -> None:
+        """Show project menu with left edge aligned to button's left edge."""
+        btn = self._project_switch
+        pos = btn.mapToGlobal(btn.rect().bottomLeft())
+        self._project_menu.popup(pos)
 
     def _set_project_switch_state(self, state: str) -> None:
         # Apply a deterministic state property for QSS styling:
@@ -123,16 +128,16 @@ class TopBar(QWidget):
             empty.setEnabled(False)
             self._project_menu.addAction(empty)
             self._project_switch.setEnabled(False)
-            self._project_switch.setText("No Projects")
+            self._project_switch.setText("NO PROJECTS")
             self._set_project_switch_state("disabled")
             return
 
         self._project_switch.setEnabled(True)
         if current_root is None:
-            self._project_switch.setText("Select Project")
+            self._project_switch.setText("SELECT PROJECT")
             self._set_project_switch_state("empty")
         else:
-            self._project_switch.setText(current_root.name)
+            self._project_switch.setText((current_root.name or "").upper())
             self._set_project_switch_state("active")
 
         group = QActionGroup(self._project_menu)

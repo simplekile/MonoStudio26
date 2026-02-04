@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt, Signal, QSize, QPoint
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -23,9 +24,9 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.models import Asset, Department, Shot
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS
+from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 from monostudio.ui_qt.thumbnails import ThumbnailCache
-from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
+from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,10 @@ class InspectorPanel(QWidget):
     close_requested = Signal()
     manage_departments_requested = Signal()
     paste_thumbnail_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    open_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    open_with_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    department_focus_changed = Signal(object, object)  # emits (ViewItem, department_name)
+    status_change_requested = Signal(object, str)  # (ViewItem, status: ready|progress|waiting|blocked)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -96,20 +101,22 @@ class InspectorPanel(QWidget):
 
         self._empty = _InspectorEmptyState()
         self._preview = _InspectorPreview()
-        self._identity = _IdentityBlock()
-        self._health = _ProductionHealth()
+        self._asset_status = _InspectorAssetStatusBlock()
         self._dept_pipeline = _DepartmentPipeline()
         self._tech = _TechnicalSpecs()
         self._stakeholders = _Stakeholders()
 
         self._dept_pipeline.manage_clicked.connect(self.manage_departments_requested.emit)
+        self._dept_pipeline.department_focused.connect(self._on_department_focused)
         self._preview.paste_requested.connect(self._on_paste_requested)
+        self._asset_status.open_clicked.connect(self._on_open_clicked)
+        self._asset_status.open_with_clicked.connect(self._on_open_with_clicked)
+        self._asset_status.status_change_requested.connect(self.status_change_requested.emit)
 
         for w in (
             self._empty,
             self._preview,
-            self._identity,
-            self._health,
+            self._asset_status,
             self._dept_pipeline,
             self._tech,
             self._stakeholders,
@@ -127,7 +134,7 @@ class InspectorPanel(QWidget):
         self._current_item = item
         has_item = item is not None
         self._empty.setVisible(not has_item)
-        for w in (self._preview, self._identity, self._health, self._dept_pipeline, self._tech, self._stakeholders):
+        for w in (self._preview, self._asset_status, self._dept_pipeline, self._tech, self._stakeholders):
             w.setVisible(has_item)
 
         if item is None:
@@ -135,8 +142,7 @@ class InspectorPanel(QWidget):
             return
 
         self._preview.set_item(item)
-        self._identity.set_item(item)
-        self._health.set_item(item)
+        self._asset_status.set_item(item)
         self._dept_pipeline.set_item(item)
         self._tech.set_item(item)
         self._stakeholders.set_item(item)
@@ -155,6 +161,33 @@ class InspectorPanel(QWidget):
         if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
             return
         self.paste_thumbnail_requested.emit(item)
+
+    def _on_open_clicked(self) -> None:
+        item = self._current_item
+        if item is None:
+            return
+        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        self.open_requested.emit(item)
+
+    def _on_open_with_clicked(self) -> None:
+        item = self._current_item
+        if item is None:
+            return
+        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        self.open_with_requested.emit(item)
+
+    def _on_department_focused(self, department_name: str) -> None:
+        item = self._current_item
+        if item is None:
+            return
+        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        dep = (department_name or "").strip()
+        if not dep:
+            return
+        self.department_focus_changed.emit(item, dep)
 
     # Backward compatibility (legacy call sites)
     def set_empty_state(self, _message: str | None = None) -> None:
@@ -224,8 +257,7 @@ class _InspectorHeader(QWidget):
 
         title = QLabel("INSPECTOR", self)
         title.setObjectName("InspectorHeaderTitle")
-        f = QFont("Inter", 10)
-        f.setWeight(QFont.Weight.ExtraBold)
+        f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
         title.setFont(f)
 
         btn = QToolButton(self)
@@ -268,12 +300,18 @@ class _PreviewWidget(QWidget):
         self.setSizePolicy(policy)
         self._pix: QPixmap | None = None
         self._has_image = False
+        self._placeholder_kind: str = ""  # "asset" | "shot" | "project" for icon; else letter
         self._placeholder_letter: str = ""
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
     def set_pixmap(self, pix: QPixmap | None) -> None:
         self._pix = pix
         self._has_image = bool(pix and not pix.isNull())
+        self.update()
+
+    def set_placeholder_kind(self, kind: str, *, letter: str = "") -> None:
+        self._placeholder_kind = (kind or "").strip().lower()
+        self._placeholder_letter = (letter or "").strip()[:1].upper()
         self.update()
 
     def set_placeholder_letter(self, letter: str) -> None:
@@ -314,24 +352,31 @@ class _PreviewWidget(QWidget):
                 p.drawPixmap(r, crop)
                 return
 
-            # Neutral placeholder (no illustration/mascot)
+            # Placeholder: icon by kind (asset/shot/project) or letter/em-dash
             p.setClipping(False)
             p.setPen(QPen(QColor(MONOS_COLORS["border"]), 1))
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(r.adjusted(0, 0, -1, -1), radius, radius)
 
+            if self._placeholder_kind in ("asset", "shot", "project"):
+                icon_name = "box" if self._placeholder_kind == "asset" else "clapperboard" if self._placeholder_kind == "shot" else "layout-dashboard"
+                icon = lucide_icon(icon_name, size=64, color_hex=MONOS_COLORS["text_meta"])
+                src = icon.pixmap(64, 64)
+                if not src.isNull():
+                    x = r.x() + (r.width() - 64) // 2
+                    y = r.y() + (r.height() - 64) // 2
+                    p.drawPixmap(x, y, src)
+                return
+
             if self._placeholder_letter:
                 p.setPen(QColor(MONOS_COLORS["text_meta"]))
-                f = QFont("Inter", 28)
-                f.setWeight(QFont.Weight.DemiBold)
+                f = monos_font("Inter", 28, QFont.Weight.DemiBold)
                 p.setFont(f)
                 p.drawText(r, Qt.AlignCenter, self._placeholder_letter)
                 return
 
-            p.setClipping(False)
             p.setPen(QColor(MONOS_COLORS["text_meta"]))
-            f = QFont("Inter", 11)
-            f.setWeight(QFont.Weight.DemiBold)
+            f = monos_font("Inter", 11, QFont.Weight.DemiBold)
             p.setFont(f)
             p.drawText(r, Qt.AlignCenter, "—")
         finally:
@@ -345,62 +390,73 @@ class _PreviewWidget(QWidget):
         self.context_menu_requested.emit(gp)
 
 
+class _PreviewContainer(QWidget):
+    """Container for thumbnail with Paste button centered on top (icon only)."""
+    paste_requested = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        l = QVBoxLayout(self)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(0)
+        self._w = _PreviewWidget(self)
+        l.addWidget(self._w, 0)
+        self._btn_paste = QToolButton(self)
+        self._btn_paste.setCursor(Qt.PointingHandCursor)
+        self._btn_paste.setToolTip("Paste thumbnail from clipboard")
+        self._btn_paste.setIcon(lucide_icon("upload", size=20, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_paste.setIconSize(QSize(24, 24))
+        self._btn_paste.setFixedSize(44, 44)
+        self._btn_paste.setStyleSheet(
+            "QToolButton { border: none; border-radius: 22px; background: rgba(0,0,0,0.6); } "
+            "QToolButton:hover { background: rgba(0,0,0,0.8); } "
+            "QToolButton:disabled { background: rgba(0,0,0,0.3); }"
+        )
+        self._btn_paste.clicked.connect(self.paste_requested.emit)
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        r = self._w.geometry()
+        x = r.x() + (r.width() - self._btn_paste.width()) // 2
+        y = r.y() + (r.height() - self._btn_paste.height()) // 2
+        self._btn_paste.move(x, y)
+        self._btn_paste.raise_()
+
+    def set_paste_enabled(self, enabled: bool) -> None:
+        self._btn_paste.setEnabled(bool(enabled))
+
+
 class _InspectorPreview(QWidget):
     paste_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        # Same thumbnail discovery rules as cards: prefer thumbnail.user.(png|jpg), then thumbnail.(png|jpg).
         self._thumbs = ThumbnailCache(size_px=512)
         self._item: ViewItem | None = None
         l = QVBoxLayout(self)
         l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(8)
-        self._w = _PreviewWidget(self)
-        l.addWidget(self._w, 0)
-
-        actions = QWidget(self)
-        actions_l = QHBoxLayout(actions)
-        actions_l.setContentsMargins(0, 0, 0, 0)
-        actions_l.setSpacing(8)
-
-        title = QLabel("THUMBNAIL", actions)
-        title.setObjectName("InspectorSectionTitle")
-        f = QFont("Inter", 10)
-        f.setWeight(QFont.Weight.ExtraBold)
-        title.setFont(f)
-        title.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
-
-        self._btn_paste = QToolButton(actions)
-        self._btn_paste.setText("Paste")
-        self._btn_paste.setCursor(Qt.PointingHandCursor)
-        self._btn_paste.setAutoRaise(True)
-        self._btn_paste.setToolTip("Paste thumbnail from clipboard")
-        self._btn_paste.clicked.connect(self.paste_requested.emit)
-
-        actions_l.addWidget(title, 0, Qt.AlignVCenter)
-        actions_l.addStretch(1)
-        actions_l.addWidget(self._btn_paste, 0, Qt.AlignVCenter)
-        l.addWidget(actions, 0)
-
-        self._w.context_menu_requested.connect(self._open_context_menu)
+        l.setSpacing(0)
+        self._container = _PreviewContainer(self)
+        l.addWidget(self._container, 0)
+        self._container.paste_requested.connect(self.paste_requested.emit)
+        self._container._w.context_menu_requested.connect(self._open_context_menu)
         self._set_paste_enabled(False)
 
     def _set_paste_enabled(self, enabled: bool) -> None:
-        self._btn_paste.setEnabled(bool(enabled))
+        self._container.set_paste_enabled(enabled)
 
     def set_item(self, item: ViewItem) -> None:
         self._item = item
         can_paste = item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
         self._set_paste_enabled(can_paste)
-        # Match card behavior: use thumbnail.png/jpg if present; else neutral placeholder.
-        self._w.set_placeholder_letter((item.name or "").strip()[:1])
+        w = self._container._w
+        w.set_placeholder_kind(item.kind.value, letter=(display_name_for_item(item) or "").strip()[:1])
         thumb = self._thumbs.resolve_thumbnail_file(item.path)
         if thumb is None:
-            self._w.set_pixmap(None)
+            w.set_pixmap(None)
             return
         pix = self._thumbs.load_thumbnail_pixmap(thumb)
-        self._w.set_pixmap(pix)
+        w.set_pixmap(pix)
 
     def refresh_thumbnail(self) -> None:
         item = self._item
@@ -417,7 +473,7 @@ class _InspectorPreview(QWidget):
         can_paste = bool(item and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT))
 
         menu = QMenu(self)
-        act = QAction("Paste thumbnail from Clipboard", menu)
+        act = QAction(lucide_icon("upload", size=16, color_hex=MONOS_COLORS["text_label"]), "Paste thumbnail from Clipboard", menu)
         act.setEnabled(can_paste)
         act.triggered.connect(self.paste_requested.emit)
         menu.addAction(act)
@@ -425,6 +481,9 @@ class _InspectorPreview(QWidget):
 
 
 class _IdentityBlock(QWidget):
+    open_clicked = Signal()
+    open_with_clicked = Signal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorIdentity")
@@ -435,8 +494,7 @@ class _IdentityBlock(QWidget):
 
         self._name = QLabel("", self)
         self._name.setObjectName("InspectorPrimaryName")
-        f = QFont("Inter", 15)
-        f.setWeight(QFont.Weight.DemiBold)
+        f = monos_font("Inter", 15, QFont.Weight.DemiBold)
         self._name.setFont(f)
 
         meta_row = QWidget(self)
@@ -463,8 +521,7 @@ class _IdentityBlock(QWidget):
         l.addWidget(meta_row, 0)
 
     def set_item(self, item: ViewItem) -> None:
-        self._name.setText(item.name)
-
+        self._name.setText(display_name_for_item(item))
         kind = item.kind.value.upper()
         version = "—"
         ref = item.ref
@@ -476,6 +533,61 @@ class _IdentityBlock(QWidget):
 
         self._meta_left.setText(kind)
         self._meta_version.setText(version)
+
+
+class _InspectorAssetStatusBlock(QWidget):
+    """One container: row1 = Asset info (name+meta) | Status combo; row2 = Open, Open With."""
+    open_clicked = Signal()
+    open_with_clicked = Signal()
+    status_change_requested = Signal(object, str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("InspectorAssetStatusBlock")
+        l = QVBoxLayout(self)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(10)
+
+        row1 = QWidget(self)
+        row1_l = QHBoxLayout(row1)
+        row1_l.setContentsMargins(0, 0, 0, 0)
+        row1_l.setSpacing(12)
+        self._identity = _IdentityBlock(self)
+        self._health = _ProductionHealth(self)
+        row1_l.addWidget(self._identity, 1)
+        row1_l.addWidget(self._health, 0, Qt.AlignVCenter)
+
+        row2 = QWidget(self)
+        row2_l = QHBoxLayout(row2)
+        row2_l.setContentsMargins(0, 0, 0, 0)
+        row2_l.setSpacing(8)
+        self._btn_open = QToolButton(row2)
+        self._btn_open.setText("Open")
+        self._btn_open.setCursor(Qt.PointingHandCursor)
+        self._btn_open.setAutoRaise(True)
+        self._btn_open.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_open.clicked.connect(self.open_clicked.emit)
+        self._btn_open_with = QToolButton(row2)
+        self._btn_open_with.setText("Open With…")
+        self._btn_open_with.setCursor(Qt.PointingHandCursor)
+        self._btn_open_with.setAutoRaise(True)
+        self._btn_open_with.setIcon(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_open_with.clicked.connect(self.open_with_clicked.emit)
+        row2_l.addWidget(self._btn_open, 0)
+        row2_l.addWidget(self._btn_open_with, 0)
+        row2_l.addStretch(1)
+
+        l.addWidget(row1, 0)
+        l.addWidget(row2, 0)
+
+        self._health.status_change_requested.connect(self.status_change_requested.emit)
+
+    def set_item(self, item: ViewItem) -> None:
+        self._identity.set_item(item)
+        self._health.set_item(item)
+        is_asset_or_shot = bool(item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT))
+        self._btn_open.setEnabled(is_asset_or_shot)
+        self._btn_open_with.setEnabled(is_asset_or_shot)
 
 
 class _MiniInfoCard(QFrame):
@@ -491,8 +603,7 @@ class _MiniInfoCard(QFrame):
 
         hdr = QLabel(title, self)
         hdr.setObjectName("InspectorMiniCardTitle")
-        f = QFont("Inter", 10)
-        f.setWeight(QFont.Weight.ExtraBold)
+        f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
         hdr.setFont(f)
         hdr.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
 
@@ -506,75 +617,77 @@ class _MiniInfoCard(QFrame):
 
 
 class _ProductionHealth(QWidget):
+    """Status combo only (no title, no assignee)."""
+    status_change_requested = Signal(object, str)  # (ViewItem, status)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorProductionHealth")
+        self._current_item: ViewItem | None = None
 
-        l = QVBoxLayout(self)
+        l = QHBoxLayout(self)
         l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(10)
+        l.setSpacing(8)
 
-        title = QLabel("PRODUCTION HEALTH", self)
-        title.setObjectName("InspectorSectionTitle")
-        f = QFont("Inter", 10)
-        f.setWeight(QFont.Weight.ExtraBold)
-        title.setFont(f)
-        title.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
-
-        row = QWidget(self)
-        row_l = QHBoxLayout(row)
-        row_l.setContentsMargins(0, 0, 0, 0)
-        row_l.setSpacing(12)
-
-        self._card_status = _MiniInfoCard("STATUS", row)
-        self._status_dot = QLabel("", row)
-        self._status_dot.setFixedSize(8, 8)
-        self._status_label = QLabel("—", row)
-        self._status_label.setStyleSheet(f"color: {MONOS_COLORS['text_label']};")
-        self._card_status._body_l.addWidget(self._status_dot, 0, Qt.AlignVCenter)
-        self._card_status._body_l.addWidget(self._status_label, 0, Qt.AlignVCenter)
-        self._card_status._body_l.addStretch(1)
-
-        self._card_assignee = _MiniInfoCard("ASSIGNEE", row)
-        self._assignee_avatar = QLabel("", row)
-        self._assignee_avatar.setFixedSize(24, 24)
-        self._assignee_avatar.setAlignment(Qt.AlignCenter)
-        self._assignee_avatar.setStyleSheet(
-            f"border-radius: 12px; background: {MONOS_COLORS['content_bg']}; color: {MONOS_COLORS['text_meta']};"
-        )
-        self._assignee_name = QLabel("—", row)
-        self._assignee_name.setStyleSheet(f"color: {MONOS_COLORS['text_label']};")
-        self._card_assignee._body_l.addWidget(self._assignee_avatar, 0)
-        self._card_assignee._body_l.addWidget(self._assignee_name, 0)
-        self._card_assignee._body_l.addStretch(1)
-
-        row_l.addWidget(self._card_status, 1)
-        row_l.addWidget(self._card_assignee, 1)
-
-        l.addWidget(title, 0)
-        l.addWidget(row, 0)
+        self._status_combo = QComboBox(self)
+        self._status_combo.setObjectName("InspectorStatusCombo")
+        self._status_combo.setMinimumWidth(90)
+        for label, key in (("Ready", "ready"), ("Progress", "progress"), ("Waiting", "waiting"), ("Blocked", "blocked")):
+            self._status_combo.addItem(label, key)
+        self._status_combo.currentIndexChanged.connect(self._on_status_combo_changed)
+        l.addWidget(self._status_combo, 0, Qt.AlignVCenter)
+        l.addStretch(1)
 
     def set_item(self, item: ViewItem) -> None:
+        self._current_item = item
         status = "WAITING"
         ref = item.ref
         if isinstance(ref, Department):
             status = _status_from_department(ref)
+            self._status_combo.setVisible(False)
         elif isinstance(ref, (Asset, Shot)):
-            # Best-effort: READY if any dept has publish versions; else PROGRESS if any work exists.
-            if any(d.publish_version_count > 0 for d in ref.departments):
-                status = "READY"
-            elif any(d.work_exists for d in ref.departments):
-                status = "PROGRESS"
+            # User-set status overrides computed
+            user = getattr(item, "user_status", None)
+            if user:
+                status = (user or "").strip().upper()
+                if len(status) >= 2:
+                    status = status[0] + status[1:].lower()  # Ready, Progress, Waiting, Blocked
+                else:
+                    status = status or "WAITING"
             else:
-                status = "WAITING"
+                if any(d.publish_version_count > 0 for d in ref.departments):
+                    status = "READY"
+                elif any(d.work_exists for d in ref.departments):
+                    status = "PROGRESS"
+                else:
+                    status = "WAITING"
+            self._status_combo.setVisible(True)
+            key = status.lower()
+            idx = self._status_combo.findData(key)
+            if idx >= 0:
+                self._status_combo.blockSignals(True)
+                self._status_combo.setCurrentIndex(idx)
+                self._status_combo.blockSignals(False)
+        else:
+            self._status_combo.setVisible(False)
 
         color = _status_color(status)
-        self._status_dot.setStyleSheet(f"border-radius: 4px; background: {color};")
-        self._status_label.setText(status)
+        self._status_combo.setStyleSheet(
+            f"QComboBox#InspectorStatusCombo {{ "
+            f"padding: 2px 8px; border-radius: 999px; border: none; "
+            f"background: rgba(255,255,255,0.06); color: {color}; "
+            f"font-size: 12px; min-width: 80px; }} "
+            f"QComboBox#InspectorStatusCombo::drop-down {{ width: 0; border: none; }} "
+            f"QComboBox#InspectorStatusCombo QAbstractItemView {{ "
+            f"background: #18181b; color: #e2e2e2; selection-background-color: #2563eb; }}"
+        )
 
-        # Assignee unknown in current data model: show placeholders.
-        self._assignee_avatar.setText("—")
-        self._assignee_name.setText("—")
+    def _on_status_combo_changed(self) -> None:
+        if self._current_item is None:
+            return
+        key = self._status_combo.currentData()
+        if isinstance(key, str):
+            self.status_change_requested.emit(self._current_item, key)
 
 
 class _ThinProgress(QWidget):
@@ -608,11 +721,15 @@ class _ThinProgress(QWidget):
 
 
 class _DeptCard(QFrame):
+    clicked = Signal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorDeptCard")
         self.setFrameShape(QFrame.NoFrame)
         self.setFixedHeight(76)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setProperty("focused", False)
 
         l = QVBoxLayout(self)
         l.setContentsMargins(12, 10, 12, 10)
@@ -625,8 +742,7 @@ class _DeptCard(QFrame):
 
         self._name = QLabel("", self)
         self._name.setStyleSheet(f"color: {MONOS_COLORS['text_primary']};")
-        f = QFont("Inter", 12)
-        f.setWeight(QFont.Weight.Medium)
+        f = monos_font("Inter", 12, QFont.Weight.Medium)
         self._name.setFont(f)
 
         self._pill = QLabel("", self)
@@ -710,6 +826,19 @@ class _DeptCard(QFrame):
         self._assignee_avatar.setText("—")
         self._assignee.setText("—")
 
+    def set_focused(self, focused: bool) -> None:
+        self.setProperty("focused", bool(focused))
+        # Trigger QSS re-polish.
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        # Clicking the card explicitly focuses this department (used by Smart Open).
+        if event and getattr(event, "button", lambda: None)() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
     def _open_folder(self) -> None:
         from PySide6.QtGui import QDesktopServices
         from PySide6.QtCore import QUrl
@@ -726,6 +855,7 @@ class _DeptCard(QFrame):
 
 class _DepartmentPipeline(QWidget):
     manage_clicked = Signal()
+    department_focused = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -741,8 +871,7 @@ class _DepartmentPipeline(QWidget):
 
         title = QLabel("DEPARTMENT PIPELINE", self)
         title.setObjectName("InspectorSectionTitle")
-        f = QFont("Inter", 10)
-        f.setWeight(QFont.Weight.ExtraBold)
+        f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
         title.setFont(f)
         title.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
 
@@ -769,13 +898,16 @@ class _DepartmentPipeline(QWidget):
         l.addWidget(hdr, 0)
         l.addWidget(self._list, 0)
         l.addWidget(self._empty, 0)
+        self._focused_dept: str | None = None
 
     def set_item(self, item: ViewItem) -> None:
-        # Clear
+        # Clear: remove cards from layout and delete them. Do not setParent(None)
+        # or each widget becomes a top-level window (popup) in Qt.
         while self._list_l.count():
-            w = self._list_l.takeAt(0).widget()
+            layout_item = self._list_l.takeAt(0)
+            w = layout_item.widget()
             if w is not None:
-                w.setParent(None)
+                w.deleteLater()
 
         depts: tuple[Department, ...] = ()
         ref = item.ref
@@ -786,12 +918,24 @@ class _DepartmentPipeline(QWidget):
 
         if not depts:
             self._empty.setVisible(True)
+            self._focused_dept = None
             return
 
         self._empty.setVisible(False)
+        self._focused_dept = None
         for d in depts:
             card = _DeptCard(self)
             card.set_department(d)
+            # Focus routing: clicking one dept focuses it and clears others.
+            def on_clicked(*, dept_name: str = d.name, current_card: _DeptCard = card) -> None:
+                self._focused_dept = dept_name
+                for i in range(self._list_l.count()):
+                    w = self._list_l.itemAt(i).widget()
+                    if isinstance(w, _DeptCard):
+                        w.set_focused(w is current_card)
+                self.department_focused.emit(dept_name)
+
+            card.clicked.connect(on_clicked)
             self._list_l.addWidget(card, 0)
 
 
@@ -823,8 +967,7 @@ class _TechnicalSpecs(QWidget):
 
         title = QLabel("TECHNICAL SPECS", self)
         title.setObjectName("InspectorSectionTitle")
-        f = QFont("Inter", 10)
-        f.setWeight(QFont.Weight.ExtraBold)
+        f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
         title.setFont(f)
         title.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
 

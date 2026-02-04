@@ -1,0 +1,98 @@
+---
+description: Dialog UI — layout, QSS và pattern theo Main UI (MONOS)
+alwaysApply: false
+globs: monostudio/ui_qt/*dialog*.py
+---
+
+# MONOS — Dialog UI (v1)
+
+Dialog phải đồng bộ với Main UI: cùng palette, typography, spacing. Style **luôn** đặt trong global stylesheet (`monostudio/ui_qt/style.py`), không viết QSS rải rác trong từng dialog.
+
+## Nguyên tắc
+
+- **Một nguồn style**: QSS cho `QDialog`, `QDialogButtonBox`, nút, hint, group box… đều khai báo trong `style.py` (trong `apply_dark_theme`).
+- **ObjectName**: Dùng `setObjectName(...)` để gắn style qua QSS (ví dụ `DialogHint`, `DialogPrimaryButton`), tránh inline `setStyleSheet()` khi có thể.
+- **Typography**: Tuân thủ rule Typography & Font Stack — Inter cho UI, JetBrains Mono cho path/ID/log; body 13px, label/muted #71717a hoặc #a1a1aa.
+
+## Layout
+
+- **Root**: `QVBoxLayout(self)` với `setContentsMargins(12, 12, 12, 12)`, `setSpacing(10)` hoặc `12`.
+- **Nút**: Đặt ở cuối layout; dùng `QDialogButtonBox` (Ok/Cancel) hoặc hàng `QPushButton` với objectName được style trong `style.py`.
+- **Lưới**: Ưu tiên 8px grid (khoảng cách 8, 12, 16…).
+
+## Màu (đồng bộ Main UI)
+
+- Nền dialog: `#18181b` (panel) hoặc `#121214` (content_bg) tùy ngữ cảnh.
+- Viền: `rgba(39, 39, 42, 0.50)` hoặc `#27272a`.
+- Chữ chính: `#fafafa` / `#cccccc`; label: `#a1a1aa`; muted/hint: `#71717a`.
+- Accent: `#2563eb` (Blue-600), `#60a5fa` (Blue-400).
+- Nút primary: giống `QPushButton#MainViewPrimaryAction` (border Blue-600, background rgba Blue, text #fafafa).
+- Nút secondary: border `rgba(39,39,42,0.50)`, background `rgba(24,24,27,0.35)`, hover sáng hơn.
+
+## Control trong dialog
+
+- **QLineEdit**: Dùng chung style global (padding 6px 8px, border-radius 6px, focus Blue-600). Trường path/ID: `setProperty("mono", true)` hoặc objectName có QSS mono.
+- **QLabel hint / phụ**: Nên dùng objectName (vd `DialogHint`) và style trong `style.py` với `color: #a1a1aa;` hoặc `#71717a`, `font-size: 11px` nếu cần.
+- **QGroupBox**: Nền và viền đồng bộ panel/surface; style trong `style.py` cho `QGroupBox` trong dialog nếu cần (ví dụ trong `OpenResolverDialog`).
+
+## QDialogButtonBox
+
+- Để nút kế thừa palette và QSS nút chung. Nếu cần nút primary rõ (vd "Open", "Save"): lấy `QDialogButtonBox.Ok`, `setText()` phù hợp, có thể set objectName (vd `DialogPrimaryButton`) và thêm QSS tương đương `MainViewPrimaryAction` trong `style.py`.
+
+## QMessageBox / QInputDialog
+
+- Dùng khi cần nhanh; kế thừa palette app. Không bắt buộc custom QSS; nếu sau này thống nhất giao diện message box thì thêm block `QMessageBox` trong `style.py`.
+
+## Ví dụ cấu trúc
+
+```python
+# Trong __init__ của QDialog
+self.setWindowTitle("…")
+self.setModal(True)
+# Tùy chọn: self.setObjectName("SomeDialog") nếu cần QSS riêng cho dialog đó
+
+root = QVBoxLayout(self)
+root.setContentsMargins(12, 12, 12, 12)
+root.setSpacing(12)
+
+hint = QLabel("…", self)
+hint.setObjectName("DialogHint")  # style trong style.py
+
+# ... nội dung (form, list, group box) ...
+
+buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+ok = buttons.button(QDialogButtonBox.Ok)
+if ok:
+    ok.setDefault(True)
+buttons.accepted.connect(self._on_accept)
+buttons.rejected.connect(self.reject)
+root.addWidget(buttons)
+```
+
+## Gợi ý QSS trong style.py (khi cần)
+
+Thêm vào chuỗi `app.setStyleSheet(...)` trong `apply_dark_theme`:
+
+```css
+/* --- Dialogs (MONOS) --- */
+QDialog {
+    background-color: #18181b;
+}
+QLabel#DialogHint {
+    color: #a1a1aa;
+    font-size: 11px;
+}
+QDialogButtonBox QPushButton[text="Delete"] {
+    /* optional: destructive variant */
+}
+```
+
+`QGroupBox` trong dialog dùng chung palette (Base/Window); nếu cần viền rõ: `border: 1px solid rgba(39, 39, 42, 0.50); border-radius: 8px; background: #121214;`.
+
+## Checklist khi thêm/sửa dialog
+
+- [ ] Margins 12, spacing 10 hoặc 12.
+- [ ] Màu chữ/hint dùng qua objectName + QSS trong `style.py`, tránh inline setStyleSheet nếu đã có class chung.
+- [ ] Path/ID read-only: mono font (property hoặc objectName).
+- [ ] Nút primary (Ok/Open/Save/Delete): rõ ràng; destructive dùng text "Delete" và có thể style đỏ nếu cần.
+- [ ] Không thêm scrollbar QSS riêng — dùng global scrollbar đã định nghĩa.

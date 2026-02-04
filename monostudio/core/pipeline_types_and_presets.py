@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from monostudio.core.department_registry import get_project_pipeline_dir
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,34 @@ def pipeline_types_and_presets_path() -> Path:
 
 def pipeline_department_vocabulary_path() -> Path:
     return pipeline_root() / "department_vocabulary.json"
+
+
+def pipeline_department_presets_dir() -> Path:
+    """Directory for shipped department mapping presets (*.json)."""
+    return pipeline_root() / "department_presets"
+
+
+def get_default_pipeline_types_and_presets() -> PipelineTypesAndPresets:
+    """Return the built-in default types and departments (same as bootstrap)."""
+    default_depts = {
+        "layout": DepartmentDef("layout", "Layout", "lay", "layout-dashboard"),
+        "model": DepartmentDef("model", "Modeling", "mdl", "box"),
+        "rig": DepartmentDef("rig", "Rigging", "rig", "bone"),
+        "surfacing": DepartmentDef("surfacing", "Surfacing", "surf", "palette"),
+        "grooming": DepartmentDef("grooming", "Grooming", "grm", "scissors"),
+        "lookdev": DepartmentDef("lookdev", "Lookdev", "ldv", "sparkles"),
+        "anim": DepartmentDef("anim", "Animation", "anim", "clapperboard"),
+        "fx": DepartmentDef("fx", "FX", "fx", "zap"),
+        "lighting": DepartmentDef("lighting", "Lighting", "lgt", "lightbulb"),
+        "comp": DepartmentDef("comp", "Comp", "comp", "sliders-horizontal"),
+    }
+    default_types = {
+        "shot": TypeDef("shot", "Shot", "sh", ["layout", "anim", "fx", "lighting"], "clapperboard"),
+        "character": TypeDef("character", "Character", "char", ["model", "rig", "surfacing", "grooming", "lookdev"], "user"),
+        "prop": TypeDef("prop", "Prop", "prop", ["model", "surfacing", "grooming", "lookdev"], "package"),
+        "environment": TypeDef("environment", "Environment", "env", ["layout", "model", "lighting", "lookdev"], "trees"),
+    }
+    return PipelineTypesAndPresets(types=default_types, departments=default_depts)
 
 
 def ensure_pipeline_bootstrap() -> None:
@@ -147,15 +178,14 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
         return PipelineTypesAndPresets(types={}, departments=out_depts)
 
     out_types: dict[str, TypeDef] = {}
-    for type_id, node in types_raw.items():
-        if not isinstance(type_id, str) or not type_id:
+    for key, node in types_raw.items():
+        if not isinstance(key, str) or not key:
             continue
         if not isinstance(node, dict):
             continue
+        # Use node["id"] as type_id when present (e.g. _characters), else use object key.
         node_id = node.get("id")
-        if isinstance(node_id, str) and node_id and node_id != type_id:
-            # Ignore mismatched nodes silently.
-            continue
+        type_id = (node_id.strip() if isinstance(node_id, str) and node_id.strip() else key)
         name = node.get("name")
         short_name = node.get("short_name")
         icon_name = node.get("icon_name")
@@ -230,6 +260,126 @@ def save_pipeline_types_and_presets(config: PipelineTypesAndPresets) -> bool:
     try:
         pipeline_root().mkdir(parents=True, exist_ok=True)
         pipeline_types_and_presets_path().write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return True
+    except OSError:
+        return False
+
+
+_TYPES_AND_PRESETS_JSON = "types_and_presets.json"
+
+
+def get_user_default_config_root() -> Path:
+    """User-level default config root: Documents/.monostudio/ (cross-platform)."""
+    return Path.home() / "Documents" / ".monostudio"
+
+
+def ensure_user_default_config_dir() -> None:
+    """Create Documents/.monostudio/ and pipeline/ subdir if missing (call at app startup)."""
+    try:
+        root = get_user_default_config_root()
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "pipeline").mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+
+def seed_project_from_user_default(project_root: Path) -> bool:
+    """
+    If Documents/.monostudio/pipeline/ has types_and_presets.json, types.json or
+    departments.json, copy them into the project's .monostudio/pipeline/ so the
+    new project uses that config. Returns True if at least one file was copied.
+    """
+    user_pipeline = get_user_default_config_root() / "pipeline"
+    try:
+        pipeline_dir = get_project_pipeline_dir(Path(project_root))
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+        copied = False
+        for name in (_TYPES_AND_PRESETS_JSON, "types.json", "departments.json"):
+            src = user_pipeline / name
+            if src.is_file():
+                shutil.copy2(src, pipeline_dir / name)
+                copied = True
+        return copied
+    except OSError:
+        return False
+
+
+def save_pipeline_types_and_presets_to_user_default(config: PipelineTypesAndPresets) -> bool:
+    """Write types and departments config to Documents/.monostudio/pipeline/types_and_presets.json."""
+    payload: dict = {"types": {}, "departments": {}}
+
+    depts_out: dict[str, dict] = {}
+    for dept_id, d in config.departments.items():
+        node: dict[str, object] = {
+            "name": d.name,
+            "short_name": d.short_name,
+        }
+        if d.icon_name:
+            node["icon_name"] = d.icon_name
+        depts_out[dept_id] = node
+    payload["departments"] = depts_out
+
+    types_out: dict[str, dict] = {}
+    for type_id, t in config.types.items():
+        node: dict[str, object] = {
+            "id": type_id,
+            "name": t.name,
+            "short_name": t.short_name,
+            "departments": t.departments,
+        }
+        if t.icon_name:
+            node["icon_name"] = t.icon_name
+        types_out[type_id] = node
+    payload["types"] = types_out
+
+    try:
+        root = get_user_default_config_root()
+        pipeline_dir = root / "pipeline"
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+        (pipeline_dir / _TYPES_AND_PRESETS_JSON).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return True
+    except OSError:
+        return False
+
+
+def save_pipeline_types_and_presets_to_project(project_root: Path, config: PipelineTypesAndPresets) -> bool:
+    """Write types and departments config to <project_root>/.monostudio/pipeline/types_and_presets.json."""
+    payload: dict = {"types": {}, "departments": {}}
+
+    depts_out: dict[str, dict] = {}
+    for dept_id, d in config.departments.items():
+        node: dict[str, object] = {
+            "name": d.name,
+            "short_name": d.short_name,
+        }
+        if d.icon_name:
+            node["icon_name"] = d.icon_name
+        depts_out[dept_id] = node
+    payload["departments"] = depts_out
+
+    types_out: dict[str, dict] = {}
+    for type_id, t in config.types.items():
+        node: dict[str, object] = {
+            "id": type_id,
+            "name": t.name,
+            "short_name": t.short_name,
+            "departments": t.departments,
+        }
+        if t.icon_name:
+            node["icon_name"] = t.icon_name
+        types_out[type_id] = node
+    payload["types"] = types_out
+
+    try:
+        pipeline_dir = get_project_pipeline_dir(Path(project_root))
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+        (pipeline_dir / _TYPES_AND_PRESETS_JSON).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )

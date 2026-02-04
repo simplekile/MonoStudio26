@@ -1,0 +1,103 @@
+---
+description: MONOS Context Menu QSS — Deep Dark, sharp, Electric Blue hover. Apply in global app stylesheet (style.py).
+globs: monostudio/ui_qt/style.py, **/ui_qt/*.py
+alwaysApply: false
+---
+
+# MONOS Context Menu QSS (Deep Dark · Electric Blue) (v1)
+
+Để đồng bộ với giao diện **MONOS Deep Dark UI** (#121214), style QSS cho **QMenu** (context menu, dropdown) cần **sắc nét (sharp)**, **padding chặt chẽ** (mật độ thông tin cao), và **hover Electric Blue**.
+
+## 1. Triển khai bắt buộc
+
+- **Luôn** áp dụng QSS cho QMenu qua **global app stylesheet** (`monostudio/ui_qt/style.py`), không viết QSS rải rác theo widget.
+- Menu dùng chung (context menu, toolbar dropdown) dùng **cùng bộ QSS**; menu đặc thù (vd `QMenu#ProjectSwitchMenu`) có thể override bằng selector theo `objectName`.
+
+## 2. QSS (Qt Style Sheet)
+
+```css
+/* ---------- MONOS :: Context Menu (Deep Dark, Electric Blue) ---------- */
+QMenu {
+    background-color: #121214;
+    border: 1px solid #2a2a2d;
+    border-radius: 4px;
+    padding: 5px 0px;
+}
+
+QMenu::item {
+    background-color: transparent;
+    padding: 6px 28px 6px 24px;
+    color: #e2e2e2;
+    font-size: 13px;
+    min-width: 180px;
+}
+
+QMenu::item:selected {
+    background-color: #2563eb;  /* Electric Blue */
+    color: white;
+}
+
+QMenu::item:selected:disabled {
+    background-color: transparent;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #2a2a2d;
+    margin: 4px 8px;
+}
+
+QMenu::icon {
+    padding-left: 10px;
+}
+
+QMenu::right-arrow {
+    width: 10px;
+    height: 10px;
+    padding-right: 10px;
+    /* image: url(...) optional when chevron-right.svg available */
+}
+
+QMenu::item:disabled {
+    color: #555555;
+}
+
+QMenu::indicator {
+    width: 14px;
+    height: 14px;
+    margin-left: 8px;
+}
+
+/* Danger actions (Archive / Delete) */
+QMenu::item[class="danger-action"]:selected {
+    background-color: #ef4444;
+}
+```
+
+## 3. Python (PySide6) — Menu “xịn” (bo góc, không viền window)
+
+Khi cần menu popup có bo góc rõ và không bị viền window mặc định:
+
+```python
+from PySide6.QtWidgets import QMenu
+from PySide6.QtCore import Qt
+
+class MonosMenu(QMenu):
+    def __init__(self, title="", parent=None):
+        super().__init__(title, parent)
+        self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+```
+
+- Dùng `MonosMenu` cho context menu nếu muốn bỏ viền và để QSS `border-radius` hiển thị đúng.
+- Drop shadow có thể thêm bằng code nếu cần (Windows 10/11).
+
+## 4. Mẹo pipeline CGI (MONOS)
+
+- **Compact**: Danh sách DCC dài → giảm padding item từ `6px` xuống `4px` trong QSS.
+- **Header row**: Dòng đầu menu kiểu “Asset Name + Badge” → dùng **QWidgetAction** với QWidget (layout: Label + Badge), rồi `menu.addAction(widget_action)`.
+- **Danger actions**: Gán `action.setProperty("class", "danger-action")` cho Archive/Delete; QSS đã định nghĩa `QMenu::item[class="danger-action"]:selected { background-color: #ef4444; }`.
+
+## 5. Shortcut
+
+- Shortcut hiển thị bên phải item; khi item disabled vẫn giữ nền transparent (`:selected:disabled`).

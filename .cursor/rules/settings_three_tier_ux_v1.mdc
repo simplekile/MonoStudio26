@@ -1,0 +1,53 @@
+---
+description: UX quy tắc 3 tầng cho Settings (Scope / Module / Filter)
+alwaysApply: false
+globs: monostudio/ui_qt/settings_dialog.py
+---
+
+# MONOS — Settings 3-Tier UX (v1)
+
+Giao diện Settings dùng **3 tầng** rõ ràng: Scope → Module → Filter. Mỗi tầng có hành vi và mẹo thiết kế riêng.
+
+## Tầng 1 (Cột trái): "The Scope"
+
+**Hành vi:** Thay đổi **hoàn toàn** ngữ cảnh hiển thị bên phải. Chọn Scope = đổi hẳn nhóm chức năng (General, Pipeline, DCCs, Project).
+
+**Mẹo thiết kế:**
+- Dùng **icon bên cạnh text** để người dùng nhận diện nhanh (vd. Settings/sliders cho General, GitBranch/layers cho Pipeline, Monitor/zap cho DCCs, Folder cho Project).
+- Cột trái style đồng bộ với main UI sidebar: item height ~36px, padding, border-radius; selected = accent nhẹ (Blue), không vẽ focus rectangle đè lên.
+
+**Trong code:** `QListWidget#SettingsNav`; mỗi `QListWidgetItem` nên có `setIcon(...)` và list có `setIconSize(QSize(16, 16))`.
+
+---
+
+## Tầng 2 (Dòng trên): "The Module"
+
+**Hành vi:** Chuyển đổi giữa **các thực thể dữ liệu khác nhau** trong cùng một Scope (vd. Pipeline → Departments | Categories | Statuses).
+
+**Mẹo thiết kế:**
+- Giữ **font chữ to và đậm hơn** một chút — đây là tiêu đề chính của vùng nội dung.
+- Tab ngang, nối với pane bên dưới (border-radius trên tab, pane bo góc dưới). Selected tab = nền trùng với pane, chữ #fafafa.
+
+**Trong code:** `QTabWidget#SettingsTier2Tabs` trong `style.py`: tab `font-size: 13px` (hoặc 14px), `font-weight: 600`.
+
+---
+
+## Tầng 3 (Dòng dưới): "The Filter"
+
+**Hành vi:** **Lọc nhỏ** dữ liệu bên trong mô-đun — cùng một loại dữ liệu nhưng góc nhìn khác (vd. Department chia theo Asset Depts / Shot Depts).
+
+**Mẹo thiết kế:**
+- Thiết kế dạng **Segmented Control** (giống iOS / Raycast): một thanh liền, các segment dính nhau; segment đầu bo trái, segment cuối bo phải; selected = một segment nổi bật (nền/viền accent), không tách rời từng “pill” riêng lẻ.
+- Người dùng hiểu: đây là **các góc nhìn khác nhau của cùng một loại dữ liệu**.
+
+**Trong code:** `QTabWidget#SettingsPillTabs` trong `style.py`: tab không margin-right (hoặc margin rất nhỏ để dính nhau), first tab border-radius trái, last tab border-radius phải, middle không bo góc ngoài; selected có background/viền accent.
+
+---
+
+## Tóm tắt
+
+| Tầng   | Vị trí    | Tên       | Hành vi           | Thiết kế chính                    |
+|--------|-----------|-----------|-------------------|-----------------------------------|
+| 1      | Cột trái  | The Scope | Đổi ngữ cảnh      | Icon + text, nhận diện nhanh      |
+| 2      | Dòng trên | The Module| Đổi thực thể      | Font to, đậm — tiêu đề nội dung   |
+| 3      | Dòng dưới | The Filter| Lọc góc nhìn      | Segmented Control, một thanh liền |

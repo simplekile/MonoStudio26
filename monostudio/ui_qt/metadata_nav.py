@@ -6,7 +6,6 @@ from typing import Literal
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
-    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -23,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.models import Asset
 from monostudio.core.pipeline_types_and_presets import PipelineTypesAndPresets, TypeDef, load_pipeline_types_and_presets
+from monostudio.ui_qt.style import MonosDialog, monos_font
 
 Mode = Literal["assets", "shots"]
 
@@ -128,7 +128,7 @@ class PipelineMetadataWorker(QObject):
             self.finished.emit()
 
 
-class ManageFilterDialog(QDialog):
+class ManageFilterDialog(MonosDialog):
     """
     Stub dialog (Phase 0): no full logic yet.
     """
@@ -139,11 +139,11 @@ class ManageFilterDialog(QDialog):
         self.setModal(True)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
+        root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
 
         msg = QLabel("Not implemented yet.", self)
-        msg.setStyleSheet("color: rgba(161,161,170,0.85);")
+        msg.setObjectName("DialogHint")
         root.addWidget(msg, 0)
 
         btn = QPushButton("Close", self)
@@ -568,8 +568,7 @@ class AppController(QObject):
 
 
 def _section_title_font() -> QFont:
-    f = QFont("Inter", 10)
-    f.setWeight(QFont.Weight.ExtraBold)
+    f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
     f.setLetterSpacing(QFont.PercentageSpacing, 110)  # tracking-widest-ish
     return f
 
