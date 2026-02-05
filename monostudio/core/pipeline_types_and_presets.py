@@ -134,7 +134,9 @@ def ensure_pipeline_bootstrap() -> None:
         }
     }
     try:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        from monostudio.core.atomic_write import atomic_write_text
+        content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(path, content, encoding="utf-8")
     except OSError:
         return
 
@@ -258,11 +260,11 @@ def save_pipeline_types_and_presets(config: PipelineTypesAndPresets) -> bool:
     payload["types"] = types_out
 
     try:
+        from monostudio.core.atomic_write import atomic_write_text
         pipeline_root().mkdir(parents=True, exist_ok=True)
-        pipeline_types_and_presets_path().write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        path = pipeline_types_and_presets_path()
+        content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(path, content, encoding="utf-8")
         return True
     except OSError:
         return False
@@ -336,13 +338,13 @@ def save_pipeline_types_and_presets_to_user_default(config: PipelineTypesAndPres
     payload["types"] = types_out
 
     try:
+        from monostudio.core.atomic_write import atomic_write_text
         root = get_user_default_config_root()
         pipeline_dir = root / "pipeline"
         pipeline_dir.mkdir(parents=True, exist_ok=True)
-        (pipeline_dir / _TYPES_AND_PRESETS_JSON).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        path = pipeline_dir / _TYPES_AND_PRESETS_JSON
+        content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(path, content, encoding="utf-8")
         return True
     except OSError:
         return False
@@ -377,12 +379,12 @@ def save_pipeline_types_and_presets_to_project(project_root: Path, config: Pipel
     payload["types"] = types_out
 
     try:
+        from monostudio.core.atomic_write import atomic_write_text
         pipeline_dir = get_project_pipeline_dir(Path(project_root))
         pipeline_dir.mkdir(parents=True, exist_ok=True)
-        (pipeline_dir / _TYPES_AND_PRESETS_JSON).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        path = pipeline_dir / _TYPES_AND_PRESETS_JSON
+        content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(path, content, encoding="utf-8")
         return True
     except OSError:
         return False

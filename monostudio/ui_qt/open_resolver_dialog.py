@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QScrollArea,
     QVBoxLayout,
@@ -26,6 +28,7 @@ from monostudio.ui_qt.style import MonosDialog
 _DCC_CARD_SIZE = 100
 _DCC_CARD_ICON_SIZE = 44
 _DCC_CARDS_PER_ROW = 4
+_HEADER_ICON_SIZE = 28
 
 
 @dataclass(frozen=True)
@@ -67,9 +70,18 @@ class DccCard(QFrame):
         layout.addWidget(self._text_label, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.setFixedSize(_DCC_CARD_SIZE, _DCC_CARD_SIZE)
+        self._last_used = False
 
     def dcc_id(self) -> str:
         return self._dcc_id
+
+    def set_last_used(self, last_used: bool) -> None:
+        if self._last_used != last_used:
+            self._last_used = last_used
+            self.setProperty("last_used", "true" if last_used else "false")
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
 
     def set_selected(self, selected: bool) -> None:
         if self._selected != selected:
@@ -105,6 +117,15 @@ class OpenResolverDialog(MonosDialog):
         dcc_registry: DccRegistry,
         initial_department: str | None = None,
         initial_dcc: str | None = None,
+        icon: QIcon | None = None,
+        hint_text: str | None = None,
+        primary_button_text: str = "Open",
+        allowed_dcc_ids: list[str] | None = None,
+        disabled_dcc_ids: list[str] | None = None,
+        show_department_picker: bool = False,
+        item_name: str = "",
+        type_folder: str = "",
+        department_label: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -115,12 +136,78 @@ class OpenResolverDialog(MonosDialog):
         self._dcc_registry = dcc_registry
         self._dept_registry = department_registry
         self._initial_dcc = (initial_dcc or "").strip() or None
+        self._allowed_dcc_ids: set[str] = set(allowed_dcc_ids) if allowed_dcc_ids else set()
+        self._disabled_dcc_ids: set[str] = set(disabled_dcc_ids) if disabled_dcc_ids else set()
+        self._show_department_picker = show_department_picker
+        self._fixed_department = (initial_department or "").strip() or None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
 
-        hint = QLabel("Choose a Department and a DCC to open this item.", self)
+        # Header: icon + bold title (distinguishes Open With vs Create New)
+        header = QWidget(self)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 8)
+        header_layout.setSpacing(10)
+        if icon and not icon.isNull():
+            icon_label = QLabel(header)
+            icon_label.setObjectName("OpenResolverDialogHeaderIcon")
+            pix = icon.pixmap(QSize(_HEADER_ICON_SIZE, _HEADER_ICON_SIZE))
+            icon_label.setPixmap(pix)
+            icon_label.setFixedSize(_HEADER_ICON_SIZE, _HEADER_ICON_SIZE)
+            header_layout.addWidget(icon_label, 0)
+        title_label = QLabel(title or "Open With…", header)
+        title_label.setObjectName("OpenResolverDialogTitle")
+        header_layout.addWidget(title_label, 1)
+        root.addWidget(header, 0)
+
+        # Context: asset name, type folder, department (so user sees what is being opened/created)
+        if item_name or type_folder or department_label:
+            ctx = QWidget(self)
+            ctx.setObjectName("OpenResolverContext")
+            ctx_l = QVBoxLayout(ctx)
+            ctx_l.setContentsMargins(0, 0, 0, 8)
+            ctx_l.setSpacing(4)
+            if item_name:
+                row = QWidget(ctx)
+                row_l = QHBoxLayout(row)
+                row_l.setContentsMargins(0, 0, 0, 0)
+                k1 = QLabel("Asset / Shot:", ctx)
+                k1.setObjectName("DialogHint")
+                v1 = QLabel(item_name, ctx)
+                v1.setObjectName("OpenResolverContextValue")
+                row_l.addWidget(k1, 0)
+                row_l.addWidget(v1, 0)
+                row_l.addStretch(1)
+                ctx_l.addWidget(row, 0)
+            if type_folder:
+                row = QWidget(ctx)
+                row_l = QHBoxLayout(row)
+                row_l.setContentsMargins(0, 0, 0, 0)
+                k2 = QLabel("Type folder:", ctx)
+                k2.setObjectName("DialogHint")
+                v2 = QLabel(type_folder, ctx)
+                v2.setObjectName("OpenResolverContextValue")
+                row_l.addWidget(k2, 0)
+                row_l.addWidget(v2, 0)
+                row_l.addStretch(1)
+                ctx_l.addWidget(row, 0)
+            if department_label:
+                row = QWidget(ctx)
+                row_l = QHBoxLayout(row)
+                row_l.setContentsMargins(0, 0, 0, 0)
+                k3 = QLabel("Department:", ctx)
+                k3.setObjectName("DialogHint")
+                v3 = QLabel(department_label, ctx)
+                v3.setObjectName("OpenResolverContextValue")
+                row_l.addWidget(k3, 0)
+                row_l.addWidget(v3, 0)
+                row_l.addStretch(1)
+                ctx_l.addWidget(row, 0)
+            root.addWidget(ctx, 0)
+
+        hint = QLabel(hint_text or "Choose a DCC to open.", self)
         hint.setWordWrap(True)
         hint.setObjectName("DialogHint")
         root.addWidget(hint, 0)
@@ -158,10 +245,15 @@ class OpenResolverDialog(MonosDialog):
         grp_layout = QVBoxLayout(grp)
         grp_layout.setContentsMargins(12, 12, 12, 12)
         grp_layout.setSpacing(10)
-        grp_layout.addWidget(QLabel("Department", grp), 0)
+        self._dept_label = QLabel("Department", grp)
+        grp_layout.addWidget(self._dept_label, 0)
         grp_layout.addWidget(self._dept, 0)
         grp_layout.addWidget(QLabel("DCC", grp), 0)
         grp_layout.addWidget(scroll, 1)
+
+        if not self._show_department_picker:
+            self._dept_label.setVisible(False)
+            self._dept.setVisible(False)
 
         # Initial selection by logical ID.
         if initial_department:
@@ -184,7 +276,7 @@ class OpenResolverDialog(MonosDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         ok = buttons.button(QDialogButtonBox.Ok)
         if ok is not None:
-            ok.setText("Open")
+            ok.setText(primary_button_text)
             ok.setDefault(True)
         self._btn_ok = ok
         buttons.accepted.connect(self._on_accept)
@@ -192,15 +284,16 @@ class OpenResolverDialog(MonosDialog):
         root.addWidget(buttons, 0)
 
         def on_card_clicked(dcc_id: str) -> None:
+            if dcc_id in self._disabled_dcc_ids:
+                return
             self._selected_dcc_id = (dcc_id or "").strip() or None
             for card in self._dcc_cards:
-                card.set_selected(card.dcc_id() == self._selected_dcc_id)
+                card.set_selected(card.isEnabled() and card.dcc_id() == self._selected_dcc_id)
             if self._btn_ok is not None:
                 self._btn_ok.setEnabled(bool(self._selected_dcc_id))
 
         def sync_dcc_list(_idx: int | None = None) -> None:
-            # Show all supported DCCs regardless of department
-            # Clear existing cards
+            # When _allowed_dcc_ids is set (Open With), only show DCCs that have created work files.
             for card in self._dcc_cards:
                 card.clicked_card.disconnect()
                 card.setParent(None)
@@ -209,6 +302,8 @@ class OpenResolverDialog(MonosDialog):
             self._selected_dcc_id = None
 
             dcc_ids = self._dcc_registry.get_all_dccs()
+            if self._allowed_dcc_ids:
+                dcc_ids = [d for d in dcc_ids if d in self._allowed_dcc_ids]
             for col, dcc_id in enumerate(dcc_ids):
                 info = self._dcc_registry.get_dcc_info(dcc_id)
                 label = info.get("label") if isinstance(info, dict) else None
@@ -223,28 +318,42 @@ class OpenResolverDialog(MonosDialog):
                     color_hex=str(color_hex).strip() if isinstance(color_hex, str) else None,
                     parent=self._cards_container,
                 )
+                if dcc_id in self._disabled_dcc_ids:
+                    card.setEnabled(False)
+                    card.setToolTip("DCC folder already exists for this department.")
                 card.clicked_card.connect(on_card_clicked)
                 row = col // _DCC_CARDS_PER_ROW
                 c = col % _DCC_CARDS_PER_ROW
                 self._cards_layout.addWidget(card, row, c)
                 self._dcc_cards.append(card)
+                # Mark card that was opened most recently (for green border)
+                if self._initial_dcc and card.dcc_id() == self._initial_dcc:
+                    card.set_last_used(True)
 
-            # Apply initial or default selection
+            # Apply initial or default selection (only enabled cards)
+            enabled_cards = [c for c in self._dcc_cards if c.isEnabled()]
             if self._initial_dcc:
                 for card in self._dcc_cards:
-                    if card.dcc_id() == self._initial_dcc:
+                    if card.dcc_id() == self._initial_dcc and card.isEnabled():
                         self._selected_dcc_id = card.dcc_id()
                         card.set_selected(True)
                         break
                 self._initial_dcc = None
-            if self._selected_dcc_id is None and self._dcc_cards:
-                self._dcc_cards[0].set_selected(True)
-                self._selected_dcc_id = self._dcc_cards[0].dcc_id()
+            if self._selected_dcc_id is None and enabled_cards:
+                enabled_cards[0].set_selected(True)
+                self._selected_dcc_id = enabled_cards[0].dcc_id()
 
-            has = len(self._dcc_cards) > 0
+            has = len(enabled_cards) > 0
             self._no_dcc_hint.setVisible(not has)
             if not has:
-                self._no_dcc_hint.setText("No DCCs registered.")
+                if self._disabled_dcc_ids and self._dcc_cards:
+                    self._no_dcc_hint.setText(
+                        "All DCCs already have a folder for this department."
+                    )
+                elif self._allowed_dcc_ids:
+                    self._no_dcc_hint.setText("No DCCs with work files yet.")
+                else:
+                    self._no_dcc_hint.setText("No DCCs registered.")
             if self._btn_ok is not None:
                 self._btn_ok.setEnabled(has and bool(self._selected_dcc_id))
 
@@ -255,8 +364,11 @@ class OpenResolverDialog(MonosDialog):
         return self._choice
 
     def _on_accept(self) -> None:
-        dept_id = self._dept.currentData()
-        dept = (dept_id or "").strip() if isinstance(dept_id, str) else ""
+        if self._show_department_picker:
+            dept_id = self._dept.currentData()
+            dept = (dept_id or "").strip() if isinstance(dept_id, str) else ""
+        else:
+            dept = self._fixed_department or ""
         dcc = (self._selected_dcc_id or "").strip() or None
         if not dept or not dcc:
             return

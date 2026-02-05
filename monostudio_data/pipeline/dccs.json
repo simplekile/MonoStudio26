@@ -3,6 +3,7 @@
     "blender": {
       "label": "Blender",
       "executable": "blender",
+      "folder": "blender",
       "departments": ["layout", "model", "rig", "surfacing", "grooming", "lookdev", "anim", "fx", "lighting", "comp"],
       "default": true,
       "workfile_extensions": [".blend"],
@@ -12,7 +13,8 @@
     "maya": {
       "label": "Maya",
       "executable": "maya",
-      "departments": ["anim", "rig", "layout"],
+      "folder": "maya",
+      "departments": ["layout", "model", "rig", "anim"],
       "workfile_extensions": [".ma", ".mb"],
       "brand_icon_slug": "autodeskmaya",
       "brand_color_hex": "#37A5CC"
@@ -20,7 +22,8 @@
     "houdini": {
       "label": "Houdini",
       "executable": "houdini",
-      "departments": ["fx"],
+      "folder": "houdini",
+      "departments": ["layout", "model", "rig", "surfacing", "grooming", "lookdev", "anim", "fx", "lighting"],
       "workfile_extensions": [".hip", ".hiplc", ".hipnc"],
       "brand_icon_slug": "houdini",
       "brand_color_hex": "#FF4713"
@@ -28,10 +31,11 @@
     "substance_painter": {
       "label": "Substance Painter",
       "executable": "substancepainter",
-      "departments": ["surfacing", "lookdev", "model", "texturing"],
+      "folder": "substance_painter",
+      "departments": ["surfacing", "lookdev", "texturing"],
       "workfile_extensions": [".spp"],
       "brand_icon_slug": "substancepainter",
-      "brand_color_hex": "#E68600"
+      "brand_color_hex": "#eeeeee"
     }
   }
 }

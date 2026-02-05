@@ -43,11 +43,10 @@ def _read_manifest_text(project_root: Path) -> str | None:
 
 
 def _write_manifest_json(project_root: Path, data: dict) -> None:
+    from monostudio.core.atomic_write import atomic_write_text
     p = _manifest_path(project_root)
-    tmp = p.with_suffix(".json.tmp")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(p)
+    content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(p, content, encoding="utf-8")
 
 
 def _append_force_rename_log(project_root: Path, payload: dict) -> Path:
@@ -144,9 +143,9 @@ def force_rename_project_id(
             # Restore manifest content if we had it.
             if manifest_before_text is not None:
                 try:
+                    from monostudio.core.atomic_write import atomic_write_text
                     p = _manifest_path(old_root)
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    p.write_text(manifest_before_text, encoding="utf-8")
+                    atomic_write_text(p, manifest_before_text, encoding="utf-8")
                 except Exception:
                     # Rollback incomplete; re-raise original error.
                     raise e

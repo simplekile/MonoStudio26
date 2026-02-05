@@ -128,6 +128,20 @@ class DccRegistry:
             out["default"] = True
         return out
 
+    def get_folder(self, dcc_id: str) -> str:
+        """
+        Return the filesystem folder name for this DCC (e.g. for use_dcc_folders layout).
+        Uses optional "folder" key in registry; otherwise dcc_id. Unknown DCC raises.
+        """
+        did = (dcc_id or "").strip()
+        entry = self._entries.get(did)
+        if entry is None:
+            raise RuntimeError(f"Unknown DCC id: {did!r}")
+        folder = entry.raw.get("folder")
+        if isinstance(folder, str) and folder.strip():
+            return folder.strip()
+        return entry.dcc_id
+
     def get_available_dccs(self, department: str) -> list[str]:
         dep = (department or "").strip()
         if not dep:

@@ -23,7 +23,7 @@ _MONOS_DIALOG_RADIUS = 12
 # Border: solid light so it's always visible (lighter than #18181b)
 _MONOS_DIALOG_BORDER = "#3f3f46"
 # Overlay behind modal dialog: white 15% opacity
-_MONOS_DIALOG_OVERLAY_CSS = "background: rgba(255, 255, 255, 0.15);"
+_MONOS_DIALOG_OVERLAY_CSS = "background: rgba(0, 0, 0, 0.55);"
 
 # Menu popup: same round-corner standard (radius 12, border lighter than bg)
 _MONOS_MENU_BG = "#1c1c1f"
@@ -200,7 +200,10 @@ class MonosDialog(QDialog):
         self._border_overlay.setGeometry(self.rect())
         self._border_overlay.raise_()
         self._border_overlay.show()
+        # Overlay phủ toàn bộ cửa sổ chính (top-level), không chỉ parent trực tiếp (vd. sidebar)
         parent = self.parent()
+        while isinstance(parent, QWidget) and parent.parent() and isinstance(parent.parent(), QWidget):
+            parent = parent.parent()
         if isinstance(parent, QWidget) and parent.isWidgetType():
             if self._overlay is None:
                 self._overlay = QWidget(parent)
@@ -476,7 +479,6 @@ def apply_dark_theme(app: QApplication) -> None:
             font-family: "Inter", "Inter UI", "Segoe UI", "San Francisco", sans-serif;
             font-size: 24px; /* x2 from 12px */
             font-weight: 500;
-            -qt-subpixel-positioned: true;
             text-align: left;
         }
         QToolButton#ProjectSwitch[state="active"] {
@@ -510,7 +512,6 @@ def apply_dark_theme(app: QApplication) -> None:
             margin-top: 8px;
             font-family: "Inter", "Inter UI", "Segoe UI", "San Francisco", sans-serif;
             font-size: 12px;
-            -qt-subpixel-positioned: true;
             outline: none;
         }
         QMenu#ProjectSwitchMenu::item {
@@ -825,11 +826,29 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #a1a1aa;
             font-size: 11px;
         }
-        /* Open Resolver: DCC selection cards */
+        /* Open Resolver / Create New: header icon + bold title */
+        QLabel#OpenResolverDialogTitle {
+            font-weight: 700;
+            font-size: 14px;
+            color: #fafafa;
+        }
+        QLabel#OpenResolverContextValue {
+            font-weight: 600;
+            font-size: 13px;
+            color: #e4e4e7;
+        }
+        /* Open Resolver: DCC selection cards — circular like type/department badges */
         QFrame#DccCard {
             background-color: #1e1e20;
             border: 1px solid #2a2a2d;
-            border-radius: 8px;
+            border-radius: 50%;
+        }
+        QFrame#DccCard[last_used="true"] {
+            border: 2px solid rgba(37, 99, 235, 0.5);
+        }
+        QFrame#DccCard[last_used="true"][selected="true"] {
+            border: 2px solid #2563eb;
+            background-color: rgba(37, 99, 235, 0.12);
         }
         QFrame#DccCard:hover {
             background-color: #27272a;
@@ -841,6 +860,11 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QFrame#DccCard[selected="true"]:hover {
             background-color: rgba(37, 99, 235, 0.18);
+        }
+        QFrame#DccCard:disabled {
+            background-color: #18181b;
+            border-color: #27272a;
+            opacity: 0.6;
         }
         QLabel#DccCardLabel {
             color: #e4e4e7;

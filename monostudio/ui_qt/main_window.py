@@ -6,12 +6,18 @@ import logging
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt, QSettings, Signal
+from PySide6.QtCore import QByteArray, QFileSystemWatcher, Qt, QSettings, Signal, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QMessageBox, QSplitter, QVBoxLayout, QWidget
 
 from monostudio.core.department_registry import DepartmentRegistry
-from monostudio.core.fs_reader import build_project_index
+from monostudio.core.dcc_registry import get_default_dcc_registry
+from monostudio.core.fs_reader import (
+    build_project_index,
+    read_use_dcc_folders,
+    resolve_work_path,
+    run_incremental_scan,
+)
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.workspace_reader import DiscoveredProject, ProjectQuickStats, discover_projects, read_project_quick_stats
@@ -23,6 +29,7 @@ from monostudio.core.pipeline_types_and_presets import (
 )
 from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
 from monostudio.core.item_status import read_item_status, write_item_status
+from monostudio.core.pending_create import remove_by_entity, remove_for_entities, clear_all as pending_clear_all
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
 from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
@@ -33,8 +40,15 @@ from monostudio.ui_qt.top_bar import TopBar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog
 from monostudio.ui_qt.app_controller import AppController
+from monostudio.ui_qt.app_state import AppState
+from monostudio.ui_qt.worker_manager import WorkerManager, WorkerTask
+from monostudio.ui_qt.thumbnails import ThumbnailManager
+from monostudio.ui_qt.fs_watcher import FsEventCollector
+from monostudio.ui_qt.stress_diagnostics_dialog import StressDiagnosticsDialog
+from monostudio.ui_qt.stress_profiler import enabled as stress_profiler_enabled
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS
+from monostudio.ui_qt.notification import notify as notification_service
 
 
 class MainWindow(QMainWindow):
@@ -70,6 +84,21 @@ class MainWindow(QMainWindow):
 
         self._project_root: Path | None = None
         self._project_index: ProjectIndex | None = None
+        self._app_state = AppState(self)
+        self._worker_manager = WorkerManager(self)
+        self._worker_manager.taskFinished.connect(self._on_worker_task_finished)
+        self._thumbnail_manager = ThumbnailManager(
+            self,
+            app_state=self._app_state,
+            worker_manager=self._worker_manager,
+            size_px=384,
+            max_memory=200,
+        )
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_event_collector = FsEventCollector(self, debounce_ms=300)
+        self._fs_watcher.fileChanged.connect(self._fs_event_collector.add_path)
+        self._fs_watcher.directoryChanged.connect(self._fs_event_collector.add_path)
+        self._fs_event_collector.batchReady.connect(self._on_fs_batch_ready)
         self._entered_parent: Asset | Shot | None = None
 
         # Centralized filter state (UI-only; no filtering engine yet)
@@ -93,7 +122,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._main_view = MainView()
+        self._main_view.set_thumbnail_manager(self._thumbnail_manager)
         self._inspector = InspectorPanel()
+        self._inspector.set_thumbnail_manager(self._thumbnail_manager)
         self._inspector.setMinimumWidth(240)
         self._top_bar = TopBar(self)
         self._clipboard_thumbs = ClipboardThumbnailHandler(parent=self)
@@ -143,6 +174,8 @@ class MainWindow(QMainWindow):
         self._sidebar.filters().typeClicked.connect(self._controller.on_type_clicked)
         self._controller.departmentChanged.connect(lambda v: self._set_current_department(v, toggle_if_same=False))
         self._controller.typeChanged.connect(lambda v: self._set_current_type(v, toggle_if_same=False))
+        self._controller.departmentChanged.connect(self._on_department_changed_notify)
+        self._controller.typeChanged.connect(self._on_type_changed_notify)
         self._controller.departmentChanged.connect(lambda _v: self._main_view.set_active_department(self._controller.current_department))
         self.departmentChanged.connect(self._on_filter_state_changed)
         self.typeChanged.connect(self._on_filter_state_changed)
@@ -156,6 +189,13 @@ class MainWindow(QMainWindow):
         self._main_view.copy_inventory_requested.connect(self._on_copy_item_inventory_requested)
         self._main_view.open_requested.connect(self._on_open_requested)
         self._main_view.open_with_requested.connect(self._on_open_with_requested)
+        self._main_view.create_new_requested.connect(self._on_create_new_requested)
+        self._main_view.selection_id_changed.connect(self._app_state.set_selection)
+        self._app_state.selectionChanged.connect(self._main_view.set_selection_from_state)
+        self._app_state.assetsChanged.connect(self._on_app_state_assets_changed)
+        self._app_state.shotsChanged.connect(self._on_app_state_shots_changed)
+        self._app_state.filtersChanged.connect(self._on_app_state_filters_changed)
+        self._app_state.thumbnailsChanged.connect(self._on_app_state_thumbnails_changed)
 
         # Clipboard thumbnail overrides: refresh UI after successful paste.
         self._clipboard_thumbs.thumbnailUpdated.connect(self._on_thumbnail_updated)
@@ -175,6 +215,13 @@ class MainWindow(QMainWindow):
         self._sync_primary_action()
         self._sync_top_bar()
         self._sync_filter_state_from_sidebar()
+        self._app_state.set_filters(self.current_department, self.current_type)
+
+        notification_service.set_main_window(self, self._main_view)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        notification_service.update_overlay_geometry()
 
     @staticmethod
     def _norm(s: str | None) -> str:
@@ -235,6 +282,7 @@ class MainWindow(QMainWindow):
         if new == self.current_department:
             return
         self.current_department = new
+        self._app_state.set_filters(self.current_department, self.current_type)
         self.departmentChanged.emit(new)
 
     def _set_current_type(self, type_id, *, toggle_if_same: bool) -> None:
@@ -244,6 +292,7 @@ class MainWindow(QMainWindow):
         if new == self.current_type:
             return
         self.current_type = new
+        self._app_state.set_filters(self.current_department, self.current_type)
         self.typeChanged.emit(new)
 
     def _sync_filter_state_from_sidebar(self) -> None:
@@ -392,8 +441,13 @@ class MainWindow(QMainWindow):
             act = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Assets Inventory")
         else:
             act = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Shots Inventory")
-
+        stress_act = None
+        if stress_profiler_enabled():
+            stress_act = menu.addAction("Stress diagnostics…")
         chosen = menu.exec(global_pos)
+        if chosen == stress_act:
+            self._open_stress_diagnostics()
+            return
         if chosen != act:
             return
 
@@ -453,7 +507,7 @@ class MainWindow(QMainWindow):
             p = Path(item_id)
         except Exception:
             return
-        self._main_view.invalidate_thumbnail(p)
+        self._app_state.invalidate_thumbnails([item_id])
         # If Inspector is currently showing this item, refresh it too.
         try:
             cur = self._main_view.selected_view_item()
@@ -548,6 +602,8 @@ class MainWindow(QMainWindow):
             self._inspector.set_item(None)
 
             if context_name in ("Assets", "Shots"):
+                # Clear so diff application does not mix with previous context data.
+                self._main_view.clear()
                 # Deterministic autoscan trigger (locked rule).
                 self._rescan_project()
                 self._reload_main_view()
@@ -565,6 +621,8 @@ class MainWindow(QMainWindow):
             self._context_switch_in_progress = False
 
     def _on_context_clicked(self, context_name: str) -> None:
+        # Reload current view (click on already-selected nav item). No page-change toast here
+        # to avoid duplicate with context_changed when user clicks a different page.
         # Spec: click reloads Main View. (No autoscan trigger unless it was a switch.)
         self._context_switch_in_progress = True
         try:
@@ -577,6 +635,8 @@ class MainWindow(QMainWindow):
             self._inspector.set_item(None)
 
             if context_name in ("Assets", "Shots", "Projects"):
+                if context_name in ("Assets", "Shots"):
+                    self._main_view.clear()
                 self._reload_main_view()
             else:
                 self._main_view.clear()
@@ -585,6 +645,16 @@ class MainWindow(QMainWindow):
             self._sync_filter_state_from_sidebar()
         finally:
             self._context_switch_in_progress = False
+
+    def _on_department_changed_notify(self, department: str | None) -> None:
+        if getattr(self, "_context_switch_in_progress", False):
+            return
+        # Sidebar notifications disabled.
+
+    def _on_type_changed_notify(self, type_id: str | None) -> None:
+        if getattr(self, "_context_switch_in_progress", False):
+            return
+        # Sidebar notifications disabled.
 
     def _empty_message_for_context(self, context_name: str) -> str:
         if context_name == "Projects":
@@ -619,10 +689,255 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _asset_passes_filter(self, asset: Asset | None) -> bool:
+        if asset is None:
+            return False
+        return len(self.filter_assets([asset], self.current_department, self.current_type)) > 0
+
+    def _on_app_state_assets_changed(self, added: list, removed: list, updated: list) -> None:
+        _dcc_log = logging.getLogger("monostudio.dcc_debug")
+        _dcc_log.debug("assetsChanged signal added=%s removed=%s updated=%s", added, removed, updated)
+        if self._sidebar.current_context() != "Assets":
+            _dcc_log.debug("assetsChanged ignored (context != Assets)")
+            return
+        # Build Asset lists so grid receives diffs only; grid does not query AppState.
+        added_assets = []
+        for i in added:
+            a = self._app_state.get_asset(i)
+            if a is not None and self._asset_passes_filter(a):
+                added_assets.append(a)
+        updated_assets = []
+        for i in updated:
+            a = self._app_state.get_asset(i)
+            if a is not None and self._asset_passes_filter(a):
+                updated_assets.append(a)
+        _dcc_log.debug("assetsChanged resolved added=%d updated=%d -> apply_assets_diff", len(added_assets), len(updated_assets))
+        # Clear pending_create for any asset that now has work_file_path (so "Creating…" goes away even if incremental_scan never completed).
+        repaint_entity_ids: list[str] = []
+        for eid in (added or []) + (updated or []):
+            asset = self._app_state.get_asset(eid)
+            if not isinstance(asset, Asset):
+                continue
+            states = getattr(asset, "dcc_work_states", None) or ()
+            has_work_path = False
+            for key_st in states:
+                if isinstance(key_st, (tuple, list)) and len(key_st) >= 2 and getattr(key_st[1], "work_file_path", None):
+                    has_work_path = True
+                    break
+            if has_work_path:
+                remove_by_entity(eid)
+                repaint_entity_ids.append(eid)
+        if repaint_entity_ids:
+            _dcc_log.debug("assetsChanged cleared pending for entities with work_file_path: %s", repaint_entity_ids)
+            for eid in repaint_entity_ids:
+                try:
+                    self._main_view.repaint_tiles_for_entity(eid)
+                except Exception:
+                    pass
+        type_reg = TypeRegistry.for_project(self._project_root) if self._project_root else None
+
+        def view_item_builder(asset: Asset) -> ViewItem:
+            type_folder = (type_reg.get_type_folder(asset.asset_type) or "").strip() if type_reg else ""
+            user_status = read_item_status(asset.path)
+            return ViewItem(
+                kind=ViewItemKind.ASSET,
+                name=asset.name,
+                type_badge=asset.asset_type,
+                path=asset.path,
+                departments_count=len(asset.departments),
+                ref=asset,
+                type_folder=type_folder,
+                user_status=user_status,
+            )
+
+        # Capture before apply: apply may clear selection and emit None, overwriting AppState
+        _sid = self._app_state.selection_id()
+        self._main_view.apply_assets_diff_from_assets(
+            added_assets, removed, updated_assets, view_item_builder
+        )
+        def _restore():
+            self._app_state.set_selection(_sid)
+        QTimer.singleShot(0, _restore)
+
+    def _on_app_state_shots_changed(self, added: list, removed: list, updated: list) -> None:
+        if self._sidebar.current_context() != "Shots":
+            return
+
+        def resolver(item_id: str) -> ViewItem | None:
+            s = self._app_state.get_shot(item_id)
+            if s is None:
+                return None
+            user_status = read_item_status(s.path)
+            return ViewItem(
+                kind=ViewItemKind.SHOT,
+                name=s.name,
+                type_badge="shot",
+                path=s.path,
+                departments_count=len(s.departments),
+                ref=s,
+                user_status=user_status,
+            )
+
+        _sid = self._app_state.selection_id()
+        self._main_view.apply_shots_diff(added, removed, updated, resolver)
+        def _restore():
+            self._app_state.set_selection(_sid)
+        QTimer.singleShot(0, _restore)
+
+    def _on_app_state_filters_changed(self) -> None:
+        ctx = self._sidebar.current_context()
+        if ctx in ("Assets", "Shots"):
+            self._reload_main_view()
+
+    def _on_app_state_thumbnails_changed(self, asset_ids: list) -> None:
+        """Refresh UI for these asset ids (thumbnail ready or invalidate requested). Do not clear cache here."""
+        ids_set = set(asset_ids or [])
+        if not ids_set:
+            return
+        try:
+            self._main_view.refresh_thumbnails_for(list(ids_set))
+        except Exception:
+            pass
+        try:
+            cur = self._main_view.selected_view_item()
+            if cur is not None and str(cur.path) in ids_set:
+                self._inspector.update_thumbnail_for_current()
+        except Exception:
+            pass
+
+    def _on_worker_task_finished(self, category: str, result: object, error: str | None) -> None:
+        """Forward worker results to AppState only; never update UI directly."""
+        _dcc_log = logging.getLogger("monostudio.dcc_debug")
+        if error is not None:
+            logging.getLogger(__name__).warning("Worker task %s failed: %s", category, error)
+            _dcc_log.debug("worker taskFinished category=%s error=%s", category, error)
+            return
+        if category == "incremental_scan" and not (isinstance(result, tuple) and len(result) >= 4):
+            _dcc_log.debug("worker taskFinished incremental_scan result type=%s len=%s (expected tuple len>=4)",
+                           type(result).__name__, len(result) if isinstance(result, (tuple, list)) else "n/a")
+            return
+        if category == "filesystem_scan" and isinstance(result, ProjectIndex):
+            self._project_index = result
+            self._app_state.update_assets(list(result.assets))
+            self._app_state.update_shots(list(result.shots))
+            self._app_state.commit_immediate()
+            self._sidebar.set_project_index(result)
+            self._reload_main_view()
+            self._sync_primary_action()
+            self._sync_top_bar()
+        elif category == "incremental_scan" and isinstance(result, tuple) and len(result) >= 4:
+            new_assets, new_shots, requested_asset_ids, requested_shot_ids = (
+                result[0], result[1], result[2], result[3]
+            )
+            _dcc_log = logging.getLogger("monostudio.dcc_debug")
+            _dcc_log.debug("incremental_scan taskFinished success (will clear pending and repaint)")
+            _dcc_log.debug(
+                "incremental_scan done requested_asset_ids=%s requested_shot_ids=%s new_assets_count=%s new_shots_count=%s",
+                requested_asset_ids,
+                requested_shot_ids,
+                len(new_assets) if isinstance(new_assets, list) else 0,
+                len(new_shots) if isinstance(new_shots, list) else 0,
+            )
+            if not isinstance(new_assets, list) or not isinstance(new_shots, list):
+                return
+            for a in new_assets or []:
+                if isinstance(a, Asset):
+                    states = dict(getattr(a, "dcc_work_states", ()) or ())
+                    for (dept, dcc), st in states.items():
+                        if getattr(st, "work_file_path", None):
+                            _dcc_log.debug("incremental_scan asset path=%s (dept=%s dcc=%s) has work_file_path=%s", a.path, dept, dcc, getattr(st, "work_file_path"))
+            current_assets = dict(self._app_state.assets())
+            current_shots = dict(self._app_state.shots())
+            new_asset_paths = {str(Path(a.path).resolve()) for a in new_assets if isinstance(a, Asset)}
+            new_shot_paths = {str(Path(s.path).resolve()) for s in new_shots if isinstance(s, Shot)}
+
+            def same_path(key: str, path_value: Path) -> bool:
+                try:
+                    return Path(key).resolve() == Path(path_value).resolve()
+                except OSError:
+                    return False
+
+            for aid in requested_asset_ids or []:
+                if not aid:
+                    continue
+                if aid not in new_asset_paths and not any(same_path(aid, a.path) for a in new_assets if isinstance(a, Asset)):
+                    current_assets.pop(aid, None)
+            for a in new_assets:
+                if not isinstance(a, Asset):
+                    continue
+                # Keep existing AppState key so diff reports "updated" and the same tile row is refreshed.
+                existing_key = next((k for k in (requested_asset_ids or []) if same_path(k, a.path)), None)
+                key = existing_key if existing_key else str(a.path)
+                for k in list(current_assets):
+                    if k != key and same_path(k, a.path):
+                        current_assets.pop(k, None)
+                current_assets[key] = a
+
+            for sid in requested_shot_ids or []:
+                if not sid:
+                    continue
+                if sid not in new_shot_paths and not any(same_path(sid, s.path) for s in new_shots if isinstance(s, Shot)):
+                    current_shots.pop(sid, None)
+            for s in new_shots:
+                if not isinstance(s, Shot):
+                    continue
+                existing_key = next((k for k in (requested_shot_ids or []) if same_path(k, s.path)), None)
+                key = existing_key if existing_key else str(s.path)
+                for k in list(current_shots):
+                    if k != key and same_path(k, s.path):
+                        current_shots.pop(k, None)
+                current_shots[key] = s
+            self._app_state.update_assets(current_assets)
+            self._app_state.update_shots(current_shots)
+            self._app_state.commit_immediate()
+            # Clear pending only when scan found work_file_path (so "Creating…" goes away when file exists)
+            # or when requested entity is missing (deleted on disk). Avoid clearing too early so badge
+            # stays "Creating…" until file appears; watcher-driven scan will then clear when file is saved.
+            _to_clear: list[str] = []
+            def _entity_has_work_path(obj: Asset | Shot) -> bool:
+                for key_st in getattr(obj, "dcc_work_states", ()) or ():
+                    if isinstance(key_st, (tuple, list)) and len(key_st) >= 2 and getattr(key_st[1], "work_file_path", None):
+                        return True
+                return False
+            for a in new_assets or []:
+                if isinstance(a, Asset) and _entity_has_work_path(a):
+                    _to_clear.append(str(Path(a.path).resolve()))
+            for s in new_shots or []:
+                if isinstance(s, Shot) and _entity_has_work_path(s):
+                    _to_clear.append(str(Path(s.path).resolve()))
+            for aid in requested_asset_ids or []:
+                if aid not in new_asset_paths and not any(same_path(aid, a.path) for a in new_assets if isinstance(a, Asset)):
+                    _to_clear.append(aid)
+            for sid in requested_shot_ids or []:
+                if sid not in new_shot_paths and not any(same_path(sid, s.path) for s in new_shots if isinstance(s, Shot)):
+                    _to_clear.append(sid)
+            if _to_clear:
+                _dcc_log.debug("incremental_scan clearing pending for entity_ids=%s", _to_clear)
+                remove_for_entities(_to_clear)
+            _dcc_log.debug("incremental_scan calling _reload_main_view + repaint_tile_and_list_views (singleShot 0)")
+            if self._project_index is not None:
+                self._project_index = ProjectIndex(
+                    root=self._project_index.root,
+                    assets=tuple(sorted(current_assets.values(), key=lambda x: (x.asset_type, x.name))),
+                    shots=tuple(sorted(current_shots.values(), key=lambda x: x.name)),
+                )
+                self._sidebar.set_project_index(self._project_index)
+                # So new assets/shots (e.g. just created) get their paths watched
+                self._update_fs_watcher_paths()
+            self._reload_main_view()
+            QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
+            self._sync_primary_action()
+            self._sync_top_bar()
+
     def _apply_project_root(self, folder: str | None, *, save: bool) -> None:
         # No validation (per rules). Store path and reload UI.
         if save:
             self._settings.setValue("project/root", folder or "")
+        try:
+            from monostudio.core.crash_recovery import set_crash_context
+            set_crash_context(last_project_path=folder or "")
+        except Exception:
+            pass
 
         self._project_root = Path(folder) if folder else None
         self._controller.set_project_root(self._project_root)
@@ -632,13 +947,41 @@ class MainWindow(QMainWindow):
         # Reload index if root set; otherwise clear.
         if self._project_root is None:
             self._project_index = None
+            self._app_state.clear_project_data()
+            pending_clear_all()
             self._entered_parent = None
             self._main_view.clear()
         else:
-            self._project_index = build_project_index(self._project_root)
-            self._entered_parent = None
-            self._reload_main_view()
+            try:
+                self._project_index = build_project_index(self._project_root)
+                self._entered_parent = None
+                self._app_state.update_assets(list(self._project_index.assets))
+                self._app_state.update_shots(list(self._project_index.shots))
+                self._app_state.commit_immediate()
+                self._reload_main_view()
+            except Exception as e:
+                failed_path = str(self._project_root)
+                logging.exception("Failed to load project at %s", failed_path)
+                self._project_index = None
+                self._project_root = None
+                self._app_state.clear_project_data()
+                self._entered_parent = None
+                self._main_view.clear()
+                self._sidebar.set_project_index(None)
+                self._update_fs_watcher_paths()
+                self._inspector.set_item(None)
+                self._sync_primary_action()
+                self._sync_top_bar()
+                if save:
+                    self._settings.setValue("project/root", "")
+                QMessageBox.warning(
+                    self,
+                    "Project load failed",
+                    f"Could not open project:\n{failed_path}\n\n{e}\n\nOpen Settings to choose another project.",
+                )
+                return
         self._sidebar.set_project_index(self._project_index)
+        self._update_fs_watcher_paths()
 
         # After selecting a folder: keep layout stable, show neutral empty-state.
         self._inspector.set_item(None)
@@ -671,20 +1014,208 @@ class MainWindow(QMainWindow):
         self._sync_top_bar()
 
     def _rescan_project(self) -> None:
-        # Autoscan must be deterministic and synchronous.
+        # Synchronous rescan (e.g. context switch); use when UI must have data immediately.
         if self._project_root is None:
             self._project_index = None
+            self._app_state.clear_project_data()
             self._sidebar.set_project_index(None)
             return
         self._project_index = build_project_index(self._project_root)
         self._sidebar.set_project_index(self._project_index)
+        self._app_state.update_assets(list(self._project_index.assets))
+        self._app_state.update_shots(list(self._project_index.shots))
+        self._app_state.commit_immediate()
+
+    def _submit_rescan_task(self) -> None:
+        """Submit a filesystem scan to WorkerManager; result is forwarded to AppState in _on_worker_task_finished."""
+        if self._project_root is None:
+            return
+        root = self._project_root
+
+        def run() -> ProjectIndex:
+            return build_project_index(root)
+
+        task = WorkerTask("filesystem_scan", run, manager=self._worker_manager)
+        self._worker_manager.submit_task(task, category="filesystem_scan", replace_existing=True)
+
+    def _on_fs_batch_ready(self, asset_ids: list, shot_ids: list, type_folders: list) -> None:
+        """Submit incremental scan for fs watcher batch; never full rescan."""
+        _watcher_log = logging.getLogger("monostudio.fs_watcher")
+        if self._project_root is None:
+            return
+        root = self._project_root
+        a_ids = [x for x in (asset_ids or []) if isinstance(x, str) and x.strip()]
+        s_ids = [x for x in (shot_ids or []) if isinstance(x, str) and x.strip()]
+        t_folders = [x for x in (type_folders or []) if isinstance(x, str) and x.strip()]
+        if not a_ids and not s_ids and not t_folders:
+            return
+        _watcher_log.debug("fs_watcher batch_ready -> incremental_scan asset_ids=%s shot_ids=%s type_folders=%s", len(a_ids), len(s_ids), len(t_folders))
+
+        def run() -> tuple[list[Asset], list[Shot], list[str], list[str]]:
+            return run_incremental_scan(root, a_ids, s_ids, t_folders)
+
+        task = WorkerTask("incremental_scan", run, manager=self._worker_manager)
+        self._worker_manager.submit_task(
+            task,
+            category="incremental_scan",
+            replace_existing=True,
+            debounce_ms=400,
+        )
+
+    def _submit_incremental_scan_for_item(self, item: Asset | Shot) -> None:
+        """Rescan a single asset/shot so AppState and tile DCC badges update (e.g. after Create New)."""
+        if self._project_root is None:
+            return
+        root = self._project_root.resolve()
+        # Ensure absolute path so worker (any cwd) scans the correct directory.
+        p = Path(item.path)
+        if p.is_absolute():
+            item_path = str(p.resolve())
+        else:
+            item_path = str((root / p).resolve())
+        if isinstance(item, Asset):
+            a_ids, s_ids = [item_path], []
+        else:
+            a_ids, s_ids = [], [item_path]
+
+        def run() -> tuple[list[Asset], list[Shot], list[str], list[str]]:
+            return run_incremental_scan(root, a_ids, s_ids, [])
+
+        task = WorkerTask("incremental_scan", run, manager=self._worker_manager)
+        self._worker_manager.submit_task(
+            task,
+            category="incremental_scan",
+            replace_existing=True,
+            debounce_ms=0,
+        )
+
+    def _update_fs_watcher_paths(self) -> None:
+        """Set or clear watched paths and collector state from current project root.
+        Watches project root, assets/, shots/, and each asset/shot directory so changes
+        inside entity folders (e.g. work/) are detected on Windows (no recursive watch).
+        """
+        _watcher_log = logging.getLogger("monostudio.fs_watcher")
+        existing = self._fs_watcher.directories() + self._fs_watcher.files()
+        if existing:
+            self._fs_watcher.removePaths(existing)
+        self._fs_event_collector.set_project_root(None)
+        self._fs_event_collector.set_registries(None, None)
+        if self._project_root is None:
+            _watcher_log.debug("fs_watcher paths cleared (no project)")
+            return
+        try:
+            root = self._project_root.resolve()
+        except OSError:
+            return
+        to_add: list[str] = []
+        if root.is_dir():
+            to_add.append(str(root))
+        assets_dir = root / "assets"
+        shots_dir = root / "shots"
+        if assets_dir.is_dir():
+            to_add.append(str(assets_dir))
+        if shots_dir.is_dir():
+            to_add.append(str(shots_dir))
+        # Watch each asset/shot dir and every DCC work/ dir (model/blender/work, model/maya/work, …)
+        _max_paths = 2000
+        _seen: set[str] = set(to_add)
+        use_dcc_folders = read_use_dcc_folders(root)
+        try:
+            _dcc_reg = get_default_dcc_registry()
+        except Exception:
+            _dcc_reg = None
+        if self._project_index is not None:
+            for asset in self._project_index.assets:
+                base = Path(asset.path)
+                if not base.is_absolute():
+                    base = (root / base).resolve()
+                if base.is_dir() and len(to_add) < _max_paths:
+                    s = str(base)
+                    if s not in _seen:
+                        _seen.add(s)
+                        to_add.append(s)
+                for dept in asset.departments:
+                    dept_dir = dept.path if Path(dept.path).is_absolute() else (root / dept.path).resolve()
+                    if dept_dir.is_dir() and len(to_add) < _max_paths:
+                        s = str(dept_dir)
+                        if s not in _seen:
+                            _seen.add(s)
+                            to_add.append(s)
+                    if use_dcc_folders and _dcc_reg is not None:
+                        for dcc_id in _dcc_reg.get_all_dccs():
+                            try:
+                                wp = resolve_work_path(dept_dir, dcc_id, True, _dcc_reg)
+                            except Exception:
+                                continue
+                            if wp.is_dir() and len(to_add) < _max_paths:
+                                s = str(wp)
+                                if s not in _seen:
+                                    _seen.add(s)
+                                    to_add.append(s)
+                    else:
+                        wp = dept.work_path if Path(dept.work_path).is_absolute() else (root / dept.work_path).resolve()
+                        if wp.is_dir() and len(to_add) < _max_paths:
+                            s = str(wp)
+                            if s not in _seen:
+                                _seen.add(s)
+                                to_add.append(s)
+            for shot in self._project_index.shots:
+                base = Path(shot.path)
+                if not base.is_absolute():
+                    base = (root / base).resolve()
+                if base.is_dir() and len(to_add) < _max_paths:
+                    s = str(base)
+                    if s not in _seen:
+                        _seen.add(s)
+                        to_add.append(s)
+                for dept in shot.departments:
+                    dept_dir = dept.path if Path(dept.path).is_absolute() else (root / dept.path).resolve()
+                    if dept_dir.is_dir() and len(to_add) < _max_paths:
+                        s = str(dept_dir)
+                        if s not in _seen:
+                            _seen.add(s)
+                            to_add.append(s)
+                    if use_dcc_folders and _dcc_reg is not None:
+                        for dcc_id in _dcc_reg.get_all_dccs():
+                            try:
+                                wp = resolve_work_path(dept_dir, dcc_id, True, _dcc_reg)
+                            except Exception:
+                                continue
+                            if wp.is_dir() and len(to_add) < _max_paths:
+                                s = str(wp)
+                                if s not in _seen:
+                                    _seen.add(s)
+                                    to_add.append(s)
+                    else:
+                        wp = dept.work_path if Path(dept.work_path).is_absolute() else (root / dept.work_path).resolve()
+                        if wp.is_dir() and len(to_add) < _max_paths:
+                            s = str(wp)
+                            if s not in _seen:
+                                _seen.add(s)
+                                to_add.append(s)
+        if to_add:
+            added = self._fs_watcher.addPaths(to_add)
+            failed = len(to_add) - len(added)
+            _watcher_log.debug("fs_watcher addPaths: requested=%d added=%d failed=%d", len(to_add), len(added), failed)
+            if failed:
+                _watcher_log.debug("fs_watcher paths not added: %s", set(to_add) - set(added))
+        self._fs_event_collector.set_project_root(root)
+        try:
+            type_reg = TypeRegistry.for_project(root)
+            dept_reg = DepartmentRegistry.for_project(root)
+            self._fs_event_collector.set_registries(type_reg, dept_reg)
+        except Exception:
+            pass
 
     def _on_refresh_requested(self) -> None:
-        # Trigger: user clicks Refresh (context menu) -> rescan synchronously.
+        # Trigger: user clicks Refresh -> rescan in background via WorkerManager.
         self._entered_parent = None
-        self._rescan_project()
-        self._reload_main_view()
+        try:
+            self._main_view.clear_selection()
+        except Exception:
+            pass
         self._inspector.set_item(None)
+        self._submit_rescan_task()
         self._sync_primary_action()
 
     def _reload_main_view(self) -> None:
@@ -718,12 +1249,14 @@ class MainWindow(QMainWindow):
             return
 
         if context == "Assets":
-            type_reg = TypeRegistry.for_project(self._project_root) if self._project_root else None
+            # Render from AppState; filter and build ViewItems (used for initial load and on filtersChanged).
+            assets_ordered = self._app_state.get_assets_in_order()
             filtered_assets = self.filter_assets(
-                list(self._project_index.assets),
+                assets_ordered,
                 self.current_department,
                 self.current_type,
             )
+            type_reg = TypeRegistry.for_project(self._project_root) if self._project_root else None
             for asset in filtered_assets:
                 type_folder = (type_reg.get_type_folder(asset.asset_type) or "").strip() if type_reg else ""
                 user_status = read_item_status(asset.path)
@@ -740,7 +1273,7 @@ class MainWindow(QMainWindow):
                     )
                 )
         elif context == "Shots":
-            for shot in self._project_index.shots:
+            for shot in self._app_state.get_shots_in_order():
                 user_status = read_item_status(shot.path)
                 items.append(
                     ViewItem(
@@ -759,17 +1292,18 @@ class MainWindow(QMainWindow):
             return
 
         if self._project_root is not None:
-            # In a project, use default empty states unless overridden by other flows.
             self._main_view.set_empty_override(None)
-
-        # Header context: show active department inline with title.
         if context in ("Assets", "Shots"):
             self._main_view.set_active_department(self._controller.current_department)
         else:
             self._main_view.set_active_department(None)
-
+        # Capture before set_items: repopulating clears selection and can overwrite AppState
+        _sid = self._app_state.selection_id()
         self._main_view.set_items(items)
         self._sidebar.set_project_index(self._project_index)
+        def _restore():
+            self._app_state.set_selection(_sid)
+        QTimer.singleShot(0, _restore)
 
     def _on_item_activated(self, item: ViewItem) -> None:
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
@@ -784,12 +1318,14 @@ class MainWindow(QMainWindow):
             try:
                 self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
             except Exception as e:
+                logging.warning("DCC launch failed (asset): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
             return
         if item.kind == ViewItemKind.SHOT and isinstance(item.ref, Shot):
             try:
                 self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
             except Exception as e:
+                logging.warning("DCC launch failed (shot): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
             return
         return
@@ -805,6 +1341,7 @@ class MainWindow(QMainWindow):
         try:
             self._controller.smart_open(item=ref, force_dialog=False, parent=self)
         except Exception as e:
+            logging.warning("DCC launch failed: %s", e, exc_info=True)
             QMessageBox.critical(self, "Open DCC", str(e))
 
     def _on_open_with_requested(self, item: object) -> None:
@@ -818,7 +1355,25 @@ class MainWindow(QMainWindow):
         try:
             self._controller.smart_open(item=ref, force_dialog=True, parent=self)
         except Exception as e:
+            logging.warning("DCC launch failed (open with): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open With…", str(e))
+
+    def _on_create_new_requested(self, item: object) -> None:
+        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            return
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            self._controller.smart_open(item=ref, force_dialog=True, force_create_new=True, parent=self)
+            # Repaint tile so delegate shows "Creating…" from resolve_dcc_status (pending already recorded).
+            self._main_view.repaint_tiles_for_entity(str(ref.path))
+            # Pending cleared when watcher triggers incremental_scan and scan finds work_file_path (or via assetsChanged).
+        except Exception as e:
+            logging.warning("DCC launch failed (create new): %s", e, exc_info=True)
+            QMessageBox.critical(self, "Create New…", str(e))
 
     def _on_inspector_open_requested(self, item: object) -> None:
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
@@ -831,6 +1386,7 @@ class MainWindow(QMainWindow):
         try:
             self._controller.smart_open(item=ref, force_dialog=False, parent=self)
         except Exception as e:
+            logging.warning("DCC launch failed (inspector): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open DCC", str(e))
 
     def _on_inspector_open_with_requested(self, item: object) -> None:
@@ -844,6 +1400,7 @@ class MainWindow(QMainWindow):
         try:
             self._controller.smart_open(item=ref, force_dialog=True, parent=self)
         except Exception as e:
+            logging.warning("DCC launch failed (inspector open with): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open With…", str(e))
 
     def _on_inspector_department_focus_changed(self, item: object, department: object) -> None:
@@ -891,6 +1448,19 @@ class MainWindow(QMainWindow):
         self._workspace_projects.append(discovered)
         # Auto-switch to new project (sets project/root, triggers existing autoscan, resets Inspector).
         self._apply_project_root(str(created.root), save=True)
+
+    def _open_stress_diagnostics(self) -> None:
+        """Open stress diagnostics dialog (only when MONOS_STRESS=1 or MONOS_PROFILE=1)."""
+        if not stress_profiler_enabled():
+            return
+        dialog = StressDiagnosticsDialog(
+            app_state=self._app_state,
+            main_view=self._main_view,
+            thumbnail_manager=self._thumbnail_manager,
+            fs_collector=self._fs_event_collector,
+            parent=self,
+        )
+        dialog.show()
 
     def _open_settings(self) -> None:
         dialog = SettingsDialog(
@@ -962,8 +1532,9 @@ class MainWindow(QMainWindow):
             "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
         }
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            from monostudio.core.atomic_write import atomic_write_text
+            content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            atomic_write_text(path, content, encoding="utf-8")
         except OSError:
             pass
         super().closeEvent(event)
@@ -1041,13 +1612,16 @@ class MainWindow(QMainWindow):
 
         created: list[Path] = []
         try:
+            use_dcc_folders = read_use_dcc_folders(self._project_root)
             to_create: list[Path] = [target]
             for d in departments:
                 dept_folder = dept_reg.get_department_folder(d, "asset")
                 dept_dir = target / dept_folder
                 to_create.append(dept_dir)
                 if create_subfolders:
-                    to_create.append(dept_dir / "work")
+                    # Only department + work + publish. DCC subfolders (dept/<dcc>/work) are created on demand when user does "Create New…".
+                    if not use_dcc_folders:
+                        to_create.append(dept_dir / "work")
                     to_create.append(dept_dir / "publish")
 
             for p in to_create:
@@ -1091,6 +1665,7 @@ class MainWindow(QMainWindow):
             return
 
         dept_reg = DepartmentRegistry.for_project(self._project_root)
+        use_dcc_folders = read_use_dcc_folders(self._project_root)
         created: list[Path] = []
         try:
             to_create: list[Path] = [target]
@@ -1099,7 +1674,9 @@ class MainWindow(QMainWindow):
                 dept_dir = target / dept_folder
                 to_create.append(dept_dir)
                 if create_subfolders:
-                    to_create.append(dept_dir / "work")
+                    # Only department + work + publish. DCC subfolders (dept/<dcc>/work) are created on demand when user does "Create New…".
+                    if not use_dcc_folders:
+                        to_create.append(dept_dir / "work")
                     to_create.append(dept_dir / "publish")
 
             for p in to_create:

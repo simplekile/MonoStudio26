@@ -183,17 +183,16 @@ def _build_types_payload(mapping: dict[str, dict]) -> dict[str, dict]:
 def write_types_to_path(path: Path, mapping: dict[str, dict]) -> bool:
     """
     Write types.json to the given path (e.g. user default).
-    Creates parent dirs if needed. Returns False if payload empty or write fails.
+    Uses atomic write (temp -> flush -> fsync -> rename). Returns False if payload empty or write fails.
     """
+    from monostudio.core.atomic_write import atomic_write_text
+
     payload = _build_types_payload(mapping)
     if not payload:
         return False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"types": payload}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        content = json.dumps({"types": payload}, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(path, content, encoding="utf-8")
         return True
     except OSError:
         return False

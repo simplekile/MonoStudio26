@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 import re
 
-from PySide6.QtCore import Qt, Signal, QSize, QPoint
+from PySide6.QtCore import Qt, Signal, QSize, QPoint, QTimer
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,6 +27,32 @@ from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 from monostudio.ui_qt.thumbnails import ThumbnailCache
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
+
+
+def _inspector_diff(prev: ViewItem | None, cur: ViewItem | None) -> dict[str, bool]:
+    """Shallow diff for Inspector: which fields changed. Used to update only affected sections."""
+    if prev is None and cur is None:
+        return {}
+    if prev is None or cur is None:
+        return {"item": True, "name": True, "type": True, "status": True, "thumbnail": True, "departments": True}
+    if str(prev.path) != str(cur.path):
+        return {"item": True, "name": True, "type": True, "status": True, "thumbnail": True, "departments": True}
+    out: dict[str, bool] = {"item": False}
+    out["name"] = (display_name_for_item(prev) != display_name_for_item(cur))
+    out["type"] = ((prev.type_badge or "") != (cur.type_badge or ""))
+    prev_status = getattr(prev, "user_status", None) or ""
+    cur_status = getattr(cur, "user_status", None) or ""
+    out["status"] = (prev_status != cur_status)
+    # Thumbnail: assume changed if we are doing an incremental update (caller can force thumbnail refresh).
+    out["thumbnail"] = False  # Only refresh when explicitly requested (e.g. thumbnailsChanged).
+    prev_ref, cur_ref = prev.ref, cur.ref
+    if isinstance(prev_ref, (Asset, Shot)) and isinstance(cur_ref, (Asset, Shot)):
+        out["departments"] = len(prev_ref.departments) != len(cur_ref.departments) or any(
+            p.name != c.name for p, c in zip(prev_ref.departments, cur_ref.departments)
+        )
+    else:
+        out["departments"] = (prev_ref != cur_ref)
+    return out
 
 
 @dataclass(frozen=True)
@@ -127,10 +153,25 @@ class InspectorPanel(QWidget):
         self._scroll.setWidget(content)
 
         self._current_item: ViewItem | None = None
+        self._previous_item: ViewItem | None = None
+        self._thumbnail_manager: object | None = None
         self.set_item(None)
 
+    def set_thumbnail_manager(self, manager: object | None) -> None:
+        """Use ThumbnailManager for async loading; None to use legacy ThumbnailCache only."""
+        self._thumbnail_manager = manager
+        self._preview.set_thumbnail_manager(manager)
+
     def set_item(self, item: ViewItem | None) -> None:
-        # Show/hide sections per selection. Inspector header remains stable.
+        # Diff-based: never rebuild layout. Update only changed sections; preserve scroll position.
+        try:
+            from monostudio.ui_qt.stress_profiler import enabled, record_inspector_update
+            if enabled():
+                record_inspector_update("set_item")
+        except Exception:
+            pass
+        prev = self._current_item
+        self._previous_item = prev
         self._current_item = item
         has_item = item is not None
         self._empty.setVisible(not has_item)
@@ -141,16 +182,52 @@ class InspectorPanel(QWidget):
             self._empty.set_message("Select an item to view details")
             return
 
-        self._preview.set_item(item)
-        self._asset_status.set_item(item)
-        self._dept_pipeline.set_item(item)
-        self._tech.set_item(item)
-        self._stakeholders.set_item(item)
+        scroll_bar = self._scroll.verticalScrollBar()
+        scroll_pos = scroll_bar.value() if scroll_bar else 0
+
+        diff = _inspector_diff(prev, item)
+        full_update = diff.get("item", True) or not prev or str(prev.path) != str(item.path)
+
+        if full_update:
+            self._preview.set_item(item)
+            self._asset_status.set_item(item)
+            self._dept_pipeline.set_item(item)
+            self._tech.set_item(item)
+            self._stakeholders.set_item(item)
+        else:
+            if diff.get("name") or diff.get("type"):
+                self._asset_status.update_identity(item)
+            if diff.get("status"):
+                self._asset_status.update_status(item)
+            if diff.get("thumbnail"):
+                self._preview.update_thumbnail_only()
+            if diff.get("departments"):
+                self._dept_pipeline.set_item(item)
+            if diff.get("name") or diff.get("type"):
+                self._tech.set_item(item)
+
+        if scroll_bar and scroll_bar.value() != scroll_pos:
+            scroll_bar.setValue(scroll_pos)
 
     def refresh_thumbnail(self) -> None:
         # Best-effort; safe no-op if nothing selected.
         try:
             self._preview.refresh_thumbnail()
+        except Exception:
+            pass
+
+    def update_thumbnail_for_current(self) -> None:
+        """Update thumbnail only for current item (e.g. after thumbnailsChanged). No layout change."""
+        if self._current_item is None:
+            return
+        try:
+            from monostudio.ui_qt.stress_profiler import enabled, record_inspector_update
+            if enabled():
+                record_inspector_update("update_thumbnail_only")
+        except Exception:
+            pass
+        try:
+            self._preview.update_thumbnail_only()
         except Exception:
             pass
 
@@ -186,7 +263,18 @@ class InspectorPanel(QWidget):
             return
         dep = (department_name or "").strip()
         if not dep:
+            self._tech.set_resolved_path(None)
             return
+        ref = getattr(item, "ref", None)
+        if isinstance(ref, (Asset, Shot)) and ref.departments:
+            for d in ref.departments:
+                if (d.name or "").strip().casefold() == dep.casefold():
+                    self._tech.set_resolved_path(d.work_path)
+                    break
+            else:
+                self._tech.set_resolved_path(None)
+        else:
+            self._tech.set_resolved_path(None)
         self.department_focus_changed.emit(item, dep)
 
     # Backward compatibility (legacy call sites)
@@ -432,6 +520,7 @@ class _InspectorPreview(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._thumbs = ThumbnailCache(size_px=512)
+        self._thumbnail_manager: object | None = None
         self._item: ViewItem | None = None
         l = QVBoxLayout(self)
         l.setContentsMargins(0, 0, 0, 0)
@@ -445,24 +534,69 @@ class _InspectorPreview(QWidget):
     def _set_paste_enabled(self, enabled: bool) -> None:
         self._container.set_paste_enabled(enabled)
 
+    def set_thumbnail_manager(self, manager: object | None) -> None:
+        """Use ThumbnailManager for async loading; None to use legacy ThumbnailCache only."""
+        self._thumbnail_manager = manager
+
     def set_item(self, item: ViewItem) -> None:
         self._item = item
         can_paste = item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
         self._set_paste_enabled(can_paste)
         w = self._container._w
         w.set_placeholder_kind(item.kind.value, letter=(display_name_for_item(item) or "").strip()[:1])
-        thumb = self._thumbs.resolve_thumbnail_file(item.path)
-        if thumb is None:
-            w.set_pixmap(None)
+        w.set_pixmap(None)  # Show placeholder immediately; load thumbnail async.
+        path = item.path
+        asset_id = str(path)
+
+        def load() -> None:
+            mgr = getattr(self, "_thumbnail_manager", None)
+            if mgr is not None and hasattr(mgr, "request_thumbnail"):
+                pix = mgr.request_thumbnail(asset_id)
+                if getattr(self, "_item", None) and self._item.path == path:
+                    self._container._w.set_pixmap(pix)
+                return
+            thumb = self._thumbs.resolve_thumbnail_file(path)
+            if thumb is None:
+                if getattr(self, "_item", None) and self._item.path == path:
+                    self._container._w.set_pixmap(None)
+                return
+            pix = self._thumbs.load_thumbnail_pixmap(thumb)
+            if getattr(self, "_item", None) and self._item.path == path:
+                self._container._w.set_pixmap(pix)
+
+        QTimer.singleShot(0, load)
+
+    def update_thumbnail_only(self) -> None:
+        """Update thumbnail image only (e.g. after thumbnailsChanged). Does not rebuild; uses manager or cache."""
+        item = self._item
+        if item is None:
             return
-        pix = self._thumbs.load_thumbnail_pixmap(thumb)
-        w.set_pixmap(pix)
+        path = item.path
+        asset_id = str(path)
+
+        def load() -> None:
+            mgr = getattr(self, "_thumbnail_manager", None)
+            if mgr is not None and hasattr(mgr, "request_thumbnail"):
+                pix = mgr.request_thumbnail(asset_id)
+                self._container._w.set_pixmap(pix)
+                return
+            thumb = self._thumbs.resolve_thumbnail_file(path)
+            if thumb is None:
+                self._container._w.set_pixmap(None)
+                return
+            pix = self._thumbs.load_thumbnail_pixmap(thumb)
+            self._container._w.set_pixmap(pix)
+
+        QTimer.singleShot(0, load)
 
     def refresh_thumbnail(self) -> None:
         item = self._item
         if item is None:
             return
-        # Force cache miss for both user + auto candidates to ensure immediate refresh.
+        mgr = getattr(self, "_thumbnail_manager", None)
+        if mgr is not None and hasattr(mgr, "invalidate"):
+            mgr.invalidate(str(item.path))
+        # Force cache miss for legacy ThumbnailCache.
         for name in ("thumbnail.user.png", "thumbnail.user.jpg", "thumbnail.png", "thumbnail.jpg"):
             self._thumbs.invalidate_file(item.path / name)
         self.set_item(item)
@@ -588,6 +722,12 @@ class _InspectorAssetStatusBlock(QWidget):
         is_asset_or_shot = bool(item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT))
         self._btn_open.setEnabled(is_asset_or_shot)
         self._btn_open_with.setEnabled(is_asset_or_shot)
+
+    def update_identity(self, item: ViewItem) -> None:
+        self._identity.set_item(item)
+
+    def update_status(self, item: ViewItem) -> None:
+        self._health.set_item(item)
 
 
 class _MiniInfoCard(QFrame):
@@ -853,6 +993,9 @@ class _DeptCard(QFrame):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._dept.path)))
 
 
+_MAX_DEPT_CARDS = 32
+
+
 class _DepartmentPipeline(QWidget):
     manage_clicked = Signal()
     department_focused = Signal(str)
@@ -892,6 +1035,15 @@ class _DepartmentPipeline(QWidget):
         self._list_l.setContentsMargins(0, 0, 0, 0)
         self._list_l.setSpacing(12)
 
+        self._dept_cards: list[_DeptCard] = []
+        self._dept_click_handlers: list[object] = []  # stored slots for disconnect
+        for _ in range(_MAX_DEPT_CARDS):
+            card = _DeptCard(self)
+            card.setVisible(False)
+            self._dept_cards.append(card)
+            self._dept_click_handlers.append(None)
+            self._list_l.addWidget(card, 0)
+
         self._empty = QLabel("—", self)
         self._empty.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
 
@@ -901,14 +1053,7 @@ class _DepartmentPipeline(QWidget):
         self._focused_dept: str | None = None
 
     def set_item(self, item: ViewItem) -> None:
-        # Clear: remove cards from layout and delete them. Do not setParent(None)
-        # or each widget becomes a top-level window (popup) in Qt.
-        while self._list_l.count():
-            layout_item = self._list_l.takeAt(0)
-            w = layout_item.widget()
-            if w is not None:
-                w.deleteLater()
-
+        # Reuse card pool: never delete or create widgets; update and show/hide only.
         depts: tuple[Department, ...] = ()
         ref = item.ref
         if isinstance(ref, Department):
@@ -917,26 +1062,39 @@ class _DepartmentPipeline(QWidget):
             depts = ref.departments
 
         if not depts:
+            for c in self._dept_cards:
+                c.setVisible(False)
             self._empty.setVisible(True)
             self._focused_dept = None
             return
 
         self._empty.setVisible(False)
         self._focused_dept = None
-        for d in depts:
-            card = _DeptCard(self)
+        for i, d in enumerate(depts):
+            card = self._dept_cards[i]
             card.set_department(d)
-            # Focus routing: clicking one dept focuses it and clears others.
-            def on_clicked(*, dept_name: str = d.name, current_card: _DeptCard = card) -> None:
-                self._focused_dept = dept_name
-                for i in range(self._list_l.count()):
-                    w = self._list_l.itemAt(i).widget()
-                    if isinstance(w, _DeptCard):
-                        w.set_focused(w is current_card)
-                self.department_focused.emit(dept_name)
+            card.setVisible(True)
+            # Disconnect previous slot if any (avoids RuntimeWarning when none connected).
+            old_handler = self._dept_click_handlers[i]
+            if old_handler is not None:
+                try:
+                    card.clicked.disconnect(old_handler)
+                except (TypeError, RuntimeError):
+                    pass
+                self._dept_click_handlers[i] = None
+
+            def on_clicked(idx: int = i) -> None:
+                current_card = self._dept_cards[idx]
+                self._focused_dept = depts[idx].name if idx < len(depts) else None
+                if self._focused_dept:
+                    for j, c in enumerate(self._dept_cards):
+                        c.set_focused(c is current_card)
+                    self.department_focused.emit(self._focused_dept)
 
             card.clicked.connect(on_clicked)
-            self._list_l.addWidget(card, 0)
+            self._dept_click_handlers[i] = on_clicked
+        for j in range(len(depts), len(self._dept_cards)):
+            self._dept_cards[j].setVisible(False)
 
 
 class _TechRow(QWidget):
@@ -960,6 +1118,8 @@ class _TechnicalSpecs(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorTechnicalSpecs")
+        self._last_item: ViewItem | None = None
+        self._resolved_path: Path | None = None
 
         l = QVBoxLayout(self)
         l.setContentsMargins(0, 0, 0, 0)
@@ -1006,11 +1166,23 @@ class _TechnicalSpecs(QWidget):
         l.addWidget(self._modified, 0)
 
     def set_item(self, item: ViewItem) -> None:
+        self._last_item = item
+        self._resolved_path = None
         self._frame.set_value("—")
         self._fps.set_value("—")
         self._res.set_value("—")
         self._src.setText(str(item.path))
         self._modified.set_value(_format_mtime(item.path))
+
+    def set_resolved_path(self, path: Path | None) -> None:
+        """Update displayed path to a department work path (or reset to item path when None)."""
+        self._resolved_path = path
+        if path is not None:
+            self._src.setText(str(path))
+            self._modified.set_value(_format_mtime(path))
+        elif self._last_item is not None:
+            self._src.setText(str(self._last_item.path))
+            self._modified.set_value(_format_mtime(self._last_item.path))
 
     @staticmethod
     def _copy_text(text: str) -> None:

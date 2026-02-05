@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Callable
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal, QUrl
+from PySide6.QtCore import QElapsedTimer, QEvent, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -32,6 +34,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableView,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -42,8 +45,97 @@ from monostudio.ui_qt.style import MONOS_COLORS, THUMB_TAG_STYLE, monos_font
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.core.dcc_registry import get_default_dcc_registry
+from monostudio.core.dcc_status import resolve_dcc_status
 from monostudio.core.workspace_reader import ProjectQuickStats
 from monostudio.core.models import Asset, Shot
+
+import logging
+_dcc_debug_log = logging.getLogger("monostudio.dcc_debug")
+
+# Lucide icon names for type/department thumb badges (icon-only, no text).
+_TYPE_ICON_MAP: dict[str, str] = {
+    "project": "layout-dashboard",
+    "shot": "clapperboard",
+    "_characters": "user",
+    "character": "user",
+    "_props": "package",
+    "prop": "package",
+    "_environment": "trees",
+    "environment": "trees",
+}
+_DEPT_ICON_MAP: dict[str, str] = {
+    "layout": "layout-dashboard",
+    "model": "box",
+    "modeling": "box",
+    "rig": "bone",
+    "rigging": "bone",
+    "surfacing": "palette",
+    "grooming": "scissors",
+    "lookdev": "sparkles",
+    "anim": "clapperboard",
+    "animation": "clapperboard",
+    "fx": "zap",
+    "lighting": "lightbulb",
+    "comp": "sliders-horizontal",
+}
+
+# Labels for type badge tooltip (readable names).
+_TYPE_TOOLTIP_MAP: dict[str, str] = {
+    "project": "Project",
+    "shot": "Shot",
+    "character": "Character",
+    "_characters": "Character",
+    "prop": "Prop",
+    "_props": "Prop",
+    "environment": "Environment",
+    "_environment": "Environment",
+}
+
+
+def _item_last_opened_dcc(item_path: Path, active_department: str) -> str | None:
+    """Read last-opened DCC for this item from .monostudio/open.json. Returns dcc_id or None."""
+    if not item_path or not isinstance(item_path, Path):
+        return None
+    meta_path = item_path / ".monostudio" / "open.json"
+    try:
+        if not meta_path.is_file():
+            return None
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    dep = (active_department or "").strip().casefold()
+    by_dep = data.get("last_open_by_department")
+    if isinstance(by_dep, dict):
+        node = by_dep.get(dep) or by_dep.get(active_department)
+        if isinstance(node, dict):
+            dcc = node.get("dcc")
+            if isinstance(dcc, str) and dcc.strip():
+                return dcc.strip()
+    last_open = data.get("last_open")
+    if isinstance(last_open, dict) and (last_open.get("department") or "").strip().casefold() == dep:
+        dcc = last_open.get("dcc")
+        if isinstance(dcc, str) and dcc.strip():
+            return dcc.strip()
+    return None
+
+
+def _thumb_badge_rects(cell_rect: QRect, gap_px: int, has_dept: bool) -> tuple[QRect, QRect | None]:
+    """Compute type and department badge rects (matches delegate layout). Used for tooltip hit-test."""
+    r = cell_rect.adjusted(0, 0, -gap_px, -gap_px)
+    border_px = 1
+    inner = r.adjusted(border_px, border_px, -border_px, -border_px)
+    thumb_w = inner.width()
+    thumb_h = max(1, int(thumb_w * 9 / 16))
+    thumb = QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
+    chip_r = (16 + 5 * 2) // 2
+    chip_h = chip_r * 2
+    gap = 4
+    ix, iy = thumb.left() + 12, thumb.top() + 12
+    type_rect = QRect(ix, iy, chip_h, chip_h)
+    dept_rect = QRect(ix + chip_h + gap, iy, chip_h, chip_h) if has_dept else None
+    return type_rect, dept_rect
 
 
 class _ClearOnEmptyClickListView(QListView):
@@ -138,6 +230,8 @@ class _GridCardDelegate(QStyledItemDelegate):
         p.drawRoundedRect(r, radius, radius)
 
     def paint(self, painter: QPainter, option, index) -> None:  # type: ignore[override]
+        _timer = QElapsedTimer()
+        _timer.start()
         item = index.data(Qt.UserRole)
         if not isinstance(item, ViewItem):
             super().paint(painter, option, index)
@@ -265,82 +359,138 @@ class _GridCardDelegate(QStyledItemDelegate):
             p.setBrush(border_c)
             p.drawEllipse(QPoint(dot_x, dot_y), dot_radius, dot_radius)
 
-            # Type tag (top-left) — asset/shot type badge (CHAR, PROP, SEQ, …)
-            type_badge_text = (item.type_badge or "").strip()
-            if type_badge_text:
-                a_bg = int(THUMB_TAG_STYLE["bg_alpha"])
-                a_border = int(THUMB_TAG_STYLE["border_alpha"])
-                type_key = str(THUMB_TAG_STYLE.get("type_color_key", "emerald_500"))
-                type_c = QColor(MONOS_COLORS.get(type_key, MONOS_COLORS["text_meta"]))
+            # Type + Department icons (top-left, side by side, fully round, distinct colors)
+            icon_size = 16
+            pad = 5
+            chip_r = (icon_size + pad * 2) // 2  # radius for circle
+            chip_h = chip_r * 2
+            gap = 4
+            ix = thumb.left() + 12
+            iy = thumb.top() + 12
+            # Colors: project / shot / type (asset) / department — all different
+            type_badge_raw = (item.type_badge or "").strip()
+            type_badge_lower = type_badge_raw.lower()
+            if item.kind.value == "project":
+                type_chip_color = QColor("#8b5cf6")  # violet
+            elif item.kind.value == "shot":
+                type_chip_color = QColor(MONOS_COLORS["amber_500"])
+            else:
+                type_chip_color = QColor(MONOS_COLORS["emerald_500"])
+            type_chip_color.setAlpha(220)
+            type_icon_name = _TYPE_ICON_MAP.get(type_badge_lower) or _TYPE_ICON_MAP.get(type_badge_raw) or "box"
+            type_icon = lucide_icon(type_icon_name, size=icon_size, color_hex="#ffffff")
+            type_pix = type_icon.pixmap(icon_size, icon_size)
+            if not type_pix.isNull():
+                cx, cy = ix + chip_r, iy + chip_r
+                p.setPen(Qt.NoPen)
+                p.setBrush(type_chip_color)
+                p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
+                p.drawPixmap(ix + pad, iy + pad, type_pix)
+                ix += chip_h + gap
+            dep = (self._active_department or "").strip()
+            if dep:
+                dept_key = self._norm(dep)
+                dept_icon_name = _DEPT_ICON_MAP.get(dept_key, "layers")
+                dept_chip_color = QColor(MONOS_COLORS["blue_500"])
+                dept_chip_color.setAlpha(220)
+                dept_icon = lucide_icon(dept_icon_name, size=icon_size, color_hex="#ffffff")
+                dept_pix = dept_icon.pixmap(icon_size, icon_size)
+                if not dept_pix.isNull():
+                    cx, cy = ix + chip_r, iy + chip_r
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(dept_chip_color)
+                    p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
+                    p.drawPixmap(ix + pad, iy + pad, dept_pix)
 
-                def with_alpha(base: QColor, a: int) -> QColor:
-                    c2 = QColor(base)
-                    c2.setAlpha(int(a))
-                    return c2
-
-                type_bg = with_alpha(type_c, a_bg)
-                type_border = with_alpha(type_c, a_border)
-                draw_thumb_tag(
-                    x=thumb.left() + 12,
-                    y=thumb.top() + 12,
-                    text=type_badge_text,
-                    text_color=type_c,
-                    bg_color=type_bg,
-                    border_color=type_border,
-                )
-
-            # DCC badge (bottom-right of thumb) — only when Department context is explicit (active department)
-            def dcc_badge_for_item() -> tuple[QIcon | None, str | None]:
-                dep = (self._active_department or "").strip()
-                if not dep:
-                    return None, None
+            # DCC badges (bottom-right of thumb) — filesystem-driven; "exists" = icon, "creating" = "Creating…"
+            def dcc_badges_for_item() -> list[tuple[QIcon | None, str, str]]:
+                """Returns (icon or None, dcc_id, status) with status in ("exists", "creating")."""
+                out: list[tuple[QIcon | None, str, str]] = []
                 ref = item.ref
                 if not isinstance(ref, (Asset, Shot)):
-                    return None, None
-                # Find matching department object on the item.
-                dept_obj = None
-                for d in getattr(ref, "departments", ()) or ():
-                    try:
-                        if self._norm(getattr(d, "name", "")) == self._norm(dep):
-                            dept_obj = d
-                            break
-                    except Exception:
-                        continue
-                if dept_obj is None:
-                    return None, None
-                if not getattr(dept_obj, "work_file_exists", False):
-                    return None, None
-                dcc_id = getattr(dept_obj, "work_file_dcc", None)
-                dcc_id = dcc_id.strip() if isinstance(dcc_id, str) else ""
-                if not dcc_id:
-                    return None, None
-
-                # Registry is the single source of truth for DCC identity + branding.
+                    return out
                 try:
-                    info = get_default_dcc_registry().get_dcc_info(dcc_id)
+                    reg = get_default_dcc_registry()
                 except Exception:
-                    info = None
+                    return out
+                active_key = self._norm((self._active_department or "").strip())
+                for d in getattr(ref, "departments", ()) or ():
+                    dept_name = getattr(d, "name", "") or ""
+                    if active_key and self._norm(dept_name) != active_key:
+                        continue
+                    for dcc_id in reg.get_available_dccs(dept_name) or []:
+                        dcc_id = (dcc_id or "").strip()
+                        if not dcc_id:
+                            continue
+                        status = resolve_dcc_status(ref, dept_name, dcc_id)
+                        if status == "creating":
+                            out.append((None, dcc_id, "creating"))
+                            continue
+                        if status != "exists":
+                            continue
+                        try:
+                            info = reg.get_dcc_info(dcc_id) if dcc_id else None
+                        except Exception:
+                            info = None
+                        slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+                        color = info.get("brand_color_hex") if isinstance(info, dict) else None
+                        if isinstance(slug, str) and slug.strip():
+                            ic = brand_icon(slug.strip(), size=14, color_hex=(color if isinstance(color, str) else None))
+                        else:
+                            ic = lucide_icon("layers", size=14, color_hex=MONOS_COLORS["text_label"])
+                        out.append((ic, dcc_id, "exists"))
+                return out
 
-                slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
-                color = info.get("brand_color_hex") if isinstance(info, dict) else None
-                if isinstance(slug, str) and slug.strip():
-                    return brand_icon(slug.strip(), size=16, color_hex=(color if isinstance(color, str) else None)), dcc_id
-                return lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]), dcc_id
-
-            dcc_icon, _dcc_id = dcc_badge_for_item()
-            if dcc_icon is not None and not dcc_icon.isNull():
-                size = 18
-                pad = 6
+            dcc_list = dcc_badges_for_item()
+            if dcc_list:
+                size = 16
+                pad = 4
+                gap = 3
+                max_show = 4
                 chip_h = size + pad * 2
-                bx = thumb.right() - 12 - chip_h
-                by = thumb.bottom() - 12 - chip_h
-                bg_rect = QRect(bx, by, chip_h, chip_h)
-                # Subtle chip for readability over thumbnails
-                p.setPen(Qt.NoPen)
-                p.setBrush(QColor(0, 0, 0, 140))
-                p.drawRoundedRect(bg_rect, 10, 10)
-                pix = dcc_icon.pixmap(size, size)
-                p.drawPixmap(bx + pad, by + pad, pix)
+                chip_r = chip_h // 2
+                creating_chip_w = 56
+                widths = [creating_chip_w if s == "creating" else chip_h for (_, _, s) in dcc_list[:max_show]]
+                row_w = sum(widths) + (len(widths) - 1) * gap
+                base_x = thumb.right() - 12 - row_w
+                base_y = thumb.bottom() - 12 - chip_h
+                creating_font = monos_font("Inter", 9)
+                dcc_bg = QColor(0, 0, 0, 160)
+                last_used_dcc = _item_last_opened_dcc(item.path, self._active_department or "") if getattr(item, "path", None) else None
+                x_cursor = base_x
+                for i, (dcc_icon, _dcc_id, badge_status) in enumerate(dcc_list[:max_show]):
+                    w = widths[i]
+                    bg_rect = QRect(x_cursor, base_y, w, chip_h)
+                    is_last_used = (last_used_dcc and (_dcc_id or "").strip() == last_used_dcc)
+                    if badge_status == "creating":
+                        # Pill: bo tròn, không border; chỉ border xanh dương 50% nếu là last-used
+                        p.setPen(Qt.NoPen)
+                        p.setBrush(dcc_bg)
+                        p.drawRoundedRect(bg_rect, chip_r, chip_r)
+                        if is_last_used:
+                            p.setPen(QPen(QColor(37, 99, 235, 128), 2))
+                            p.setBrush(Qt.NoBrush)
+                            p.drawRoundedRect(bg_rect, chip_r, chip_r)
+                        _dcc_debug_log.debug("paint DCC badge Creating… entity_path=%r dcc_id=%r", getattr(item.ref, "path", None), _dcc_id)
+                        p.setFont(creating_font)
+                        p.setPen(QColor(255, 255, 255))
+                        p.drawText(bg_rect, Qt.AlignmentFlag.AlignCenter, "Creating…")
+                    else:
+                        # Icon: hình tròn, không border; chỉ border xanh dương 50% nếu là last-used
+                        cx = x_cursor + chip_r
+                        cy = base_y + chip_r
+                        p.setPen(Qt.NoPen)
+                        p.setBrush(dcc_bg)
+                        p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
+                        if is_last_used:
+                            p.setPen(QPen(QColor(37, 99, 235, 128), 2))
+                            p.setBrush(Qt.NoBrush)
+                            p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
+                        if dcc_icon is not None and not dcc_icon.isNull():
+                            pix = dcc_icon.pixmap(size, size)
+                            if not pix.isNull():
+                                p.drawPixmap(x_cursor + pad, base_y + pad, pix)
+                    x_cursor += w + gap
 
             # Stop clipping before text to avoid rounded-corner cropping issues
             p.setClipping(False)
@@ -389,6 +539,12 @@ class _GridCardDelegate(QStyledItemDelegate):
 
         finally:
             p.restore()
+            try:
+                from monostudio.ui_qt.stress_profiler import enabled, record_paint_ms
+                if enabled():
+                    record_paint_ms(float(_timer.elapsed()) if hasattr(_timer, "elapsed") else 0)
+            except Exception:
+                pass
 
     def sizeHint(self, option, index) -> QSize:  # type: ignore[override]
         # Responsive card size is controlled by MainView; keep uniform sizes for performance.
@@ -402,6 +558,7 @@ class MainView(QWidget):
     """
 
     valid_selection_changed = Signal(bool)
+    selection_id_changed = Signal(object)  # str | None — selection intent for AppState
     item_activated = Signal(object)  # emits ViewItem
     refresh_requested = Signal()
     root_context_menu_requested = Signal(object)  # emits global QPoint
@@ -409,6 +566,7 @@ class MainView(QWidget):
     delete_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_with_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    create_new_requested = Signal(object)  # emits ViewItem (asset/shot only)
     status_set_requested = Signal(object, str)  # (ViewItem, status: ready|progress|waiting|blocked)
     primary_action_requested = Signal()  # header primary action
     view_mode_changed = Signal(str)  # "tile" | "list"
@@ -427,6 +585,7 @@ class MainView(QWidget):
         self._project_root: str | None = None
         self._empty_override: str | None = None
         self._thumb_cache = ThumbnailCache(size_px=self._THUMBNAIL_SIZE_PX)
+        self._thumbnail_manager: object | None = None
         self._thumb_prefetch_scheduled = False
 
         self._view_mode: str = "tile"
@@ -673,10 +832,38 @@ class MainView(QWidget):
         self.valid_selection_changed.emit(self.has_valid_selection())
 
         self._all_items: list[ViewItem] = []
+        # AssetGrid: asset_id -> row index for O(1) lookup; _order = display order of asset_ids.
+        self._items: dict[str, int] = {}
+        self._order: list[str] = []
+        self._selection_driven_by_state = False
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched is self._tile_view.viewport() and event.type() == QEvent.Resize:
             self._schedule_grid_layout_sync()
+        if (
+            watched is self._tile_view.viewport()
+            and event.type() == QEvent.ToolTip
+            and self._view_mode == "tile"
+        ):
+            pos = event.pos()
+            index = self._tile_view.indexAt(pos)
+            if index.isValid():
+                item = index.data(Qt.UserRole)
+                if isinstance(item, ViewItem):
+                    cell_rect = self._tile_view.visualRect(index)
+                    if cell_rect.contains(pos):
+                        active_dep = (getattr(self._grid_delegate, "_active_department", None) or "").strip()
+                        has_dept = bool(active_dep)
+                        type_rect, dept_rect = _thumb_badge_rects(cell_rect, self._GRID_GAP_PX, has_dept)
+                        if type_rect.contains(pos):
+                            tt = _TYPE_TOOLTIP_MAP.get((item.type_badge or "").strip().lower()) or _TYPE_TOOLTIP_MAP.get((item.type_badge or "").strip()) or (item.type_badge or "Type")
+                            QToolTip.showText(event.globalPos(), tt)
+                            event.accept()
+                            return True
+                        if has_dept and dept_rect and dept_rect.contains(pos):
+                            QToolTip.showText(event.globalPos(), active_dep)
+                            event.accept()
+                            return True
         return super().eventFilter(watched, event)
 
     def _schedule_grid_layout_sync(self) -> None:
@@ -799,6 +986,10 @@ class MainView(QWidget):
             self.set_view_mode(default_mode, save=False)
         self._schedule_grid_layout_sync()
 
+    def set_thumbnail_manager(self, manager: object | None) -> None:
+        """Use ThumbnailManager for async loading; None to use legacy ThumbnailCache only."""
+        self._thumbnail_manager = manager
+
     def set_project_root(self, path: str | None) -> None:
         # Store only; no validation, no scanning (per requirements).
         self._project_root = path or None
@@ -818,14 +1009,31 @@ class MainView(QWidget):
         self._list_model.setHorizontalHeaderLabels(self._list_headers())
         self._apply_list_column_defaults()
         self._all_items = []
+        self._items = {}
+        self._order = []
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
 
     def set_items(self, items: list[ViewItem]) -> None:
         # Explicit input only; no hidden filtering here (filter tree lives in Sidebar).
-        self._all_items = items
+        self._all_items = list(items)
         self._populate_views(items)
+        self._order = [str(vi.path) for vi in self._all_items]
+        self._rebuild_items_from_order()
+
+    def _paths_equal(self, a: Path | str, b: Path | str) -> bool:
+        """Compare paths for equality (resolved when possible so absolute/relative match)."""
+        try:
+            pa, pb = Path(a), Path(b)
+            if pa == pb:
+                return True
+            try:
+                return pa.resolve() == pb.resolve()
+            except OSError:
+                return str(pa).strip() == str(pb).strip()
+        except (TypeError, OSError):
+            return False
 
     def select_item_by_path(self, path: Path) -> bool:
         """Select the row whose item has the given path; returns True if found and selected."""
@@ -835,7 +1043,7 @@ class MainView(QWidget):
             if not idx.isValid():
                 continue
             item = idx.data(Qt.UserRole)
-            if isinstance(item, ViewItem) and item.path == path:
+            if isinstance(item, ViewItem) and self._paths_equal(item.path, path):
                 self._tile_view.setCurrentIndex(idx)
                 self._list_view.setCurrentIndex(self._list_model.index(row, 0))
                 return True
@@ -844,15 +1052,18 @@ class MainView(QWidget):
     def invalidate_thumbnail(self, item_root: Path) -> None:
         """
         Force a thumbnail refresh for a specific item.
-        Used by explicit overrides (e.g. clipboard paste) to ensure the grid updates immediately.
+        Uses ThumbnailManager when set; else legacy cache invalidation.
         """
         root = Path(item_root)
+        asset_id = str(root)
+        mgr = getattr(self, "_thumbnail_manager", None)
+        if mgr is not None and hasattr(mgr, "invalidate"):
+            mgr.invalidate(asset_id)
+        else:
+            for name in ("thumbnail.user.png", "thumbnail.user.jpg", "thumbnail.png", "thumbnail.jpg"):
+                self._thumb_cache.invalidate_file(root / name)
 
-        # Clear cache entries (both user override + auto candidates).
-        for name in ("thumbnail.user.png", "thumbnail.user.jpg", "thumbnail.png", "thumbnail.jpg"):
-            self._thumb_cache.invalidate_file(root / name)
-
-        # Tile model stores "loaded"/"missing" states; reset them so prefetch re-loads.
+        # Reset row state and re-request or prefetch.
         try:
             rows = int(self._tile_model.rowCount())
         except Exception:
@@ -870,9 +1081,390 @@ class MainView(QWidget):
             if std_item is None:
                 continue
             std_item.setData(None, self._THUMB_STATE_ROLE)
-            std_item.setIcon(self._icon_for_item(item))
+            if mgr is not None and hasattr(mgr, "request_thumbnail"):
+                pix = mgr.request_thumbnail(asset_id)
+                if pix is not None:
+                    std_item.setIcon(QIcon(pix))
+                    std_item.setData("loaded", self._THUMB_STATE_ROLE)
+                else:
+                    std_item.setIcon(self._icon_for_item(item))
+            else:
+                std_item.setIcon(self._icon_for_item(item))
 
         self._schedule_thumbnail_prefetch()
+
+    def repaint_tiles_for_entity(self, entity_id: str) -> None:
+        """Force repaint of tiles so delegate re-evaluates (e.g. pending 'creating' status)."""
+        if not entity_id or not str(entity_id).strip():
+            return
+        self._tile_view.viewport().update()
+
+    def repaint_tile_and_list_views(self) -> None:
+        """Force repaint of grid and list so DCC status badges reflect latest AppState after scan."""
+        rc = self._tile_model.rowCount()
+        if rc > 0:
+            tl = self._tile_model.index(0, 0)
+            br = self._tile_model.index(rc - 1, 0)
+            self._tile_model.dataChanged.emit(tl, br, [Qt.UserRole])
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
+    def refresh_thumbnails_for(self, asset_ids: list[str]) -> None:
+        """
+        Refresh tile thumbnails for the given asset ids (e.g. after thumbnail ready or invalidate).
+        Uses ThumbnailManager when set; only updates visible/cached rows.
+        """
+        if not asset_ids:
+            return
+        mgr = getattr(self, "_thumbnail_manager", None)
+        if mgr is None or not hasattr(mgr, "request_thumbnail"):
+            return
+        for asset_id in asset_ids:
+            if not asset_id or not str(asset_id).strip():
+                continue
+            row = self._row_for_item_id(asset_id)
+            if row is None:
+                continue
+            idx = self._tile_model.index(row, 0)
+            if not idx.isValid():
+                continue
+            item = idx.data(Qt.UserRole)
+            if not isinstance(item, ViewItem):
+                continue
+            std_item = self._tile_model.itemFromIndex(idx)
+            if std_item is None:
+                continue
+            pix = mgr.request_thumbnail(asset_id)
+            if pix is not None:
+                std_item.setIcon(QIcon(pix))
+                std_item.setData("loaded", self._THUMB_STATE_ROLE)
+            else:
+                std_item.setIcon(self._icon_for_item(item))
+                std_item.setData(None, self._THUMB_STATE_ROLE)
+
+    def _row_for_item_id(self, item_id: str) -> int | None:
+        """Return the model row index for the item with the given path id; path-normalized so updated_ids match."""
+        if self._items and item_id in self._items:
+            row = self._items[item_id]
+            if row < self._tile_model.rowCount():
+                return row
+        try:
+            target = Path(item_id).resolve()
+        except Exception:
+            return None
+        for row in range(self._tile_model.rowCount()):
+            idx = self._tile_model.index(row, 0)
+            if not idx.isValid():
+                continue
+            item = idx.data(Qt.UserRole)
+            if not isinstance(item, ViewItem):
+                continue
+            try:
+                if Path(item.path).resolve() == target:
+                    return row
+            except Exception:
+                if item.path == Path(item_id):
+                    return row
+        return None
+
+    @staticmethod
+    def _asset_sort_key(vi: ViewItem) -> tuple:
+        """Deterministic sort key for grid order (asset_type, name)."""
+        if isinstance(vi.ref, Asset):
+            return (vi.ref.asset_type, vi.ref.name)
+        return ((vi.type_badge or "").lower(), (vi.name or "").lower())
+
+    def _rebuild_items_from_order(self) -> None:
+        """Rebuild _items from _order so _items[asset_id] = row index."""
+        self._items = {aid: row for row, aid in enumerate(self._order)}
+
+    def _insert_row_at(self, row: int, item: ViewItem, one_based_index: int) -> None:
+        """Insert one row at the given position in both tile and list models (asset/shot context)."""
+        tile_entry = QStandardItem(display_name_for_item(item))
+        tile_entry.setEditable(False)
+        tile_entry.setData(item, Qt.UserRole)
+        tile_entry.setData(None, self._THUMB_STATE_ROLE)
+        tile_entry.setIcon(self._icon_for_item(item))
+        self._tile_model.insertRow(row, tile_entry)
+        self._insert_list_row_at(row, item, one_based_index)
+
+    def _insert_list_row_at(self, row: int, item: ViewItem, one_based_index: int) -> None:
+        """Insert list row at position (asset/shot context)."""
+        mono = monos_font("JetBrains Mono", 11)
+        if self._browser_context == "project":
+            stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
+            status = "WAITING" if not stats else stats.status
+            shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
+            assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
+            updated = "—" if not stats or not stats.last_modified else stats.last_modified
+            cells = [
+                QStandardItem(str(one_based_index)),
+                QStandardItem(display_name_for_item(item)),
+                QStandardItem(status),
+                QStandardItem(shots),
+                QStandardItem(assets),
+                QStandardItem(updated),
+                QStandardItem(str(item.path)),
+            ]
+            cells[6].setFont(mono)
+        else:
+            status = "WAITING"
+            if isinstance(item.ref, (Asset, Shot)):
+                if any(d.publish_version_count > 0 for d in item.ref.departments):
+                    status = "READY"
+                elif any(d.work_exists for d in item.ref.departments):
+                    status = "PROGRESS"
+            cells = [
+                QStandardItem(str(one_based_index)),
+                QStandardItem(display_name_for_item(item)),
+                QStandardItem(status),
+                QStandardItem("—"),
+                QStandardItem("—"),
+                QStandardItem("—"),
+            ]
+            cells[3].setFont(mono)
+        for c in cells:
+            c.setEditable(False)
+            c.setData(item, Qt.UserRole)
+        self._list_model.insertRow(row, cells)
+
+    def set_selection_from_state(self, selection_id: str | None) -> None:
+        """Drive selection from AppState only; does not emit selection_id_changed back."""
+        self._selection_driven_by_state = True
+        try:
+            if not selection_id or not selection_id.strip():
+                self._tile_view.clearSelection()
+                self._list_view.clearSelection()
+            else:
+                try:
+                    found = self.select_item_by_path(Path(selection_id))
+                    if not found:
+                        self._tile_view.clearSelection()
+                        self._list_view.clearSelection()
+                except Exception:
+                    self._tile_view.clearSelection()
+                    self._list_view.clearSelection()
+            self._update_empty_states()
+            self.valid_selection_changed.emit(self.has_valid_selection())
+        finally:
+            self._selection_driven_by_state = False
+
+    def apply_assets_diff(
+        self,
+        added_ids: list[str],
+        removed_ids: list[str],
+        updated_ids: list[str],
+        view_item_resolver: Callable[[str], ViewItem | None],
+    ) -> None:
+        """Apply diff only: remove, update, add affected items. No full rebuild. Uses _items for O(1) lookup."""
+        batch_size = len(added_ids) + len(removed_ids) + len(updated_ids)
+        batch_update = batch_size > 8
+        if batch_update:
+            self._tile_view.setUpdatesEnabled(False)
+            self._list_view.setUpdatesEnabled(False)
+        try:
+            self._apply_assets_diff_impl(
+                added_ids, removed_ids, updated_ids, view_item_resolver
+            )
+        finally:
+            if batch_update:
+                self._tile_view.setUpdatesEnabled(True)
+                self._list_view.setUpdatesEnabled(True)
+                self._tile_view.viewport().update()
+                self._list_view.viewport().update()
+        self._renumber_list_indices()
+        self._update_empty_states()
+        self.valid_selection_changed.emit(self.has_valid_selection())
+        self._schedule_thumbnail_prefetch()
+
+    def _apply_assets_diff_impl(
+        self,
+        added_ids: list[str],
+        removed_ids: list[str],
+        updated_ids: list[str],
+        view_item_resolver: Callable[[str], ViewItem | None],
+    ) -> None:
+        removed_set = set(removed_ids)
+
+        # 1. Remove: reverse row order so indices stay valid.
+        rows_to_remove = []
+        for rid in removed_ids:
+            r = self._row_for_item_id(rid)
+            if r is not None:
+                rows_to_remove.append(r)
+        rows_to_remove.sort(reverse=True)
+        for r in rows_to_remove:
+            self._tile_model.removeRow(r)
+            self._list_model.removeRow(r)
+        self._order = [aid for aid in self._order if aid not in removed_set]
+        self._all_items = [vi for vi in self._all_items if str(vi.path) not in removed_set]
+        self._rebuild_items_from_order()
+
+        # 2. Update in place: only affected visuals (label, status, thumbnail). Use path-normalized row lookup.
+        for uid in updated_ids:
+            row = self._row_for_item_id(uid)
+            if row is None or row >= self._tile_model.rowCount():
+                _dcc_debug_log.debug("apply_assets_diff_impl skip update uid=%r row=%s model_rows=%d _order[:5]=%s", uid, row, self._tile_model.rowCount(), (self._order[:5] if self._order else []))
+                continue
+            _dcc_debug_log.debug("apply_assets_diff_impl updating row=%d uid=%r", row, uid)
+            vi = view_item_resolver(uid)
+            if vi is None:
+                continue
+            tile_item = self._tile_model.item(row, 0)
+            if tile_item is not None:
+                tile_item.setText(display_name_for_item(vi))
+                tile_item.setData(vi, Qt.UserRole)
+                tile_item.setData(None, self._THUMB_STATE_ROLE)
+                tile_item.setIcon(self._icon_for_item(vi))
+            self._set_list_row_for_item(row, vi, row + 1)
+            if row < len(self._order):
+                self._order[row] = uid
+            if row < len(self._all_items):
+                self._all_items[row] = vi
+
+        if updated_ids:
+            self._rebuild_items_from_order()
+
+        # 3. Add: insert at correct sorted position (AppState order).
+        for aid in added_ids:
+            vi = view_item_resolver(aid)
+            if vi is None:
+                continue
+            new_key = self._asset_sort_key(vi)
+            insert_row = 0
+            for i, existing_vi in enumerate(self._all_items):
+                if self._asset_sort_key(existing_vi) > new_key:
+                    insert_row = i
+                    break
+            else:
+                insert_row = len(self._all_items)
+            self._order.insert(insert_row, aid)
+            self._all_items.insert(insert_row, vi)
+            self._insert_row_at(insert_row, vi, insert_row + 1)
+            self._rebuild_items_from_order()
+
+    def apply_assets_diff_from_assets(
+        self,
+        added: list[Asset],
+        removed: list[str],
+        updated: list[Asset],
+        view_item_builder: Callable[[Asset], ViewItem],
+    ) -> None:
+        """Apply diff from Asset lists only. Grid does not query AppState; data comes from signal/coordinator."""
+        added_ids = [str(a.path) for a in added]
+        removed_ids = list(removed)
+        updated_ids = [str(a.path) for a in updated]
+        _dcc_debug_log.debug("apply_assets_diff_from_assets added_ids=%s removed_ids=%s updated_ids=%s", added_ids, removed_ids, updated_ids)
+
+        def resolver(item_id: str) -> ViewItem | None:
+            for a in added:
+                if str(a.path) == item_id:
+                    return view_item_builder(a)
+            for a in updated:
+                if str(a.path) == item_id:
+                    return view_item_builder(a)
+            return None
+
+        self.apply_assets_diff(added_ids, removed_ids, updated_ids, resolver)
+
+    def apply_shots_diff(
+        self,
+        added_ids: list[str],
+        removed_ids: list[str],
+        updated_ids: list[str],
+        view_item_resolver: Callable[[str], ViewItem | None],
+    ) -> None:
+        """Same as apply_assets_diff for shots context."""
+        self.apply_assets_diff(added_ids, removed_ids, updated_ids, view_item_resolver)
+
+    def _append_row_for_item(self, item: ViewItem, row_index: int) -> None:
+        """Append one row to tile and list models (asset/shot context)."""
+        tile_entry = QStandardItem(display_name_for_item(item))
+        tile_entry.setEditable(False)
+        tile_entry.setData(item, Qt.UserRole)
+        tile_entry.setData(None, self._THUMB_STATE_ROLE)
+        tile_entry.setIcon(self._icon_for_item(item))
+        self._tile_model.appendRow(tile_entry)
+        self._append_list_row_for_item(item, row_index)
+
+    def _append_list_row_for_item(self, item: ViewItem, row_index: int) -> None:
+        mono = monos_font("JetBrains Mono", 11)
+        if self._browser_context == "project":
+            stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
+            status = "WAITING" if not stats else stats.status
+            shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
+            assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
+            updated = "—" if not stats or not stats.last_modified else stats.last_modified
+            c_index = QStandardItem(str(row_index))
+            c_name = QStandardItem(display_name_for_item(item))
+            c_status = QStandardItem(status)
+            c_shots = QStandardItem(shots)
+            c_assets = QStandardItem(assets)
+            c_updated = QStandardItem(updated)
+            c_path = QStandardItem(str(item.path))
+            c_path.setFont(mono)
+            for cell in (c_index, c_name, c_status, c_shots, c_assets, c_updated, c_path):
+                cell.setEditable(False)
+                cell.setData(item, Qt.UserRole)
+            self._list_model.appendRow([c_index, c_name, c_status, c_shots, c_assets, c_updated, c_path])
+        else:
+            c_index = QStandardItem(str(row_index))
+            c_name = QStandardItem(display_name_for_item(item))
+            status = "WAITING"
+            if isinstance(item.ref, (Asset, Shot)):
+                if any(d.publish_version_count > 0 for d in item.ref.departments):
+                    status = "READY"
+                elif any(d.work_exists for d in item.ref.departments):
+                    status = "PROGRESS"
+            c_status = QStandardItem(status)
+            c_version = QStandardItem("—")
+            c_assignee = QStandardItem("—")
+            c_updated = QStandardItem("—")
+            c_version.setFont(mono)
+            for cell in (c_index, c_name, c_status, c_version, c_assignee, c_updated):
+                cell.setEditable(False)
+                cell.setData(item, Qt.UserRole)
+            self._list_model.appendRow([c_index, c_name, c_status, c_version, c_assignee, c_updated])
+
+    def _set_list_row_for_item(self, row: int, item: ViewItem, row_index: int) -> None:
+        """Replace list row at index with item (asset/shot context)."""
+        if self._browser_context == "project":
+            stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
+            status = "WAITING" if not stats else stats.status
+            shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
+            assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
+            updated = "—" if not stats or not stats.last_modified else stats.last_modified
+            mono = monos_font("JetBrains Mono", 11)
+            self._list_model.item(row, 0).setText(str(row_index))
+            self._list_model.item(row, 1).setText(display_name_for_item(item))
+            self._list_model.item(row, 1).setData(item, Qt.UserRole)
+            self._list_model.item(row, 2).setText(status)
+            self._list_model.item(row, 3).setText(shots)
+            self._list_model.item(row, 4).setText(assets)
+            self._list_model.item(row, 5).setText(updated)
+            self._list_model.item(row, 6).setText(str(item.path))
+            for c in range(7):
+                self._list_model.item(row, c).setData(item, Qt.UserRole)
+        else:
+            status = "WAITING"
+            if isinstance(item.ref, (Asset, Shot)):
+                if any(d.publish_version_count > 0 for d in item.ref.departments):
+                    status = "READY"
+                elif any(d.work_exists for d in item.ref.departments):
+                    status = "PROGRESS"
+            self._list_model.item(row, 0).setText(str(row_index))
+            self._list_model.item(row, 1).setText(display_name_for_item(item))
+            self._list_model.item(row, 1).setData(item, Qt.UserRole)
+            self._list_model.item(row, 2).setText(status)
+            for c in range(6):
+                self._list_model.item(row, c).setData(item, Qt.UserRole)
+
+    def _renumber_list_indices(self) -> None:
+        """Set first column to 1-based row index for all rows."""
+        for row in range(self._list_model.rowCount()):
+            it = self._list_model.item(row, 0)
+            if it is not None:
+                it.setText(str(row + 1))
 
     def _populate_views(self, items: list[ViewItem]) -> None:
         # Populate both Tile and List representations from the same items.
@@ -1083,6 +1675,11 @@ class MainView(QWidget):
         self.valid_selection_changed.emit(self.has_valid_selection())
 
     def _on_any_selection_changed(self, *_args) -> None:
+        if getattr(self, "_selection_driven_by_state", False):
+            return
+        item = self.selected_view_item()
+        sid = str(item.path) if item is not None else None
+        self.selection_id_changed.emit(sid)
         self.valid_selection_changed.emit(self.has_valid_selection())
 
     def _update_empty_states(self) -> None:
@@ -1150,10 +1747,12 @@ class MainView(QWidget):
 
         open_action = None
         open_with_action = None
+        create_new_action = None
         copy_inventory = None
         if item.kind.value in ("asset", "shot"):
             open_action = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open")
             open_with_action = menu.addAction(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]), "Open With…")
+            create_new_action = menu.addAction(lucide_icon("file-plus", size=16, color_hex=MONOS_COLORS["text_label"]), "Create New…")
             menu.addSeparator()
             copy_inventory = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Inventory")
             menu.addSeparator()
@@ -1191,6 +1790,7 @@ class MainView(QWidget):
         menu.setProperty("_act_copy_inventory", copy_inventory)
         menu.setProperty("_act_open", open_action)
         menu.setProperty("_act_open_with", open_with_action)
+        menu.setProperty("_act_create_new", create_new_action)
         menu.setProperty("_act_refresh", refresh_action)
         menu.setProperty("_act_delete", delete_action)
         menu.setProperty("_act_open_work", open_work)
@@ -1220,11 +1820,16 @@ class MainView(QWidget):
         if text == "Open With…":
             self.open_with_requested.emit(item)
             return
+        if text == "Create New…":
+            self.create_new_requested.emit(item)
+            return
         if text == "Copy Full Path":
-            self._copy_full_path(str(item.path))
+            path_str, _ = self._resolved_path_and_folder_for_item(item)
+            self._copy_full_path(path_str)
             return
         if text == "Open Folder":
-            self._open_folder(Path(item.path))
+            _, folder = self._resolved_path_and_folder_for_item(item)
+            self._open_folder(folder)
             return
         if text == "Refresh":
             self.refresh_requested.emit()
@@ -1240,6 +1845,24 @@ class MainView(QWidget):
             if hasattr(item, "ref") and item.ref is not None and hasattr(item.ref, "publish_path"):
                 self._open_folder(Path(item.ref.publish_path))
             return
+
+    def _resolved_path_and_folder_for_item(self, item: ViewItem) -> tuple[str, Path]:
+        """
+        Resolve path (for copy) and folder (for open) from item and current department/type.
+        When a department is selected and the item (asset/shot) has that department,
+        returns the department's work folder; otherwise returns item root path.
+        """
+        default_path = Path(item.path)
+        active_dep = (self._active_department or "").strip() or None
+        if not active_dep or item.kind.value not in ("asset", "shot"):
+            return (str(default_path), default_path)
+        ref = getattr(item, "ref", None)
+        if not isinstance(ref, (Asset, Shot)) or not ref.departments:
+            return (str(default_path), default_path)
+        for d in ref.departments:
+            if (d.name or "").strip().casefold() == active_dep.casefold():
+                return (str(d.work_path), d.work_path)
+        return (str(default_path), default_path)
 
     def _copy_full_path(self, path_text: str) -> None:
         if not path_text:
@@ -1298,6 +1921,19 @@ class MainView(QWidget):
 
             state = std_item.data(self._THUMB_STATE_ROLE)
             if state in ("loaded", "missing"):
+                continue
+
+            asset_id = str(item.path)
+            mgr = getattr(self, "_thumbnail_manager", None)
+            if mgr is not None and hasattr(mgr, "request_thumbnail"):
+                pix = mgr.request_thumbnail(asset_id)
+                if pix is not None:
+                    std_item.setIcon(QIcon(pix))
+                    std_item.setData("loaded", self._THUMB_STATE_ROLE)
+                    continue
+                thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path)
+                if thumb_file is None:
+                    std_item.setData("missing", self._THUMB_STATE_ROLE)
                 continue
 
             thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path)

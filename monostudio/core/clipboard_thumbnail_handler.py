@@ -179,22 +179,11 @@ class ClipboardThumbnailHandler(QObject):
             "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
-        tmp = meta_path.with_suffix(".json.tmp")
         try:
-            meta_dir.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            os.replace(str(tmp), str(meta_path))
-        except PermissionError:
+            from monostudio.core.atomic_write import atomic_write_text
+            content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            atomic_write_text(meta_path, content, encoding="utf-8")
+        except (PermissionError, OSError):
             # Metadata should never block the thumbnail write; fail silently.
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
-        except OSError:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
+            pass
 

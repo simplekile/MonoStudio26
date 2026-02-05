@@ -1,11 +1,14 @@
 """
 Per-item user-defined status (asset/shot).
 Stored in <item_root>/.monostudio/status.json. Overrides computed status when set.
+Writes use atomic write for crash safety.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from monostudio.core.atomic_write import atomic_write_text
 
 VALID_STATUSES = frozenset({"ready", "progress", "waiting", "blocked"})
 
@@ -36,5 +39,5 @@ def write_item_status(item_root: Path, status: str) -> None:
     if s not in VALID_STATUSES:
         raise ValueError(f"Invalid status {status!r}; must be one of {sorted(VALID_STATUSES)}")
     path = Path(item_root) / ".monostudio" / "status.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"status": s}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    content = json.dumps({"status": s}, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(path, content, encoding="utf-8")

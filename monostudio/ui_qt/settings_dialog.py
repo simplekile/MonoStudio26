@@ -36,7 +36,9 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.core.dcc_blender import resolve_blender_executable
+from monostudio.core.dcc_houdini import resolve_houdini_executable
 from monostudio.core.dcc_maya import resolve_maya_executable
+from monostudio.core.dcc_substance_painter import resolve_substance_painter_executable
 from monostudio.core.department_registry import (
     DepartmentRegistry,
     get_default_department_mapping,
@@ -44,7 +46,11 @@ from monostudio.core.department_registry import (
     save_project_departments,
     write_departments_to_path,
 )
-from monostudio.core.fs_reader import build_project_index
+from monostudio.core.fs_reader import (
+    build_project_index,
+    read_use_dcc_folders,
+    save_use_dcc_folders,
+)
 from monostudio.core.type_registry import TypeRegistry, save_project_types, write_types_to_path
 from monostudio.core.pipeline_types_and_presets import (
     PipelineTypesAndPresets,
@@ -119,8 +125,12 @@ class SettingsDialog(MonosDialog):
         # Optional integrations UI fields.
         self._blender_exe_field: QLineEdit | None = None
         self._maya_exe_field: QLineEdit | None = None
+        self._houdini_exe_field: QLineEdit | None = None
+        self._substance_painter_exe_field: QLineEdit | None = None
         self._dept_mapping_table: QTableWidget | None = None
         self._type_mapping_table: QTableWidget | None = None
+        self._use_dcc_folders_cb: QCheckBox | None = None
+        self._notification_max_visible_combo: QComboBox | None = None
 
         # Tier 1: left nav — General | Pipeline | DCCs | Project
         self._content_stack = QStackedWidget(self)
@@ -261,9 +271,39 @@ class SettingsDialog(MonosDialog):
         """Tier 2: General → Workspace | UI | Behavior (nút page ngang)."""
         return self._build_tier2_page_buttons([
             ("Workspace", self._build_app_workspace_tab()),
-            ("UI", self._placeholder("General → UI (placeholder)")),
+            ("UI", self._build_ui_tab()),
             ("Behavior", self._placeholder("General → Behavior (placeholder)")),
         ])
+
+    def _build_ui_tab(self) -> QWidget:
+        """General → UI: notifications and other UI options."""
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        grp = QGroupBox("Notifications", root)
+        grp_layout = QVBoxLayout(grp)
+        form = QFormLayout()
+        self._notification_max_visible_combo = QComboBox(grp)
+        self._notification_max_visible_combo.addItems(["1", "2", "3"])
+        try:
+            cur = 1
+            if self._settings is not None:
+                v = self._settings.value("notification/max_visible", 1, int)
+                cur = max(1, min(3, int(v) if v is not None else 1))
+        except Exception:
+            cur = 1
+        self._notification_max_visible_combo.setCurrentIndex(cur - 1)
+        form.addRow("Max visible toasts:", self._notification_max_visible_combo)
+        hint = QLabel("Sidebar toasts (page, department, type) appear bottom-left; others bottom-right.", grp)
+        hint.setWordWrap(True)
+        hint.setObjectName("DialogHelper")
+        grp_layout.addLayout(form)
+        grp_layout.addWidget(hint)
+        layout.addWidget(grp)
+        layout.addStretch(1)
+        return root
 
     def _build_pipeline_page(self) -> QWidget:
         """Tier 2: Pipeline → Mapping Folders | Categories | Statuses (nút page ngang)."""
@@ -362,6 +402,16 @@ class SettingsDialog(MonosDialog):
         row_prj_l.addWidget(btn_project, 0)
         form.addRow("Project Root", row_prj)
 
+        self._use_dcc_folders_cb = QCheckBox("Use DCC folders (department/<dcc>/work)", grp)
+        self._use_dcc_folders_cb.setChecked(
+            read_use_dcc_folders(self._project_root) if self._project_root else True
+        )
+        self._use_dcc_folders_cb.setToolTip(
+            "Store work files in department/<dcc>/work (e.g. modeling/blender/work). Default: on."
+        )
+        self._use_dcc_folders_cb.setEnabled(self._project_root is not None)
+        form.addRow("", self._use_dcc_folders_cb)
+
         layout.addWidget(grp)
         layout.addStretch(1)
         return root
@@ -382,6 +432,9 @@ class SettingsDialog(MonosDialog):
             return
         self._project_root = Path(folder)
         self._project_path.setText(folder)
+        if self._use_dcc_folders_cb is not None:
+            self._use_dcc_folders_cb.setEnabled(True)
+            self._use_dcc_folders_cb.setChecked(read_use_dcc_folders(self._project_root))
         self.project_root_selected.emit(folder)
 
     def _build_type_mapping_page(self) -> QWidget:
@@ -746,7 +799,9 @@ class SettingsDialog(MonosDialog):
                 return
             payload = {"departments": mapping}
             try:
-                Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                from monostudio.core.atomic_write import atomic_write_text
+                content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+                atomic_write_text(Path(path), content, encoding="utf-8")
                 QMessageBox.information(self, "Save preset", "Preset saved.")
                 # Refresh preset list so the new file appears in the dropdown
                 preset_combo.blockSignals(True)
@@ -932,9 +987,105 @@ class SettingsDialog(MonosDialog):
         row_maya_l.addWidget(btn_browse_maya, 0)
         form.addRow("Maya Executable", row_maya)
 
+        # Houdini
+        field_houdini = QLineEdit(self)
+        field_houdini.setPlaceholderText("Auto-detect, or browse to houdini.exe")
+        field_houdini.setProperty("mono", True)
+        self._houdini_exe_field = field_houdini
+        if self._settings is not None:
+            cur_h = (self._settings.value("integrations/houdini_exe", "", str) or "").strip()
+            field_houdini.setText(cur_h)
+        else:
+            field_houdini.setEnabled(False)
+        btn_browse_houdini = QPushButton("Browse…", self)
+        btn_auto_houdini = QPushButton("Auto Detect", self)
+        if self._settings is None:
+            btn_browse_houdini.setEnabled(False)
+            btn_auto_houdini.setEnabled(False)
+
+        def on_browse_houdini() -> None:
+            start = field_houdini.text().strip()
+            start_dir = str(Path(start).parent) if start else ""
+            path, _flt = QFileDialog.getOpenFileName(
+                self,
+                "Select Houdini Executable",
+                start_dir,
+                "Houdini (houdini.exe);;Executables (*.exe);;All files (*.*)",
+            )
+            if path:
+                field_houdini.setText(path)
+
+        def on_auto_detect_houdini() -> None:
+            found = resolve_houdini_executable(field_houdini.text().strip() or "houdini")
+            if not found:
+                QMessageBox.information(self, "Auto Detect", "Houdini was not found. Browse to 'houdini.exe' or set HFS.")
+                return
+            field_houdini.setText(found)
+
+        btn_browse_houdini.clicked.connect(on_browse_houdini)
+        btn_auto_houdini.clicked.connect(on_auto_detect_houdini)
+        row_houdini = QWidget(self)
+        row_houdini_l = QHBoxLayout(row_houdini)
+        row_houdini_l.setContentsMargins(0, 0, 0, 0)
+        row_houdini_l.setSpacing(8)
+        row_houdini_l.addWidget(field_houdini, 1)
+        row_houdini_l.addWidget(btn_auto_houdini, 0)
+        row_houdini_l.addWidget(btn_browse_houdini, 0)
+        form.addRow("Houdini Executable", row_houdini)
+
+        # Substance Painter
+        field_sp = QLineEdit(self)
+        field_sp.setPlaceholderText("Auto-detect, or browse to Adobe Substance 3D Painter.exe")
+        field_sp.setProperty("mono", True)
+        self._substance_painter_exe_field = field_sp
+        if self._settings is not None:
+            cur_sp = (self._settings.value("integrations/substance_painter_exe", "", str) or "").strip()
+            field_sp.setText(cur_sp)
+        else:
+            field_sp.setEnabled(False)
+        btn_browse_sp = QPushButton("Browse…", self)
+        btn_auto_sp = QPushButton("Auto Detect", self)
+        if self._settings is None:
+            btn_browse_sp.setEnabled(False)
+            btn_auto_sp.setEnabled(False)
+
+        def on_browse_sp() -> None:
+            start = field_sp.text().strip()
+            start_dir = str(Path(start).parent) if start else ""
+            path, _flt = QFileDialog.getOpenFileName(
+                self,
+                "Select Substance Painter Executable",
+                start_dir,
+                "Substance Painter (*.exe);;Executables (*.exe);;All files (*.*)",
+            )
+            if path:
+                field_sp.setText(path)
+
+        def on_auto_detect_sp() -> None:
+            found = resolve_substance_painter_executable(field_sp.text().strip() or "substancepainter")
+            if not found:
+                QMessageBox.information(
+                    self,
+                    "Auto Detect",
+                    "Substance Painter was not found. Browse to 'Adobe Substance 3D Painter.exe'.",
+                )
+                return
+            field_sp.setText(found)
+
+        btn_browse_sp.clicked.connect(on_browse_sp)
+        btn_auto_sp.clicked.connect(on_auto_detect_sp)
+        row_sp = QWidget(self)
+        row_sp_l = QHBoxLayout(row_sp)
+        row_sp_l.setContentsMargins(0, 0, 0, 0)
+        row_sp_l.setSpacing(8)
+        row_sp_l.addWidget(field_sp, 1)
+        row_sp_l.addWidget(btn_auto_sp, 0)
+        row_sp_l.addWidget(btn_browse_sp, 0)
+        form.addRow("Substance Painter Executable", row_sp)
+
         hint = QLabel(
-            "If empty, MonoStudio will try to auto-detect Blender and Maya.\n"
-            "You can also set env vars MONOSTUDIO_BLENDER_EXE and MONOSTUDIO_MAYA_EXE."
+            "If empty, MonoStudio will try to auto-detect Blender, Maya, Houdini, and Substance Painter.\n"
+            "Env vars: MONOSTUDIO_BLENDER_EXE, MONOSTUDIO_MAYA_EXE, MONOSTUDIO_HOUDINI_EXE, MONOSTUDIO_SUBSTANCE_PAINTER_EXE (or HFS for Houdini)."
         )
         hint.setWordWrap(True)
         hint.setObjectName("DialogHint")
@@ -1399,12 +1550,36 @@ class SettingsDialog(MonosDialog):
             if type_mapping and not save_project_types(self._project_root, type_mapping):
                 QMessageBox.warning(self, "Settings", "Failed to save Type Mapping to project.")
 
+        # Persist project-level use_dcc_folders when project is set.
+        if self._project_root is not None and self._use_dcc_folders_cb is not None:
+            if not save_use_dcc_folders(self._project_root, self._use_dcc_folders_cb.isChecked()):
+                QMessageBox.warning(
+                    self,
+                    "Settings",
+                    "Failed to save Use DCC folders to project.",
+                )
+
+        # Persist notification UI setting.
+        try:
+            if self._settings is not None and self._notification_max_visible_combo is not None:
+                idx = self._notification_max_visible_combo.currentIndex()
+                self._settings.setValue("notification/max_visible", idx + 1)
+        except Exception:
+            pass
+
         # Persist integrations (best-effort; should not block saving pipeline config).
         try:
             if self._settings is not None and self._blender_exe_field is not None:
                 self._settings.setValue("integrations/blender_exe", (self._blender_exe_field.text() or "").strip())
             if self._settings is not None and self._maya_exe_field is not None:
                 self._settings.setValue("integrations/maya_exe", (self._maya_exe_field.text() or "").strip())
+            if self._settings is not None and self._houdini_exe_field is not None:
+                self._settings.setValue("integrations/houdini_exe", (self._houdini_exe_field.text() or "").strip())
+            if self._settings is not None and self._substance_painter_exe_field is not None:
+                self._settings.setValue(
+                    "integrations/substance_painter_exe",
+                    (self._substance_painter_exe_field.text() or "").strip(),
+                )
         except Exception:
             pass
         self.accept()
