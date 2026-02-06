@@ -267,6 +267,18 @@ THUMB_TAG_STYLE: dict[str, object] = {
     "type_color_key": "emerald_500",  # #10b981
 }
 
+# Sidebar department list: container + section header + spacer (used by _SidebarDeptListDelegate).
+# Container BG gradient giống page: trái → phải #121214 → #1b1b1b.
+SIDEBAR_DEPT_LIST_STYLE: dict[str, object] = {
+    "section_row_height_px": 20,
+    "spacer_row_height_px": 4,  # gap between containers
+    "section_font_size_px": 7,
+    "section_title_color_key": "text_meta",
+    "container_radius_px": 6,  # rounded corners for container blocks
+    "container_gradient_start": "#27272f",  # Zinc-900, sáng hơn
+    "container_gradient_end": "#18181b",  # Zinc-800
+}
+
 
 def monos_font(
     family: str = "Inter",
@@ -1340,7 +1352,7 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #18181b;
         }
         QLabel#SidebarBrandIcon {
-            background: #2563eb; /* Blue-600 */
+            background: #27272a; /* Zinc-800, black & white */
             color: #ffffff;
             border-radius: 6px;
             font-weight: 700;
@@ -1349,6 +1361,7 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #dddddd;
             font-size: 16px;
             font-weight: 800;
+            font-style: italic;
         }
         QLabel#SidebarSectionHeader {
             color: #71717a; /* Zinc-500 */

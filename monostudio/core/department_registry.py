@@ -146,14 +146,58 @@ def _load_departments_json(path: Path) -> dict[str, dict] | None:
         order = node.get("order")
         if not isinstance(order, (int, float)):
             order = 999
-        out[dept_id.strip()] = {
+        node_out: dict = {
             "label": label.strip(),
             "folder": folder.strip(),
             "shot_folder": shot_folder,
             "asset_folder": asset_folder,
             "order": int(order),
         }
+        parent_val = node.get("parent")
+        if isinstance(parent_val, str) and parent_val.strip():
+            node_out["parent"] = parent_val.strip()
+        out[dept_id.strip()] = node_out
     return out if out else None
+
+
+def _compute_relative_paths(mapping: dict[str, dict]) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Compute full relative path per dept_id for shot and asset (nested: parent/child on disk).
+    Returns (shot_rel: dept_id -> path, asset_rel: dept_id -> path).
+    """
+    shot_rel: dict[str, str] = {}
+    asset_rel: dict[str, str] = {}
+
+    def build_paths(context_key: str) -> None:
+        rel = shot_rel if context_key == "shot" else asset_rel
+        key = "shot_folder" if context_key == "shot" else "asset_folder"
+        ordered: list[str] = []
+        seen: set[str] = set()
+        while len(ordered) < len(mapping):
+            added = False
+            for dept_id, node in mapping.items():
+                if dept_id in seen:
+                    continue
+                parent = node.get("parent")
+                if not parent or parent not in mapping or parent in seen:
+                    ordered.append(dept_id)
+                    seen.add(dept_id)
+                    added = True
+            if not added:
+                break
+        for dept_id in ordered:
+            node = mapping[dept_id]
+            folder = (node.get(key) or node.get("folder") or dept_id or "").strip()
+            parent = node.get("parent")
+            if not parent or parent not in mapping:
+                rel[dept_id] = folder
+            else:
+                parent_path = rel.get(parent) or ""
+                rel[dept_id] = f"{parent_path}/{folder}" if parent_path else folder
+
+    build_paths("shot")
+    build_paths("asset")
+    return shot_rel, asset_rel
 
 
 class DepartmentRegistry:
@@ -166,14 +210,19 @@ class DepartmentRegistry:
 
     def __init__(self, mapping: dict[str, dict], source_path: Path | None) -> None:
         """
-        mapping: dept_id -> { "label", "folder", "shot_folder", "asset_folder", "order" }
+        mapping: dept_id -> { "label", "folder", "shot_folder", "asset_folder", "order", optional "parent" }
         source_path: path to departments.json, or None if using default in-memory mapping.
+        Cấu trúc nested: khi có "parent", folder trên disk là relative path (vd 01_modelling/01_sculpt).
         """
         self._mapping = dict(mapping)
         self._source_path = Path(source_path) if source_path else None
-        # Index folder -> dept_id per context (first wins if duplicate folders)
         self._shot_folder_to_id: dict[str, str] = {}
         self._asset_folder_to_id: dict[str, str] = {}
+        self._shot_relative_path: dict[str, str] = {}
+        self._asset_relative_path: dict[str, str] = {}
+        self._shot_relative_path_to_id: dict[str, str] = {}
+        self._asset_relative_path_to_id: dict[str, str] = {}
+
         for dept_id, node in sorted(self._mapping.items(), key=lambda kv: kv[1].get("order", 999)):
             shot_f = (node.get("shot_folder") or node.get("folder") or "").strip()
             asset_f = (node.get("asset_folder") or node.get("folder") or "").strip()
@@ -181,6 +230,19 @@ class DepartmentRegistry:
                 self._shot_folder_to_id[shot_f] = dept_id
             if asset_f and asset_f not in self._asset_folder_to_id:
                 self._asset_folder_to_id[asset_f] = dept_id
+
+        has_parent = any(
+            isinstance(n.get("parent"), str) and (n.get("parent") or "").strip()
+            for n in self._mapping.values()
+        )
+        if has_parent:
+            self._shot_relative_path, self._asset_relative_path = _compute_relative_paths(self._mapping)
+            for d, p in self._shot_relative_path.items():
+                if p and p not in self._shot_relative_path_to_id:
+                    self._shot_relative_path_to_id[p] = d
+            for d, p in self._asset_relative_path.items():
+                if p and p not in self._asset_relative_path_to_id:
+                    self._asset_relative_path_to_id[p] = d
 
     @classmethod
     def for_project(cls, project_root: Path) -> "DepartmentRegistry":
@@ -211,21 +273,55 @@ class DepartmentRegistry:
         return (dept_id or "").strip() or ""
 
     def get_department_folder(self, dept_id: str, context: DepartmentContext = "shot") -> str:
-        """Physical folder name for the department in the given context (shot or asset)."""
-        node = self._mapping.get((dept_id or "").strip())
+        """Physical folder (single segment or relative path when nested)."""
+        return self.get_department_relative_path(dept_id, context)
+
+    def get_department_relative_path(self, dept_id: str, context: DepartmentContext = "shot") -> str:
+        """
+        Relative path for the department (one segment when flat, parent/child when nested).
+        Dùng cho create flow và scan khi nested.
+        """
+        dept_id = (dept_id or "").strip()
+        if self._asset_relative_path or self._shot_relative_path:
+            rel = self._shot_relative_path if context == "shot" else self._asset_relative_path
+            if rel:
+                return rel.get(dept_id) or self._single_folder(dept_id, context)
+        return self._single_folder(dept_id, context)
+
+    def _single_folder(self, dept_id: str, context: DepartmentContext) -> str:
+        node = self._mapping.get(dept_id)
         if not node:
-            return (dept_id or "").strip() or ""
-        if context == "shot":
-            folder = (node.get("shot_folder") or node.get("folder") or "").strip()
-        else:
-            folder = (node.get("asset_folder") or node.get("folder") or "").strip()
-        return folder or (dept_id or "").strip() or ""
+            return dept_id or ""
+        key = "shot_folder" if context == "shot" else "asset_folder"
+        folder = (node.get(key) or node.get("folder") or dept_id or "").strip()
+        return folder or dept_id
+
+    def get_department_relative_paths(self, context: DepartmentContext) -> list[tuple[str, str]]:
+        """
+        List (relative_path, dept_id) for all departments.
+        Nested: full path (vd 01_modelling/01_sculpt) để scan tìm subdepartment.
+        """
+        rel = self._shot_relative_path if context == "shot" else self._asset_relative_path
+        if rel:
+            return [(path, d) for d, path in rel.items() if path]
+        out: list[tuple[str, str]] = []
+        for dept_id in self.get_departments():
+            path = self.get_department_relative_path(dept_id, context)
+            if path:
+                out.append((path, dept_id))
+        return out
 
     def get_department_by_folder(self, folder_name: str, context: DepartmentContext) -> str | None:
-        """Resolve physical folder name to logical department ID in the given context (shot or asset)."""
+        """Resolve folder name or relative path to logical department ID."""
         key = (folder_name or "").strip()
+        if not key:
+            return None
         if context == "shot":
+            if self._shot_relative_path_to_id:
+                return self._shot_relative_path_to_id.get(key)
             return self._shot_folder_to_id.get(key)
+        if self._asset_relative_path_to_id:
+            return self._asset_relative_path_to_id.get(key)
         return self._asset_folder_to_id.get(key)
 
     def get_mapping_edit_level(
@@ -277,20 +373,33 @@ def _edit_level_for_folder(index: ProjectIndex, folder_name: str) -> MappingEdit
     return "WARNING"
 
 
-def _department_folder_usage(index: ProjectIndex, folder_name: str) -> tuple[bool, bool]:
+def _department_folder_usage(
+    index: ProjectIndex,
+    folder_name_or_rel_path: str,
+) -> tuple[bool, bool]:
     """
     Check usage of a physical department folder across the project.
-
+    folder_name_or_rel_path: single segment (flat) or relative path (nested, e.g. 01_modelling/01_sculpt).
     Returns (folder_exists_anywhere, files_exist_anywhere).
     """
     folder_exists = False
     files_exist = False
+    key = (folder_name_or_rel_path or "").strip()
+    use_relative = "/" in key
 
-    def check_item_departments(departments: tuple) -> None:
+    def check_item_departments(item_root: Path, departments: tuple) -> None:
         nonlocal folder_exists, files_exist
         for d in departments:
-            if d.path.name != folder_name:
-                continue
+            if use_relative:
+                try:
+                    rel = d.path.relative_to(item_root)
+                    if rel.as_posix() != key:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+            else:
+                if d.path.name != key:
+                    continue
             folder_exists = True
             work_path = d.work_path
             publish_path = d.publish_path
@@ -299,11 +408,11 @@ def _department_folder_usage(index: ProjectIndex, folder_name: str) -> tuple[boo
                 return
 
     for a in index.assets:
-        check_item_departments(a.departments)
+        check_item_departments(a.path, a.departments)
         if files_exist:
             return True, True
     for s in index.shots:
-        check_item_departments(s.departments)
+        check_item_departments(s.path, s.departments)
         if files_exist:
             return True, True
 
@@ -345,13 +454,16 @@ def _build_departments_payload(mapping: dict[str, dict]) -> dict[str, dict]:
         order = node.get("order")
         if not isinstance(order, (int, float)):
             order = 999
-        payload[dept_id.strip()] = {
+        row: dict = {
             "label": label.strip(),
             "folder": folder.strip(),
             "shot_folder": shot_folder.strip(),
             "asset_folder": asset_folder.strip(),
             "order": int(order),
         }
+        if isinstance(node.get("parent"), str) and (node.get("parent") or "").strip():
+            row["parent"] = (node.get("parent") or "").strip()
+        payload[dept_id.strip()] = row
     return payload
 
 

@@ -1,0 +1,107 @@
+---
+description: Subdepartment design – Plan B (nested folders). Schema, rules, and implementation touch points.
+alwaysApply: false
+---
+
+# Subdepartment – Plan B (Nested folders)
+
+## Chốt mapping
+
+- **Cấu trúc logic** (chỉ grouping + leaf tasks):
+  - modelling → sculpt, retopo, uv
+  - rigging → geoclean (clean_geo), rig (build_rig)
+  - surfacing → baking, texturing
+
+- **departments.json**: mỗi node có `label`, `folder`, `order`; subdepartment có thêm `parent` (id của parent). Parent chỉ là grouping, không phải task.
+
+- **Rule bắt buộc (TypeDef / Create dialog)**  
+  Type chỉ reference **subdepartment (leaf)**. **Không** reference cả parent lẫn child cùng lúc.  
+  Đúng: `sculpt, retopo, uv`  
+  Sai: `modelling, sculpt, retopo`  
+  Khi build TypeDef.departments hoặc Create dialog: dùng `filter_departments_leaf_only()` hoặc tương đương; không cho parent xuất hiện cùng child.
+
+---
+
+## Plan B: Nested folder trên disk
+
+- **Mục tiêu**: Thư mục department trên filesystem theo hierarchy (ví dụ `assets/<type>/<name>/surfacing/texturing/work`, `modelling/sculpt/publish`).
+- **Backward compatibility**: Project cũ giữ flat. Thêm project-level setting:
+  - `department_layout`: `"flat"` | `"nested"` (mặc định `flat`).
+  - Lưu ở `.monostudio/project.json` (hoặc tương đương). Không sửa schema departments.json cũ.
+
+### Flat (hiện tại)
+
+- Mỗi department = một folder trực tiếp dưới asset/shot: `assets/char/foo/01_modeling/`, `assets/char/foo/02_retopo/`.
+- `get_department_folder(dept_id, context)` trả về một tên folder (vd `01_modeling`).
+
+### Nested (Plan B)
+
+- Department có parent: path = parent_folder/child_folder (vd `surfacing/texturing`, `modelling/sculpt`).
+- Department root: path = folder (vd `layout`, `grooming`).
+- `get_department_folder(dept_id, context)` (hoặc API mới `get_department_relative_path`) trả về **relative path** có thể nhiều cấp, ví dụ `surfacing/texturing`, `modelling/sculpt`.
+- Create flow: `(asset_dir / relative_path).mkdir(parents=True, exist_ok=True)`.
+- Scan: cần map **relative path** (hoặc path parts) → dept_id; không chỉ `dept_dir.name` mà có thể `dept_dir` là path tương đối từ asset_dir/shot_dir.
+
+---
+
+## Validation (bắt buộc)
+
+- `parent` phải tồn tại trong mapping.
+- Không cycle: chain parent không được quay lại chính nó.
+- **Full ancestor chain**: parent không được trỏ tới bất kỳ descendant nào (vd surfacing → lookdev → surfacing ❌).
+- **Khi xóa department cha trong Settings**: **Promote children lên root** (không auto xóa con).
+
+---
+
+## API DepartmentRegistry (giữ + mở rộng)
+
+- `get_departments_flat()`: list phẳng, thứ tự root rồi con (cho fs / logic).
+- `get_departments_tree()`: nested (tuple/list) cho UI tree.
+- **Không** overload một hàm `get_departments()` vừa flat vừa tree; tách rõ hai API.
+- `get_root_department(dept_id)`: trả về root của chain.
+- `get_department_path_labels(dept_id)`: trả về list label cho tooltip/breadcrumb, vd `["Surfacing", "Texturing"]`.
+- `get_parent(dept_id)`, `filter_departments_leaf_only(dept_ids)`.
+- **Plan B**: `get_department_relative_path(dept_id, context)` trả về relative path (flat: một segment, nested: parent/child). Hoặc mở rộng `get_department_folder` khi `department_layout == "nested"` trả về path nhiều cấp.
+
+---
+
+## UI (đã đúng hướng, giữ)
+
+- **Settings → Department Mapping**: QTreeView + model (không QTreeWidget); reorder/drag/filter sau này.
+- **Create dialog**: `selected_departments()` chỉ leaf; không đổi logic nghiệp vụ.
+- **Inspector / MainView**: Tooltip "Parent › Sub"; **không** thay display name chính (giữ cho search, filter, DCC mapping).
+
+---
+
+## Touch points khi implement Plan B
+
+1. **department_registry.py**
+   - Đọc `department_layout` (project) hoặc default flat.
+   - Khi nested: build relative path từ root → leaf (parent folder + "/" + child folder). Reverse map: relative_path → dept_id cho scan.
+
+2. **fs_reader.py**
+   - **Flat**: giữ `_iter_dirs(asset_dir)` = direct children; `get_department_by_folder(dept_dir.name, "asset")`.
+   - **Nested**: duyệt recursive hoặc list “leaf department paths” (vd mỗi dept_id có relative path); với mỗi dept_dir là path tương đối (có thể nhiều cấp), resolve dept_id bằng map relative_path → dept_id. Cấu trúc work/publish: vẫn `dept_dir / "work"`, `dept_dir / "publish"` với `dept_dir` = full Path tới leaf folder.
+
+3. **Create flow (main_window.py, app_controller.py)**
+   - Thay vì `asset_dir / dept_folder` với dept_folder một tên, dùng `asset_dir / relative_path`; `mkdir(parents=True, exist_ok=True)`.
+
+4. **Inspector / main_view**
+   - Path hiển thị đã dùng department path; nested chỉ thay cách resolve path (leaf folder = có thể là subpath).
+
+5. **Publish / work mapping**
+   - Logic “folder name” → dept_id mở rộng thành “relative path” → dept_id khi nested.
+
+6. **Project setting**
+   - Thêm `department_layout` vào project.json; UI Settings (optional) để chọn flat vs nested cho project mới / migration.
+
+---
+
+## Thứ tự implement gợi ý
+
+1. DepartmentRegistry: hỗ trợ `get_department_relative_path(dept_id, context)` (hoặc mở rộng get_department_folder) + đọc `department_layout`; reverse map relative_path → dept_id.
+2. Project: thêm `department_layout` (default flat), không migrate project cũ.
+3. fs_reader: khi nested, iterate theo danh sách relative path của từng leaf department; build Department từ path tương đối.
+4. Create flow: dùng relative path + mkdir(parents=True).
+5. Inspector / path display: dùng relative path nếu cần.
+6. (Optional) Settings UI: toggle flat/nested cho project.

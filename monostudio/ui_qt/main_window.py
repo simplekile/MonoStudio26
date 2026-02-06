@@ -78,6 +78,8 @@ class MainWindow(QMainWindow):
         self._context_switch_in_progress: bool = False
         # Guard: filter (department/type) changes must never trigger Open DCC flows or spawn dialogs.
         self._filter_switch_in_progress: bool = False
+        # Per-context (page, department, type) saved selection; restore when switching back.
+        self._selection_by_context: dict[tuple[str, str, str], str] = {}
         self._workspace_root: Path | None = None
         self._workspace_projects: list[DiscoveredProject] = []
         self._workspace_project_status: dict[str, str] = {}
@@ -192,6 +194,7 @@ class MainWindow(QMainWindow):
         self._main_view.create_new_requested.connect(self._on_create_new_requested)
         self._main_view.selection_id_changed.connect(self._app_state.set_selection)
         self._app_state.selectionChanged.connect(self._main_view.set_selection_from_state)
+        self._app_state.selectionChanged.connect(self._on_selection_changed_save_focus)
         self._app_state.assetsChanged.connect(self._on_app_state_assets_changed)
         self._app_state.shotsChanged.connect(self._on_app_state_shots_changed)
         self._app_state.filtersChanged.connect(self._on_app_state_filters_changed)
@@ -226,6 +229,31 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _norm(s: str | None) -> str:
         return (s or "").strip().casefold()
+
+    def _context_key(self) -> tuple[str, str, str] | None:
+        """(mode, department, type) for Assets/Shots; use sidebar filters so key matches after page/filter switch."""
+        ctx = self._sidebar.current_context()
+        if ctx == "Assets":
+            f = self._sidebar.filters()
+            return ("assets", f.current_department() or "", f.current_type() or "")
+        if ctx == "Shots":
+            f = self._sidebar.filters()
+            return ("shots", f.current_department() or "", f.current_type() or "")
+        return None
+
+    def _on_selection_changed_save_focus(self, selection_id: str | None) -> None:
+        """Persist current selection per (page, department, type) so it can be restored when switching back.
+        Only update when user selects something; do not clear saved focus when selection is cleared on switch.
+        Store resolved path so restore matches regardless of relative/absolute."""
+        key = self._context_key()
+        if key is None:
+            return
+        if selection_id and selection_id.strip():
+            raw = (selection_id or "").strip()
+            try:
+                self._selection_by_context[key] = str(Path(raw).resolve())
+            except (OSError, RuntimeError):
+                self._selection_by_context[key] = raw
 
     def filter_assets(self, assets: list[Asset], department: str | None, type_id: str | None) -> list[Asset]:
         """
@@ -602,6 +630,8 @@ class MainWindow(QMainWindow):
             self._inspector.set_item(None)
 
             if context_name in ("Assets", "Shots"):
+                # Sync filter state first so _reload_main_view and focus restore use correct (page, dept, type).
+                self._sync_filter_state_from_sidebar()
                 # Clear so diff application does not mix with previous context data.
                 self._main_view.clear()
                 # Deterministic autoscan trigger (locked rule).
@@ -636,6 +666,7 @@ class MainWindow(QMainWindow):
 
             if context_name in ("Assets", "Shots", "Projects"):
                 if context_name in ("Assets", "Shots"):
+                    self._sync_filter_state_from_sidebar()
                     self._main_view.clear()
                 self._reload_main_view()
             else:
@@ -1019,12 +1050,15 @@ class MainWindow(QMainWindow):
             self._project_index = None
             self._app_state.clear_project_data()
             self._sidebar.set_project_index(None)
+            self._update_fs_watcher_paths()
             return
         self._project_index = build_project_index(self._project_root)
         self._sidebar.set_project_index(self._project_index)
         self._app_state.update_assets(list(self._project_index.assets))
         self._app_state.update_shots(list(self._project_index.shots))
         self._app_state.commit_immediate()
+        # So watcher includes new/updated asset and shot paths (incl. nested dept work dirs).
+        self._update_fs_watcher_paths()
 
     def _submit_rescan_task(self) -> None:
         """Submit a filesystem scan to WorkerManager; result is forwarded to AppState in _on_worker_task_finished."""
@@ -1297,13 +1331,17 @@ class MainWindow(QMainWindow):
             self._main_view.set_active_department(self._controller.current_department)
         else:
             self._main_view.set_active_department(None)
-        # Capture before set_items: repopulating clears selection and can overwrite AppState
-        _sid = self._app_state.selection_id()
+        # Restore selection for this (page, dept, type): use saved focus if any, else none
+        _key = self._context_key()
+        _sid = self._selection_by_context.get(_key) if _key else None
+        if _sid is None:
+            _sid = self._app_state.selection_id()
         self._main_view.set_items(items)
         self._sidebar.set_project_index(self._project_index)
+        # Defer restore so it runs after view/model finish updating (avoids being overwritten by selection-clear)
         def _restore():
             self._app_state.set_selection(_sid)
-        QTimer.singleShot(0, _restore)
+        QTimer.singleShot(50, _restore)
 
     def _on_item_activated(self, item: ViewItem) -> None:
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
@@ -1353,7 +1391,7 @@ class MainWindow(QMainWindow):
         if not isinstance(ref, (Asset, Shot)):
             return
         try:
-            self._controller.smart_open(item=ref, force_dialog=True, parent=self)
+            self._controller.smart_open(item=ref, force_dialog=True, force_open_with=True, parent=self)
         except Exception as e:
             logging.warning("DCC launch failed (open with): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open With…", str(e))
@@ -1398,7 +1436,7 @@ class MainWindow(QMainWindow):
         if not isinstance(ref, (Asset, Shot)):
             return
         try:
-            self._controller.smart_open(item=ref, force_dialog=True, parent=self)
+            self._controller.smart_open(item=ref, force_dialog=True, force_open_with=True, parent=self)
         except Exception as e:
             logging.warning("DCC launch failed (inspector open with): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open With…", str(e))

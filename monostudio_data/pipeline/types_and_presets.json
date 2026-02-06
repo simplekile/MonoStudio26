@@ -4,102 +4,48 @@
       "id": "shot",
       "name": "Shot",
       "short_name": "sh",
-      "departments": [
-        "layout",
-        "anim",
-        "fx",
-        "lighting"
-      ],
+      "departments": ["layout", "anim", "fx", "lighting"],
       "icon_name": "clapperboard"
     },
     "character": {
       "id": "_characters",
       "name": "Character",
       "short_name": "char",
-      "departments": [
-        "model",
-        "rig",
-        "surfacing",
-        "grooming",
-        "lookdev"
-      ],
+      "departments": ["sculpt", "retopo", "uv", "geoclean", "rig", "baking", "texturing", "grooming", "lookdev"],
       "icon_name": "user"
     },
     "prop": {
       "id": "_props",
       "name": "Prop",
       "short_name": "prop",
-      "departments": [
-        "model",
-        "surfacing",
-        "grooming",
-        "lookdev"
-      ],
+      "departments": ["sculpt", "retopo", "uv", "baking", "texturing", "grooming", "lookdev"],
       "icon_name": "package"
     },
     "environment": {
       "id": "_environment",
       "name": "Environment",
       "short_name": "env",
-      "departments": [
-        "layout",
-        "model",
-        "lighting",
-        "lookdev"
-      ],
+      "departments": ["layout", "sculpt", "retopo", "uv", "lighting", "lookdev"],
       "icon_name": "trees"
     }
   },
   "departments": {
-    "layout": {
-      "name": "Layout",
-      "short_name": "lay",
-      "icon_name": "layout-dashboard"
-    },
-    "model": {
-      "name": "Modeling",
-      "short_name": "mdl",
-      "icon_name": "box"
-    },
-    "rig": {
-      "name": "Rigging",
-      "short_name": "rig",
-      "icon_name": "bone"
-    },
-    "surfacing": {
-      "name": "Surfacing",
-      "short_name": "surf",
-      "icon_name": "palette"
-    },
-    "grooming": {
-      "name": "Grooming",
-      "short_name": "grm",
-      "icon_name": "scissors"
-    },
-    "lookdev": {
-      "name": "Lookdev",
-      "short_name": "ldv",
-      "icon_name": "sparkles"
-    },
-    "anim": {
-      "name": "Animation",
-      "short_name": "anim",
-      "icon_name": "clapperboard"
-    },
-    "fx": {
-      "name": "FX",
-      "short_name": "fx",
-      "icon_name": "zap"
-    },
-    "lighting": {
-      "name": "Lighting",
-      "short_name": "lgt",
-      "icon_name": "lightbulb"
-    },
-    "comp": {
-      "name": "Comp",
-      "short_name": "comp",
-      "icon_name": "sliders-horizontal"
-    }
+    "layout": {"name": "Layout", "short_name": "lay", "icon_name": "layout-dashboard"},
+    "modelling": {"name": "Modelling", "short_name": "mod", "icon_name": "box"},
+    "sculpt": {"name": "Sculpt", "short_name": "scl", "icon_name": "box", "parent": "modelling"},
+    "retopo": {"name": "Retopo", "short_name": "rto", "icon_name": "box", "parent": "modelling"},
+    "uv": {"name": "UV", "short_name": "uv", "icon_name": "box", "parent": "modelling"},
+    "rigging": {"name": "Rigging", "short_name": "rig", "icon_name": "bone"},
+    "geoclean": {"name": "Clean Geo", "short_name": "geo", "icon_name": "box", "parent": "rigging"},
+    "rig": {"name": "Build Rig", "short_name": "br", "icon_name": "bone", "parent": "rigging"},
+    "surfacing": {"name": "Surfacing", "short_name": "surf", "icon_name": "palette"},
+    "baking": {"name": "Baking", "short_name": "bak", "icon_name": "palette", "parent": "surfacing"},
+    "texturing": {"name": "Texturing", "short_name": "tex", "icon_name": "palette", "parent": "surfacing"},
+    "grooming": {"name": "Grooming", "short_name": "grm", "icon_name": "scissors"},
+    "lookdev": {"name": "Lookdev", "short_name": "ldv", "icon_name": "sparkles"},
+    "anim": {"name": "Animation", "short_name": "anim", "icon_name": "clapperboard"},
+    "fx": {"name": "FX", "short_name": "fx", "icon_name": "zap"},
+    "lighting": {"name": "Lighting", "short_name": "lgt", "icon_name": "lightbulb"},
+    "comp": {"name": "Comp", "short_name": "comp", "icon_name": "sliders-horizontal"}
   }
 }

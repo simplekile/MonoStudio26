@@ -14,6 +14,7 @@ class DepartmentDef:
     name: str
     short_name: str
     icon_name: str | None = None
+    parent: str | None = None  # subdepartment: parent dept_id for grouping in UI
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,8 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
             name = node.get("name")
             short_name = node.get("short_name")
             icon_name = node.get("icon_name")
+            parent_raw = node.get("parent")
+            parent = (parent_raw.strip() if isinstance(parent_raw, str) and parent_raw.strip() else None) or None
             if not isinstance(name, str) or not name.strip():
                 continue
             if not isinstance(short_name, str) or not short_name.strip():
@@ -173,6 +176,7 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
                 name=name.strip(),
                 short_name=short_name.strip(),
                 icon_name=icon,
+                parent=parent,
             )
 
     types_raw = data.get("types")

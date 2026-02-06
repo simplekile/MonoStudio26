@@ -2,9 +2,21 @@ from __future__ import annotations
 
 import json
 from enum import Enum
+from pathlib import Path
 
-from PySide6.QtCore import QRect, QSize, Qt, Signal, QSettings
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette
+from PySide6.QtCore import QByteArray, QPointF, QRect, QRectF, QSize, Qt, Signal, QSettings
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPixmap,
+)
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -28,7 +40,12 @@ from PySide6.QtWidgets import (
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
+from monostudio.ui_qt.style import (
+    MONOS_COLORS,
+    SIDEBAR_DEPT_LIST_STYLE,
+    MonosDialog,
+    monos_font,
+)
 
 
 class SidebarContext(str, Enum):
@@ -70,9 +87,175 @@ def _lucide_two_state_icon(icon_name: str, *, fallback_name: str) -> QIcon:
     return out
 
 
+def _load_logo_pixmap(size: int, color_hex: str) -> QPixmap:
+    """Load app logo from monostudio_data/icons/logo.svg; render at size with fill color (black & white)."""
+    repo_root = Path(__file__).resolve().parents[2]
+    logo_path = repo_root / "monostudio_data" / "icons" / "logo.svg"
+    if not logo_path.is_file():
+        return QPixmap()
+    try:
+        svg = logo_path.read_text(encoding="utf-8").replace("currentColor", color_hex)
+    except OSError:
+        return QPixmap()
+    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+    if not renderer.isValid():
+        return QPixmap()
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    try:
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        renderer.render(p, QRect(0, 0, size, size))
+    finally:
+        p.end()
+    return pix
+
+
+# Row kinds: section (container header), dept (selectable), spacer (gap between containers).
+_DEPT_ROW_SECTION = "section"
+_DEPT_ROW_DEPT = "dept"
+_DEPT_ROW_SPACER = "spacer"
+
+
+def _container_gradient(rect: QRectF) -> QLinearGradient:
+    """Gradient cho container (giống page): start → end từ trái sang phải."""
+    g = QLinearGradient(QPointF(rect.left(), 0), QPointF(rect.right(), 0))
+    start = str(SIDEBAR_DEPT_LIST_STYLE.get("container_gradient_start", "#121214"))
+    end = str(SIDEBAR_DEPT_LIST_STYLE.get("container_gradient_end", "#1b1b1b"))
+    g.setColorAt(0.0, QColor(start))
+    g.setColorAt(1.0, QColor(end))
+    return g
+
+
+def _rounded_rect_path(rect: QRectF, radius: float, round_top: bool, round_bottom: bool) -> QPainterPath:
+    """Path for rect with optional rounded top and/or bottom corners."""
+    path = QPainterPath()
+    r = min(radius, rect.width() / 2, rect.height() / 2)
+    if r <= 0:
+        path.addRect(rect)
+        return path
+    if round_top and round_bottom:
+        path.addRoundedRect(rect, r, r)
+        return path
+    if round_top:
+        path.moveTo(rect.left() + r, rect.top())
+        path.lineTo(rect.right() - r, rect.top())
+        path.arcTo(rect.right() - 2 * r, rect.top(), 2 * r, 2 * r, 90, -90)
+        path.lineTo(rect.right(), rect.bottom())
+        path.lineTo(rect.left(), rect.bottom())
+        path.lineTo(rect.left(), rect.top() + r)
+        path.arcTo(rect.left(), rect.top(), 2 * r, 2 * r, 180, -90)
+        path.closeSubpath()
+        return path
+    if round_bottom:
+        path.moveTo(rect.left(), rect.top())
+        path.lineTo(rect.right(), rect.top())
+        path.lineTo(rect.right(), rect.bottom() - r)
+        path.arcTo(rect.right() - 2 * r, rect.bottom() - 2 * r, 2 * r, 2 * r, 0, -90)
+        path.lineTo(rect.left() + r, rect.bottom())
+        path.arcTo(rect.left(), rect.bottom() - 2 * r, 2 * r, 2 * r, 270, -90)
+        path.closeSubpath()
+        return path
+    path.addRect(rect)
+    return path
+
+
+class _SidebarDeptListDelegate(QStyledItemDelegate):
+    """
+    Department list: section = container header (fill + title 7px); dept = fill + dot + icon + text.
+    Section non-interactive. UserRole: dict with type + section_label or dept_id (+ optional in_section).
+    """
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[override]
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+
+        data = opt.index.data(Qt.UserRole) if opt.index.isValid() else None
+        if isinstance(data, dict):
+            if data.get("type") == _DEPT_ROW_SECTION:
+                self._paint_section(painter, opt, data.get("section_label", ""))
+                return
+            if data.get("type") == _DEPT_ROW_SPACER:
+                return  # empty row, list background shows through
+        self._paint_dept_row(painter, opt, data if isinstance(data, dict) else None)
+
+    def _paint_section(self, painter: QPainter, opt: QStyleOptionViewItem, title: str) -> None:
+        r = opt.rect
+        radius = float(SIDEBAR_DEPT_LIST_STYLE.get("container_radius_px", 6))
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(_container_gradient(QRectF(r)))
+            path = _rounded_rect_path(QRectF(r), radius, round_top=True, round_bottom=False)
+            painter.drawPath(path)
+            if title:
+                fs = int(SIDEBAR_DEPT_LIST_STYLE["section_font_size_px"])
+                f = QFont(opt.font.family(), fs, QFont.Weight.Normal)
+                painter.setFont(f)
+                key = str(SIDEBAR_DEPT_LIST_STYLE["section_title_color_key"])
+                painter.setPen(QColor(MONOS_COLORS.get(key, MONOS_COLORS["text_meta"])))
+                # Cùng padding trái như dept (10px) để title nằm chung container
+                text_r = r.adjusted(10, 0, -10, 0)
+                painter.drawText(text_r, Qt.AlignVCenter | Qt.AlignLeft, title)
+        finally:
+            painter.restore()
+
+    def _paint_dept_row(self, painter: QPainter, opt: QStyleOptionViewItem, data: dict | None) -> None:
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        r = opt.rect
+        radius = float(SIDEBAR_DEPT_LIST_STYLE.get("container_radius_px", 6))
+        round_top = bool(data.get("round_top")) if isinstance(data, dict) else False
+        round_bottom = bool(data.get("round_bottom")) if isinstance(data, dict) else False
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(_container_gradient(QRectF(r)))
+            path = _rounded_rect_path(QRectF(r), radius, round_top, round_bottom)
+            painter.drawPath(path)
+            style.drawPrimitive(QStyle.PE_PanelItemViewItem, opt, painter, widget)
+            inner = r.adjusted(10, 0, -10, 0)
+            dot_r = 4
+            dot_gap = 10
+            dot_cx = inner.left() + dot_r
+            dot_cy = r.center().y()
+            is_selected = bool(opt.state & QStyle.State_Selected)
+            dot_color = QColor(MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_meta"])
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(dot_color)
+            painter.drawEllipse(dot_cx - dot_r, dot_cy - dot_r, dot_r * 2, dot_r * 2)
+            x = dot_cx + dot_r + dot_gap
+            icon_size = opt.decorationSize if opt.decorationSize.isValid() else QSize(16, 16)
+            if not opt.icon.isNull():
+                ir = QRect(x, r.center().y() - icon_size.height() // 2, icon_size.width(), icon_size.height())
+                opt.icon.paint(painter, ir, Qt.AlignCenter, QIcon.Selected if is_selected else QIcon.Normal)
+                x = ir.right() + 8
+            text_rect = QRect(x, r.top(), max(0, inner.right() - x), r.height())
+            fm = QFontMetrics(opt.font)
+            text = fm.elidedText(opt.text, Qt.ElideRight, text_rect.width())
+            pen_color = QColor(MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"])
+            painter.setPen(pen_color)
+            painter.setFont(opt.font)
+            painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+        finally:
+            painter.restore()
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # type: ignore[override]
+        data = index.data(Qt.UserRole) if index.isValid() else None
+        if isinstance(data, dict):
+            if data.get("type") == _DEPT_ROW_SECTION:
+                return QSize(-1, int(SIDEBAR_DEPT_LIST_STYLE["section_row_height_px"]))
+            if data.get("type") == _DEPT_ROW_SPACER:
+                return QSize(-1, int(SIDEBAR_DEPT_LIST_STYLE["spacer_row_height_px"]))
+        return super().sizeHint(option, index)
+
+
 class _SidebarDotItemDelegate(QStyledItemDelegate):
     """
-    Sidebar list item delegate:
+    Sidebar list item delegate (e.g. Types list):
     - Draw a small leading dot (grey)
     - When selected, dot turns blue
     - Keeps existing icon (metadata) + text
@@ -270,6 +453,7 @@ class SidebarWidget(QWidget):
         self._type_icon_by_id: dict[str, str] = {}
         self._dept_label_by_id: dict[str, str] = {}
         self._dept_icon_by_id: dict[str, str] = {}
+        self._dept_parent: dict[str, str] = {}  # dept_id -> parent_id for subdepartment grouping
         # None = not configured yet (will default to first N once). [] is a valid "show none".
         self._visible_departments: list[str] | None = None
         self._visible_types: list[str] | None = None  # type_ids
@@ -315,10 +499,10 @@ class SidebarWidget(QWidget):
         self._dept_list = QListWidget(self)
         self._dept_list.setObjectName("SidebarFilterList")
         self._dept_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._dept_list.setUniformItemSizes(True)
+        self._dept_list.setUniformItemSizes(False)  # section/spacer/dept have different heights
         self._dept_list.setFocusPolicy(Qt.NoFocus)
         self._dept_list.setIconSize(QSize(16, 16))
-        self._dept_list.setItemDelegate(_SidebarDotItemDelegate(self._dept_list))
+        self._dept_list.setItemDelegate(_SidebarDeptListDelegate(self._dept_list))
         self._dept_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._dept_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._dept_list.itemClicked.connect(self._on_department_clicked)
@@ -399,6 +583,7 @@ class SidebarWidget(QWidget):
         depts: list[str] = []
         dept_labels: dict[str, str] = {}
         dept_icons: dict[str, str] = {}
+        dept_parent: dict[str, str] = {}
         for type_id, t in meta.types.items():
             if self._mode == "shots":
                 if not _is_shot_type(type_id):
@@ -414,6 +599,8 @@ class SidebarWidget(QWidget):
                         dept_labels[d] = dd.name
                         if dd.icon_name:
                             dept_icons[d] = dd.icon_name
+                        if getattr(dd, "parent", None) and dd.parent.strip():
+                            dept_parent[d] = (dd.parent or "").strip()
 
         # Primary order = JSON order from meta.departments keys.
         for dept_id in meta.departments.keys():
@@ -428,6 +615,7 @@ class SidebarWidget(QWidget):
         self._all_departments = depts
         self._dept_label_by_id = dept_labels
         self._dept_icon_by_id = dept_icons
+        self._dept_parent = dept_parent
 
         # If current selections are no longer valid in this mode, clear locally.
         # (No intent signals here; signals are reserved for user clicks.)
@@ -574,14 +762,68 @@ class SidebarWidget(QWidget):
             # Keep only still-valid items (no auto-fill).
             self._visible_departments = [v for v in self._visible_departments if v in cleaned]
 
+        visible = self._visible_departments or []
+        parents_with_children = {
+            self._dept_parent[d] for d in visible if self._dept_parent.get(d)
+        }
+        sections_emitted: set[str] = set()
+
         self._dept_list.blockSignals(True)
         try:
             self._dept_list.clear()
-            for v in (self._visible_departments or []):
-                label = self._dept_label_by_id.get(v, v)
+            next_dept_round_top = True  # first dept in list or after section/spacer
+            for i, dept_id in enumerate(visible):
+                parent_id = self._dept_parent.get(dept_id)
+                is_in_section = bool(parent_id and parent_id in parents_with_children)
+                # Spacer before each new container so blocks are clearly separated.
+                if self._dept_list.count() > 0:
+                    if is_in_section:
+                        if parent_id not in sections_emitted:
+                            spacer = QListWidgetItem("")
+                            spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
+                            spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                            self._dept_list.addItem(spacer)
+                    else:
+                        spacer = QListWidgetItem("")
+                        spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
+                        spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                        self._dept_list.addItem(spacer)
+                        next_dept_round_top = True  # standalone dept after spacer
+
+                if is_in_section and parent_id not in sections_emitted:
+                    section_label = _title_case_label(
+                        self._dept_label_by_id.get(parent_id, parent_id)
+                    )
+                    section_item = QListWidgetItem("")
+                    section_item.setData(
+                        Qt.UserRole,
+                        {"type": _DEPT_ROW_SECTION, "section_label": section_label},
+                    )
+                    section_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    self._dept_list.addItem(section_item)
+                    sections_emitted.add(parent_id)
+                    next_dept_round_top = False  # subdept đầu nối liền section, không bo góc trên
+
+                # Last in block: no next dept or next dept has different parent
+                if i + 1 >= len(visible):
+                    last_in_block = True
+                else:
+                    next_parent = self._dept_parent.get(visible[i + 1])
+                    last_in_block = next_parent != parent_id
+
+                label = self._dept_label_by_id.get(dept_id, dept_id)
                 it = QListWidgetItem(_title_case_label(label))
-                it.setData(Qt.UserRole, v)
-                icon_name = self._dept_icon_by_id.get(v)
+                it.setData(
+                    Qt.UserRole,
+                    {
+                        "type": _DEPT_ROW_DEPT,
+                        "dept_id": dept_id,
+                        "round_top": next_dept_round_top,
+                        "round_bottom": last_in_block,
+                    },
+                )
+                next_dept_round_top = False
+                icon_name = self._dept_icon_by_id.get(dept_id)
                 if icon_name:
                     it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="layers"))
                 self._dept_list.addItem(it)
@@ -624,10 +866,14 @@ class SidebarWidget(QWidget):
             if self._active_department is not None:
                 for i in range(self._dept_list.count()):
                     it = self._dept_list.item(i)
-                    if it is not None and it.data(Qt.UserRole) == self._active_department:
-                        it.setSelected(True)
-                        self._dept_list.setCurrentItem(it)
-                        break
+                    if it is None:
+                        continue
+                    data = it.data(Qt.UserRole)
+                    if isinstance(data, dict) and data.get("type") == _DEPT_ROW_DEPT:
+                        if data.get("dept_id") == self._active_department:
+                            it.setSelected(True)
+                            self._dept_list.setCurrentItem(it)
+                            break
 
             if self._active_type is not None:
                 for i in range(self._type_list.count()):
@@ -641,9 +887,13 @@ class SidebarWidget(QWidget):
             self._type_list.blockSignals(False)
 
     def _on_department_clicked(self, item: QListWidgetItem) -> None:
-        v = item.data(Qt.UserRole)
-        clicked = v if isinstance(v, str) else None
-        if clicked is not None and clicked == self._active_department:
+        data = item.data(Qt.UserRole)
+        if not isinstance(data, dict) or data.get("type") != _DEPT_ROW_DEPT:
+            return
+        clicked = data.get("dept_id") if isinstance(data.get("dept_id"), str) else None
+        if clicked is None:
+            return
+        if clicked == self._active_department:
             self._active_department = None
             self._sync_selection()
             self.departmentClicked.emit(None)
@@ -718,16 +968,16 @@ class SidebarWidget(QWidget):
     def _fit_list_height(w: QListWidget) -> None:
         """
         No-scroll policy: make the list tall enough to show all items.
+        Sums row heights (supports variable heights for section/separator/dept rows).
         """
         rows = int(w.count())
         if rows <= 0:
             w.setFixedHeight(0)
             return
 
-        row_h = max(1, int(w.sizeHintForRow(0)))
-        # QSS adds padding; approximate to keep all rows visible.
+        total_h = sum(max(1, int(w.sizeHintForRow(i))) for i in range(rows))
         extra = 2 * int(w.frameWidth()) + 12 + 4
-        w.setFixedHeight(rows * row_h + extra)
+        w.setFixedHeight(total_h + extra)
 
 
 class _FilterPickDialog(MonosDialog):
@@ -869,15 +1119,19 @@ class Sidebar(QWidget):
         brand_layout.setContentsMargins(0, 0, 0, 0)
         brand_layout.setSpacing(12)  # icon-to-text ~12px
 
-        icon_box = QLabel("M", brand)
+        icon_box = QLabel(brand)
         icon_box.setObjectName("SidebarBrandIcon")
         icon_box.setAlignment(Qt.AlignCenter)
         icon_box.setFixedSize(28, 28)
+        _logo_pix = _load_logo_pixmap(20, "#ffffff")
+        if not _logo_pix.isNull():
+            icon_box.setPixmap(_logo_pix)
 
         brand_label = QLabel("MONOS", brand)
         brand_label.setObjectName("SidebarBrandLabel")
         f_brand = monos_font("Inter", 16, QFont.Weight.ExtraBold)  # 800
         f_brand.setLetterSpacing(QFont.PercentageSpacing, 97)  # tracking-tight
+        f_brand.setStyle(QFont.Style.StyleItalic)
         brand_label.setFont(f_brand)
 
         brand_layout.addWidget(icon_box)

@@ -1,0 +1,148 @@
+---
+description: Plan tổng hợp từ sau commit gần nhất – subdepartments, sidebar, dialogs, settings. Dùng để bắt đầu lại / handoff.
+alwaysApply: false
+---
+
+# Plan tổng hợp (sau commit "WIP: pipeline and UI updates...")
+
+Tài liệu này tổng hợp **các yêu cầu và thay đổi đã làm** kể từ commit gần nhất, để có thể bắt đầu lại session hoặc handoff mà không mất context.
+
+---
+
+## 1. Settings – Bỏ "Department folders"
+
+**Yêu cầu:** Bỏ hẳn mục "Department folders" (Flat / Nested) trong Settings.
+
+**Đã làm:**
+- Xóa biến `_department_layout_combo`, đoạn tạo combo + thêm vào form, đoạn set index khi chọn project root, đoạn gọi `save_department_layout` trong `_on_save`.
+- Sửa comment còn nhắc `department_layout` thành chỉ "use_dcc_folders".
+- **File:** `monostudio/ui_qt/settings_dialog.py`.
+
+**Ghi chú:** Layout department mặc định luôn "nested"; không còn lưu/đọc từ project.json trong Settings UI.
+
+---
+
+## 2. Subdepartments – Open + DCC badge
+
+**Vấn đề:** Departments mở và DCC badge trên thumb bình thường; subdepartments khi open bị mở dialog "Open with" và DCC badge không hiện.
+
+**Nguyên nhân (tóm tắt):**
+- Subdepartment (sculpt, retopo, texturing…) thường không có trong `dccs.json` → `get_available_dccs("sculpt")` rỗng → không có badge; `resolve_default_dcc` trả về None → hiện dialog.
+
+**Đã làm:**
+
+- **DCC badge (main_view):**
+  - Build danh sách DCC **hoàn toàn từ `dcc_work_states`** (lọc theo department đang active), không phụ thuộc `get_available_dccs` cho việc "có badge hay không".
+  - Chỉ vẽ badge khi `resolve_dcc_status` = "exists" hoặc "creating".
+  - Thêm icon cho subdepartment trong `_DEPT_ICON_MAP` (sculpt, retopo, uv, geoclean, baking, texturing…).
+  - **File:** `monostudio/ui_qt/main_view.py`.
+
+- **Open không dialog (app_controller):**
+  - Sau khi resolve DCC, nếu `resolved_dcc` vẫn None (subdepartment không trong registry): lấy DCC từ department có work file: `work_file_dcc` hoặc `work_file_dccs[0]`.
+  - **File:** `monostudio/ui_qt/app_controller.py`.
+
+---
+
+## 3. Open = last opened DCC
+
+**Yêu cầu:** Khi open (double-click), luôn ưu tiên DCC "last opened" cho item + department đó.
+
+**Đã làm:**
+- Thêm `_last_used_dcc_for_department(department, meta)` lấy DCC từ metadata (last_open_by_department, last_open, defaults).
+- `_resolve_dcc` dùng helper đó; fallback cho subdepartment: nếu có `last_used_dcc` và DCC đó có work file trong department thì dùng, không thì `work_file_dcc` / `work_file_dccs[0]`.
+- **File:** `monostudio/ui_qt/app_controller.py`.
+
+---
+
+## 4. Sidebar – Departments rõ hơn (parent = container, subdepartment thuộc parent)
+
+**Yêu cầu:** Hiển thị departments rõ hơn; subdepartment nằm trong container có title là parent; parent không tương tác; không collapse.
+
+**Đã làm:**
+
+- **Cấu trúc list:**
+  - Parent có con trong list chỉ xuất hiện dưới dạng **section header** (không có dòng clickable cho parent).
+  - Trước mỗi nhóm subdepartment: một dòng **header** = title parent (font nhỏ, cùng dòng với nét đứt).
+  - Subdepartment: dòng clickable, indent dưới header.
+
+- **Section header (parent title):**
+  - Font 9px, Normal, màu muted (text_meta).
+  - **Cùng dòng với line:** nét đứt trái + khoảng trống + chữ title + khoảng trống + nét đứt phải (không vẽ line xuyên qua chữ).
+  - Header không selectable, click không làm gì.
+
+- **Nét đứt:**
+  - Alpha 20% (`setAlphaF(0.2)`).
+  - Vẽ phía trên section header và phía trên **department độc lập** (không có child, không phải title): Layout, Grooming, Lookdev, Lighting…
+
+- **Nguồn parent:** `get_default_department_mapping()` (default preset) để có `_dept_parent_by_id`.
+
+- **File:** `monostudio/ui_qt/sidebar.py` (set_departments, _SidebarDotItemDelegate, reload_from_pipeline_metadata, _on_department_clicked, _sync_selection).
+
+---
+
+## 5. Add dialog (Select Departments) – Giống department list
+
+**Yêu cầu:** Dialog "Select Departments" (nút + cạnh DEPARTMENTS) có cấu trúc giống list department: container có title parent, nét đứt, nhóm subdepartment.
+
+**Đã làm:**
+- `_open_department_picker`: build `items_for_dlg` giống `set_departments` (header rows + department rows), mỗi item 4-tuple `(id, label, icon, parent_id)`.
+- `_FilterPickDialog`: thêm `use_department_style`, `expand_list_height`; khi có header thì dùng `_FilterPickDialogDelegate`.
+- **Delegate:** Header = line + title cùng dòng (giống sidebar); department row = nét đứt phía trên nếu không có parent, rồi icon + text.
+- **Kích thước:** Chỉ với department picker: `expand_list_height=True` → list `setMinimumHeight(480)` (dialog cao gấp đôi).
+- **File:** `monostudio/ui_qt/sidebar.py` (_open_department_picker, _FilterPickDialog, _FilterPickDialogDelegate).
+
+---
+
+## 6. Type picker – Cùng cấu trúc, trừ kích thước
+
+**Yêu cầu:** Type picker cũng có cấu trúc tương tự (header + nhóm, nét đứt), nhưng **không** tăng kích thước dialog.
+
+**Đã làm:**
+- Nhóm type theo **Assets** / **Shots** (`_is_shot_type`).
+  - Header "Assets" + các type không phải shot (character, prop, environment…).
+  - Header "Shots" + các type shot.
+- Mỗi item 4-tuple với group_id "assets" hoặc "shots" để delegate không vẽ nét đứt phía trên từng dòng type (chỉ có nét đứt ở header).
+- `use_department_style=True`, `expand_list_height=False` → không set min height 480.
+- **File:** `monostudio/ui_qt/sidebar.py` (_open_type_picker).
+
+---
+
+## 7. Tóm tắt file thay đổi (liên quan session này)
+
+| File | Nội dung chính |
+|------|----------------|
+| `monostudio/ui_qt/settings_dialog.py` | Bỏ Department folders (combo + save department_layout). |
+| `monostudio/ui_qt/app_controller.py` | Fallback DCC từ work_file_dcc / last_used cho subdepartment; _last_used_dcc_for_department. |
+| `monostudio/ui_qt/main_view.py` | DCC badge từ dcc_work_states; _DEPT_ICON_MAP cho subdepartment. |
+| `monostudio/ui_qt/sidebar.py` | Department list: header (line+title), nét đứt, parent map; delegate; _open_department_picker với items nhóm; _FilterPickDialog + delegate + expand_list_height; _open_type_picker với nhóm Assets/Shots. |
+
+---
+
+## 8. Prompt tổng hợp (để bắt đầu lại)
+
+Có thể dùng đoạn sau làm prompt gốc khi bắt đầu lại:
+
+```
+Dự án MonoStudio: từ sau commit "WIP: pipeline and UI updates...", cần đảm bảo:
+
+1. Settings: Đã bỏ hẳn mục "Department folders" (Flat/Nested); không còn UI hay save department_layout.
+
+2. Subdepartments:
+   - Open (double-click): mở thẳng với DCC đúng, không bật "Open with" khi đã có work file; ưu tiên last-opened DCC từ metadata, fallback work_file_dcc/work_file_dccs khi registry không có subdepartment.
+   - DCC badge trên thumbnail: hiển thị đúng cho subdepartment (lấy từ dcc_work_states + pending, không chỉ get_available_dccs); icon department cho subdepartment (sculpt, retopo, uv, texturing...) đã có trong _DEPT_ICON_MAP.
+
+3. Sidebar – Departments:
+   - Parent chỉ là section header (không click, không collapse).
+   - Title parent: font nhỏ (9px), cùng dòng với nét đứt (trái + chữ + phải).
+   - Nét đứt alpha 20%; vẽ trên section header và trên department độc lập (Layout, Grooming, Lookdev, Lighting...).
+
+4. Dialog "Select Departments" (add): Cấu trúc giống list (header + nhóm + nét đứt), list cao 480px (expand_list_height=True).
+
+5. Dialog "Select Types": Cấu trúc tương tự (header Assets / Shots + nhóm), không tăng kích thước (expand_list_height=False).
+
+Tham chiếu chi tiết: .cursor/rules/plan_since_last_commit_v1.mdc
+```
+
+---
+
+*Tạo: tổng hợp từ session sau commit 6e6b580.*

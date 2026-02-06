@@ -1,13 +1,1 @@
-[
-  "layout",
-  "model",
-  "rig",
-  "surfacing",
-  "grooming",
-  "lookdev",
-  "anim",
-  "lighting",
-  "comp",
-  "fx"
-]
-
+["layout", "modelling", "sculpt", "retopo", "uv", "rigging", "geoclean", "rig", "surfacing", "baking", "texturing", "grooming", "lookdev", "anim", "fx", "lighting", "comp"]

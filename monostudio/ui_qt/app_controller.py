@@ -430,7 +430,9 @@ class AppController(QObject):
             work_path = resolve_work_path(
                 dept_dir, dcc, use_dcc_folders, self._dcc_registry
             )
-            prefix = work_file_prefix(name=item.name, department=dept_folder)
+            # Nested: prefix dùng segment cuối (vd 01_sculpt), không dùng full path
+            dept_segment = Path(dept_folder).name if "/" in (dept_folder or "") else (dept_folder or "")
+            prefix = work_file_prefix(name=item.name, department=dept_segment)
             return get_work_file_path(work_path, prefix, ext)
         prefix = work_file_prefix(name=item.name, department=department)
         return get_work_file_path(item.path / department / "work", prefix, ext)

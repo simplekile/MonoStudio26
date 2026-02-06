@@ -92,6 +92,43 @@ _TYPE_TOOLTIP_MAP: dict[str, str] = {
 }
 
 
+def _work_file_version_from_path(path: Path) -> int | None:
+    """Parse work file version from path stem (e.g. prefix_v003 -> 3). Returns int or None."""
+    stem = (path.stem or "").strip()
+    idx = stem.rfind("_v")
+    if idx < 0 or len(stem) < idx + 5:
+        return None
+    mid = stem[idx + 2 : idx + 5]
+    if len(mid) == 3 and mid.isdigit():
+        return int(mid)
+    return None
+
+
+def _card_work_file_version(ref: Asset | Shot, active_department: str | None) -> str | None:
+    """
+    Work file version for card meta when a department is selected.
+    Returns None when department is "all" (no filter) → caller should hide version.
+    Returns "v001" or "—" when department is set.
+    """
+    dep = (active_department or "").strip()
+    if not dep:
+        return None
+    states = getattr(ref, "dcc_work_states", ()) or ()
+    max_ver: int | None = None
+    for (dept_id, _dcc_id), state in states:
+        if (dept_id or "").strip().casefold() != dep.casefold():
+            continue
+        path = getattr(state, "work_file_path", None)
+        if path is None:
+            continue
+        v = _work_file_version_from_path(path)
+        if v is not None and (max_ver is None or v > max_ver):
+            max_ver = v
+    if max_ver is not None:
+        return f"v{max_ver:03d}"
+    return "—"
+
+
 def _item_last_opened_dcc(item_path: Path, active_department: str) -> str | None:
     """Read last-opened DCC for this item from .monostudio/open.json. Returns dcc_id or None."""
     if not item_path or not isinstance(item_path, Path):
@@ -523,9 +560,16 @@ class _GridCardDelegate(QStyledItemDelegate):
                 meta_rect = QRect(x, y + 24, w, 16)
                 p.drawText(meta_rect, Qt.AlignLeft | Qt.AlignVCenter, meta)
             else:
+                # Meta: ID + version (from work file when department is set); assignee tạm ẩn.
                 p.setFont(self._font_meta_mono)
                 p.setPen(self._c_text_meta)
-                meta = f"ID {item.name}   v —   assignee —"
+                active_dep = (self._active_department or "").strip()
+                show_version = bool(active_dep)
+                ver_str = _card_work_file_version(item.ref, self._active_department) if isinstance(item.ref, (Asset, Shot)) else None
+                if show_version and ver_str is not None:
+                    meta = f"ID {item.name}   {ver_str}" if ver_str != "—" else f"ID {item.name}   v —"
+                else:
+                    meta = f"ID {item.name}"
                 meta_rect = QRect(x, y + 24, w, 16)
                 p.drawText(meta_rect, Qt.AlignLeft | Qt.AlignVCenter, meta)
 

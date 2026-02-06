@@ -145,9 +145,10 @@ def _build_asset_departments(
         reg_use = reg or get_default_dcc_registry()
     except Exception:
         reg_use = None
-    for dept_dir in _iter_dirs(asset_dir):
-        dept_id = dept_registry.get_department_by_folder(dept_dir.name, "asset")
-        if dept_id is None:
+    # Nested: dùng relative path (vd 01_modelling/01_sculpt) để scan subdepartment
+    for rel_path, dept_id in dept_registry.get_department_relative_paths("asset"):
+        dept_dir = asset_dir / rel_path
+        if not dept_dir.is_dir():
             continue
         publish_path = dept_dir / "publish"
         publish_exists = publish_path.is_dir()
@@ -246,9 +247,10 @@ def _build_shot_departments(
         reg_use = reg or get_default_dcc_registry()
     except Exception:
         reg_use = None
-    for dept_dir in _iter_dirs(shot_dir):
-        dept_id = dept_registry.get_department_by_folder(dept_dir.name, "shot")
-        if dept_id is None:
+    # Nested: dùng relative path để scan subdepartment
+    for rel_path, dept_id in dept_registry.get_department_relative_paths("shot"):
+        dept_dir = shot_dir / rel_path
+        if not dept_dir.is_dir():
             continue
         publish_path = dept_dir / "publish"
         publish_exists = publish_path.is_dir()
