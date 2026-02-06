@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QDate, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QShowEvent
 from PySide6.QtWidgets import QDateEdit, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QVBoxLayout
 
 from monostudio.core.project_id import generate_project_id
@@ -70,6 +70,10 @@ class NewProjectDialog(MonosDialog):
 
         self._sync_preview()
         self._update_ok_enabled()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._name.setFocus()
 
     def project_name(self) -> str:
         return self._name.text().strip()

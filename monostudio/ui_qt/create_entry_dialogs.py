@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QHBoxLayout,
-    QCheckBox,
     QLabel,
     QMenu,
     QPushButton,
@@ -25,6 +25,15 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.pipeline_types_and_presets import TypeDef, load_department_vocabulary, load_pipeline_types_and_presets
 from monostudio.ui_qt.style import MonosDialog
+
+
+def _get_global_create_work_publish_subfolders() -> bool:
+    """Read global default from Settings (General → Workspace)."""
+    s = QSettings("MonoStudio26", "MonoStudio26")
+    raw = s.value("pipeline/create_work_publish_subfolders", "true", str)
+    if isinstance(raw, bool):
+        return raw
+    return (raw or "true").strip().lower() in ("true", "1", "yes")
 
 
 def _debug_dialogs_enabled() -> bool:
@@ -200,9 +209,6 @@ class CreateAssetDialog(MonosDialog):
         self._final_name_preview.setWordWrap(True)
         self._final_name_preview.setObjectName("DialogHelper")
 
-        self._subfolders = QCheckBox("Create work/ and publish/ inside departments")
-        self._subfolders.setChecked(True)  # user request: default ON
-
         self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self._buttons.accepted.connect(self.accept)
         self._buttons.rejected.connect(self.reject)
@@ -233,15 +239,16 @@ class CreateAssetDialog(MonosDialog):
             )
         )
 
-        layout.addSpacing(12)
-        layout.addWidget(self._subfolders)
-
         layout.addSpacing(12)  # top margin above button row (>= 12px)
         layout.addWidget(self._buttons)
 
         self._update_ok_enabled()
         self._update_type_preview()
         self._update_final_name_preview()
+        # Luôn chọn type đầu tiên khi mở dialog (sau khi mọi widget đã tạo)
+        first_id = self._get_first_asset_type_id()
+        if first_id is not None:
+            self._set_type(first_id)
 
     def asset_type(self) -> str:
         return (self._selected_type_id or "").strip()
@@ -271,7 +278,7 @@ class CreateAssetDialog(MonosDialog):
         return list(raw)
 
     def create_subfolders(self) -> bool:
-        return bool(self._subfolders.isChecked())
+        return _get_global_create_work_publish_subfolders()
 
     def _build_type_menu(self) -> None:
         self._type_menu.clear()
@@ -289,6 +296,11 @@ class CreateAssetDialog(MonosDialog):
             act = QAction(t.name, self._type_menu)
             act.triggered.connect(lambda checked=False, tid=type_id: self._set_type(tid))
             self._type_menu.addAction(act)
+
+    def _get_first_asset_type_id(self) -> str | None:
+        allowed = [(type_id, t) for type_id, t in self._types.items() if not _is_shot_type_id(type_id)]
+        allowed.sort(key=lambda kv: kv[1].name.lower())
+        return allowed[0][0] if allowed else None
 
     def _set_type(self, type_id: str) -> None:
         self._selected_type_id = type_id
@@ -338,6 +350,10 @@ class CreateAssetDialog(MonosDialog):
             name_input=self._asset_name.text(),
             final_name=self.asset_name(),
         )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._asset_name.setFocus()
 
 
 class CreateShotDialog(MonosDialog):
@@ -393,9 +409,6 @@ class CreateShotDialog(MonosDialog):
         self._type_preview.setVisible(False)
         self._type_preview.setWordWrap(True)
         self._type_preview.setObjectName("DialogHelper")
-
-        self._subfolders = QCheckBox("Create work/ and publish/ inside departments")
-        self._subfolders.setChecked(True)  # user request: default ON
 
         self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self._buttons.accepted.connect(self.accept)
@@ -455,16 +468,15 @@ class CreateShotDialog(MonosDialog):
         layout.addSpacing(5)  # input -> preview (4–6px)
         layout.addWidget(self._final_name_preview)
 
-        layout.addSpacing(14)
-
-        layout.addSpacing(12)
-        layout.addWidget(self._subfolders)
-
         layout.addSpacing(12)  # top margin above button row (>= 12px)
         layout.addWidget(self._buttons)
 
         self._update_final_name_preview()
         self._update_ok_enabled()
+        # Luôn chọn type đầu tiên khi mở dialog (sau khi mọi widget đã tạo)
+        first_id = self._get_first_shot_type_id()
+        if first_id is not None:
+            self._set_type(first_id)
 
     def shot_name(self) -> str:
         # Must match the previewed final folder name exactly.
@@ -495,22 +507,33 @@ class CreateShotDialog(MonosDialog):
         return list(raw)
 
     def create_subfolders(self) -> bool:
-        return bool(self._subfolders.isChecked())
+        return _get_global_create_work_publish_subfolders()
 
     def _build_type_menu(self) -> None:
         self._type_menu.clear()
         self._selected_type_id = None
-        self._type_button.setEnabled(bool(self._types))
-        if not self._types:
+        allowed = [
+            (type_id, t)
+            for type_id, t in sorted(self._types.items(), key=lambda kv: kv[1].name.lower())
+            if _is_shot_type_id(type_id)
+        ]
+        self._type_button.setEnabled(bool(allowed))
+        if not allowed:
             self._type_button.setText("No types")
             return
         self._type_button.setText("Select Type…")
-        for type_id, t in sorted(self._types.items(), key=lambda kv: kv[1].name.lower()):
-            if not _is_shot_type_id(type_id):
-                continue
+        for type_id, t in allowed:
             act = QAction(t.name, self._type_menu)
             act.triggered.connect(lambda checked=False, tid=type_id: self._set_type(tid))
             self._type_menu.addAction(act)
+
+    def _get_first_shot_type_id(self) -> str | None:
+        allowed = [
+            (type_id, t)
+            for type_id, t in sorted(self._types.items(), key=lambda kv: kv[1].name.lower())
+            if _is_shot_type_id(type_id)
+        ]
+        return allowed[0][0] if allowed else None
 
     def _set_type(self, type_id: str) -> None:
         self._selected_type_id = type_id
@@ -567,4 +590,8 @@ class CreateShotDialog(MonosDialog):
             preview_text=self._final_name_preview.text(),
             final_name=self.shot_name(),
         )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._shot_number.setFocus()
 

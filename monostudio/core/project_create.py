@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from monostudio.core.department_registry import (
+    DepartmentRegistry,
+    get_project_pipeline_dir,
+    save_project_departments,
+)
 from monostudio.core.project_id import generate_project_id
+from monostudio.core.type_registry import save_project_types, TypeRegistry
 
 
 @dataclass(frozen=True)
@@ -27,7 +33,9 @@ def create_new_project(
     """
     Safe project creation (read/write):
     - Creates a new project folder under workspace_root using an auto-generated Project ID.
-    - Creates required structure: assets/, shots/, .monostudio/project.json
+    - Creates required structure: assets/, shots/, .monostudio/project.json,
+      .monostudio/pipeline/types.json and departments.json (default TypeRegistry and
+      DepartmentRegistry so scan and UI have config on disk).
     - Writes metadata deterministically.
     - On failure: best-effort rollback inside the new project folder only.
     """
@@ -73,6 +81,16 @@ def create_new_project(
             + "\n",
             encoding="utf-8",
         )
+
+        # Create pipeline config so TypeRegistry and DepartmentRegistry load from disk.
+        pipeline_dir = get_project_pipeline_dir(project_root)
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+        type_reg = TypeRegistry.for_project(project_root)
+        if not save_project_types(project_root, type_reg.get_raw_mapping()):
+            pass  # non-fatal; app still uses in-memory default
+        dept_reg = DepartmentRegistry.for_project(project_root)
+        if not save_project_departments(project_root, dept_reg.get_raw_mapping()):
+            pass  # non-fatal; app still uses in-memory default
 
         return CreatedProject(project_id=project_id, display_name=name, start_date=start_date, root=project_root)
     except Exception:

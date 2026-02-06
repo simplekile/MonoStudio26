@@ -102,6 +102,7 @@ class MainWindow(QMainWindow):
         self._fs_watcher.directoryChanged.connect(self._fs_event_collector.add_path)
         self._fs_event_collector.batchReady.connect(self._on_fs_batch_ready)
         self._entered_parent: Asset | Shot | None = None
+        self._watcher_unavailable_for_root: Path | None = None  # skip addPaths retries (e.g. Dropbox)
 
         # Centralized filter state (UI-only; no filtering engine yet)
         self.current_department: str | None = None
@@ -860,6 +861,7 @@ class MainWindow(QMainWindow):
             new_assets, new_shots, requested_asset_ids, requested_shot_ids = (
                 result[0], result[1], result[2], result[3]
             )
+            type_folders_scanned = list(result[4]) if len(result) >= 5 and result[4] else []
             _dcc_log = logging.getLogger("monostudio.dcc_debug")
             _dcc_log.debug("incremental_scan taskFinished success (will clear pending and repaint)")
             _dcc_log.debug(
@@ -893,6 +895,32 @@ class MainWindow(QMainWindow):
                     continue
                 if aid not in new_asset_paths and not any(same_path(aid, a.path) for a in new_assets if isinstance(a, Asset)):
                     current_assets.pop(aid, None)
+            # When watcher only got directoryChanged(type_folder), requested_asset_ids is empty;
+            # remove from state any asset in a re-scanned type folder that is no longer on disk.
+            _removed_by_type_folder: list[str] = []
+            root = self._project_root
+            if root is not None and type_folders_scanned:
+                try:
+                    root_resolved = Path(root).resolve()
+                    for key, asset in list(current_assets.items()):
+                        if not isinstance(asset, Asset):
+                            continue
+                        try:
+                            rel = Path(asset.path).resolve().relative_to(root_resolved)
+                            parts = rel.parts
+                            if len(parts) >= 2 and parts[0] == "assets":
+                                type_folder_for_asset = parts[1]
+                                if type_folder_for_asset in type_folders_scanned:
+                                    asset_path_str = str(Path(asset.path).resolve())
+                                    if asset_path_str not in new_asset_paths and not any(
+                                        same_path(asset_path_str, a.path) for a in new_assets if isinstance(a, Asset)
+                                    ):
+                                        current_assets.pop(key, None)
+                                        _removed_by_type_folder.append(key)
+                        except (ValueError, OSError):
+                            pass
+                except OSError:
+                    pass
             for a in new_assets:
                 if not isinstance(a, Asset):
                     continue
@@ -942,6 +970,8 @@ class MainWindow(QMainWindow):
             for sid in requested_shot_ids or []:
                 if sid not in new_shot_paths and not any(same_path(sid, s.path) for s in new_shots if isinstance(s, Shot)):
                     _to_clear.append(sid)
+            for key in _removed_by_type_folder:
+                _to_clear.append(key)
             if _to_clear:
                 _dcc_log.debug("incremental_scan clearing pending for entity_ids=%s", _to_clear)
                 remove_for_entities(_to_clear)
@@ -1125,8 +1155,9 @@ class MainWindow(QMainWindow):
 
     def _update_fs_watcher_paths(self) -> None:
         """Set or clear watched paths and collector state from current project root.
-        Watches project root, assets/, shots/, and each asset/shot directory so changes
-        inside entity folders (e.g. work/) are detected on Windows (no recursive watch).
+        Priority: (1) root, assets/, shots/; (2) each asset/shot base; (3) dept + work
+        paths until _max_paths. Cap ensures subdepartments don't blow path count; when
+        over limit, later entities keep at least their root watched.
         """
         _watcher_log = logging.getLogger("monostudio.fs_watcher")
         existing = self._fs_watcher.directories() + self._fs_watcher.files()
@@ -1135,12 +1166,14 @@ class MainWindow(QMainWindow):
         self._fs_event_collector.set_project_root(None)
         self._fs_event_collector.set_registries(None, None)
         if self._project_root is None:
+            self._watcher_unavailable_for_root = None
             _watcher_log.debug("fs_watcher paths cleared (no project)")
             return
         try:
             root = self._project_root.resolve()
         except OSError:
             return
+        _max_paths = 2000
         to_add: list[str] = []
         if root.is_dir():
             to_add.append(str(root))
@@ -1150,8 +1183,6 @@ class MainWindow(QMainWindow):
             to_add.append(str(assets_dir))
         if shots_dir.is_dir():
             to_add.append(str(shots_dir))
-        # Watch each asset/shot dir and every DCC work/ dir (model/blender/work, model/maya/work, …)
-        _max_paths = 2000
         _seen: set[str] = set(to_add)
         use_dcc_folders = read_use_dcc_folders(root)
         try:
@@ -1159,80 +1190,111 @@ class MainWindow(QMainWindow):
         except Exception:
             _dcc_reg = None
         if self._project_index is not None:
+            # Phase 1: all entity roots so every asset/shot has at least one watched path
             for asset in self._project_index.assets:
                 base = Path(asset.path)
                 if not base.is_absolute():
                     base = (root / base).resolve()
-                if base.is_dir() and len(to_add) < _max_paths:
+                if base.is_dir():
                     s = str(base)
                     if s not in _seen:
                         _seen.add(s)
                         to_add.append(s)
+            for shot in self._project_index.shots:
+                base = Path(shot.path)
+                if not base.is_absolute():
+                    base = (root / base).resolve()
+                if base.is_dir():
+                    s = str(base)
+                    if s not in _seen:
+                        _seen.add(s)
+                        to_add.append(s)
+            # Phase 2: dept + work paths until cap (so subdepartments don't exceed _max_paths)
+            for asset in self._project_index.assets:
+                if len(to_add) >= _max_paths:
+                    break
+                base = Path(asset.path)
+                if not base.is_absolute():
+                    base = (root / base).resolve()
                 for dept in asset.departments:
+                    if len(to_add) >= _max_paths:
+                        break
                     dept_dir = dept.path if Path(dept.path).is_absolute() else (root / dept.path).resolve()
-                    if dept_dir.is_dir() and len(to_add) < _max_paths:
+                    if dept_dir.is_dir():
                         s = str(dept_dir)
                         if s not in _seen:
                             _seen.add(s)
                             to_add.append(s)
+                    if len(to_add) >= _max_paths:
+                        break
                     if use_dcc_folders and _dcc_reg is not None:
                         for dcc_id in _dcc_reg.get_all_dccs():
+                            if len(to_add) >= _max_paths:
+                                break
                             try:
                                 wp = resolve_work_path(dept_dir, dcc_id, True, _dcc_reg)
                             except Exception:
                                 continue
-                            if wp.is_dir() and len(to_add) < _max_paths:
+                            if wp.is_dir():
                                 s = str(wp)
                                 if s not in _seen:
                                     _seen.add(s)
                                     to_add.append(s)
                     else:
                         wp = dept.work_path if Path(dept.work_path).is_absolute() else (root / dept.work_path).resolve()
-                        if wp.is_dir() and len(to_add) < _max_paths:
+                        if wp.is_dir():
                             s = str(wp)
                             if s not in _seen:
                                 _seen.add(s)
                                 to_add.append(s)
             for shot in self._project_index.shots:
-                base = Path(shot.path)
-                if not base.is_absolute():
-                    base = (root / base).resolve()
-                if base.is_dir() and len(to_add) < _max_paths:
-                    s = str(base)
-                    if s not in _seen:
-                        _seen.add(s)
-                        to_add.append(s)
+                if len(to_add) >= _max_paths:
+                    break
                 for dept in shot.departments:
+                    if len(to_add) >= _max_paths:
+                        break
                     dept_dir = dept.path if Path(dept.path).is_absolute() else (root / dept.path).resolve()
-                    if dept_dir.is_dir() and len(to_add) < _max_paths:
+                    if dept_dir.is_dir():
                         s = str(dept_dir)
                         if s not in _seen:
                             _seen.add(s)
                             to_add.append(s)
+                    if len(to_add) >= _max_paths:
+                        break
                     if use_dcc_folders and _dcc_reg is not None:
                         for dcc_id in _dcc_reg.get_all_dccs():
+                            if len(to_add) >= _max_paths:
+                                break
                             try:
                                 wp = resolve_work_path(dept_dir, dcc_id, True, _dcc_reg)
                             except Exception:
                                 continue
-                            if wp.is_dir() and len(to_add) < _max_paths:
+                            if wp.is_dir():
                                 s = str(wp)
                                 if s not in _seen:
                                     _seen.add(s)
                                     to_add.append(s)
                     else:
                         wp = dept.work_path if Path(dept.work_path).is_absolute() else (root / dept.work_path).resolve()
-                        if wp.is_dir() and len(to_add) < _max_paths:
+                        if wp.is_dir():
                             s = str(wp)
                             if s not in _seen:
                                 _seen.add(s)
                                 to_add.append(s)
         if to_add:
-            added = self._fs_watcher.addPaths(to_add)
-            failed = len(to_add) - len(added)
-            _watcher_log.debug("fs_watcher addPaths: requested=%d added=%d failed=%d", len(to_add), len(added), failed)
-            if failed:
-                _watcher_log.debug("fs_watcher paths not added: %s", set(to_add) - set(added))
+            if self._watcher_unavailable_for_root is not None and root == self._watcher_unavailable_for_root:
+                _watcher_log.debug("fs_watcher skipping addPaths (unavailable for this project)")
+            else:
+                added = self._fs_watcher.addPaths(to_add)
+                failed = len(to_add) - len(added)
+                _watcher_log.debug("fs_watcher addPaths: requested=%d added=%d failed=%d", len(to_add), len(added), failed)
+                if added == 0 and failed > 0:
+                    self._watcher_unavailable_for_root = root
+                    _watcher_log.info(
+                        "File system watcher could not watch project paths (common on Dropbox/network drives). Use Refresh to update."
+                    )
+                elif failed:
+                    _watcher_log.debug("fs_watcher paths not added: %s", set(to_add) - set(added))
         self._fs_event_collector.set_project_root(root)
         try:
             type_reg = TypeRegistry.for_project(root)
