@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QStyle,
     QStyleOptionViewItem,
     QStyledItemDelegate,
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.recent_tasks_store import RecentTask
 from monostudio.ui_qt.style import (
     MONOS_COLORS,
     SIDEBAR_DEPT_LIST_STYLE,
@@ -115,6 +117,9 @@ def _load_logo_pixmap(size: int, color_hex: str) -> QPixmap:
 _DEPT_ROW_SECTION = "section"
 _DEPT_ROW_DEPT = "dept"
 _DEPT_ROW_SPACER = "spacer"
+
+# Section order for type list (Assets then Shots).
+_TYPE_SECTION_ORDER = ("Assets", "Shots")
 
 
 def _container_gradient(rect: QRectF) -> QLinearGradient:
@@ -537,10 +542,10 @@ class SidebarWidget(QWidget):
         self._type_list = QListWidget(self)
         self._type_list.setObjectName("SidebarFilterList")
         self._type_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._type_list.setUniformItemSizes(True)
+        self._type_list.setUniformItemSizes(False)  # section/spacer/type like departments
         self._type_list.setFocusPolicy(Qt.NoFocus)
         self._type_list.setIconSize(QSize(16, 16))
-        self._type_list.setItemDelegate(_SidebarDotItemDelegate(self._type_list))
+        self._type_list.setItemDelegate(_SidebarDeptListDelegate(self._type_list))
         self._type_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._type_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._type_list.itemClicked.connect(self._on_type_clicked)
@@ -632,6 +637,13 @@ class SidebarWidget(QWidget):
 
     def current_type(self) -> str | None:
         return self._active_type
+
+    def get_department_display(self, dept_id: str | None) -> tuple[str | None, str | None]:
+        """Return (label, icon_name) for pipeline display (header + thumb badge). Subdepartment-safe."""
+        did = (dept_id or "").strip() or None
+        if not did:
+            return (None, None)
+        return (self._dept_label_by_id.get(did), self._dept_icon_by_id.get(did))
 
     def set_settings(self, settings: QSettings) -> None:
         """
@@ -840,21 +852,67 @@ class SidebarWidget(QWidget):
         else:
             self._visible_types = [v for v in self._visible_types if v in cleaned]
 
+        visible = self._visible_types or []
+        # Group by section: Assets vs Shots (same structure as department list).
+        asset_types = [t for t in visible if not _is_shot_type(t)]
+        shot_types = [t for t in visible if _is_shot_type(t)]
+        sections_with_types: list[tuple[str, list[str]]] = []
+        if asset_types:
+            sections_with_types.append(("Assets", asset_types))
+        if shot_types:
+            sections_with_types.append(("Shots", shot_types))
+
         self._type_list.blockSignals(True)
         try:
             self._type_list.clear()
-            for v in (self._visible_types or []):
-                label = self._type_label_by_id.get(v, v)
-                it = QListWidgetItem(_title_case_label(label))
-                it.setData(Qt.UserRole, v)  # stable id
-                icon_name = self._type_icon_by_id.get(v)
-                if icon_name:
-                    it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="folder"))
-                self._type_list.addItem(it)
+            next_type_round_top = True
+            for sec_idx, (section_label, type_ids) in enumerate(sections_with_types):
+                if self._type_list.count() > 0:
+                    spacer = QListWidgetItem("")
+                    spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
+                    spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    self._type_list.addItem(spacer)
+                    next_type_round_top = True
+                section_item = QListWidgetItem("")
+                section_item.setData(
+                    Qt.UserRole,
+                    {"type": _DEPT_ROW_SECTION, "section_label": section_label},
+                )
+                section_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self._type_list.addItem(section_item)
+                next_type_round_top = False
+                for i, type_id in enumerate(type_ids):
+                    last_in_block = i + 1 >= len(type_ids)
+                    label = self._type_label_by_id.get(type_id, type_id)
+                    it = QListWidgetItem(_title_case_label(label))
+                    it.setData(
+                        Qt.UserRole,
+                        {
+                            "type": _DEPT_ROW_DEPT,
+                            "dept_id": type_id,
+                            "round_top": next_type_round_top,
+                            "round_bottom": last_in_block,
+                        },
+                    )
+                    next_type_round_top = False
+                    icon_name = self._type_icon_by_id.get(type_id)
+                    if icon_name:
+                        it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="folder"))
+                    self._type_list.addItem(it)
             self._sync_selection()
             self._fit_list_height(self._type_list)
         finally:
             self._type_list.blockSignals(False)
+
+    def set_selected_department(self, dept_id: str | None, *, emit: bool = True) -> None:
+        """Set department selection. If emit=True, emit departmentClicked (user click).
+        Use emit=False when syncing from Recent Task so controller does not treat same dept as toggle-off."""
+        self._active_department = (dept_id or "").strip() or None
+        self._sync_selection()
+        if emit:
+            self.departmentClicked.emit(self._active_department)
+        self._state_by_mode[self._mode] = self._snapshot_state()
+        self._save_state_for_mode(self._mode)
 
     def _sync_selection(self) -> None:
         self._dept_list.blockSignals(True)
@@ -878,10 +936,14 @@ class SidebarWidget(QWidget):
             if self._active_type is not None:
                 for i in range(self._type_list.count()):
                     it = self._type_list.item(i)
-                    if it is not None and it.data(Qt.UserRole) == self._active_type:
-                        it.setSelected(True)
-                        self._type_list.setCurrentItem(it)
-                        break
+                    if it is None:
+                        continue
+                    data = it.data(Qt.UserRole)
+                    if isinstance(data, dict) and data.get("type") == _DEPT_ROW_DEPT:
+                        if data.get("dept_id") == self._active_type:
+                            it.setSelected(True)
+                            self._type_list.setCurrentItem(it)
+                            break
         finally:
             self._dept_list.blockSignals(False)
             self._type_list.blockSignals(False)
@@ -907,9 +969,13 @@ class SidebarWidget(QWidget):
         self._save_state_for_mode(self._mode)
 
     def _on_type_clicked(self, item: QListWidgetItem) -> None:
-        v = item.data(Qt.UserRole)
-        clicked = v if isinstance(v, str) else None
-        if clicked is not None and clicked == self._active_type:
+        data = item.data(Qt.UserRole)
+        if not isinstance(data, dict) or data.get("type") != _DEPT_ROW_DEPT:
+            return
+        clicked = data.get("dept_id") if isinstance(data.get("dept_id"), str) else None
+        if clicked is None:
+            return
+        if clicked == self._active_type:
             self._active_type = None
             self._sync_selection()
             self.typeClicked.emit(None)
@@ -929,6 +995,9 @@ class SidebarWidget(QWidget):
             selected=set(self._visible_departments or []),
             max_selected=None,
             parent=self,
+            dept_parent=self._dept_parent,
+            dept_label_by_id=self._dept_label_by_id,
+            list_min_height_px=_FILTER_PICK_LIST_MIN_HEIGHT_DEPT_PX,
         )
         if dlg.exec() != QDialog.Accepted:
             return
@@ -943,6 +1012,7 @@ class SidebarWidget(QWidget):
         self._save_state_for_mode(self._mode)
 
     def _open_type_picker(self) -> None:
+        type_section = {tid: ("Shots" if _is_shot_type(tid) else "Assets") for tid in self._all_types}
         dlg = _FilterPickDialog(
             title="Select Types",
             items=[
@@ -952,6 +1022,8 @@ class SidebarWidget(QWidget):
             selected=set(self._visible_types or []),
             max_selected=None,
             parent=self,
+            type_section_by_id=type_section,
+            list_min_height_px=_FILTER_PICK_LIST_MIN_HEIGHT_TYPE_PX,
         )
         if dlg.exec() != QDialog.Accepted:
             return
@@ -980,10 +1052,15 @@ class SidebarWidget(QWidget):
         w.setFixedHeight(total_h + extra)
 
 
+# Default list min heights for picker dialogs (from SIDEBAR_DEPT_LIST_STYLE usage).
+_FILTER_PICK_LIST_MIN_HEIGHT_DEPT_PX = 580  # department dialog: double height
+_FILTER_PICK_LIST_MIN_HEIGHT_TYPE_PX = 240   # type dialog: unchanged
+
+
 class _FilterPickDialog(MonosDialog):
     """
     Picker dialog for Departments / Types.
-    Selectable list (multi-select), same style as department preset in Settings.
+    Same container/section/spacer/row structure as sidebar list when dept_parent or type_section_by_id is set.
     """
 
     def __init__(
@@ -994,12 +1071,15 @@ class _FilterPickDialog(MonosDialog):
         selected: set[str],
         max_selected: int | None,
         parent=None,
+        dept_parent: dict[str, str] | None = None,
+        dept_label_by_id: dict[str, str] | None = None,
+        type_section_by_id: dict[str, str] | None = None,
+        list_min_height_px: int | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
         self.setObjectName("SidebarFilterPickDialog")
-        # Force QSS background to paint (otherwise dialog can appear black on Windows).
         self.setAttribute(Qt.WA_StyledBackground, True)
 
         self._items: list[tuple[str, str, str | None]] = [
@@ -1008,6 +1088,9 @@ class _FilterPickDialog(MonosDialog):
             if isinstance(i, str) and i.strip() and isinstance(lbl, str) and lbl.strip()
         ]
         _selected = set(selected)
+        self._dept_parent = dept_parent or {}
+        self._dept_label_by_id = dept_label_by_id or {}
+        self._type_section_by_id = type_section_by_id or {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -1025,17 +1108,17 @@ class _FilterPickDialog(MonosDialog):
         self._list.setIconSize(QSize(16, 16))
         self._list.selectionModel().selectionChanged.connect(self._sync_hint)
 
-        for item_id, label, icon_name in self._items:
-            it = QListWidgetItem(label)
-            it.setData(Qt.UserRole, item_id)
-            if icon_name:
-                ic = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS["text_label"])
-                if ic.isNull():
-                    ic = lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"])
-                it.setIcon(ic)
-            self._list.addItem(it)
-            if item_id in _selected:
-                it.setSelected(True)
+        use_structured = bool(self._dept_parent) or bool(self._type_section_by_id)
+        if use_structured:
+            self._list.setUniformItemSizes(False)
+            self._list.setItemDelegate(_SidebarDeptListDelegate(self._list))
+            self._build_structured_list(_selected)
+        else:
+            self._build_flat_list(_selected)
+
+        if list_min_height_px is not None:
+            self._list.setMinimumHeight(list_min_height_px)
+            self._list.setMaximumHeight(list_min_height_px)
 
         # Buttons
         btn_row = QWidget(self)
@@ -1059,15 +1142,125 @@ class _FilterPickDialog(MonosDialog):
 
         self._sync_hint()
 
+    def _build_flat_list(self, _selected: set[str]) -> None:
+        for item_id, label, icon_name in self._items:
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, item_id)
+            if icon_name:
+                ic = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS["text_label"])
+                if ic.isNull():
+                    ic = lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"])
+                it.setIcon(ic)
+            self._list.addItem(it)
+            if item_id in _selected:
+                it.setSelected(True)
+
+    def _build_structured_list(self, _selected: set[str]) -> None:
+        if self._type_section_by_id:
+            self._build_structured_list_types(_selected)
+        else:
+            self._build_structured_list_depts(_selected)
+
+    def _build_structured_list_depts(self, _selected: set[str]) -> None:
+        visible = [i[0] for i in self._items]
+        parents_with_children = {self._dept_parent[d] for d in visible if self._dept_parent.get(d)}
+        sections_emitted: set[str] = set()
+        next_round_top = True
+        for i, (dept_id, label, icon_name) in enumerate(self._items):
+            parent_id = self._dept_parent.get(dept_id)
+            is_in_section = bool(parent_id and parent_id in parents_with_children)
+            if self._list.count() > 0:
+                if is_in_section and parent_id not in sections_emitted:
+                    spacer = QListWidgetItem("")
+                    spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
+                    spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    self._list.addItem(spacer)
+                elif not is_in_section:
+                    spacer = QListWidgetItem("")
+                    spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
+                    spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    self._list.addItem(spacer)
+                    next_round_top = True
+            if is_in_section and parent_id not in sections_emitted:
+                section_label = _title_case_label(self._dept_label_by_id.get(parent_id, parent_id))
+                section_item = QListWidgetItem("")
+                section_item.setData(Qt.UserRole, {"type": _DEPT_ROW_SECTION, "section_label": section_label})
+                section_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self._list.addItem(section_item)
+                sections_emitted.add(parent_id)
+                next_round_top = False
+            if i + 1 >= len(self._items):
+                last_in_block = True
+            else:
+                next_parent = self._dept_parent.get(self._items[i + 1][0])
+                last_in_block = next_parent != parent_id
+            it = QListWidgetItem(_title_case_label(label))
+            it.setData(
+                Qt.UserRole,
+                {"type": _DEPT_ROW_DEPT, "dept_id": dept_id, "round_top": next_round_top, "round_bottom": last_in_block},
+            )
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            if icon_name:
+                ic = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS["text_label"])
+                if ic.isNull():
+                    ic = lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"])
+                it.setIcon(ic)
+            self._list.addItem(it)
+            if dept_id in _selected:
+                it.setSelected(True)
+            next_round_top = False
+
+    def _build_structured_list_types(self, _selected: set[str]) -> None:
+        asset_ids = [i[0] for i in self._items if self._type_section_by_id.get(i[0], "Assets") == "Assets"]
+        shot_ids = [i[0] for i in self._items if self._type_section_by_id.get(i[0], "Assets") == "Shots"]
+        item_by_id = {i[0]: i for i in self._items}
+        for section_label, id_list in [("Assets", asset_ids), ("Shots", shot_ids)]:
+            if not id_list:
+                continue
+            if self._list.count() > 0:
+                spacer = QListWidgetItem("")
+                spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
+                spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self._list.addItem(spacer)
+            section_item = QListWidgetItem("")
+            section_item.setData(Qt.UserRole, {"type": _DEPT_ROW_SECTION, "section_label": section_label})
+            section_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self._list.addItem(section_item)
+            for idx, type_id in enumerate(id_list):
+                tup = item_by_id.get(type_id)
+                if not tup:
+                    continue
+                _, label, icon_name = tup
+                last_in_block = idx + 1 >= len(id_list)
+                it = QListWidgetItem(_title_case_label(label))
+                it.setData(
+                    Qt.UserRole,
+                    {"type": _DEPT_ROW_DEPT, "dept_id": type_id, "round_top": False, "round_bottom": last_in_block},
+                )
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                if icon_name:
+                    ic = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS["text_label"])
+                    if ic.isNull():
+                        ic = lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"])
+                    it.setIcon(ic)
+                self._list.addItem(it)
+                if type_id in _selected:
+                    it.setSelected(True)
+
     def selected_items(self) -> list[str]:
         """Return selected item ids in list order."""
         out: list[str] = []
         for i in range(self._list.count()):
             it = self._list.item(i)
-            if it and it.isSelected():
-                v = it.data(Qt.UserRole)
-                if isinstance(v, str) and v:
-                    out.append(v)
+            if not it or not it.isSelected():
+                continue
+            v = it.data(Qt.UserRole)
+            if isinstance(v, str) and v:
+                out.append(v)
+            if isinstance(v, dict) and v.get("type") == _DEPT_ROW_DEPT:
+                sid = v.get("dept_id")
+                if isinstance(sid, str) and sid:
+                    out.append(sid)
         return out
 
     def _sync_hint(self) -> None:
@@ -1088,6 +1281,7 @@ class Sidebar(QWidget):
     context_clicked = Signal(str)  # emitted when clicking already-selected nav item
     context_menu_requested = Signal(str, object)  # (context_text, global_pos) for nav items
     settings_requested = Signal()
+    recent_task_clicked = Signal(object)  # RecentTask
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1181,7 +1375,7 @@ class Sidebar(QWidget):
         # Section: FILTERS (metadata-driven; mock data for now)
         self._filters = SidebarWidget(scroll_inner)
 
-        # Section: RECENT TASKS (placeholder UI only)
+        # Section: RECENT TASKS
         tasks_block = QWidget(scroll_inner)
         tasks_layout = QVBoxLayout(tasks_block)
         tasks_layout.setContentsMargins(0, 0, 0, 0)
@@ -1191,11 +1385,21 @@ class Sidebar(QWidget):
         tasks_header.setObjectName("SidebarSectionHeader")
         tasks_header.setFont(f_h)
 
-        tasks_empty = QLabel("No tasks", tasks_block)
-        tasks_empty.setObjectName("SidebarMutedText")
+        self._tasks_stacked = QStackedWidget(tasks_block)
+        self._tasks_empty = QLabel("No tasks", tasks_block)
+        self._tasks_empty.setObjectName("SidebarMutedText")
+        self._tasks_list = QListWidget(tasks_block)
+        self._tasks_list.setObjectName("SidebarRecentTasksList")
+        self._tasks_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._tasks_list.setFocusPolicy(Qt.NoFocus)
+        self._tasks_list.setSpacing(2)
+        self._tasks_list.setMaximumHeight(200)
+        self._tasks_list.itemClicked.connect(self._on_recent_task_item_clicked)
+        self._tasks_stacked.addWidget(self._tasks_empty)
+        self._tasks_stacked.addWidget(self._tasks_list)
 
         tasks_layout.addWidget(tasks_header, 0)
-        tasks_layout.addWidget(tasks_empty, 0)
+        tasks_layout.addWidget(self._tasks_stacked, 0)
         tasks_layout.addStretch(1)
 
         scroll_layout.addWidget(self._filters, 1)
@@ -1233,6 +1437,23 @@ class Sidebar(QWidget):
 
     def filters(self) -> SidebarWidget:
         return self._filters
+
+    def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
+        self._tasks_list.clear()
+        if not tasks:
+            self._tasks_stacked.setCurrentWidget(self._tasks_empty)
+            return
+        self._tasks_stacked.setCurrentWidget(self._tasks_list)
+        for t in tasks:
+            it = QListWidgetItem(f"{t.item_name} · {t.department}")
+            it.setData(Qt.UserRole, t)
+            it.setSizeHint(QSize(0, 32))
+            self._tasks_list.addItem(it)
+
+    def _on_recent_task_item_clicked(self, item: QListWidgetItem) -> None:
+        task = item.data(Qt.UserRole) if item else None
+        if isinstance(task, RecentTask):
+            self.recent_task_clicked.emit(task)
 
     def _add_nav_item(self, label: str, icon_name: str) -> None:
         it = QListWidgetItem("")

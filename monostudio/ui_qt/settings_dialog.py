@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -176,13 +175,13 @@ class SettingsDialog(MonosDialog):
         content_layout.addWidget(nav_frame, 0)
         content_layout.addWidget(self._content_stack, 1)
 
-        self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        ok = self._buttons.button(QDialogButtonBox.Ok)
-        if ok is not None:
-            ok.setText("Save")
-            ok.setObjectName("DialogPrimaryButton")
-        self._buttons.accepted.connect(self._on_save)
-        self._buttons.rejected.connect(self.reject)
+        btn_save = QPushButton("Save")
+        btn_save.setObjectName("DialogPrimaryButton")
+        btn_save.clicked.connect(self._on_save)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setObjectName("DialogSecondaryButton")
+        btn_cancel.clicked.connect(self.reject)
 
         btn_save_as_default = QPushButton("Save as default")
         btn_save_as_default.setObjectName("SettingsCategoryActionButton")
@@ -194,7 +193,8 @@ class SettingsDialog(MonosDialog):
         button_row_l.setSpacing(10)
         button_row_l.addWidget(btn_save_as_default)
         button_row_l.addStretch(1)
-        button_row_l.addWidget(self._buttons)
+        button_row_l.addWidget(btn_save)
+        button_row_l.addWidget(btn_cancel)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -272,7 +272,7 @@ class SettingsDialog(MonosDialog):
         return self._build_tier2_page_buttons([
             ("Workspace", self._build_app_workspace_tab()),
             ("UI", self._build_ui_tab()),
-            ("Behavior", self._placeholder("General → Behavior (placeholder)")),
+            ("Behavior", self._build_behavior_tab()),
         ])
 
     def _build_ui_tab(self) -> QWidget:
@@ -300,6 +300,39 @@ class SettingsDialog(MonosDialog):
         hint.setWordWrap(True)
         hint.setObjectName("DialogHelper")
         grp_layout.addLayout(form)
+        grp_layout.addWidget(hint)
+        layout.addWidget(grp)
+        layout.addStretch(1)
+        return root
+
+    def _build_behavior_tab(self) -> QWidget:
+        """General → Behavior: global pipeline options (create asset/shot)."""
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        grp = QGroupBox("New Asset / Shot", root)
+        grp_layout = QVBoxLayout(grp)
+        self._create_work_publish_subfolders_cb = QCheckBox(
+            "Create work/ and publish/ inside departments",
+            grp,
+        )
+        try:
+            if self._settings is not None:
+                v = self._settings.value("pipeline/create_work_publish_subfolders", True, type=bool)
+                self._create_work_publish_subfolders_cb.setChecked(bool(v))
+            else:
+                self._create_work_publish_subfolders_cb.setChecked(True)
+        except Exception:
+            self._create_work_publish_subfolders_cb.setChecked(True)
+        hint = QLabel(
+            "When creating a new asset or shot, create work/ and publish/ subfolders inside each department folder. This setting applies globally to all projects.",
+            grp,
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("DialogHelper")
+        grp_layout.addWidget(self._create_work_publish_subfolders_cb)
         grp_layout.addWidget(hint)
         layout.addWidget(grp)
         layout.addStretch(1)
@@ -1564,6 +1597,16 @@ class SettingsDialog(MonosDialog):
             if self._settings is not None and self._notification_max_visible_combo is not None:
                 idx = self._notification_max_visible_combo.currentIndex()
                 self._settings.setValue("notification/max_visible", idx + 1)
+        except Exception:
+            pass
+
+        # Persist global pipeline behavior (create work/publish subfolders).
+        try:
+            if self._settings is not None and self._create_work_publish_subfolders_cb is not None:
+                self._settings.setValue(
+                    "pipeline/create_work_publish_subfolders",
+                    self._create_work_publish_subfolders_cb.isChecked(),
+                )
         except Exception:
             pass
 

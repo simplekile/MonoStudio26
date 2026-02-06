@@ -1253,6 +1253,23 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(24, 24, 27, 0.35);
             color: rgba(250, 250, 250, 0.45);
         }
+        /* Dialog: nút hủy (phải) — màu xám, giống Settings */
+        QPushButton#DialogSecondaryButton {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            background: rgba(24, 24, 27, 0.35);
+            color: #a1a1aa;
+        }
+        QPushButton#DialogSecondaryButton:hover {
+            background: rgba(24, 24, 27, 0.55);
+            border-color: rgba(39, 39, 42, 0.70);
+            color: #fafafa;
+        }
+        QPushButton#DialogSecondaryButton:disabled {
+            color: rgba(161, 161, 170, 0.5);
+            background: rgba(24, 24, 27, 0.25);
+        }
         /* Categories (Asset/Shot Depts): nút Create/Delete Type — style giống nhau cho cả hai trang */
         QPushButton#SettingsCategoryActionButton {
             padding: 8px 12px;
@@ -1474,6 +1491,28 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(59, 130, 246, 0.10);
             color: #60a5fa; /* Blue-400 */
             border: 1px solid rgba(59, 130, 246, 0.30);
+        }
+
+        /* Recent tasks list (sidebar) */
+        QListWidget#SidebarRecentTasksList {
+            border: none;
+            border-radius: 6px;
+            background: transparent;
+            color: #a1a1aa;
+            padding: 4px 0;
+        }
+        QListWidget#SidebarRecentTasksList::item {
+            height: 32px;
+            padding: 4px 10px;
+            border-radius: 6px;
+        }
+        QListWidget#SidebarRecentTasksList::item:hover {
+            background: rgba(130, 130, 130, 0.10);
+            color: #fafafa;
+        }
+        QListWidget#SidebarRecentTasksList::item:selected {
+            background: rgba(59, 130, 246, 0.10);
+            color: #60a5fa;
         }
 
         QToolButton#SidebarFilterAddButton {

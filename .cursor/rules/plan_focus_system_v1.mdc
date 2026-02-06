@@ -1,0 +1,141 @@
+---
+description: Plan hệ thống Focus mới — single source of truth cho "department đang làm việc".
+alwaysApply: false
+---
+
+# Plan: Hệ thống Focus mới (v1)
+
+Tài liệu này mô tả thiết kế **hệ thống focus mới** sau khi đã xóa hệ thống cũ (Inspector-per-item focus + Smart Open priority #1). Mục tiêu: **một nguồn sự thật duy nhất** cho "department đang được chọn / đang làm việc", không conflict với Sidebar, Recent Task hay Smart Open.
+
+---
+
+## 1. Trạng thái hiện tại (sau khi xóa)
+
+- **Smart Open** chọn department theo thứ tự:  
+  1) Sidebar active department  
+  2) Asset/Shot last-used (defaults, last_open)  
+  3) Project default  
+- **Sidebar filter**: department + type; controller có `current_department` / `current_type`.  
+- **Recent Task**: click → set sidebar department + chọn item; Open dùng sidebar department.  
+- **Inspector department cards**: click card chỉ cập nhật Tech row (resolved path), **không** lưu "focus" hay ảnh hưởng Smart Open.
+
+---
+
+## 2. Mục tiêu hệ thống Focus mới
+
+- **Focus** = "department (và tùy chọn item) mà user đang xem / sẵn sàng mở".
+- Dùng cho: **Smart Open** (double-click mở đúng department), **UI highlight** (card nào đang "active"), **Recent Task / Sidebar** đồng bộ một chiều.
+- **Một nguồn sự thật**: không có hai nơi lưu focus (sidebar + inspector) dễ lệch nhau.
+
+---
+
+## 3. Đề xuất: Focus = Sidebar + Selection
+
+### 3.1 Nguyên tắc
+
+- **Focused department** = **Sidebar active department** (`controller.current_department`).  
+- **Focused item** = **Item đang được chọn trong Main View** (selection).  
+- Không lưu thêm "Inspector department focus" per item. Khi user click department card trong Inspector, hành vi có thể là:
+  - **Option A (đơn giản):** Chỉ cập nhật Tech row (resolved path) như hiện tại; **không** thay đổi "focused department". Open vẫn theo sidebar.
+  - **Option B (click = set focus):** Click card → set **sidebar department** = department của card đó (đồng bộ controller + sidebar filter). Đây là "focus" duy nhất; Smart Open đã dùng sidebar nên tự đúng.
+
+### 3.2 Option B chi tiết (recommended)
+
+- **Inspector department card click:**  
+  - Cập nhật Tech row (resolved path) như hiện tại.  
+  - **Và** gọi logic "set sidebar department" = department của card (tương đương user click department ở sidebar).  
+- **Luồng:** Inspector emit `department_clicked(department_name)` → MainWindow hoặc controller set `current_department` + đồng bộ Sidebar filter (set_selected_department) → Smart Open luôn dùng sidebar → mở đúng department.  
+- **Visual:** Sidebar đã có "selected" department; Inspector card có thể **tùy chọn** highlight card tương ứng với `current_department` (read-only: so sánh card.dept == current_department, không lưu state riêng).
+
+### 3.3 Lợi ích
+
+- Một nguồn sự thật: **chỉ** `current_department` (và selection cho item).  
+- Recent Task / Sidebar / Inspector click đều quy về cùng một state.  
+- Không conflict: không có "inspector focus" cũ để override.
+
+---
+
+## 4. Thành phần cần thêm (nếu làm Option B)
+
+| Thành phần | Mô tả |
+|------------|--------|
+| **Inspector → Sidebar sync** | Khi user click department card: ngoài `_tech.set_resolved_path`, gọi callback/signal để MainWindow set sidebar department = department đó (controller.on_department_clicked + sidebar.filters().set_selected_department). |
+| **Signal** | Có thể dùng lại `department_focused` (internal) và thêm signal ra ngoài `department_clicked_for_filter(department_name)` để MainWindow sync sidebar; hoặc dùng chung một signal "user chose this department" cho cả Tech row và filter. |
+| **Card highlight (optional)** | Trong Inspector, khi vẽ/sync: nếu `current_department` (từ controller hoặc prop) == card's department thì set style "selected/focused" cho card. Cần MainWindow truyền `current_department` xuống Inspector hoặc Inspector subscribe controller.departmentChanged. |
+
+---
+
+## 5. Không làm gì (giữ như hiện tại)
+
+- **Không** lưu per-item "last focused department" trong controller.  
+- **Không** priority "Inspector focus" trong `_resolve_department`.  
+- **Không** `clear_inspector_focus_for_item` hay logic tương tự.
+
+---
+
+## 6. Checklist triển khai (Option B)
+
+| Bước | Nội dung |
+|------|----------|
+| 1 | Inspector: khi department card clicked, ngoài department_focused (Tech row), emit signal ra ngoài để MainWindow nhận (vd. `department_clicked_for_filter(str)`). |
+| 2 | MainWindow: connect signal đó → gọi controller.on_department_clicked(dept) và sidebar.filters().set_selected_department(dept). |
+| 3 | (Optional) Inspector nhận current_department (từ controller hoặc prop) và highlight card có department trùng (set_focused(card.dept == current_department)); dùng QSS cho border/background "focused". |
+
+---
+
+## 7. Focus khi Refresh và Switch Page (selection)
+
+Đã xóa: lưu selection theo context (`_selection_by_context`), save khi đổi selection (`_on_selection_changed_save_focus`), restore khi reload/switch page. **Hiện tại:** mỗi lần refresh hoặc chuyển page/filter → **clear selection** (`set_selection(None)`).
+
+Cần tính lại cách focus (selection) khi:
+- **Switch page:** Assets ↔ Shots (hoặc sang Projects/Dashboard/…).
+- **Change filter:** đổi department hoặc type trong sidebar → `_reload_main_view()`.
+- **Refresh:** rescan project hoặc user bấm refresh → list rebuild.
+
+### 7.1 Option hiện tại (đã làm)
+
+- **Luôn clear selection** khi reload/switch. Đơn giản, không state per context. Nhược: user chuyển qua Shots rồi quay lại Assets phải chọn lại item.
+
+### 7.2 Các hướng thiết kế có thể
+
+| Option | Mô tả | Ưu / Nhược |
+|--------|--------|------------|
+| **A. Giữ clear** | Không restore, luôn clear khi reload/switch (hiện tại). | Đơn giản, không bug lệch context. UX: mất selection khi đổi filter/page. |
+| **B. Restore per context** | Lưu một selection **per (page, department, type)**; khi trở lại đúng context thì restore selection đó (tương đương code cũ đã xóa). | UX tốt khi hay chuyển page/filter. Cần lại `_context_key()`, dict lưu path/id, save trên selectionChanged, restore trong `_reload_main_view` (defer sau set_items). |
+| **C. Same-item nếu còn trong list** | Không lưu per context; khi reload (cùng page), nếu **selection hiện tại** vẫn nằm trong list items mới thì **giữ selection**, không clear. | Một nguồn sự thật (chỉ app_state.selection_id); refresh/filter nhẹ không làm mất selection nếu item vẫn pass filter. Chuyển page vẫn clear (vì list khác hẳn). |
+| **D. Global last selection + try restore** | Chỉ lưu một "last selected id" (global). Mỗi lần reload bất kỳ context nào: nếu id đó có trong items mới thì set_selection(id), không thì clear. | Đơn giản hơn B; khi quay lại Assets có thể tự chọn lại item trước đó nếu còn trong list. Có thể không mong muốn khi list là Shots. |
+
+### 7.3 Đề xuất tính lại
+
+- **Ngắn hạn:** Giữ **Option A** (clear) cho đến khi có nhu cầu UX rõ (hay chuyển page/filter và muốn giữ selection).
+- **Khi cần restore:** Ưu tiên **Option C** (giữ selection nếu item vẫn trong list khi reload cùng page) — không thêm state per context; restore **đồng bộ** (không defer) để tránh nháy (xem 7.4).  
+- **Nếu cần "nhớ từng context":** Dùng lại **Option B** (restore per context) với `_context_key()` + dict + save/restore như đã mô tả trong plan (có thể tách module/store nếu muốn).
+
+### 7.4 Cách không conflict và không nháy (recommended)
+
+- **Không conflict:** Chỉ dùng **một nguồn sự thật** cho selection = `app_state.selection_id()`. Không lưu thêm dict per context (Option B dễ conflict nếu hai nơi cùng ghi). Logic restore chỉ đọc selection hiện tại, kiểm tra có trong list mới không → giữ hoặc clear.
+- **Không nháy:**
+  1. **Không defer restore.** Defer (vd. `QTimer.singleShot(50, _restore)`) → frame 1 list không selection, frame 2 set selection → nháy. Gọi restore **đồng bộ** ngay sau `set_items` trong cùng call stack.
+  2. **Tốt nhất: restore bên trong `set_items`.** MainView nhận thêm `preserve_selection_id: str | None = None`. Sau `_rebuild_items_from_order()`, nếu `preserve_selection_id` có trong list thì gọi `select_item_by_path(Path(preserve_selection_id))` (và sync app_state nếu cần) **trước khi return**. Lần vẽ đầu tiên đã có selection đúng → không nháy.
+  3. **Nếu không sửa MainView:** Trong `_reload_main_view` gọi `set_items(items)` rồi **ngay lập tức** (không QTimer) `set_selection(current_id)` khi current_id còn trong items. Tránh defer.
+
+**Tóm tắt:** Option C + restore đồng bộ (trong set_items hoặc ngay sau set_items, không defer) = không conflict, không nháy.
+
+### 7.5 Điểm cần sửa khi triển khai (B hoặc C)
+
+- **`_reload_main_view`:** Hiện gọi `set_items(items)` rồi `set_selection(None)`.  
+  - **Option C (không nháy):** Lấy `current_id = self._app_state.selection_id()`. Cách 1 (recommended): `self._main_view.set_items(items, preserve_selection_id=current_id)`; trong MainView sau rebuild gọi `select_item_by_path` nếu preserve_selection_id có trong list. Cách 2: `set_items(items)` rồi ngay sau đó `self._app_state.set_selection(current_id)` nếu còn trong list, else `set_selection(None)` — **không** dùng QTimer.singleShot.  
+  - Option B: `_sid = self._selection_by_context.get(self._context_key())`; `set_items(items)`; gọi `set_selection(_sid or None)` **đồng bộ** (không defer).  
+- **Save (chỉ Option B):** Connect `selectionChanged` → lưu `selection_id` vào `_selection_by_context[_context_key()]`.
+
+---
+
+## 8. Tóm tắt
+
+- **Focus cũ (đã xóa):** Inspector lưu "focused department" per item, Smart Open ưu tiên nó → dễ conflict với Sidebar/Recent Task. **Selection:** lưu per context và restore khi switch page/refresh → đã xóa, hiện luôn clear.
+- **Focus mới (plan):** Focus = **Sidebar active department** (+ selection = item). Inspector click department có thể **set** sidebar department (Option B) để mọi thứ đồng bộ; card highlight (nếu có) chỉ đọc từ `current_department`, không lưu state riêng.
+- **Focus khi refresh / switch page:** Mục 7 — Option A (clear) / B / C / D. **Cách không conflict + không nháy (7.4):** Option C, một nguồn sự thật (app_state); restore **đồng bộ** (trong set_items với `preserve_selection_id` hoặc ngay sau set_items, **không defer**).
+
+---
+
+*Tạo sau khi xóa hệ thống focus cũ; cập nhật thêm mục 7 (focus refresh/switch page).*

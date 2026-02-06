@@ -5,11 +5,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QHBoxLayout,
-    QCheckBox,
     QLabel,
     QMenu,
     QPushButton,
@@ -18,7 +17,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtWidgets import (
-    QDialogButtonBox,
     QLineEdit,
     QVBoxLayout,
 )
@@ -56,6 +54,18 @@ def _safe_read_json(path: Path) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _global_create_work_publish_subfolders_default() -> bool:
+    """Read global default from Settings (General → Behavior). Applied when opening Create Asset/Shot dialogs."""
+    try:
+        s = QSettings("MonoStudio26", "MonoStudio26")
+        v = s.value("pipeline/create_work_publish_subfolders", True)
+        if isinstance(v, bool):
+            return v
+        return str(v).lower() in ("true", "1")
+    except Exception:
+        return True
 
 
 def _is_shot_type_id(type_id: str) -> bool:
@@ -200,15 +210,19 @@ class CreateAssetDialog(MonosDialog):
         self._final_name_preview.setWordWrap(True)
         self._final_name_preview.setObjectName("DialogHelper")
 
-        self._subfolders = QCheckBox("Create work/ and publish/ inside departments")
-        self._subfolders.setChecked(True)  # user request: default ON
-
-        self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self._buttons.accepted.connect(self.accept)
-        self._buttons.rejected.connect(self.reject)
-        ok = self._buttons.button(QDialogButtonBox.Ok)
-        if ok is not None:
-            ok.setText("Create Asset")
+        button_row = QWidget()
+        button_row_l = QHBoxLayout(button_row)
+        button_row_l.setContentsMargins(0, 0, 0, 0)
+        button_row_l.setSpacing(10)
+        self._ok_btn = QPushButton("Create Asset")
+        self._ok_btn.setObjectName("DialogPrimaryButton")
+        self._ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        button_row_l.addWidget(self._ok_btn)
+        button_row_l.addWidget(cancel_btn)
+        button_row_l.addStretch(1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)  # >= 12px all sides
@@ -233,15 +247,15 @@ class CreateAssetDialog(MonosDialog):
             )
         )
 
-        layout.addSpacing(12)
-        layout.addWidget(self._subfolders)
-
         layout.addSpacing(12)  # top margin above button row (>= 12px)
-        layout.addWidget(self._buttons)
+        layout.addWidget(button_row)
 
         self._update_ok_enabled()
         self._update_type_preview()
         self._update_final_name_preview()
+        first_id = self._get_first_asset_type_id()
+        if first_id is not None:
+            self._set_type(first_id)
 
     def asset_type(self) -> str:
         return (self._selected_type_id or "").strip()
@@ -271,7 +285,7 @@ class CreateAssetDialog(MonosDialog):
         return list(raw)
 
     def create_subfolders(self) -> bool:
-        return bool(self._subfolders.isChecked())
+        return _global_create_work_publish_subfolders_default()
 
     def _build_type_menu(self) -> None:
         self._type_menu.clear()
@@ -289,6 +303,11 @@ class CreateAssetDialog(MonosDialog):
             act = QAction(t.name, self._type_menu)
             act.triggered.connect(lambda checked=False, tid=type_id: self._set_type(tid))
             self._type_menu.addAction(act)
+
+    def _get_first_asset_type_id(self) -> str | None:
+        allowed = [(type_id, t) for type_id, t in self._types.items() if not _is_shot_type_id(type_id)]
+        allowed.sort(key=lambda kv: kv[1].name.lower())
+        return allowed[0][0] if allowed else None
 
     def _set_type(self, type_id: str) -> None:
         self._selected_type_id = type_id
@@ -323,10 +342,7 @@ class CreateAssetDialog(MonosDialog):
         self._debug_name_fields()
 
     def _update_ok_enabled(self) -> None:
-        ok = self._buttons.button(QDialogButtonBox.Ok)
-        if ok is None:
-            return
-        ok.setEnabled(bool(self._selected_type_id and self._asset_name.text().strip()))
+        self._ok_btn.setEnabled(bool(self._selected_type_id and self._asset_name.text().strip()))
 
     def _debug_name_fields(self) -> None:
         t = self._types.get(self._selected_type_id or "")
@@ -338,6 +354,10 @@ class CreateAssetDialog(MonosDialog):
             name_input=self._asset_name.text(),
             final_name=self.asset_name(),
         )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._asset_name.setFocus()
 
 
 class CreateShotDialog(MonosDialog):
@@ -394,15 +414,19 @@ class CreateShotDialog(MonosDialog):
         self._type_preview.setWordWrap(True)
         self._type_preview.setObjectName("DialogHelper")
 
-        self._subfolders = QCheckBox("Create work/ and publish/ inside departments")
-        self._subfolders.setChecked(True)  # user request: default ON
-
-        self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self._buttons.accepted.connect(self.accept)
-        self._buttons.rejected.connect(self.reject)
-        ok = self._buttons.button(QDialogButtonBox.Ok)
-        if ok is not None:
-            ok.setText("Create Shot")
+        button_row = QWidget()
+        button_row_l = QHBoxLayout(button_row)
+        button_row_l.setContentsMargins(0, 0, 0, 0)
+        button_row_l.setSpacing(10)
+        self._ok_btn = QPushButton("Create Shot")
+        self._ok_btn.setObjectName("DialogPrimaryButton")
+        self._ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        button_row_l.addWidget(self._ok_btn)
+        button_row_l.addWidget(cancel_btn)
+        button_row_l.addStretch(1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)  # >= 12px all sides
@@ -455,16 +479,14 @@ class CreateShotDialog(MonosDialog):
         layout.addSpacing(5)  # input -> preview (4–6px)
         layout.addWidget(self._final_name_preview)
 
-        layout.addSpacing(14)
-
-        layout.addSpacing(12)
-        layout.addWidget(self._subfolders)
-
         layout.addSpacing(12)  # top margin above button row (>= 12px)
-        layout.addWidget(self._buttons)
+        layout.addWidget(button_row)
 
         self._update_final_name_preview()
         self._update_ok_enabled()
+        first_id = self._get_first_shot_type_id()
+        if first_id is not None:
+            self._set_type(first_id)
 
     def shot_name(self) -> str:
         # Must match the previewed final folder name exactly.
@@ -495,22 +517,33 @@ class CreateShotDialog(MonosDialog):
         return list(raw)
 
     def create_subfolders(self) -> bool:
-        return bool(self._subfolders.isChecked())
+        return _global_create_work_publish_subfolders_default()
 
     def _build_type_menu(self) -> None:
         self._type_menu.clear()
         self._selected_type_id = None
-        self._type_button.setEnabled(bool(self._types))
-        if not self._types:
+        allowed = [
+            (type_id, t)
+            for type_id, t in sorted(self._types.items(), key=lambda kv: kv[1].name.lower())
+            if _is_shot_type_id(type_id)
+        ]
+        self._type_button.setEnabled(bool(allowed))
+        if not allowed:
             self._type_button.setText("No types")
             return
         self._type_button.setText("Select Type…")
-        for type_id, t in sorted(self._types.items(), key=lambda kv: kv[1].name.lower()):
-            if not _is_shot_type_id(type_id):
-                continue
+        for type_id, t in allowed:
             act = QAction(t.name, self._type_menu)
             act.triggered.connect(lambda checked=False, tid=type_id: self._set_type(tid))
             self._type_menu.addAction(act)
+
+    def _get_first_shot_type_id(self) -> str | None:
+        allowed = [
+            (type_id, t)
+            for type_id, t in sorted(self._types.items(), key=lambda kv: kv[1].name.lower())
+            if _is_shot_type_id(type_id)
+        ]
+        return allowed[0][0] if allowed else None
 
     def _set_type(self, type_id: str) -> None:
         self._selected_type_id = type_id
@@ -537,10 +570,7 @@ class CreateShotDialog(MonosDialog):
         self._type_preview.setVisible(True)
 
     def _update_ok_enabled(self) -> None:
-        ok = self._buttons.button(QDialogButtonBox.Ok)
-        if ok is None:
-            return
-        ok.setEnabled(bool(self._selected_type_id) and bool(self.shot_name()))
+        self._ok_btn.setEnabled(bool(self._selected_type_id) and bool(self.shot_name()))
 
     def _update_final_name_preview(self) -> None:
         # Final folder name preview (read-only, computed; no side effects).
@@ -567,4 +597,8 @@ class CreateShotDialog(MonosDialog):
             preview_text=self._final_name_preview.text(),
             final_name=self.shot_name(),
         )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._shot_number.setFocus()
 

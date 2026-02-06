@@ -1,0 +1,125 @@
+---
+description: Plan borderless (frameless) windows cho app MONOS — custom title bar, drag, resize, min/max/close.
+alwaysApply: false
+---
+
+# Plan: Borderless Windows cho App (v1)
+
+Tài liệu này mô tả thiết kế **cửa sổ borderless (frameless)** cho ứng dụng MONOS: bỏ khung OS, dùng **custom title bar** (dựa trên TopBar hiện tại), kéo thả, resize, minimize/maximize/close, và tùy chọn bo góc.
+
+---
+
+## 1. Hiện trạng
+
+- **MainWindow**: `QMainWindow`, khung và title bar mặc định của OS (Windows).
+- **TopBar**: widget nội bộ chứa Project switch, chưa đóng vai trò title bar (không kéo window, không nút Min/Max/Close).
+- **Dialogs/Menu**: đã dùng `MonosDialog` / `MonosMenu` với `FramelessWindowHint` + mask bo góc (xem `round_corner_standard_v1.mdc`, `style.py`).
+
+---
+
+## 2. Mục tiêu
+
+- **Main window**: không khung OS (borderless), giao diện thống nhất với Deep Dark (#121214).
+- **Custom title bar**: vùng kéo (drag), nút Minimize / Maximize (Restore) / Close; tích hợp với TopBar hiện có (project switch bên trái, window buttons bên phải).
+- **Resize**: kéo viền/cạnh để đổi kích thước (giữ `setMinimumSize(640, 480)`).
+- **Geometry/state**: vẫn lưu/khôi phục vị trí, kích thước, trạng thái maximized (tương thích với `_restore_window_geometry` / `saveGeometry`).
+- **Nền tảng ưu tiên**: Windows 10/11 (hiện tại); ghi chú ngắn cho macOS nếu cần sau.
+
+---
+
+## 3. Thành phần kỹ thuật
+
+### 3.1 Cửa sổ chính (MainWindow)
+
+| Yêu cầu | Cách làm |
+|--------|----------|
+| Tắt khung OS | `setWindowFlags(windowFlags() \| Qt.FramelessWindowHint)` (giữ `Qt.Window`). |
+| Nền không trong suốt | **Không** dùng `WA_TranslucentBackground` cho main window để tránh lỗi UpdateLayeredWindow / dirty rect trên Windows (đã ghi nhận với menu). Nền vẽ bằng QSS/palette (#121214). |
+| Bo góc (tùy chọn) | **Phase 2**: có thể dùng DWM (Windows 11) hoặc mask + paintEvent như MonosDialog; Phase 1 có thể để góc vuông. |
+
+### 3.2 Custom title bar (dựa trên TopBar)
+
+| Thành phần | Mô tả |
+|------------|--------|
+| **Drag region** | Toàn bộ TopBar (hoặc vùng trừ các nút) dùng để kéo window: `mousePressEvent` + `mouseMoveEvent` → `window()->windowHandle()->startSystemMove()` (Qt 5.15+/6) hoặc `QWidget.move()` với delta. |
+| **Window buttons** | Minimize, Maximize (Restore), Close — thêm vào bên phải TopBar (layout: `[Project switch] ... stretch ... [Min] [Max] [Close]`). Style: icon-only, Deep Dark, hover/active theo `typography_font_stack_v1` / Electric Blue. |
+| **Double-click** | Double-click trên vùng title (không phải nút) → toggle Maximize/Restore. |
+| **Chiều cao** | Giữ hoặc chỉnh TopBar ~40–44px để đủ hit area và thống nhất 8px grid. |
+
+### 3.3 Resize
+
+| Cách | Ưu / Nhược |
+|------|-------------|
+| **Hit-test vùng viền** | Trong `MainWindow` (hoặc wrapper): override `nativeEvent` (Windows: `WM_NCHITTEST`) trả về `HTLEFT`, `HTRIGHT`, `HTTOP`, `HTBOTTOM`, `HTTOPLEFT`, ... để OS xử lý resize. Chuẩn, mượt. |
+| **QSizeGrip** | Một grip góc dưới phải; đơn giản nhưng chỉ resize từ góc. |
+| **Overlay resize handles** | Widget con ở các cạnh/c góc, bắt chuột và gọi `setGeometry` / resize — linh hoạt nhưng phải tự xử lý cursor, double-click maximize. |
+
+**Đề xuất**: Phase 1 dùng **native hit-test** (Windows `WM_NCHITTEST`) trong `nativeEvent` của MainWindow; trừ vùng TopBar và nút, các cạnh/c góc trả về mã hit phù hợp.
+
+### 3.4 Minimize / Maximize / Close
+
+- **Minimize**: `showMinimized()`.
+- **Maximize / Restore**: `isMaximized()` → `showNormal()` / `showMaximized()`; cập nhật icon nút (Max ↔ Restore).
+- **Close**: `close()` (giữ logic đã có: lưu geometry, v.v.).
+- Trên **macOS** (sau này): có thể đặt nút bên trái (traffic lights) và tuân quy tắc title bar height.
+
+### 3.5 Geometry và state
+
+- Tiếp tục dùng `saveGeometry()` / `restoreGeometry()` trong `_restore_window_geometry` và `closeEvent`.
+- **Maximized**: với frameless, một số OS vẫn lưu/khôi phục trạng thái maximized qua geometry; kiểm tra trên Windows và nếu cần gọi `showMaximized()` sau khi restore geometry khi state là maximized (có thể lưu thêm flag trong settings).
+
+---
+
+## 4. Rủi ro và lưu ý
+
+| Vấn đề | Giải pháp |
+|--------|-----------|
+| **Windows snap / Snap Layouts** | Frameless vẫn tham gia snap nếu không tắt; có thể cần kiểm tra với Windows 11. Nếu thiếu, có thể xem DWM hoặc API snap. |
+| **Fullscreen** | Nếu sau này cần fullscreen (F11), dùng `showFullScreen()` / `showNormal()`; title bar có thể ẩn tạm. |
+| **DPI / multi-monitor** | Giữ logic hiện tại; hit-test và drag dùng tọa độ Qt, thường đã scale đúng. |
+| **Focus / Alt+Tab** | Khung frameless không đổi hành vi focus hay task switcher. |
+| **Menu bar / Alt** | Đã ẩn menu bar; nếu cần menu toàn cửa sổ sau này, có thể thêm shortcut (vd Alt) mở menu dưới TopBar. |
+
+---
+
+## 5. File / module cần sửa hoặc thêm
+
+| File | Thay đổi |
+|------|----------|
+| **main_window.py** | Set `FramelessWindowHint` sau khi set minimum size; override `nativeEvent` (Windows) cho hit-test resize; có thể override `changeEvent` để cập nhật nút Max/Restore khi maximized thay đổi. |
+| **top_bar.py** | Thêm vùng kéo (drag) và 3 nút Min/Max/Close; layout thêm row hoặc ô bên phải; double-click title → signal/callback để MainWindow toggle maximize. |
+| **style.py** (hoặc QSS) | Style cho nút window (Min/Max/Close): kích thước, màu, hover, active; có thể thêm `#WindowMinBtn`, `#WindowMaxBtn`, `#WindowCloseBtn`. |
+| **style.py** (tùy chọn) | Hằng số cho bề dày vùng resize (vd 4–6px) nếu dùng cho hit-test. |
+
+---
+
+## 6. Checklist triển khai (Phase 1)
+
+| Bước | Nội dung |
+|------|----------|
+| 1 | MainWindow: `setWindowFlags(windowFlags() \| Qt.FramelessWindowHint)` (giữ Qt.Window). |
+| 2 | TopBar: thêm 3 nút Minimize, Maximize, Close (icon), layout bên phải; connect tới slot MainWindow (min/max/close). |
+| 3 | TopBar: implement drag (mousePress + mouseMove → startSystemMove nếu có, else move window theo delta). |
+| 4 | TopBar: double-click trên vùng title (không phải nút) emit signal → MainWindow toggle maximize. |
+| 5 | MainWindow: override `nativeEvent` (Windows) — nếu msg == WM_NCHITTEST, tính vị trí trong frame (margin 4–6px), trả về HTTOP/HTBOTTOM/HTLEFT/HTRIGHT/HTTOPLEFT/... cho resize; vùng TopBar trả về HTCAPTION. |
+| 6 | MainWindow: khi maximized thay đổi (changeEvent), cập nhật icon nút Max ↔ Restore (qua signal hoặc callback tới TopBar). |
+| 7 | Geometry: đảm bảo save/restore vẫn hoạt động; nếu cần, lưu thêm "maximized" trong settings và gọi showMaximized() khi restore. |
+| 8 | QSS: style 3 nút window (Deep Dark, hover, close có thể đỏ nhẹ khi hover). |
+
+---
+
+## 7. Phase 2 (tùy chọn)
+
+- **Bo góc main window**: DWM (Windows 11) hoặc mask + paintEvent; cẩn thận với nền không trong suốt (có thể chỉ viền bo góc, không mask toàn cửa sổ).
+- **Windows 11 Snap Layouts**: Đảm bảo maximize và snap vẫn hoạt động; kiểm tra với build frameless thực tế.
+- **macOS**: Title bar bên trái (traffic lights), chiều cao title bar theo HIG.
+
+---
+
+## 8. Tóm tắt
+
+- **Borderless** = `FramelessWindowHint` trên MainWindow, không dùng WA_TranslucentBackground cho main.
+- **Title bar** = TopBar hiện có + drag + 3 nút Min/Max/Close + double-click maximize.
+- **Resize** = hit-test trong `nativeEvent` (WM_NCHITTEST) trả về các vùng cạnh/c góc.
+- **Geometry/state** = giữ save/restore, bổ sung maximized nếu cần.
+- Style và typography tuân **typography_font_stack_v1**, **scrollbar_qss_v1**, Deep Dark (#121214).

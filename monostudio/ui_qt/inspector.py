@@ -95,7 +95,6 @@ class InspectorPanel(QWidget):
     paste_thumbnail_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_with_requested = Signal(object)  # emits ViewItem (asset/shot only)
-    department_focus_changed = Signal(object, object)  # emits (ViewItem, department_name)
     status_change_requested = Signal(object, str)  # (ViewItem, status: ready|progress|waiting|blocked)
 
     def __init__(self, parent=None) -> None:
@@ -256,6 +255,7 @@ class InspectorPanel(QWidget):
         self.open_with_requested.emit(item)
 
     def _on_department_focused(self, department_name: str) -> None:
+        """Update Tech row with the clicked department's work path (no focus state)."""
         item = self._current_item
         if item is None:
             return
@@ -275,7 +275,6 @@ class InspectorPanel(QWidget):
                 self._tech.set_resolved_path(None)
         else:
             self._tech.set_resolved_path(None)
-        self.department_focus_changed.emit(item, dep)
 
     # Backward compatibility (legacy call sites)
     def set_empty_state(self, _message: str | None = None) -> None:
@@ -869,7 +868,6 @@ class _DeptCard(QFrame):
         self.setFrameShape(QFrame.NoFrame)
         self.setFixedHeight(76)
         self.setCursor(Qt.PointingHandCursor)
-        self.setProperty("focused", False)
 
         l = QVBoxLayout(self)
         l.setContentsMargins(12, 10, 12, 10)
@@ -966,15 +964,8 @@ class _DeptCard(QFrame):
         self._assignee_avatar.setText("—")
         self._assignee.setText("—")
 
-    def set_focused(self, focused: bool) -> None:
-        self.setProperty("focused", bool(focused))
-        # Trigger QSS re-polish.
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self.update()
-
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        # Clicking the card explicitly focuses this department (used by Smart Open).
+        # Clicking the card updates Tech row with this department's work path.
         if event and getattr(event, "button", lambda: None)() == Qt.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
@@ -1050,7 +1041,6 @@ class _DepartmentPipeline(QWidget):
         l.addWidget(hdr, 0)
         l.addWidget(self._list, 0)
         l.addWidget(self._empty, 0)
-        self._focused_dept: str | None = None
 
     def set_item(self, item: ViewItem) -> None:
         # Reuse card pool: never delete or create widgets; update and show/hide only.
@@ -1065,11 +1055,9 @@ class _DepartmentPipeline(QWidget):
             for c in self._dept_cards:
                 c.setVisible(False)
             self._empty.setVisible(True)
-            self._focused_dept = None
             return
 
         self._empty.setVisible(False)
-        self._focused_dept = None
         for i, d in enumerate(depts):
             card = self._dept_cards[i]
             card.set_department(d)
@@ -1084,12 +1072,9 @@ class _DepartmentPipeline(QWidget):
                 self._dept_click_handlers[i] = None
 
             def on_clicked(idx: int = i) -> None:
-                current_card = self._dept_cards[idx]
-                self._focused_dept = depts[idx].name if idx < len(depts) else None
-                if self._focused_dept:
-                    for j, c in enumerate(self._dept_cards):
-                        c.set_focused(c is current_card)
-                    self.department_focused.emit(self._focused_dept)
+                dept_name = depts[idx].name if idx < len(depts) else None
+                if dept_name:
+                    self.department_focused.emit(dept_name)
 
             card.clicked.connect(on_clicked)
             self._dept_click_handlers[i] = on_clicked

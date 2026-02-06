@@ -7,12 +7,12 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -273,15 +273,21 @@ class OpenResolverDialog(MonosDialog):
         wrap_l.addWidget(self._no_dcc_hint, 0)
         root.addWidget(wrap, 0)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
-        ok = buttons.button(QDialogButtonBox.Ok)
-        if ok is not None:
-            ok.setText(primary_button_text)
-            ok.setDefault(True)
-        self._btn_ok = ok
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons, 0)
+        button_row = QWidget(self)
+        button_row_l = QHBoxLayout(button_row)
+        button_row_l.setContentsMargins(0, 0, 0, 0)
+        button_row_l.setSpacing(10)
+        self._btn_ok = QPushButton(primary_button_text, self)
+        self._btn_ok.setObjectName("DialogPrimaryButton")
+        self._btn_ok.setDefault(True)
+        self._btn_ok.clicked.connect(self._on_accept)
+        cancel_btn = QPushButton("Cancel", self)
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        button_row_l.addWidget(self._btn_ok)
+        button_row_l.addWidget(cancel_btn)
+        button_row_l.addStretch(1)
+        root.addWidget(button_row, 0)
 
         def on_card_clicked(dcc_id: str) -> None:
             if dcc_id in self._disabled_dcc_ids:

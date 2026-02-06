@@ -1,0 +1,155 @@
+---
+description: Plan tính năng "Recent Tasks" ở sidebar – data, UI, integration.
+alwaysApply: false
+---
+
+# Plan: Recent Tasks (Sidebar)
+
+Tài liệu kế hoạch cho tính năng **Recent Tasks** trong sidebar: định nghĩa "task", nguồn dữ liệu, lưu trữ, UI và tích hợp với luồng Open hiện tại.
+
+---
+
+## 1. Định nghĩa "Recent Task"
+
+Một **recent task** = một lần user **mở (hoặc tạo) work file** cho một entity (asset/shot) + department + DCC.
+
+- **Hiển thị:** `ItemName · Department` (vd: `Character_01 · Modeling`, `Shot_010 · Layout`).
+- **Dữ liệu tối thiểu:** project_root, item_path, item_name, item_type (asset|shot), department, dcc, opened_at (ISO).
+- **Hành vi khi click:** Navigate tới item đó (chọn trong grid) + set department (sidebar filter + inspector); tùy chọn: trigger "Open" lại (mở DCC).
+
+---
+
+## 2. Nguồn dữ liệu và lưu trữ
+
+### 2.1 Hiện trạng
+
+- Mỗi lần open/create thành công, `AppController._write_item_open_metadata()` ghi vào `<item_root>/.monostudio/open.json` (last_open, last_open_by_department).
+- Metadata **per-item**, không có danh sách "recent" tập trung.
+
+### 2.2 Chọn: App-level store (đề xuất)
+
+- **Lưu danh sách recent tasks** ở cấp ứng dụng (không phụ thuộc project).
+- **Vị trí:** `QSettings` (key `monostudio/recent_tasks`) hoặc file `<app_data>/monostudio/recent_tasks.json`.
+- **Cấu trúc:** Mảng tối đa N bản ghi (vd N=20–30), mỗi bản ghi:
+  - `project_root` (str path)
+  - `item_path` (str path)
+  - `item_name` (str, để hiển thị)
+  - `item_type` ("asset" | "shot")
+  - `department` (str)
+  - `dcc` (str)
+  - `opened_at` (ISO 8601)
+- **Dedupe:** Khi push một task mới, nếu đã tồn tại (project_root, item_path, department) thì **xóa bản cũ và thêm mới vào đầu** (move-to-front).
+- **Scope sidebar:** Chỉ hiển thị tasks có `project_root == current_project_root`. Khi đổi project, list cập nhật theo.
+
+### 2.3 Thay thế (không đề xuất)
+
+- **Derive từ project:** Quét toàn bộ asset/shot, đọc `open.json` mỗi item, gộp và sort theo `opened_at`. Nhược: nhiều I/O, chỉ trong project hiện tại, không có thứ tự "toàn app".
+
+---
+
+## 3. Module / API đề xuất
+
+### 3.1 RecentTasksStore (singleton hoặc inject)
+
+- **Vị trí:** `monostudio/core/recent_tasks.py` hoặc `monostudio/ui_qt/recent_tasks_store.py`.
+- **API:**
+  - `push(project_root: Path, item_path: Path, item_name: str, item_type: Literal["asset","shot"], department: str, dcc: str) -> None`  
+    Ghi mới (hoặc move-to-front), persist.
+  - `get_all() -> list[RecentTask]`  
+    Trả về list đã sort theo opened_at (mới nhất trước).
+  - `get_for_project(project_root: Path) -> list[RecentTask]`  
+    Lọc theo project, cùng thứ tự.
+- **Persist:** Sau mỗi push, ghi lại QSettings hoặc JSON. Có thể debounce 500ms nếu lo nhiều push liên tiếp.
+
+### 3.2 RecentTask (dataclass hoặc TypedDict)
+
+```python
+# TypedDict hoặc dataclass
+project_root: str
+item_path: str
+item_name: str
+item_type: Literal["asset", "shot"]
+department: str
+dcc: str
+opened_at: str  # ISO 8601
+```
+
+---
+
+## 4. Tích hợp AppController
+
+- **Điểm gọi:** Ngay sau `_write_item_open_metadata(...)` trong `open_item` (sau khi open/create thành công).
+- **Thêm:** Gọi `RecentTasksStore.push(project_root=self._project_root, item_path=item.path, item_name=item.name or item.path.name, item_type="asset" if isinstance(item, Asset) else "shot", department=resolved_department, dcc=resolved_dcc)`.
+- **Điều kiện:** Chỉ push khi `self._project_root` và `item.path` hợp lệ.
+
+---
+
+## 5. Sidebar UI
+
+### 5.1 Thay thế placeholder
+
+- **Hiện tại:** `tasks_block` có header "RECENT TASKS" + label "No tasks" + stretch.
+- **Sau:** Giữ `tasks_block` và header; thay "No tasks" bằng **danh sách có thể cuộn** (QListWidget hoặc QScrollArea + layout với các row).
+
+### 5.2 Mỗi dòng (task row)
+
+- **Nội dung:** Icon nhỏ (asset/shot) + `item_name` + dấu phân cách + `department` (label). Optional: DCC icon nhỏ bên phải.
+- **Style:** Đồng bộ typography (Level 3 / body), màu text_label, hover blue_400; dùng objectName cho QSS nếu cần.
+- **Số dòng tối đa hiển thị:** 5–8; list cuộn nếu nhiều hơn (scrollbar đã có global QSS).
+
+### 5.3 Empty state
+
+- Khi `get_for_project(current_project_root)` rỗng: hiển thị "No tasks" (giống hiện tại), objectName SidebarMutedText.
+
+### 5.4 Tương tác
+
+- **Click:** Emit signal `recent_task_clicked(task: RecentTask)`.
+- **MainWindow / MetadataNav:** Kết nối signal → chọn item tương ứng trong grid (main_view) + set department (sidebar filter + app_controller) + có thể gọi `open_item` lại nếu muốn (hoặc chỉ navigate).
+
+---
+
+## 6. Luồng dữ liệu (Sidebar ← → App)
+
+- **Cấp nguồn:** MainWindow (hoặc nơi giữ project_root + project_index) khi:
+  - Mở project / đổi project;
+  - Sau khi open_item thành công (store đã push; cần refresh list).
+- **Cách cập nhật sidebar:**  
+  - Sidebar có method `set_recent_tasks(tasks: list[RecentTask])` và nội bộ rebuild list widget; **hoặc**  
+  - Sidebar subscribe một signal từ AppState/MainWindow kiểu `recent_tasks_changed(list[RecentTask])`, và MainWindow gọi store `get_for_project(project_root)` rồi emit với list đó.
+- **Sau open_item thành công:** MainWindow (hoặc app_controller) thông báo "recent tasks đã thay đổi" → lấy lại list cho project hiện tại → cập nhật sidebar.
+
+---
+
+## 7. Checklist triển khai
+
+| Bước | Nội dung |
+|------|----------|
+| 1 | Tạo `RecentTask` (TypedDict/dataclass) và `RecentTasksStore` (push, get_all, get_for_project, persist QSettings hoặc JSON). |
+| 2 | Trong `AppController.open_item`, sau `_write_item_open_metadata`, gọi `RecentTasksStore.push(...)`. |
+| 3 | Sidebar: thay `tasks_empty` bằng list (QListWidget hoặc layout + delegate); method `set_recent_tasks(tasks)` và vẽ empty state khi rỗng. |
+| 4 | Sidebar: signal `recent_task_clicked(RecentTask)`; style row theo typography + scrollbar. |
+| 5 | MainWindow/MetadataNav: khi set project / sau open_item, lấy `get_for_project(project_root)` và gọi `sidebar.set_recent_tasks(...)`; connect `recent_task_clicked` → chọn item + set department (và tùy chọn open lại). |
+| 6 | (Optional) Clear recent tasks: entry trong Settings hoặc context menu "Clear recent tasks" cho vùng RECENT TASKS. |
+
+---
+
+## 8. File cần sửa / thêm
+
+| File | Thay đổi |
+|------|----------|
+| **Mới** `monostudio/core/recent_tasks.py` (hoặc `ui_qt/recent_tasks_store.py`) | Store + RecentTask, persist. |
+| `monostudio/ui_qt/app_controller.py` | Sau _write_item_open_metadata gọi store.push. |
+| `monostudio/ui_qt/sidebar.py` | List recent tasks, set_recent_tasks(), signal recent_task_clicked, empty state. |
+| `monostudio/ui_qt/main_window.py` (hoặc nơi wire sidebar) | Cung cấp list cho sidebar khi đổi project / sau open; xử lý recent_task_clicked. |
+
+---
+
+## 9. Ghi chú
+
+- **Typography:** Theo rule typography_font_stack_v1 (Level 3 / body, Inter, technical mono nếu hiển thị path).
+- **Scrollbar:** Dùng global QSS (scrollbar_qss_v1), không style riêng cho list recent tasks.
+- **Performance:** Push và persist nên nhanh (chỉ vài chục bản ghi); không cần worker thread.
+
+---
+
+*Tạo cho tính năng Recent Tasks sidebar. Có thể cập nhật khi triển khai (vd. thêm DCC icon, "Open" nút trên từng row).*

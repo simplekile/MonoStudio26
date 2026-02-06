@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QDate, Qt
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QDateEdit, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QVBoxLayout
+from PySide6.QtGui import QFont, QShowEvent
+from PySide6.QtWidgets import QDateEdit, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
 
 from monostudio.core.project_id import generate_project_id
 from monostudio.ui_qt.style import MonosDialog
@@ -58,18 +58,32 @@ class NewProjectDialog(MonosDialog):
         form.addRow("Project ID (auto)", self._project_id_preview)
         form.addRow(workspace_hint, self._workspace_label)
 
-        self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self._buttons.accepted.connect(self.accept)
-        self._buttons.rejected.connect(self.reject)
+        button_row = QWidget()
+        button_row_l = QHBoxLayout(button_row)
+        button_row_l.setContentsMargins(0, 0, 0, 0)
+        button_row_l.setSpacing(10)
+        self._ok_btn = QPushButton("Create")
+        self._ok_btn.setObjectName("DialogPrimaryButton")
+        self._ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        button_row_l.addWidget(self._ok_btn)
+        button_row_l.addWidget(cancel_btn)
+        button_row_l.addStretch(1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
         layout.addLayout(form)
-        layout.addWidget(self._buttons)
+        layout.addWidget(button_row)
 
         self._sync_preview()
         self._update_ok_enabled()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._name.setFocus()
 
     def project_name(self) -> str:
         return self._name.text().strip()
@@ -84,10 +98,7 @@ class NewProjectDialog(MonosDialog):
         return generate_project_id(self.project_name())
 
     def _update_ok_enabled(self) -> None:
-        ok = self._buttons.button(QDialogButtonBox.Ok)
-        if ok is None:
-            return
-        ok.setEnabled(bool(self.project_name()) and bool(self.start_date_iso()))
+        self._ok_btn.setEnabled(bool(self.project_name()) and bool(self.start_date_iso()))
 
     def _sync_preview(self) -> None:
         name = self.project_name()

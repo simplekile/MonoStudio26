@@ -4,11 +4,13 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialogButtonBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QSizePolicy,
     QVBoxLayout,
+    QWidget,
 )
 
 from monostudio.ui_qt.style import MonosDialog
@@ -45,16 +47,20 @@ class DeleteConfirmDialog(MonosDialog):
         self._input.setPlaceholderText(self._expected)
         self._input.textChanged.connect(self._update_ok_enabled)
 
-        self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        ok = self._buttons.button(QDialogButtonBox.Ok)
-        if ok is not None:
-            ok.setText("Delete")
-            ok.setEnabled(False)
-        cancel = self._buttons.button(QDialogButtonBox.Cancel)
-        if cancel is not None:
-            cancel.setText("Cancel")
-        self._buttons.accepted.connect(self.accept)
-        self._buttons.rejected.connect(self.reject)
+        button_row = QWidget()
+        button_row_l = QHBoxLayout(button_row)
+        button_row_l.setContentsMargins(0, 0, 0, 0)
+        button_row_l.setSpacing(10)
+        self._ok_btn = QPushButton("Delete")
+        self._ok_btn.setObjectName("DialogPrimaryButton")
+        self._ok_btn.setEnabled(False)
+        self._ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        button_row_l.addWidget(self._ok_btn)
+        button_row_l.addWidget(cancel_btn)
+        button_row_l.addStretch(1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -64,14 +70,11 @@ class DeleteConfirmDialog(MonosDialog):
         layout.addWidget(prompt)
         layout.addWidget(self._input)
         layout.addSpacing(10)
-        layout.addWidget(self._buttons)
+        layout.addWidget(button_row)
 
         self._update_ok_enabled()
 
     def _update_ok_enabled(self) -> None:
-        ok = self._buttons.button(QDialogButtonBox.Ok)
-        if ok is None:
-            return
         typed = self._input.text().strip()  # trim whitespace
-        ok.setEnabled(typed == self._expected)
+        self._ok_btn.setEnabled(typed == self._expected)
 

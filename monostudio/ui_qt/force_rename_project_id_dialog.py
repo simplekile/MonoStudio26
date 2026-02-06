@@ -10,7 +10,6 @@ from PySide6.QtCore import Qt, QTimer, QRegularExpression
 from PySide6.QtGui import QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QCheckBox,
-    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -137,13 +136,21 @@ class ForceRenameProjectIdDialog(MonosDialog):
         self._confirm_text.setPlaceholderText("Type CURRENT Project ID to confirm")
         self._confirm_text.setProperty("mono", True)
 
-        # Buttons
-        self._buttons = QDialogButtonBox(QDialogButtonBox.Cancel, parent=self)
+        # Buttons (trái = đồng ý, phải = hủy; style giống Settings)
         self._btn_force = QPushButton("Force Rename", self)
+        self._btn_force.setObjectName("DialogPrimaryButton")
         self._btn_force.setEnabled(False)
         self._btn_force.clicked.connect(self._on_force_rename_clicked)
-        self._buttons.addButton(self._btn_force, QDialogButtonBox.AcceptRole)
-        self._buttons.rejected.connect(self.reject)
+        cancel_btn = QPushButton("Cancel", self)
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        button_row = QWidget(self)
+        button_row_l = QHBoxLayout(button_row)
+        button_row_l.setContentsMargins(0, 0, 0, 0)
+        button_row_l.setSpacing(10)
+        button_row_l.addWidget(self._btn_force)
+        button_row_l.addWidget(cancel_btn)
+        button_row_l.addStretch(1)
 
         # Layout
         layout = QVBoxLayout(self)
@@ -187,7 +194,7 @@ class ForceRenameProjectIdDialog(MonosDialog):
         layout.addWidget(impact_box)
         layout.addWidget(risk_row)
         layout.addWidget(confirm_box)
-        layout.addWidget(self._buttons)
+        layout.addWidget(button_row)
 
         # Wiring
         self._confirm_check.toggled.connect(lambda _v: self._sync_force_enabled())

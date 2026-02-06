@@ -5,9 +5,12 @@ import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from PySide6.QtCore import QObject, QSettings, Signal, QThreadPool, QRunnable
+
+if TYPE_CHECKING:
+    from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
 
 from monostudio.core.dcc_blender import BlenderDccAdapter
 from monostudio.core.dcc_houdini import HoudiniDccAdapter
@@ -54,11 +57,12 @@ class AppController(QObject):
         self.current_type: str | None = None
 
         self._project_root: Path | None = None
-        # Inspector explicit focus (per item path).
-        self._inspector_focus_by_item: dict[str, str] = {}
-        self._inspector_current_item_path: str | None = None
+        self._recent_tasks_store: RecentTasksStore | None = None
 
         self.mayaLaunchRequested.connect(self._on_maya_launch_requested)
+
+    def set_recent_tasks_store(self, store: RecentTasksStore | None) -> None:
+        self._recent_tasks_store = store
 
     def set_project_root(self, project_root: Path | None) -> None:
         self._project_root = project_root
@@ -95,25 +99,15 @@ class AppController(QObject):
             self.current_type = typ
             self.typeChanged.emit(typ)
 
-    def on_inspector_department_focused(self, *, item_path: Path, department: str) -> None:
-        """
-        Explicit user intent: Inspector focused a department for this item.
-        Stored for Smart Open priority #1.
-        """
-        p = str(Path(item_path))
-        dep = (department or "").strip()
-        if not p or not dep:
-            return
-        self._inspector_focus_by_item[p] = dep
-
-    def on_inspector_item_changed(self, item_path: Path | None) -> None:
-        """
-        Keeps Smart Open priority #1 honest:
-        only use Inspector focus when Inspector is currently showing the same item.
-        """
-        self._inspector_current_item_path = str(item_path) if item_path else None
-
-    def smart_open(self, *, item: Asset | Shot, force_dialog: bool = False, force_create_new: bool = False, parent=None) -> None:
+    def smart_open(
+        self,
+        *,
+        item: Asset | Shot,
+        force_dialog: bool = False,
+        force_open_with: bool = False,
+        force_create_new: bool = False,
+        parent=None,
+    ) -> None:
         """
         Smart Open Resolver (primary interaction for double-click).
         - Resolve Department (priority order)
@@ -122,6 +116,7 @@ class AppController(QObject):
         - Update per-item open metadata on success
 
         Dialog is fallback only (unless force_dialog=True).
+        force_open_with=True: show "Open With…" dialog (choose DCC to open existing work file).
         force_create_new=True: show "Create New…" dialog and always create a new work file (never open existing).
         """
         if self._project_root is None:
@@ -155,12 +150,22 @@ class AppController(QObject):
             for d in item.departments:
                 if self._norm(d.name) == self._norm(resolved_department):
                     resolved_dept_has_work_file = getattr(d, "work_file_exists", False)
+                    # Subdepartment: registry may only list parent, so resolved_dcc can be None.
+                    # Fallback to DCC from scan (work_file_dcc / work_file_dccs) so Open opens directly.
+                    if resolved_dept_has_work_file and not resolved_dcc:
+                        resolved_dcc = getattr(d, "work_file_dcc", None)
+                        if not resolved_dcc:
+                            dccs = getattr(d, "work_file_dccs", ()) or ()
+                            resolved_dcc = (dccs[0].strip() if dccs and dccs[0] else None)
+                        elif isinstance(resolved_dcc, str):
+                            resolved_dcc = resolved_dcc.strip() or None
                     break
 
         remember_for_item = False
-        show_dialog = force_dialog or force_create_new or not resolved_department or not resolved_dcc or not resolved_dept_has_work_file
+        show_dialog = force_dialog or force_open_with or force_create_new or not resolved_department or not resolved_dcc or not resolved_dept_has_work_file
         # When no work file exists (e.g. double-click on new item), show Create New dialog instead of Open With.
-        use_create_new_dialog = force_create_new or (show_dialog and not resolved_dept_has_work_file)
+        # force_open_with: always show Open With… dialog, never Create New.
+        use_create_new_dialog = not force_open_with and (force_create_new or (show_dialog and not resolved_dept_has_work_file))
         # No department dropdown: always use resolved department (fallback to first available).
         if not resolved_department and available_depts:
             resolved_department = available_depts[0]
@@ -254,6 +259,16 @@ class AppController(QObject):
             remember_for_item=remember_for_item,
             action=action,
         )
+        # Push to recent tasks for sidebar.
+        if self._recent_tasks_store is not None and self._project_root is not None:
+            self._recent_tasks_store.push(
+                project_root=self._project_root,
+                item_path=item.path,
+                item_name=getattr(item, "name", None) or item.path.name,
+                item_type="asset" if isinstance(item, Asset) else "shot",
+                department=resolved_department,
+                dcc=resolved_dcc,
+            )
 
     def _available_departments(self, item: Asset | Shot) -> list[str]:
         # Deterministic ordering (filesystem scan is already sorted).
@@ -281,21 +296,13 @@ class AppController(QObject):
         meta: dict[str, Any],
         project_defaults: dict[str, Any],
     ) -> str | None:
-        # 1) Inspector Department Focus (explicit)
-        if self._inspector_current_item_path == str(item.path):
-            focused = self._inspector_focus_by_item.get(str(item.path))
-            if focused and any(self._norm(d) == self._norm(focused) for d in available_departments):
-                for d in available_departments:
-                    if self._norm(d) == self._norm(focused):
-                        return d
-
-        # 2) Sidebar Active Department
+        # 1) Sidebar Active Department
         if self.current_department and any(self._norm(d) == self._norm(self.current_department) for d in available_departments):
             for d in available_departments:
                 if self._norm(d) == self._norm(self.current_department):
                     return d
 
-        # 3) Asset/Shot last-used (or per-item default if present)
+        # 2) Asset/Shot last-used (or per-item default if present)
         defaults = meta.get("defaults") if isinstance(meta, dict) else None
         if isinstance(defaults, dict):
             dep = defaults.get("department")
@@ -312,7 +319,7 @@ class AppController(QObject):
                     if self._norm(d) == self._norm(dep):
                         return d
 
-        # 4) Project default department
+        # 3) Project default department
         dep = project_defaults.get("department")
         if isinstance(dep, str) and dep.strip():
             for d in available_departments:

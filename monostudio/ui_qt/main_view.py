@@ -205,6 +205,7 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._card_size = QSize(320, 260)
         self._gap_px = 24
         self._active_department: str | None = None
+        self._active_department_icon_name: str | None = None  # from pipeline (subdepartment-safe)
 
         # Theme cache (no per-paint parsing / allocations)
         self._c_card_bg = QColor(MONOS_COLORS["card_bg"])
@@ -253,11 +254,12 @@ class _GridCardDelegate(QStyledItemDelegate):
             self._gap_px = gap_px
             self._view.viewport().update()
 
-    def set_active_department(self, department: str | None) -> None:
+    def set_active_department(self, department: str | None, *, icon_name: str | None = None) -> None:
         dep = (department or "").strip() or None
-        if dep == self._active_department:
+        if dep == self._active_department and icon_name == self._active_department_icon_name:
             return
         self._active_department = dep
+        self._active_department_icon_name = (icon_name or "").strip() or None
         self._view.viewport().update()
 
     @staticmethod
@@ -427,7 +429,7 @@ class _GridCardDelegate(QStyledItemDelegate):
             dep = (self._active_department or "").strip()
             if dep:
                 dept_key = self._norm(dep)
-                dept_icon_name = _DEPT_ICON_MAP.get(dept_key, "layers")
+                dept_icon_name = (self._active_department_icon_name or "").strip() or _DEPT_ICON_MAP.get(dept_key, "layers")
                 dept_chip_color = QColor(MONOS_COLORS["blue_500"])
                 dept_chip_color.setAlpha(220)
                 dept_icon = lucide_icon(dept_icon_name, size=icon_size, color_hex="#ffffff")
@@ -440,6 +442,7 @@ class _GridCardDelegate(QStyledItemDelegate):
                     p.drawPixmap(ix + pad, iy + pad, dept_pix)
 
             # DCC badges (bottom-right of thumb) — filesystem-driven; "exists" = icon, "creating" = "Creating…"
+            # Prefer dcc_work_states (scan) so subdepartments show badges; fallback to registry for "creating" only.
             def dcc_badges_for_item() -> list[tuple[QIcon | None, str, str]]:
                 """Returns (icon or None, dcc_id, status) with status in ("exists", "creating")."""
                 out: list[tuple[QIcon | None, str, str]] = []
@@ -451,6 +454,40 @@ class _GridCardDelegate(QStyledItemDelegate):
                 except Exception:
                     return out
                 active_key = self._norm((self._active_department or "").strip())
+                states = getattr(ref, "dcc_work_states", ()) or ()
+                seen: set[tuple[str, str]] = set()
+
+                def add_badge(dept_id: str, dcc_id: str, status: str) -> None:
+                    if (dept_id, dcc_id) in seen:
+                        return
+                    seen.add((dept_id, dcc_id))
+                    if status == "creating":
+                        out.append((None, dcc_id, "creating"))
+                        return
+                    if status != "exists":
+                        return
+                    try:
+                        info = reg.get_dcc_info(dcc_id) if dcc_id else None
+                    except Exception:
+                        info = None
+                    slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+                    color = info.get("brand_color_hex") if isinstance(info, dict) else None
+                    if isinstance(slug, str) and slug.strip():
+                        ic = brand_icon(slug.strip(), size=14, color_hex=(color if isinstance(color, str) else None))
+                    else:
+                        ic = lucide_icon("layers", size=14, color_hex=MONOS_COLORS["text_label"])
+                    out.append((ic, dcc_id, "exists"))
+
+                for (dept_id, dcc_id), _state in states:
+                    dept_id = (dept_id or "").strip()
+                    dcc_id = (dcc_id or "").strip()
+                    if not dept_id or not dcc_id:
+                        continue
+                    if active_key and self._norm(dept_id) != active_key:
+                        continue
+                    status = resolve_dcc_status(ref, dept_id, dcc_id)
+                    if status in ("exists", "creating"):
+                        add_badge(dept_id, dcc_id, status)
                 for d in getattr(ref, "departments", ()) or ():
                     dept_name = getattr(d, "name", "") or ""
                     if active_key and self._norm(dept_name) != active_key:
@@ -461,21 +498,7 @@ class _GridCardDelegate(QStyledItemDelegate):
                             continue
                         status = resolve_dcc_status(ref, dept_name, dcc_id)
                         if status == "creating":
-                            out.append((None, dcc_id, "creating"))
-                            continue
-                        if status != "exists":
-                            continue
-                        try:
-                            info = reg.get_dcc_info(dcc_id) if dcc_id else None
-                        except Exception:
-                            info = None
-                        slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
-                        color = info.get("brand_color_hex") if isinstance(info, dict) else None
-                        if isinstance(slug, str) and slug.strip():
-                            ic = brand_icon(slug.strip(), size=14, color_hex=(color if isinstance(color, str) else None))
-                        else:
-                            ic = lucide_icon("layers", size=14, color_hex=MONOS_COLORS["text_label"])
-                        out.append((ic, dcc_id, "exists"))
+                            add_badge(dept_name, dcc_id, "creating")
                 return out
 
             dcc_list = dcc_badges_for_item()
@@ -638,6 +661,8 @@ class MainView(QWidget):
         # Header context (read-only)
         self._base_title: str = ""
         self._active_department: str | None = None
+        self._active_department_label: str | None = None  # pipeline label (subdepartment-safe)
+        self._active_department_icon_name: str | None = None  # pipeline icon (subdepartment-safe)
 
         header = QWidget(self)
         header.setObjectName("MainViewHeader")
@@ -970,11 +995,19 @@ class MainView(QWidget):
     def set_context_title(self, title: str) -> None:
         self.update_title(base_title=title, department=self._active_department)
 
-    def set_active_department(self, department: str | None) -> None:
+    def set_active_department(
+        self,
+        department: str | None,
+        *,
+        label: str | None = None,
+        icon_name: str | None = None,
+    ) -> None:
         self._active_department = (department or "").strip() or None
+        self._active_department_label = (label or "").strip() or None
+        self._active_department_icon_name = (icon_name or "").strip() or None
         self.update_title(base_title=self._base_title or self._context_title.text(), department=self._active_department)
         try:
-            self._grid_delegate.set_active_department(self._active_department)
+            self._grid_delegate.set_active_department(self._active_department, icon_name=self._active_department_icon_name)
         except Exception:
             pass
 
@@ -992,8 +1025,10 @@ class MainView(QWidget):
         if not dep:
             self._department_badge.setVisible(False)
             return
-        dep_up = dep.upper()
-        icon = lucide_icon("layers", size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
+        dep_label = (self._active_department_label or "").strip() or dep
+        dep_up = dep_label.upper()
+        icon_name = (self._active_department_icon_name or "").strip() or "layers"
+        icon = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
         self._department_icon.setPixmap(icon.pixmap(16, 16))
         self._department_label.setText(dep_up)
         self._department_badge.setVisible(True)
@@ -1059,12 +1094,18 @@ class MainView(QWidget):
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
 
-    def set_items(self, items: list[ViewItem]) -> None:
+    def set_items(self, items: list[ViewItem], preserve_selection_id: str | None = None) -> None:
         # Explicit input only; no hidden filtering here (filter tree lives in Sidebar).
         self._all_items = list(items)
         self._populate_views(items)
         self._order = [str(vi.path) for vi in self._all_items]
         self._rebuild_items_from_order()
+        # Restore selection in same update to avoid flicker (Option C, plan_focus_system_v1).
+        if preserve_selection_id and preserve_selection_id.strip():
+            try:
+                self.select_item_by_path(Path(preserve_selection_id))
+            except (TypeError, OSError):
+                pass
 
     def _paths_equal(self, a: Path | str, b: Path | str) -> bool:
         """Compare paths for equality (resolved when possible so absolute/relative match)."""

@@ -41,6 +41,7 @@ from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog
 from monostudio.ui_qt.app_controller import AppController
 from monostudio.ui_qt.app_state import AppState
+from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
 from monostudio.ui_qt.worker_manager import WorkerManager, WorkerTask
 from monostudio.ui_qt.thumbnails import ThumbnailManager
 from monostudio.ui_qt.fs_watcher import FsEventCollector
@@ -74,12 +75,12 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
         repo_root = Path(__file__).resolve().parents[2]
         self._controller = AppController(settings=self._settings, repo_root=repo_root, parent=self)
+        self._recent_tasks_store = RecentTasksStore(self._settings)
+        self._controller.set_recent_tasks_store(self._recent_tasks_store)
         # Guard: context switches must never trigger Open DCC flows or spawn dialogs.
         self._context_switch_in_progress: bool = False
         # Guard: filter (department/type) changes must never trigger Open DCC flows or spawn dialogs.
         self._filter_switch_in_progress: bool = False
-        # Per-context (page, department, type) saved selection; restore when switching back.
-        self._selection_by_context: dict[tuple[str, str, str], str] = {}
         self._workspace_root: Path | None = None
         self._workspace_projects: list[DiscoveredProject] = []
         self._workspace_project_status: dict[str, str] = {}
@@ -171,6 +172,7 @@ class MainWindow(QMainWindow):
         self._sidebar.context_clicked.connect(self._on_context_clicked)
         self._sidebar.context_menu_requested.connect(self._on_sidebar_context_menu_requested)
         self._sidebar.settings_requested.connect(self._open_settings)
+        self._sidebar.recent_task_clicked.connect(self._on_recent_task_clicked)
         # Metadata-driven filter sidebar (UI-only; wiring stub).
         self._sidebar.filters().departmentClicked.connect(self._controller.on_department_clicked)
         self._sidebar.filters().typeClicked.connect(self._controller.on_type_clicked)
@@ -178,7 +180,7 @@ class MainWindow(QMainWindow):
         self._controller.typeChanged.connect(lambda v: self._set_current_type(v, toggle_if_same=False))
         self._controller.departmentChanged.connect(self._on_department_changed_notify)
         self._controller.typeChanged.connect(self._on_type_changed_notify)
-        self._controller.departmentChanged.connect(lambda _v: self._main_view.set_active_department(self._controller.current_department))
+        self._controller.departmentChanged.connect(self._set_main_view_department)
         self.departmentChanged.connect(self._on_filter_state_changed)
         self.typeChanged.connect(self._on_filter_state_changed)
         self._top_bar.project_switch_requested.connect(self._switch_project)
@@ -194,7 +196,6 @@ class MainWindow(QMainWindow):
         self._main_view.create_new_requested.connect(self._on_create_new_requested)
         self._main_view.selection_id_changed.connect(self._app_state.set_selection)
         self._app_state.selectionChanged.connect(self._main_view.set_selection_from_state)
-        self._app_state.selectionChanged.connect(self._on_selection_changed_save_focus)
         self._app_state.assetsChanged.connect(self._on_app_state_assets_changed)
         self._app_state.shotsChanged.connect(self._on_app_state_shots_changed)
         self._app_state.filtersChanged.connect(self._on_app_state_filters_changed)
@@ -209,7 +210,6 @@ class MainWindow(QMainWindow):
         # Inspector intents (explicit)
         self._inspector.open_requested.connect(self._on_inspector_open_requested)
         self._inspector.open_with_requested.connect(self._on_inspector_open_with_requested)
-        self._inspector.department_focus_changed.connect(self._on_inspector_department_focus_changed)
         self._inspector.status_change_requested.connect(self._on_status_set_requested)
 
         # Initial population is driven by project-root restore (scan trigger) and current context.
@@ -230,30 +230,15 @@ class MainWindow(QMainWindow):
     def _norm(s: str | None) -> str:
         return (s or "").strip().casefold()
 
-    def _context_key(self) -> tuple[str, str, str] | None:
-        """(mode, department, type) for Assets/Shots; use sidebar filters so key matches after page/filter switch."""
-        ctx = self._sidebar.current_context()
-        if ctx == "Assets":
-            f = self._sidebar.filters()
-            return ("assets", f.current_department() or "", f.current_type() or "")
-        if ctx == "Shots":
-            f = self._sidebar.filters()
-            return ("shots", f.current_department() or "", f.current_type() or "")
-        return None
-
-    def _on_selection_changed_save_focus(self, selection_id: str | None) -> None:
-        """Persist current selection per (page, department, type) so it can be restored when switching back.
-        Only update when user selects something; do not clear saved focus when selection is cleared on switch.
-        Store resolved path so restore matches regardless of relative/absolute."""
-        key = self._context_key()
-        if key is None:
-            return
-        if selection_id and selection_id.strip():
-            raw = (selection_id or "").strip()
-            try:
-                self._selection_by_context[key] = str(Path(raw).resolve())
-            except (OSError, RuntimeError):
-                self._selection_by_context[key] = raw
+    @staticmethod
+    def _path_matches_selection(path_or_str: Path | str, selection_id: str) -> bool:
+        """True if path (asset/shot folder) matches selection_id (path string); for preserve_selection_id."""
+        if not selection_id or not str(selection_id).strip():
+            return False
+        try:
+            return Path(path_or_str).resolve() == Path(selection_id).resolve()
+        except (OSError, TypeError):
+            return str(path_or_str).strip() == str(selection_id).strip()
 
     def filter_assets(self, assets: list[Asset], department: str | None, type_id: str | None) -> list[Asset]:
         """
@@ -302,6 +287,12 @@ class MainWindow(QMainWindow):
                 self._on_valid_selection_changed(self._main_view.has_valid_selection())
             except Exception:
                 pass
+
+    def _set_main_view_department(self, _value: object = None) -> None:
+        """Sync main view header + thumb badge with current department (pipeline label/icon for subdepartments)."""
+        dep = self._controller.current_department
+        label, icon_name = self._sidebar.filters().get_department_display(dep) if dep else (None, None)
+        self._main_view.set_active_department(dep, label=label, icon_name=icon_name)
 
     def _set_current_department(self, department, *, toggle_if_same: bool) -> None:
         new = department if isinstance(department, str) and department.strip() else None
@@ -630,7 +621,7 @@ class MainWindow(QMainWindow):
             self._inspector.set_item(None)
 
             if context_name in ("Assets", "Shots"):
-                # Sync filter state first so _reload_main_view and focus restore use correct (page, dept, type).
+                # Sync filter state first so _reload_main_view uses correct (page, dept, type).
                 self._sync_filter_state_from_sidebar()
                 # Clear so diff application does not mix with previous context data.
                 self._main_view.clear()
@@ -700,25 +691,13 @@ class MainWindow(QMainWindow):
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
             # During context switches we intentionally keep Inspector cleared and avoid re-entrant UI updates.
             self._inspector.set_item(None)
-            try:
-                self._controller.on_inspector_item_changed(None)
-            except Exception:
-                pass
             return
         if not has_selection:
             self._inspector.set_item(None)
-            try:
-                self._controller.on_inspector_item_changed(None)
-            except Exception:
-                pass
             return
 
         selected = self._main_view.selected_view_item()
         self._inspector.set_item(selected)
-        try:
-            self._controller.on_inspector_item_changed(selected.path if isinstance(selected, ViewItem) else None)
-        except Exception:
-            pass
 
     def _asset_passes_filter(self, asset: Asset | None) -> bool:
         if asset is None:
@@ -1017,8 +996,13 @@ class MainWindow(QMainWindow):
         # After selecting a folder: keep layout stable, show neutral empty-state.
         self._inspector.set_item(None)
 
+        self._refresh_recent_tasks()
         self._sync_primary_action()
         self._sync_top_bar()
+
+    def _refresh_recent_tasks(self) -> None:
+        tasks = self._recent_tasks_store.get_for_project(self._project_root) if self._project_root else []
+        self._sidebar.set_recent_tasks(tasks)
 
     def _apply_workspace_root(self, folder: str | None, *, save: bool) -> None:
         # No validation. Read-only discovery.
@@ -1127,6 +1111,8 @@ class MainWindow(QMainWindow):
         """Set or clear watched paths and collector state from current project root.
         Watches project root, assets/, shots/, and each asset/shot directory so changes
         inside entity folders (e.g. work/) are detected on Windows (no recursive watch).
+        For nested (subdepartment) layout, also watches parent dirs of each department
+        so that new subdepartment folders (e.g. surfacing/lookdev) trigger a scan.
         """
         _watcher_log = logging.getLogger("monostudio.fs_watcher")
         existing = self._fs_watcher.directories() + self._fs_watcher.files()
@@ -1158,6 +1144,31 @@ class MainWindow(QMainWindow):
             _dcc_reg = get_default_dcc_registry()
         except Exception:
             _dcc_reg = None
+
+        def _add_dir_and_ancestors(dir_path: Path, entity_base: Path) -> None:
+            """Add dir_path and its parent chain up to (not including) entity_base so nested subdepartments are watched."""
+            try:
+                resolved = dir_path.resolve()
+                base_resolved = entity_base.resolve()
+            except OSError:
+                return
+            if not resolved.is_dir() or len(to_add) >= _max_paths:
+                return
+            # Add this directory
+            s = str(resolved)
+            if s not in _seen:
+                _seen.add(s)
+                to_add.append(s)
+            # Add parent chain for nested layout (e.g. surfacing when dept is surfacing/texturing)
+            parent = resolved.parent
+            while parent != base_resolved and len(parent.parts) > len(base_resolved.parts):
+                if parent.is_dir() and len(to_add) < _max_paths:
+                    ps = str(parent)
+                    if ps not in _seen:
+                        _seen.add(ps)
+                        to_add.append(ps)
+                parent = parent.parent
+
         if self._project_index is not None:
             for asset in self._project_index.assets:
                 base = Path(asset.path)
@@ -1170,11 +1181,7 @@ class MainWindow(QMainWindow):
                         to_add.append(s)
                 for dept in asset.departments:
                     dept_dir = dept.path if Path(dept.path).is_absolute() else (root / dept.path).resolve()
-                    if dept_dir.is_dir() and len(to_add) < _max_paths:
-                        s = str(dept_dir)
-                        if s not in _seen:
-                            _seen.add(s)
-                            to_add.append(s)
+                    _add_dir_and_ancestors(dept_dir, base)
                     if use_dcc_folders and _dcc_reg is not None:
                         for dcc_id in _dcc_reg.get_all_dccs():
                             try:
@@ -1204,11 +1211,7 @@ class MainWindow(QMainWindow):
                         to_add.append(s)
                 for dept in shot.departments:
                     dept_dir = dept.path if Path(dept.path).is_absolute() else (root / dept.path).resolve()
-                    if dept_dir.is_dir() and len(to_add) < _max_paths:
-                        s = str(dept_dir)
-                        if s not in _seen:
-                            _seen.add(s)
-                            to_add.append(s)
+                    _add_dir_and_ancestors(dept_dir, base)
                     if use_dcc_folders and _dcc_reg is not None:
                         for dcc_id in _dcc_reg.get_all_dccs():
                             try:
@@ -1328,20 +1331,21 @@ class MainWindow(QMainWindow):
         if self._project_root is not None:
             self._main_view.set_empty_override(None)
         if context in ("Assets", "Shots"):
-            self._main_view.set_active_department(self._controller.current_department)
+            self._set_main_view_department()
         else:
             self._main_view.set_active_department(None)
-        # Restore selection for this (page, dept, type): use saved focus if any, else none
-        _key = self._context_key()
-        _sid = self._selection_by_context.get(_key) if _key else None
-        if _sid is None:
-            _sid = self._app_state.selection_id()
-        self._main_view.set_items(items)
+        # Preserve selection if still in list (Option C; no defer to avoid flicker).
+        current_id = self._app_state.selection_id()
+        preserve = None
+        if current_id and items:
+            for vi in items:
+                if self._path_matches_selection(vi.path, current_id):
+                    preserve = current_id
+                    break
+        self._main_view.set_items(items, preserve_selection_id=preserve)
         self._sidebar.set_project_index(self._project_index)
-        # Defer restore so it runs after view/model finish updating (avoids being overwritten by selection-clear)
-        def _restore():
-            self._app_state.set_selection(_sid)
-        QTimer.singleShot(50, _restore)
+        if preserve is None:
+            self._app_state.set_selection(None)
 
     def _on_item_activated(self, item: ViewItem) -> None:
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
@@ -1378,6 +1382,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._controller.smart_open(item=ref, force_dialog=False, parent=self)
+            self._refresh_recent_tasks()
         except Exception as e:
             logging.warning("DCC launch failed: %s", e, exc_info=True)
             QMessageBox.critical(self, "Open DCC", str(e))
@@ -1392,6 +1397,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._controller.smart_open(item=ref, force_dialog=True, force_open_with=True, parent=self)
+            self._refresh_recent_tasks()
         except Exception as e:
             logging.warning("DCC launch failed (open with): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open With…", str(e))
@@ -1408,6 +1414,7 @@ class MainWindow(QMainWindow):
             self._controller.smart_open(item=ref, force_dialog=True, force_create_new=True, parent=self)
             # Repaint tile so delegate shows "Creating…" from resolve_dcc_status (pending already recorded).
             self._main_view.repaint_tiles_for_entity(str(ref.path))
+            self._refresh_recent_tasks()
             # Pending cleared when watcher triggers incremental_scan and scan finds work_file_path (or via assetsChanged).
         except Exception as e:
             logging.warning("DCC launch failed (create new): %s", e, exc_info=True)
@@ -1423,6 +1430,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._controller.smart_open(item=ref, force_dialog=False, parent=self)
+            self._refresh_recent_tasks()
         except Exception as e:
             logging.warning("DCC launch failed (inspector): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open DCC", str(e))
@@ -1437,20 +1445,24 @@ class MainWindow(QMainWindow):
             return
         try:
             self._controller.smart_open(item=ref, force_dialog=True, force_open_with=True, parent=self)
+            self._refresh_recent_tasks()
         except Exception as e:
             logging.warning("DCC launch failed (inspector open with): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open With…", str(e))
 
-    def _on_inspector_department_focus_changed(self, item: object, department: object) -> None:
-        if not isinstance(item, ViewItem):
+    def _on_recent_task_clicked(self, task: object) -> None:
+        from monostudio.ui_qt.recent_tasks_store import RecentTask
+        if not isinstance(task, RecentTask):
             return
-        dep = department if isinstance(department, str) else ""
-        if not dep.strip():
-            return
-        try:
-            self._controller.on_inspector_department_focused(item_path=item.path, department=dep)
-        except Exception:
-            return
+        # Switch to Assets or Shots context.
+        ctx = "Assets" if task.item_type == "asset" else "Shots"
+        self._sidebar.set_current_context(ctx)
+        # Set department filter: sync controller first, then sidebar with emit=False so clicking
+        # two tasks with the same department does not trigger controller's "same dept → toggle off".
+        self._controller.sync_filter_state(department=task.department, type_id=self.current_type)
+        self._sidebar.filters().set_selected_department(task.department, emit=False)
+        # Select the item in main view.
+        self._main_view.select_item_by_path(Path(task.item_path))
 
     def _new_project(self) -> None:
         if self._workspace_root is None:
