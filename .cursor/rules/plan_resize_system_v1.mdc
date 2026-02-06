@@ -1,0 +1,115 @@
+---
+description: Plan hệ thống resize chuẩn cho borderless MainWindow — một nơi duy nhất, rõ ràng, dễ bảo trì.
+alwaysApply: false
+---
+
+# Plan: Hệ thống Resize chuẩn (v1)
+
+Tài liệu này mô tả thiết kế **hệ thống resize chuẩn** cho cửa sổ borderless MONOS: logic resize tập trung, không rải rác trong MainWindow, dễ mở rộng (Windows / macOS / Linux).
+
+---
+
+## 1. Mục tiêu
+
+- **Một nơi duy nhất**: toàn bộ hit-test và hằng số resize nằm trong một module/class, MainWindow chỉ gọi hoặc kế thừa.
+- **Rõ ràng**: margin, vùng caption (title bar), thứ tự ưu tiên (góc → cạnh → caption) được định nghĩa tường minh.
+- **Chuẩn OS**: trên Windows dùng WM_NCHITTEST; sau này có thể bổ sung macOS (resizeEdge) / X11 nếu cần.
+- **Không code ad-hoc**: xóa toàn bộ nativeEvent / resize logic nhúng trực tiếp trong MainWindow.
+
+---
+
+## 2. Thành phần
+
+### 2.1 Module / class resize
+
+| Thành phần | Mô tả |
+|------------|--------|
+| **Vị trí** | `monostudio/ui_qt/frameless_resize.py` (module mới) hoặc mixin/helper được MainWindow dùng. |
+| **Hằng số** | `RESIZE_MARGIN_PX = 6` (bề dày vùng cạnh/c góc); có thể thêm `CAPTION_EXCLUDE_RECT` hoặc callback “vùng caption”. |
+| **Hit-test** | Hàm thuần: nhận (window, point_in_window_coords, title_bar_rect_or_callback) → trả về mã hit (HT* trên Windows). |
+| **Tích hợp MainWindow** | MainWindow override `nativeEvent` chỉ gọi helper (vd. `frameless_resize.handle_nchittest(eventType, message)`); hoặc MainWindow kế thừa một base class đã implement sẵn. |
+
+### 2.2 Thứ tự ưu tiên hit (Windows)
+
+1. **Góc** (margin × margin): TOPLEFT, TOPRIGHT, BOTTOMLEFT, BOTTOMRIGHT.
+2. **Cạnh** (trong margin): TOP, BOTTOM, LEFT, RIGHT.
+3. **Caption**: điểm thuộc vùng title bar (TopBar) → HTCAPTION.
+4. **Client**: còn lại → HTNOWHERE (hoặc HTCLIENT).
+
+Vùng title bar: có thể truyền vào dưới dạng `QRect` (trong tọa độ window) hoặc callback `(window) -> QRect`.
+
+### 2.3 Windows: WM_NCHITTEST
+
+- Chỉ xử lý khi `eventType == "windows_generic_MSG"` và `message == WM_NCHITTEST`.
+- Đọc tọa độ từ message (lParam: x, y screen); đổi sang tọa độ window.
+- Gọi hàm hit-test chuẩn → nhận mã HT*.
+- Trả về `(True, hit_code)` cho PySide6 (hoặc ghi vào result pointer nếu binding yêu cầu).
+
+### 2.4 Các mã hit (Windows)
+
+- HTNOWHERE = 0, HTCAPTION = 2.
+- Cạnh: HTLEFT=10, HTRIGHT=11, HTTOP=12, HTBOTTOM=13.
+- Góc: HTTOPLEFT=14, HTTOPRIGHT=15, HTBOTTOMLEFT=16, HTBOTTOMRIGHT=17.
+
+---
+
+## 3. API đề xuất (frameless_resize.py)
+
+```python
+# Hằng số
+RESIZE_MARGIN_PX: int = 6
+
+def hit_test(
+    window: QWidget,
+    point_window: QPoint,
+    title_bar_rect_in_window: QRect | None,
+) -> int:
+    """
+    Trả về mã hit Windows (HT*) cho point trong tọa độ window.
+    title_bar_rect_in_window: vùng drag (caption); None = không có caption.
+    """
+
+def handle_native_event(
+    window: QWidget,
+    event_type: QByteArray,
+    message: bytes,
+    title_bar_rect_fn: Callable[[], QRect],
+) -> tuple[bool, int] | None:
+    """
+    Xử lý nativeEvent (Windows WM_NCHITTEST).
+    Trả về (True, hit_code) nếu đã xử lý; None để để super() xử lý.
+    """
+```
+
+MainWindow sẽ:
+- Truyền `title_bar_rect_fn` = lambda: rect của TopBar trong tọa độ MainWindow.
+- Trong `nativeEvent`: gọi `handle_native_event(...)`; nếu kết quả khác None thì return, ngược lại return `super().nativeEvent(...)`.
+
+---
+
+## 4. Checklist triển khai
+
+| Bước | Nội dung |
+|------|----------|
+| 1 | Xóa toàn bộ nativeEvent và logic resize hiện tại khỏi MainWindow (đã làm khi áp dụng plan này). |
+| 2 | Tạo `monostudio/ui_qt/frameless_resize.py`: hằng số RESIZE_MARGIN_PX, hàm hit_test, hàm handle_native_event (Windows). |
+| 3 | MainWindow: import frameless_resize; trong nativeEvent gọi handle_native_event với title_bar_rect từ _top_bar; return kết quả hoặc super(). |
+| 4 | (Tùy chọn) Unit test cho hit_test: cho trước point và rect title bar, kiểm tra mã hit trả về. |
+| 5 | (Sau này) macOS: NSScreen / resizeEdge; Linux/X11: tương đương nếu cần. |
+
+---
+
+## 5. Lợi ích
+
+- **MainWindow gọn**: không còn vài chục dòng MSG/ctypes/hit trong main_window.py.
+- **Dễ đổi margin / logic**: chỉ sửa một file, test hit_test.
+- **Mở rộng**: thêm nền tảng khác trong frameless_resize, MainWindow gần như không đổi.
+- **Nhất quán**: một bộ quy tắc (margin, thứ tự ưu tiên) cho toàn app.
+
+---
+
+## 6. Tóm tắt
+
+- **Resize chuẩn** = module `frameless_resize` với hit_test + handle_native_event, hằng số margin, vùng caption rõ ràng.
+- **MainWindow** chỉ gọi helper trong nativeEvent, không chứa logic hit-test.
+- **Hiện tại**: đã xóa resize cũ; khi triển khai theo plan sẽ thêm frameless_resize và nối lại trong MainWindow.

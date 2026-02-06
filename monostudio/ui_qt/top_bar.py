@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsDropShadowEffect,
@@ -19,12 +19,16 @@ from monostudio.ui_qt.style import MonosMenu
 
 class TopBar(QWidget):
     project_switch_requested = Signal(str)  # project root path
+    minimize_clicked = Signal()
+    maximize_clicked = Signal()
+    close_clicked = Signal()
+    title_double_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("TopBar")
-        # Ensure QSS background is painted for this container.
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self._drag_start_pos: QPoint | None = None
 
         self._project_menu = MonosMenu(self, rounded=False)
         self._project_menu.setObjectName("ProjectSwitchMenu")
@@ -40,29 +44,95 @@ class TopBar(QWidget):
         self._project_switch.setObjectName("ProjectSwitch")
         self._project_switch.setProperty("state", "empty")
         self._project_switch.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._project_switch.setLayoutDirection(Qt.RightToLeft)  # icon on the right
+        self._project_switch.setLayoutDirection(Qt.RightToLeft)
         self._project_switch.setIcon(lucide_icon("chevron-down", size=12, color_hex="#a1a1aa"))
         self._project_switch.setText("SELECT PROJECT")
         self._project_switch.setPopupMode(QToolButton.InstantPopup)
         self._project_switch.clicked.connect(self._show_project_menu_left_aligned)
         try:
             bf = self._project_switch.font()
-            bf.setLetterSpacing(QFont.AbsoluteSpacing, 0.2)  # px (tight but readable)
+            bf.setLetterSpacing(QFont.AbsoluteSpacing, 0.2)
             self._project_switch.setFont(bf)
         except Exception:
             pass
 
+        # Window buttons (borderless title bar)
+        self._btn_min = QToolButton(self)
+        self._btn_min.setObjectName("WindowMinBtn")
+        self._btn_min.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_min.setIcon(lucide_icon("minus", size=12, color_hex="#a1a1aa"))
+        self._btn_min.setFixedSize(44, 36)
+        self._btn_min.clicked.connect(self.minimize_clicked.emit)
+        self._btn_max = QToolButton(self)
+        self._btn_max.setObjectName("WindowMaxBtn")
+        self._btn_max.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_max.setIcon(lucide_icon("square", size=12, color_hex="#a1a1aa"))
+        self._btn_max.setFixedSize(44, 36)
+        self._btn_max.clicked.connect(self.maximize_clicked.emit)
+        self._btn_close = QToolButton(self)
+        self._btn_close.setObjectName("WindowCloseBtn")
+        self._btn_close.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_close.setIcon(lucide_icon("x", size=12, color_hex="#a1a1aa"))
+        self._btn_close.setFixedSize(44, 36)
+        self._btn_close.clicked.connect(self.close_clicked.emit)
+
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(24, 10, 24, 10)
-        layout.setSpacing(12)
+        layout.setContentsMargins(24, 10, 8, 10)
+        layout.setSpacing(0)
         layout.addWidget(self._project_switch, 0, Qt.AlignLeft | Qt.AlignVCenter)
         layout.addStretch(1)
+        layout.addWidget(self._btn_min, 0, Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(self._btn_max, 0, Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(self._btn_close, 0, Qt.AlignRight | Qt.AlignVCenter)
 
     def _show_project_menu_left_aligned(self) -> None:
         """Show project menu with left edge aligned to button's left edge."""
         btn = self._project_switch
         pos = btn.mapToGlobal(btn.rect().bottomLeft())
         self._project_menu.popup(pos)
+
+    def set_maximized(self, maximized: bool) -> None:
+        """Update window button icon (Max vs Restore)."""
+        if maximized:
+            self._btn_max.setIcon(lucide_icon("maximize-2", size=12, color_hex="#a1a1aa"))
+        else:
+            self._btn_max.setIcon(lucide_icon("square", size=12, color_hex="#a1a1aa"))
+
+    def _is_on_window_buttons(self, pos: QPoint) -> bool:
+        return (
+            self._btn_min.geometry().contains(pos)
+            or self._btn_max.geometry().contains(pos)
+            or self._btn_close.geometry().contains(pos)
+        )
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and not self._is_on_window_buttons(event.pos()):
+            self._drag_start_pos = event.globalPosition().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_start_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            win = self.window()
+            if win and win.windowHandle():
+                try:
+                    win.windowHandle().startSystemMove()
+                    self._drag_start_pos = None
+                except AttributeError:
+                    delta = event.globalPosition().toPoint() - self._drag_start_pos
+                    win.move(win.x() + delta.x(), win.y() + delta.y())
+                    self._drag_start_pos = event.globalPosition().toPoint()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and not self._is_on_window_buttons(event.pos()):
+            self.title_double_clicked.emit()
+        else:
+            super().mouseDoubleClickEvent(event)
 
     def _set_project_switch_state(self, state: str) -> None:
         # Apply a deterministic state property for QSS styling:

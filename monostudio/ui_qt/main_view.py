@@ -683,6 +683,22 @@ class MainView(QWidget):
         f_title = monos_font("Inter", 16, QFont.Weight.Bold)
         self._context_title.setFont(f_title)
 
+        self._type_badge = QWidget(title_row)
+        self._type_badge.setObjectName("MainViewTypeBadge")
+        self._type_badge.setAttribute(Qt.WA_StyledBackground, True)
+        type_badge_l = QHBoxLayout(self._type_badge)
+        type_badge_l.setContentsMargins(8, 4, 10, 4)
+        type_badge_l.setSpacing(6)
+        self._type_icon = QLabel(self._type_badge)
+        self._type_icon.setScaledContents(False)
+        self._type_icon.setFixedSize(16, 16)
+        type_font = monos_font("Inter", 13, QFont.Weight.Bold)
+        self._type_label = QLabel(self._type_badge)
+        self._type_label.setObjectName("MainViewTypeBadgeLabel")
+        self._type_label.setFont(type_font)
+        type_badge_l.addWidget(self._type_icon, 0, Qt.AlignVCenter)
+        type_badge_l.addWidget(self._type_label, 0, Qt.AlignVCenter)
+
         self._department_badge = QWidget(title_row)
         self._department_badge.setObjectName("MainViewDepartmentBadge")
         self._department_badge.setAttribute(Qt.WA_StyledBackground, True)
@@ -700,6 +716,7 @@ class MainView(QWidget):
         badge_l.addWidget(self._department_icon, 0, Qt.AlignVCenter)
         badge_l.addWidget(self._department_label, 0, Qt.AlignVCenter)
         title_row_l.addWidget(self._context_title, 0, Qt.AlignVCenter)
+        title_row_l.addWidget(self._type_badge, 0, Qt.AlignVCenter)
         title_row_l.addWidget(self._department_badge, 0, Qt.AlignVCenter)
 
         # Center: View toggle (Grid | List) — pill UI same as Settings Tier3 (Asset Depts | Shot Depts)
@@ -886,6 +903,8 @@ class MainView(QWidget):
         header_layout.addWidget(self._btn_card_size, 0, Qt.AlignVCenter)
         header_layout.addWidget(self._primary_action, 0, Qt.AlignVCenter)
 
+        self._update_type_badge(self._browser_context)
+
         self._tile_view.selectionModel().selectionChanged.connect(self._on_any_selection_changed)
         self._list_view.selectionModel().selectionChanged.connect(self._on_any_selection_changed)
 
@@ -1033,6 +1052,19 @@ class MainView(QWidget):
         self._department_label.setText(dep_up)
         self._department_badge.setVisible(True)
 
+    def _update_type_badge(self, context: str) -> None:
+        """Update type badge from browser context (project | asset | shot) selected in sidebar."""
+        _context_icon_map = {"project": "layout-dashboard", "asset": "box", "shot": "clapperboard"}
+        _context_label_map = {"project": "Project", "asset": "Asset", "shot": "Shot"}
+        if context not in _context_label_map:
+            return
+        icon_name = _context_icon_map.get(context, "box")
+        label = _context_label_map[context]
+        icon = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
+        self._type_icon.setPixmap(icon.pixmap(16, 16))
+        self._type_label.setText(label.upper())
+        self._type_badge.setVisible(True)
+
     def set_primary_action(self, *, label: str, enabled: bool, tooltip: str | None) -> None:
         # Always visible; enabled and tooltip reflect current context requirements.
         self._primary_action.setText(f"+ {label}".strip())
@@ -1055,6 +1087,7 @@ class MainView(QWidget):
 
         title = "Project" if context == "project" else ("Shot" if context == "shot" else "Asset")
         self.set_context_title(title)
+        self._update_type_badge(context)
 
         key = self._settings_key_view_mode()
         saved = self._settings.value(key, "", str)

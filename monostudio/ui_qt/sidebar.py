@@ -38,8 +38,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets
+from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.recent_tasks_store import RecentTask
 from monostudio.ui_qt.style import (
@@ -644,6 +646,13 @@ class SidebarWidget(QWidget):
         if not did:
             return (None, None)
         return (self._dept_label_by_id.get(did), self._dept_icon_by_id.get(did))
+
+    def get_type_display(self, type_id: str | None) -> tuple[str | None, str | None]:
+        """Return (label, icon_name) for pipeline type (e.g. recent task row icon)."""
+        tid = (type_id or "").strip() or None
+        if not tid:
+            return (None, None)
+        return (self._type_label_by_id.get(tid), self._type_icon_by_id.get(tid))
 
     def set_settings(self, settings: QSettings) -> None:
         """
@@ -1268,6 +1277,150 @@ class _FilterPickDialog(MonosDialog):
         self._hint.setText(f"Selected {n}")
 
 
+# --- Recent Task row: icon type + item name + department icon + DCC icon (right)
+_TASK_ROW_HEIGHT = 36
+_TASK_ICON_SIZE = 16
+_TASK_SMALL_ICON_SIZE = 14  # department + DCC icons
+_TASK_ICON_GAP = 8
+_TASK_RIGHT_MARGIN = 4
+
+
+def _task_dcc_icon(dcc_id: str, is_selected: bool) -> QIcon:
+    """DCC icon from registry brand_icon_slug; fallback lucide layers."""
+    if not (dcc_id or "").strip():
+        return QIcon()
+    try:
+        reg = get_default_dcc_registry()
+        info = reg.get_dcc_info((dcc_id or "").strip())
+        slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+        color = info.get("brand_color_hex") if isinstance(info, dict) else None
+    except Exception:
+        slug = None
+        color = None
+    slug = (slug or dcc_id or "").strip()
+    if not slug:
+        return lucide_icon("layers", size=_TASK_SMALL_ICON_SIZE, color_hex=MONOS_COLORS["text_label"])
+    hex_color = (color if isinstance(color, str) else None) or (MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"])
+    return brand_icon(slug, size=_TASK_SMALL_ICON_SIZE, color_hex=hex_color)
+
+
+def _task_dept_icon(sidebar_widget: QWidget | None, dept_id: str, is_selected: bool) -> QIcon:
+    """Department icon from sidebar filters pipeline (label, icon_name); fallback lucide layers."""
+    if not (dept_id or "").strip() or not sidebar_widget:
+        return QIcon()
+    filters = getattr(sidebar_widget, "filters", None)
+    if not callable(filters):
+        return lucide_icon("layers", size=_TASK_SMALL_ICON_SIZE, color_hex=MONOS_COLORS["text_label"])
+    try:
+        panel = filters()
+        _, icon_name = panel.get_department_display((dept_id or "").strip())
+    except Exception:
+        icon_name = None
+    name = (icon_name or "").strip() or "layers"
+    color = MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"]
+    return lucide_icon(name, size=_TASK_SMALL_ICON_SIZE, color_hex=color)
+
+
+class _SidebarRecentTaskDelegate(QStyledItemDelegate):
+    """
+    Paints one recent task row: icon (sidebar type) + item name + department icon + DCC icon (right).
+    UserRole = RecentTask.
+    """
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[override]
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+
+        task = index.data(Qt.UserRole) if index.isValid() else None
+        if not isinstance(task, RecentTask):
+            style = opt.widget.style() if opt.widget else QApplication.style()
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+            return
+
+        r = opt.rect
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        is_selected = bool(opt.state & QStyle.State_Selected)
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, opt, painter, widget)
+
+        # Resolve sidebar (for context + department icon)
+        sidebar_widget: QWidget | None = None
+        w = widget
+        while w:
+            if getattr(w, "current_context", None) is not None and getattr(w, "filters", None) is not None:
+                sidebar_widget = w
+                break
+            w = w.parentWidget() if hasattr(w, "parentWidget") else None
+
+        painter.save()
+        try:
+            x = r.left() + 4
+            cy = r.center().y()
+
+            # 1) Icon = type selected in sidebar (character, environment, ... from pipeline)
+            type_icon_name = "folder"
+            if sidebar_widget:
+                try:
+                    filters = getattr(sidebar_widget, "filters", None)
+                    if callable(filters):
+                        panel = filters()
+                        type_id = (panel.current_type() or "").strip()
+                        if type_id:
+                            _, icon = panel.get_type_display(type_id)
+                            type_icon_name = (icon or "").strip() or "folder"
+                except Exception:
+                    type_icon_name = "folder"
+            color = MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"]
+            icon = lucide_icon(type_icon_name, size=_TASK_ICON_SIZE, color_hex=color)
+            if not icon.isNull():
+                ir = QRect(x, cy - _TASK_ICON_SIZE // 2, _TASK_ICON_SIZE, _TASK_ICON_SIZE)
+                icon.paint(painter, ir, Qt.AlignCenter, QIcon.Selected if is_selected else QIcon.Normal)
+            x += _TASK_ICON_SIZE + _TASK_ICON_GAP
+
+            # 2) Right side: department icon + DCC icon (both right-aligned)
+            has_dept = bool((task.department or "").strip())
+            has_dcc = bool((task.dcc or "").strip())
+            right_w = 0
+            if has_dcc:
+                right_w += _TASK_SMALL_ICON_SIZE + _TASK_ICON_GAP
+            if has_dept:
+                right_w += _TASK_SMALL_ICON_SIZE
+            if has_dcc or has_dept:
+                right_w += _TASK_RIGHT_MARGIN
+
+            # 3) Item name only (elided)
+            text_w = max(0, r.width() - (x - r.left()) - right_w)
+            name_str = (task.item_name or "").strip()
+            fm = QFontMetrics(opt.font)
+            elided = fm.elidedText(name_str, Qt.TextElideMode.ElideRight, text_w)
+            text_rect = QRect(x, r.top(), text_w, r.height())
+            primary_color = MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_primary"]
+            painter.setPen(QColor(primary_color))
+            painter.setFont(opt.font)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+
+            # 4) Department icon then DCC icon (right-aligned, dept left of DCC)
+            right_x = r.right() - _TASK_RIGHT_MARGIN
+            if has_dcc:
+                dcc_icon = _task_dcc_icon(task.dcc, is_selected)
+                if not dcc_icon.isNull():
+                    ix = right_x - _TASK_SMALL_ICON_SIZE
+                    iy = cy - _TASK_SMALL_ICON_SIZE // 2
+                    dcc_icon.paint(painter, QRect(ix, iy, _TASK_SMALL_ICON_SIZE, _TASK_SMALL_ICON_SIZE), Qt.AlignCenter)
+                right_x -= _TASK_SMALL_ICON_SIZE + _TASK_ICON_GAP
+            if has_dept:
+                dept_icon = _task_dept_icon(sidebar_widget, task.department, is_selected)
+                if not dept_icon.isNull():
+                    ix = right_x - _TASK_SMALL_ICON_SIZE
+                    iy = cy - _TASK_SMALL_ICON_SIZE // 2
+                    dept_icon.paint(painter, QRect(ix, iy, _TASK_SMALL_ICON_SIZE, _TASK_SMALL_ICON_SIZE), Qt.AlignCenter)
+        finally:
+            painter.restore()
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # type: ignore[override]
+        return QSize(-1, _TASK_ROW_HEIGHT)
+
+
 class Sidebar(QWidget):
     """
     MONOS Sidebar (fixed 256px) with 4 blocks:
@@ -1390,6 +1543,7 @@ class Sidebar(QWidget):
         self._tasks_empty.setObjectName("SidebarMutedText")
         self._tasks_list = QListWidget(tasks_block)
         self._tasks_list.setObjectName("SidebarRecentTasksList")
+        self._tasks_list.setItemDelegate(_SidebarRecentTaskDelegate(self._tasks_list))
         self._tasks_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tasks_list.setFocusPolicy(Qt.NoFocus)
         self._tasks_list.setSpacing(2)
@@ -1445,10 +1599,13 @@ class Sidebar(QWidget):
             return
         self._tasks_stacked.setCurrentWidget(self._tasks_list)
         for t in tasks:
-            it = QListWidgetItem(f"{t.item_name} · {t.department}")
+            it = QListWidgetItem("")
             it.setData(Qt.UserRole, t)
-            it.setSizeHint(QSize(0, 32))
+            it.setSizeHint(QSize(0, _TASK_ROW_HEIGHT))
+            it.setToolTip(f"{t.item_name}\n{t.department}" + (f" · {t.dcc}" if t.dcc else ""))
             self._tasks_list.addItem(it)
+        # Focus the first (most recently opened) task
+        self._tasks_list.setCurrentRow(0)
 
     def _on_recent_task_item_clicked(self, item: QListWidgetItem) -> None:
         task = item.data(Qt.UserRole) if item else None

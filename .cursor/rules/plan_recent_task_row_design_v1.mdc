@@ -1,0 +1,168 @@
+---
+description: Plan thiết kế UI/UX cho từng task row trong Recent Tasks (sidebar).
+alwaysApply: false
+---
+
+# Plan: Thiết kế Task Row (Recent Tasks)
+
+Thiết kế chi tiết cho **một dòng task** trong danh sách Recent Tasks ở sidebar: layout, nội dung, typography, tương tác và mở rộng.
+
+---
+
+## 1. Mục tiêu
+
+- Một dòng phải **đọc nhanh**: item nào, department nào, (tùy chọn) DCC nào.
+- **Nhất quán** với Sidebar (typography, màu, 8px grid).
+- **Click = navigate** (đã có); có thể mở rộng: Open trực tiếp, context menu.
+
+---
+
+## 2. Dữ liệu hiển thị (từ RecentTask)
+
+| Field         | Dùng cho UI                    | Ghi chú                    |
+|---------------|---------------------------------|----------------------------|
+| item_name     | Tên chính (asset/shot)         | Elide nếu quá dài          |
+| department    | Department (label)             | Có thể title-case          |
+| item_type     | asset \| shot                  | Để chọn icon (box / clapperboard) |
+| dcc           | (Optional) badge hoặc icon     | Maya, Blender, Houdini…    |
+| opened_at     | (Optional) "2h ago" / relative | Muted, nhỏ                 |
+
+---
+
+## 3. Layout đề xuất
+
+### 3.1 Cấu trúc một dòng (trái → phải)
+
+- **Icon entity** (16×16): asset = box, shot = clapperboard (Lucide), màu text_label (Zinc-400), không đổi khi hover/selected (hoặc selected = blue_400).
+- **Khoảng 8px.**
+- **Primary text:** `item_name` (Body: 13px, 500, Zinc-300; hover/selected: Zinc-200 hoặc Blue-400).
+- **Separator:** ` · ` (middle dot, muted) hoặc ` – `.
+- **Secondary text:** `department` (cùng size, Zinc-500 hoặc text_meta).
+- **(Optional) Khoảng 4–8px + DCC badge/icon** (nhỏ, 12px hoặc icon 14px) bên phải.
+
+Chiều cao dòng: **32px** (đã dùng) hoặc 36px nếu thêm dòng phụ (opened_at). Căn theo 8px grid.
+
+### 3.2 Elide & overflow
+
+- `item_name` dài: elide right (…) trong giới hạn width (sidebar ~224px trừ icon + padding).
+- Department thường ngắn; nếu dài cũng elide.
+- Tooltip (optional): full `item_name`, `department`, `dcc`, path (mono) khi hover.
+
+---
+
+## 4. Typography (theo typography_font_stack_v1)
+
+| Phần           | Font   | Size | Weight | Màu (normal / hover / selected)     |
+|----------------|--------|------|--------|-------------------------------------|
+| Item name      | Inter  | 13   | 500    | text_primary / Zinc-200 / Blue-400   |
+| Department     | Inter  | 13   | 500    | text_meta (Zinc-500)                |
+| DCC (nếu có)   | Inter  | 11   | 600    | text_label hoặc badge (nền nhạt)    |
+| opened_at      | Inter  | 11   | 500    | Zinc-600 (muted)                    |
+
+Không dùng mono cho item_name/department (trừ tooltip path). Level 3 / Body đủ cho primary.
+
+---
+
+## 5. States & QSS
+
+- **Normal:** Nền transparent (list nền sidebar), chữ theo bảng trên.
+- **Hover:** Nền `rgba(130,130,130,0.10)`, chữ sáng hơn (Zinc-200 / #fafafa) — đã có trong SidebarRecentTasksList::item:hover.
+- **Selected:** Nền `rgba(59,130,246,0.10)`, chữ Blue-400 — đã có trong ::item:selected.
+- **Focus:** No focus ring (FocusPolicy NoFocus đã set).
+
+Giữ objectName `SidebarRecentTasksList`; có thể thêm subclass cho item delegate nếu vẽ custom (icon + hai đoạn text).
+
+---
+
+## 6. Tương tác
+
+### 6.1 Click (đã có)
+
+- **Single click:** Navigate (context + department + chọn item). Không mở DCC.
+- **Double click (optional):** Có thể map thành "Navigate + Open" (mở DCC luôn). Hiện chưa cần.
+
+### 6.2 Context menu (đề xuất mở rộng)
+
+- **Open** — Navigate + mở DCC (smart_open).
+- **Remove from list** — Xóa task này khỏi RecentTasksStore (cần API `remove(project_root, item_path, department)`).
+- **Clear all** — Xóa toàn bộ recent tasks (hoặc chỉ project hiện tại).
+
+Dùng QMenu theo context_menu_qss_v1; danger-style cho "Clear all" nếu muốn.
+
+### 6.3 (Optional) Nút Open trên dòng
+
+- Icon "play" hoặc "folder-open" bên phải, chỉ hiện khi hover row.
+- Click icon = navigate + smart_open; tránh conflict với click cả dòng (navigate only).
+- Có thể bỏ qua ở phase 1 để giữ UI đơn giản.
+
+---
+
+## 7. Icon entity (asset vs shot)
+
+- **Asset:** Lucide `box` (đã dùng cho nav Assets).
+- **Shot:** Lucide `clapperboard` (đã dùng cho nav Shots).
+- Size 16×16, màu theo state (text_label / blue_400 khi selected). Có thể dùng `_lucide_two_state_icon` pattern như department list.
+
+---
+
+## 8. DCC (optional)
+
+- **Cách 1:** Chỉ text label nhỏ bên phải (vd "Maya", "Blender"), 11px, muted.
+- **Cách 2:** Icon DCC (nếu có bộ icon) + tooltip tên DCC.
+- **Cách 3:** Bỏ qua trên row, chỉ hiện trong tooltip khi hover.
+
+Ưu tiên đơn giản: không hiện DCC trên dòng, hoặc text nhỏ 11px bên phải.
+
+---
+
+## 9. Empty state
+
+- Đã có: "No tasks" (SidebarMutedText) khi list rỗng.
+- Có thể thêm câu ngắn: "Open or create a work file to see recent tasks."
+
+---
+
+## 10. Implementation gợi ý
+
+### 10.1 Giữ QListWidgetItem text đơn giản
+
+- Hiện tại: `QListWidgetItem(f"{t.item_name} · {t.department}")` — đủ dùng, QSS áp cho toàn item.
+- Để thêm **icon entity** (asset/shot): `it.setIcon(icon)` với QIcon từ Lucide; setIconSize(16, 16).
+
+### 10.2 Custom delegate (nếu cần hai màu / elide riêng)
+
+- Dùng `QStyledItemDelegate` cho `SidebarRecentTasksList`: paint icon + item_name (một màu) + " · " + department (màu muted) + optional DCC; sizeHint 32.
+- So sánh với _SidebarDeptListDelegate: cùng pattern, khác nội dung.
+
+### 10.3 Tooltip
+
+- `it.setToolTip(f"{t.item_name}\n{t.department}" + (f"\n{t.dcc}" if t.dcc else "") + f"\n{Path(t.item_path).name}")` hoặc tooltip đẹp hơn (HTML/formatted) nếu cần.
+
+### 10.4 Context menu
+
+- `_tasks_list.setContextMenuPolicy(Qt.CustomContextMenu)`, connect `customContextMenuRequested` → build QMenu (Open, Remove from list, Clear all) tại vị trí click; xử lý từng action trong MainWindow hoặc qua signal từ Sidebar.
+
+---
+
+## 11. Checklist triển khai (theo độ ưu tiên)
+
+| Bước | Nội dung |
+|------|----------|
+| 1 | Thêm icon entity (box / clapperboard) cho mỗi item theo item_type; setIcon, setIconSize(16,16). |
+| 2 | (Optional) Tooltip: item_name, department, dcc, path. |
+| 3 | (Optional) Custom delegate: hai màu (name vs department), elide chuẩn. |
+| 4 | (Optional) Context menu: Open, Remove from list, Clear all. |
+| 5 | (Optional) DCC label 11px bên phải hoặc trong tooltip. |
+
+---
+
+## 12. Tóm tắt
+
+- **Một dòng:** Icon (asset/shot) + item_name + " · " + department; (optional) DCC, opened_at.
+- **Typography:** Body 13, Inter; department/DCC muted; đúng rule 8px grid.
+- **States:** Normal / Hover / Selected theo QSS hiện có; không focus ring.
+- **Click:** Navigate (đã có). Mở rộng: context menu (Open, Remove, Clear all), (optional) nút Open trên row hoặc double-click = Open.
+
+---
+
+*Tham chiếu: plan_recent_tasks_sidebar_v1.mdc, typography_font_stack_v1.mdc, context_menu_qss_v1.mdc.*

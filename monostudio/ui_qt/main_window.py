@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QFileSystemWatcher, Qt, QSettings, Signal, QTimer
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QMessageBox, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QMessageBox, QSizeGrip, QSplitter, QVBoxLayout, QWidget
 
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.dcc_registry import get_default_dcc_registry
@@ -71,6 +71,10 @@ class MainWindow(QMainWindow):
 
         # Minimum window size (usability floor).
         self.setMinimumSize(640, 480)
+
+        # Borderless window: no OS frame; custom title bar (TopBar) handles drag and window buttons.
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
+        self.setObjectName("MonosMainWindow")
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
         repo_root = Path(__file__).resolve().parents[2]
@@ -168,6 +172,11 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(main_splitter)
 
+        # Resize (6b B): QSizeGrip góc dưới phải
+        self._size_grip = QSizeGrip(self)
+        self._size_grip.setFixedSize(20, 20)
+        self._size_grip.raise_()
+
         self._sidebar.context_changed.connect(self._on_context_switched)
         self._sidebar.context_clicked.connect(self._on_context_clicked)
         self._sidebar.context_menu_requested.connect(self._on_sidebar_context_menu_requested)
@@ -184,6 +193,10 @@ class MainWindow(QMainWindow):
         self.departmentChanged.connect(self._on_filter_state_changed)
         self.typeChanged.connect(self._on_filter_state_changed)
         self._top_bar.project_switch_requested.connect(self._switch_project)
+        self._top_bar.minimize_clicked.connect(self.showMinimized)
+        self._top_bar.maximize_clicked.connect(self._toggle_maximize)
+        self._top_bar.close_clicked.connect(self.close)
+        self._top_bar.title_double_clicked.connect(self._toggle_maximize)
         self._inspector.close_requested.connect(self._main_view.clear_selection)
         self._inspector.paste_thumbnail_requested.connect(self._on_paste_thumbnail_requested)
         self._main_view.valid_selection_changed.connect(self._on_valid_selection_changed)
@@ -1359,6 +1372,7 @@ class MainWindow(QMainWindow):
         if item.kind == ViewItemKind.ASSET and isinstance(item.ref, Asset):
             try:
                 self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
+                self._refresh_recent_tasks()
             except Exception as e:
                 logging.warning("DCC launch failed (asset): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
@@ -1366,6 +1380,7 @@ class MainWindow(QMainWindow):
         if item.kind == ViewItemKind.SHOT and isinstance(item.ref, Shot):
             try:
                 self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
+                self._refresh_recent_tasks()
             except Exception as e:
                 logging.warning("DCC launch failed (shot): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
@@ -1547,6 +1562,26 @@ class MainWindow(QMainWindow):
         repo_root = Path(__file__).resolve().parents[2]
         return repo_root / "monostudio_data" / "config" / "app_settings.json"
 
+    def _toggle_maximize(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._top_bar.set_maximized(self.isMaximized())
+
+    def _apply_restore_maximized(self) -> None:
+        """Restore maximized state khi load; 6b B: cập nhật icon sau showMaximized."""
+        self.showMaximized()
+        self._top_bar.set_maximized(True)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Đặt QSizeGrip góc dưới phải (trừ border 1px)
+        g = self._size_grip
+        margin = 1
+        g.setGeometry(self.width() - g.width() - margin, self.height() - g.height() - margin, g.width(), g.height())
+        g.raise_()
+
     def _restore_window_geometry(self) -> None:
         """
         Restore saved window geometry BEFORE showing the window.
@@ -1567,6 +1602,9 @@ class MainWindow(QMainWindow):
                     restored = bool(self.restoreGeometry(QByteArray(raw)))
                 except (OSError, ValueError):
                     restored = False
+            # Restore maximized state (6b B: gọi set_maximized sau showMaximized)
+            if data.get("window_maximized") is True and restored:
+                QTimer.singleShot(0, self._apply_restore_maximized)
 
         if not restored:
             # First launch / no saved geometry: default size.
@@ -1574,12 +1612,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """
-        Save window geometry on close (size + position).
+        Save window geometry on close (size + position + maximized).
         Silent failure on IO errors.
         """
         path = self._app_settings_path()
         payload = {
             "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
+            "window_maximized": self.isMaximized(),
         }
         try:
             from monostudio.core.atomic_write import atomic_write_text

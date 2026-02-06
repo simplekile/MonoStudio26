@@ -365,6 +365,20 @@ def apply_dark_theme(app: QApplication) -> None:
         """
         QWidget { font-family: "Inter"; font-size: 13px; }
 
+        /* MONOS :: Main window (borderless) — outer border */
+        QMainWindow#MonosMainWindow {
+            border: 1px solid #3f3f46;
+            background-color: #121214;
+        }
+        QSizeGrip {
+            background: transparent;
+            width: 20px;
+            height: 20px;
+        }
+        QSizeGrip:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+
         /* ===============================
            MONOS :: Scrollbar (Dark / Minimal / DPI-safe)
            - scrollbar is a tool, not a UI element
@@ -557,6 +571,24 @@ def apply_dark_theme(app: QApplication) -> None:
             height: 1px;
             margin: 6px 6px;
             background: rgba(39, 39, 42, 0.70);
+        }
+        /* Borderless window buttons (TopBar) */
+        QToolButton#WindowMinBtn,
+        QToolButton#WindowMaxBtn,
+        QToolButton#WindowCloseBtn {
+            border: none;
+            border-radius: 0;
+            background: transparent;
+            color: #a1a1aa;
+        }
+        QToolButton#WindowMinBtn:hover,
+        QToolButton#WindowMaxBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: #e2e2e2;
+        }
+        QToolButton#WindowCloseBtn:hover {
+            background: #ef4444;
+            color: white;
         }
         /* Panel separators (splitter handles) */
         QSplitter::handle {

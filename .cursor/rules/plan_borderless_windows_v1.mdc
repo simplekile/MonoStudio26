@@ -108,6 +108,32 @@ Tài liệu này mô tả thiết kế **cửa sổ borderless (frameless)** cho
 
 ---
 
+## 6b. Phương án khác (cho bước 5 & 6)
+
+### Resize (thay cho nativeEvent trực tiếp trong MainWindow)
+
+| Phương án | Mô tả | Ưu / Nhược |
+|-----------|--------|-------------|
+| **A. nativeEvent + module** | Logic hit-test đưa vào `frameless_resize.py`; MainWindow chỉ gọi `handle_native_event(...)`. | Giống hành vi hiện tại, code gọn trong MainWindow; cần thêm module (xem `plan_resize_system_v1.mdc`). |
+| **B. QSizeGrip** | Thêm `QSizeGrip` góc dưới phải, không dùng WM_NCHITTEST. | Đơn giản, cross-platform; chỉ resize từ 1 góc, không kéo cạnh. |
+| **C. Overlay resize handles** | 8 widget mỏng (4 cạnh + 4 góc) phủ lên viền, bắt chuột và gọi `resize()`/`setGeometry()`. | Không phụ thuộc nativeEvent, dễ tùy chỉnh; phải tự vẽ cursor, xử lý double-click maximize, có thể vướng hit-test. |
+| **D. Không resize** | Chỉ drag + min/max/close; user maximize hoặc kéo từ taskbar. | Ít code nhất; UX kém nếu user muốn kéo viền. |
+
+**Khuyến nghị**: A (module) nếu muốn resize đầy đủ và code sạch; B nếu chấp nhận chỉ resize từ góc.
+
+### Cập nhật icon Max ↔ Restore (thay cho changeEvent)
+
+| Phương án | Mô tả | Ưu / Nhược |
+|-----------|--------|-------------|
+| **A. changeEvent (hiện tại)** | MainWindow override `changeEvent`, khi `WindowStateChange` gọi `_top_bar.set_maximized(isMaximized())`. | Chuẩn Qt, bắt mọi thay đổi state (maximize từ nút, double-click, snap). |
+| **B. Gọi sau showMaximized/showNormal** | Trong slot `_toggle_maximize` và khi Restore từ nút, sau khi gọi `showMaximized()`/`showNormal()` thì gọi luôn `_top_bar.set_maximized(...)`. | Không cần changeEvent; dễ sót khi state đổi từ nơi khác (snap, API). |
+| **C. TopBar lắng nghe** | MainWindow emit signal `windowStateChanged(bool maximized)` mỗi khi đổi; hoặc TopBar dùng timer/eventFilter đọc `window().isMaximized()`. | Tách biệt MainWindow/TopBar; changeEvent vẫn là nguồn đáng tin hơn. |
+| **D. Cập nhật ngay trong slot nút** | Khi user click nút Max/Restore, TopBar đổi icon trước rồi MainWindow mới showMaximized/showNormal. | Cảm giác nhanh; vẫn nên đồng bộ với changeEvent để đúng khi double-click title hoặc snap. |
+
+**Khuyến nghị**: Giữ A (changeEvent) làm nguồn sự thật duy nhất; B/D chỉ bổ sung nếu cần feedback tức thì.
+
+---
+
 ## 7. Phase 2 (tùy chọn)
 
 - **Bo góc main window**: DWM (Windows 11) hoặc mask + paintEvent; cẩn thận với nền không trong suốt (có thể chỉ viền bo góc, không mask toàn cửa sổ).
