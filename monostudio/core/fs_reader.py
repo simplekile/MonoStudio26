@@ -796,12 +796,11 @@ def run_incremental_scan(
     type_folders: list[str],
     department_registry: "DepartmentRegistry | None" = None,
     type_registry: "TypeRegistry | None" = None,
-) -> tuple[list[Asset], list[Shot], list[str], list[str], list[str]]:
+) -> tuple[list[Asset], list[Shot], list[str], list[str]]:
     """
     Incremental scan: rescan only the given asset paths, shot paths, and type folders.
-    Returns (new_assets, new_shots, requested_asset_ids, requested_shot_ids, type_folders_scanned).
-    type_folders_scanned: list of type folders that were re-scanned (so caller can remove from
-    state any asset belonging to that type whose path is not in new_assets — e.g. deleted on disk).
+    Returns (new_assets, new_shots, requested_asset_ids, requested_shot_ids).
+    Caller can remove from state any requested id not present in new_* (e.g. deleted on disk).
     """
     from monostudio.core.department_registry import DepartmentRegistry
     from monostudio.core.type_registry import TypeRegistry
@@ -833,15 +832,13 @@ def run_incremental_scan(
         s = scan_single_shot(root, p, dept_reg)
         if s is not None:
             shots_out.append(s)
-    type_folders_scanned: list[str] = []
     for type_folder in type_folders:
         if not type_folder:
             continue
-        type_folders_scanned.append(type_folder)
         for a in scan_assets_in_type(root, type_folder, dept_reg, type_reg):
             aid = str(a.path)
             if aid not in seen_asset_ids:
                 seen_asset_ids.add(aid)
                 assets_out.append(a)
-    return (assets_out, shots_out, list(asset_ids), list(shot_ids), type_folders_scanned)
+    return (assets_out, shots_out, list(asset_ids), list(shot_ids))
 

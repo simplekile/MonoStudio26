@@ -130,7 +130,6 @@ class SettingsDialog(MonosDialog):
         self._dept_mapping_table: QTableWidget | None = None
         self._type_mapping_table: QTableWidget | None = None
         self._use_dcc_folders_cb: QCheckBox | None = None
-        self._create_work_publish_subfolders_cb: QCheckBox | None = None
         self._notification_max_visible_combo: QComboBox | None = None
 
         # Tier 1: left nav — General | Pipeline | DCCs | Project
@@ -414,28 +413,6 @@ class SettingsDialog(MonosDialog):
         form.addRow("", self._use_dcc_folders_cb)
 
         layout.addWidget(grp)
-
-        grp_defaults = QGroupBox("New assets & shots", root)
-        grp_defaults_l = QVBoxLayout(grp_defaults)
-        grp_defaults_l.setContentsMargins(12, 12, 12, 12)
-        grp_defaults_l.setSpacing(10)
-        self._create_work_publish_subfolders_cb = QCheckBox(
-            "Create work/ and publish/ inside departments", grp_defaults
-        )
-        self._create_work_publish_subfolders_cb.setToolTip(
-            "When creating a new asset or shot, create work/ and publish/ under each department folder. Global default."
-        )
-        _cv = True
-        if self._settings is not None:
-            raw = self._settings.value("pipeline/create_work_publish_subfolders", "true", str)
-            if isinstance(raw, bool):
-                _cv = raw
-            else:
-                _cv = (raw or "true").strip().lower() in ("true", "1", "yes")
-        self._create_work_publish_subfolders_cb.setChecked(_cv)
-        grp_defaults_l.addWidget(self._create_work_publish_subfolders_cb)
-        layout.addWidget(grp_defaults)
-
         layout.addStretch(1)
         return root
 
@@ -1581,13 +1558,6 @@ class SettingsDialog(MonosDialog):
                     "Settings",
                     "Failed to save Use DCC folders to project.",
                 )
-
-        # Global pipeline default: create work/publish subfolders for new assets & shots.
-        if self._settings is not None and self._create_work_publish_subfolders_cb is not None:
-            self._settings.setValue(
-                "pipeline/create_work_publish_subfolders",
-                self._create_work_publish_subfolders_cb.isChecked(),
-            )
 
         # Persist notification UI setting.
         try:
