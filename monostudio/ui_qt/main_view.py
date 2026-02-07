@@ -903,7 +903,7 @@ class MainView(QWidget):
         header_layout.addWidget(self._btn_card_size, 0, Qt.AlignVCenter)
         header_layout.addWidget(self._primary_action, 0, Qt.AlignVCenter)
 
-        self._update_type_badge(self._browser_context)
+        self.set_selected_asset_type(None)
 
         self._tile_view.selectionModel().selectionChanged.connect(self._on_any_selection_changed)
         self._list_view.selectionModel().selectionChanged.connect(self._on_any_selection_changed)
@@ -1052,17 +1052,28 @@ class MainView(QWidget):
         self._department_label.setText(dep_up)
         self._department_badge.setVisible(True)
 
-    def _update_type_badge(self, context: str) -> None:
-        """Update type badge from browser context (project | asset | shot) selected in sidebar."""
-        _context_icon_map = {"project": "layout-dashboard", "asset": "box", "shot": "clapperboard"}
-        _context_label_map = {"project": "Project", "asset": "Asset", "shot": "Shot"}
-        if context not in _context_label_map:
+    def set_selected_asset_type(
+        self,
+        type_id: str | None,
+        *,
+        label: str | None = None,
+        icon_name: str | None = None,
+    ) -> None:
+        """
+        Update type badge from asset type selected in sidebar (Character, Prop, Environment, …).
+        When type_id is None (or not in Assets), badge is hidden.
+        """
+        if not (type_id and (type_id := type_id.strip())):
+            self._type_badge.setVisible(False)
             return
-        icon_name = _context_icon_map.get(context, "box")
-        label = _context_label_map[context]
-        icon = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
+        display_label = (label or "").strip() or _TYPE_TOOLTIP_MAP.get(type_id, type_id)
+        icon = lucide_icon(
+            (icon_name or "").strip() or _TYPE_ICON_MAP.get(type_id, _TYPE_ICON_MAP.get(f"_{type_id}", "box")),
+            size=16,
+            color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"),
+        )
         self._type_icon.setPixmap(icon.pixmap(16, 16))
-        self._type_label.setText(label.upper())
+        self._type_label.setText(display_label.upper())
         self._type_badge.setVisible(True)
 
     def set_primary_action(self, *, label: str, enabled: bool, tooltip: str | None) -> None:
@@ -1087,7 +1098,6 @@ class MainView(QWidget):
 
         title = "Project" if context == "project" else ("Shot" if context == "shot" else "Asset")
         self.set_context_title(title)
-        self._update_type_badge(context)
 
         key = self._settings_key_view_mode()
         saved = self._settings.value(key, "", str)
@@ -1703,9 +1713,11 @@ class MainView(QWidget):
             pass
 
     def _icon_for_item(self, item: ViewItem):
-        # Placeholder by kind when no thumbnail: asset/shot/project get type icon, not text.
+        # Placeholder by kind when no thumbnail: asset/shot/project get type icon; inbox_item = folder.
         if item.kind.value in ("asset", "shot", "project"):
             return self._placeholder_icon_for_kind(item.kind.value)
+        if item.kind.value == "inbox_item":
+            return lucide_icon("folder", size=20, color_hex=MONOS_COLORS["text_label"])
         return lucide_icon("folder", size=20, color_hex=MONOS_COLORS["text_label"])
 
     def _placeholder_icon_for_kind(self, kind: str) -> QIcon:
@@ -1856,9 +1868,8 @@ class MainView(QWidget):
         self._dispatch_item_context_action(chosen, item)
 
     def _build_item_context_menu(self, item: ViewItem) -> QMenu | None:
-        # Candidate 1 + 2 helpers (explicit, silent).
-        # Asset / Shot / Department only.
-        if item.kind.value not in ("asset", "shot", "department"):
+        # Asset / Shot / Department / Inbox item.
+        if item.kind.value not in ("asset", "shot", "department", "inbox_item"):
             return None
 
         menu = QMenu(self)
@@ -1867,6 +1878,17 @@ class MainView(QWidget):
         open_with_action = None
         create_new_action = None
         copy_inventory = None
+        if item.kind.value == "inbox_item":
+            copy_full_path = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Full Path")
+            open_folder = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Folder")
+            menu.setProperty("_act_copy_full_path", copy_full_path)
+            menu.setProperty("_act_open_folder", open_folder)
+            menu.setProperty("_act_open", None)
+            menu.setProperty("_act_open_with", None)
+            menu.setProperty("_act_copy_inventory", None)
+            menu.setProperty("_act_delete", None)
+            menu.setProperty("_act_refresh", None)
+            return menu
         if item.kind.value in ("asset", "shot"):
             open_action = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open")
             open_with_action = menu.addAction(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]), "Open With…")

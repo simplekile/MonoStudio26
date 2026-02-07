@@ -1,0 +1,7 @@
+[
+  { "id": "reference", "label": "Reference", "path_template": "reference", "context": "both" },
+  { "id": "concept", "label": "Concept", "path_template": "concept", "context": "both" },
+  { "id": "texture", "label": "Texture", "path_template": "surfacing/texturing/ref", "context": "asset" },
+  { "id": "character_sculpt", "label": "Character Sculpt", "path_template": "modelling/sculpt/ref", "context": "asset" },
+  { "id": "shot_reference", "label": "Shot Reference", "path_template": "reference", "context": "shot" }
+]

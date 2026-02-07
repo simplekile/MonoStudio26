@@ -10,6 +10,7 @@ class ViewItemKind(str, Enum):
     ASSET = "asset"
     SHOT = "shot"
     DEPARTMENT = "department"
+    INBOX_ITEM = "inbox_item"
 
 
 @dataclass(frozen=True)

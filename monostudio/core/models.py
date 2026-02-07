@@ -56,3 +56,18 @@ class ProjectIndex:
     assets: tuple[Asset, ...]
     shots: tuple[Shot, ...]
 
+
+@dataclass
+class InboxItem:
+    """
+    Single file or folder in the inbox tree. Used for inbox/<source>/<date>/... structure.
+    """
+    path: Path
+    relative_path: str  # from inbox root, for meta key and tree display
+    name: str
+    is_dir: bool
+    source: str | None  # "client" | "freelancer", from path or meta
+    added_at: str | None  # ISO8601
+    description: str | None
+    children: list["InboxItem"]  # empty = no children; populated when is_dir
+

@@ -6,10 +6,11 @@ import logging
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QFileSystemWatcher, Qt, QSettings, Signal, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QByteArray, QFileSystemWatcher, Qt, QSettings, Signal, QTimer, QUrl
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QMessageBox, QSizeGrip, QSplitter, QVBoxLayout, QWidget
 
+from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.fs_reader import (
@@ -18,7 +19,8 @@ from monostudio.core.fs_reader import (
     resolve_work_path,
     run_incremental_scan,
 )
-from monostudio.core.models import Asset, ProjectIndex, Shot
+from monostudio.core.models import Asset, InboxItem, ProjectIndex, Shot
+from monostudio.core.inbox_reader import get_inbox_root, scan_inbox
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.workspace_reader import DiscoveredProject, ProjectQuickStats, discover_projects, read_project_quick_stats
 from monostudio.core.project_create import create_new_project
@@ -77,7 +79,7 @@ class MainWindow(QMainWindow):
         self.setObjectName("MonosMainWindow")
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
-        repo_root = Path(__file__).resolve().parents[2]
+        repo_root = get_app_base_path()
         self._controller = AppController(settings=self._settings, repo_root=repo_root, parent=self)
         self._recent_tasks_store = RecentTasksStore(self._settings)
         self._controller.set_recent_tasks_store(self._recent_tasks_store)
@@ -285,10 +287,11 @@ class MainWindow(QMainWindow):
         # Filter changes can cause selection/model churn; never allow it to trigger Open flows.
         if getattr(self, "_filter_switch_in_progress", False):
             return
-        # UI-only: rebuild grid/list from existing in-memory data (no rescans).
-        if self._sidebar.current_context() != "Assets":
+        ctx = self._sidebar.current_context()
+        # Reload for Assets (filter) and Inbox (source = client/freelancer).
+        if ctx not in ("Assets", "Inbox"):
             return
-        if self._entered_parent is not None:
+        if ctx == "Assets" and self._entered_parent is not None:
             return
         self._filter_switch_in_progress = True
         try:
@@ -306,6 +309,18 @@ class MainWindow(QMainWindow):
         dep = self._controller.current_department
         label, icon_name = self._sidebar.filters().get_department_display(dep) if dep else (None, None)
         self._main_view.set_active_department(dep, label=label, icon_name=icon_name)
+
+    def _set_main_view_type(self) -> None:
+        """Sync main view type badge with asset type selected in sidebar (Character, Prop, Environment, …)."""
+        if self._sidebar.current_context() != "Assets":
+            self._main_view.set_selected_asset_type(None)
+            return
+        type_id = self._sidebar.filters().current_type()
+        if not type_id:
+            self._main_view.set_selected_asset_type(None)
+            return
+        label, icon_name = self._sidebar.filters().get_type_display(type_id)
+        self._main_view.set_selected_asset_type(type_id, label=label, icon_name=icon_name)
 
     def _set_current_department(self, department, *, toggle_if_same: bool) -> None:
         new = department if isinstance(department, str) and department.strip() else None
@@ -342,6 +357,7 @@ class MainWindow(QMainWindow):
             department=filters.current_department(),
             type_id=filters.current_type(),
         )
+        self._set_main_view_type()
 
     def _current_type_name(self) -> str | None:
         if self.current_type is None:
@@ -698,6 +714,8 @@ class MainWindow(QMainWindow):
             if not self._workspace_projects:
                 return "No projects found in this workspace"
             return "Select a project using the project switcher in the top bar."
+        if context_name == "Inbox":
+            return "Select Client or Freelancer in sidebar, or add folders to inbox."
         return f"{context_name} is not available yet."
 
     def _on_valid_selection_changed(self, has_selection: bool) -> None:
@@ -1274,6 +1292,7 @@ class MainWindow(QMainWindow):
 
         # Projects context: show workspace discovery results (read-only).
         if context == "Projects":
+            self._main_view.set_selected_asset_type(None)
             for proj in self._workspace_projects:
                 stats: ProjectQuickStats | None
                 try:
@@ -1291,6 +1310,41 @@ class MainWindow(QMainWindow):
                     )
                 )
             self._main_view.set_empty_override(None if items else "No projects found in this workspace")
+            self._main_view.set_items(items)
+            return
+
+        if context == "Inbox":
+            self._main_view.set_selected_asset_type(None)
+            self._main_view.set_active_department(None)
+            if self._project_root is None:
+                self._main_view.clear()
+                self._main_view.set_empty_override(self._empty_message_for_context(context))
+                return
+            try:
+                inbox_nodes = scan_inbox(self._project_root)
+            except Exception:
+                inbox_nodes = []
+            source_filter = (self._sidebar.filters().current_type() or "").strip().lower()  # inbox mode: "client" or "freelancer"
+            if source_filter:
+                for node in inbox_nodes:
+                    if (node.name or "").lower() != source_filter:
+                        continue
+                    if node.is_dir and node.children:
+                        for child in node.children:
+                            items.append(
+                                ViewItem(
+                                    kind=ViewItemKind.INBOX_ITEM,
+                                    name=child.name,
+                                    type_badge=node.name or "",
+                                    path=child.path,
+                                    departments_count=None,
+                                    ref=child,
+                                )
+                            )
+                    break
+            self._main_view.set_empty_override(
+                None if items else "Select Client or Freelancer in sidebar, or add folders to inbox."
+            )
             self._main_view.set_items(items)
             return
 
@@ -1345,8 +1399,10 @@ class MainWindow(QMainWindow):
             self._main_view.set_empty_override(None)
         if context in ("Assets", "Shots"):
             self._set_main_view_department()
+            self._set_main_view_type()
         else:
             self._main_view.set_active_department(None)
+            self._main_view.set_selected_asset_type(None)
         # Preserve selection if still in list (Option C; no defer to avoid flicker).
         current_id = self._app_state.selection_id()
         preserve = None
@@ -1384,6 +1440,12 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logging.warning("DCC launch failed (shot): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
+            return
+        if item.kind == ViewItemKind.INBOX_ITEM and item.path:
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(item.path)))
+            except Exception:
+                pass
             return
         return
 
@@ -1559,8 +1621,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _app_settings_path() -> Path:
-        repo_root = Path(__file__).resolve().parents[2]
-        return repo_root / "monostudio_data" / "config" / "app_settings.json"
+        return get_app_base_path() / "monostudio_data" / "config" / "app_settings.json"
 
     def _toggle_maximize(self) -> None:
         if self.isMaximized():

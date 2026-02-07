@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets
+from monostudio.core.app_paths import get_app_base_path
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.recent_tasks_store import RecentTask
@@ -53,12 +54,11 @@ from monostudio.ui_qt.style import (
 
 
 class SidebarContext(str, Enum):
-    DASHBOARD = "Dashboard"
     PROJECTS = "Projects"
     SHOTS = "Shots"
     ASSETS = "Assets"
+    INBOX = "Inbox"
     LIBRARY = "Library"
-    DEPARTMENTS = "Departments"
 
 
 def _is_shot_type(type_id: str) -> bool:
@@ -93,8 +93,8 @@ def _lucide_two_state_icon(icon_name: str, *, fallback_name: str) -> QIcon:
 
 def _load_logo_pixmap(size: int, color_hex: str) -> QPixmap:
     """Load app logo from monostudio_data/icons/logo.svg; render at size with fill color (black & white)."""
-    repo_root = Path(__file__).resolve().parents[2]
-    logo_path = repo_root / "monostudio_data" / "icons" / "logo.svg"
+    base = get_app_base_path()
+    logo_path = base / "monostudio_data" / "icons" / "logo.svg"
     if not logo_path.is_file():
         return QPixmap()
     try:
@@ -564,7 +564,23 @@ class SidebarWidget(QWidget):
     def reload_from_pipeline_metadata(self) -> None:
         """
         UI-only: load departments/types from pipeline metadata JSON for current mode.
+        For mode "inbox": only Source (Client/Freelancer); no departments.
         """
+        if self._mode == "inbox":
+            self._all_types = ["client", "freelancer"]
+            self._type_label_by_id = {"client": "Client", "freelancer": "Freelancer"}
+            self._type_icon_by_id = {}
+            self._all_departments = []
+            self._dept_label_by_id = {}
+            self._dept_icon_by_id = {}
+            self._dept_parent = {}
+            if self._active_type is not None and self._active_type not in set(self._all_types):
+                self._active_type = None
+            self._active_department = None
+            self.set_departments([])
+            self.set_types(self._all_types)
+            return
+
         meta = load_pipeline_types_and_presets()
 
         # Types: stable ids + display names.
@@ -725,11 +741,11 @@ class SidebarWidget(QWidget):
 
     def set_mode(self, mode: str) -> None:
         """
-        UI-only: switch between assets/shots modes.
-        This controls which types/departments are listed from pipeline metadata.
+        UI-only: switch between assets/shots/inbox modes.
+        Inbox: only Source (Client/Freelancer) list; no departments.
         """
         m = (mode or "").strip().lower()
-        if m not in ("assets", "shots"):
+        if m not in ("assets", "shots", "inbox"):
             return
         if self._mode == m:
             return
@@ -1499,17 +1515,16 @@ class Sidebar(QWidget):
         self._nav.itemClicked.connect(self._on_nav_item_clicked)
 
         # Primary nav items (Lucide, order locked by spec)
-        self._add_nav_item(SidebarContext.DASHBOARD.value, "layout-dashboard")
         self._add_nav_item(SidebarContext.PROJECTS.value, "folder-kanban")
         self._add_nav_item(SidebarContext.SHOTS.value, "clapperboard")
         self._add_nav_item(SidebarContext.ASSETS.value, "box")
+        self._add_nav_item(SidebarContext.INBOX.value, "inbox")
         self._add_nav_item(SidebarContext.LIBRARY.value, "library")
-        self._add_nav_item(SidebarContext.DEPARTMENTS.value, "layers")
 
         top_layout.addWidget(brand, 0)
         top_layout.addWidget(self._nav, 0)
 
-        # --- Block 2+3: Scrollable center (Hierarchy + Recent Tasks)
+        # --- Block 2: Scrollable center (Filters only)
         scroll = QScrollArea(self)
         scroll.setObjectName("SidebarScrollArea")
         scroll.setWidgetResizable(True)
@@ -1528,10 +1543,15 @@ class Sidebar(QWidget):
         # Section: FILTERS (metadata-driven; mock data for now)
         self._filters = SidebarWidget(scroll_inner)
 
-        # Section: RECENT TASKS
-        tasks_block = QWidget(scroll_inner)
+        scroll_layout.addWidget(self._filters, 1)
+        scroll_layout.addStretch(1)
+        scroll.setWidget(scroll_inner)
+
+        # --- Block 3: Recent Tasks (fixed position, does not scroll)
+        tasks_block = QWidget(self)
+        tasks_block.setObjectName("SidebarRecentTasksBlock")
         tasks_layout = QVBoxLayout(tasks_block)
-        tasks_layout.setContentsMargins(0, 0, 0, 0)
+        tasks_layout.setContentsMargins(16, 12, 16, 8)  # align with sidebar padding
         tasks_layout.setSpacing(8)
 
         tasks_header = QLabel("RECENT TASKS", tasks_block)
@@ -1554,12 +1574,6 @@ class Sidebar(QWidget):
 
         tasks_layout.addWidget(tasks_header, 0)
         tasks_layout.addWidget(self._tasks_stacked, 0)
-        tasks_layout.addStretch(1)
-
-        scroll_layout.addWidget(self._filters, 1)
-        scroll_layout.addWidget(tasks_block, 0)
-        scroll_layout.addStretch(1)
-        scroll.setWidget(scroll_inner)
 
         # --- Block 4: Global Settings (bottom fixed)
         bottom = QWidget(self)
@@ -1581,6 +1595,7 @@ class Sidebar(QWidget):
 
         root.addWidget(top, 0)
         root.addWidget(scroll, 1)
+        root.addWidget(tasks_block, 0)  # fixed position, above Global Settings
         root.addWidget(bottom, 0)
 
         # Default context: Assets (keeps existing workflow stable)
@@ -1660,11 +1675,17 @@ class Sidebar(QWidget):
 
         self._last_context_text = context
         self._sync_nav_active_states()
-        # Filter panel departments/types depend on current browser page.
-        if context == SidebarContext.SHOTS.value:
-            self._filters.set_mode("shots")
-        elif context == SidebarContext.ASSETS.value:
-            self._filters.set_mode("assets")
+        # Filter panel: visible on Assets / Shots / Inbox; hidden on Projects, Library.
+        if context in (SidebarContext.PROJECTS.value, SidebarContext.LIBRARY.value):
+            self._filters.setVisible(False)
+        else:
+            self._filters.setVisible(True)
+            if context == SidebarContext.SHOTS.value:
+                self._filters.set_mode("shots")
+            elif context == SidebarContext.ASSETS.value:
+                self._filters.set_mode("assets")
+            elif context == SidebarContext.INBOX.value:
+                self._filters.set_mode("inbox")
         self.context_changed.emit(context)
 
     def _on_nav_item_clicked(self, item: QListWidgetItem) -> None:
