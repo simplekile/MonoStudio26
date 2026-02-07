@@ -1,0 +1,198 @@
+---
+description: Plan trang Inbox – chứa file client/freelancer, phân phối tới reference, concept, texture, sculpt...
+alwaysApply: false
+---
+
+# Plan: Trang Inbox (v1)
+
+Trang **Inbox** dùng để tập trung file từ client và freelancer, sau đó phân phối (distribute) vào đúng vị trí trong pipeline: reference, concept, texture, character sculpt, v.v.
+
+---
+
+## 1. Mục đích & phạm vi
+
+- **Chứa**: File/folder do client hoặc freelancer gửi (drop, upload, copy vào Inbox).
+- **Phân phối**: Một hoặc nhiều item trong Inbox được gán đích (reference, concept, texture, sculpt, …) và copy/move tới đúng vị trí trong project (asset/shot + folder tương ứng).
+- **Không làm (Phase 1)**: Sync cloud, email, approval workflow, versioning inbox – chỉ quản lý local folder + distribute.
+
+---
+
+## 2. Vị trí trong app
+
+- **Sidebar**: Thêm một nav item mới **Inbox** (icon gợi ý: `inbox` hoặc `mail` từ Lucide).
+- **Thứ tự nav**: Giữ Projects → Shots → Assets → Library; chèn **Inbox** giữa Assets và Library (hoặc sau Library) tùy spec.
+- **Context**: `SidebarContext.INBOX = "Inbox"`. Khi chọn Inbox, filter panel chỉ có **Source** (Client / Freelancer). Không có Department, không có Type.
+
+---
+
+## 3. Dữ liệu & cấu trúc trên disk
+
+### 3.1 Inbox root
+
+- **Đề xuất**: `<project_root>/inbox` (folder visible, dễ thấy cho artist/client drop file).
+- **Alternate**: `<project_root>/.monostudio/inbox` nếu muốn inbox “ẩn” khỏi browse thư mục thường; khi đó cần cách “Add to Inbox” rõ ràng (drag-drop vào app, hoặc nút “Add file/folder” mở dialog chọn file).
+
+Chốt Phase 1: **`<project_root>/inbox`** – đơn giản, dễ drop từ Explorer/Finder.
+
+### 3.2 Cấu trúc trong inbox (nested – dễ theo dõi khi client đặt tên không chuẩn)
+
+- **Chốt: Nested theo nguồn + tùy chọn cấp con** – tránh một đống file tên lộn xộn khó theo dõi.
+  - **Chuẩn**: `inbox/client/`, `inbox/freelancer/`; dưới mỗi nguồn có cấp con theo **date** (vd `client/2025-02-07/`) – folder vừa download được copy vào đúng `source/date/`. Metadata: `.monostudio/inbox_meta.json` keyed theo path tương đối. Value: `{ "source": "client" | "freelancer", "added_at": "ISO8601", "description": "" }`. **Date** mặc định là ngày kéo thả, user có thể tùy chỉnh.
+- **Scan**: đệ quy từ `inbox/`, bỏ qua hidden; build cây (tree) để UI hiển thị nested. Mỗi node: file hoặc folder, path tương đối, children (nếu folder).
+
+### 3.3 Model (Python)
+
+- **InboxItem** (dataclass hoặc typed dict):
+  - `path: Path` (absolute tới file/folder trong inbox)
+  - `relative_path: str` (từ inbox root, dùng làm key meta và cho tree)
+  - `name: str` (display – tên file/folder)
+  - `is_dir: bool`
+  - `source: str | None` ("client" | "freelancer")
+  - `added_at: str | None` (ISO; date folder thường theo ngày)
+  - `description: str | None` (ghi chú khi import)
+  - `children: list[InboxItem] | None` (nếu is_dir; None = chưa load con, rỗng = không có con)
+- **InboxTree**: Scan đệ quy trả về list[InboxItem] gốc (mỗi item có children); hoặc build tree on-demand (lazy load con khi expand).
+
+---
+
+## 4. Đích phân phối (Destinations)
+
+Cần map “loại đích” (reference, concept, texture, character sculpt, …) tới **path thực** trong project.
+
+### 4.1 Các loại đích điển hình
+
+| Destination type | Ý nghĩa | Path mẫu (project_root = P) |
+|------------------|--------|-----------------------------|
+| **Reference** | Reference chung asset/shot | Chưa có trong pipeline: cần định nghĩa. Ví dụ `assets/<type>/<name>/reference/` hoặc `shots/<name>/reference/`. |
+| **Concept** | Concept art / mood | Tương tự: `assets/<type>/<name>/concept/` hoặc `shots/<name>/concept/`. |
+| **Texture** | Texture cho surfacing | `assets/<type>/<name>/surfacing/texturing/` (hoặc flat `.../texturing/`) – có thể vào subfolder `ref` hoặc `in` tùy convention. |
+| **Character sculpt** | Sculpt ref / base mesh | `assets/character/<name>/modelling/sculpt/` (work hoặc subfolder ref). |
+| **Shot reference** | Ref cho shot | `shots/<name>/reference/` hoặc folder tương đương. |
+
+Pipeline hiện tại có **department folders** (sculpt, retopo, texturing, …) nhưng **không** có folder `reference` / `concept` chuẩn. Cần:
+
+- **Chuẩn hóa** (recommended): Thêm convention folder **reference** và **concept** cho asset và shot (ví dụ `assets/<type>/<name>/reference`, `.../concept`; `shots/<name>/reference`, `.../concept`). Không bắt buộc nằm trong department registry; có thể là “special folder” ngoài work/publish.
+- **Config**: File preset (ví dụ `monostudio_data/pipeline/inbox_destinations.json` hoặc trong `types_and_presets.json`) định nghĩa:
+  - `id`, `label`, `path_template` (relative to asset root hoặc shot root), `context`: "asset" | "shot" | "both".
+  - Ví dụ: `{"id": "reference", "label": "Reference", "path_template": "reference", "context": "both"}`.
+
+### 4.2 Khi map (không có dialog)
+
+- Map thao tác **trên trang Inbox** và **Inspector**, không mở dialog. User: (1) chọn item/folder từ cây trái → Add vào list mapping bên phải; (2) chọn một hoặc nhiều item trong list phải → trong **Inspector** chọn destination (type + asset/shot) và bấm xác nhận (Copy/Move). Path đích resolve từ destination preset + entity; copy (hoặc move) file/folder.
+
+---
+
+## 5. UI (không dùng dialog – toàn bộ trên trang + Inspector)
+
+### 5.1 Import / kéo thả folder vào Inbox
+
+- User **import hoặc kéo thả** folder vừa download từ client/freelancer vào Inbox. **Không mở dialog** – dùng form nhỏ inline hoặc panel (popover / slide panel) để nhập:
+  - **Phân loại**: Client hoặc Freelancer.
+  - **Date**: mặc định = ngày hôm nay (ngày kéo thả); user có thể tùy chỉnh. Folder sẽ nằm trong `inbox/<source>/<date>/` (vd `inbox/client/2025-02-07/`).
+  - **Description**: tùy chọn (ghi vào meta).
+- Sau khi xác nhận (hoặc drop), app copy folder vào `inbox/<source>/<date>/` và ghi meta (source, date, description).
+
+### 5.2 Khi click vào Inbox – Sidebar
+
+- User chọn **Source** (Client / Freelancer) ở sidebar. **Không có Department**, không có Type trên Inbox.
+- Sau đó user chọn **folder theo date** (vd click vào một date folder như `client/2025-02-07`) – lúc này nội dung chính chuyển sang **split view** (xem 5.3).
+
+### 5.3 Split view khi đã chọn date folder
+
+- **Không có dialog**. Giao diện chính chia **hai nửa**:
+  - **Bên trái**: **Cây thư mục** trong date folder đã chọn – hiển thị nội dung (file/folder) của folder ngày đó. User chọn item hoặc folder cần map → bấm **Add** → item/folder đó được **thêm vào list bên phải** (list mapping).
+  - **Bên phải**: **List mapping** – danh sách item/folder đã được user add từ trái, chuẩn bị map (sẽ distribute). User chọn destination cho từng item (hoặc nhiều mục) và xác nhận qua **Inspector** (xem 5.5).
+- Tóm tắt: **Trái = cây trong date folder (nguồn), phải = list item đã add, chuẩn bị map**. Add từ trái sang phải; destination và xác nhận ở Inspector.
+
+### 5.4 Actions (trên view, không dialog)
+
+- **Add**: Từ cây trái, chọn item/folder → bấm Add → thêm vào list mapping bên phải.
+- **Open folder**: Mở inbox (hoặc date folder) trong Explorer/Finder.
+- **Remove from mapping list**: Bỏ item khỏi list bên phải (chưa map).
+- **Refresh**: Rescan inbox / date folder.
+
+### 5.5 Sidebar khi context = Inbox
+
+- Chỉ hiển thị **Source** (Client / Freelancer). **Không hiển thị DEPARTMENTS**, không Type.
+
+### 5.6 Inspector – destination và xác nhận map
+
+- Khi user chọn **một hoặc nhiều mục** trong **list mapping (bên phải)**:
+  - Inspector hiển thị: danh sách item đã chọn, **chọn destination** (destination type + asset/shot – list hoặc combo từ project_index), option **Copy** vs **Move**, nút **Xác nhận / Distribute**.
+  - User chọn destination (vd Reference + asset `hero`), bấm xác nhận → app copy (hoặc move) file/folder vào path tương ứng. Có thể áp dụng cùng destination cho nhiều item đã chọn.
+- **Không có dialog** – toàn bộ thao tác chọn destination và xác nhận diễn ra trong Inspector.
+
+---
+
+## 6. Implementation touch points
+
+### 6.1 Core
+
+- **inbox_reader.py** (mới, trong `monostudio/core/`):
+  - `get_inbox_root(project_root: Path) -> Path`
+  - `scan_inbox(project_root: Path) -> list[InboxItem]` (scan đệ quy, mỗi item có `children`; list dir + đọc `.monostudio/inbox_meta.json`)
+  - `read_inbox_meta(project_root: Path) -> dict` / `write_inbox_meta(project_root: Path, data: dict)`
+  - `add_to_inbox(project_root: Path, source_path: Path, source_label: str, note: str) -> InboxItem | None` (copy + meta)
+  - `remove_from_inbox(project_root: Path, relative_key: str)` (xóa file/folder + cập nhật meta)
+
+- **inbox_destinations** (preset hoặc module):
+  - Đọc destination types từ JSON (path_template, context: asset/shot/both).
+  - `resolve_destination_path(project_root: Path, destination_id: str, entity: Asset | Shot) -> Path | None`
+
+- **Distribute logic**:
+  - Copy (hoặc move) từ `inbox_item.path` → `resolve_destination_path(...)`; nếu move thì gọi `remove_from_inbox` sau khi copy thành công.
+
+### 6.2 Models
+
+- **InboxItem** trong `monostudio/core/models.py` hoặc `monostudio/core/inbox_reader.py` (dataclass).
+
+### 6.3 UI
+
+- **Sidebar** (`sidebar.py`):
+  - Thêm `SidebarContext.INBOX = "Inbox"`.
+  - `_add_nav_item(SidebarContext.INBOX.value, "inbox")`.
+  - Trong `_on_current_nav_item_changed`: khi context == Inbox, ẩn hoặc đổi filter panel (Source filter).
+
+- **MainWindow** (`main_window.py`):
+  - Khi `context == "Inbox"`: hiển thị **Inbox view** (xem dưới). Trước khi chọn date folder: list/tree client/freelancer + date folders; khi chọn một date folder → chuyển sang **split view** (trái: cây nội dung date folder, phải: mapping list). Không dùng dialog.
+  - Drag-drop folder vào Inbox: hiển thị **inline form hoặc panel** (client/freelancer, date mặc định hôm nay, description). On confirm → copy vào `inbox/<source>/<date>/` + meta.
+
+- **Inbox view** (widget riêng hoặc tích hợp):
+  - **Bước 1** (chưa chọn date folder): List hoặc tree **client/freelancer** → **date folders** (user click chọn một date).
+  - **Bước 2** (đã chọn date folder): **Split view** – **Trái**: QTreeView cây thư mục **trong date folder** đã chọn; nút **Add** để thêm selection vào list bên phải. **Phải**: List **mapping** (item/folder đã add, chuẩn bị map). Selection bên phải → Inspector để chọn destination và xác nhận.
+
+- **Inspector** (`inspector.py`):
+  - Khi selection là **item(s) trong mapping list (bên phải)**: hiển thị panel **destination** – chọn destination type + asset/shot (list hoặc combo từ project_index), Copy vs Move, nút **Xác nhận / Distribute**. Không dialog – thao tác ngay trong Inspector.
+
+- **Không dùng dialog** cho import và distribute: form inline/panel khi drop; destination + xác nhận trong Inspector.
+
+### 6.4 Preset JSON (optional)
+
+- `monostudio_data/pipeline/inbox_destinations.json`:
+  - Array of `{ "id": "reference", "label": "Reference", "path_template": "reference", "context": "both" }`, `{ "id": "concept", ... }`, `{ "id": "texture", "label": "Texture", "path_template": "surfacing/texturing/ref", "context": "asset" }`, v.v.
+
+---
+
+## 7. Thứ tự implement gợi ý
+
+1. **Data & disk**: Định nghĩa `inbox/` + `.monostudio/inbox_meta.json`; model `InboxItem`; `inbox_reader.py` (scan, read/write meta, add, remove).
+2. **Destinations**: Preset inbox_destinations.json + logic resolve path (asset/shot + path_template).
+3. **Sidebar + routing**: `SidebarContext.INBOX`, nav item, `_reload_main_view` cho Inbox (scan → ViewItems).
+4. **MainView**: Hiển thị INBOX_ITEM (tile/list), context menu (Distribute, Open folder, Remove).
+5. **Inspector**: Panel cho Inbox item (metadata + actions).
+6. **Add to Inbox**: Dialog + copy + meta.
+7. **Distribute**: Dialog (destination type + entity) + copy/move + refresh.
+
+---
+
+## 8. Tóm tắt
+
+| Hạng mục | Nội dung |
+|----------|----------|
+| **Trang** | Inbox – sidebar nav mới, context "Inbox". |
+| **Dữ liệu** | `<project_root>/inbox` + `.monostudio/inbox_meta.json`; InboxItem (path, name, source, added_at, note). |
+| **Đích** | Reference, Concept, Texture, Sculpt, … qua preset path_template + asset/shot. |
+| **UI** | Không dialog. Import: kéo thả + form inline (client/freelancer, date, description). Trang Inbox: sidebar chỉ Source (không Department, không Type); chọn date folder → split view trái (cây date folder) + phải (list mapping); Add từ trái sang phải; destination + xác nhận trong Inspector. |
+| **Core** | inbox_reader.py (scan, meta, add, remove); resolve_destination_path; map = copy/move từ mapping list qua Inspector. |
+
+Khi implement, ưu tiên Phase 1: Inbox folder + cấu trúc source/date + form inline khi drop; split view (cây date + list mapping) + Add; Inspector destination + xác nhận (copy) tới ít nhất 2–3 đích (reference, concept, texture).
