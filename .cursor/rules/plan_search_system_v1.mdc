@@ -1,0 +1,161 @@
+---
+description: Plan hệ thống Search — filter theo text trong view hiện tại, optional global quick jump.
+alwaysApply: false
+---
+
+# Plan: Hệ thống Search (v1)
+
+Tài liệu này mô tả thiết kế **hệ thống search** cho MONOS: filter theo text trong view hiện tại (Assets / Shots / Projects / Inbox), và tùy chọn **global quick jump** (command palette hoặc omnibar) để nhảy nhanh tới entity.
+
+---
+
+## 1. Mục đích & phạm vi
+
+- **Filter theo text**: Trong từng context (Assets, Shots, Projects, Inbox), user nhập chuỗi → danh sách hiện tại chỉ hiển thị item **khớp** (tên, type, path, tùy context). Tương thích với filter Sidebar (department + type): search = bước lọc **bổ sung** (AND với department/type).
+- **Quick jump (Phase 2, optional)**: Một điểm vào chung (vd. Ctrl+K hoặc ô search global) → gợi ý Assets / Shots / Projects / Inbox items; chọn một mục → chuyển context + chọn item đó. Không bắt buộc Phase 1.
+- **Không làm (Phase 1)**: Full-text trong file, search trong nội dung publish, search ngoài project (workspace-wide global search có thể Phase 2).
+
+---
+
+## 2. Trạng thái hiện tại
+
+- **MainView** spec đã ghi "Search + Filters" nhưng **chưa có** ô search hay logic filter-by-text.
+- **Filter hiện tại**: Chỉ Sidebar (department + type cho Assets; source client/freelancer cho Inbox). `_reload_main_view` build `items` từ `filter_assets` + context, không có bước filter theo chuỗi text.
+- **Nguồn dữ liệu**: `app_state.get_assets_in_order()` / `get_shots_in_order()`, `_workspace_projects`, `scan_inbox(project_root)`; mỗi entity có `name`, `path`, (asset: `asset_type`), (inbox: `name`, path).
+
+---
+
+## 3. Phạm vi tìm kiếm theo context
+
+| Context   | Nguồn items                    | Trường tìm (match substring, case-insensitive) |
+|----------|---------------------------------|-------------------------------------------------|
+| **Assets**  | `filter_assets(..., dept, type)` | `name`, `asset_type`, `path` (path string)      |
+| **Shots**   | `get_shots_in_order()`          | `name`, `path`                                  |
+| **Projects**| `_workspace_projects`           | `proj.name`, `proj.root` (path)                 |
+| **Inbox**   | `scan_inbox` + source filter    | `name`, `relative_path`, `path`                 |
+
+- **Chuẩn hóa**: Chuỗi search normalize: strip, lower; match bằng `needle in haystack` (substring). Có thể mở rộng sau: tokenize, match từng từ (AND), hoặc regex (optional).
+- **Empty query**: Nếu search query rỗng → coi như “không áp dụng search”, hiển thị toàn bộ items đã qua filter Sidebar.
+
+---
+
+## 4. Vị trí trong app
+
+### 4.1 Search local (trong Main View) — Phase 1 bắt buộc
+
+- **Vị trí**: **Header của Main View** (cùng hàng với context title / type badge / view mode), bên phải hoặc giữa: một **ô search** (QLineEdit) với placeholder "Search…" / "Search assets…" (context-aware).
+- **Hành vi**: User gõ → sau debounce (vd. 150–200 ms) emit **search query** → MainWindow (hoặc controller) lưu `current_search_query: str` và gọi `_reload_main_view()`. Trong `_reload_main_view`, sau khi có `items` từ filter Sidebar (và context), **áp dụng thêm** filter theo `current_search_query`: giữ lại item nếu bất kỳ trường nào (name, type, path) chứa chuỗi (case-insensitive). Set items đã filter vào MainView.
+- **Clear**: Nút clear (X) trong ô khi có text; clear → query = "" → reload.
+
+### 4.2 Global quick jump (Phase 2, optional)
+
+- **Điểm vào**: Shortcut **Ctrl+K** (hoặc Cmd+K) mở **command palette / omnibar**: một popup giữa màn hình với ô search, gợi ý theo realtime:
+  - Projects (tên, path)
+  - Assets (trong project hiện tại: name, type)
+  - Shots (trong project hiện tại: name)
+  - Inbox items (nếu có project)
+- **Hành vi**: Chọn một dòng → đóng palette; **chuyển context** (Projects/Assets/Shots/Inbox) nếu cần; **chọn item** tương ứng (set selection, scroll into view). Có thể kèm “quick actions” (Open, Create New…) trong palette sau.
+- **Data**: Cùng nguồn với local search; có thể build list gợi ý từ `app_state` + `_workspace_projects` + inbox, filter theo text giống local.
+
+---
+
+## 5. Luồng dữ liệu (Phase 1)
+
+1. **MainView** (header): QLineEdit search + nút clear. Signal `search_query_changed(str)` (emit sau debounce).
+2. **MainWindow** (hoặc AppController): Giữ `current_search_query: str`; connect `search_query_changed` → set `current_search_query` → `_reload_main_view()`.
+3. **`_reload_main_view()`**: Như hiện tại build `items` theo context + Sidebar filter; **trước khi** `set_items(items)`:
+   - Nếu `current_search_query` rỗng → không làm gì thêm.
+   - Nếu không rỗng → filter `items`: giữ lại chỉ những `ViewItem` có ít nhất một trường (name, type_badge, path string) chứa chuỗi (normalize: lower, strip).
+4. **MainView**: Nhận `items` đã filter → hiển thị. Empty state: "No matches for «query»" khi items rỗng nhưng có query.
+
+---
+
+## 6. Chi tiết kỹ thuật
+
+### 6.1 Normalize và match
+
+- Query: `q = (current_search_query or "").strip().lower()`.
+- Với mỗi `ViewItem`:
+  - `name_norm = (item.name or "").lower()`
+  - `type_norm = (item.type_badge or "").lower()`
+  - `path_norm = str(item.path).lower()`
+  - Giữ item nếu `q in name_norm or q in type_norm or q in path_norm` (và `q` không rỗng).
+
+### 6.2 Debounce
+
+- MainView (hoặc widget search) debounce 150–200 ms trước khi emit `search_query_changed(text)`, tránh reload liên tục khi gõ nhanh.
+
+### 6.3 Placeholder / accessibility
+
+- Placeholder text theo context: "Search assets", "Search shots", "Search projects", "Search inbox".
+- ObjectName cho QLineEdit (vd. `MainViewSearchInput`) để QSS và test.
+
+### 6.4 Sync với Sidebar / filter
+
+- Search **không** thay đổi Sidebar (department/type). Sidebar vẫn là filter chính; search chỉ lọc thêm trên kết quả đã filter. Khi đổi department/type → `_reload_main_view` chạy → dùng cùng `current_search_query` để filter bước hai.
+
+---
+
+## 7. Implementation touch points
+
+### 7.1 Core / logic
+
+- **MainWindow** (hoặc helper):
+  - `current_search_query: str` (instance var).
+  - Trong `_reload_main_view()`: sau khi build `items` (Projects / Assets / Shots / Inbox), gọi `_apply_search_filter(items, self.current_search_query) -> list[ViewItem]`; dùng kết quả cho `set_items(...)`.
+- **Hàm** `_apply_search_filter(items: list[ViewItem], query: str) -> list[ViewItem]`: normalize query; với mỗi item kiểm tra name/type_badge/path; trả về list con.
+
+### 7.2 UI
+
+- **MainView** (`main_view.py`):
+  - Header: thêm **QLineEdit** (search) + **QToolButton** (clear, icon X); layout cùng hàng với title/type badge/view mode.
+  - Debounce: QTimer singleShot 150–200 ms; on `textChanged` schedule timer, khi timer fire emit `search_query_changed(self._search_input.text())`.
+  - Signal: `search_query_changed = Signal(str)`.
+  - Method: `set_search_placeholder(text: str)` để MainWindow set placeholder theo context (optional; có thể set mỗi lần set_context).
+  - Clear button: khi có text, click → clear line edit → emit `search_query_changed("")`.
+- **MainWindow**:
+  - Connect `main_view.search_query_changed` → slot: set `current_search_query`, gọi `_reload_main_view()`.
+  - Khi đổi context (sidebar nav), có thể clear search (query = "") hoặc giữ query tùy spec; **đề xuất**: giữ query khi chuyển Assets ↔ Shots trong cùng project, clear khi chuyển sang Projects/Inbox (hoặc ngược lại giữ để UX đơn giản).
+
+### 7.3 Empty state
+
+- MainView đã có `set_empty_override(msg)`. Khi `items` rỗng **và** `current_search_query` không rỗng → `set_empty_override("No matches for \"" + query + "\"")` (escape nếu cần). Khi query rỗng và items rỗng → dùng empty message theo context như hiện tại.
+
+### 7.4 Style (QSS)
+
+- Ô search: đồng bộ Deep Dark (nền #1c1c1f, viền #2a2a2d, text Zinc-200); font Inter 13px; placeholder Zinc-500. Có thể đặt trong `style.py` cho `QLineEdit` trong MainViewHeader hoặc dùng objectName.
+
+---
+
+## 8. Thứ tự implement gợi ý (Phase 1)
+
+1. **Logic filter**: Thêm `_apply_search_filter(items, query)` (có thể trong `main_window.py` hoặc `monostudio/ui_qt/search_filter.py`); gọi từ `_reload_main_view` sau khi build items.
+2. **State**: Thêm `current_search_query` trong MainWindow; tích hợp vào `_reload_main_view` và empty state.
+3. **MainView header**: Thêm QLineEdit + clear button; debounce; signal `search_query_changed`.
+4. **MainWindow connect**: Connect signal → set query → `_reload_main_view()`; set placeholder theo context khi đổi nav.
+5. **Empty state**: Khi items rỗng và query không rỗng → set_empty_override("No matches for …").
+6. **Polish**: QSS, accessibility, clear-on-context (nếu chọn clear khi sang Projects/Inbox).
+
+---
+
+## 9. Phase 2 (optional): Global quick jump
+
+- **Command palette**: Widget popup (frameless, rounded), ô search ở trên; list gợi ý bên dưới (QListWidget hoặc custom). Dữ liệu: merge projects + assets + shots + inbox; filter theo text giống trên; mỗi row hiển thị icon + label + sublabel (path/type).
+- **Shortcut**: Ctrl+K (Cmd+K) → show palette, focus ô search.
+- **Chọn item**: Emit signal với (context, item_id/path) → MainWindow chuyển context (sidebar + controller), set selection, đóng palette.
+- **Vị trí code**: Có thể `monostudio/ui_qt/command_palette.py` hoặc `quick_jump_dialog.py`; MainWindow connect shortcut và show/hide.
+
+---
+
+## 10. Tóm tắt
+
+| Hạng mục | Nội dung |
+|----------|----------|
+| **Mục đích** | Filter theo text trong view hiện tại (AND với Sidebar); optional Phase 2: global quick jump (Ctrl+K). |
+| **Phạm vi tìm** | Assets: name, type, path. Shots: name, path. Projects: name, path. Inbox: name, path/relative_path. |
+| **Vị trí UI** | Ô search trong **Main View header** (Phase 1); optional command palette (Phase 2). |
+| **Luồng** | MainView search QLineEdit (debounce) → search_query_changed → MainWindow current_search_query → _reload_main_view → _apply_search_filter(items, query) → set_items. |
+| **Core** | _apply_search_filter(items, query); normalize query; match substring trên name/type_badge/path. |
+| **Empty state** | "No matches for «query»" khi có query và items rỗng. |
+
+Khi implement Phase 1, ưu tiên: logic filter + state → UI search + connect → empty state → style.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,12 +10,15 @@ from PySide6.QtCore import Qt, Signal, QSize, QPoint, QTimer
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMenu,
+    QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QToolButton,
@@ -22,7 +26,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.core.models import Asset, Department, Shot
+from monostudio.core.models import Asset, Department, Shot, ProjectIndex
+from monostudio.core.inbox_reader import load_inbox_destinations, resolve_destination_path
+from monostudio.core.type_registry import TypeRegistry
+from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 from monostudio.ui_qt.thumbnails import ThumbnailCache
@@ -93,9 +100,9 @@ class InspectorPanel(QWidget):
     close_requested = Signal()
     manage_departments_requested = Signal()
     paste_thumbnail_requested = Signal(object)  # emits ViewItem (asset/shot only)
-    open_requested = Signal(object)  # emits ViewItem (asset/shot only)
-    open_with_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    open_folder_requested = Signal(object)  # emits ViewItem — mở folder trong explorer
     status_change_requested = Signal(object, str)  # (ViewItem, status: ready|progress|waiting|blocked)
+    inbox_distribute_finished = Signal(list)  # emits list of paths after distribute from Inbox
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -134,9 +141,11 @@ class InspectorPanel(QWidget):
         self._dept_pipeline.manage_clicked.connect(self.manage_departments_requested.emit)
         self._dept_pipeline.department_focused.connect(self._on_department_focused)
         self._preview.paste_requested.connect(self._on_paste_requested)
-        self._asset_status.open_clicked.connect(self._on_open_clicked)
-        self._asset_status.open_with_clicked.connect(self._on_open_with_clicked)
+        self._asset_status.open_folder_clicked.connect(self._on_open_folder_requested)
         self._asset_status.status_change_requested.connect(self.status_change_requested.emit)
+
+        self._inbox_destination = _InboxDestinationBlock()
+        self._inbox_destination.distribute_finished.connect(self.inbox_distribute_finished.emit)
 
         for w in (
             self._empty,
@@ -145,21 +154,52 @@ class InspectorPanel(QWidget):
             self._dept_pipeline,
             self._tech,
             self._stakeholders,
+            self._inbox_destination,
         ):
             self._content_layout.addWidget(w, 0)
 
         self._content_layout.addStretch(1)
+        self._inbox_destination.setVisible(False)
         self._scroll.setWidget(content)
 
         self._current_item: ViewItem | None = None
         self._previous_item: ViewItem | None = None
         self._thumbnail_manager: object | None = None
+        self._department_label_resolver: object | None = None  # callable[[str], str] | None
+        self._department_registry: object | None = None  # DepartmentRegistry | None (để biết subdepartment, display name)
         self.set_item(None)
+
+    def set_department_label_resolver(self, resolver: object | None) -> None:
+        """Gán hàm dept_id -> label (từ DepartmentRegistry.get_department_label) để hiển thị tên thay ID; None để dùng id."""
+        self._department_label_resolver = resolver
+
+    def set_department_registry(self, registry: object | None) -> None:
+        """Gán DepartmentRegistry: dùng cho display name + ưu tiên subdepartment trong meta."""
+        self._department_registry = registry
+        if registry is not None and hasattr(registry, "get_department_label"):
+            self._department_label_resolver = registry.get_department_label
+        else:
+            self._department_label_resolver = None
 
     def set_thumbnail_manager(self, manager: object | None) -> None:
         """Use ThumbnailManager for async loading; None to use legacy ThumbnailCache only."""
         self._thumbnail_manager = manager
         self._preview.set_thumbnail_manager(manager)
+
+    def set_inbox_mapping_selection(
+        self,
+        paths: list,
+        project_root: Path | None,
+        project_index: ProjectIndex | None,
+    ) -> None:
+        """Inbox: hiển thị block DESTINATION khi có item trong mapping list được chọn."""
+        path_list = [Path(p) for p in paths if p] if paths else []
+        if not path_list:
+            self._inbox_destination.setVisible(False)
+            self._inbox_destination.set_data([], None, None)
+            return
+        self._inbox_destination.set_data(path_list, project_root, project_index)
+        self._inbox_destination.setVisible(True)
 
     def set_item(self, item: ViewItem | None) -> None:
         # Diff-based: never rebuild layout. Update only changed sections; preserve scroll position.
@@ -230,6 +270,12 @@ class InspectorPanel(QWidget):
         except Exception:
             pass
 
+    def _on_open_folder_requested(self) -> None:
+        item = self._current_item
+        if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        self.open_folder_requested.emit(item)
+
     def _on_paste_requested(self) -> None:
         item = self._current_item
         if item is None:
@@ -238,21 +284,6 @@ class InspectorPanel(QWidget):
             return
         self.paste_thumbnail_requested.emit(item)
 
-    def _on_open_clicked(self) -> None:
-        item = self._current_item
-        if item is None:
-            return
-        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
-            return
-        self.open_requested.emit(item)
-
-    def _on_open_with_clicked(self) -> None:
-        item = self._current_item
-        if item is None:
-            return
-        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
-            return
-        self.open_with_requested.emit(item)
 
     def _on_department_focused(self, department_name: str) -> None:
         """Update Tech row with the clicked department's work path (no focus state)."""
@@ -291,6 +322,49 @@ class InspectorPanel(QWidget):
 
 
 _V_RE = re.compile(r"^v(\d{3})$")
+
+
+def _version_from_path(path: Path | None) -> str:
+    """Rút version từ path: ưu tiên _v001 trong tên file (vd char_Zephy_01_sculpt_v002.blend → v002)."""
+    if not path:
+        return "—"
+    name = path.name or ""
+    # Tên file: ..._v002.blend hoặc ..._v002
+    m = re.search(r"_v(\d{3})(?:\.\w+)?$", name) or re.search(r"_v(\d{3})\b", name)
+    if m:
+        return f"v{m.group(1)}"
+    # Folder tên v001, v002
+    if _V_RE.match(name):
+        return name
+    # Trong đường dẫn có segment v001/v002 (vd .../publish/v002)
+    for part in path.parts:
+        if _V_RE.match(part):
+            return part
+    return "—"
+
+
+def _path_for_version(item: ViewItem) -> Path | None:
+    """
+    Path dùng để rút version: ưu tiên path FILE work (vd .blend) từ dcc_work_states.
+    Nếu có nhiều work file thì lấy version cao nhất; không có thì dùng item.path.
+    """
+    ref = item.ref
+    if not isinstance(ref, (Asset, Shot)):
+        return item.path
+    states = getattr(ref, "dcc_work_states", None) or ()
+    paths_with_version: list[tuple[Path, int]] = []
+    for key_st in states:
+        if isinstance(key_st, (tuple, list)) and len(key_st) >= 2:
+            st = key_st[1]
+            wp = getattr(st, "work_file_path", None)
+            if wp and isinstance(wp, Path):
+                ver_str = _version_from_path(wp)
+                if ver_str != "—" and _V_RE.match(ver_str):
+                    paths_with_version.append((wp, int(_V_RE.match(ver_str).group(1))))
+    if paths_with_version:
+        best = max(paths_with_version, key=lambda pv: pv[1])
+        return best[0]
+    return item.path
 
 
 def _format_mtime(path: Path) -> str:
@@ -633,20 +707,28 @@ class _IdentityBlock(QWidget):
         meta_row = QWidget(self)
         meta_l = QHBoxLayout(meta_row)
         meta_l.setContentsMargins(0, 0, 0, 0)
-        meta_l.setSpacing(8)
+        meta_l.setSpacing(6)
 
-        self._meta_left = QLabel("", self)
-        self._meta_left.setStyleSheet(f"color: {MONOS_COLORS['text_label']};")
+        self._meta_type = QLabel("", self)
+        self._meta_type.setStyleSheet(f"color: {MONOS_COLORS['text_label']};")
 
-        dot = QLabel("·", self)
-        dot.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
+        dot1 = QLabel("·", self)
+        dot1.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
 
-        self._meta_version = QLabel("", self)
+        self._meta_dept = QLabel("", self)
+        self._meta_dept.setStyleSheet(f"color: {MONOS_COLORS['text_label']};")
+
+        dot2 = QLabel("·", self)
+        dot2.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
+
+        self._meta_version = QLabel("—", self)
         self._meta_version.setProperty("mono", True)
         self._meta_version.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
 
-        meta_l.addWidget(self._meta_left, 0)
-        meta_l.addWidget(dot, 0)
+        meta_l.addWidget(self._meta_type, 0)
+        meta_l.addWidget(dot1, 0)
+        meta_l.addWidget(self._meta_dept, 0)
+        meta_l.addWidget(dot2, 0)
         meta_l.addWidget(self._meta_version, 0)
         meta_l.addStretch(1)
 
@@ -655,23 +737,56 @@ class _IdentityBlock(QWidget):
 
     def set_item(self, item: ViewItem) -> None:
         self._name.setText(display_name_for_item(item))
-        kind = item.kind.value.upper()
-        version = "—"
         ref = item.ref
+        # Type: asset_type (char/prop/env) for Asset, else kind (ASSET/SHOT/DEPARTMENT)
+        if isinstance(ref, Asset) and (ref.asset_type or "").strip():
+            type_str = (ref.asset_type or "").strip().upper()
+        else:
+            type_str = item.kind.value.upper()
+        # Department: display name (label); có subdepartment thì ưu tiên subdepartment, không hiện parent
+        dept_str = "—"
+        registry = None
+        label_resolver = None
+        p = self.parent()
+        while p:
+            if getattr(p, "_department_registry", None) is not None:
+                registry = getattr(p, "_department_registry", None)
+            if getattr(p, "_department_label_resolver", None) is not None:
+                label_resolver = getattr(p, "_department_label_resolver", None)
+            if registry is not None and label_resolver is not None:
+                break
+            p = p.parent()
+        if isinstance(ref, Department):
+            raw = ref.name or "—"
+            dept_str = (_department_display_name(raw, label_resolver) if raw != "—" else "—")
+        elif isinstance(ref, (Asset, Shot)) and ref.departments:
+            # Có subdepartment thì lấy subdepartment (leaf), không hiện department (parent)
+            dept_to_show = None
+            if registry is not None and hasattr(registry, "is_subdepartment"):
+                subdepts = [d for d in ref.departments if registry.is_subdepartment(d.name or "")]
+                dept_to_show = subdepts[0] if subdepts else ref.departments[0]
+            else:
+                dept_to_show = ref.departments[0]
+            raw = dept_to_show.name or "—"
+            dept_str = _department_display_name(raw, label_resolver) if raw else "—"
+        # Version: Department = latest_publish_version; Asset/Shot = rút từ path FILE; hiển thị uppercase
+        version = "—"
         if isinstance(ref, Department):
             if ref.latest_publish_version and _V_RE.match(ref.latest_publish_version):
-                version = ref.latest_publish_version
+                version = (ref.latest_publish_version or "").upper()
         elif isinstance(ref, (Asset, Shot)):
-            version = _infer_latest_version_from_departments(ref.departments)
+            path_for_version = _path_for_version(item)
+            v = _version_from_path(path_for_version)
+            version = v.upper() if v and v != "—" else (v or "—")
 
-        self._meta_left.setText(kind)
+        self._meta_type.setText(type_str)
+        self._meta_dept.setText(dept_str)
         self._meta_version.setText(version)
 
 
 class _InspectorAssetStatusBlock(QWidget):
-    """One container: row1 = Asset info (name+meta) | Status combo; row2 = Open, Open With."""
-    open_clicked = Signal()
-    open_with_clicked = Signal()
+    """One container: row1 = Asset info (name+meta) | Status combo; row2 = Open folder."""
+    open_folder_clicked = Signal()
     status_change_requested = Signal(object, str)
 
     def __init__(self, parent=None) -> None:
@@ -694,20 +809,13 @@ class _InspectorAssetStatusBlock(QWidget):
         row2_l = QHBoxLayout(row2)
         row2_l.setContentsMargins(0, 0, 0, 0)
         row2_l.setSpacing(8)
-        self._btn_open = QToolButton(row2)
-        self._btn_open.setText("Open")
-        self._btn_open.setCursor(Qt.PointingHandCursor)
-        self._btn_open.setAutoRaise(True)
-        self._btn_open.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
-        self._btn_open.clicked.connect(self.open_clicked.emit)
-        self._btn_open_with = QToolButton(row2)
-        self._btn_open_with.setText("Open With…")
-        self._btn_open_with.setCursor(Qt.PointingHandCursor)
-        self._btn_open_with.setAutoRaise(True)
-        self._btn_open_with.setIcon(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]))
-        self._btn_open_with.clicked.connect(self.open_with_clicked.emit)
-        row2_l.addWidget(self._btn_open, 0)
-        row2_l.addWidget(self._btn_open_with, 0)
+        self._btn_open_folder = QToolButton(row2)
+        self._btn_open_folder.setText("Open folder")
+        self._btn_open_folder.setCursor(Qt.PointingHandCursor)
+        self._btn_open_folder.setAutoRaise(True)
+        self._btn_open_folder.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_open_folder.clicked.connect(self._on_open_folder_clicked)
+        row2_l.addWidget(self._btn_open_folder, 0)
         row2_l.addStretch(1)
 
         l.addWidget(row1, 0)
@@ -715,12 +823,14 @@ class _InspectorAssetStatusBlock(QWidget):
 
         self._health.status_change_requested.connect(self.status_change_requested.emit)
 
+    def _on_open_folder_clicked(self) -> None:
+        self.open_folder_clicked.emit()
+
     def set_item(self, item: ViewItem) -> None:
         self._identity.set_item(item)
         self._health.set_item(item)
         is_asset_or_shot = bool(item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT))
-        self._btn_open.setEnabled(is_asset_or_shot)
-        self._btn_open_with.setEnabled(is_asset_or_shot)
+        self._btn_open_folder.setEnabled(is_asset_or_shot)
 
     def update_identity(self, item: ViewItem) -> None:
         self._identity.set_item(item)
@@ -829,36 +939,6 @@ class _ProductionHealth(QWidget):
             self.status_change_requested.emit(self._current_item, key)
 
 
-class _ThinProgress(QWidget):
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setFixedHeight(4)
-        self._value = 0
-
-    def set_value(self, v: int) -> None:
-        self._value = max(0, min(100, int(v)))
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        _ = event
-        p = QPainter(self)
-        try:
-            p.setRenderHint(QPainter.Antialiasing, True)
-            r = self.rect()
-            bg = QColor(MONOS_COLORS["border"])
-            fg = QColor(MONOS_COLORS["blue_600"])
-            p.setPen(Qt.NoPen)
-            p.setBrush(bg)
-            p.drawRoundedRect(r, 2, 2)
-            if self._value > 0:
-                w = max(1, int(r.width() * (self._value / 100.0)))
-                fr = r.adjusted(0, 0, -(r.width() - w), 0)
-                p.setBrush(fg)
-                p.drawRoundedRect(fr, 2, 2)
-        finally:
-            p.end()
-
-
 class _DeptCard(QFrame):
     clicked = Signal()
 
@@ -866,17 +946,17 @@ class _DeptCard(QFrame):
         super().__init__(parent)
         self.setObjectName("InspectorDeptCard")
         self.setFrameShape(QFrame.NoFrame)
-        self.setFixedHeight(76)
+        self.setFixedHeight(48)
         self.setCursor(Qt.PointingHandCursor)
 
         l = QVBoxLayout(self)
         l.setContentsMargins(12, 10, 12, 10)
-        l.setSpacing(8)
+        l.setSpacing(0)
 
-        top = QWidget(self)
-        top_l = QHBoxLayout(top)
-        top_l.setContentsMargins(0, 0, 0, 0)
-        top_l.setSpacing(8)
+        row = QWidget(self)
+        row_l = QHBoxLayout(row)
+        row_l.setContentsMargins(0, 0, 0, 0)
+        row_l.setSpacing(8)
 
         self._name = QLabel("", self)
         self._name.setStyleSheet(f"color: {MONOS_COLORS['text_primary']};")
@@ -889,80 +969,29 @@ class _DeptCard(QFrame):
             f"padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.06); color: {MONOS_COLORS['text_label']};"
         )
 
-        top_l.addWidget(self._name, 1)
-        top_l.addWidget(self._pill, 0, Qt.AlignRight)
-
-        mid = QWidget(self)
-        mid_l = QHBoxLayout(mid)
-        mid_l.setContentsMargins(0, 0, 0, 0)
-        mid_l.setSpacing(10)
-
-        self._progress = _ThinProgress(self)
-        self._progress.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        self._assignee_avatar = QLabel("—", self)
-        self._assignee_avatar.setFixedSize(20, 20)
-        self._assignee_avatar.setAlignment(Qt.AlignCenter)
-        self._assignee_avatar.setStyleSheet(
-            f"border-radius: 10px; background: {MONOS_COLORS['content_bg']}; color: {MONOS_COLORS['text_meta']};"
-        )
-        self._assignee = QLabel("—", self)
-        self._assignee.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
-
-        actions = QWidget(self)
-        act_l = QHBoxLayout(actions)
-        act_l.setContentsMargins(0, 0, 0, 0)
-        act_l.setSpacing(2)
-
         self._btn_open = QToolButton(self)
         self._btn_open.setAutoRaise(True)
         self._btn_open.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
         self._btn_open.setToolTip("Open folder")
 
-        self._btn_publish = QToolButton(self)
-        self._btn_publish.setAutoRaise(True)
-        self._btn_publish.setEnabled(False)
-        self._btn_publish.setIcon(lucide_icon("upload", size=16, color_hex=MONOS_COLORS["text_meta"]))
-        self._btn_publish.setToolTip("Publish (not available yet)")
+        row_l.addWidget(self._name, 1)
+        row_l.addWidget(self._pill, 0, Qt.AlignVCenter)
+        row_l.addWidget(self._btn_open, 0, Qt.AlignVCenter)
 
-        self._btn_comment = QToolButton(self)
-        self._btn_comment.setAutoRaise(True)
-        self._btn_comment.setEnabled(False)
-        self._btn_comment.setIcon(lucide_icon("message-circle", size=16, color_hex=MONOS_COLORS["text_meta"]))
-        self._btn_comment.setToolTip("Comment (not available yet)")
-
-        self._btn_more = QToolButton(self)
-        self._btn_more.setAutoRaise(True)
-        self._btn_more.setEnabled(False)
-        self._btn_more.setIcon(lucide_icon("ellipsis", size=16, color_hex=MONOS_COLORS["text_meta"]))
-        self._btn_more.setToolTip("More (not available yet)")
-
-        for b in (self._btn_open, self._btn_publish, self._btn_comment, self._btn_more):
-            act_l.addWidget(b, 0)
-
-        mid_l.addWidget(self._progress, 1)
-        mid_l.addWidget(self._assignee_avatar, 0)
-        mid_l.addWidget(self._assignee, 0)
-        mid_l.addStretch(1)
-        mid_l.addWidget(actions, 0, Qt.AlignRight)
-
-        l.addWidget(top, 0)
-        l.addWidget(mid, 0)
+        l.addWidget(row, 0)
 
         self._dept: Department | None = None
         self._btn_open.clicked.connect(self._open_folder)
 
-    def set_department(self, dept: Department) -> None:
+    def set_department(self, dept: Department, display_name: str | None = None) -> None:
         self._dept = dept
-        self._name.setText(dept.name)
+        text = (display_name or dept.name or "").strip().upper()
+        self._name.setText(text)
         status = _status_from_department(dept)
         self._pill.setText(status)
         self._pill.setStyleSheet(
             f"padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.06); color: {_status_color(status)};"
         )
-        self._progress.set_value(100 if status == "READY" else (50 if status == "PROGRESS" else 0))
-        self._assignee_avatar.setText("—")
-        self._assignee.setText("—")
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         # Clicking the card updates Tech row with this department's work path.
@@ -985,6 +1014,15 @@ class _DeptCard(QFrame):
 
 
 _MAX_DEPT_CARDS = 32
+_MAX_DEPT_SECTIONS = 16
+
+
+def _department_display_name(dept_id: str, label_resolver: object | None) -> str:
+    """Tên hiển thị: label từ registry nếu có, else dept_id; luôn uppercase."""
+    if callable(label_resolver):
+        label = label_resolver(dept_id)
+        return (label or dept_id or "").strip().upper()
+    return (dept_id or "").strip().upper()
 
 
 class _DepartmentPipeline(QWidget):
@@ -1024,16 +1062,25 @@ class _DepartmentPipeline(QWidget):
         self._list = QWidget(self)
         self._list_l = QVBoxLayout(self._list)
         self._list_l.setContentsMargins(0, 0, 0, 0)
-        self._list_l.setSpacing(12)
+        self._list_l.setSpacing(8)
+
+        self._section_titles: list[QLabel] = []
+        for _ in range(_MAX_DEPT_SECTIONS):
+            lbl = QLabel(self._list)
+            lbl.setObjectName("InspectorSectionTitle")
+            f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
+            lbl.setFont(f)
+            lbl.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
+            lbl.setVisible(False)
+            self._section_titles.append(lbl)
 
         self._dept_cards: list[_DeptCard] = []
-        self._dept_click_handlers: list[object] = []  # stored slots for disconnect
+        self._dept_card_slots: list[object] = []  # slot per card for clean disconnect
         for _ in range(_MAX_DEPT_CARDS):
-            card = _DeptCard(self)
+            card = _DeptCard(self._list)
             card.setVisible(False)
             self._dept_cards.append(card)
-            self._dept_click_handlers.append(None)
-            self._list_l.addWidget(card, 0)
+            self._dept_card_slots.append(None)
 
         self._empty = QLabel("—", self)
         self._empty.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
@@ -1043,43 +1090,107 @@ class _DepartmentPipeline(QWidget):
         l.addWidget(self._empty, 0)
 
     def set_item(self, item: ViewItem) -> None:
-        # Reuse card pool: never delete or create widgets; update and show/hide only.
-        depts: tuple[Department, ...] = ()
         ref = item.ref
         if isinstance(ref, Department):
             depts = (ref,)
         elif isinstance(ref, (Asset, Shot)):
             depts = ref.departments
+        else:
+            depts = ()
+
+        registry = None
+        label_resolver = None
+        p = self.parent()
+        while p:
+            if getattr(p, "_department_registry", None) is not None:
+                registry = getattr(p, "_department_registry", None)
+            if getattr(p, "_department_label_resolver", None) is not None:
+                label_resolver = getattr(p, "_department_label_resolver", None)
+            if registry is not None and label_resolver is not None:
+                break
+            p = p.parent()
 
         if not depts:
+            while self._list_l.count():
+                self._list_l.takeAt(0)
             for c in self._dept_cards:
                 c.setVisible(False)
+            for s in self._section_titles:
+                s.setVisible(False)
             self._empty.setVisible(True)
             return
 
         self._empty.setVisible(False)
-        for i, d in enumerate(depts):
-            card = self._dept_cards[i]
-            card.set_department(d)
-            card.setVisible(True)
-            # Disconnect previous slot if any (avoids RuntimeWarning when none connected).
-            old_handler = self._dept_click_handlers[i]
-            if old_handler is not None:
+
+        # Thứ tự theo registry (giống sidebar)
+        if registry and hasattr(registry, "get_departments"):
+            ordered_ids = list(registry.get_departments())
+            dept_by_id = {d.name: d for d in depts}
+            ordered_depts = [dept_by_id[dept_id] for dept_id in ordered_ids if dept_id in dept_by_id]
+        else:
+            ordered_depts = list(depts)
+
+        # Build rows: ("section", parent_label) hoặc ("dept", Department) — subdepartment nằm trong container có title = department (parent)
+        rows: list[tuple[str, object]] = []
+        sections_emitted: set[str] = set()
+        for d in ordered_depts:
+            dept_id = d.name or ""
+            parent_id = registry.get_parent(dept_id) if registry and hasattr(registry, "get_parent") else None
+            if parent_id and parent_id not in sections_emitted:
+                parent_label = (registry.get_department_label(parent_id) or parent_id).strip().upper()
+                rows.append(("section", parent_label))
+                sections_emitted.add(parent_id)
+            rows.append(("dept", d))
+
+        # Disconnect only cards that had a slot connected (tránh RuntimeWarning khi disconnect None)
+        for i, card in enumerate(self._dept_cards):
+            slot = self._dept_card_slots[i] if i < len(self._dept_card_slots) else None
+            if slot is not None:
                 try:
-                    card.clicked.disconnect(old_handler)
+                    card.clicked.disconnect(slot)
                 except (TypeError, RuntimeError):
                     pass
-                self._dept_click_handlers[i] = None
+                self._dept_card_slots[i] = None
 
-            def on_clicked(idx: int = i) -> None:
-                dept_name = depts[idx].name if idx < len(depts) else None
-                if dept_name:
-                    self.department_focused.emit(dept_name)
+        while self._list_l.count():
+            self._list_l.takeAt(0)
 
-            card.clicked.connect(on_clicked)
-            self._dept_click_handlers[i] = on_clicked
-        for j in range(len(depts), len(self._dept_cards)):
-            self._dept_cards[j].setVisible(False)
+        section_idx = 0
+        card_idx = 0
+        for typ, data in rows:
+            if typ == "section":
+                if section_idx >= len(self._section_titles):
+                    break
+                w = self._section_titles[section_idx]
+                w.setText(str(data))
+                w.setVisible(True)
+                self._list_l.addWidget(w, 0)
+                section_idx += 1
+            else:
+                if card_idx >= len(self._dept_cards):
+                    break
+                d = data
+                card = self._dept_cards[card_idx]
+                display_name = _department_display_name(d.name or "", label_resolver)
+                card.set_department(d, display_name)
+                card.setVisible(True)
+                dept_name = d.name
+
+                def _emit(dept: str) -> None:
+                    if dept:
+                        self.department_focused.emit(dept)
+
+                slot = lambda _d=dept_name: _emit(_d)
+                card.clicked.connect(slot)
+                if card_idx < len(self._dept_card_slots):
+                    self._dept_card_slots[card_idx] = slot
+                self._list_l.addWidget(card, 0)
+                card_idx += 1
+
+        for i in range(section_idx, len(self._section_titles)):
+            self._section_titles[i].setVisible(False)
+        for i in range(card_idx, len(self._dept_cards)):
+            self._dept_cards[i].setVisible(False)
 
 
 class _TechRow(QWidget):
@@ -1215,4 +1326,263 @@ class _Stakeholders(QWidget):
     def set_item(self, _item: ViewItem) -> None:
         # No stakeholders data in current model.
         self._content.setText("—")
+
+
+# Scope: user chọn trước (global / asset / shot), sau đó destination (script, texture, ...), cuối cùng entity.
+_INBOX_SCOPE_PROJECT = "project"
+_INBOX_SCOPE_ASSET = "asset"
+_INBOX_SCOPE_SHOT = "shot"
+
+
+class _InboxDestinationBlock(QWidget):
+    """Flow: Scope (Global | Asset | Shot) → Destination (script/storyboard/texture/...) → Entity (nếu cần)."""
+
+    distribute_finished = Signal(object)  # list[Path] đã distribute
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("InboxDestinationBlock")
+        self._paths: list[Path] = []
+        self._project_root: Path | None = None
+        self._project_index: ProjectIndex | None = None
+        self._type_reg: TypeRegistry | None = None
+        self._dept_reg: DepartmentRegistry | None = None
+        self._destinations: list[dict] = []
+
+        l = QVBoxLayout(self)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(10)
+
+        title = QLabel("DESTINATION", self)
+        title.setObjectName("InboxDestinationTitle")
+        f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 112.0)
+        title.setFont(f)
+        title.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
+        l.addWidget(title, 0)
+
+        # Card WHERE: Scope + Destination
+        card_where = QFrame(self)
+        card_where.setObjectName("InboxDestCardWhere")
+        card_where.setFrameShape(QFrame.NoFrame)
+        card_where.setAttribute(Qt.WA_StyledBackground, True)
+        lw = QVBoxLayout(card_where)
+        lw.setContentsMargins(12, 12, 12, 12)
+        lw.setSpacing(8)
+        title_where = QLabel("WHERE", card_where)
+        title_where.setObjectName("InboxDestCardTitle")
+        lw.addWidget(title_where, 0)
+        scope_l = QHBoxLayout()
+        scope_l.addWidget(QLabel("Scope", card_where), 0)
+        self._scope_combo = QComboBox(card_where)
+        self._scope_combo.setObjectName("InboxScopeCombo")
+        self._scope_combo.addItem("Global Reference", _INBOX_SCOPE_PROJECT)
+        self._scope_combo.addItem("Asset", _INBOX_SCOPE_ASSET)
+        self._scope_combo.addItem("Shot", _INBOX_SCOPE_SHOT)
+        scope_l.addWidget(self._scope_combo, 1)
+        lw.addLayout(scope_l, 0)
+        dest_l = QHBoxLayout()
+        dest_l.addWidget(QLabel("Destination", card_where), 0)
+        self._dest_combo = QComboBox(card_where)
+        self._dest_combo.setObjectName("InboxDestCombo")
+        dest_l.addWidget(self._dest_combo, 1)
+        lw.addLayout(dest_l, 0)
+        l.addWidget(card_where, 0)
+
+        # Card TARGET: Type + Entity
+        card_target = QFrame(self)
+        card_target.setObjectName("InboxDestCardTarget")
+        card_target.setFrameShape(QFrame.NoFrame)
+        card_target.setAttribute(Qt.WA_StyledBackground, True)
+        lt = QVBoxLayout(card_target)
+        lt.setContentsMargins(12, 12, 12, 12)
+        lt.setSpacing(8)
+        title_target = QLabel("TARGET", card_target)
+        title_target.setObjectName("InboxDestCardTitle")
+        lt.addWidget(title_target, 0)
+        type_row = QWidget(card_target)
+        type_lay = QHBoxLayout(type_row)
+        type_lay.setContentsMargins(0, 0, 0, 0)
+        type_lay.addWidget(QLabel("Type", type_row), 0)
+        self._type_combo = QComboBox(type_row)
+        self._type_combo.setObjectName("InboxTypeCombo")
+        type_lay.addWidget(self._type_combo, 1)
+        lt.addWidget(type_row, 0)
+        self._type_row_widget = type_row
+        entity_l = QHBoxLayout()
+        entity_l.addWidget(QLabel("Entity", card_target), 0)
+        self._entity_combo = QComboBox(card_target)
+        self._entity_combo.setObjectName("InboxEntityCombo")
+        entity_l.addWidget(self._entity_combo, 1)
+        lt.addLayout(entity_l, 0)
+        l.addWidget(card_target, 0)
+
+        # Card ACTION: Copy/Move + Distribute
+        card_action = QFrame(self)
+        card_action.setObjectName("InboxDestCardAction")
+        card_action.setFrameShape(QFrame.NoFrame)
+        card_action.setAttribute(Qt.WA_StyledBackground, True)
+        la = QVBoxLayout(card_action)
+        la.setContentsMargins(12, 12, 12, 12)
+        la.setSpacing(8)
+        title_action = QLabel("ACTION", card_action)
+        title_action.setObjectName("InboxDestCardTitle")
+        la.addWidget(title_action, 0)
+        copy_move_l = QHBoxLayout()
+        self._copy_radio = QRadioButton("Copy", card_action)
+        self._move_radio = QRadioButton("Move", card_action)
+        self._copy_radio.setChecked(True)
+        copy_move_grp = QButtonGroup(self)
+        copy_move_grp.addButton(self._copy_radio)
+        copy_move_grp.addButton(self._move_radio)
+        copy_move_l.addWidget(self._copy_radio, 0)
+        copy_move_l.addWidget(self._move_radio, 0)
+        copy_move_l.addStretch(1)
+        la.addLayout(copy_move_l, 0)
+        self._distribute_btn = QPushButton("Distribute", card_action)
+        self._distribute_btn.setObjectName("InboxDistributeButton")
+        self._distribute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._distribute_btn.clicked.connect(self._on_distribute)
+        la.addWidget(self._distribute_btn, 0)
+        l.addWidget(card_action, 0)
+
+        self._scope_combo.currentIndexChanged.connect(self._refill_dest_combo)
+        self._scope_combo.currentIndexChanged.connect(self._on_scope_changed)
+        self._dest_combo.currentIndexChanged.connect(self._update_distribute_enabled)
+        self._type_combo.currentIndexChanged.connect(self._refill_entity_combo)
+        self._entity_combo.currentIndexChanged.connect(self._update_distribute_enabled)
+
+    def set_data(
+        self,
+        paths: list[Path],
+        project_root: Path | None,
+        project_index: ProjectIndex | None,
+    ) -> None:
+        self._paths = list(paths) if paths else []
+        self._project_root = Path(project_root) if project_root else None
+        self._project_index = project_index
+        try:
+            self._type_reg = TypeRegistry.for_project(self._project_root) if self._project_root else None
+        except Exception:
+            self._type_reg = None
+        self._destinations = load_inbox_destinations()
+        self._refill_dest_combo()
+        self._on_scope_changed()
+        self._update_distribute_enabled()
+
+    def _current_scope(self) -> str:
+        v = self._scope_combo.currentData()
+        return (v or _INBOX_SCOPE_PROJECT).strip().lower()
+
+    def _refill_dest_combo(self) -> None:
+        self._dest_combo.clear()
+        scope = self._current_scope()
+        for d in self._destinations:
+            ctx = (d.get("context") or "both").strip().lower()
+            if scope == _INBOX_SCOPE_PROJECT and ctx == "project":
+                self._dest_combo.addItem(d.get("label", d.get("id", "")), d.get("id", ""))
+            elif scope == _INBOX_SCOPE_ASSET and ctx in ("asset", "both"):
+                self._dest_combo.addItem(d.get("label", d.get("id", "")), d.get("id", ""))
+            elif scope == _INBOX_SCOPE_SHOT and ctx in ("shot", "both"):
+                self._dest_combo.addItem(d.get("label", d.get("id", "")), d.get("id", ""))
+        self._on_scope_changed()
+        self._update_distribute_enabled()
+
+    def _on_scope_changed(self) -> None:
+        scope = self._current_scope()
+        if scope == _INBOX_SCOPE_PROJECT:
+            self._type_row_widget.setVisible(False)
+            self._entity_combo.clear()
+            self._entity_combo.addItem("Project (global)", None)
+            self._update_distribute_enabled()
+            return
+        if scope == _INBOX_SCOPE_SHOT:
+            self._type_row_widget.setVisible(False)
+            self._refill_entity_combo()
+            self._update_distribute_enabled()
+            return
+        self._type_row_widget.setVisible(True)
+        self._refill_type_combo()
+        self._refill_entity_combo()
+        self._update_distribute_enabled()
+
+    def _refill_type_combo(self) -> None:
+        self._type_combo.clear()
+        if self._type_reg:
+            for tid in self._type_reg.get_types():
+                if (tid or "").lower() == "shot":
+                    continue
+                label = self._type_reg.get_type_label(tid) or tid
+                self._type_combo.addItem(label, tid)
+        self._refill_entity_combo()
+
+    def _refill_entity_combo(self) -> None:
+        self._entity_combo.clear()
+        scope = self._current_scope()
+        if scope == _INBOX_SCOPE_PROJECT:
+            self._entity_combo.addItem("Project (global)", None)
+            self._update_distribute_enabled()
+            return
+        if not self._project_index:
+            self._update_distribute_enabled()
+            return
+        if scope == _INBOX_SCOPE_SHOT:
+            for s in self._project_index.shots:
+                self._entity_combo.addItem(f"{s.name} (Shot)", s)
+            self._update_distribute_enabled()
+            return
+        type_id = self._type_combo.currentData()
+        if self._project_index and type_id:
+            for a in self._project_index.assets:
+                if (a.asset_type or "").strip().lower() != (type_id or "").strip().lower():
+                    continue
+                label = self._type_reg.get_type_label(type_id) if self._type_reg else type_id
+                self._entity_combo.addItem(f"{a.name} ({label})", a)
+        self._update_distribute_enabled()
+
+    def _update_distribute_enabled(self) -> None:
+        self._distribute_btn.setEnabled(
+            bool(
+                self._paths
+                and self._project_root
+                and self._dest_combo.count() > 0
+                and self._entity_combo.count() > 0
+            )
+        )
+
+    def _on_distribute(self) -> None:
+        if not self._paths or not self._project_root:
+            return
+        dest_id = self._dest_combo.currentData()
+        entity = self._entity_combo.currentData()
+        if not dest_id:
+            return
+        # context "project" => entity có thể None (global reference)
+        if entity is not None and not isinstance(entity, (Asset, Shot)):
+            return
+        move = self._move_radio.isChecked()
+        done: list[Path] = []
+        for src in self._paths:
+            dest_dir = resolve_destination_path(self._project_root, dest_id, entity)
+            if not dest_dir:
+                continue
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = dest_dir / src.name
+            try:
+                if src.is_dir():
+                    if dest_path.exists():
+                        shutil.rmtree(dest_path)
+                    shutil.copytree(src, dest_path)
+                else:
+                    shutil.copy2(src, dest_path)
+                if move:
+                    if src.is_dir():
+                        shutil.rmtree(src)
+                    else:
+                        src.unlink()
+                done.append(src)
+            except OSError:
+                pass
+        if done:
+            self.distribute_finished.emit(done)
 

@@ -229,24 +229,29 @@ def load_inbox_destinations() -> list[dict[str, Any]]:
 def resolve_destination_path(
     project_root: Path,
     destination_id: str,
-    entity: Asset | Shot,
+    entity: Asset | Shot | None,
 ) -> Path | None:
     """
-    Resolve the target path for distributing an inbox item to a destination (e.g. reference, concept).
-    entity: Asset or Shot. Returns entity.path / path_template, or None if destination not applicable.
+    Resolve the target path for distributing an inbox item to a destination.
+    - context "project": path = project_root / path_template (entity ignored). Dùng cho reference global (script, storyboard, guideline, concept).
+    - context "asset"|"shot"|"both": path = entity.path / path_template; entity bắt buộc.
     """
     destinations = load_inbox_destinations()
     dest = next((d for d in destinations if (d.get("id") or "").strip() == (destination_id or "").strip()), None)
     if not dest:
         return None
     context = (dest.get("context") or "both").strip().lower()
+    template = (dest.get("path_template") or "").strip()
+    if not template:
+        return None
+    if context == "project":
+        return (Path(project_root) / template).resolve()
+    if entity is None:
+        return None
     if isinstance(entity, Asset):
         if context == "shot":
             return None
     elif isinstance(entity, Shot):
         if context == "asset":
             return None
-    template = (dest.get("path_template") or "").strip()
-    if not template:
-        return None
     return (entity.path / template).resolve()

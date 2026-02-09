@@ -1,0 +1,279 @@
+---
+description: Plan thiết kế lại giao diện Inspector block Inbox – dễ nhìn, có preview ASCII
+alwaysApply: false
+---
+
+# Plan: Inbox Inspector UI Redesign (v1)
+
+Mục tiêu: Inspector block Inbox (Scope → Destination → Type → Entity → Distribute) **dễ đọc, dễ quét** nhờ phân nhóm rõ, hierarchy và spacing hợp lý. Kèm bản preview ASCII.
+
+---
+
+## 1. Hiện trạng & vấn đề
+
+- Tất cả control xếp **một cột dọc**: label + combo lặp lại (Scope, Destination, Type, Entity), rồi Copy/Move + nút Distribute.
+- **Không có nhóm trực quan**: "đích đến" (scope + destination) và "chọn entity" (type + entity) lẫn với nhau.
+- **Ít breathing room**: spacing 10px, không có section tách biệt.
+- **Nút Distribute** ngang hàng với radio Copy/Move, chưa nổi bật là action chính.
+
+---
+
+## 2. Nguyên tắc thiết kế
+
+- **Phân nhóm logic**: (1) **Where** – Scope + Destination; (2) **Target** – Type + Entity (khi cần); (3) **Action** – Copy/Move + Distribute.
+- **Hierarchy**: section header nhỏ (uppercase, muted) → nội dung (combo/control) rõ hơn.
+- **Spacing**: tăng khoảng cách giữa các nhóm; trong nhóm giữ compact.
+- **Primary action**: nút Distribute dễ thấy (full-width hoặc accent), tách khỏi Copy/Move.
+- **Ẩn/hiện nhất quán**: Type/Entity chỉ hiện khi Scope = Asset hoặc Shot; layout không “nhảy” quá mạnh (có thể giữ vùng cố định, ẩn nội dung).
+
+---
+
+### 2.1 Card: nên dùng cho nhóm, không cho từng item
+
+- **Nên:** Mỗi **nhóm** (Where, Target, Action) nằm trong **một card** – background #18181b, border-radius 6–8px, padding 10–12px. Dễ quét, phân cấp rõ.
+- **Không nên:** Mỗi **item** (Scope, Destination, Type, Entity) một card riêng → quá nhiều hộp, rối.
+
+Tóm tắt: **card theo nhóm (3 card)** hợp lý; **card theo từng dòng** tránh.
+
+---
+
+## 3. Bản preview ASCII
+
+### 3.1 Layout đề xuất (Option A – sections có header)
+
+```
+┌─────────────────────────────────────────┐
+│  DESTINATION                            │
+├─────────────────────────────────────────┤
+│  WHERE                                  │
+│  ┌─────────────────────────────────┐   │
+│  │ Scope          [Global Ref ▾]   │   │
+│  └─────────────────────────────────┘   │
+│  ┌─────────────────────────────────┐   │
+│  │ Destination    [Reference ▾]    │   │
+│  └─────────────────────────────────┘   │
+│                                         │
+│  TARGET                    (optional)  │
+│  ┌─────────────────────────────────┐   │
+│  │ Type            [Character ▾]   │   │  ← chỉ khi Scope = Asset
+│  └─────────────────────────────────┘   │
+│  ┌─────────────────────────────────┐   │
+│  │ Entity          [hero (Char) ▾] │   │
+│  └─────────────────────────────────┘   │
+│                                         │
+│  ○ Copy   ○ Move                        │
+│  ┌─────────────────────────────────┐   │
+│  │         Distribute              │   │  ← full-width, accent
+│  └─────────────────────────────────┘   │
+└─────────────────────────────────────────┘
+```
+
+- **WHERE**: Scope + Destination (2 dòng, có thể đặt trong một QFrame nền nhạt hoặc chỉ tăng spacing dưới).
+- **TARGET**: Type + Entity; khi Scope = Global thì ẩn cả block hoặc chỉ hiện 1 dòng "Project (global)".
+- **Action**: Copy/Move trên một dòng; Distribute nút riêng, full-width.
+
+### 3.2 Option B – compact, chỉ tách bằng spacing + divider
+
+```
+┌─────────────────────────────────────────┐
+│  DESTINATION                            │
+│                                         │
+│  Scope            [Global Reference ▾] │
+│  Destination      [Reference / Script▾]│
+│  ─────────────────────────────────────  │  ← divider (muted line)
+│  Type             [Character ▾]         │
+│  Entity           [hero (Character) ▾]  │
+│  ─────────────────────────────────────  │
+│  ○ Copy   ○ Move                        │
+│  ┌─────────────────────────────────┐   │
+│  │         Distribute              │   │
+│  └─────────────────────────────────┘   │
+└─────────────────────────────────────────┘
+```
+
+- Không thêm section title "WHERE" / "TARGET"; dùng một đường kẻ mỏng (divider) giữa "đích" và "entity".
+- Giữ cùng thứ tự: Scope → Destination → (divider) → Type → Entity → (divider) → Copy/Move → Distribute.
+
+### 3.3 Khi Scope = Global (không cần Type/Entity)
+
+```
+┌─────────────────────────────────────────┐
+│  DESTINATION                            │
+│                                         │
+│  Scope            [Global Reference ▾] │
+│  Destination      [Reference / Script▾]│
+│  ─────────────────────────────────────  │
+│  Entity           Project (global)     │  ← 1 dòng cố định, có thể disable hoặc ẩn
+│  ─────────────────────────────────────  │
+│  ○ Copy   ○ Move                        │
+│  ┌─────────────────────────────────┐   │
+│  │         Distribute              │   │
+│  └─────────────────────────────────┘   │
+└─────────────────────────────────────────┘
+```
+
+### 3.4 Option C – card theo nhóm (3 card)
+
+```
+┌─────────────────────────────────────────┐
+│  DESTINATION                            │
+├─────────────────────────────────────────┤
+│  ┌─ WHERE (card) ───────────────────┐  │
+│  │  Scope        [Global Reference ▾]│  │
+│  │  Destination  [Reference / Script▾]│  │
+│  └───────────────────────────────────┘  │
+│  ┌─ TARGET (card) ───────────────────┐  │
+│  │  Type         [Character ▾]        │  │
+│  │  Entity       [hero (Character) ▾]│  │
+│  └───────────────────────────────────┘  │
+│  ┌─ ACTION (card) ───────────────────┐  │
+│  │  ○ Copy   ○ Move                  │  │
+│  │  ┌─────────────────────────────┐  │  │
+│  │  │       Distribute            │  │  │
+│  │  └─────────────────────────────┘  │  │
+│  └───────────────────────────────────┘  │
+└─────────────────────────────────────────┘
+```
+
+- Mỗi nhóm = một QFrame (objectName để style): bg #18181b, border-radius 8px, padding 12px, margin-bottom 10px.
+- Card TARGET ẩn hoặc thu gọn khi Scope = Global (chỉ 1 dòng "Project (global)" cũng có thể nằm trong card để layout ổn định).
+
+### 3.5 Khi Scope = Shot (không Type, chỉ Entity = shot)
+
+```
+┌─────────────────────────────────────────┐
+│  DESTINATION                            │
+│  Scope            [Shot ▾]             │
+│  Destination      [Shot Reference ▾]   │
+│  ─────────────────────────────────────  │
+│  Entity           [s001 (Shot) ▾]      │
+│  ─────────────────────────────────────  │
+│  ○ Copy   ○ Move    [ Distribute ]     │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## 4. Chi tiết UI (áp dụng Option A hoặc B)
+
+| Thành phần | Đề xuất |
+|------------|--------|
+| **Block title** | Giữ "DESTINATION", font 10px ExtraBold, letter-spacing, color text_meta. |
+| **Section label** (nếu dùng Option A) | "WHERE", "TARGET" – 9px hoặc 10px, uppercase, text_meta, spacing 4–6px phía trên. |
+| **Divider** (Option B hoặc giữa section) | 1px solid, color border/surface (#27272a), margin top/bottom 8–12px. |
+| **Label + Combo** | Label cố định width (e.g. 80–90px) hoặc không, font 13px; combo stretch. Combo có thể đặt trong frame nhạt (bg surface) để dễ nhìn. |
+| **Copy / Move** | Một dòng, radio; có thể đặt trong cùng row với label "Action" hoặc để trần. |
+| **Distribute** | Nút full-width (hoặc min-height 36px), background accent (blue_500/600), color white; hover đậm hơn. |
+
+---
+
+## 5. Style plan – Option C (card theo nhóm)
+
+Chốt Option C. Toàn bộ style áp trong **global app stylesheet** (`monostudio/ui_qt/style.py`), scope bằng objectName để không ảnh hưởng Inspector khác.
+
+### 5.1 ObjectNames (cho QSS)
+
+| Widget | objectName | Ghi chú |
+|--------|------------|--------|
+| Block container | (giữ) `InboxDestinationBlock` | Đã có. |
+| Card Where | `InboxDestCardWhere` | QFrame chứa Scope + Destination. |
+| Card Target | `InboxDestCardTarget` | QFrame chứa Type + Entity. |
+| Card Action | `InboxDestCardAction` | QFrame chứa Copy/Move + nút Distribute. |
+| Section header trong card | `InboxDestCardTitle` | QLabel "WHERE" / "TARGET" / "ACTION". |
+| Nút Distribute | `InboxDistributeButton` | Đã có. |
+
+### 5.2 Token màu / spacing (MONOS)
+
+- **Card bg:** `#18181b` (MONOS_COLORS card_bg / panel).
+- **Card border:** `#27272a` (border / surface), 1px.
+- **Card radius:** 8px.
+- **Card padding:** 12px.
+- **Khoảng cách giữa 2 card:** 10px (margin-bottom của card hoặc spacing layout).
+- **Section title:** color `#71717a` (text_meta), font 10px ExtraBold, letter-spacing, uppercase.
+- **Label (Scope, Destination, Type, Entity):** color text_label `#a1a1aa`, font 13px.
+- **Combo:** nền surface `#27272a` hoặc transparent, border 1px border; font 13px.
+- **Distribute:** bg `#2563eb` (blue_600), color white; hover bg `#3b82f6` (blue_500); min-height 36px, full-width.
+
+### 5.3 Khối QSS đề xuất (thêm vào style.py)
+
+```css
+/* Inbox Destination Block – Option C (card theo nhóm) */
+QWidget#InboxDestinationBlock {
+    background: transparent;
+}
+
+QWidget#InboxDestinationBlock QFrame#InboxDestCardWhere,
+QWidget#InboxDestinationBlock QFrame#InboxDestCardTarget,
+QWidget#InboxDestinationBlock QFrame#InboxDestCardAction {
+    background-color: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+}
+
+QWidget#InboxDestinationBlock QLabel#InboxDestCardTitle {
+    color: #71717a;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    margin-bottom: 8px;
+}
+
+QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton {
+    background-color: #2563eb;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    min-height: 36px;
+    font-weight: 600;
+}
+QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton:hover {
+    background-color: #3b82f6;
+}
+QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton:pressed {
+    background-color: #1d4ed8;
+}
+```
+
+- Block title "DESTINATION" giữ style hiện tại (InboxDestinationTitle).
+- Label + Combo bên trong card không bắt buộc objectName; có thể style chung `#InboxDestinationBlock QLabel` (trừ InboxDestCardTitle), `#InboxDestinationBlock QComboBox`.
+
+### 5.4 Layout / spacing trong code
+
+- Sau block title: spacing 8px rồi card Where.
+- Mỗi card: QVBoxLayout, contentsMargins 12; spacing giữa các row trong card 8px.
+- Giữa 2 card: 10px (layout spacing hoặc margin-bottom trên card).
+- Card Action: Copy/Move một dòng; Distribute nút full-width, cách Copy/Move 8–10px.
+
+### 5.5 Thứ tự implement style
+
+1. Thêm 3 QFrame với objectName InboxDestCardWhere / InboxDestCardTarget / InboxDestCardAction; bọc đúng nội dung (Scope+Destination, Type+Entity, Copy/Move+Distribute).
+2. Thêm QLabel section title trong mỗi card với objectName InboxDestCardTitle (text WHERE / TARGET / ACTION).
+3. Paste khối QSS vào `style.py` (sau InboxSplitToolbar / InboxMappingHeader, trước Context Menu).
+4. Kiểm tra ẩn/hiện card Target khi Scope = Global (card vẫn tồn tại, có thể ẩn hoặc chỉ còn 1 dòng "Project (global)").
+
+---
+
+## 6. Implementation checklist
+
+- [x] Chọn layout: **Option C** (card theo nhóm).
+- [ ] **Code:** 3 QFrame (InboxDestCardWhere, InboxDestCardTarget, InboxDestCardAction), mỗi card có QLabel InboxDestCardTitle (WHERE / TARGET / ACTION).
+- [ ] **Style:** Thêm khối QSS §5.3 vào `style.py`; card bg #18181b, border #27272a, radius 8px, padding 12px; nút Distribute accent full-width.
+- [ ] **Spacing:** 10px giữa các card; 8px trong card giữa các row; Distribute cách Copy/Move 8–10px.
+- [ ] Giữ logic ẩn/hiện Type + nội dung Entity theo Scope; card TARGET vẫn hiện (có thể chỉ 1 dòng "Project (global)" khi Scope = Global).
+- [ ] **Không** làm card cho từng item – chỉ 3 card nhóm.
+
+---
+
+## 7. Tóm tắt
+
+| Mục | Nội dung |
+|-----|----------|
+| **Mục tiêu** | Inspector Inbox dễ nhìn: nhóm rõ (Where / Target / Action), spacing và hierarchy hợp lý. |
+| **Preview** | ASCII: Option A (headers), Option B (divider), Option C (card theo nhóm); trạng thái Global / Shot. |
+| **Card** | Nên: 1 card cho mỗi nhóm (Where, Target, Action). Không nên: 1 card cho mỗi item (Scope, Destination, …). |
+| **Thay đổi** | Section/divider hoặc card, spacing, style nút Distribute. |
+| **Không đổi** | Flow Scope → Destination → Type → Entity, Copy/Move, logic distribute. |
+
+**Chốt Option C.** Implement theo §5 (style plan) và §6 (checklist); QSS trong `style.py`.

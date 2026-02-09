@@ -1,0 +1,139 @@
+---
+description: Plan Inbox – 2 view có bar riêng, mapping luôn hiện và lưu distributed, Inspector tree = preview / mapping = distribute
+alwaysApply: false
+---
+
+# Plan: Inbox – Hai view có bar riêng, Mapping luôn hiện, Inspector theo nguồn chọn (v1)
+
+Mục tiêu: (1) **Giữ header MainView** (context title + type badge) phía trên khi ở page Inbox; (2) Mỗi khung view (tree vs mapping) có **top bar riêng** bên dưới header; (3) **Mapping view luôn hiện** trên page Inbox, nội dung theo **type filter** sidebar, **lưu lại toàn bộ file đã phân phối**; (4) **Inspector**: chọn tree → thumb + metadata; chọn mapping → block distribute như hiện tại.
+
+---
+
+## 1. Hiện trạng (tóm tắt)
+
+- **Inbox page** hiện có 2 trạng thái: (a) **Main view** = list date folder (Client / Freelancer); (b) **InboxSplitView** = trái = tree date folder, phải = mapping list; **một toolbar chung** (breadcrumb + Add / Remove / Refresh / Open folder) phía trên.
+- **Mapping** chỉ tồn tại khi đang ở split view (đã vào một date folder); khi Back về list thì split view bị destroy, mapping mất.
+- **Inspector**: chỉ có `set_inbox_mapping_selection(paths)` → hiện block Destination (distribute). Chọn item **tree** hiện không đổi Inspector (không preview file).
+
+---
+
+## 2. Thay đổi yêu cầu (đầu vào)
+
+| # | Yêu cầu | Ghi chú |
+|---|--------|--------|
+| 2.1 | **Hai view có bar riêng** | View tree có **breadcrumb**; view mapping có **các nút chức năng** (Add, Remove, Refresh, Open folder, …). |
+| 2.2 | **Mapping view luôn hiện ở page Inbox** | Không phụ thuộc “đã vào date folder” hay chưa; luôn có khung bên phải là mapping. |
+| 2.3 | **Nội dung mapping theo type filter sidebar** | Client / Freelancer quyết định danh sách (đã phân phối) hiển thị. |
+| 2.4 | **Lưu lại tất cả file đã phân phối** | Distributed files được persist và hiển thị trong mapping view (theo type). |
+| 2.5 | **Click tree** → Inspector hiện **thumb + metadata** của file đó (preview, không distribute). | |
+| 2.6 | **Click mapping** → Inspector hiện **distribute** như hiện tại (Destination, Distribute). | |
+| 2.7 | **Giữ header MainView** khi ở Inbox | Thanh header (context title + type badge) giống Assets/Shots vẫn hiện phía trên: title "Inbox", badge = Client/Freelancer theo sidebar. |
+
+---
+
+## 3. Kiến trúc đề xuất
+
+### 3.1 Layout Inbox page: header + luôn 2 cột
+
+- **Trang Inbox** = **một widget cố định** (ví dụ `InboxPageWidget`) gồm **hai tầng**:
+  1. **Header (giữ giống MainView)**  
+     Thanh trên cùng: **context title** = "Inbox", **type badge** = Client / Freelancer (theo sidebar). Cùng style với `MainViewHeader` (QWidget#MainViewHeader) để đồng bộ với Assets/Shots.
+  2. **Dưới header**: **QSplitter ngang** (2 cột):
+  - **Cột trái (left pane)**: Nội dung thay đổi theo ngữ cảnh:
+    - **Khi chưa vào date folder**: List date folder (giống main view Inbox hiện tại: Client / Freelancer sections, item = date folder).
+    - **Khi đã vào date folder**: Tree file/folder của date folder đó.
+  - **Cột phải (right pane)**: **Mapping view** – **luôn hiện**, không đổi khi vào/ra date folder.
+
+- **Mỗi pane có top bar riêng**:
+  - **Bar trái**: Chỉ **breadcrumb** (vd. `Inbox › Client › 2025-02-07` khi trong date folder; `Inbox › Client` hoặc `Inbox` khi đang xem list).
+  - **Bar phải**: **Tiêu đề** (vd. "Mapping" / "Distributed") + **nút chức năng**: Add to mapping, Remove, Refresh, Open folder (Open folder chỉ enable khi đang trong date folder).
+
+### 3.2 Dữ liệu mapping: “pending” vs “distributed”
+
+- **Pending (to distribute)**: Item user thêm từ tree bằng “Add to mapping” trong session hiện tại; chưa bấm Distribute. Có thể lưu tạm trong memory (theo date folder đang mở).
+- **Distributed (đã phân phối)**: Sau khi Distribute thành công → **persist** (lưu theo project + type filter). Gợi ý lưu:
+  - **Vị trí**: `<project_root>/.monostudio/inbox_distributed.json` (hoặc key trong QSettings nếu ưu tiên ít file).
+  - **Cấu trúc**: `{ "client": [ {"path": "...", "distributed_at": "ISO8601", "destination": "..."? }, ... ], "freelancer": [ ... ] }` để filter theo type (Client/Freelancer) và hiển thị trong mapping view.
+- **Mapping view hiển thị**:
+  - **Option A**: Một list duy nhất = **Distributed** (đã phân phối), filter theo type sidebar; “pending” nằm ở đâu đó khác (vd. toolbar hiện số pending, hoặc section nhỏ “To distribute” phía trên list).
+  - **Option B**: Hai section trong cùng pane: **To distribute** (pending) + **Distributed** (persistent, filter theo type). User yêu cầu “tất cả file đã phân phối được lưu lại ở view đó” → ít nhất **Distributed** phải nằm trong view mapping; Option B rõ ràng hơn (vừa pending vừa history).
+
+**Đề xuất**: Option B – mapping view có 2 khu vực: (1) **To distribute** (pending, có nút Add/Remove); (2) **Distributed** (read-only list từ persisted data, filter theo Client/Freelancer).
+
+### 3.3 Luồng màn hình
+
+1. User chọn **Inbox** trên sidebar → content stack hiện **InboxPageWidget** (split: trái = list date folder, phải = mapping với bar có nút).
+2. **Trái**: List date folder (giống hiện tại), breadcrumb ví dụ `Inbox › Client` (hoặc `Inbox` nếu không chọn type). Click date folder → **trái** chuyển sang tree của date folder đó, breadcrumb `Inbox › Client › 2025-02-07`. Nút “Back” hoặc click segment breadcrumb → trái quay lại list.
+3. **Phải**: Luôn là mapping. Khi vào date folder, user có thể “Add to mapping” từ tree → item vào **To distribute**. Khi Distribute xong → item chuyển từ To distribute sang **Distributed** và persist. List **Distributed** lọc theo type (Client/Freelancer) từ sidebar.
+4. **Inspector**:
+   - **Chọn item bên tree** → `set_inbox_tree_preview(path)` (hoặc tương đương): hiện **thumbnail + metadata** của file (path, size, modified, …), **ẩn** block Destination (distribute).
+   - **Chọn item bên mapping** → `set_inbox_mapping_selection(paths, ...)` như hiện tại: hiện block **Destination** (Scope, Destination, Type, Entity, Distribute), ẩn hoặc giữ preview tùy thiết kế (có thể giữ preview nhỏ cho mapping item).
+
+---
+
+## 4. Chi tiết triển khai (gợi ý)
+
+### 4.1 Widget / lớp mới (hoặc refactor)
+
+| Thành phần | Mô tả |
+|------------|--------|
+| **InboxPageWidget** | Widget gốc của page Inbox: **(1) Header** (giống MainView: title "Inbox" + type badge Client/Freelancer); **(2) QSplitter(trái, phải)**. Trái = stacked hoặc swap widget (list | tree); phải = InboxMappingPane. Kết nối sidebar type filter để cập nhật header badge, list trái + filter distributed phải. |
+| **Left pane content** | **InboxListView**: list date folder (dùng lại logic build items từ main_view Inbox hiện tại). **InboxTreeView**: tree một date folder (tách từ InboxSplitView hiện tại: chỉ phần tree + breadcrumb bar). Chuyển đổi: click date folder → set right widget of stack = InboxTreeView(path); Back → set = InboxListView. |
+| **InboxMappingPane** | Bar trên: title + Add, Remove, Refresh, Open folder. Dưới: list (hoặc 2 section To distribute / Distributed). Load distributed từ file/settings theo type filter. |
+| **Persistence** | Service hoặc helper: `load_distributed(project_root, type_filter)`, `save_distributed(project_root, type_filter, entries)`. Gọi khi Distribute xong và khi mở Inbox page. |
+
+### 4.2 MainWindow
+
+- **Khi context = Inbox**: Không còn swap giữa `_main_view` và `_inbox_split_view`. Chỉ hiện **InboxPageWidget** (đã chứa cả list/tree bên trái và mapping bên phải). Không tạo/hủy split view khi vào/ra date folder; chỉ đổi nội dung cột trái.
+- **Tín hiệu mới**:
+  - **Tree selection** (file trong tree): emit `inbox_tree_selection_changed(path: Path | None)` → MainWindow gọi `_inspector.set_inbox_tree_preview(path)`.
+  - **Mapping selection**: giữ `mapping_selection_changed(paths)` → `set_inbox_mapping_selection(paths, ...)`.
+- **Khi chọn tree**: Clear mapping selection (single-selection mode) hoặc cho phép chọn cả hai nhưng Inspector ưu tiên “last clicked” (tree vs mapping) để quyết định hiện preview hay distribute. Đơn giản nhất: **chọn tree** → chỉ preview, **chọn mapping** → chỉ distribute; clear bên kia khi chọn bên này (optional).
+
+### 4.3 Inspector
+
+- **set_inbox_tree_preview(self, path: Path | None)**:
+  - Nếu `path` None: ẩn preview Inbox (hoặc hiện empty).
+  - Nếu có path: tạo “pseudo” ViewItem (hoặc struct) chỉ chứa path/file info → hiện **thumbnail** (nếu ảnh/video) + **metadata** (tên, size, ngày sửa, loại file). **Ẩn** block `_inbox_destination` (distribute).
+- **set_inbox_mapping_selection(...)** (giữ như hiện tại):
+  - Hiện block Destination (Scope, Destination, Type, Entity, Distribute). Có thể **ẩn** preview tree khi đang chọn mapping (để Inspector không quá dài).
+
+### 4.4 Header MainView + bar riêng từng view
+
+- **Header (tầng trên cùng, giữ như MainView)**:
+  - Một dòng: **Context title** = "Inbox" (giống "Assets" / "Shots"); **Type badge** = Client hoặc Freelancer theo sidebar (cùng style `MainViewTypeBadge`). Có thể reuse component/stylesheet từ MainView hoặc tạo bar cùng objectName để QSS áp dụng đúng.
+- **Bar trái** (cho list hoặc tree, dưới header):
+  - Chỉ breadcrumb (clickable segments: Inbox → back to list, Client/Freelancer → back to list nếu đang trong date).
+  - Có thể thêm nút “Back” nhỏ (optional) nếu muốn.
+- **Bar phải** (mapping):
+  - Label: "Mapping" hoặc "Distributed & to distribute".
+  - Nút: Add to mapping (enable khi đang trong date folder), Remove (khi có item pending chọn), Refresh (reload distributed từ disk), Open folder (enable khi trong date folder).
+  - Style: đồng bộ với MainViewHeader (typography, spacing) theo rule typography.
+
+### 4.5 Persist “distributed”
+
+- Sau khi Distribute thành công (`inbox_distribute_finished`): ngoài việc remove path khỏi pending, gọi **append** path (và optional meta: destination, time) vào danh sách distributed cho **type hiện tại** (Client/Freelancer), rồi **save** (file JSON hoặc QSettings).
+- Khi mở Inbox page hoặc đổi type filter: **load** distributed cho type đó và hiển thị trong mapping pane (section “Distributed”).
+
+---
+
+## 5. Thứ tự triển khai gợi ý
+
+1. **Persistence**: Định nghĩa format lưu distributed (JSON hoặc settings), hàm load/save theo project + type.
+2. **InboxPageWidget**: Tạo layout 2 cột; cột trái = placeholder (list hoặc tree), cột phải = InboxMappingPane (bar + list, chưa nối distributed).
+3. **Tách bar**: Bar trái chỉ breadcrumb; bar phải chỉ title + nút. Di chuyển nút từ toolbar cũ sang bar phải.
+4. **Nội dung trái**: Tích hợp InboxListView (reuse logic main view Inbox) và InboxTreeView (tách từ InboxSplitView); chuyển đổi khi click date folder / Back.
+5. **Mapping pane**: Hai section To distribute / Distributed; load distributed từ persistence, filter theo type; nút Add/Remove chỉ tác động pending.
+6. **MainWindow**: Inbox page = InboxPageWidget; bỏ tạo/hủy InboxSplitView khi vào/ra date folder; nối type filter → list + distributed filter.
+7. **Inspector**: Thêm `set_inbox_tree_preview(path)`; khi chọn tree gọi API này, khi chọn mapping gọi `set_inbox_mapping_selection`; ẩn/hiện block phù hợp.
+8. **Distribute xong**: Ghi vào distributed + save; remove khỏi pending; refresh list Distributed.
+
+---
+
+## 6. Tóm tắt
+
+- **Hai view, hai bar**: Trái = breadcrumb; phải = title + Add / Remove / Refresh / Open folder.
+- **Mapping luôn hiện** trên Inbox, nội dung theo type (Client/Freelancer); **distributed** được lưu và hiển thị (cùng hoặc dưới “To distribute”).
+- **Tree selection** → Inspector: thumb + metadata (preview).
+- **Mapping selection** → Inspector: distribute (Destination block).
+- **Refactor**: Một Inbox page widget cố định (split 2 cột), không còn swap main_view ↔ split_view khi vào/ra date folder.

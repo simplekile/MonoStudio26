@@ -7,15 +7,12 @@ from PySide6.QtCore import QByteArray, QRect, Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 
+from monostudio.core.app_paths import get_app_base_path
 from monostudio.ui_qt.style import MONOS_COLORS
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
 def _lucide_icons_dir() -> Path:
-    return _repo_root() / "monostudio_data" / "icons" / "lucide"
+    return get_app_base_path() / "monostudio_data" / "icons" / "lucide"
 
 
 def _lucide_svg_path(name: str) -> Path:
@@ -56,7 +53,6 @@ def lucide_icon(name: str, *, size: int = 16, color_hex: str | None = None) -> Q
     p = QPainter(pix)
     try:
         p.setRenderHint(QPainter.Antialiasing, True)
-        p.setRenderHint(QPainter.TextAntialiasing, True)
         renderer.render(p, QRect(0, 0, size, size))
     finally:
         p.end()

@@ -56,23 +56,25 @@ class TopBar(QWidget):
         except Exception:
             pass
 
-        # Window buttons (borderless title bar)
+        # Window buttons — render at 24px then Qt scales down = sharper on HiDPI
+        _win_icon_color = "#d4d4d8"
+        _win_icon_size = 24
         self._btn_min = QToolButton(self)
         self._btn_min.setObjectName("WindowMinBtn")
         self._btn_min.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self._btn_min.setIcon(lucide_icon("minus", size=12, color_hex="#a1a1aa"))
+        self._btn_min.setIcon(lucide_icon("minus", size=_win_icon_size, color_hex=_win_icon_color))
         self._btn_min.setFixedSize(44, 36)
         self._btn_min.clicked.connect(self.minimize_clicked.emit)
         self._btn_max = QToolButton(self)
         self._btn_max.setObjectName("WindowMaxBtn")
         self._btn_max.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self._btn_max.setIcon(lucide_icon("square", size=12, color_hex="#a1a1aa"))
+        self._btn_max.setIcon(lucide_icon("square", size=_win_icon_size, color_hex=_win_icon_color))
         self._btn_max.setFixedSize(44, 36)
         self._btn_max.clicked.connect(self.maximize_clicked.emit)
         self._btn_close = QToolButton(self)
         self._btn_close.setObjectName("WindowCloseBtn")
         self._btn_close.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self._btn_close.setIcon(lucide_icon("x", size=12, color_hex="#a1a1aa"))
+        self._btn_close.setIcon(lucide_icon("x", size=_win_icon_size, color_hex=_win_icon_color))
         self._btn_close.setFixedSize(44, 36)
         self._btn_close.clicked.connect(self.close_clicked.emit)
 
@@ -93,10 +95,11 @@ class TopBar(QWidget):
 
     def set_maximized(self, maximized: bool) -> None:
         """Update window button icon (Max vs Restore)."""
+        _c = "#d4d4d8"
         if maximized:
-            self._btn_max.setIcon(lucide_icon("maximize-2", size=12, color_hex="#a1a1aa"))
+            self._btn_max.setIcon(lucide_icon("maximize-2", size=24, color_hex=_c))
         else:
-            self._btn_max.setIcon(lucide_icon("square", size=12, color_hex="#a1a1aa"))
+            self._btn_max.setIcon(lucide_icon("square", size=24, color_hex=_c))
 
     def _is_on_window_buttons(self, pos: QPoint) -> bool:
         return (

@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, Qt
+
+from monostudio.core.app_paths import get_app_base_path
 from PySide6.QtGui import (
     QBitmap,
     QBrush,
@@ -249,6 +251,18 @@ MONOS_COLORS: dict[str, str] = {
     "card_hover": "#1f1f22",
 }
 
+# File-type icon colors (Inbox tree / mapping list: folder, image, video, DCC, …)
+FILE_TYPE_ICON_COLORS: dict[str, str] = {
+    "folder": "#f59e0b",    # Amber-500
+    "image": "#10b981",     # Emerald-500
+    "video": "#8b5cf6",     # Violet-500
+    "audio": "#f97316",     # Orange-500
+    "dcc": "#3b82f6",       # Blue-500
+    "archive": "#64748b",   # Slate-500
+    "document": "#a1a1aa", # Zinc-400
+    "file": "#a1a1aa",     # Zinc-400 default
+}
+
 # Thumb overlay tag spec (used by custom painters, not QSS).
 # Keep ALL tags consistent: same font/padding/radius/alpha; only color changes.
 THUMB_TAG_STYLE: dict[str, object] = {
@@ -307,9 +321,9 @@ def _install_fonts(app: QApplication) -> None:
     - UI font: Inter (bundled in repo)
     - Technical font: JetBrains Mono (system-installed; used via stylesheet on marked fields)
     """
-    repo_root = Path(__file__).resolve().parents[2]
-    inter_regular = repo_root / "fonts" / "Inter" / "Inter-VariableFont_opsz,wght.ttf"
-    inter_italic = repo_root / "fonts" / "Inter" / "Inter-Italic-VariableFont_opsz,wght.ttf"
+    base = get_app_base_path()
+    inter_regular = base / "fonts" / "Inter" / "Inter-VariableFont_opsz,wght.ttf"
+    inter_italic = base / "fonts" / "Inter" / "Inter-Italic-VariableFont_opsz,wght.ttf"
 
     for p in (inter_regular, inter_italic):
         try:
@@ -441,6 +455,41 @@ def apply_dark_theme(app: QApplication) -> None:
         QScrollBar::add-page:horizontal,
         QScrollBar::sub-page:horizontal {
             background: none;
+        }
+
+        /* Inbox Destination Block – Option C (card theo nhóm) */
+        QWidget#InboxDestinationBlock {
+            background: transparent;
+        }
+        QWidget#InboxDestinationBlock QFrame#InboxDestCardWhere,
+        QWidget#InboxDestinationBlock QFrame#InboxDestCardTarget,
+        QWidget#InboxDestinationBlock QFrame#InboxDestCardAction {
+            background-color: #18181b;
+            border: 1px solid #27272a;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 10px;
+        }
+        QWidget#InboxDestinationBlock QLabel#InboxDestCardTitle {
+            color: #71717a;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            margin-bottom: 8px;
+        }
+        QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton {
+            background-color: #2563eb;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            min-height: 36px;
+            font-weight: 600;
+        }
+        QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton:hover {
+            background-color: #3b82f6;
+        }
+        QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton:pressed {
+            background-color: #1d4ed8;
         }
 
         /* ---------- MONOS :: Context Menu (Deep Dark, Electric Blue) ---------- */
@@ -579,12 +628,12 @@ def apply_dark_theme(app: QApplication) -> None:
             border: none;
             border-radius: 0;
             background: transparent;
-            color: #a1a1aa;
+            color: #d4d4d8;
         }
         QToolButton#WindowMinBtn:hover,
         QToolButton#WindowMaxBtn:hover {
             background: rgba(255, 255, 255, 0.08);
-            color: #e2e2e2;
+            color: #e4e4e7;
         }
         QToolButton#WindowCloseBtn:hover {
             background: #ef4444;
@@ -641,6 +690,56 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #60a5fa;
         }
 
+        /* --- Inbox split: file tree (modern flat look) --- */
+        QTreeView#InboxSplitTree {
+            background-color: #121214;
+            border: none;
+            outline: none;
+            color: #a1a1aa;
+            font-size: 13px;
+            padding: 8px 0;
+        }
+        QTreeView#InboxSplitTree::item {
+            padding: 6px 12px;
+            border-radius: 4px;
+            margin: 1px 8px;
+        }
+        QTreeView#InboxSplitTree::item:hover {
+            background-color: rgba(255, 255, 255, 0.06);
+            color: #fafafa;
+        }
+        QTreeView#InboxSplitTree::item:selected {
+            background-color: rgba(59, 130, 246, 0.12);
+            color: #60a5fa;
+        }
+        QTreeView#InboxSplitTree::item:selected:!active {
+            background-color: rgba(255, 255, 255, 0.04);
+            color: #a1a1aa;
+        }
+
+        /* --- Inbox mapping list (match tree + list style) --- */
+        QListWidget#InboxMappingList {
+            background-color: #121214;
+            border: none;
+            outline: none;
+            color: #a1a1aa;
+            font-size: 13px;
+            padding: 4px 0;
+        }
+        QListWidget#InboxMappingList::item {
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin: 2px 8px;
+        }
+        QListWidget#InboxMappingList::item:hover {
+            background-color: rgba(255, 255, 255, 0.06);
+            color: #fafafa;
+        }
+        QListWidget#InboxMappingList::item:selected {
+            background-color: rgba(59, 130, 246, 0.12);
+            color: #60a5fa;
+        }
+
         /* --- MONOS Deep Dark Table (Pipeline: Departments, Types mapping) --- */
         QTableWidget, QTableView {
             background-color: #121214;
@@ -694,6 +793,15 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #cccccc;
             font-weight: 700;
         }
+        QWidget#MainViewTypeBadge {
+            background: rgba(63, 63, 70, 0.45);
+            border: 1px solid rgba(63, 63, 70, 0.80);
+            border-radius: 6px;
+        }
+        QLabel#MainViewTypeBadgeLabel {
+            color: #cccccc;
+            font-weight: 700;
+        }
         QWidget#MainViewDepartmentBadge {
             background: rgba(59, 130, 246, 0.26);  /* Blue-400, more prominent */
             border: 1px solid rgba(63, 63, 70, 0.80);
@@ -737,6 +845,40 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid rgba(39, 39, 42, 0.50);
             background: rgba(24, 24, 27, 0.35);
             color: rgba(250, 250, 250, 0.45);
+        }
+        QLineEdit#MainViewSearchInput {
+            background-color: #1c1c1f;
+            border: 1px solid #2a2a2d;
+            border-radius: 6px;
+            color: #e4e4e7;
+            font-size: 13px;
+            padding: 6px 10px;
+        }
+        QLineEdit#MainViewSearchInput:focus {
+            border: 1px solid rgba(63, 63, 70, 0.90);
+        }
+        QToolButton#MainViewSearchClear {
+            padding: 4px;
+            border: none;
+            background: transparent;
+        }
+        QToolButton#MainViewSearchClear:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 4px;
+        }
+        QFrame#MainViewSearchPopup {
+            background-color: #1c1c1f;
+            border: 1px solid #2a2a2d;
+            border-radius: 8px;
+        }
+        QToolButton#MainViewSearchIconButton {
+            padding: 6px;
+            border: none;
+            background: transparent;
+        }
+        QToolButton#MainViewSearchIconButton:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 6px;
         }
 
         /* --- Inspector --- */

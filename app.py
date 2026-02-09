@@ -5,9 +5,10 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtWidgets import QApplication
 
+from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.crash_recovery import install_crash_logging
 from monostudio.core.pipeline_types_and_presets import ensure_user_default_config_dir
 from monostudio.ui_qt.main_window import MainWindow
@@ -41,7 +42,15 @@ def main() -> int:
     ensure_user_default_config_dir()
     apply_dark_theme(app)
 
+    # Icon for taskbar, Alt+Tab, window title (app.ico from logo)
+    _icon_path = get_app_base_path() / "monostudio_data" / "icons" / "app.ico"
+    _icon = QIcon(str(_icon_path)) if _icon_path.is_file() else QIcon()
+    if not _icon.isNull():
+        app.setWindowIcon(_icon)
+
     window = MainWindow()
+    if not _icon.isNull():
+        window.setWindowIcon(_icon)
     window.show()
 
     return app.exec()

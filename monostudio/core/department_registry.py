@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
+from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.models import Asset, ProjectIndex, Shot
 
 
@@ -27,7 +28,8 @@ _MONOS_PROJECT_JSON = "monos.project.json"
 _DEPARTMENTS_JSON = "departments.json"
 
 # Shipped default department mapping (monostudio_data/pipeline/department_presets/mono2026_preset.json).
-_MONO2026_PRESET_PATH = Path(__file__).resolve().parents[2] / "monostudio_data" / "pipeline" / "department_presets" / "mono2026_preset.json"
+def _mono2026_preset_path() -> Path:
+    return get_app_base_path() / "monostudio_data" / "pipeline" / "department_presets" / "mono2026_preset.json"
 
 
 def get_project_pipeline_dir(project_root: Path) -> Path:
@@ -85,7 +87,7 @@ def _default_department_mapping() -> dict[str, dict]:
     Default mapping when no project departments.json exists.
     Uses monostudio_data/pipeline/department_presets/mono2026_preset.json when present.
     """
-    loaded = _load_departments_json(_MONO2026_PRESET_PATH)
+    loaded = _load_departments_json(_mono2026_preset_path())
     if loaded:
         return loaded
     return _fallback_department_mapping()
@@ -271,6 +273,22 @@ class DepartmentRegistry:
         if node and isinstance(node.get("label"), str):
             return node["label"].strip()
         return (dept_id or "").strip() or ""
+
+    def is_subdepartment(self, dept_id: str) -> bool:
+        """True if this department has a parent (is a subdepartment / leaf task)."""
+        node = self._mapping.get((dept_id or "").strip())
+        if not node:
+            return False
+        p = node.get("parent")
+        return isinstance(p, str) and bool((p or "").strip())
+
+    def get_parent(self, dept_id: str) -> str | None:
+        """Parent department ID if this is a subdepartment; None otherwise."""
+        node = self._mapping.get((dept_id or "").strip())
+        if not node:
+            return None
+        p = node.get("parent")
+        return (p or "").strip() or None if isinstance(p, str) else None
 
     def get_department_folder(self, dept_id: str, context: DepartmentContext = "shot") -> str:
         """Physical folder (single segment or relative path when nested)."""

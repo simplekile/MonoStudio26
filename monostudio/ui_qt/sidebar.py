@@ -576,6 +576,7 @@ class SidebarWidget(QWidget):
             self._dept_parent = {}
             if self._active_type is not None and self._active_type not in set(self._all_types):
                 self._active_type = None
+            # When _active_type is None, main window shows both Client and Freelancer with section titles.
             self._active_department = None
             self.set_departments([])
             self.set_types(self._all_types)
@@ -1666,13 +1667,13 @@ class Sidebar(QWidget):
         self._project_index = project_index
         self._sync_nav_badges()
 
-    def _on_current_nav_item_changed(self, current: QListWidgetItem | None, _previous) -> None:
+    def _on_current_nav_item_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         if current is None:
             return
         context = current.data(Qt.UserRole)
         if not isinstance(context, str) or not context:
             return
-
+        self._previous_context_text = getattr(self, "_last_context_text", None)
         self._last_context_text = context
         self._sync_nav_active_states()
         # Filter panel: visible on Assets / Shots / Inbox; hidden on Projects, Library.
@@ -1689,11 +1690,13 @@ class Sidebar(QWidget):
         self.context_changed.emit(context)
 
     def _on_nav_item_clicked(self, item: QListWidgetItem) -> None:
-        # Click reloads current view (only when clicking already-selected item).
+        # Emit only when clicking the already-selected item (reload). When switching, currentItemChanged
+        # runs first and updates _last_context_text, so we must compare to _previous_context_text.
         context = item.data(Qt.UserRole)
         if not isinstance(context, str) or not context:
             return
-        if context == self._last_context_text:
+        prev = getattr(self, "_previous_context_text", None)
+        if context == self._last_context_text and context == prev:
             self.context_clicked.emit(context)
 
     def _on_nav_context_menu_requested(self, pos) -> None:

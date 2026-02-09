@@ -1,0 +1,121 @@
+---
+description: Plan UI chọn đích Inbox – flow Scope → Destination → Entity
+alwaysApply: false
+---
+
+# Plan: Inbox Destination UI (v1) – Scope → Destination → Entity
+
+User chọn **scope** trước (global / asset / shot), rồi chọn **loại đích** (script, storyboard, texture, model, …) tùy scope, cuối cùng chọn **entity** (shot hoặc character/asset) nếu cần.
+
+---
+
+## 1. Flow tổng quát (3 bước)
+
+| Bước | Tên UI | Nội dung | Ghi chú |
+|------|--------|----------|---------|
+| **1** | **Scope** (hoặc "To") | Global Reference \| Asset \| Shot | Quyết định "đổ vào đâu": project-level, từng asset, hay từng shot. |
+| **2** | **Destination** (hoặc "Category" / "Folder") | Danh sách thay đổi theo Scope | Script, Storyboard, Texture, Model, Reference, … chỉ hiện những mục hợp với scope đã chọn. |
+| **3** | **Entity** (chỉ khi Scope = Asset hoặc Shot) | Shot cụ thể \| Asset cụ thể (có thể lọc Type + Department) | Chọn shot nào / character (asset) nào. |
+
+- **Scope = Global Reference** → không cần bước 3 (không chọn entity).
+- **Scope = Asset** → bước 2 chỉ hiện destination cho asset; bước 3: lọc Type (Character/Prop/Env) → chọn asset (không có Department trong Inspector).
+- **Scope = Shot** → bước 2 chỉ hiện destination cho shot; bước 3: chọn shot.
+
+---
+
+## 2. Chi tiết từng bước
+
+### 2.1 Bước 1 – Scope
+
+- **Combo / radio:** 3 lựa chọn cố định.
+  - **Global Reference** – đích nằm dưới project root (reference, reference/script, …).
+  - **Asset** – đích nằm dưới từng asset (reference, concept, texture, model, …).
+  - **Shot** – đích nằm dưới từng shot (reference, …).
+- Giá trị lưu: `"project"` | `"asset"` | `"shot"` (trùng với `context` trong preset).
+
+### 2.2 Bước 2 – Destination (phụ thuộc Scope)
+
+Nguồn: `inbox_destinations.json`, mỗi entry có `context`: `"project"` | `"asset"` | `"shot"` | `"both"`.
+
+- **Khi Scope = Global Reference:** chỉ hiện destination có `context === "project"`.
+  - VD: Global Reference, Reference / Script, Reference / Storyboard, Reference / Guideline, Reference / Concept.
+- **Khi Scope = Asset:** chỉ hiện destination có `context === "asset"` hoặc `"both"`.
+  - VD: Reference (asset/shot), Concept (asset/shot), Texture, Character Sculpt.
+- **Khi Scope = Shot:** chỉ hiện destination có `context === "shot"` hoặc `"both"`.
+  - VD: Reference (asset/shot), Shot Reference.
+
+Logic filter:
+- `scope === "project"` → `dest.context === "project"`.
+- `scope === "asset"` → `dest.context in ("asset", "both")`.
+- `scope === "shot"` → `dest.context in ("shot", "both")`.
+
+Label hiển thị: dùng `label` trong JSON (có thể rút gọn bớt "(asset/shot)" nếu đã lọc theo scope).
+
+### 2.3 Bước 3 – Entity (chỉ khi Scope = Asset hoặc Shot)
+
+- **Scope = Global Reference:** ẩn hẳn bước 3 (không combo Entity, hoặc hiển thị cố định "Project (global)" không cần chọn).
+- **Scope = Shot:**
+  - Một combo **Entity** = danh sách shot (từ `project_index.shots`).
+  - Có thể thêm ô search/filter nếu sau này cần.
+- **Scope = Asset:**
+  - **Type** (combo): Character, Prop, Environment, … (từ TypeRegistry / project). Không có Department trong Inspector.
+  - **Entity** (combo): danh sách asset thỏa `asset_type === Type`.
+
+Thứ tự UI: **Type → Entity** (bỏ Department trong Inspector; department chỉ dùng ở sidebar khi cần).
+
+---
+
+## 3. Thứ tự control trên Inspector
+
+Đề xuất layout (từ trên xuống):
+
+1. **Destination** (block title, không đổi).
+2. **Scope** – combo: "Global Reference" | "Asset" | "Shot".
+3. **Destination** – combo: script / storyboard / texture / model / reference / … (filter theo Scope).
+4. **Type** – combo (chỉ hiện khi Scope = Asset): Character | Prop | Environment | …
+5. **Entity** – combo: "Project (global)" (khi Scope = Global) | list shot | list asset (lọc theo Type).
+6. Copy / Move + nút **Distribute**.
+
+Ẩn/hiện:
+- Scope = Global → ẩn Type; Entity = "Project (global)".
+- Scope = Shot → ẩn Type; hiện Entity = list shot.
+- Scope = Asset → hiện Type, Entity (list asset theo Type; không có Department trong Inspector).
+
+---
+
+## 4. Data: inbox_destinations.json
+
+Giữ nguyên cấu trúc hiện tại: mỗi entry có `id`, `label`, `path_template`, `context` (`"project"` | `"asset"` | `"shot"` | `"both"`).
+
+- **context = "project"**: path = `project_root / path_template`; không cần entity.
+- **context = "asset"**: path = `entity.path / path_template` với entity là Asset.
+- **context = "shot"**: path = `entity.path / path_template` với entity là Shot.
+- **context = "both"**: path = `entity.path / path_template` với entity là Asset hoặc Shot (scope quyết định chọn asset hay shot).
+
+Không cần thêm field mới; chỉ cần UI đổi thứ tự: **chọn Scope trước → filter Destination theo scope → chọn Entity (nếu cần)**.
+
+---
+
+## 5. Implementation checklist
+
+- [x] **Inspector block** – Thứ tự control (không có Department):
+  1. Combo **Scope**: Global Reference | Asset | Shot (data: "project" | "asset" | "shot").
+  2. Combo **Destination**: fill từ `load_inbox_destinations()`, filter theo `scope`.
+  3. Combo **Type** (chỉ khi Scope = Asset): Character | Prop | Environment | …
+  4. Combo **Entity**: khi Global → "Project (global)"; khi Shot → list shots; khi Asset → list asset (lọc Type only).
+- [ ] **resolve_destination_path** – Giữ nguyên: `(project_root, destination_id, entity)`. Khi scope = project, entity = None.
+- [ ] **Distribute** – Logic không đổi: từ destination_id + entity (hoặc None) resolve path → copy/move.
+
+---
+
+## 6. Tóm tắt
+
+| User chọn | Bước 1 Scope | Bước 2 Destination (ví dụ) | Bước 3 Entity |
+|-----------|----------------|-----------------------------|----------------|
+| Ref global, script | Global Reference | Reference / Script | — (không chọn) |
+| Ref global, storyboard | Global Reference | Reference / Storyboard | — |
+| Asset, texture, nhân vật A | Asset | Texture | Type=Character, Dept=(All), Entity=A |
+| Asset, model, prop B | Asset | Character Sculpt (hoặc Model) | Type=Prop, Entity=B |
+| Shot, reference, s001 | Shot | Shot Reference (hoặc Reference) | Entity=s001 |
+
+Flow: **Scope → Destination (theo scope) → Entity (nếu Asset/Shot)**. Plan này dùng để refactor Inspector block và giữ nguyên JSON + `resolve_destination_path`.

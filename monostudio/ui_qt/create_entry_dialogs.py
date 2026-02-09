@@ -3,23 +3,24 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt, QDate, QSettings
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QComboBox,
+    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
     QMenu,
     QPushButton,
     QSizePolicy,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
-from PySide6.QtWidgets import (
-    QLineEdit,
-    QVBoxLayout,
-)
+from PySide6.QtWidgets import QDateEdit, QLineEdit
 
 from monostudio.core.pipeline_types_and_presets import TypeDef, load_department_vocabulary, load_pipeline_types_and_presets
 from monostudio.ui_qt.style import MonosDialog
@@ -602,3 +603,46 @@ class CreateShotDialog(MonosDialog):
         super().showEvent(event)
         self._shot_number.setFocus()
 
+
+class AddToInboxDialog(MonosDialog):
+    """Dialog khi drop file/folder vào Inbox: chọn source (client/freelancer), date, description."""
+
+    def __init__(self, default_date: date | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add to Inbox")
+        self.setModal(True)
+
+        d = default_date or date.today()
+        self._date_edit = QDateEdit(QDate(d.year, d.month, d.day))
+        self._date_edit.setCalendarPopup(True)
+
+        self._source_combo = QComboBox()
+        self._source_combo.addItem("Client", "client")
+        self._source_combo.addItem("Freelancer", "freelancer")
+
+        self._description_edit = QLineEdit()
+        self._description_edit.setPlaceholderText("Optional description")
+        self._description_edit.setClearButtonEnabled(True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+        root.addWidget(_field_block("Source", self._source_combo, "Folder under inbox: client or freelancer."))
+        root.addWidget(_field_block("Date", self._date_edit, "Folder date (YYYY-MM-DD)."))
+        root.addWidget(_field_block("Description", self._description_edit, "Optional note for this import."))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def source(self) -> str:
+        return (self._source_combo.currentData() or "client") or "client"
+
+    def date_str(self) -> str:
+        qd = self._date_edit.date()
+        return f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+
+    def description(self) -> str | None:
+        t = (self._description_edit.text() or "").strip()
+        return t if t else None

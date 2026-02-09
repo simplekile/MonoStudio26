@@ -1,7 +1,12 @@
 [
-  { "id": "reference", "label": "Reference", "path_template": "reference", "context": "both" },
-  { "id": "concept", "label": "Concept", "path_template": "concept", "context": "both" },
-  { "id": "texture", "label": "Texture", "path_template": "surfacing/texturing/ref", "context": "asset" },
-  { "id": "character_sculpt", "label": "Character Sculpt", "path_template": "modelling/sculpt/ref", "context": "asset" },
-  { "id": "shot_reference", "label": "Shot Reference", "path_template": "reference", "context": "shot" }
+  {"id": "global_reference", "label": "Global Reference", "path_template": "reference", "context": "project"},
+  {"id": "reference_script", "label": "Reference / Script", "path_template": "reference/script", "context": "project"},
+  {"id": "reference_storyboard", "label": "Reference / Storyboard", "path_template": "reference/storyboard", "context": "project"},
+  {"id": "reference_guideline", "label": "Reference / Guideline", "path_template": "reference/guideline", "context": "project"},
+  {"id": "reference_concept", "label": "Reference / Concept", "path_template": "reference/concept", "context": "project"},
+  {"id": "reference", "label": "Reference (asset/shot)", "path_template": "reference", "context": "both"},
+  {"id": "concept", "label": "Concept (asset/shot)", "path_template": "concept", "context": "both"},
+  {"id": "texture", "label": "Texture", "path_template": "surfacing/texturing/ref", "context": "asset"},
+  {"id": "character_sculpt", "label": "Character Sculpt", "path_template": "modelling/sculpt/ref", "context": "asset"},
+  {"id": "shot_reference", "label": "Shot Reference", "path_template": "reference", "context": "shot"}
 ]

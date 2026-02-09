@@ -1,0 +1,150 @@
+# Plan: Hiển thị Page & Lưu State hoàn chỉnh (v1)
+
+Tài liệu mô tả **luồng hiển thị page** (sidebar → content stack → main view / inbox split) và **danh sách state cần persist/restore** với key, vị trí lưu, và các việc còn thiếu/sửa.
+
+---
+
+## 1. Hiển thị Page (Page Display Flow)
+
+### 1.1 Cấu trúc tổng thể
+
+```
+Sidebar (nav)          Content area
+─────────────────      ─────────────────────────────────────
+• Assets          →    [ QStackedWidget ]
+• Shots                ├─ index 0: MainView (Assets / Shots / Projects / Library)
+• Inbox                └─ index 1: InboxSplitView (chỉ khi user "vào" date folder trong Inbox)
+• Projects
+• Library
+```
+
+- **Sidebar** (`sidebar.current_context()`) quyết định **page logic**: Assets | Shots | Inbox | Projects | Library.
+- **Content stack** quyết định **widget hiển thị**:
+  - **MainView** khi: Assets, Shots, Projects, Library, **hoặc** Inbox đang ở dạng list (danh sách date folders).
+  - **InboxSplitView** chỉ khi: context = Inbox **và** user đã double-click vào một date folder (tree bên trái + mapping bên phải).
+
+### 1.2 Luồng chuyển page
+
+| Bước | Sự kiện | Xử lý (main_window) |
+|------|--------|----------------------|
+| 1 | User click nav item (Assets/Shots/Inbox/…) | `_nav.currentRowChanged` → `context_changed` → `_on_context_switched` |
+| 2 | Đang ở Inbox, rời sang page khác | Lưu inbox state (date folder, tree, splitter); remove InboxSplitView khỏi stack; `setCurrentWidget(_main_view)` |
+| 3 | Chuyển sang Inbox | Sync filter; nếu `_restore_inbox_date_folder_state()` → tạo InboxSplitView + restore tree/splitter; else `_reload_main_view()` (list inbox) |
+| 4 | Click lại nav item đang chọn | `context_clicked` → `_on_context_clicked` → reload main view (không đổi page) |
+
+**MainView nội bộ:**
+
+- **Browser context**: `project` | `asset` | `shot` (set theo sidebar context: Projects → project, Shots → shot, Assets → asset).
+- **View mode**: `tile` | `list` (toggle grid/list), persist **per browser_context**.
+- **Card size**: preset (small/medium/large), persist **per browser_context**.
+
+### 1.3 Điểm cần đảm bảo khi implement
+
+- Khi restore sidebar context = "Inbox", nếu có lưu "restore split" + last date folder **hợp lệ** → tạo InboxSplitView và show ngay split view; ngược lại show list inbox trong MainView.
+- Tránh double reload: Inbox có cooldown `_inbox_switch_cooldown` và sync filter trước khi `_reload_main_view`.
+- MainView.clear() được gọi trước khi đổi stack để tránh flash nội dung cũ.
+
+---
+
+## 2. State persistence — Tổng quan
+
+| State | Key / storage | Lưu khi | Khôi phục khi |
+|-------|----------------|--------|----------------|
+| Window geometry + maximized | `app_settings.json`: `window_geometry_b64`, `window_maximized` | closeEvent | _restore_window_geometry (trước show) |
+| Sidebar nav page | QSettings `ui/sidebar_context` | closeEvent | _restore_sidebar_context (sau connect) |
+| Workspace root | QSettings `workspace/root` | _apply_workspace_root(save=True) | _restore_workspace_root |
+| Project root | QSettings `project/root` | _apply_project_root(save=True) | _restore_project_root |
+| Sidebar filters (assets/shots) | QSettings `sidebar/filters/{mode}/…` | _save_state_for_mode (khi đổi mode) | set_settings → _load_state_for_mode |
+| MainView view mode | QSettings `mainview/view_mode/{context}` | set_view_mode(save=True) | set_browser_context → value(key) → set_view_mode(..., save=False) |
+| MainView card size | QSettings `mainview/card_size/{context}` | set_card_size_preset(save=True) | _load_card_size_preset |
+| Inbox: last date folder | QSettings `inbox/last_date_folder_path` | _save_inbox_date_folder_state | _restore_inbox_date_folder_state |
+| Inbox: restore split? | QSettings `inbox/restore_split_view` | Khi rời Inbox (True); khi Back (False) | _restore_inbox_date_folder_state |
+| Inbox: tree expanded | QSettings `inbox/tree_expanded_paths` | _save_inbox_tree_state | _load_inbox_tree_state → set_tree_state |
+| Inbox: splitter sizes | QSettings `inbox/splitter_sizes` | _save_inbox_tree_state | _load_inbox_tree_state |
+| Recent tasks | QSettings (RecentTasksStore) | push | __init__ / get_for_project |
+
+---
+
+## 3. State chưa lưu / cần bổ sung hoặc sửa
+
+### 3.1 Splitters chính (Main Window)
+
+- **main_splitter** (sidebar | content+inspector): sizes `[256, 1100]` mặc định — **chưa** save/restore.
+- **content_splitter** (content_stack | inspector): sizes `[800, 320]` — **chưa** save/restore.
+
+**Đề xuất:**
+
+- Gán `objectName` cho từng splitter (vd `MainSplitter`, `ContentSplitter`).
+- Trong `closeEvent`: lưu sizes vào QSettings hoặc `app_settings.json` (vd `ui/main_splitter_sizes`, `ui/content_splitter_sizes` — list int).
+- Trong `_restore_window_geometry` (hoặc sau khi set central widget): nếu có saved sizes hợp lệ thì `setSizes(saved)`.
+
+### 3.2 Inbox: Restore date folder (bug hiện tại)
+
+Trong `_restore_inbox_date_folder_state()`:
+
+- Hiện có đoạn **return True** / **return False** sớm, khiến code đọc `path_str` và gọi `_enter_inbox_date_folder` **không bao giờ chạy** (dead code).
+- Cần sửa logic: chỉ return True khi đã gọi `_enter_inbox_date_folder(path, restore_tree_state=True)` thành công; nếu không có path hợp lệ hoặc restore fail thì return False để flow dùng list inbox.
+
+**Đề xuất:**
+
+- Đọc `inbox/restore_split_view`; nếu False/0 → return False.
+- Đọc `inbox/last_date_folder_path`; validate path (exists, under project_root).
+- Nếu hợp lệ: gọi `_enter_inbox_date_folder(path, restore_tree_state=True)` và return True.
+- Ngược lại: return False.
+
+### 3.3 Selection (item đang chọn)
+
+- **AppState.selection_id** hiện **không** persist qua restart.
+- Có thể cố ý (tránh restore selection vào item đã xóa/đổi path). Nếu muốn "restore selection":
+  - Lưu `project/last_selection_id` (hoặc per-context) trong closeEvent / khi selection thay đổi (debounce).
+  - Sau _reload_main_view (hoặc set_items) gọi `preserve_selection_id=...` với giá trị đã lưu; MainView đã hỗ trợ `preserve_selection_id` trong `set_items`.
+
+### 3.4 Search query
+
+- `current_search_query` **không** lưu. Nếu muốn: lưu per-context (vd `mainview/search/{context}`) và apply sau khi set_items.
+
+### 3.5 Inspector visibility
+
+- Inspector có thể đóng (close) — chỉ clear selection; **không** lưu trạng thái "đã thu gọn" hay width. Nếu cần: lưu width hoặc collapsed state trong QSettings và restore khi init.
+
+---
+
+## 4. Thứ tự khôi phục khi mở app (checklist)
+
+Để page và state hiển thị đúng, thứ tự gợi ý:
+
+1. **QSettings + app_settings.json** đã load (MainWindow.__init__).
+2. **Workspace root** → `_restore_workspace_root()`.
+3. **Project root** → `_restore_project_root()` (sẽ trigger build_project_index, _reload_main_view nếu có project).
+4. **Window geometry** → `_restore_window_geometry()` (trước show).
+5. **Splitters** (nếu đã thêm) → restore sizes sau setCentralWidget.
+6. **Sidebar context** → `_restore_sidebar_context()` (sau khi đã connect signals).  
+   - Nếu context = Inbox → trong _on_context_switched sẽ gọi _restore_inbox_date_folder_state(); nếu True thì tạo InboxSplitView và setCurrentWidget.
+7. **Filter state** → `_sync_filter_state_from_sidebar()` (đã gọi sau _restore_sidebar_context).
+8. **MainView** view mode / card size đã restore trong set_browser_context (gọi khi sync primary action / set context).
+
+---
+
+## 5. File / code tham chiếu
+
+| Nội dung | File / vị trí |
+|----------|----------------|
+| Content stack, splitters, closeEvent, restore flows | `monostudio/ui_qt/main_window.py` |
+| Sidebar nav, set_current_context, context_changed | `monostudio/ui_qt/sidebar.py` |
+| MainView view mode, card size, set_browser_context, _settings_key_view_mode | `monostudio/ui_qt/main_view.py` |
+| Sidebar filters persist (set_settings, _save_state_for_mode) | `monostudio/ui_qt/sidebar.py` (SidebarFiltersBlock) |
+| Inbox save/restore (date folder, tree, splitter) | `main_window.py`: _save_inbox_*, _restore_inbox_*, _enter_inbox_date_folder |
+| Window geometry (restore/save) | `main_window.py`: _restore_window_geometry, closeEvent, _app_settings_path |
+| Project/workspace restore | `main_window.py`: _restore_project_root, _restore_workspace_root |
+
+---
+
+## 6. Tóm tắt hành động
+
+- **Đã có:** Sidebar page, workspace/project root, window geometry + maximized, sidebar filters (assets/shots), MainView view mode + card size per context, Inbox date folder/tree/splitter keys, recent tasks.
+- **Cần làm thêm / sửa:**
+  1. **Splitter state**: Lưu/restore main_splitter và content_splitter sizes.
+  2. **Inbox restore**: Sửa `_restore_inbox_date_folder_state()` để thực sự đọc path và gọi `_enter_inbox_date_folder` khi hợp lệ.
+  3. (Tùy chọn) Selection persist; search query persist; inspector width/collapsed.
+
+Sau khi hoàn thành các mục trên, **hiển thị page** và **lưu state** sẽ nhất quán và hoàn chỉnh theo đúng flow hiện tại của app.

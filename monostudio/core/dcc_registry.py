@@ -7,6 +7,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from monostudio.core.app_paths import get_app_base_path
+
 
 @dataclass(frozen=True)
 class _DccEntry:
@@ -31,7 +33,7 @@ class DccRegistry:
 
     @staticmethod
     def default_path(*, repo_root: Path | None = None) -> Path:
-        root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
+        root = Path(repo_root) if repo_root is not None else get_app_base_path()
         return root / "monostudio_data" / "pipeline" / "dccs.json"
 
     @classmethod

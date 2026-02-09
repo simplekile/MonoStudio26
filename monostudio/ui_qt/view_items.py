@@ -11,6 +11,7 @@ class ViewItemKind(str, Enum):
     SHOT = "shot"
     DEPARTMENT = "department"
     INBOX_ITEM = "inbox_item"
+    INBOX_SECTION = "inbox_section"  # section title when showing both Client and Freelancer
 
 
 @dataclass(frozen=True)

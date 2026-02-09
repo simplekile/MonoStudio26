@@ -5,6 +5,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.department_registry import get_project_pipeline_dir
 
 
@@ -33,8 +34,7 @@ class PipelineTypesAndPresets:
 
 
 def pipeline_root() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "monostudio_data" / "pipeline"
+    return get_app_base_path() / "monostudio_data" / "pipeline"
 
 
 def pipeline_types_and_presets_path() -> Path:

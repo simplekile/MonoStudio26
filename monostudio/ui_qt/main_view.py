@@ -10,20 +10,26 @@ from PySide6.QtGui import (
     QActionGroup,
     QColor,
     QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
     QFont,
     QIcon,
+    QKeySequence,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
+    QShortcut,
     QStandardItem,
     QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListView,
     QMenu,
     QApplication,
@@ -274,6 +280,30 @@ class _GridCardDelegate(QStyledItemDelegate):
         item = index.data(Qt.UserRole)
         if not isinstance(item, ViewItem):
             super().paint(painter, option, index)
+            return
+
+        # Section header (inbox_section): full-width bar, no thumbnail
+        if item.kind.value == "inbox_section":
+            g = max(0, int(self._gap_px))
+            r = option.rect.adjusted(0, 0, -g, -g)
+            if r.width() <= 0 or r.height() <= 0:
+                return
+            p = painter
+            p.save()
+            try:
+                p.setRenderHint(QPainter.Antialiasing, True)
+                p.setRenderHint(QPainter.TextAntialiasing, True)
+                from PySide6.QtGui import QFont
+                p.fillRect(r, QColor("#1f1f23"))
+                p.setPen(QColor("#a1a1aa"))
+                f = p.font()
+                f.setWeight(QFont.Weight.DemiBold)
+                f.setPointSize(11)
+                p.setFont(f)
+                name = (item.name or "").strip() or "—"
+                p.drawText(r.adjusted(12, 0, -12, 0), Qt.AlignLeft | Qt.AlignVCenter, name)
+            finally:
+                p.restore()
             return
 
         # Paint inside the grid cell leaving explicit gap on right/bottom.
@@ -637,6 +667,8 @@ class MainView(QWidget):
     status_set_requested = Signal(object, str)  # (ViewItem, status: ready|progress|waiting|blocked)
     primary_action_requested = Signal()  # header primary action
     view_mode_changed = Signal(str)  # "tile" | "list"
+    inbox_drop_requested = Signal(object)  # list[Path] — when Inbox context and user drops files/folders
+    search_query_changed = Signal(str)  # debounced search text; empty string = clear
 
     _SETTINGS_KEY_VIEW_MODE_PREFIX = "main_view/mode"
     _SETTINGS_KEY_CARD_SIZE_PREFIX = "main_view/card_size"
@@ -718,6 +750,43 @@ class MainView(QWidget):
         title_row_l.addWidget(self._context_title, 0, Qt.AlignVCenter)
         title_row_l.addWidget(self._type_badge, 0, Qt.AlignVCenter)
         title_row_l.addWidget(self._department_badge, 0, Qt.AlignVCenter)
+
+        # Search: icon button (right side of bar); popup with QLineEdit opens on click or Ctrl+F
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.timeout.connect(self._emit_search_query)
+        self._search_debounce_ms = 180
+        self._search_popup = QFrame(self)
+        self._search_popup.setObjectName("MainViewSearchPopup")
+        self._search_popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._search_popup.setFixedSize(260, 40)
+        self._search_popup.setAttribute(Qt.WA_StyledBackground, True)
+        popup_layout = QHBoxLayout(self._search_popup)
+        popup_layout.setContentsMargins(8, 6, 8, 6)
+        popup_layout.setSpacing(6)
+        self._search_input = QLineEdit(self._search_popup)
+        self._search_input.setObjectName("MainViewSearchInput")
+        self._search_input.setPlaceholderText("Search…")
+        self._search_input.setClearButtonEnabled(False)
+        self._search_input.textChanged.connect(self._on_search_text_changed)
+        self._btn_search_clear = QToolButton(self._search_popup)
+        self._btn_search_clear.setObjectName("MainViewSearchClear")
+        self._btn_search_clear.setIcon(lucide_icon("x", size=14, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_search_clear.setAutoRaise(True)
+        self._btn_search_clear.setCursor(Qt.PointingHandCursor)
+        self._btn_search_clear.setVisible(False)
+        self._btn_search_clear.clicked.connect(self._clear_search)
+        popup_layout.addWidget(self._search_input, 1)
+        popup_layout.addWidget(self._btn_search_clear, 0, Qt.AlignVCenter)
+        self._btn_search_icon = QToolButton(header)
+        self._btn_search_icon.setObjectName("MainViewSearchIconButton")
+        self._btn_search_icon.setToolTip("Search (Ctrl+F)")
+        self._btn_search_icon.setAutoRaise(True)
+        self._btn_search_icon.setCursor(Qt.PointingHandCursor)
+        self._btn_search_icon.setIcon(lucide_icon("search", size=16, color_hex=MONOS_COLORS["text_primary"]))
+        self._btn_search_icon.clicked.connect(self._show_search_popup)
+        _search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        _search_shortcut.activated.connect(self._show_search_popup)
 
         # Center: View toggle (Grid | List) — pill UI same as Settings Tier3 (Asset Depts | Shot Depts)
         toggle = QWidget(header)
@@ -901,6 +970,7 @@ class MainView(QWidget):
         header_layout.addWidget(toggle, 0, Qt.AlignVCenter)
         header_layout.addStretch(1)
         header_layout.addWidget(self._btn_card_size, 0, Qt.AlignVCenter)
+        header_layout.addWidget(self._btn_search_icon, 0, Qt.AlignVCenter)
         header_layout.addWidget(self._primary_action, 0, Qt.AlignVCenter)
 
         self.set_selected_asset_type(None)
@@ -924,6 +994,69 @@ class MainView(QWidget):
         self._items: dict[str, int] = {}
         self._order: list[str] = []
         self._selection_driven_by_state = False
+        self._accept_inbox_drop = False
+
+    def set_accept_inbox_drop(self, enabled: bool) -> None:
+        """When True, MainView accepts drag-drop of files/folders and emits inbox_drop_requested(paths)."""
+        if self._accept_inbox_drop == enabled:
+            return
+        self._accept_inbox_drop = enabled
+        self.setAcceptDrops(enabled)
+
+    def _on_search_text_changed(self, _text: str) -> None:
+        self._btn_search_clear.setVisible(bool((self._search_input.text() or "").strip()))
+        self._search_debounce_timer.stop()
+        self._search_debounce_timer.start(self._search_debounce_ms)
+
+    def _emit_search_query(self) -> None:
+        text = (self._search_input.text() or "").strip()
+        self.search_query_changed.emit(text)
+
+    def _clear_search(self) -> None:
+        self._search_debounce_timer.stop()
+        self._search_input.clear()
+        self._btn_search_clear.setVisible(False)
+        self.search_query_changed.emit("")
+
+    def _show_search_popup(self) -> None:
+        """Show search popup below the search icon; focus line edit. Called by icon click or Ctrl+F."""
+        pos = self._btn_search_icon.mapToGlobal(self._btn_search_icon.rect().bottomLeft())
+        self._search_popup.move(pos.x(), pos.y() + 2)
+        self._search_popup.show()
+        self._search_input.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def set_search_placeholder(self, placeholder: str) -> None:
+        """Set placeholder text for the search input (e.g. context-aware: Search assets, Search shots)."""
+        self._search_input.setPlaceholderText(placeholder or "Search…")
+
+    def set_search_query(self, query: str) -> None:
+        """Set search input text without emitting (e.g. when clearing on context switch)."""
+        self._search_input.blockSignals(True)
+        try:
+            self._search_input.setText(query or "")
+        finally:
+            self._search_input.blockSignals(False)
+        self._btn_search_clear.setVisible(bool((query or "").strip()))
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if not self._accept_inbox_drop or not event.mimeData().hasUrls():
+            super().dragEnterEvent(event)
+            return
+        event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if not self._accept_inbox_drop or not event.mimeData().hasUrls():
+            super().dropEvent(event)
+            return
+        paths: list[Path] = []
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                p = Path(url.toLocalFile())
+                if p.exists():
+                    paths.append(p)
+        event.acceptProposedAction()
+        if paths:
+            self.inbox_drop_requested.emit(paths)
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched is self._tile_view.viewport() and event.type() == QEvent.Resize:
@@ -1664,7 +1797,6 @@ class MainView(QWidget):
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
 
-
     def _settings_key_view_mode(self) -> str:
         return f"{self._SETTINGS_KEY_VIEW_MODE_PREFIX}/{self._browser_context}"
 
@@ -1718,6 +1850,8 @@ class MainView(QWidget):
             return self._placeholder_icon_for_kind(item.kind.value)
         if item.kind.value == "inbox_item":
             return lucide_icon("folder", size=20, color_hex=MONOS_COLORS["text_label"])
+        if item.kind.value == "inbox_section":
+            return lucide_icon("inbox", size=20, color_hex=MONOS_COLORS["text_label"])
         return lucide_icon("folder", size=20, color_hex=MONOS_COLORS["text_label"])
 
     def _placeholder_icon_for_kind(self, kind: str) -> QIcon:
@@ -1826,8 +1960,15 @@ class MainView(QWidget):
 
         tile_has_rows = self._tile_model.rowCount() > 0
         list_has_rows = self._list_model.rowCount() > 0
-        self._tile_page.setCurrentIndex(1 if tile_has_rows else 0)
-        self._list_page.setCurrentIndex(1 if list_has_rows else 0)
+        idx_tile = 1 if tile_has_rows else 0
+        idx_list = 1 if list_has_rows else 0
+        self._tile_page.setCurrentIndex(idx_tile)
+        self._list_page.setCurrentIndex(idx_list)
+        # Force stack to show content and repaint so placeholder does not stay on top (timing/layout).
+        if tile_has_rows or list_has_rows:
+            self._tile_page.update()
+            self._list_page.update()
+            self.update()
 
     def _on_tile_activated(self, index) -> None:
         item = index.data(Qt.UserRole)
@@ -1868,7 +2009,7 @@ class MainView(QWidget):
         self._dispatch_item_context_action(chosen, item)
 
     def _build_item_context_menu(self, item: ViewItem) -> QMenu | None:
-        # Asset / Shot / Department / Inbox item.
+        # Asset / Shot / Department / Inbox item. Section headers (inbox_section) have no menu.
         if item.kind.value not in ("asset", "shot", "department", "inbox_item"):
             return None
 

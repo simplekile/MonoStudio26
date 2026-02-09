@@ -7,15 +7,12 @@ from PySide6.QtCore import QByteArray, QRect, Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 
+from monostudio.core.app_paths import get_app_base_path
 from monostudio.ui_qt.style import MONOS_COLORS
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
 def _brands_dir() -> Path:
-    return _repo_root() / "monostudio_data" / "icons" / "brands"
+    return get_app_base_path() / "monostudio_data" / "icons" / "brands"
 
 
 def _brand_svg_path(slug: str) -> Path:

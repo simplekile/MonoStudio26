@@ -4,11 +4,13 @@ import base64
 import json
 import logging
 import shutil
+from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QFileSystemWatcher, Qt, QSettings, Signal, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, Qt, QSettings, Signal, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
-from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QMessageBox, QSizeGrip, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget
+from qframelesswindow import FramelessMainWindow
 
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.department_registry import DepartmentRegistry
@@ -20,7 +22,7 @@ from monostudio.core.fs_reader import (
     run_incremental_scan,
 )
 from monostudio.core.models import Asset, InboxItem, ProjectIndex, Shot
-from monostudio.core.inbox_reader import get_inbox_root, scan_inbox
+from monostudio.core.inbox_reader import add_to_inbox, get_inbox_root, scan_inbox
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.workspace_reader import DiscoveredProject, ProjectQuickStats, discover_projects, read_project_quick_stats
 from monostudio.core.project_create import create_new_project
@@ -32,7 +34,8 @@ from monostudio.core.pipeline_types_and_presets import (
 from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
 from monostudio.core.item_status import read_item_status, write_item_status
 from monostudio.core.pending_create import remove_by_entity, remove_for_entities, clear_all as pending_clear_all
-from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
+from monostudio.ui_qt.create_entry_dialogs import AddToInboxDialog, CreateAssetDialog, CreateShotDialog
+from monostudio.ui_qt.inbox_split_view import InboxSplitView
 from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
 from monostudio.ui_qt.new_project_dialog import NewProjectDialog
@@ -54,7 +57,7 @@ from monostudio.ui_qt.style import MONOS_COLORS
 from monostudio.ui_qt.notification import notify as notification_service
 
 
-class MainWindow(QMainWindow):
+class MainWindow(FramelessMainWindow):
     """
     Phase 0 shell:
     - 3 panels: Sidebar (~15%), Main View (~60%), Inspector (~25%, hidden by default)
@@ -73,9 +76,6 @@ class MainWindow(QMainWindow):
 
         # Minimum window size (usability floor).
         self.setMinimumSize(640, 480)
-
-        # Borderless window: no OS frame; custom title bar (TopBar) handles drag and window buttons.
-        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
         self.setObjectName("MonosMainWindow")
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
@@ -85,6 +85,8 @@ class MainWindow(QMainWindow):
         self._controller.set_recent_tasks_store(self._recent_tasks_store)
         # Guard: context switches must never trigger Open DCC flows or spawn dialogs.
         self._context_switch_in_progress: bool = False
+        # Short cooldown after switching to Inbox so a delayed filter signal does not trigger a second reload (items flash then placeholder).
+        self._inbox_switch_cooldown: bool = False
         # Guard: filter (department/type) changes must never trigger Open DCC flows or spawn dialogs.
         self._filter_switch_in_progress: bool = False
         self._workspace_root: Path | None = None
@@ -113,6 +115,7 @@ class MainWindow(QMainWindow):
         # Centralized filter state (UI-only; no filtering engine yet)
         self.current_department: str | None = None
         self.current_type: str | None = None
+        self.current_search_query: str = ""
         meta = load_pipeline_types_and_presets()
         self._type_name_by_id: dict[str, str] = {k: v.name for k, v in meta.types.items()}
         # Type aliases allow robust matching against filesystem folder names:
@@ -132,10 +135,15 @@ class MainWindow(QMainWindow):
             pass
         self._main_view = MainView()
         self._main_view.set_thumbnail_manager(self._thumbnail_manager)
+        self._content_stack = QStackedWidget()
+        self._content_stack.addWidget(self._main_view)
+        self._inbox_split_view: InboxSplitView | None = None
         self._inspector = InspectorPanel()
         self._inspector.set_thumbnail_manager(self._thumbnail_manager)
         self._inspector.setMinimumWidth(240)
         self._top_bar = TopBar(self)
+        self._top_bar.setFixedHeight(56)  # so FramelessMainWindow resize keeps height
+        self.setTitleBar(self._top_bar)  # replace library title bar with MONOS TopBar
         self._clipboard_thumbs = ClipboardThumbnailHandler(parent=self)
 
         # Topbar replaces the menu bar (no menus).
@@ -148,36 +156,39 @@ class MainWindow(QMainWindow):
         self._restore_window_geometry()
 
         # L1: Main layout (horizontal) -> [Sidebar] + [Right container]
-        # L2: Right container (vertical) -> [Topbar] + [Main content]
+        # L2: Right container (vertical) -> [spacer for title bar] + [Main content]
+        # Title bar is window child via setTitleBar(); spacer keeps content below it.
+        _title_bar_spacer = QWidget(self)
+        _title_bar_spacer.setFixedHeight(56)
         right_container = QWidget(self)
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
-        right_layout.addWidget(self._top_bar, 0)
+        right_layout.addWidget(_title_bar_spacer, 0)
 
-        content_splitter = QSplitter(Qt.Horizontal)
-        content_splitter.setChildrenCollapsible(False)
-        content_splitter.addWidget(self._main_view)
-        content_splitter.addWidget(self._inspector)
-        content_splitter.setStretchFactor(0, 70)
-        content_splitter.setStretchFactor(1, 30)
-        content_splitter.setSizes([800, 320])
-        right_layout.addWidget(content_splitter, 1)
+        self._content_splitter = QSplitter(Qt.Horizontal)
+        self._content_splitter.setObjectName("ContentSplitter")
+        self._content_splitter.setChildrenCollapsible(False)
+        self._content_splitter.addWidget(self._content_stack)
+        self._content_splitter.addWidget(self._inspector)
+        self._content_splitter.setStretchFactor(0, 70)
+        self._content_splitter.setStretchFactor(1, 30)
+        self._content_splitter.setSizes([800, 320])
+        right_layout.addWidget(self._content_splitter, 1)
 
-        main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.setChildrenCollapsible(False)
-        main_splitter.addWidget(self._sidebar)
-        main_splitter.addWidget(right_container)
-        main_splitter.setStretchFactor(0, 20)
-        main_splitter.setStretchFactor(1, 80)
-        main_splitter.setSizes([256, 1100])
+        self._main_splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter.setObjectName("MainSplitter")
+        self._main_splitter.setChildrenCollapsible(False)
+        self._main_splitter.addWidget(self._sidebar)
+        self._main_splitter.addWidget(right_container)
+        self._main_splitter.setStretchFactor(0, 20)
+        self._main_splitter.setStretchFactor(1, 80)
+        self._main_splitter.setSizes([256, 1100])
 
-        self.setCentralWidget(main_splitter)
-
-        # Resize (6b B): QSizeGrip góc dưới phải
-        self._size_grip = QSizeGrip(self)
-        self._size_grip.setFixedSize(20, 20)
-        self._size_grip.raise_()
+        self.setCentralWidget(self._main_splitter)
+        self._restore_splitter_sizes()
+        # Title bar must stay on top so it receives drag and window buttons (min/max/close).
+        self._top_bar.raise_()
 
         self._sidebar.context_changed.connect(self._on_context_switched)
         self._sidebar.context_clicked.connect(self._on_context_clicked)
@@ -221,11 +232,16 @@ class MainWindow(QMainWindow):
         self._main_view.delete_requested.connect(self._on_delete_requested)
         self._main_view.status_set_requested.connect(self._on_status_set_requested)
         self._main_view.primary_action_requested.connect(self._on_primary_action_requested)
+        self._main_view.inbox_drop_requested.connect(self._on_inbox_drop_requested)
+        self._main_view.search_query_changed.connect(self._on_search_query_changed)
 
         # Inspector intents (explicit)
-        self._inspector.open_requested.connect(self._on_inspector_open_requested)
-        self._inspector.open_with_requested.connect(self._on_inspector_open_with_requested)
+        self._inspector.open_folder_requested.connect(self._on_inspector_open_folder_requested)
         self._inspector.status_change_requested.connect(self._on_status_set_requested)
+        self._inspector.inbox_distribute_finished.connect(self._on_inbox_distribute_finished)
+
+        # Restore last nav page (Assets/Shots/Inbox/...) after connections so Inbox switch builds split view.
+        self._restore_sidebar_context()
 
         # Initial population is driven by project-root restore (scan trigger) and current context.
         self._reload_main_view()
@@ -239,7 +255,13 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._top_bar.raise_()  # keep title bar on top so drag + min/max/close work
         notification_service.update_overlay_geometry()
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._top_bar.set_maximized(self.isMaximized())
 
     @staticmethod
     def _norm(s: str | None) -> str:
@@ -281,15 +303,35 @@ class MainWindow(QMainWindow):
             out.append(a)
         return out
 
+    def _apply_search_filter(self, items: list[ViewItem], query: str) -> list[ViewItem]:
+        """Filter ViewItems by substring match on name, type_badge, path (case-insensitive). Empty query = no filter."""
+        q = (query or "").strip().lower()
+        if not q:
+            return items
+        out: list[ViewItem] = []
+        for item in items:
+            name_norm = (item.name or "").lower()
+            type_norm = (item.type_badge or "").lower()
+            path_norm = str(item.path).lower()
+            if q in name_norm or q in type_norm or q in path_norm:
+                out.append(item)
+        return out
+
     # Filter click handlers now live in AppController.
 
     def _on_filter_state_changed(self, _value=None) -> None:
         # Filter changes can cause selection/model churn; never allow it to trigger Open flows.
         if getattr(self, "_filter_switch_in_progress", False):
             return
+        # During context switch, do not reload from filter signals (avoids second reload that can wipe Inbox items).
+        if getattr(self, "_context_switch_in_progress", False):
+            return
         ctx = self._sidebar.current_context()
         # Reload for Assets (filter) and Inbox (source = client/freelancer).
         if ctx not in ("Assets", "Inbox"):
+            return
+        # Ignore filter-driven reload for Inbox briefly after switching to Inbox (avoids items flash then placeholder).
+        if ctx == "Inbox" and getattr(self, "_inbox_switch_cooldown", False):
             return
         if ctx == "Assets" and self._entered_parent is not None:
             return
@@ -311,8 +353,17 @@ class MainWindow(QMainWindow):
         self._main_view.set_active_department(dep, label=label, icon_name=icon_name)
 
     def _set_main_view_type(self) -> None:
-        """Sync main view type badge with asset type selected in sidebar (Character, Prop, Environment, …)."""
-        if self._sidebar.current_context() != "Assets":
+        """Sync main view type badge: Assets = asset type (Character, Prop, …); Inbox = source (Client, Freelancer)."""
+        ctx = self._sidebar.current_context()
+        if ctx == "Inbox":
+            type_id = self._sidebar.filters().current_type()
+            if not type_id:
+                self._main_view.set_selected_asset_type(None)
+                return
+            label, icon_name = self._sidebar.filters().get_type_display(type_id)
+            self._main_view.set_selected_asset_type(type_id, label=label, icon_name=icon_name)
+            return
+        if ctx != "Assets":
             self._main_view.set_selected_asset_type(None)
             return
         type_id = self._sidebar.filters().current_type()
@@ -346,11 +397,27 @@ class MainWindow(QMainWindow):
         """
         Keep centralized filter state in sync with the SidebarWidget selection
         when switching pages (Assets vs Shots) where SidebarWidget restores per-page state.
+        For Inbox we do not clear type (source = Client/Freelancer); we pull sidebar type
+        into our state without emitting, so _reload_main_view sees a valid source and
+        no second reload wipes items.
         """
         ctx = self._sidebar.current_context()
         if ctx not in ("Assets", "Shots"):
-            self._set_current_department(None, toggle_if_same=False)
-            self._set_current_type(None, toggle_if_same=False)
+            if ctx == "Inbox":
+                # Sync sidebar → local state only (no emit) so first _reload_main_view has a valid source.
+                filters = self._sidebar.filters()
+                t = filters.current_type()
+                d = filters.current_department()
+                if t is not None:
+                    self.current_type = t
+                    self._app_state.set_filters(self.current_department, self.current_type)
+                if d is not None:
+                    self.current_department = d
+                    self._app_state.set_filters(self.current_department, self.current_type)
+                self._set_main_view_type()  # type badge in headbar (Client / Freelancer)
+            else:
+                self._set_current_department(None, toggle_if_same=False)
+                self._set_current_type(None, toggle_if_same=False)
             return
         filters = self._sidebar.filters()
         self._controller.sync_filter_state(
@@ -628,6 +695,13 @@ class MainWindow(QMainWindow):
         path = self._settings.value("project/root", "", str)
         self._apply_project_root(path or None, save=False)
 
+    def _restore_sidebar_context(self) -> None:
+        """Restore last selected nav page (Assets/Shots/Inbox/Projects/Library) from QSettings."""
+        _valid = ("Assets", "Shots", "Inbox", "Projects", "Library")
+        ctx = (self._settings.value("ui/sidebar_context", "Assets", str) or "Assets").strip()
+        if ctx in _valid:
+            self._sidebar.set_current_context(ctx)
+
     def _on_context_switched(self, context_name: str) -> None:
         # Trigger: user switches between top-level contexts.
         self._context_switch_in_progress = True
@@ -642,6 +716,16 @@ class MainWindow(QMainWindow):
 
             self._main_view.set_context_title(context_name)
             self._entered_parent = None
+            if context_name != "Inbox" and self._inbox_split_view is not None:
+                self._save_inbox_date_folder_state(self._inbox_split_view.date_folder_path())
+                self._save_inbox_tree_state(self._inbox_split_view)
+                self._settings.setValue(self._inbox_restore_split_key(), True)  # khi quay lại Inbox thì mở lại date folder
+                self._content_stack.setCurrentWidget(self._main_view)
+                self._main_view.clear()  # avoid showing stale Inbox list before next page loads
+                self._content_stack.removeWidget(self._inbox_split_view)
+                self._inbox_split_view.deleteLater()
+                self._inbox_split_view = None
+                self._inspector.set_inbox_mapping_selection([], None, None)
             # Clear selection first; selection churn during model resets is a common source of re-entrant UI.
             try:
                 self._main_view.clear_selection()
@@ -649,6 +733,7 @@ class MainWindow(QMainWindow):
                 pass
             self._inspector.set_item(None)
 
+            self._main_view.set_accept_inbox_drop(False)
             if context_name in ("Assets", "Shots"):
                 # Sync filter state first so _reload_main_view uses correct (page, dept, type).
                 self._sync_filter_state_from_sidebar()
@@ -657,11 +742,20 @@ class MainWindow(QMainWindow):
                 # Deterministic autoscan trigger (locked rule).
                 self._rescan_project()
                 self._reload_main_view()
+            elif context_name == "Inbox":
+                self._main_view.set_accept_inbox_drop(True)
+                self._sync_filter_state_from_sidebar()  # ensure sidebar source (client/freelancer) is in sync before reload
+                self._inbox_switch_cooldown = True
+                QTimer.singleShot(120, lambda: setattr(self, "_inbox_switch_cooldown", False))
+                self._main_view.clear()  # avoid showing stale Assets/Shots/Projects content before Inbox loads
+                restored = self._restore_inbox_date_folder_state()
+                if not restored:
+                    self._reload_main_view()  # run synchronously so no second reload (e.g. from filter signal) clears items
             elif context_name == "Projects":
-                # Projects browser: read-only workspace view (no project rescan).
                 self._reload_main_view()
             else:
-                # Non-project-browser areas are placeholders (no scans, no side effects).
+                # Library and others: no drop; clear inbox drop if was on Inbox.
+                self._main_view.set_accept_inbox_drop(False)
                 self._main_view.clear()
                 self._main_view.set_empty_override(self._empty_message_for_context(context_name))
 
@@ -674,6 +768,7 @@ class MainWindow(QMainWindow):
         # Reload current view (click on already-selected nav item). No page-change toast here
         # to avoid duplicate with context_changed when user clicks a different page.
         # Spec: click reloads Main View. (No autoscan trigger unless it was a switch.)
+        # Note: Switching to Inbox emits both context_changed and context_clicked; we must not clear Inbox here.
         self._context_switch_in_progress = True
         try:
             self._main_view.set_context_title(context_name)
@@ -688,6 +783,9 @@ class MainWindow(QMainWindow):
                 if context_name in ("Assets", "Shots"):
                     self._sync_filter_state_from_sidebar()
                     self._main_view.clear()
+                self._reload_main_view()
+            elif context_name == "Inbox":
+                self._sync_filter_state_from_sidebar()
                 self._reload_main_view()
             else:
                 self._main_view.clear()
@@ -985,6 +1083,15 @@ class MainWindow(QMainWindow):
         self._main_view.set_project_root(folder)
         self._main_view.set_empty_override(None)
 
+        if self._project_root is not None:
+            try:
+                dept_reg = DepartmentRegistry.for_project(self._project_root)
+                self._inspector.set_department_registry(dept_reg)
+            except Exception:
+                self._inspector.set_department_registry(None)
+        else:
+            self._inspector.set_department_registry(None)
+
         # Reload index if root set; otherwise clear.
         if self._project_root is None:
             self._project_index = None
@@ -1009,6 +1116,7 @@ class MainWindow(QMainWindow):
                 self._entered_parent = None
                 self._main_view.clear()
                 self._sidebar.set_project_index(None)
+                self._inspector.set_department_registry(None)
                 self._update_fs_watcher_paths()
                 self._inspector.set_item(None)
                 self._sync_primary_action()
@@ -1286,8 +1394,15 @@ class MainWindow(QMainWindow):
         self._submit_rescan_task()
         self._sync_primary_action()
 
+    def _on_search_query_changed(self, query: str) -> None:
+        self.current_search_query = (query or "").strip()
+        self._reload_main_view()
+
     def _reload_main_view(self) -> None:
         context = self._sidebar.current_context()
+        # Placeholder for search input (context-aware).
+        placeholders = {"Assets": "Search assets", "Shots": "Search shots", "Projects": "Search projects", "Inbox": "Search inbox"}
+        self._main_view.set_search_placeholder(placeholders.get(context, "Search…"))
         items: list[ViewItem] = []
 
         # Projects context: show workspace discovery results (read-only).
@@ -1309,7 +1424,11 @@ class MainWindow(QMainWindow):
                         ref=stats,
                     )
                 )
-            self._main_view.set_empty_override(None if items else "No projects found in this workspace")
+            items = self._apply_search_filter(items, self.current_search_query)
+            if not items and (self.current_search_query or "").strip():
+                self._main_view.set_empty_override('No matches for "' + self.current_search_query.strip() + '"')
+            else:
+                self._main_view.set_empty_override(None if items else "No projects found in this workspace")
             self._main_view.set_items(items)
             return
 
@@ -1324,7 +1443,7 @@ class MainWindow(QMainWindow):
                 inbox_nodes = scan_inbox(self._project_root)
             except Exception:
                 inbox_nodes = []
-            source_filter = (self._sidebar.filters().current_type() or "").strip().lower()  # inbox mode: "client" or "freelancer"
+            source_filter = (self._sidebar.filters().current_type() or "").strip().lower()  # "client", "freelancer", or "" = both
             if source_filter:
                 for node in inbox_nodes:
                     if (node.name or "").lower() != source_filter:
@@ -1342,10 +1461,47 @@ class MainWindow(QMainWindow):
                                 )
                             )
                     break
-            self._main_view.set_empty_override(
-                None if items else "Select Client or Freelancer in sidebar, or add folders to inbox."
-            )
+            else:
+                # No Client/Freelancer selected: show both with section titles.
+                for node in inbox_nodes:
+                    name_lower = (node.name or "").lower()
+                    if name_lower not in ("client", "freelancer"):
+                        continue
+                    if not node.is_dir:
+                        continue
+                    title = (node.name or "").strip().replace("_", " ").title() or node.name
+                    section_path = Path(node.path)
+                    items.append(
+                        ViewItem(
+                            kind=ViewItemKind.INBOX_SECTION,
+                            name=title,
+                            type_badge="",
+                            path=section_path,
+                            departments_count=None,
+                            ref=node,
+                        )
+                    )
+                    if node.children:
+                        for child in node.children:
+                            items.append(
+                                ViewItem(
+                                    kind=ViewItemKind.INBOX_ITEM,
+                                    name=child.name,
+                                    type_badge=node.name or "",
+                                    path=child.path,
+                                    departments_count=None,
+                                    ref=child,
+                                )
+                            )
+            items = self._apply_search_filter(items, self.current_search_query)
+            if not items and (self.current_search_query or "").strip():
+                self._main_view.set_empty_override('No matches for "' + self.current_search_query.strip() + '"')
+            else:
+                self._main_view.set_empty_override(
+                    None if items else "Select Client or Freelancer in sidebar, or add folders to inbox."
+                )
             self._main_view.set_items(items)
+            self._set_main_view_type()  # headbar type badge (Client / Freelancer when selected)
             return
 
         if self._project_index is None:
@@ -1395,8 +1551,12 @@ class MainWindow(QMainWindow):
             self._main_view.set_empty_override(self._empty_message_for_context(context))
             return
 
+        items = self._apply_search_filter(items, self.current_search_query)
         if self._project_root is not None:
-            self._main_view.set_empty_override(None)
+            if not items and (self.current_search_query or "").strip():
+                self._main_view.set_empty_override('No matches for "' + self.current_search_query.strip() + '"')
+            else:
+                self._main_view.set_empty_override(None)
         if context in ("Assets", "Shots"):
             self._set_main_view_department()
             self._set_main_view_type()
@@ -1418,6 +1578,8 @@ class MainWindow(QMainWindow):
 
     def _on_item_activated(self, item: ViewItem) -> None:
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            return
+        if item.kind == ViewItemKind.INBOX_SECTION:
             return
         # NOTE: "Enter departments" navigation has been removed.
         # Double click / Enter will be repurposed by a different function later.
@@ -1442,12 +1604,147 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Open DCC", str(e))
             return
         if item.kind == ViewItemKind.INBOX_ITEM and item.path:
+            ref = getattr(item, "ref", None)
+            if ref is not None and getattr(ref, "is_dir", False):
+                self._enter_inbox_date_folder(Path(item.path))
+                return
             try:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(item.path)))
             except Exception:
                 pass
             return
         return
+
+    def _inbox_date_folder_settings_key(self) -> str:
+        return "inbox/last_date_folder_path"
+
+    def _inbox_restore_split_key(self) -> str:
+        return "inbox/restore_split_view"
+
+    def _inbox_tree_expanded_key(self) -> str:
+        return "inbox/tree_expanded_paths"
+
+    def _inbox_splitter_sizes_key(self) -> str:
+        return "inbox/splitter_sizes"
+
+    def _save_inbox_date_folder_state(self, path: Path) -> None:
+        if path and path.is_dir() and self._project_root and str(path).startswith(str(self._project_root)):
+            self._settings.setValue(self._inbox_date_folder_settings_key(), str(path.resolve()))
+
+    def _save_inbox_tree_state(self, view: InboxSplitView) -> None:
+        state = view.get_tree_state()
+        expanded = state.get("expanded_paths") or []
+        self._settings.setValue(self._inbox_tree_expanded_key(), "\n".join(expanded))
+        sizes = state.get("splitter_sizes") or []
+        self._settings.setValue(self._inbox_splitter_sizes_key(), ",".join(str(s) for s in sizes))
+
+    def _load_inbox_tree_state(self) -> dict | None:
+        expanded_str = self._settings.value(self._inbox_tree_expanded_key(), "", str)
+        expanded = [p.strip() for p in (expanded_str or "").split("\n") if p.strip()]
+        sizes_str = self._settings.value(self._inbox_splitter_sizes_key(), "", str)
+        sizes = []
+        for s in (sizes_str or "").split(","):
+            s = s.strip()
+            if s.isdigit():
+                sizes.append(int(s))
+        if not expanded and len(sizes) != 2:
+            return None
+        return {
+            "expanded_paths": expanded,
+            "splitter_sizes": sizes if len(sizes) == 2 else [],
+        }
+
+    def _restore_inbox_date_folder_state(self) -> bool:
+        """Restore Inbox split view (date folder + tree state) when user had it open. Returns True if restored."""
+        raw = self._settings.value(self._inbox_restore_split_key(), True)
+        if raw in (False, "false", "0", 0):
+            return False
+        path_str = self._settings.value(self._inbox_date_folder_settings_key(), "", str)
+        if not path_str or not self._project_root:
+            return False
+        path = Path(path_str)
+        if not path.is_dir():
+            return False
+        try:
+            if not str(path.resolve()).startswith(str(self._project_root.resolve())):
+                return False
+        except OSError:
+            return False
+        self._enter_inbox_date_folder(path, restore_tree_state=True)
+        return True
+
+    def _enter_inbox_date_folder(self, date_folder_path: Path, *, restore_tree_state: bool = False) -> None:
+        if not date_folder_path.is_dir():
+            return
+        self._save_inbox_date_folder_state(date_folder_path)
+        self._inbox_split_view = InboxSplitView(date_folder_path, self)
+        self._inbox_split_view.back_requested.connect(self._on_inbox_split_back)
+        self._inbox_split_view.mapping_selection_changed.connect(self._on_inbox_mapping_selection_changed)
+        self._inbox_split_view.open_folder_requested.connect(
+            lambda p: QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+        )
+        self._content_stack.addWidget(self._inbox_split_view)
+        self._content_stack.setCurrentWidget(self._inbox_split_view)
+        self._inspector.set_item(None)
+        self._inspector.set_inbox_mapping_selection([], None, None)
+        if restore_tree_state:
+            tree_state = self._load_inbox_tree_state()
+            if tree_state:
+                self._inbox_split_view.set_tree_state(tree_state)
+
+    def _on_inbox_split_back(self) -> None:
+        if self._inbox_split_view is None:
+            return
+        self._save_inbox_date_folder_state(self._inbox_split_view.date_folder_path())
+        self._save_inbox_tree_state(self._inbox_split_view)
+        self._settings.setValue(self._inbox_restore_split_key(), False)  # user chọn về list, lần sau vào Inbox hiện list
+        self._content_stack.setCurrentWidget(self._main_view)
+        self._content_stack.removeWidget(self._inbox_split_view)
+        self._inbox_split_view.deleteLater()
+        self._inbox_split_view = None
+        self._inspector.set_inbox_mapping_selection([], None, None)
+        self._reload_main_view()
+
+    def _on_inbox_mapping_selection_changed(self, paths: list) -> None:
+        path_list = [Path(p) for p in paths if p] if paths else []
+        self._inspector.set_inbox_mapping_selection(
+            path_list,
+            self._project_root,
+            self._project_index,
+        )
+
+    def _on_inbox_distribute_finished(self, paths: list) -> None:
+        if self._inbox_split_view and paths:
+            self._inbox_split_view.remove_mapping_paths([Path(p) for p in paths if p])
+
+    def _on_inbox_drop_requested(self, paths: list) -> None:
+        """User dropped files/folders onto Inbox view: show Add to Inbox form, then copy into inbox."""
+        if not paths or not self._project_root:
+            return
+        try:
+            path_list = [Path(p) for p in paths if p]
+        except (TypeError, ValueError):
+            return
+        if not path_list:
+            return
+        dialog = AddToInboxDialog(default_date=date.today(), parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        source_label = dialog.source()
+        date_str = dialog.date_str()
+        description = dialog.description()
+        for p in path_list:
+            try:
+                add_to_inbox(
+                    self._project_root,
+                    p,
+                    source_label,
+                    date_str,
+                    description,
+                )
+            except Exception as e:
+                logging.warning("Add to inbox failed for %s: %s", p, e)
+        self._reload_main_view()
 
     def _on_open_requested(self, item: object) -> None:
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
@@ -1497,35 +1794,13 @@ class MainWindow(QMainWindow):
             logging.warning("DCC launch failed (create new): %s", e, exc_info=True)
             QMessageBox.critical(self, "Create New…", str(e))
 
-    def _on_inspector_open_requested(self, item: object) -> None:
-        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+    def _on_inspector_open_folder_requested(self, item: object) -> None:
+        if not isinstance(item, ViewItem) or not getattr(item, "path", None):
             return
-        if not isinstance(item, ViewItem):
+        path = item.path
+        if not path.exists():
             return
-        ref = item.ref
-        if not isinstance(ref, (Asset, Shot)):
-            return
-        try:
-            self._controller.smart_open(item=ref, force_dialog=False, parent=self)
-            self._refresh_recent_tasks()
-        except Exception as e:
-            logging.warning("DCC launch failed (inspector): %s", e, exc_info=True)
-            QMessageBox.critical(self, "Open DCC", str(e))
-
-    def _on_inspector_open_with_requested(self, item: object) -> None:
-        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
-            return
-        if not isinstance(item, ViewItem):
-            return
-        ref = item.ref
-        if not isinstance(ref, (Asset, Shot)):
-            return
-        try:
-            self._controller.smart_open(item=ref, force_dialog=True, force_open_with=True, parent=self)
-            self._refresh_recent_tasks()
-        except Exception as e:
-            logging.warning("DCC launch failed (inspector open with): %s", e, exc_info=True)
-            QMessageBox.critical(self, "Open With…", str(e))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _on_recent_task_clicked(self, task: object) -> None:
         from monostudio.ui_qt.recent_tasks_store import RecentTask
@@ -1635,14 +1910,6 @@ class MainWindow(QMainWindow):
         self.showMaximized()
         self._top_bar.set_maximized(True)
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        # Đặt QSizeGrip góc dưới phải (trừ border 1px)
-        g = self._size_grip
-        margin = 1
-        g.setGeometry(self.width() - g.width() - margin, self.height() - g.height() - margin, g.width(), g.height())
-        g.raise_()
-
     def _restore_window_geometry(self) -> None:
         """
         Restore saved window geometry BEFORE showing the window.
@@ -1671,15 +1938,42 @@ class MainWindow(QMainWindow):
             # First launch / no saved geometry: default size.
             self.resize(1920, 1080)
 
+    def _restore_splitter_sizes(self) -> None:
+        """Restore main/content splitter sizes from app_settings.json (after central widget is set)."""
+        path = self._app_settings_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if not isinstance(data, dict):
+            return
+        for key, splitter, default in (
+            ("main_splitter_sizes", self._main_splitter, [256, 1100]),
+            ("content_splitter_sizes", self._content_splitter, [800, 320]),
+        ):
+            raw = data.get(key)
+            if isinstance(raw, list) and len(raw) == 2:
+                sizes = [int(x) for x in raw if isinstance(x, (int, float))]
+                if len(sizes) == 2 and all(s > 0 for s in sizes):
+                    splitter.setSizes(sizes)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """
         Save window geometry on close (size + position + maximized).
+        Save sidebar nav page (Assets/Shots/Inbox/...) to QSettings.
+        Save splitter sizes to app_settings.json.
         Silent failure on IO errors.
         """
+        try:
+            self._settings.setValue("ui/sidebar_context", self._sidebar.current_context())
+        except Exception:
+            pass
         path = self._app_settings_path()
         payload = {
             "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "window_maximized": self.isMaximized(),
+            "main_splitter_sizes": self._main_splitter.sizes(),
+            "content_splitter_sizes": self._content_splitter.sizes(),
         }
         try:
             from monostudio.core.atomic_write import atomic_write_text
