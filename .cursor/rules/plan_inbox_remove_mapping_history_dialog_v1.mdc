@@ -1,0 +1,86 @@
+---
+description: Plan sửa Inbox – bỏ mapping view, không Add to mapping, Distributed → History dialog
+alwaysApply: false
+---
+
+# Plan: Inbox – Bỏ Mapping View, Distribute từ Tree, History = Dialog (v1)
+
+## 1. Mục tiêu
+
+- **Bỏ mapping view** (pane phải) trên page Inbox; page chỉ còn **list date folder | tree** (một cột hoặc full width).
+- **Bỏ "Add to mapping"**: không còn list "To distribute" trung gian. **Selection trên tree = nguồn để distribute**.
+- **Distributed → History**: dữ liệu đã phân phối không còn hiển thị trên page; thành **History** mở bằng **một dialog** trigger bởi **nút** (vd trong header Inbox).
+
+---
+
+## 2. Luồng mới
+
+| Bước | Hành vi |
+|------|--------|
+| Vào Inbox | Sidebar chọn Client/Freelancer → page hiện list date folder (trái, full width). **Nút "History"** trong header. |
+| Vào date folder | Click date folder → nội dung chuyển sang **tree** (file/folder); breadcrumb + Back. |
+| Chọn item trong tree | **Multi-select** trong tree → Inspector hiện **preview** (thumb + metadata) của item đầu **và** block **Destination** (Scope, Destination, Entity, Distribute). User chọn đích và bấm Distribute. |
+| Sau Distribute | File/folder được copy/move tới đích; **append vào distributed** (persist); không còn bước "remove từ pending" vì không có pending list. |
+| Xem history | User bấm nút **History** → mở **dialog** hiển thị danh sách đã distributed (path, distributed_at, optional destination). Read-only, có Refresh; có thể Open folder. |
+
+---
+
+## 3. Thay đổi kỹ thuật
+
+### 3.1 InboxPageWidget
+
+- **Layout**: Bỏ `QSplitter` 2 cột; chỉ giữ **một vùng nội dung** = stack (list date folder | tree). Full width.
+- **Header**: Giữ "Inbox" + type badge (Client/Freelancer). Thêm nút **"History"** (icon + label) bên phải header; click → mở **InboxHistoryDialog**.
+- **Bỏ**: `InboxMappingPane`, toàn bộ logic Add to mapping, `mapping_selection_changed`, `set_date_folder_context` cho mapping pane.
+- **Tree pane**: Giữ `InboxTreePane`; bỏ signal `add_requested` và nút Add. **Selection trong tree** (có thể multi-select) → emit signal **tree_distribute_selection_changed(list[Path])** (hoặc tái dùng mở rộng: khi có selection tree thì MainWindow gọi Inspector với danh sách path đó cho block distribute).
+
+### 3.2 Inspector
+
+- **Nguồn distribute**: Không còn `set_inbox_mapping_selection(paths)`. Thay bằng: **khi chọn item trong tree Inbox** → MainWindow gọi API tương đương với **danh sách path đang chọn trong tree** (multi-select). Có thể:
+  - **Option A**: Thêm `set_inbox_tree_distribute_paths(paths, project_root, project_index)` – khi paths không rỗng thì hiện block Destination với paths đó; khi rỗng thì ẩn. Preview vẫn có thể lấy từ path đầu.
+  - **Option B**: Gộp với tree preview: `set_inbox_tree_selection(path_or_paths)` – nếu 1 item: preview + ẩn distribute; nếu nhiều item: preview item đầu + hiện block distribute với full list. Hoặc đơn giản: **luôn** khi có tree selection (1 hoặc nhiều) đều hiện cả preview (item đầu) và block distribute (toàn bộ selection). User chọn 1 file cũng có thể distribute 1 file.
+- **Đề xuất**: Option đơn giản – **bất kỳ selection tree nào (1 hoặc nhiều)** → Inspector hiện preview (item đầu) **và** block Destination với toàn bộ selection. Bỏ phân biệt "chọn tree = chỉ preview" vs "chọn mapping = distribute". API: `set_inbox_distribute_paths(paths, project_root, project_index)` và khi có paths thì cũng set preview từ path[0].
+
+### 3.3 MainWindow
+
+- **Inbox**: Không kết nối `mapping_selection_changed`; kết nối **tree selection** (hoặc tree "distribute selection") → gọi Inspector với list path từ tree (get_selected_paths() từ InboxTreePane).
+- **Sau distribute**: Gọi `append_inbox_distributed` như hiện tại; **không** gọi `get_mapping_pane().remove_pending_paths` (đã bỏ mapping pane). Có thể gọi refresh cho History dialog nếu đang mở (optional).
+
+### 3.4 InboxHistoryDialog (mới)
+
+- **Trigger**: Nút "History" trên header Inbox.
+- **Nội dung**: Load `load_inbox_distributed(project_root, type_filter)`; hiển thị bảng/list: path (hoặc tên file), distributed_at, optional destination. Filter theo type (Client/Freelancer) đang chọn trên sidebar.
+- **Hành vi**: Read-only; nút Refresh (reload từ disk); có thể "Open folder" cho từng item hoặc chung. Style theo MonosDialog (round corner, deep dark).
+- **Vị trí code**: Có thể đặt trong `monostudio/ui_qt/` (vd `inbox_history_dialog.py` hoặc trong `create_entry_dialogs.py` nếu muốn gom dialog).
+
+### 3.5 InboxMappingPane
+
+- **Số phận**: Không dùng trên Inbox page nữa. Có thể **xóa** class `InboxMappingPane` và mọi reference, hoặc giữ lại trong codebase cho tương lai (không dùng). Đề xuất: **xóa** để code sạch; nếu cần sau có thể lấy từ git.
+
+### 3.6 Persistence
+
+- **Distributed (History)**: Giữ nguyên `inbox_destributed.json`, `load_inbox_distributed`, `append_inbox_distributed`. Chỉ đổi nơi **hiển thị**: từ pane "Distributed" trên page → dialog History.
+
+---
+
+## 4. Tóm tắt
+
+| Hạng mục | Trước | Sau |
+|----------|--------|-----|
+| Layout Inbox page | Header + Split( list/tree \| mapping pane ) | Header (Inbox + badge + **History**) + list/tree full width |
+| Nguồn distribute | List "To distribute" (add từ tree) | **Selection trong tree** (multi-select) |
+| Inspector block Destination | Hiện khi chọn item trong mapping list | Hiện khi chọn 1 hoặc nhiều item trong tree |
+| Distributed / History | Pane "Distributed" bên phải | **Dialog History** mở bằng nút |
+| Add to mapping | Có (tree → list) | **Bỏ** |
+
+---
+
+## 5. Thứ tự implement gợi ý
+
+1. **InboxHistoryDialog**: Widget dialog load + hiển thị `load_inbox_distributed(project_root, type_filter)`; nút Refresh. Chưa cần gắn nút.
+2. **InboxPageWidget**: Bỏ splitter và InboxMappingPane; thêm nút History trong header → mở InboxHistoryDialog. Truyền project_root + type_filter vào dialog.
+3. **InboxTreePane**: Bỏ nút Add và signal `add_requested`. Đảm bảo tree có multi-select và có API `get_selected_paths()`.
+4. **MainWindow**: Khi Inbox + tree selection đổi → gọi Inspector với `set_inbox_distribute_paths(paths, project_root, project_index)` (hoặc API đã chọn). Bỏ kết nối `mapping_selection_changed` và mọi tham chiếu tới get_mapping_pane().
+5. **Inspector**: Thống nhất API: khi Inbox tree selection → vừa preview (path đầu) vừa block Destination (full list). Bỏ hoặc gộp `set_inbox_mapping_selection` thành `set_inbox_distribute_paths`.
+6. **_on_inbox_distribute_finished**: Bỏ remove_pending_paths, bỏ refresh_distributed trên page; nếu History dialog đang mở thì refresh dialog.
+7. **Dọn**: Xóa class InboxMappingPane (và import/ref trong inbox_split_view / inbox_page_widget). Cập nhật rule plan_inbox_two_panes_and_mapping nếu cần.
