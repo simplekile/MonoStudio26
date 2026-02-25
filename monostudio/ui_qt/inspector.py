@@ -31,7 +31,7 @@ from monostudio.core.inbox_reader import load_inbox_destinations, resolve_destin
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS, monos_font
+from monostudio.ui_qt.style import MONOS_COLORS, file_icon_spec_for_path, monos_font
 from monostudio.ui_qt.thumbnails import ThumbnailCache
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 
@@ -162,6 +162,17 @@ class InspectorPanel(QWidget):
         self._inbox_destination.setVisible(False)
         self._scroll.setWidget(content)
 
+        # ACTION card pinned below the scroll area (always visible at bottom when distributing)
+        action_wrap = QWidget(self)
+        action_wrap.setObjectName("InboxActionWrapper")
+        aw_lay = QVBoxLayout(action_wrap)
+        aw_lay.setContentsMargins(12, 8, 12, 12)
+        aw_lay.setSpacing(0)
+        aw_lay.addWidget(self._inbox_destination.action_card)
+        self._inbox_action_wrapper = action_wrap
+        self._inbox_action_wrapper.setVisible(False)
+        root.addWidget(self._inbox_action_wrapper, 0)
+
         self._current_item: ViewItem | None = None
         self._previous_item: ViewItem | None = None
         self._thumbnail_manager: object | None = None
@@ -192,14 +203,59 @@ class InspectorPanel(QWidget):
         project_root: Path | None,
         project_index: ProjectIndex | None,
     ) -> None:
-        """Inbox: hiển thị block DESTINATION khi có item trong mapping list được chọn."""
+        """Legacy: use set_inbox_distribute_paths. Inbox mapping list removed; distribute from tree selection."""
+        self.set_inbox_distribute_paths(paths, project_root, project_index)
+
+    def set_inbox_distribute_paths(
+        self,
+        paths: list,
+        project_root: Path | None,
+        project_index: ProjectIndex | None,
+    ) -> None:
+        """Inbox: tree selection → preview (first path) + block DESTINATION (all paths). Empty paths → hide block, clear preview."""
         path_list = [Path(p) for p in paths if p] if paths else []
         if not path_list:
             self._inbox_destination.setVisible(False)
+            self._inbox_action_wrapper.setVisible(False)
             self._inbox_destination.set_data([], None, None)
+            self.set_item(None)
             return
         self._inbox_destination.set_data(path_list, project_root, project_index)
         self._inbox_destination.setVisible(True)
+        self._inbox_action_wrapper.setVisible(True)
+        first = path_list[0]
+        fake = ViewItem(
+            kind=ViewItemKind.INBOX_ITEM,
+            name=first.name,
+            type_badge="",
+            path=first,
+            departments_count=None,
+            ref=None,
+        )
+        self.set_item(fake)
+        self._asset_status.setVisible(False)
+        self._dept_pipeline.setVisible(False)
+        self._tech.setVisible(False)
+        self._stakeholders.setVisible(False)
+        self._inbox_action_wrapper.setVisible(True)
+
+    def set_inbox_tree_preview(self, path: Path | None) -> None:
+        """Inbox/Reference: khi chọn file trong tree → hiện thumb + metadata, ẩn block distribute."""
+        self._inbox_destination.setVisible(False)
+        self._inbox_action_wrapper.setVisible(False)
+        self._inbox_destination.set_data([], None, None)
+        if not path or not path.exists():
+            self.set_item(None)
+            return
+        fake = ViewItem(
+            kind=ViewItemKind.INBOX_ITEM,
+            name=path.name,
+            type_badge="",
+            path=path,
+            departments_count=None,
+            ref=None,
+        )
+        self.set_item(fake)
 
     def set_item(self, item: ViewItem | None) -> None:
         # Diff-based: never rebuild layout. Update only changed sections; preserve scroll position.
@@ -216,6 +272,8 @@ class InspectorPanel(QWidget):
         self._empty.setVisible(not has_item)
         for w in (self._preview, self._asset_status, self._dept_pipeline, self._tech, self._stakeholders):
             w.setVisible(has_item)
+        if has_item:
+            self._inbox_action_wrapper.setVisible(False)
 
         if item is None:
             self._empty.set_message("Select an item to view details")
@@ -463,16 +521,25 @@ class _PreviewWidget(QWidget):
         self._has_image = False
         self._placeholder_kind: str = ""  # "asset" | "shot" | "project" for icon; else letter
         self._placeholder_letter: str = ""
+        self._placeholder_file_icon: tuple[str, str] = ()  # (icon_name, color_hex) for Inbox file type
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
     def set_pixmap(self, pix: QPixmap | None) -> None:
         self._pix = pix
         self._has_image = bool(pix and not pix.isNull())
+        if self._has_image:
+            self._placeholder_file_icon = ()
         self.update()
 
     def set_placeholder_kind(self, kind: str, *, letter: str = "") -> None:
         self._placeholder_kind = (kind or "").strip().lower()
         self._placeholder_letter = (letter or "").strip()[:1].upper()
+        self._placeholder_file_icon = ()
+        self.update()
+
+    def set_placeholder_file_icon(self, icon_name: str, color_hex: str) -> None:
+        """Inbox: hiển thị icon theo loại file (folder, file-text, box/DCC, …) khi không có thumbnail."""
+        self._placeholder_file_icon = ((icon_name or "file").strip(), (color_hex or "").strip())
         self.update()
 
     def set_placeholder_letter(self, letter: str) -> None:
@@ -522,6 +589,17 @@ class _PreviewWidget(QWidget):
             if self._placeholder_kind in ("asset", "shot", "project"):
                 icon_name = "box" if self._placeholder_kind == "asset" else "clapperboard" if self._placeholder_kind == "shot" else "layout-dashboard"
                 icon = lucide_icon(icon_name, size=64, color_hex=MONOS_COLORS["text_meta"])
+                src = icon.pixmap(64, 64)
+                if not src.isNull():
+                    x = r.x() + (r.width() - 64) // 2
+                    y = r.y() + (r.height() - 64) // 2
+                    p.drawPixmap(x, y, src)
+                return
+
+            if self._placeholder_file_icon:
+                icon_name, color_hex = self._placeholder_file_icon
+                color = color_hex or MONOS_COLORS["text_meta"]
+                icon = lucide_icon(icon_name, size=64, color_hex=color)
                 src = icon.pixmap(64, 64)
                 if not src.isNull():
                     x = r.x() + (r.width() - 64) // 2
@@ -584,7 +662,9 @@ class _PreviewContainer(QWidget):
         self._btn_paste.raise_()
 
     def set_paste_enabled(self, enabled: bool) -> None:
-        self._btn_paste.setEnabled(bool(enabled))
+        on = bool(enabled)
+        self._btn_paste.setEnabled(on)
+        self._btn_paste.setVisible(on)
 
 
 class _InspectorPreview(QWidget):
@@ -622,15 +702,24 @@ class _InspectorPreview(QWidget):
         asset_id = str(path)
 
         def load() -> None:
-            mgr = getattr(self, "_thumbnail_manager", None)
-            if mgr is not None and hasattr(mgr, "request_thumbnail"):
-                pix = mgr.request_thumbnail(asset_id)
-                if getattr(self, "_item", None) and self._item.path == path:
-                    self._container._w.set_pixmap(pix)
-                return
+            # Inbox page: use ThumbnailCache (image/video file preview). Asset/shot: use manager.
+            is_inbox = getattr(self, "_item", None) and getattr(self._item, "kind", None) == ViewItemKind.INBOX_ITEM
+            if not is_inbox:
+                mgr = getattr(self, "_thumbnail_manager", None)
+                if mgr is not None and hasattr(mgr, "request_thumbnail"):
+                    pix = mgr.request_thumbnail(asset_id)
+                    if getattr(self, "_item", None) and self._item.path == path:
+                        self._container._w.set_pixmap(pix)
+                    return
             thumb = self._thumbs.resolve_thumbnail_file(path)
             if thumb is None:
                 if getattr(self, "_item", None) and self._item.path == path:
+                    if is_inbox and path:
+                        try:
+                            icon_name, color_hex = file_icon_spec_for_path(path)
+                            self._container._w.set_placeholder_file_icon(icon_name, color_hex)
+                        except Exception:
+                            pass
                     self._container._w.set_pixmap(None)
                 return
             pix = self._thumbs.load_thumbnail_pixmap(thumb)
@@ -648,13 +737,21 @@ class _InspectorPreview(QWidget):
         asset_id = str(path)
 
         def load() -> None:
-            mgr = getattr(self, "_thumbnail_manager", None)
-            if mgr is not None and hasattr(mgr, "request_thumbnail"):
-                pix = mgr.request_thumbnail(asset_id)
-                self._container._w.set_pixmap(pix)
-                return
+            is_inbox = getattr(self, "_item", None) and getattr(self._item, "kind", None) == ViewItemKind.INBOX_ITEM
+            if not is_inbox:
+                mgr = getattr(self, "_thumbnail_manager", None)
+                if mgr is not None and hasattr(mgr, "request_thumbnail"):
+                    pix = mgr.request_thumbnail(asset_id)
+                    self._container._w.set_pixmap(pix)
+                    return
             thumb = self._thumbs.resolve_thumbnail_file(path)
             if thumb is None:
+                if is_inbox and path:
+                    try:
+                        icon_name, color_hex = file_icon_spec_for_path(path)
+                        self._container._w.set_placeholder_file_icon(icon_name, color_hex)
+                    except Exception:
+                        pass
                 self._container._w.set_pixmap(None)
                 return
             pix = self._thumbs.load_thumbnail_pixmap(thumb)
@@ -1335,9 +1432,35 @@ _INBOX_SCOPE_SHOT = "shot"
 
 
 class _InboxDestinationBlock(QWidget):
-    """Flow: Scope (Global | Asset | Shot) → Destination (script/storyboard/texture/...) → Entity (nếu cần)."""
+    """Flow: Scope (Global | Asset | Shot) → Destination (icon+label list) → Type → Entity."""
 
     distribute_finished = Signal(object)  # list[Path] đã distribute
+
+    _SCOPE_ITEMS: list[tuple[str, str, str]] = [
+        ("Global", _INBOX_SCOPE_PROJECT, "layers"),
+        ("Asset", _INBOX_SCOPE_ASSET, "box"),
+        ("Shot", _INBOX_SCOPE_SHOT, "clapperboard"),
+    ]
+
+    _DEST_ICON_MAP: dict[str, str] = {
+        "global_reference": "eye",
+        "reference_script": "file-text",
+        "reference_storyboard": "layout-dashboard",
+        "reference_guideline": "library",
+        "reference_concept": "lightbulb",
+        "reference": "eye",
+        "concept": "lightbulb",
+        "texture": "palette",
+        "character_sculpt": "bone",
+        "shot_reference": "clapperboard",
+    }
+
+    _TYPE_ICON_MAP: dict[str, str] = {
+        "character": "user",
+        "prop": "package",
+        "environment": "trees",
+        "vehicle": "box",
+    }
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1349,9 +1472,9 @@ class _InboxDestinationBlock(QWidget):
         self._dept_reg: DepartmentRegistry | None = None
         self._destinations: list[dict] = []
 
-        l = QVBoxLayout(self)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(10)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
 
         title = QLabel("DESTINATION", self)
         title.setObjectName("InboxDestinationTitle")
@@ -1359,9 +1482,9 @@ class _InboxDestinationBlock(QWidget):
         f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 112.0)
         title.setFont(f)
         title.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
-        l.addWidget(title, 0)
+        root.addWidget(title, 0)
 
-        # Card WHERE: Scope + Destination
+        # ── Card WHERE: Scope (toggle buttons) + Destination (selectable list) ──
         card_where = QFrame(self)
         card_where.setObjectName("InboxDestCardWhere")
         card_where.setFrameShape(QFrame.NoFrame)
@@ -1369,27 +1492,43 @@ class _InboxDestinationBlock(QWidget):
         lw = QVBoxLayout(card_where)
         lw.setContentsMargins(12, 12, 12, 12)
         lw.setSpacing(8)
+
         title_where = QLabel("WHERE", card_where)
         title_where.setObjectName("InboxDestCardTitle")
         lw.addWidget(title_where, 0)
-        scope_l = QHBoxLayout()
-        scope_l.addWidget(QLabel("Scope", card_where), 0)
-        self._scope_combo = QComboBox(card_where)
-        self._scope_combo.setObjectName("InboxScopeCombo")
-        self._scope_combo.addItem("Global Reference", _INBOX_SCOPE_PROJECT)
-        self._scope_combo.addItem("Asset", _INBOX_SCOPE_ASSET)
-        self._scope_combo.addItem("Shot", _INBOX_SCOPE_SHOT)
-        scope_l.addWidget(self._scope_combo, 1)
-        lw.addLayout(scope_l, 0)
-        dest_l = QHBoxLayout()
-        dest_l.addWidget(QLabel("Destination", card_where), 0)
-        self._dest_combo = QComboBox(card_where)
-        self._dest_combo.setObjectName("InboxDestCombo")
-        dest_l.addWidget(self._dest_combo, 1)
-        lw.addLayout(dest_l, 0)
-        l.addWidget(card_where, 0)
 
-        # Card TARGET: Type + Entity
+        lw.addWidget(self._make_section_label("Scope", "layers", card_where), 0)
+        scope_row = QWidget(card_where)
+        scope_lay = QHBoxLayout(scope_row)
+        scope_lay.setContentsMargins(0, 0, 0, 0)
+        scope_lay.setSpacing(4)
+        self._scope_group = QButtonGroup(self)
+        self._scope_group.setExclusive(True)
+        for label, data, icon_name in self._SCOPE_ITEMS:
+            btn = QPushButton(label, scope_row)
+            btn.setObjectName("InboxScopeButton")
+            btn.setIcon(lucide_icon(icon_name, size=14))
+            btn.setCheckable(True)
+            btn.setProperty("item_data", data)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._scope_group.addButton(btn)
+            scope_lay.addWidget(btn)
+        scope_lay.addStretch(1)
+        self._scope_group.buttons()[0].setChecked(True)
+        lw.addWidget(scope_row, 0)
+
+        lw.addWidget(self._make_section_label("Destination", "folder-open", card_where), 0)
+        self._dest_container = QWidget(card_where)
+        self._dest_layout = QVBoxLayout(self._dest_container)
+        self._dest_layout.setContentsMargins(0, 0, 0, 0)
+        self._dest_layout.setSpacing(2)
+        self._dest_group = QButtonGroup(self)
+        self._dest_group.setExclusive(True)
+        lw.addWidget(self._dest_container, 0)
+
+        root.addWidget(card_where, 0)
+
+        # ── Card TARGET: Type (selectable list, asset-only) + Entity (combo) ──
         card_target = QFrame(self)
         card_target.setObjectName("InboxDestCardTarget")
         card_target.setFrameShape(QFrame.NoFrame)
@@ -1397,40 +1536,48 @@ class _InboxDestinationBlock(QWidget):
         lt = QVBoxLayout(card_target)
         lt.setContentsMargins(12, 12, 12, 12)
         lt.setSpacing(8)
+
         title_target = QLabel("TARGET", card_target)
         title_target.setObjectName("InboxDestCardTitle")
         lt.addWidget(title_target, 0)
-        type_row = QWidget(card_target)
-        type_lay = QHBoxLayout(type_row)
-        type_lay.setContentsMargins(0, 0, 0, 0)
-        type_lay.addWidget(QLabel("Type", type_row), 0)
-        self._type_combo = QComboBox(type_row)
-        self._type_combo.setObjectName("InboxTypeCombo")
-        type_lay.addWidget(self._type_combo, 1)
-        lt.addWidget(type_row, 0)
-        self._type_row_widget = type_row
+
+        self._type_section = QWidget(card_target)
+        ts_lay = QVBoxLayout(self._type_section)
+        ts_lay.setContentsMargins(0, 0, 0, 0)
+        ts_lay.setSpacing(4)
+        ts_lay.addWidget(self._make_section_label("Type", "box", self._type_section))
+        self._type_container = QWidget(self._type_section)
+        self._type_layout = QVBoxLayout(self._type_container)
+        self._type_layout.setContentsMargins(0, 0, 0, 0)
+        self._type_layout.setSpacing(2)
+        self._type_group = QButtonGroup(self)
+        self._type_group.setExclusive(True)
+        ts_lay.addWidget(self._type_container)
+        lt.addWidget(self._type_section, 0)
+
         entity_l = QHBoxLayout()
-        entity_l.addWidget(QLabel("Entity", card_target), 0)
+        entity_l.addWidget(self._make_section_label("Entity", "package", card_target), 0)
         self._entity_combo = QComboBox(card_target)
         self._entity_combo.setObjectName("InboxEntityCombo")
         entity_l.addWidget(self._entity_combo, 1)
         lt.addLayout(entity_l, 0)
-        l.addWidget(card_target, 0)
 
-        # Card ACTION: Copy/Move + Distribute
-        card_action = QFrame(self)
-        card_action.setObjectName("InboxDestCardAction")
-        card_action.setFrameShape(QFrame.NoFrame)
-        card_action.setAttribute(Qt.WA_StyledBackground, True)
-        la = QVBoxLayout(card_action)
+        root.addWidget(card_target, 0)
+
+        # ── Card ACTION — placed externally by InspectorPanel (bottom-pinned) ──
+        self._card_action = QFrame()
+        self._card_action.setObjectName("InboxDestCardAction")
+        self._card_action.setFrameShape(QFrame.NoFrame)
+        self._card_action.setAttribute(Qt.WA_StyledBackground, True)
+        la = QVBoxLayout(self._card_action)
         la.setContentsMargins(12, 12, 12, 12)
         la.setSpacing(8)
-        title_action = QLabel("ACTION", card_action)
+        title_action = QLabel("ACTION", self._card_action)
         title_action.setObjectName("InboxDestCardTitle")
         la.addWidget(title_action, 0)
         copy_move_l = QHBoxLayout()
-        self._copy_radio = QRadioButton("Copy", card_action)
-        self._move_radio = QRadioButton("Move", card_action)
+        self._copy_radio = QRadioButton("Copy", self._card_action)
+        self._move_radio = QRadioButton("Move", self._card_action)
         self._copy_radio.setChecked(True)
         copy_move_grp = QButtonGroup(self)
         copy_move_grp.addButton(self._copy_radio)
@@ -1439,18 +1586,52 @@ class _InboxDestinationBlock(QWidget):
         copy_move_l.addWidget(self._move_radio, 0)
         copy_move_l.addStretch(1)
         la.addLayout(copy_move_l, 0)
-        self._distribute_btn = QPushButton("Distribute", card_action)
+        self._distribute_btn = QPushButton("Distribute", self._card_action)
         self._distribute_btn.setObjectName("InboxDistributeButton")
         self._distribute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._distribute_btn.clicked.connect(self._on_distribute)
         la.addWidget(self._distribute_btn, 0)
-        l.addWidget(card_action, 0)
 
-        self._scope_combo.currentIndexChanged.connect(self._refill_dest_combo)
-        self._scope_combo.currentIndexChanged.connect(self._on_scope_changed)
-        self._dest_combo.currentIndexChanged.connect(self._update_distribute_enabled)
-        self._type_combo.currentIndexChanged.connect(self._refill_entity_combo)
+        # ── Signals ──
+        self._scope_group.buttonClicked.connect(lambda _btn: self._on_scope_selection_changed())
+        self._dest_group.buttonClicked.connect(lambda _btn: self._update_distribute_enabled())
+        self._type_group.buttonClicked.connect(lambda _btn: self._refill_entity_combo())
         self._entity_combo.currentIndexChanged.connect(self._update_distribute_enabled)
+
+    # ── helpers ──
+
+    @property
+    def action_card(self) -> QFrame:
+        """The ACTION card widget (Copy/Move + Distribute). Placed externally by InspectorPanel."""
+        return self._card_action
+
+    @staticmethod
+    def _make_section_label(text: str, icon_name: str, parent: QWidget) -> QWidget:
+        """Build an [icon] Label widget for a section header."""
+        w = QWidget(parent)
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        ic = QLabel(w)
+        ic.setPixmap(lucide_icon(icon_name, size=14, color_hex=MONOS_COLORS["text_meta"]).pixmap(14, 14))
+        ic.setFixedSize(14, 14)
+        lay.addWidget(ic, 0)
+        lbl = QLabel(text, w)
+        lbl.setObjectName("InboxFieldLabel")
+        lay.addWidget(lbl, 0)
+        return w
+
+    def _make_item_button(self, label: str, data: str, icon_name: str,
+                          obj_name: str, parent: QWidget) -> QPushButton:
+        btn = QPushButton(label, parent)
+        btn.setObjectName(obj_name)
+        btn.setIcon(lucide_icon(icon_name, size=14))
+        btn.setCheckable(True)
+        btn.setProperty("item_data", data)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        return btn
+
+    # ── data ──
 
     def set_data(
         self,
@@ -1466,55 +1647,97 @@ class _InboxDestinationBlock(QWidget):
         except Exception:
             self._type_reg = None
         self._destinations = load_inbox_destinations()
-        self._refill_dest_combo()
+        self._refill_dest_items()
         self._on_scope_changed()
         self._update_distribute_enabled()
+
+    # ── scope ──
 
     def _current_scope(self) -> str:
-        v = self._scope_combo.currentData()
-        return (v or _INBOX_SCOPE_PROJECT).strip().lower()
+        btn = self._scope_group.checkedButton()
+        if btn:
+            return (btn.property("item_data") or _INBOX_SCOPE_PROJECT).strip().lower()
+        return _INBOX_SCOPE_PROJECT
 
-    def _refill_dest_combo(self) -> None:
-        self._dest_combo.clear()
-        scope = self._current_scope()
-        for d in self._destinations:
-            ctx = (d.get("context") or "both").strip().lower()
-            if scope == _INBOX_SCOPE_PROJECT and ctx == "project":
-                self._dest_combo.addItem(d.get("label", d.get("id", "")), d.get("id", ""))
-            elif scope == _INBOX_SCOPE_ASSET and ctx in ("asset", "both"):
-                self._dest_combo.addItem(d.get("label", d.get("id", "")), d.get("id", ""))
-            elif scope == _INBOX_SCOPE_SHOT and ctx in ("shot", "both"):
-                self._dest_combo.addItem(d.get("label", d.get("id", "")), d.get("id", ""))
+    def _on_scope_selection_changed(self) -> None:
+        self._refill_dest_items()
         self._on_scope_changed()
-        self._update_distribute_enabled()
 
     def _on_scope_changed(self) -> None:
         scope = self._current_scope()
         if scope == _INBOX_SCOPE_PROJECT:
-            self._type_row_widget.setVisible(False)
+            self._type_section.setVisible(False)
             self._entity_combo.clear()
             self._entity_combo.addItem("Project (global)", None)
             self._update_distribute_enabled()
             return
         if scope == _INBOX_SCOPE_SHOT:
-            self._type_row_widget.setVisible(False)
+            self._type_section.setVisible(False)
             self._refill_entity_combo()
             self._update_distribute_enabled()
             return
-        self._type_row_widget.setVisible(True)
-        self._refill_type_combo()
+        self._type_section.setVisible(True)
+        self._refill_type_items()
         self._refill_entity_combo()
         self._update_distribute_enabled()
 
-    def _refill_type_combo(self) -> None:
-        self._type_combo.clear()
+    # ── destination buttons ──
+
+    def _refill_dest_items(self) -> None:
+        for btn in list(self._dest_group.buttons()):
+            self._dest_group.removeButton(btn)
+            btn.deleteLater()
+        scope = self._current_scope()
+        first_btn: QPushButton | None = None
+        for d in self._destinations:
+            ctx = (d.get("context") or "both").strip().lower()
+            match = (
+                (scope == _INBOX_SCOPE_PROJECT and ctx == "project")
+                or (scope == _INBOX_SCOPE_ASSET and ctx in ("asset", "both"))
+                or (scope == _INBOX_SCOPE_SHOT and ctx in ("shot", "both"))
+            )
+            if not match:
+                continue
+            did = d.get("id", "")
+            icon_name = self._DEST_ICON_MAP.get(did, "folder-open")
+            btn = self._make_item_button(
+                d.get("label", did), did, icon_name,
+                "InboxDestItemButton", self._dest_container,
+            )
+            self._dest_group.addButton(btn)
+            self._dest_layout.addWidget(btn)
+            if first_btn is None:
+                first_btn = btn
+        if first_btn:
+            first_btn.setChecked(True)
+        self._update_distribute_enabled()
+
+    # ── type buttons ──
+
+    def _refill_type_items(self) -> None:
+        for btn in list(self._type_group.buttons()):
+            self._type_group.removeButton(btn)
+            btn.deleteLater()
+        first_btn: QPushButton | None = None
         if self._type_reg:
             for tid in self._type_reg.get_types():
                 if (tid or "").lower() == "shot":
                     continue
                 label = self._type_reg.get_type_label(tid) or tid
-                self._type_combo.addItem(label, tid)
+                icon_name = self._TYPE_ICON_MAP.get((tid or "").lower(), "box")
+                btn = self._make_item_button(
+                    label, tid, icon_name,
+                    "InboxTypeItemButton", self._type_container,
+                )
+                self._type_group.addButton(btn)
+                self._type_layout.addWidget(btn)
+                if first_btn is None:
+                    first_btn = btn
+        if first_btn:
+            first_btn.setChecked(True)
         self._refill_entity_combo()
+
+    # ── entity combo ──
 
     def _refill_entity_combo(self) -> None:
         self._entity_combo.clear()
@@ -1531,7 +1754,8 @@ class _InboxDestinationBlock(QWidget):
                 self._entity_combo.addItem(f"{s.name} (Shot)", s)
             self._update_distribute_enabled()
             return
-        type_id = self._type_combo.currentData()
+        type_btn = self._type_group.checkedButton()
+        type_id = type_btn.property("item_data") if type_btn else None
         if self._project_index and type_id:
             for a in self._project_index.assets:
                 if (a.asset_type or "").strip().lower() != (type_id or "").strip().lower():
@@ -1540,12 +1764,15 @@ class _InboxDestinationBlock(QWidget):
                 self._entity_combo.addItem(f"{a.name} ({label})", a)
         self._update_distribute_enabled()
 
+    # ── distribute ──
+
     def _update_distribute_enabled(self) -> None:
+        has_dest = self._dest_group.checkedButton() is not None
         self._distribute_btn.setEnabled(
             bool(
                 self._paths
                 and self._project_root
-                and self._dest_combo.count() > 0
+                and has_dest
                 and self._entity_combo.count() > 0
             )
         )
@@ -1553,11 +1780,11 @@ class _InboxDestinationBlock(QWidget):
     def _on_distribute(self) -> None:
         if not self._paths or not self._project_root:
             return
-        dest_id = self._dest_combo.currentData()
+        dest_btn = self._dest_group.checkedButton()
+        dest_id = dest_btn.property("item_data") if dest_btn else None
         entity = self._entity_combo.currentData()
         if not dest_id:
             return
-        # context "project" => entity có thể None (global reference)
         if entity is not None and not isinstance(entity, (Asset, Shot)):
             return
         move = self._move_radio.isChecked()
