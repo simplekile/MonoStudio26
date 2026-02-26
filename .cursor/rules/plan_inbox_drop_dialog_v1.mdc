@@ -1,0 +1,161 @@
+---
+description: Plan dialog khi drag-drop vào Inbox – chọn client/freelancer, thư mục date hiện có hoặc thư mục date mới (lịch)
+alwaysApply: false
+---
+
+# Plan: Inbox Drop Dialog (v1)
+
+Khi user **kéo thả file/folder vào trang Inbox**, thay vì copy thẳng vào `inbox/<source>/<today>/` (theo sidebar), hiển thị **dialog** cho phép chọn **client/freelancer**, **thư mục date hiện có** hoặc **thư mục date mới** (chọn ngày bằng lịch – design lịch xem plan riêng).
+
+---
+
+## 1. Mục đích
+
+- **Trước**: Drop → copy ngay vào `inbox/<sidebar_type>/<today>/`, không hỏi.
+- **Sau**: Drop → mở dialog → user chọn source (Client/Freelancer), chọn **existing date folder** hoặc **new date folder** (calendar) → Confirm → copy vào `inbox/<source>/<date>/` + meta, refresh view.
+
+---
+
+## 2. Trigger
+
+- **Sự kiện**: `InboxPageWidget.drop_requested.emit(paths)` (đã có khi drop trên Inbox page).
+- **Handler**: `MainWindow._on_inbox_drop_requested(paths)`.
+- **Đổi flow**: Thay vì gọi trực tiếp `add_to_inbox(..., source từ sidebar, date=None)`, mở **InboxDropDialog** với `paths`, `project_root`, (optional) `initial_source` = sidebar current type. Khi user Accept → gọi `add_to_inbox(project_root, path, source, date_str, description)` cho từng path, rồi `_reload_main_view()`.
+
+---
+
+## 3. Nội dung dialog
+
+### 3.1 Thông tin drop (read-only)
+
+- Hiển thị **số lượng** và **tên** (hoặc path ngắn) của file/folder được drop, ví dụ: "3 items: FolderA, file.zip, …" hoặc list nhỏ (scroll nếu nhiều). Chỉ để user xác nhận đúng đối tượng.
+
+### 3.2 Chọn nguồn (Client / Freelancer)
+
+- **Control**: Radio hoặc hai nút toggle (Client | Freelancer), giống sidebar Source.
+- **Default**: `initial_source` từ sidebar (client/freelancer đang chọn); nếu không hợp lệ thì "client".
+- **Value**: `"client"` | `"freelancer"` (lowercase, dùng cho `add_to_inbox(..., source_label=...)`).
+
+### 3.3 Chọn thư mục date
+
+Hai lựa chọn (radio hoặc tab):
+
+| Lựa chọn | UI | Hành vi |
+|----------|-----|---------|
+| **Thư mục date hiện có** | List/combo danh sách thư mục date **đã tồn tại** cho source đã chọn (client hoặc freelancer). Mỗi item = một folder `inbox/<source>/<date_str>/`, hiển thị `date_str` (vd 2025-02-07) hoặc format hiển thị (vd "7 Feb 2025"). | User chọn một → `date_str` = date của folder đó. Copy vào đúng folder đó (cùng source). |
+| **Thư mục date mới** | Nút "Chọn ngày…" hoặc inline **calendar/date picker** (design trong plan riêng: `plan_inbox_calendar_date_picker_v1.mdc`). | User chọn ngày → `date_str` = YYYY-MM-DD. Tạo folder mới `inbox/<source>/<date_str>/` và copy vào. |
+
+- **Default**: Có thể mặc định "Thư mục date mới" + ngày hôm nay (để giữ behavior gần với hiện tại nhưng vẫn qua dialog).
+- **Data**: Danh sách date folder hiện có lấy từ `scan_inbox(project_root)` → lọc theo `source` (client/freelancer) → lấy `children` của node tương ứng → mỗi child là một date folder (`.name` = date_str). Sort giảm dần theo date để mới nhất lên đầu (tùy chọn).
+
+### 3.4 Description (tùy chọn)
+
+- Ô text (line edit hoặc plain text) cho **description** (ghi vào meta, key `description`). Để trống được.
+
+### 3.5 Nút
+
+- **Cancel**: Đóng dialog, không copy.
+- **Add to Inbox** (hoặc **Confirm**): Validate (đã chọn source, đã chọn date – existing hoặc new), rồi copy từng path vào `inbox/<source>/<date_str>/` qua `add_to_inbox(..., description=...)`, đóng dialog, refresh.
+
+### 3.6 ASCII demo – layout dialog
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Add to Inbox                                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Adding 2 item(s):                                               │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  • ClientAssets_2025-02.zip                                 │ │
+│  │  • ref_folder/                                              │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  Source                                                          │
+│  ┌──────────────┬──────────────┐                                 │
+│  │ ● Client     │   Freelancer │                                 │
+│  └──────────────┴──────────────┘                                 │
+│                                                                  │
+│  Date folder                                                     │
+│  ○ Existing date folder                                          │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  2025-02-20  ▼  │  (combo: 2025-02-20, 2025-02-15, …)       │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│  ● New date folder                                               │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  [ Chọn ngày… ]  │  2025-02-26  (hoặc inline calendar)      │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  Description (optional)                                          │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  Batch from client review                                   │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│                              ┌─────────┐  ┌──────────────────┐   │
+│                              │ Cancel  │  │ Add to Inbox      │   │
+│                              └─────────┘  └──────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Validation
+
+- **Source**: Bắt buộc (client hoặc freelancer).
+- **Date**:
+  - Nếu chọn "Thư mục date hiện có" → phải chọn một item trong list (date_str từ item).
+  - Nếu chọn "Thư mục date mới" → phải có ngày đã chọn từ calendar (date_str = YYYY-MM-DD).
+- **Paths**: Đã có từ drop, không cần nhập lại; nếu rỗng thì không mở dialog (giữ behavior hiện tại: return sớm).
+
+---
+
+## 5. Implementation touch points
+
+### 5.1 Core
+
+- **inbox_reader.py**: Đã có `add_to_inbox(project_root, source_path, source_label, date_str, description)` và `scan_inbox(project_root)`. Có thể thêm helper `get_date_folders_for_source(project_root: Path, source: str) -> list[tuple[str, Path]]` (date_str, path) nếu muốn tách logic; không bắt buộc – có thể lấy từ `scan_inbox` rồi lọc trong UI.
+
+### 5.2 Dialog (UI)
+
+- **File mới**: `monostudio/ui_qt/inbox_drop_dialog.py`.
+- **Class**: `InboxDropDialog(MonosDialog)`.
+  - **Input**: `paths: list[Path]`, `project_root: Path`, `initial_source: str | None`.
+  - **Output**: Khi accept: (source, date_str, description). Gọi từ MainWindow; MainWindow thực hiện loop `add_to_inbox` và refresh.
+- **Layout**: 
+  - Đoạn read-only: "Adding N item(s): …"
+  - Source: Client | Freelancer (radio/toggle).
+  - Date: Radio "Existing date folder" + list/combo (chứa các date folder của source đã chọn); Radio "New date folder" + [Chọn ngày…] mở calendar (widget hoặc dialog con theo plan lịch).
+  - Description: QLineEdit hoặc QPlainTextEdit (một dòng đủ).
+  - Buttons: Cancel, Add to Inbox.
+- **Khi đổi source**: Cập nhật lại danh sách "Thư mục date hiện có" theo source mới (rescan hoặc dùng cache từ lần scan khi mở dialog).
+
+### 5.3 MainWindow
+
+- **main_window.py** – `_on_inbox_drop_requested(self, paths: list)`:
+  1. `path_list = [Path(p) for p in paths if ...]` (giữ như cũ).
+  2. Nếu `not path_list` hoặc `not project_root`: return.
+  3. `initial_source = self._sidebar.filters().current_type() or "client"` (strip, lower).
+  4. Mở `InboxDropDialog(path_list, self._project_root, initial_source)`, modal (exec).
+  5. Nếu dialog accept (result == Accepted): lấy `(source, date_str, description)` từ dialog; loop `add_to_inbox(self._project_root, p, source, date_str, description)` cho từng path; `_reload_main_view()`; (optional) notification "Added N items to Inbox".
+
+### 5.4 Calendar / date picker
+
+- **Design và component**: Theo plan riêng **`plan_inbox_calendar_date_picker_v1.mdc`**. Dialog Inbox drop chỉ cần "chỗ để chọn ngày" (widget hoặc nút mở popup/dialog con); API: trả về `date_str: str` (YYYY-MM-DD) hoặc `QDate` → format trong dialog.
+
+---
+
+## 6. Tương tác với plan khác
+
+- **plan_inbox_page_v1.mdc**: Mục 5.1 hiện mô tả "form nhỏ inline hoặc panel" khi drop. Plan này **thay thế** bằng dialog; cập nhật mô tả trong plan_inbox_page khi implement (optional).
+- **plan_inbox_calendar_date_picker_v1.mdc**: Plan design lịch – dialog drop gọi/embed component đó cho "Thư mục date mới".
+
+---
+
+## 7. Tóm tắt
+
+| Hạng mục | Nội dung |
+|----------|----------|
+| **Trigger** | Drop vào Inbox page → `drop_requested` → MainWindow mở InboxDropDialog. |
+| **Dialog** | Source (Client/Freelancer), Date = existing list hoặc new (calendar), Description; Cancel / Add to Inbox. |
+| **Existing date** | List thư mục date từ `scan_inbox` lọc theo source (client/freelancer). |
+| **New date** | Chọn ngày bằng calendar – design trong plan_inbox_calendar_date_picker_v1. |
+| **Sau khi Accept** | add_to_inbox(project_root, path, source, date_str, description) cho từng path; refresh view. |

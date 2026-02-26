@@ -1,0 +1,189 @@
+---
+description: Plan thiết kế lịch (date picker / calendar) – chọn ngày cho thư mục date mới Inbox và dùng lại nơi khác
+alwaysApply: false
+---
+
+# Plan: Inbox Calendar / Date Picker Design (v1)
+
+Thiết kế **widget lịch (calendar)** để user chọn **một ngày** (YYYY-MM-DD), dùng trong **Inbox Drop Dialog** cho "Thư mục date mới", và có thể tái sử dụng ở màn hình khác (filter theo ngày, report, v.v.).
+
+---
+
+## 1. Mục đích & phạm vi
+
+- **Use case chính**: Trong **InboxDropDialog**, khi user chọn "Thư mục date mới" → cần chọn ngày → dùng **calendar/date picker** (lịch) thay vì chỉ nhập tay chuỗi ngày.
+- **Use case phụ**: Dùng lại component này ở nơi cần chọn ngày (vd filter Inbox theo ngày, export theo khoảng ngày).
+- **Output**: Một ngày dạng `QDate` hoặc `str` (YYYY-MM-DD).
+- **Không làm (Phase 1)**: Chọn khoảng ngày (range), time zone, nhiều locale – chỉ một ngày, format YYYY-MM-DD.
+
+---
+
+## 2. Chuẩn visual (MONOS Deep Dark)
+
+- **Bo góc (round corners)**: Theo **`.cursor/rules/round_corner_standard_v1.mdc`**:
+  - **Calendar hiển thị dạng popup/top-level**: Dùng chuẩn dialog — radius **12px**, Frameless + WA_TranslucentBackground + QBitmap mask trong showEvent/resizeEvent, vẽ nền rounded trong paintEvent (giống MonosDialog).
+  - **Calendar embed trong dialog** (không phải cửa sổ riêng): Chỉ là panel con → `border-radius: 8px` (8px grid), viền `#3f3f46`.
+- **Nền**: Panel dark `#18181b` (đồng bộ dialog/popover), viền `1px solid #3f3f46`.
+- **Font**: Inter (typography rule); số ngày 13px weight 500, label tháng/năm 11–13px.
+- **Màu chữ**: Zinc-300 (#d4d4d8) cho ngày bình thường; Zinc-500 (#71717a) cho ngày ngoài tháng; **Blue-400** (#60a5fa hoặc MONOS blue) cho ngày được chọn; Zinc-100 cho hover.
+- **Hôm nay**: Viền nhạt hoặc dot indicator, không lấn át ngày chọn.
+- **Hover**: Nền nhạt `rgba(255,255,255,0.06)`; **selected**: nền Blue-400 (hoặc blue với opacity) + chữ trắng; **ô được chọn phải bo tròn** (rounded corners), không vuông.
+- **Header (tháng/năm)**: Có nút Prev/Next tháng; có thể thêm combo tháng/năm để nhảy nhanh. Style: nút giống MONOS (icon lucide chevron-left/right), label tháng-năm rõ ràng.
+
+---
+
+## 3. Bo tròn ô ngày được chọn (rounded corners)
+
+QCalendarWidget dùng **QTableView** nội bộ; selection mặc định vẽ bằng palette `Highlight` nên ô vuông. Để ô ngày được chọn **bo tròn** đồng bộ với chuẩn MONOS:
+- **Ô cell (element nhỏ)**: radius **8px** (8px grid, cùng cấp với panel con). Trùng với round_corner_standard về viền: viền sáng hơn nền (`#3f3f46`); ô cell chỉ cần vẽ rounded rect trong paintCell, không cần mask (nội bộ widget).
+- Tham khảo implement: [How to show the selected date with rounded corners in QCalendarWidget](https://stackoverflow.com/questions/78651670/how-to-show-the-selected-date-with-rounded-corners-in-qcalendarwidget).
+
+### 3.1 Cách 1: Palette transparent + override paintCell (đề xuất Phase 1)
+
+- Lấy table view bên trong: `table = self.findChild(QTableView)`.
+- Set palette của table: `Highlight` = **transparent** → delegate không vẽ nền selection mặc định.
+- Trong **paintCell()**: nếu `date == self.selectedDate()` thì **vẽ rounded rect trước** (brush = highlight color, pen = NoPen, **radius = 8** theo 8px grid), rồi gọi `QCalendarWidget.paintCell(self, painter, rect, date)` để vẽ số.
+
+```python
+# Trong __init__ của MonosCalendarWidget:
+table = self.findChild(QTableView)
+if table:
+    pal = table.palette()
+    pal.setColor(QPalette.ColorRole.Highlight, Qt.GlobalColor.transparent)
+    table.setPalette(pal)
+
+# Trong paintCell(): radius 8px đồng bộ 8px grid (giống panel con trong round_corner_standard)
+if date == self.selectedDate():
+    painter.save()
+    painter.setBrush(self.palette().highlight())  # hoặc QColor Blue-400
+    painter.setPen(Qt.PenStyle.NoPen)
+    radius = 8
+    painter.drawRoundedRect(rect, radius, radius)
+    painter.restore()
+QCalendarWidget.paintCell(self, painter, rect, date)
+```
+
+- **Lưu ý**: Nếu app dùng QSS với `selection-background-color` cho item views, palette có thể bị style ghi đè; khi đó xem Cách 2.
+
+### 3.2 Cách 2: Custom QItemDelegate
+
+- Tạo delegate kế thừa **QItemDelegate** (hoặc QStyledItemDelegate), override **paint()**.
+- Nếu `opt.state & QStyle.StateFlag.State_Selected`: vẽ rounded rect (brush = Highlight, **radius 8px**), sau đó set `opt.palette.setColor(Highlight, transparent)` và gọi `super().paint()` để vẽ text.
+- Gán: `table.setItemDelegate(CalendarDelegate(table))`.
+- **Nhược**: Delegate mặc định của QCalendarWidget mới gọi `paintCell()` của calendar; delegate tùy chỉnh không gọi → cần map QModelIndex (row, col) sang QDate và tự vẽ nội dung ô nếu muốn giữ logic ngày ngoài tháng / format đặc biệt. Chỉ dùng khi Cách 1 bị conflict với QSS.
+
+---
+
+## 4. Hai hướng implement
+
+### 4.1 Option A: Style QCalendarWidget (Qt)
+
+- **Ưu**: Nhanh, có sẵn accessibility, đủ tính năng (tháng trước/sau, chọn ngày).
+- **Nhược**: QSS cho QCalendarWidget phức tạp (nhiều sub-control), cần override từng phần (navigation, weekday, cell).
+- **Cách làm**: 
+  - Tạo widget wrapper `MonosCalendarWidget(QCalendarWidget)`, set objectName để QSS trong `style.py` target.
+  - QSS: nền #18181b, viền #3f3f46, border-radius 8px (panel embed) hoặc 12px nếu calendar là popup (theo round_corner_standard); QCalendarWidget QAbstractItemView cell: màu chữ, hover, selected (blue); QToolButton (prev/next): style nút MONOS; header (first day of week, month/year): font Inter, màu label.
+  - Set `setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)` để bỏ số tuần nếu không cần.
+  - Signal: `clicked(QDate)` hoặc `selectionChanged()`; dialog lấy `selectedDate()`.
+
+### 4.2 Option B: Custom grid (QWidget + paintEvent hoặc QTableWidget / QGridLayout + nút)
+
+- **Ưu**: Kiểm soát 100% layout và interaction, dễ đạt đúng design.
+- **Nhược**: Tốn công (vẽ 7 cột × 5–6 hàng, logic tháng trước/sau, first day of week).
+- **Cách làm**: Grid 7 cột (CN–T7 hoặc T2–CN tùy locale), hàng là tuần; mỗi ô là QPushButton hoặc QLabel clickable; header tháng + nút prev/next; khi click ô → emit `date_selected(QDate)`.
+
+**Đề xuất Phase 1**: **Option A** (QCalendarWidget + QSS) để ship nhanh; nếu sau này cần giao diện lịch đặc biệt hơn thì làm Option B.
+
+### 4.3 ASCII demo – calendar widget
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  ◀    February 2025    ▶                                │
+├──────┬──────┬──────┬──────┬──────┬──────┬──────┤
+│  CN  │  T2  │  T3  │  T4  │  T5  │  T6  │  T7  │
+├──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+│      │      │      │   1  │   2  │   3  │   4  │
+├──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+│   5  │   6  │   7  │   8  │   9  │  10  │  11  │
+├──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+│  12  │  13  │  14  │  15  │  16  │  17  │  18  │
+├──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+│  19  │  20  │  21  │  22  │  23  │  24  │  25  │
+├──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+│  26  │ [27] │  28  │      │      │      │      │  ← 27 = today or selected (blue)
+└──────┴──────┴──────┴──────┴──────┴──────┴──────┘
+       ↑
+  empty = ngày ngoài tháng (màu muted)
+  [27] = ô đang chọn (nền Blue-400)
+```
+
+- **Header**: "◀" / "▶" = prev/next tháng; "February 2025" = label tháng–năm.
+- **Row 1**: Abbrev ngày trong tuần (CN, T2…T7 hoặc Sun–Sat).
+- **Grid**: 7×6 ô; ô trống = ngày thuộc tháng khác (Zinc-500); ô có số = click để chọn.
+
+---
+
+## 5. Layout & kích thước
+
+- **Kích thước gợi ý**: Đủ hiển thị 7 cột × 6 hàng ô ngày + header (tháng/năm + prev/next). Ví dụ min width ~280px, min height ~260px (có thể scale theo DPI).
+- **Đặt trong Inbox Drop Dialog**: 
+  - Cách 1: **Inline** – khi chọn "Thư mục date mới", hiện luôn calendar bên dưới (dialog cao hơn một chút).
+  - Cách 2: **Popup / Dialog con** – nút "Chọn ngày…" mở popup (QFrame hoặc QDialog không modal nhỏ) chứa calendar; chọn xong đóng popup và điền date_str vào dialog. Ưu: dialog gọn. Nhược: thêm một bước click.
+- **Đề xuất**: Inline nếu dialog đủ rộng; nếu muốn dialog nhỏ gọn thì dùng nút "Chọn ngày…" + popup.
+
+---
+
+## 6. Hành vi
+
+- **Default date**: Khi mở (hoặc khi chọn "Thư mục date mới"), mặc định chọn **hôm nay** (`QDate.currentDate()`).
+- **Chọn ngày**: Click vào ô → chọn ngày đó; dialog/parent lấy `selectedDate()` (QDate) → format `yyyy-MM-dd` cho `add_to_inbox`.
+- **Điều hướng**: Prev/Next tháng; tùy chọn combo tháng + năm để nhảy nhanh.
+- **First day of week**: Có thể dùng locale (Qt Monday/Sunday) hoặc cố định Chủ nhật / Thứ hai theo quy ước dự án.
+
+---
+
+## 7. QSS tóm tắt (Option A – QCalendarWidget)
+
+Áp dụng trong **global stylesheet** (`style.py`), selector ví dụ `QCalendarWidget#MonosCalendar`:
+
+- `QCalendarWidget`: background #18181b, border 1px #3f3f46, border-radius 8px (embed) hoặc 12px (popup, theo round_corner_standard_v1).
+- `QCalendarWidget QWidget#qt_calendar_navigationbar`: nền transparent hoặc #1c1c1f; QToolButton (prev/next): style nút MONOS (icon, hover blue).
+- `QCalendarWidget QAbstractItemView`: cell min size ~36px; background transparent; color #d4d4d8.
+- `QCalendarWidget QAbstractItemView:selected`: background #2563eb (hoặc rgba blue); color white.
+- `QCalendarWidget QAbstractItemView:!enabled` hoặc ngày ngoài tháng: color #71717a.
+- Header weekday (T2, T3, …): font 11px, color Zinc-500.
+
+(Chi tiết từng dòng QSS có thể bổ sung khi implement.)
+
+---
+
+## 8. Implementation touch points
+
+### 8.1 Widget
+
+- **File**: Có thể trong `monostudio/ui_qt/widgets/` (nếu có) hoặc `monostudio/ui_qt/inbox_drop_dialog.py` (widget con) hoặc file riêng `monostudio/ui_qt/calendar_date_picker.py`.
+- **Class**: `MonosCalendarWidget(QCalendarWidget)` hoặc `MonosDatePickerWidget(QWidget)` (chứa QCalendarWidget + optional nút Today). 
+- **API**: 
+  - `date(): QDate`
+  - `setDate(QDate)`
+  - Signal `date_changed(QDate)` hoặc dùng `clicked(QDate)` sẵn có.
+
+### 8.2 Inbox Drop Dialog
+
+- Khi "Thư mục date mới" được chọn: hiển thị `MonosCalendarWidget`; khi user chọn ngày, lấy `selectedDate()` → `date_str = date.toString("yyyy-MM-dd")` (hoặc Qt.DateFormat.ISODate). Khi Accept dialog, dùng `date_str` cho `add_to_inbox(..., date_str, ...)`.
+
+### 8.3 Style
+
+- **style.py**: Thêm block QSS cho `QCalendarWidget#MonosCalendar` (và sub-controls) theo mục 7; tuân thủ Deep Dark và 8px grid (padding ô, khoảng cách header).
+
+---
+
+## 9. Tóm tắt
+
+| Hạng mục | Nội dung |
+|----------|----------|
+| **Mục đích** | Chọn một ngày (YYYY-MM-DD) cho "Thư mục date mới" trong Inbox Drop Dialog; tái sử dụng được. |
+| **Visual** | MONOS Deep Dark (#18181b), viền #3f3f46, Inter, Blue-400 selected, 8px grid. Bo góc: popup = 12px (round_corner_standard_v1), panel/cell = 8px. |
+| **Implement** | Ưu tiên Option A: QCalendarWidget + QSS; wrapper MonosCalendarWidget, signal clicked/selectedDate. |
+| **Placement** | Inline trong dialog hoặc popup "Chọn ngày…" tùy layout. |
+| **Default** | Hôm nay. Output: QDate hoặc str yyyy-MM-dd. |
