@@ -1,0 +1,150 @@
+---
+description: Plan đổi Library page thành Outbox – cấu trúc tương tự Inbox, Inspector chỉ review metadata (không distribute)
+alwaysApply: false
+---
+
+# Plan: Trang Outbox (thay Library) (v1)
+
+**Mục tiêu**: Bỏ Library, thay bằng **Outbox**. Cấu trúc trang và dữ liệu tương tự Inbox (sidebar nav, page riêng, list/tree theo nguồn + date), nhưng **Inspector chỉ dùng để xem metadata** (preview, path, size, date) — không có chức năng distribute / destination như Inbox.
+
+---
+
+## 1. Tóm tắt thay đổi
+
+| Hạng mục | Trước (Library) | Sau (Outbox) |
+|----------|-----------------|--------------|
+| **Sidebar** | Nav item "Library" | Nav item **Outbox** (icon gợi ý: `send` hoặc `archive`) |
+| **Context** | `SidebarContext.LIBRARY` | `SidebarContext.OUTBOX` |
+| **Nội dung trang** | Main view clear + empty message | **OutboxPageWidget** riêng (layout tương tự Inbox) |
+| **Dữ liệu** | Không có | `<project_root>/outbox` (cấu trúc nested tùy chọn, xem §3) |
+| **Inspector** | N/A | Chỉ **preview + metadata** (path, size, modified, type); **không** block Destination / Distribute |
+
+---
+
+## 2. Vị trí trong app
+
+- **Sidebar**: Thay nav item **Library** bằng **Outbox** (thứ tự: Projects → Shots → Assets → Inbox → **Outbox** → Project Guide, hoặc giữ vị trí cũ của Library).
+- **Context**: `SidebarContext.OUTBOX = "Outbox"`. Khi chọn Outbox, filter panel chỉ **Source** (Client / Freelancer) giống Inbox.
+- **Content stack**: Khi `context == "Outbox"` → hiển thị **OutboxPageWidget** (tạo mới, lazy như Inbox/Reference), không dùng MainView.
+
+---
+
+## 3. Dữ liệu & cấu trúc trên disk (đề xuất)
+
+- **Outbox root**: `<project_root>/outbox` (visible, dễ đồng bộ với cách làm Inbox).
+- **Cấu trúc (đề xuất giống Inbox để “cấu trúc tương tự”)**:
+  - `outbox/client/<date>/` và `outbox/freelancer/<date>/` (date = YYYY-MM-DD).
+  - Metadata: `.monostudio/outbox_meta.json` keyed theo path tương đối; value: `{ "source": "client" | "freelancer", "added_at": "ISO8601", "description": "" }`.
+- **Scan**: Đệ quy từ `outbox/`, bỏ qua hidden; build cây (tree) để UI hiển thị nested. Mỗi node: file hoặc folder, path tương đối, children (nếu folder).
+- **Model (Python)**: `OutboxItem` (path, relative_path, name, is_dir, source, added_at, description, children). Có thể tái dùng hoặc alias từ `InboxItem` nếu schema giống hệt.
+
+
+---
+
+## 4. UI – cấu trúc tương tự Inbox
+
+### 4.1 Layout Outbox page
+
+- **OutboxPageWidget** (widget riêng, thêm vào `_content_stack` khi lần đầu chọn Outbox):
+  1. **Header (giống MainView / Inbox)**: Context title = **"Outbox"**, type badge = Client / Freelancer (theo filter Source).
+  2. **Dưới header**: Một vùng nội dung (một cột) hoặc split nhẹ (tùy chọn):
+     - **Trái**: List date folder (theo source) → click vào date folder → chuyển sang **tree** file/folder trong date đó (giống Inbox).
+     - **Breadcrumb** dưới header: `Outbox › Client` hoặc `Outbox › Client › 2025-02-26`; nút Back hoặc click segment để quay lại list.
+- **Không có**: Mapping pane, “Add to mapping”, list “To distribute” / “Distributed”, nút Distribute, dialog History (Outbox không distribute).
+
+### 4.2 Hành vi
+
+- Chọn **Source** (Client / Freelancer) trên sidebar → list/tree Outbox lọc theo source (nếu có).
+- Click date folder → nội dung chuyển sang tree file/folder trong date đó.
+- Chọn file/folder trong tree → **Inspector** hiển thị **chỉ metadata**: thumbnail (nếu ảnh/video), path, size, modified, type. **Không** hiện block Destination, không nút Distribute.
+- Actions có thể có: **Open folder** (mở outbox hoặc date folder trong Explorer/Finder), **Refresh** (rescan outbox). Không có “Add to mapping” hay “Distribute”.
+
+### 4.3 Drag-drop / “Add to Outbox” (đã chốt: có)
+
+- User **kéo file/folder vào Outbox** (giống Inbox): form inline hoặc panel (source = Client/Freelancer, date mặc định hôm nay, description tùy chọn) → copy vào `outbox/<source>/<date>/` + ghi meta. Có thể thêm nút **"Add to Outbox"** mở dialog chọn file/folder rồi cùng form.
+
+---
+
+## 5. Inspector – chỉ review metadata
+
+- **Nguồn selection**: Khi user chọn item (file/folder) trong **Outbox tree**, MainWindow gọi API Inspector tương đương **preview-only**.
+- **Đề xuất**: Tái dùng cơ chế **`set_inbox_tree_preview(path)`** (hoặc đổi tên thành `set_file_preview(path)` dùng chung cho Inbox tree, Reference, Outbox). Khi `path` từ Outbox:
+  - Hiển thị thumbnail (nếu có), tên file, path, size, modified, type.
+  - **Ẩn** block Destination và nút Distribute (chỉ Inbox mới cần).
+- **Phân biệt Inbox vs Outbox**: Inspector nhận biết context (Inbox vs Outbox) qua signal/slot: khi selection từ Outbox page → chỉ gọi set preview, **không** gọi `set_inbox_distribute_paths`. Khi selection từ Inbox (tree hoặc mapping) → giữ hành vi hiện tại (preview + distribute).
+
+---
+
+## 6. Implementation touch points
+
+### 6.1 Sidebar & routing
+
+- **sidebar.py**:
+  - Đổi `SidebarContext.LIBRARY` → `SidebarContext.OUTBOX`, value `"Outbox"`.
+  - Nav item: label `"Outbox"`, icon `"send"` (hoặc `"archive"`).
+  - Trong `_on_current_nav_item_changed` / filter visibility: khi context == Outbox, xử lý giống Inbox — chỉ Source filter (Client/Freelancer), không Department/Type.
+- **main_window.py**:
+  - Mọi chỗ dùng `"Library"` / `SidebarContext.LIBRARY` → `"Outbox"` / `SidebarContext.OUTBOX`.
+  - `_valid` (restore context): `"Library"` → `"Outbox"`.
+  - Trong branch chuyển context: thêm `elif context_name == "Outbox":` tương tự Inbox — lazy tạo **OutboxPageWidget**, set project root (và type filter nếu có), `setCurrentWidget(outbox_page_widget)`, clear `set_inbox_distribute_paths` và `set_inbox_tree_preview(None)` nếu cần; khi vào Outbox không gọi `set_inbox_distribute_paths` với paths từ Outbox.
+  - `_reload_main_view`: khi `context == "Outbox"` và `_outbox_page_widget is not None` → gọi `_outbox_page_widget.set_project_root(...)` (và set_type_filter nếu có), return.
+
+### 6.2 Outbox page & core
+
+- **OutboxPageWidget** (file mới hoặc trong module inbox/outbox chung):
+  - Layout: header (Outbox + badge) + list/tree (list date folder → tree nội dung date).
+  - Signal: `outbox_tree_selection_changed(path: Path | None)`.
+  - Method: `set_project_root(Path)`, `set_type_filter(str)` (nếu có), `rescan()`.
+- **outbox_reader.py** (trong `monostudio/core/`, mới):
+  - `get_outbox_root(project_root: Path) -> Path`
+  - `scan_outbox(project_root: Path, source_filter: str | None) -> list[OutboxItem]` (hoặc tree structure).
+  - Đọc/ghi `.monostudio/outbox_meta.json` nếu dùng meta (optional).
+- **MainWindow**: Kết nối `outbox_page_widget.outbox_tree_selection_changed` → slot gọi `_inspector.set_inbox_tree_preview(path)` (hoặc set_file_preview) khi context Outbox; **không** set distribute paths.
+
+### 6.3 Inspector
+
+- Giữ `set_inbox_tree_preview(path)`: khi path từ Outbox, chỉ hiện preview + metadata, không hiện block Destination. (Block Destination chỉ hiện khi có `set_inbox_distribute_paths` với non-empty paths và context Inbox.)
+- Hoặc tách rõ: khi selection từ Outbox page, MainWindow chỉ gọi preview, không bao giờ gọi `set_inbox_distribute_paths` với item Outbox.
+
+### 6.4 Settings / persistence
+
+- QSettings key đang dùng "Library" cho sidebar context → đổi thành "Outbox" (hoặc migrate: đọc "Library" cũ, ghi "Outbox" mới khi restore).
+
+---
+
+## 7. Đã chốt (product)
+
+| Câu hỏi | Chốt |
+|--------|------|
+| **Outbox chứa gì?** | File/folder **gửi đi (deliver cho client)**. |
+
+| **Filter Client / Freelancer?** | **Có** — sidebar khi Outbox hiện filter Source (Client/Freelancer), cấu trúc `outbox/client/`, `outbox/freelancer/`. |
+
+| **Drag-drop / "Add to Outbox"?** | **Có** — form (source, date, description) + copy vào outbox + meta; có thể thêm nút "Add to Outbox". |
+| **History (đã gửi) riêng cho Outbox?** | **Không** — chỉ review metadata, không cần dialog History. |
+
+---
+
+## 8. Thứ tự implement gợi ý
+
+1. **Rename Library → Outbox**: Sidebar context, label, icon, QSettings key, mọi string "Library" trong main_window/sidebar.
+2. **Core**: `get_outbox_root`, `scan_outbox`, model `OutboxItem` (hoặc alias từ InboxItem); `outbox_meta.json`; `add_to_outbox(...)` (copy + meta).
+3. **OutboxPageWidget**: Header (Outbox + badge Client/Freelancer) + list date folder + tree khi vào date; signal `outbox_tree_selection_changed`; drag-drop + form Add to Outbox; nút Open folder, Refresh.
+4. **MainWindow**: Branch context == "Outbox" — lazy add OutboxPageWidget vào content stack, set current widget, connect selection → Inspector preview only; connect `drop_requested` (nếu có) → form Add to Outbox; `_reload_main_view` khi Outbox gọi set_project_root/set_type_filter.
+5. **Inspector**: Khi selection từ Outbox chỉ hiện preview/metadata, không hiện Destination/Distribute.
+6. Filter Source (Client/Freelancer) cho Outbox trong sidebar (giống Inbox).
+
+---
+
+## 9. Tóm tắt
+
+| Hạng mục | Nội dung |
+|----------|----------|
+| **Trang** | Outbox thay Library; sidebar nav "Outbox"; page riêng OutboxPageWidget. |
+| **Cấu trúc** | Giống Inbox: header + list date (theo source) + tree nội dung date; **có** drag-drop / Add to Outbox (form + copy + meta); không mapping, không distribute. |
+| **Dữ liệu** | `<project_root>/outbox` với `outbox/client/<date>/`, `outbox/freelancer/<date>/`; `.monostudio/outbox_meta.json`. |
+| **Inspector** | Chỉ review metadata (preview, path, size, date, type); không block Destination, không Distribute. |
+| **Nội dung Outbox** | File/folder **deliver cho client**; filter Source Client/Freelancer. |
+| **History** | Không cần dialog History cho Outbox. |
+
+Logic “Outbox = cấu trúc giống Inbox, Inspector chỉ metadata” là chuẩn. Đã chốt: deliver cho client, filter Client/Freelancer, có Add to Outbox (drag-drop + form), Inspector chỉ metadata, không History.
