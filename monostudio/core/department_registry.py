@@ -101,6 +101,35 @@ def get_default_department_mapping() -> dict[str, dict]:
     return dict(_default_department_mapping())
 
 
+def ensure_parent_from_preset(
+    mapping: dict[str, dict],
+    preset_path: Path | None = None,
+) -> dict[str, dict]:
+    """
+    Return a copy of mapping with "parent" from preset merged in for known subdepartments.
+    Use when saving to user default so the default always has nested layout (subdepartments under parent folder).
+    """
+    out = {k: dict(v) for k, v in mapping.items()}
+    if preset_path is None:
+        preset_path = get_app_base_path() / "monostudio_data" / "pipeline" / "department_presets" / "mono2026_preset.json"
+    try:
+        if not preset_path.is_file():
+            return out
+        data = json.loads(preset_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return out
+    preset_depts = data.get("departments") if isinstance(data, dict) else None
+    if not isinstance(preset_depts, dict):
+        return out
+    for dept_id, preset_node in preset_depts.items():
+        if not isinstance(preset_node, dict):
+            continue
+        parent_val = preset_node.get("parent")
+        if isinstance(parent_val, str) and parent_val.strip() and dept_id in out:
+            out[dept_id] = {**out[dept_id], "parent": parent_val.strip()}
+    return out
+
+
 def load_department_mapping_from_file(path: Path) -> dict[str, dict] | None:
     """
     Load department mapping from a JSON file (same format as project departments.json).

@@ -152,6 +152,36 @@ class TypeRegistry:
         key = (folder_name or "").strip()
         return self._folder_to_id.get(key)
 
+    def get_mapping_edit_level(self, project_root: Path, type_id: str) -> str:
+        """
+        Classify how safe it is to edit this type's folder mapping.
+        Returns FREE / WARNING / MIGRATION_REQUIRED.
+        """
+        folder = self.get_type_folder(type_id)
+        if not folder:
+            return "FREE"
+        from monostudio.core.structure_registry import StructureRegistry
+        struct_reg = StructureRegistry.for_project(project_root)
+        assets_dir = project_root / struct_reg.get_folder("assets")
+        type_dir = assets_dir / folder
+        if not type_dir.is_dir():
+            return "FREE"
+        try:
+            has_children = any(p.is_dir() for p in type_dir.iterdir() if not p.name.startswith("."))
+        except OSError:
+            return "FREE"
+        if not has_children:
+            return "WARNING"
+        try:
+            for child in type_dir.iterdir():
+                if not child.is_dir() or child.name.startswith("."):
+                    continue
+                if any(True for _ in child.iterdir()):
+                    return "MIGRATION_REQUIRED"
+        except OSError:
+            pass
+        return "WARNING"
+
     def get_raw_mapping(self) -> dict[str, dict]:
         """Copy of raw mapping for UI editing / save."""
         return {k: dict(v) for k, v in self._mapping.items()}

@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Callable, Literal
 
 from PySide6.QtCore import QPoint, QPropertyAnimation, QEasingCurve, Qt, QTimer, QParallelAnimationGroup
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QGraphicsOpacityEffect, QSizePolicy, QPushButton
 
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
@@ -70,20 +70,20 @@ class ToastWidget(QFrame):
         self._accent_color = QColor(accent_hex)
         self._text_color = QColor(text_hex)
 
-        # Rounded panel style (8px, 1px border, low contrast)
+        # Rounded panel: nổi bật hơn — nền sáng, viền trái accent, viền tổng thể rõ
         self.setObjectName("ToastWidget")
         self.setStyleSheet(
-            """
-            ToastWidget {
-                background-color: #18181b;
-                border: 1px solid rgba(255, 255, 255, 0.12);
+            f"""
+            ToastWidget {{
+                background-color: #1c1c1f;
+                border: 1px solid rgba(255, 255, 255, 0.22);
+                border-left: 4px solid {accent_hex};
                 border-radius: 8px;
-            }
+            }}
             """
         )
-
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
 
         icon_name = TOAST_ICONS.get(toast_type, "message-circle")
@@ -94,7 +94,7 @@ class ToastWidget(QFrame):
         layout.addWidget(icon_label)
 
         msg_label = QLabel(message, self)
-        msg_label.setFont(monos_font(point_size=12))
+        msg_label.setFont(monos_font(point_size=13, weight=QFont.Weight.Medium))
         msg_label.setStyleSheet(f"color: {text_hex}; background: transparent; border: none;")
         msg_label.setWordWrap(False)
         layout.addWidget(msg_label, 1)

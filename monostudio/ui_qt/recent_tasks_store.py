@@ -1,6 +1,6 @@
 """
 Recent tasks store: app-level list of (project, item, department, dcc) opened recently.
-Persisted via QSettings; dedupe by (project_root, item_path, department) with move-to-front.
+Persisted via QSettings; dedupe by (project_root, item_path, department, dcc) with move-to-front.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def _norm_path(p: Path | str) -> str:
 class RecentTask:
     """One recent task entry (immutable view)."""
 
-    __slots__ = ("project_root", "item_path", "item_name", "item_type", "department", "dcc", "opened_at")
+    __slots__ = ("project_root", "item_path", "item_name", "item_type", "asset_type", "department", "dcc", "opened_at")
 
     def __init__(
         self,
@@ -32,6 +32,7 @@ class RecentTask:
         item_path: str,
         item_name: str,
         item_type: Literal["asset", "shot"],
+        asset_type: str,
         department: str,
         dcc: str,
         opened_at: str,
@@ -40,6 +41,7 @@ class RecentTask:
         self.item_path = item_path
         self.item_name = (item_name or "").strip() or Path(item_path).name
         self.item_type = item_type
+        self.asset_type = (asset_type or "").strip()
         self.department = (department or "").strip()
         self.dcc = (dcc or "").strip()
         self.opened_at = opened_at
@@ -50,6 +52,7 @@ class RecentTask:
             "item_path": self.item_path,
             "item_name": self.item_name,
             "item_type": self.item_type,
+            "asset_type": self.asset_type,
             "department": self.department,
             "dcc": self.dcc,
             "opened_at": self.opened_at,
@@ -69,6 +72,7 @@ class RecentTask:
             item_path=str(ip),
             item_name=str(data.get("item_name", "")),
             item_type=it,
+            asset_type=str(data.get("asset_type", "")),
             department=str(data.get("department", "")),
             dcc=str(data.get("dcc", "")),
             opened_at=str(data.get("opened_at", _now_iso())),
@@ -82,7 +86,7 @@ _SETTINGS_KEY = "recent_tasks"
 class RecentTasksStore:
     """
     In-memory list of recent tasks; persist/load via QSettings (JSON array).
-    Dedupe by (project_root, item_path, department): re-open moves to front.
+    Dedupe by (project_root, item_path, department, dcc): re-open moves to front.
     """
 
     def __init__(self, settings: QSettings) -> None:
@@ -124,6 +128,7 @@ class RecentTasksStore:
         item_path: Path | str,
         item_name: str,
         item_type: Literal["asset", "shot"],
+        asset_type: str = "",
         department: str,
         dcc: str,
     ) -> None:
@@ -138,15 +143,18 @@ class RecentTasksStore:
             item_path=ipath,
             item_name=name,
             item_type=item_type,
+            asset_type=(asset_type or "").strip(),
             department=(department or "").strip(),
             dcc=(dcc or "").strip(),
             opened_at=now,
         )
-        # Remove existing (project_root, item_path, department)
+        # Remove existing (project_root, item_path, department, dcc)
+        dcc_norm = (dcc or "").strip().lower()
         self._tasks = [t for t in self._tasks if not (
             _norm_path(t.project_root) == proot
             and _norm_path(t.item_path) == ipath
             and (t.department or "").strip().lower() == (department or "").strip().lower()
+            and (t.dcc or "").strip().lower() == dcc_norm
         )]
         self._tasks.insert(0, new_task)
         self._tasks = self._tasks[:_MAX_RECENT]

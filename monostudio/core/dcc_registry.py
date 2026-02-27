@@ -169,6 +169,14 @@ class DccRegistry:
         dep_norm = dep.casefold()
         return any(d.casefold() == dep_norm for d in e.departments)
 
+    def requires_import(self, dcc_id: str) -> bool:
+        """True if DCC works on imported files (no native project format), e.g. RizomUV."""
+        did = (dcc_id or "").strip()
+        e = self._entries.get(did)
+        if e is None:
+            return False
+        return bool(e.raw.get("requires_import"))
+
     def resolve_default_dcc(self, *, department: str | None, last_used: str | None = None) -> str | None:
         """
         Resolution priority:

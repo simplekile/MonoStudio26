@@ -26,8 +26,8 @@ Dialog phải đồng bộ với Main UI: cùng palette, typography, spacing. St
 - Viền: `rgba(39, 39, 42, 0.50)` hoặc `#27272a`.
 - Chữ chính: `#fafafa` / `#cccccc`; label: `#a1a1aa`; muted/hint: `#71717a`.
 - Accent: `#2563eb` (Blue-600), `#60a5fa` (Blue-400).
-- Nút primary: giống `QPushButton#MainViewPrimaryAction` (border Blue-600, background rgba Blue, text #fafafa).
-- Nút secondary: border `rgba(39,39,42,0.50)`, background `rgba(24,24,27,0.35)`, hover sáng hơn.
+- **Nút đồng ý (primary)**: OK, Confirm, Add, Save, Open… — luôn dùng `setObjectName("DialogPrimaryButton")` và style trong `style.py` (màu accent: Blue-600/400, nền rgba blue, chữ #fafafa). Giống `QPushButton#MainViewPrimaryAction`.
+- **Nút hủy / phụ (secondary)**: Cancel, Back… — dùng `setObjectName("DialogSecondaryButton")` (border xám, nền rgba 24,24,27, chữ #a1a1aa, hover #fafafa).
 
 ## Control trong dialog
 
@@ -37,7 +37,7 @@ Dialog phải đồng bộ với Main UI: cùng palette, typography, spacing. St
 
 ## QDialogButtonBox
 
-- Để nút kế thừa palette và QSS nút chung. Nếu cần nút primary rõ (vd "Open", "Save"): lấy `QDialogButtonBox.Ok`, `setText()` phù hợp, có thể set objectName (vd `DialogPrimaryButton`) và thêm QSS tương đương `MainViewPrimaryAction` trong `style.py`.
+- Nút từ `QDialogButtonBox`: lấy `button(Ok)` / `button(Cancel)`, `setText()` phù hợp. **Bắt buộc** set objectName cho nút đồng ý: `ok_btn.setObjectName("DialogPrimaryButton")`; nút Cancel: `cancel_btn.setObjectName("DialogSecondaryButton")` để kế thừa QSS trong `style.py` (primary = màu xanh, secondary = xám).
 
 ## QMessageBox / QInputDialog
 
@@ -94,5 +94,5 @@ QDialogButtonBox QPushButton[text="Delete"] {
 - [ ] Margins 12, spacing 10 hoặc 12.
 - [ ] Màu chữ/hint dùng qua objectName + QSS trong `style.py`, tránh inline setStyleSheet nếu đã có class chung.
 - [ ] Path/ID read-only: mono font (property hoặc objectName).
-- [ ] Nút primary (Ok/Open/Save/Delete): rõ ràng; destructive dùng text "Delete" và có thể style đỏ nếu cần.
+- [ ] Nút đồng ý (OK/Add/Save/Open): `setObjectName("DialogPrimaryButton")`; nút Cancel/hủy: `setObjectName("DialogSecondaryButton")`. Destructive (Delete) có thể style đỏ riêng nếu cần.
 - [ ] Không thêm scrollbar QSS riêng — dùng global scrollbar đã định nghĩa.

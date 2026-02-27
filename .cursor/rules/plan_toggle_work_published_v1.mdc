@@ -1,0 +1,147 @@
+---
+description: Plan Toggle Work/Published – chỉ khu vực có work + publish folder; toggle kiểu iOS, tiết kiệm diện tích, ít chữ
+alwaysApply: false
+---
+
+# Plan: Toggle Work / Published (v1)
+
+**Mục tiêu**: Thêm toggle để hiển thị **work file** hoặc **published file** (path, version, "Open folder") ở những nơi có cả `work_path` và `publish_path`. Thiết kế **tiết kiệm diện tích**, **toggle kiểu iOS**, **ít chữ**.
+
+**Phạm vi**: Chỉ **Assets** và **Shots** (Main view + Inspector). **Inbox / Outbox không dùng** toggle này.
+
+---
+
+## 1. Tóm tắt
+
+| Hạng mục | Nội dung |
+|----------|----------|
+| **Phạm vi** | Main view (Assets/Shots), Inspector khi selection là Asset/Shot/Department. Không dùng ở Inbox, Outbox. |
+| **State** | `show_publish: bool` — `False` = work (mặc định), `True` = publish. |
+| **UI** | Một switch kiểu iOS (pill track + thumb), không label dài; tooltip giải thích. |
+| **Ảnh hưởng** | Card version/path, Inspector Tech path/version, context menu "Open Work/Publish folder", "Open with" (work vs mở folder publish). |
+
+---
+
+## 2. Vị trí UI – tiết kiệm diện tích
+
+### 2.1 Main view (header)
+
+- **Vị trí**: Trong **header**, cùng hàng với title + type/department badge + Grid|List. Đặt **sát container Grid|List** (bên trái của Tier3Container hoặc giữa stretch và Tier3Container).
+- **Chỉ hiện** khi `context in ("Assets", "Shots")`; ẩn khi Project/Inbox/Outbox/Reference/Project Guide.
+- **Thành phần**: Chỉ **một switch** (không thêm chữ "Work"/"Published" cạnh switch). Tooltip khi hover:
+  - Off: `Work` (đang xem work file / work folder)
+  - On: `Published` (đang xem published file / publish folder)
+- **Kích thước**: Switch nhỏ gọn, cùng tầm chiều cao với pill Grid|List (≈22–24px), track rộng ~36–40px (iOS thường ~51pt, có thể thu nhỏ cho desktop).
+
+### 2.2 Inspector (Tech row)
+
+- Khi item là **Asset** hoặc **Shot** (và có departments): hiện **cùng một kiểu switch** nhỏ bên cạnh hoặc trên Tech row (path/version).
+- Switch điều khiển: path + version trong Inspector đang lấy từ **work** hay **publish**; nút "Open folder" mở đúng work hoặc publish theo state.
+- **Ít chữ**: Không cần label dài; tooltip giống Main view.
+
+---
+
+## 3. Thiết kế toggle kiểu iOS
+
+### 3.1 Chuẩn visual
+
+- **Track (nền)**:
+  - Off (work): màu nền tối (vd `#2a2a2c` hoặc `#3f3f46`), bo tròn full (border-radius = nửa chiều cao).
+  - On (publish): màu "active" (vd Electric Blue `#2563eb` hoặc tone xanh MONOS).
+- **Thumb (nút trượt)**:
+  - Hình tròn hoặc bo tròn, màu sáng (vd `#fafafa`), có shadow nhẹ (tuỳ chọn).
+  - Off: thumb bên **trái**; On: thumb bên **phải**.
+- **Kích thước gợi ý**: Track width 36–40px, height 22px; thumb diameter 18px. (8px grid: 40×24, thumb 20.)
+
+### 3.2 Implementation (Qt)
+
+- **Widget**: `QCheckBox` (hoặc custom `QAbstractButton`) không hiện text (`setText("")`), chỉ vẽ track + thumb trong style.
+- **QSS**: Style `QCheckBox` (với `objectName` riêng, vd `WorkPublishSwitch`) để không ảnh hưởng checkbox khác:
+  - `indicator` width/height = kích thước track;
+  - `indicator:unchecked` = track xám + thumb trái;
+  - `indicator:checked` = track xanh + thumb phải.
+- **Hoặc**: Custom widget vẽ `paintEvent` (rounded rect track + ellipse thumb) để kiểm soát chính xác; `mousePressEvent` đảo state.
+- **Luôn** đặt QSS trong **global stylesheet** (`monostudio/ui_qt/style.py`), không rải rác.
+
+### 3.3 Accessibility
+
+- `setToolTip(...)` theo state (Work / Published).
+- Có thể thêm `setAccessibleName("Work or Published")`, `setAccessibleDescription("Switch between work file and published file view")`.
+
+---
+
+## 4. Hành vi theo state
+
+| State | Card (Main view) | Inspector Tech row | Context menu "Open folder" |
+|-------|-------------------|--------------------|-----------------------------|
+| **Work** (default) | Version = work file version (vd v003); path = work_path khi cần. | Path = department work_path; version từ work file. | "Open Work Folder" mở work_path. |
+| **Published** | Version = latest_publish_version (vd v002); path = publish_path. | Path = department publish_path; version = latest_publish_version. | "Open Publish Folder" mở publish_path. |
+
+- **"Open with" (DCC)**: Luôn mở **work file** (không đổi theo toggle); toggle chỉ ảnh hưởng **hiển thị** và **Open folder**.
+- Khi không có publish (chưa publish): Nếu đang **Published** thì vẫn hiện path publish (folder), version "—" hoặc "No publish"; không cần tự chuyển về Work.
+
+---
+
+## 5. State & persistence
+
+- **Biến**: `show_publish: bool` (hoặc `prefer_publish: bool`). Default `False` (Work).
+- **Persistence**: Lưu trong **QSettings** (vd `main_view/work_publish_toggle` hoặc `ui/show_publish`) để lần mở app sau vẫn giữ lựa chọn.
+- **Scope**: Có thể **global** (một state cho cả app) hoặc **per-context** (Assets vs Shots riêng). Đề xuất **global** để đơn giản.
+
+---
+
+## 6. Implementation touch points
+
+### 6.1 Main view (`main_view.py`)
+
+- Thêm state `_show_publish: bool = False`; đọc/ghi QSettings khi init và khi toggle đổi.
+- Trong **header**, khi context là Assets hoặc Shots: tạo widget switch (QCheckBox với objectName `WorkPublishSwitch`), add vào `header_layout` (vd trước hoặc sau `toggle` Grid|List). Ẩn khi context khác.
+- Kết nối `toggled` → cập nhật `_show_publish`, lưu QSettings, gọi `update()` / refresh cards và (qua signal) báo cho Inspector.
+- **Card version**: Hàm lấy version (vd `_card_work_file_version` hoặc tương đương) cần nhận thêm `show_publish`; nếu `show_publish` thì trả về `latest_publish_version` (department) thay vì work file version.
+- **Context menu**: Đã có "Open Work Folder" / "Open Publish Folder"; có thể giữ nguyên hai mục, không cần đổi theo toggle (toggle chỉ đổi **hiển thị**; user vẫn chọn tay mở work hay publish). Hoặc: khi chỉ hiện một nút "Open folder", nút đó mở theo `_show_publish`.
+
+### 6.2 Inspector (`inspector.py`)
+
+- Nhận state **show_publish** từ MainWindow (signal/slot hoặc getter). Khi selection là Asset/Shot/Department: path và version hiển thị theo show_publish; "Open folder" (nếu có) mở work_path hoặc publish_path tương ứng.
+- Thêm switch nhỏ trong Tech block (cùng objectName + QSS) khi item có departments; sync state với Main view (cùng QSettings hoặc signal hai chiều).
+
+### 6.3 Style (`style.py`)
+
+- Thêm QSS cho `QCheckBox#WorkPublishSwitch`: ẩn text, indicator = kích thước track, vẽ track + thumb kiểu iOS (unchecked/checked). Màu track unchecked `#2a2a2c` hoặc `#3f3f46`, checked `#2563eb`; thumb `#fafafa`.
+
+### 6.4 Data
+
+- Đã có `Department.work_path`, `publish_path`, `latest_publish_version`, `publish_exists`. Không cần model mới; chỉ đổi chỗ **lấy path/version** khi render (work vs publish).
+
+---
+
+## 7. Tóm tắt UX
+
+- **Một switch nhỏ** kiểu iOS, **không chữ** trên UI, chỉ tooltip "Work" / "Published".
+- Chỉ hiện ở **Main view header** (Assets/Shots) và **Inspector** (khi xem Asset/Shot/Dept).
+- **Mặc định**: Work. Lưu lựa chọn qua QSettings.
+- **Ảnh hưởng**: Version và path hiển thị trên card + Inspector; "Open folder" (nếu gộp một nút) mở đúng work hoặc publish. "Open with" DCC luôn work file.
+
+---
+
+## 8. Dim card khi không có publish
+
+Khi toggle Published bật **và** department đang filter **và** item không có publish cho department đó:
+- Card opacity **0.45** (dim rõ).
+- Hover lên card dim → opacity **0.75** (nhẹ hơn bình thường).
+- Selected card dim → opacity **1.0** (user chủ động chọn).
+- Version trên card: hiển thị **`v —`** (nhất quán, không thêm text "No publish").
+- Logic: helper `_item_has_publish_for_department(ref, active_department)` kiểm tra `publish_version_count > 0`.
+- Không dim khi: không filter department (xem All), hoặc toggle Work, hoặc item không phải Asset/Shot.
+
+---
+
+## 9. Checklist implement
+
+- [x] QSS `WorkPublishSwitch` (iOS-style) trong `style.py`
+- [x] Main view: state `_show_publish`, QSettings, switch trong header (chỉ Assets/Shots)
+- [x] Main view: card version lấy work vs publish theo state
+- [x] Main view: dim card khi Published + không có publish cho dept
+- [x] Inspector: nhận show_publish, path/version Tech row theo state
+- [x] MainWindow: connect toggle → Inspector sync
+- [x] Persistence: đọc/ghi QSettings khi init và toggle

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MonosMenu
+from monostudio.ui_qt.style import MonosMenu, project_accent_color
 
 
 class TopBar(QWidget):
@@ -164,24 +164,24 @@ class TopBar(QWidget):
 
     @staticmethod
     def _dot_icon(color_hex: str, *, diameter: int = 6) -> QIcon:
-        # Paint a crisp status dot (HiDPI aware).
-        # (Qt menu doesn't support delegates; we attach an icon to each QAction.)
         try:
-            dpr = float(QApplication.primaryScreen().devicePixelRatio())  # type: ignore[name-defined]
+            dpr = float(QApplication.primaryScreen().devicePixelRatio())
         except Exception:
             dpr = 1.0
-        px = max(8, int(round(diameter + 2)))
-        pm = QPixmap(int(px * dpr), int(px * dpr))
+        # Canvas large enough so QMenu icon column never clips the dot.
+        canvas = max(16, diameter + 8)
+        dev_w = int(round(canvas * dpr))
+        pm = QPixmap(dev_w, dev_w)
         pm.setDevicePixelRatio(dpr)
         pm.fill(Qt.transparent)
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(color_hex))
-        r = pm.rect()
-        center = r.center()
-        rad = int(round((diameter / 2.0) * dpr))
-        p.drawEllipse(center, rad, rad)
+        cx = canvas / 2.0
+        cy = canvas / 2.0
+        r = diameter / 2.0
+        p.drawEllipse(QRectF(cx - r, cy - r, diameter, diameter))
         p.end()
         return QIcon(pm)
 
@@ -208,22 +208,29 @@ class TopBar(QWidget):
         self._project_switch.setEnabled(True)
         if current_root is None:
             self._project_switch.setText("SELECT PROJECT")
+            self._project_switch.setIcon(lucide_icon("chevron-down", size=12, color_hex="#a1a1aa"))
             self._set_project_switch_state("empty")
         else:
-            self._project_switch.setText((current_root.name or "").upper())
+            folder_name = current_root.name or ""
+            self._project_switch.setText(folder_name.upper())
+            accent = project_accent_color(folder_name)
+            self._project_switch.setIcon(lucide_icon("chevron-down", size=12, color_hex=accent))
             self._set_project_switch_state("active")
 
         group = QActionGroup(self._project_menu)
         group.setExclusive(True)
         for proj in projects:
             label = proj.root.name
-            status = None
-            if status_by_root is not None:
-                status = status_by_root.get(str(proj.root))
-            dot = self._dot_icon(self._status_color_hex(status))
+            accent = project_accent_color(label)
+            is_current = current == str(proj.root)
+            dot = self._dot_icon(accent, diameter=8 if is_current else 6)
             act = QAction(label, self._project_menu, checkable=True)
             act.setIcon(dot)
-            act.setChecked(current == str(proj.root))
+            act.setChecked(is_current)
+            if is_current:
+                f = act.font()
+                f.setWeight(QFont.Weight.DemiBold)
+                act.setFont(f)
             act.triggered.connect(lambda checked=False, p=str(proj.root): self.project_switch_requested.emit(p))
             group.addAction(act)
             self._project_menu.addAction(act)

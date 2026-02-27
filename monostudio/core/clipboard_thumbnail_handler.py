@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from PySide6.QtCore import QObject, QSize, Qt, Signal
-from PySide6.QtGui import QGuiApplication, QImage, QPainter
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QGuiApplication, QImage
 
 
 ThumbnailKind = Literal["asset", "shot"]
@@ -28,7 +28,7 @@ class ClipboardThumbnailHandler(QObject):
 
     - Reads image from system clipboard (Qt clipboard API)
     - Normalizes to a stable internal format (RGBA8888)
-    - Resizes deterministically (asset=512x512, shot=512x288)
+    - Scales to keep aspect ratio, max one dimension 1024 (no crop, no letterbox).
     - Writes a user-override thumbnail file (does NOT overwrite auto thumbnails)
     - Writes lightweight metadata marker (source + updated_at)
     - Emits a signal for UI refresh
@@ -37,6 +37,7 @@ class ClipboardThumbnailHandler(QObject):
     thumbnailUpdated = Signal(str)  # item_id (string id; call sites decide semantics)
 
     USER_THUMB_BASENAME = "thumbnail.user"
+    MAX_THUMB_SIZE_PX = 1024
 
     def paste_thumbnail(
         self,
@@ -44,12 +45,14 @@ class ClipboardThumbnailHandler(QObject):
         item_root: Path,
         kind: ThumbnailKind,
         item_id: str,
+        department: str | None = None,
         fmt: ThumbnailFormat = "png",
         jpg_quality: int = 85,
-        crop_to_fill: bool = True,
     ) -> ClipboardThumbnailResult:
         """
-        Paste from system clipboard into a standardized thumbnail file.
+        Paste from system clipboard into a thumbnail file.
+        Image is scaled to keep aspect ratio with max dimension 1024.
+        When department is given, writes to .meta/thumb_{dept}.user.{ext}.
 
         Raises RuntimeError with explicit message on failure.
         """
@@ -68,29 +71,44 @@ class ClipboardThumbnailHandler(QObject):
 
         img = cb.image()
         if img.isNull() or img.width() <= 0 or img.height() <= 0:
-            # Explicit requirement: raise RuntimeError when clipboard has no image.
             raise RuntimeError("Clipboard does not contain an image.")
 
         img = img.convertToFormat(QImage.Format_RGBA8888)
         if img.isNull():
             raise RuntimeError("Clipboard image is invalid.")
 
-        target = self._target_size(kind)
-        out = self._resize(img=img, target=target, crop_to_fill=crop_to_fill)
+        out = self._scale_to_max(img, self.MAX_THUMB_SIZE_PX)
 
-        target_path = self._user_thumbnail_path(root, fmt=fmt)
+        dep = (department or "").strip()
+        if dep:
+            target_path = self._department_thumbnail_path(root, dep, fmt=fmt)
+        else:
+            target_path = self._user_thumbnail_path(root, fmt=fmt)
         self._write_image_atomic(out=out, target_path=target_path, fmt=fmt, jpg_quality=jpg_quality)
-        self._write_thumbnail_metadata(root, source="clipboard")
+        self._write_thumbnail_metadata(root, source="clipboard", department=dep or None)
 
         self.thumbnailUpdated.emit(iid)
         return ClipboardThumbnailResult(item_id=iid, kind=kind, thumbnail_path=target_path)
 
     @staticmethod
-    def _target_size(kind: ThumbnailKind) -> QSize:
-        if kind == "asset":
-            return QSize(512, 512)
-        # shot
-        return QSize(512, 288)
+    def _scale_to_max(img: QImage, max_px: int) -> QImage:
+        """Scale image to keep aspect ratio; longest side = max_px (no upscale)."""
+        if max_px <= 0:
+            raise RuntimeError("Invalid max thumbnail size.")
+        w, h = img.width(), img.height()
+        if w <= 0 or h <= 0:
+            raise RuntimeError("Invalid image size.")
+        scale = min(1.0, max_px / max(w, h))
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        scaled = img.scaled(
+            new_w, new_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        if scaled.isNull():
+            raise RuntimeError("Failed to scale clipboard image.")
+        return scaled
 
     @classmethod
     def _user_thumbnail_path(cls, item_root: Path, *, fmt: ThumbnailFormat) -> Path:
@@ -98,38 +116,11 @@ class ClipboardThumbnailHandler(QObject):
         return Path(item_root) / f"{cls.USER_THUMB_BASENAME}.{ext}"
 
     @staticmethod
-    def _resize(*, img: QImage, target: QSize, crop_to_fill: bool) -> QImage:
-        tw = int(target.width())
-        th = int(target.height())
-        if tw <= 0 or th <= 0:
-            raise RuntimeError("Invalid thumbnail target size.")
-
-        mode = Qt.KeepAspectRatioByExpanding if crop_to_fill else Qt.KeepAspectRatio
-        scaled = img.scaled(tw, th, mode, Qt.SmoothTransformation)
-        if scaled.isNull():
-            raise RuntimeError("Failed to resize clipboard image.")
-
-        if not crop_to_fill:
-            # Preserve aspect ratio without stretching; keep exact output size
-            # by rendering onto a transparent canvas (no prompts / no letterbox color choices).
-            canvas = QImage(tw, th, QImage.Format_RGBA8888)
-            canvas.fill(Qt.transparent)
-            p = QPainter(canvas)
-            try:
-                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-                x = int((tw - scaled.width()) // 2)
-                y = int((th - scaled.height()) // 2)
-                p.drawImage(x, y, scaled)
-            finally:
-                p.end()
-            return canvas
-
-        sx = max(0, (scaled.width() - tw) // 2)
-        sy = max(0, (scaled.height() - th) // 2)
-        out = scaled.copy(sx, sy, tw, th)
-        if out.isNull():
-            raise RuntimeError("Failed to crop resized clipboard image.")
-        return out
+    def _department_thumbnail_path(item_root: Path, department: str, *, fmt: ThumbnailFormat) -> Path:
+        ext = "png" if fmt == "png" else "jpg"
+        meta_dir = Path(item_root) / ".meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        return meta_dir / f"thumb_{department}.user.{ext}"
 
     @staticmethod
     def _write_image_atomic(*, out: QImage, target_path: Path, fmt: ThumbnailFormat, jpg_quality: int) -> None:
@@ -165,7 +156,7 @@ class ClipboardThumbnailHandler(QObject):
                 pass
 
     @staticmethod
-    def _write_thumbnail_metadata(item_root: Path, *, source: str) -> None:
+    def _write_thumbnail_metadata(item_root: Path, *, source: str, department: str | None = None) -> None:
         """
         Lightweight per-item metadata marker.
         Does NOT store binary data; does NOT duplicate resolution.
@@ -174,16 +165,17 @@ class ClipboardThumbnailHandler(QObject):
         meta_dir = root / ".monostudio"
         meta_path = meta_dir / "thumbnail.json"
 
-        payload = {
+        payload: dict = {
             "source": str(source),
             "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        if department:
+            payload["department"] = department
 
         try:
             from monostudio.core.atomic_write import atomic_write_text
             content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
             atomic_write_text(meta_path, content, encoding="utf-8")
         except (PermissionError, OSError):
-            # Metadata should never block the thumbnail write; fail silently.
             pass
 

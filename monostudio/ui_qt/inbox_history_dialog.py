@@ -1,59 +1,60 @@
 """
-Inbox History dialog: shows distributed entries (path, distributed_at) for current project + type.
-Read-only list with Refresh; optional Open folder. Triggered by History button on Inbox page.
+Inbox History dialog: shows distributed entries in a table with metadata (path, distributed_at, destination, entity, target_path).
+Read-only; Refresh and Close. Triggered by History button on Inbox page.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
+    QMenu,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
 )
 
 from monostudio.core.inbox_reader import load_inbox_distributed
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import FILE_TYPE_ICON_COLORS, MonosDialog, MONOS_COLORS, monos_font
-
-_ICON_SIZE = 18
-_EXT_IMAGE = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tga", ".tif", ".tiff", ".exr", ".hdr", ".ico", ".svg"})
-_EXT_VIDEO = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg"})
-_EXT_AUDIO = frozenset({".mp3", ".wav", ".aiff", ".aif", ".ogg", ".flac", ".m4a", ".wma", ".aac"})
-_EXT_ARCHIVE = frozenset({".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".zst"})
-_EXT_DOCUMENT = frozenset({".pdf", ".doc", ".docx", ".txt", ".rtf", ".md", ".odt", ".xls", ".xlsx", ".csv"})
-_EXT_DCC = frozenset({".blend", ".ma", ".mb", ".hip", ".hiplc", ".hipnc", ".spp"})
+from monostudio.ui_qt.style import MonosDialog, MONOS_COLORS, monos_font
 
 
-def _file_icon_spec(is_dir: bool, suffix: str) -> tuple[str, str]:
-    colors = FILE_TYPE_ICON_COLORS
-    if is_dir:
-        return ("folder", colors.get("folder", "#71717a"))
-    ext = (suffix or "").strip().lower()
-    if not ext.startswith("."):
-        ext = "." + ext if ext else ""
-    if ext in _EXT_IMAGE:
-        return ("file-image", colors.get("image", "#22c55e"))
-    if ext in _EXT_VIDEO:
-        return ("file-video", colors.get("video", "#ef4444"))
-    if ext in _EXT_AUDIO:
-        return ("file-music", colors.get("audio", "#eab308"))
-    if ext in _EXT_DCC:
-        return ("box", colors.get("dcc", "#8b5cf6"))
-    if ext in _EXT_ARCHIVE:
-        return ("file-archive", colors.get("archive", "#f97316"))
-    if ext in _EXT_DOCUMENT:
-        return ("file-text", colors.get("document", "#3b82f6"))
-    return ("file", colors.get("file", "#a1a1aa"))
+def _format_distributed_at(iso_str: str) -> str:
+    """Format ISO8601 to short date/time for display."""
+    if not iso_str or not iso_str.strip():
+        return "—"
+    s = (iso_str or "").strip()
+    try:
+        if "T" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt.strftime("%Y-%m-%d %H:%M")
+        return s[:16] if len(s) >= 16 else s
+    except (ValueError, TypeError):
+        return s[:20] if len(s) > 20 else s
+
+
+def _truncate_path(path_str: str, max_len: int = 48) -> str:
+    if not path_str or len(path_str) <= max_len:
+        return path_str or "—"
+    return "…" + path_str[-(max_len - 1):]
 
 
 class InboxHistoryDialog(MonosDialog):
-    """Dialog showing distributed inbox entries (history). Filter by project_root + type_filter."""
+    """Dialog showing distributed inbox entries in a table. Filter by project_root + type_filter."""
+
+    _COL_NAME = 0
+    _COL_DISTRIBUTED_AT = 1
+    _COL_DESTINATION = 2
+    _COL_ENTITY = 3
+    _COL_TARGET_PATH = 4
 
     def __init__(self, project_root: Path | None, type_filter: str, parent=None) -> None:
         super().__init__(parent)
@@ -68,10 +69,28 @@ class InboxHistoryDialog(MonosDialog):
         title.setObjectName("InboxMappingHeader")
         title.setFont(monos_font("Inter", 10, QFont.Weight.ExtraBold))
         root.addWidget(title, 0)
-        self._list = QListWidget(self)
-        self._list.setObjectName("InboxMappingList")
-        self._list.setSelectionMode(QListWidget.NoSelection)
-        root.addWidget(self._list, 1)
+        self._table = QTableWidget(self)
+        self._table.setObjectName("InboxHistoryTable")
+        self._table.setColumnCount(5)
+        self._table.setHorizontalHeaderLabels([
+            "Name",
+            "Distributed at",
+            "Destination",
+            "Entity",
+            "Target path",
+        ])
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setAlternatingRowColors(False)
+        self._table.setShowGrid(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(self._COL_TARGET_PATH, QHeaderView.ResizeMode.Stretch)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_context_menu)
+        root.addWidget(self._table, 1)
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         refresh_btn = QPushButton("Refresh", self)
@@ -86,8 +105,8 @@ class InboxHistoryDialog(MonosDialog):
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn, 0)
         root.addLayout(btn_row, 0)
-        self.setMinimumSize(400, 320)
-        self.resize(480, 400)
+        self.setMinimumSize(720, 360)
+        self.resize(900, 440)
         self._load()
 
     def set_context(self, project_root: Path | None, type_filter: str) -> None:
@@ -95,8 +114,37 @@ class InboxHistoryDialog(MonosDialog):
         self._type_filter = (type_filter or "").strip().lower() or None
         self._load()
 
+    def _on_context_menu(self, position) -> None:
+        idx = self._table.indexAt(position)
+        if not idx.isValid() or idx.row() < 0:
+            return
+        name_item = self._table.item(idx.row(), self._COL_NAME)
+        if not name_item:
+            return
+        paths = name_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(paths, dict):
+            return
+        source_path = (paths.get("path") or "").strip()
+        target_path = (paths.get("target_path") or "").strip()
+        if not source_path and not target_path:
+            return
+        menu = QMenu(self)
+        if source_path:
+            copy_source = menu.addAction("Copy source path")
+            copy_source.triggered.connect(lambda *, s=source_path: self._copy_to_clipboard(s))
+        if target_path:
+            copy_target = menu.addAction("Copy target path")
+            copy_target.triggered.connect(lambda *, s=target_path: self._copy_to_clipboard(s))
+        menu.exec(self._table.viewport().mapToGlobal(position))
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        if text:
+            cb = QApplication.clipboard()
+            if cb:
+                cb.setText(text)
+
     def _load(self) -> None:
-        self._list.clear()
+        self._table.setRowCount(0)
         if not self._project_root or not self._project_root.is_dir():
             return
         entries = load_inbox_distributed(self._project_root, self._type_filter)
@@ -104,22 +152,30 @@ class InboxHistoryDialog(MonosDialog):
             if not isinstance(e, dict):
                 continue
             path_str = e.get("path") or ""
-            distributed_at = e.get("distributed_at") or "—"
+            distributed_at = e.get("distributed_at") or ""
+            destination_label = (e.get("destination_label") or e.get("destination_id") or "").strip() or "—"
+            entity_name = (e.get("entity_name") or "").strip() or "—"
+            target_path = (e.get("target_path") or "").strip() or "—"
+            scope = (e.get("scope") or "").strip().lower()
+            if scope and entity_name == "—" and scope != "project":
+                entity_name = f"({scope})"
             try:
                 p = Path(path_str)
-                display = p.name
-                is_dir = p.is_dir() if p.exists() else False
-                suffix = p.suffix
+                name = p.name
             except (TypeError, ValueError):
-                display = path_str or "—"
-                is_dir = False
-                suffix = ""
-            icon_name, icon_color = _file_icon_spec(is_dir, suffix)
-            it = QListWidgetItem(display)
-            it.setData(Qt.ItemDataRole.UserRole, path_str)
-            it.setToolTip(f"{path_str}\nDistributed: {distributed_at}")
-            it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-            icon = lucide_icon(icon_name, size=_ICON_SIZE, color_hex=icon_color)
-            if not icon.isNull():
-                it.setIcon(icon)
-            self._list.addItem(it)
+                name = path_str or "—"
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            name_item = QTableWidgetItem(name)
+            name_item.setToolTip(path_str or "")
+            name_item.setData(Qt.ItemDataRole.UserRole, {"path": path_str, "target_path": target_path})
+            self._table.setItem(row, self._COL_NAME, name_item)
+            at_item = QTableWidgetItem(_format_distributed_at(distributed_at))
+            at_item.setToolTip(distributed_at or "")
+            self._table.setItem(row, self._COL_DISTRIBUTED_AT, at_item)
+            self._table.setItem(row, self._COL_DESTINATION, QTableWidgetItem(destination_label))
+            self._table.setItem(row, self._COL_ENTITY, QTableWidgetItem(entity_name))
+            target_item = QTableWidgetItem(_truncate_path(target_path))
+            target_item.setToolTip(target_path or "")
+            target_item.setFont(monos_font("JetBrains Mono", 11))
+            self._table.setItem(row, self._COL_TARGET_PATH, target_item)

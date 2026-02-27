@@ -86,13 +86,21 @@ def get_entity_ids() -> list[str]:
     return out
 
 
+_TTL_SECONDS = 30.0
+
+
 def is_pending(entity_id: str, department: str, dcc: str) -> bool:
-    """True if (entity_id, department, dcc) has a pending create."""
+    """True if (entity_id, department, dcc) has a non-expired pending create."""
     key = ((entity_id or "").strip(), (department or "").strip(), (dcc or "").strip())
-    out = key in _pending
-    if out:
-        _log.debug("pending_create.is_pending entity_id=%r dept=%r dcc=%r -> True (key in %d keys)", key[0], key[1], key[2], len(_pending))
-    return out
+    ts = _pending.get(key)
+    if ts is None:
+        return False
+    if (time.monotonic() - ts) > _TTL_SECONDS:
+        _pending.pop(key, None)
+        _log.debug("pending_create.is_pending entity_id=%r dept=%r dcc=%r -> expired (%.1fs)", key[0], key[1], key[2], time.monotonic() - ts)
+        return False
+    _log.debug("pending_create.is_pending entity_id=%r dept=%r dcc=%r -> True (age=%.1fs, keys=%d)", key[0], key[1], key[2], time.monotonic() - ts, len(_pending))
+    return True
 
 
 def clear_all() -> None:

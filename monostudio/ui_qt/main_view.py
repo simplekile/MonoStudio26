@@ -4,14 +4,12 @@ import json
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal, QUrl
+from PySide6.QtCore import QElapsedTimer, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
     QDesktopServices,
-    QDragEnterEvent,
-    QDropEvent,
     QFont,
     QIcon,
     QKeySequence,
@@ -45,8 +43,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.ui_qt.view_items import ViewItem, display_name_for_item
-from monostudio.ui_qt.thumbnails import ThumbnailCache
+from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
+from monostudio.ui_qt.thumbnails import ThumbnailCache, make_department_cache_key
 from monostudio.ui_qt.style import MONOS_COLORS, THUMB_TAG_STYLE, monos_font
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -68,6 +66,8 @@ _TYPE_ICON_MAP: dict[str, str] = {
     "prop": "package",
     "_environment": "trees",
     "environment": "trees",
+    "_vehicles": "car",
+    "vehicle": "car",
 }
 _DEPT_ICON_MAP: dict[str, str] = {
     "layout": "layout-dashboard",
@@ -78,8 +78,8 @@ _DEPT_ICON_MAP: dict[str, str] = {
     "surfacing": "palette",
     "grooming": "scissors",
     "lookdev": "sparkles",
-    "anim": "clapperboard",
-    "animation": "clapperboard",
+    "anim": "spline",
+    "animation": "spline",
     "fx": "zap",
     "lighting": "lightbulb",
     "comp": "sliders-horizontal",
@@ -95,6 +95,8 @@ _TYPE_TOOLTIP_MAP: dict[str, str] = {
     "_props": "Prop",
     "environment": "Environment",
     "_environment": "Environment",
+    "vehicle": "Vehicle",
+    "_vehicles": "Vehicle",
 }
 
 
@@ -110,10 +112,15 @@ def _work_file_version_from_path(path: Path) -> int | None:
     return None
 
 
-def _card_work_file_version(ref: Asset | Shot, active_department: str | None) -> str | None:
+def _card_work_file_version(
+    ref: Asset | Shot,
+    active_department: str | None,
+    active_dcc_id: str | None = None,
+) -> str | None:
     """
     Work file version for card meta when a department is selected.
-    Returns None when department is "all" (no filter) → caller should hide version.
+    When active_dcc_id is set, returns version for that DCC only; else max across all DCCs in department.
+    Returns None when department is "all" → caller should hide version.
     Returns "v001" or "—" when department is set.
     """
     dep = (active_department or "").strip()
@@ -121,8 +128,10 @@ def _card_work_file_version(ref: Asset | Shot, active_department: str | None) ->
         return None
     states = getattr(ref, "dcc_work_states", ()) or ()
     max_ver: int | None = None
-    for (dept_id, _dcc_id), state in states:
+    for (dept_id, dcc_id), state in states:
         if (dept_id or "").strip().casefold() != dep.casefold():
+            continue
+        if active_dcc_id is not None and (dcc_id or "").strip().casefold() != (active_dcc_id or "").strip().casefold():
             continue
         path = getattr(state, "work_file_path", None)
         if path is None:
@@ -133,6 +142,131 @@ def _card_work_file_version(ref: Asset | Shot, active_department: str | None) ->
     if max_ver is not None:
         return f"v{max_ver:03d}"
     return "—"
+
+
+def _card_publish_version(ref: Asset | Shot, active_department: str | None) -> str | None:
+    """
+    Published version for card meta when a department is selected.
+    Returns None when department is "all". Returns "v001" or "—" when department is set.
+    """
+    dep = (active_department or "").strip()
+    if not dep:
+        return None
+    for d in getattr(ref, "departments", ()) or ():
+        if (d.name or "").strip().casefold() != dep.casefold():
+            continue
+        v = getattr(d, "latest_publish_version", None) or ""
+        if v and len(v) >= 4 and v[0].lower() == "v" and v[1:4].isdigit():
+            return v
+        return "—"
+    return "—"
+
+
+def _card_version_for_display(
+    ref: Asset | Shot,
+    active_department: str | None,
+    show_publish: bool,
+    active_dcc_id: str | None = None,
+) -> str | None:
+    """Version string for card: work file version or published version according to show_publish.
+    When not in publish mode, active_dcc_id (if set) is used to show version for the selected DCC."""
+    if show_publish:
+        return _card_publish_version(ref, active_department)
+    return _card_work_file_version(ref, active_department, active_dcc_id)
+
+
+def _item_has_publish_for_department(ref: Asset | Shot, active_department: str | None) -> bool:
+    """True if the item has at least one publish version. Checks specific dept or any dept if none given."""
+    dep = (active_department or "").strip()
+    departments = getattr(ref, "departments", ()) or ()
+    if not dep:
+        return any((getattr(d, "publish_version_count", 0) or 0) > 0 for d in departments)
+    for d in departments:
+        if (d.name or "").strip().casefold() != dep.casefold():
+            continue
+        return (getattr(d, "publish_version_count", 0) or 0) > 0
+    return False
+
+
+def _resolve_publish_department(ref: Asset | Shot, active_department: str | None):
+    """Return the Department with a publish, respecting active filter. Returns None if nothing found."""
+    dep = (active_department or "").strip()
+    departments = getattr(ref, "departments", ()) or ()
+    if dep:
+        for d in departments:
+            if (d.name or "").strip().casefold() == dep.casefold() and (getattr(d, "publish_version_count", 0) or 0) > 0:
+                return d
+        return None
+    for d in departments:
+        if (getattr(d, "publish_version_count", 0) or 0) > 0:
+            return d
+    return None
+
+
+def _resolve_latest_publish_folder(ref: Asset | Shot, active_department: str | None) -> Path | None:
+    """Path to the latest publish version folder (e.g. <dept>/publish/v003/)."""
+    dept = _resolve_publish_department(ref, active_department)
+    if dept is None:
+        return None
+    ver = getattr(dept, "latest_publish_version", None)
+    if not ver:
+        return None
+    return Path(dept.publish_path) / ver
+
+
+def _resolve_publish_root_folder(ref: Asset | Shot, active_department: str | None) -> Path | None:
+    """Path to the publish root folder (e.g. <dept>/publish/). Only returns a department that has publish versions."""
+    dept = _resolve_publish_department(ref, active_department)
+    if dept is None:
+        return None
+    return Path(dept.publish_path)
+
+
+def _resolve_publish_root_folder_any(ref: Asset | Shot, active_department: str | None) -> Path | None:
+    """Path to the publish root folder (e.g. <dept>/publish/). Uses active or first department even if no versions yet."""
+    dep = (active_department or "").strip()
+    departments = getattr(ref, "departments", ()) or ()
+    if dep:
+        for d in departments:
+            if (d.name or "").strip().casefold() == dep.casefold():
+                return Path(d.publish_path)
+        return None
+    if departments:
+        return Path(departments[0].publish_path)
+    return None
+
+
+_PREVIEW_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".tga", ".bmp", ".tiff", ".tif"})
+
+
+def _resolve_primary_publish_file(ref: Asset | Shot, active_department: str | None) -> Path | None:
+    """
+    Primary file inside the latest publish version folder.
+    Prefers non-preview files; falls back to first file alphabetically.
+    Returns None if folder is empty or doesn't exist.
+    """
+    folder = _resolve_latest_publish_folder(ref, active_department)
+    if folder is None:
+        return None
+    try:
+        files = sorted(f for f in folder.iterdir() if f.is_file())
+    except (OSError, FileNotFoundError):
+        return None
+    if not files:
+        return None
+    non_preview = [f for f in files if f.suffix.lower() not in _PREVIEW_EXTENSIONS]
+    return non_preview[0] if non_preview else files[0]
+
+
+def _resolve_all_publish_files(ref: Asset | Shot, active_department: str | None) -> list[Path]:
+    """All files inside the latest publish version folder (for drag & drop)."""
+    folder = _resolve_latest_publish_folder(ref, active_department)
+    if folder is None:
+        return []
+    try:
+        return sorted(f for f in folder.iterdir() if f.is_file())
+    except (OSError, FileNotFoundError):
+        return []
 
 
 def _item_last_opened_dcc(item_path: Path, active_department: str) -> str | None:
@@ -181,6 +315,147 @@ def _thumb_badge_rects(cell_rect: QRect, gap_px: int, has_dept: bool) -> tuple[Q
     return type_rect, dept_rect
 
 
+def _dcc_ids_for_item(item: ViewItem, active_department: str | None) -> list[tuple[str, str]]:
+    """Return [(dcc_id, status), ...] for the item's DCC badges (same logic as paint).
+    status is "exists" or "creating". Only includes badges matching the active department."""
+    ref = item.ref
+    if not isinstance(ref, (Asset, Shot)):
+        return []
+    try:
+        reg = get_default_dcc_registry()
+    except Exception:
+        return []
+    _norm = lambda s: (s or "").strip().casefold()
+    active_key = _norm(active_department)
+    states = getattr(ref, "dcc_work_states", ()) or ()
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+
+    def add(dept_id: str, dcc_id: str, status: str) -> None:
+        if (dept_id, dcc_id) in seen:
+            return
+        seen.add((dept_id, dcc_id))
+        if status in ("exists", "creating"):
+            out.append((dcc_id, status))
+
+    for (dept_id, dcc_id), _state in states:
+        dept_id = (dept_id or "").strip()
+        dcc_id = (dcc_id or "").strip()
+        if not dept_id or not dcc_id:
+            continue
+        if active_key and _norm(dept_id) != active_key:
+            continue
+        status = resolve_dcc_status(ref, dept_id, dcc_id)
+        if status in ("exists", "creating"):
+            add(dept_id, dcc_id, status)
+    for d in getattr(ref, "departments", ()) or ():
+        dept_name = getattr(d, "name", "") or ""
+        if active_key and _norm(dept_name) != active_key:
+            continue
+        for dcc_id in reg.get_available_dccs(dept_name) or []:
+            dcc_id = (dcc_id or "").strip()
+            if not dcc_id:
+                continue
+            status = resolve_dcc_status(ref, dept_name, dcc_id)
+            if status == "creating":
+                add(dept_name, dcc_id, "creating")
+    return out
+
+
+def _dcc_badge_rects(
+    cell_rect: QRect,
+    gap_px: int,
+    dcc_list: list[tuple[object, str, str]] | list[tuple[str, str]],
+) -> list[tuple[QRect, str]]:
+    """Compute DCC badge rects (mirrors delegate paint layout). Returns [(rect, dcc_id), ...]."""
+    if not dcc_list:
+        return []
+    r = cell_rect.adjusted(0, 0, -gap_px, -gap_px)
+    border_px = 1
+    inner = r.adjusted(border_px, border_px, -border_px, -border_px)
+    thumb_w = inner.width()
+    thumb_h = max(1, int(thumb_w * 9 / 16))
+    thumb = QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
+
+    size = 16
+    pad = 4
+    badge_gap = 3
+    max_show = 4
+    chip_h = size + pad * 2
+    creating_chip_w = 56
+    entries = dcc_list[:max_show]
+    # Accept 2-tuple (dcc_id, status) or 3-tuple (icon, dcc_id, status)
+    def _unpack(entry: tuple) -> tuple[str, str]:
+        if len(entry) == 2:
+            return entry[0], entry[1]
+        return entry[1], entry[2]
+    parsed = [_unpack(e) for e in entries]
+    widths = [creating_chip_w if st == "creating" else chip_h for (_, st) in parsed]
+    row_w = sum(widths) + (len(widths) - 1) * badge_gap
+    base_x = thumb.right() - 12 - row_w
+    base_y = thumb.bottom() - 12 - chip_h
+
+    result: list[tuple[QRect, str]] = []
+    x_cursor = base_x
+    for i, (dcc_id, _st) in enumerate(parsed):
+        w = widths[i]
+        result.append((QRect(x_cursor, base_y, w, chip_h), dcc_id))
+        x_cursor += w + badge_gap
+    return result
+
+
+def _item_active_dcc(item_path: Path, active_department: str) -> str | None:
+    """Read active_dcc for this item+department from .monostudio/open.json."""
+    if not item_path or not isinstance(item_path, Path):
+        return None
+    meta_path = item_path / ".monostudio" / "open.json"
+    try:
+        if not meta_path.is_file():
+            return None
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    dep = (active_department or "").strip().casefold()
+    active_by_dep = data.get("active_dcc_by_department")
+    if isinstance(active_by_dep, dict):
+        dcc = active_by_dep.get(dep) or active_by_dep.get(active_department)
+        if isinstance(dcc, str) and dcc.strip():
+            return dcc.strip()
+    return None
+
+
+def _write_active_dcc(item_path: Path, active_department: str, dcc_id: str) -> None:
+    """Persist active_dcc for this item+department to .monostudio/open.json."""
+    if not item_path or not isinstance(item_path, Path):
+        return
+    meta_dir = item_path / ".monostudio"
+    meta_path = meta_dir / "open.json"
+    try:
+        data: dict = {}
+        if meta_path.is_file():
+            raw = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data = raw
+    except (OSError, json.JSONDecodeError):
+        data = {}
+
+    dep = (active_department or "").strip().casefold()
+    by_dep = data.get("active_dcc_by_department")
+    if not isinstance(by_dep, dict):
+        by_dep = {}
+    by_dep[dep] = dcc_id
+    data["active_dcc_by_department"] = by_dep
+
+    try:
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        meta_path.write_text(content, encoding="utf-8")
+    except OSError:
+        pass
+
+
 class _ClearOnEmptyClickListView(QListView):
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if not self.indexAt(event.pos()).isValid():
@@ -193,6 +468,37 @@ class _ClearOnEmptyClickTableView(QTableView):
         if not self.indexAt(event.pos()).isValid():
             self.clearSelection()
         super().mousePressEvent(event)
+
+
+class _ListRowDelegate(QStyledItemDelegate):
+    """Paints active-project row background on Projects list view."""
+
+    def __init__(self, *, view: QTableView) -> None:
+        super().__init__(view)
+        self._view = view
+        self._active_project_root: str | None = None
+
+    def set_active_project_root(self, path: str | None) -> None:
+        p = path or None
+        if p == self._active_project_root:
+            return
+        self._active_project_root = p
+        self._view.viewport().update()
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        item = index.data(Qt.UserRole)
+        active = (
+            isinstance(item, ViewItem)
+            and item.kind == ViewItemKind.PROJECT
+            and self._active_project_root is not None
+            and str(item.path) == self._active_project_root
+        )
+        if active and index.column() == 0:
+            # 2px left border Amber-400 @ 70% opacity (active project)
+            c = QColor(MONOS_COLORS["amber_400"])
+            c.setAlphaF(0.7)
+            painter.fillRect(option.rect.left(), option.rect.top(), 2, option.rect.height(), c)
+        super().paint(painter, option, index)
 
 
 class _GridCardDelegate(QStyledItemDelegate):
@@ -212,6 +518,9 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._gap_px = 24
         self._active_department: str | None = None
         self._active_department_icon_name: str | None = None  # from pipeline (subdepartment-safe)
+        self._active_project_root: str | None = None  # current open project (Projects page)
+        self._show_publish: bool = False
+        self._active_dcc_cache: dict[str, str] = {}  # "item_path|department" -> dcc_id
 
         # Theme cache (no per-paint parsing / allocations)
         self._c_card_bg = QColor(MONOS_COLORS["card_bg"])
@@ -224,6 +533,9 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._pen_border = QPen(self._c_border, 1)
         self._c_selected = QColor(MONOS_COLORS["blue_600"])
         self._pen_selected = QPen(self._c_selected, 2)
+        self._c_active = QColor(MONOS_COLORS["amber_400"])
+        self._c_active.setAlphaF(0.7)
+        self._pen_active = QPen(self._c_active, 2)
 
         # Font cache (no per-paint allocations)
         # Shared thumb tag style (status + filter tags): same geometry, only color differs.
@@ -268,6 +580,37 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._active_department_icon_name = (icon_name or "").strip() or None
         self._view.viewport().update()
 
+    def set_active_project_root(self, path: str | None) -> None:
+        p = path or None
+        if p == self._active_project_root:
+            return
+        self._active_project_root = p
+        self._view.viewport().update()
+
+    def set_show_publish(self, show_publish: bool) -> None:
+        if self._show_publish == show_publish:
+            return
+        self._show_publish = show_publish
+        self._view.viewport().update()
+
+    def get_active_dcc(self, item_path: Path | None, department: str | None) -> str | None:
+        if not item_path or not department:
+            return None
+        key = f"{item_path}|{(department or '').strip().casefold()}"
+        cached = self._active_dcc_cache.get(key)
+        if cached is not None:
+            return cached
+        val = _item_active_dcc(item_path, department)
+        if val:
+            self._active_dcc_cache[key] = val
+        return val
+
+    def set_active_dcc(self, item_path: Path, department: str, dcc_id: str) -> None:
+        key = f"{item_path}|{(department or '').strip().casefold()}"
+        self._active_dcc_cache[key] = dcc_id
+        _write_active_dcc(item_path, department, dcc_id)
+        self._view.viewport().update()
+
     @staticmethod
     def _rounded_rect(p: QPainter, r: QRect, radius: int, *, fill: QColor, pen: QPen | None = None) -> None:
         p.setPen(Qt.NoPen if pen is None else pen)
@@ -293,7 +636,6 @@ class _GridCardDelegate(QStyledItemDelegate):
             try:
                 p.setRenderHint(QPainter.Antialiasing, True)
                 p.setRenderHint(QPainter.TextAntialiasing, True)
-                from PySide6.QtGui import QFont
                 p.fillRect(r, QColor("#1f1f23"))
                 p.setPen(QColor("#a1a1aa"))
                 f = p.font()
@@ -324,8 +666,35 @@ class _GridCardDelegate(QStyledItemDelegate):
                 bg = self._c_card_hover
 
             selected = bool(option.state & QStyle.State_Selected)
-            border_px = 2 if selected else 1
-            border_pen = self._pen_selected if selected else self._pen_border
+            active = (
+                item.kind == ViewItemKind.PROJECT
+                and self._active_project_root
+                and str(item.path) == self._active_project_root
+            )
+
+            # Dim card when showing Published mode but item has no publish
+            _dim_card = False
+            if (
+                self._show_publish
+                and isinstance(item.ref, (Asset, Shot))
+                and not _item_has_publish_for_department(item.ref, self._active_department)
+            ):
+                _dim_card = True
+            if _dim_card:
+                if selected:
+                    p.setOpacity(1.0)
+                elif hover:
+                    p.setOpacity(0.45)
+                else:
+                    p.setOpacity(0.1)
+
+            border_px = 2 if (selected or active) else 1
+            if selected:
+                border_pen = self._pen_selected  # 2px Blue-600
+            elif active:
+                border_pen = self._pen_active  # 2px Amber-400 (active project)
+            else:
+                border_pen = self._pen_border
 
             outer = r
             # Fill first (no border), then draw content, then draw border ON TOP.
@@ -359,24 +728,27 @@ class _GridCardDelegate(QStyledItemDelegate):
                     p.drawPixmap(thumb, crop)
 
             def status_key() -> str:
-                # User-set status overrides computed (asset/shot only).
-                if item.kind.value in ("asset", "shot") and getattr(item, "user_status", None):
-                    return (item.user_status or "").strip().lower() or "waiting"
                 if item.kind.value == "project":
                     stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
                     return (stats.status if stats else "WAITING").lower()
-                if isinstance(item.ref, Asset):
-                    if any(d.publish_version_count > 0 for d in item.ref.departments):
-                        return "ready"
-                    if any(d.work_exists for d in item.ref.departments):
-                        return "progress"
-                    return "waiting"
-                if isinstance(item.ref, Shot):
-                    if any(d.publish_version_count > 0 for d in item.ref.departments):
-                        return "ready"
-                    if any(d.work_exists for d in item.ref.departments):
-                        return "progress"
-                    return "waiting"
+                if isinstance(item.ref, (Asset, Shot)):
+                    dep = (self._active_department or "").strip()
+                    if dep:
+                        for d in item.ref.departments:
+                            if (d.name or "").strip() == dep:
+                                if d.publish_version_count > 0:
+                                    return "ready"
+                                if d.work_exists:
+                                    return "progress"
+                                return "waiting"
+                        return "waiting"
+                    else:
+                        depts = item.ref.departments
+                        if depts and all(d.publish_version_count > 0 for d in depts):
+                            return "ready"
+                        if any(d.work_exists for d in depts):
+                            return "progress"
+                        return "waiting"
                 return "waiting"
 
             def status_style(k: str) -> tuple[QColor, QColor, QColor]:
@@ -531,56 +903,88 @@ class _GridCardDelegate(QStyledItemDelegate):
                             add_badge(dept_name, dcc_id, "creating")
                 return out
 
-            dcc_list = dcc_badges_for_item()
-            if dcc_list:
-                size = 16
-                pad = 4
-                gap = 3
-                max_show = 4
-                chip_h = size + pad * 2
-                chip_r = chip_h // 2
-                creating_chip_w = 56
-                widths = [creating_chip_w if s == "creating" else chip_h for (_, _, s) in dcc_list[:max_show]]
-                row_w = sum(widths) + (len(widths) - 1) * gap
-                base_x = thumb.right() - 12 - row_w
-                base_y = thumb.bottom() - 12 - chip_h
-                creating_font = monos_font("Inter", 9)
-                dcc_bg = QColor(0, 0, 0, 160)
-                last_used_dcc = _item_last_opened_dcc(item.path, self._active_department or "") if getattr(item, "path", None) else None
-                x_cursor = base_x
-                for i, (dcc_icon, _dcc_id, badge_status) in enumerate(dcc_list[:max_show]):
-                    w = widths[i]
-                    bg_rect = QRect(x_cursor, base_y, w, chip_h)
-                    is_last_used = (last_used_dcc and (_dcc_id or "").strip() == last_used_dcc)
-                    if badge_status == "creating":
-                        # Pill: bo tròn, không border; chỉ border xanh dương 50% nếu là last-used
-                        p.setPen(Qt.NoPen)
-                        p.setBrush(dcc_bg)
-                        p.drawRoundedRect(bg_rect, chip_r, chip_r)
-                        if is_last_used:
-                            p.setPen(QPen(QColor(37, 99, 235, 128), 2))
-                            p.setBrush(Qt.NoBrush)
-                            p.drawRoundedRect(bg_rect, chip_r, chip_r)
-                        _dcc_debug_log.debug("paint DCC badge Creating… entity_path=%r dcc_id=%r", getattr(item.ref, "path", None), _dcc_id)
-                        p.setFont(creating_font)
-                        p.setPen(QColor(255, 255, 255))
-                        p.drawText(bg_rect, Qt.AlignmentFlag.AlignCenter, "Creating…")
+            if self._show_publish:
+                # Published mode: show version pill instead of DCC badges
+                if isinstance(item.ref, (Asset, Shot)):
+                    pub_ver = _card_publish_version(item.ref, self._active_department)
+                    if pub_ver and pub_ver != "—":
+                        pub_label = pub_ver
                     else:
-                        # Icon: hình tròn, không border; chỉ border xanh dương 50% nếu là last-used
-                        cx = x_cursor + chip_r
-                        cy = base_y + chip_r
+                        pub_label = None
+                    if pub_label:
+                        pub_font = monos_font("Inter", 9, QFont.Weight.Bold)
+                        p.setFont(pub_font)
+                        fm = p.fontMetrics()
+                        text_w = fm.horizontalAdvance(pub_label)
+                        pill_pad_x = 10
+                        pill_h = 24
+                        pill_w = text_w + pill_pad_x * 2
+                        pill_r = pill_h // 2
+                        pill_x = thumb.right() - 12 - pill_w
+                        pill_y = thumb.bottom() - 12 - pill_h
+                        pill_rect = QRect(pill_x, pill_y, pill_w, pill_h)
                         p.setPen(Qt.NoPen)
-                        p.setBrush(dcc_bg)
-                        p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
-                        if is_last_used:
-                            p.setPen(QPen(QColor(37, 99, 235, 128), 2))
-                            p.setBrush(Qt.NoBrush)
+                        p.setBrush(QColor(MONOS_COLORS["blue_600"]))
+                        p.drawRoundedRect(pill_rect, pill_r, pill_r)
+                        p.setPen(QColor(255, 255, 255))
+                        p.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, pub_label)
+            else:
+                dcc_list = dcc_badges_for_item()
+                if dcc_list:
+                    size = 16
+                    pad = 4
+                    gap = 3
+                    max_show = 4
+                    chip_h = size + pad * 2
+                    chip_r = chip_h // 2
+                    creating_chip_w = 56
+                    widths = [creating_chip_w if s == "creating" else chip_h for (_, _, s) in dcc_list[:max_show]]
+                    row_w = sum(widths) + (len(widths) - 1) * gap
+                    base_x = thumb.right() - 12 - row_w
+                    base_y = thumb.bottom() - 12 - chip_h
+                    creating_font = monos_font("Inter", 9)
+                    dcc_bg = QColor(0, 0, 0, 160)
+                    active_dcc = self.get_active_dcc(getattr(item, "path", None), self._active_department) if getattr(item, "path", None) else None
+                    _existing_ids = {(_d or "").strip() for (_, _d, _s) in dcc_list[:max_show] if _s == "exists"}
+                    if not active_dcc or active_dcc not in _existing_ids:
+                        active_dcc = None
+                        for _ic, _did, _st in dcc_list[:max_show]:
+                            if _st == "exists" and (_did or "").strip():
+                                active_dcc = (_did or "").strip()
+                                break
+                    _pen_dcc_active = QPen(self._c_active, 2)
+                    x_cursor = base_x
+                    for i, (dcc_icon, _dcc_id, badge_status) in enumerate(dcc_list[:max_show]):
+                        w = widths[i]
+                        bg_rect = QRect(x_cursor, base_y, w, chip_h)
+                        is_active = bool(active_dcc and (_dcc_id or "").strip() == active_dcc)
+                        if badge_status == "creating":
+                            p.setPen(Qt.NoPen)
+                            p.setBrush(dcc_bg)
+                            p.drawRoundedRect(bg_rect, chip_r, chip_r)
+                            if is_active:
+                                p.setPen(_pen_dcc_active)
+                                p.setBrush(Qt.NoBrush)
+                                p.drawRoundedRect(bg_rect, chip_r, chip_r)
+                            _dcc_debug_log.debug("paint DCC badge Creating… entity_path=%r dcc_id=%r", getattr(item.ref, "path", None), _dcc_id)
+                            p.setFont(creating_font)
+                            p.setPen(QColor(255, 255, 255))
+                            p.drawText(bg_rect, Qt.AlignmentFlag.AlignCenter, "Creating…")
+                        else:
+                            cx = x_cursor + chip_r
+                            cy = base_y + chip_r
+                            p.setPen(Qt.NoPen)
+                            p.setBrush(dcc_bg)
                             p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
-                        if dcc_icon is not None and not dcc_icon.isNull():
-                            pix = dcc_icon.pixmap(size, size)
-                            if not pix.isNull():
-                                p.drawPixmap(x_cursor + pad, base_y + pad, pix)
-                    x_cursor += w + gap
+                            if is_active:
+                                p.setPen(_pen_dcc_active)
+                                p.setBrush(Qt.NoBrush)
+                                p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
+                            if dcc_icon is not None and not dcc_icon.isNull():
+                                pix = dcc_icon.pixmap(size, size)
+                                if not pix.isNull():
+                                    p.drawPixmap(x_cursor + pad, base_y + pad, pix)
+                        x_cursor += w + gap
 
             # Stop clipping before text to avoid rounded-corner cropping issues
             p.setClipping(False)
@@ -618,7 +1022,8 @@ class _GridCardDelegate(QStyledItemDelegate):
                 p.setPen(self._c_text_meta)
                 active_dep = (self._active_department or "").strip()
                 show_version = bool(active_dep)
-                ver_str = _card_work_file_version(item.ref, self._active_department) if isinstance(item.ref, (Asset, Shot)) else None
+                active_dcc = self.get_active_dcc(getattr(item, "path", None), self._active_department) if getattr(item, "path", None) else None
+                ver_str = _card_version_for_display(item.ref, self._active_department, self._show_publish, active_dcc_id=active_dcc) if isinstance(item.ref, (Asset, Shot)) else None
                 if show_version and ver_str is not None:
                     meta = f"ID {item.name}   {ver_str}" if ver_str != "—" else f"ID {item.name}   v —"
                 else:
@@ -648,6 +1053,51 @@ class _GridCardDelegate(QStyledItemDelegate):
         return self._card_size
 
 
+class _PublishDragModel(QStandardItemModel):
+    """QStandardItemModel that provides file URI mime data for drag when in Published mode."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._show_publish = False
+        self._active_department: str | None = None
+
+    def set_publish_state(self, show_publish: bool, active_department: str | None) -> None:
+        self._show_publish = show_publish
+        self._active_department = active_department
+
+    def flags(self, index):
+        default = super().flags(index)
+        if not index.isValid() or not self._show_publish:
+            return default
+        item = index.data(Qt.UserRole)
+        if isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
+            if _item_has_publish_for_department(item.ref, self._active_department):
+                return default | Qt.ItemIsDragEnabled
+        return default
+
+    def supportedDragActions(self):
+        return Qt.CopyAction
+
+    def mimeTypes(self):
+        return ["text/uri-list"]
+
+    def mimeData(self, indexes):
+        md = QMimeData()
+        urls: list[QUrl] = []
+        for idx in indexes:
+            if not idx.isValid():
+                continue
+            item = idx.data(Qt.UserRole)
+            if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
+                continue
+            files = _resolve_all_publish_files(item.ref, self._active_department)
+            for f in files:
+                urls.append(QUrl.fromLocalFile(str(f)))
+        if urls:
+            md.setUrls(urls)
+        return md
+
+
 class MainView(QWidget):
     """
     Spec: Main View has Tile (default) and List mode; has Search + Filters.
@@ -664,15 +1114,22 @@ class MainView(QWidget):
     open_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_with_requested = Signal(object)  # emits ViewItem (asset/shot only)
     create_new_requested = Signal(object)  # emits ViewItem (asset/shot only)
-    status_set_requested = Signal(object, str)  # (ViewItem, status: ready|progress|waiting|blocked)
+    switch_project_requested = Signal(object)  # emits ViewItem (project only)
     primary_action_requested = Signal()  # header primary action
     view_mode_changed = Signal(str)  # "tile" | "list"
-    inbox_drop_requested = Signal(object)  # list[Path] — when Inbox context and user drops files/folders
     search_query_changed = Signal(str)  # debounced search text; empty string = clear
+    show_publish_changed = Signal(bool)  # Work/Published toggle (Assets/Shots only)
+    open_publish_folder_requested = Signal(object)  # emits Path (latest publish version folder)
+    dcc_open_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
+    dcc_folder_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
+    dcc_copy_path_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
+    dcc_delete_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
+    active_dcc_changed = Signal(object, str, str)  # (path, department, dcc_id) — đồng bộ Inspector
 
     _SETTINGS_KEY_VIEW_MODE_PREFIX = "main_view/mode"
     _SETTINGS_KEY_CARD_SIZE_PREFIX = "main_view/card_size"
-    _THUMBNAIL_SIZE_PX = 384  # backing cache size (square); painted as 16:9 in grid
+    _SETTINGS_KEY_SHOW_PUBLISH = "main_view/show_publish"
+    _THUMBNAIL_SIZE_PX = 512  # backing cache size (square); painted as 16:9 in grid
     _THUMB_STATE_ROLE = Qt.UserRole + 1  # per-item state in tile model ("loaded"|"missing")
     _GRID_GAP_PX = 12
     _CARD_SIZE_PRESETS: dict[str, float] = {"small": 0.4, "medium": 0.6, "large": 1.00}
@@ -695,6 +1152,7 @@ class MainView(QWidget):
         self._active_department: str | None = None
         self._active_department_label: str | None = None  # pipeline label (subdepartment-safe)
         self._active_department_icon_name: str | None = None  # pipeline icon (subdepartment-safe)
+        self._show_publish: bool = bool(self._settings.value(self._SETTINGS_KEY_SHOW_PUBLISH, False, type=bool))
 
         header = QWidget(self)
         header.setObjectName("MainViewHeader")
@@ -788,6 +1246,17 @@ class MainView(QWidget):
         _search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
         _search_shortcut.activated.connect(self._show_search_popup)
 
+        # Work/Published toggle — pill with text label, right side of header
+        self._work_publish_switch = QPushButton("Work", header)
+        self._work_publish_switch.setObjectName("WorkPublishPill")
+        self._work_publish_switch.setCheckable(True)
+        self._work_publish_switch.setChecked(self._show_publish)
+        self._work_publish_switch.setCursor(Qt.PointingHandCursor)
+        self._work_publish_switch.setFlat(True)
+        self._work_publish_switch.toggled.connect(self._on_work_publish_toggled)
+        self._work_publish_switch.setVisible(self._browser_context in ("asset", "shot"))
+        self._sync_work_publish_pill()
+
         # Center: View toggle (Grid | List) — pill UI same as Settings Tier3 (Asset Depts | Shot Depts)
         toggle = QWidget(header)
         toggle.setObjectName("Tier3Container")
@@ -845,15 +1314,11 @@ class MainView(QWidget):
         self._btn_card_size.setMenu(self._card_size_menu)
         self._update_card_size_button()
 
-        # Right: ONE primary action button
-        self._primary_action = QPushButton("+", header)
-        self._primary_action.setObjectName("MainViewPrimaryAction")
-        self._primary_action.setCursor(Qt.PointingHandCursor)
-        self._primary_action.setMinimumHeight(32)
-        self._primary_action.clicked.connect(self.primary_action_requested.emit)
+        # (Primary action button removed — replaced by Work/Published pill)
 
         # Tile view (IconMode) skeleton
-        self._tile_model = QStandardItemModel(self)
+        self._tile_model = _PublishDragModel(self)
+        self._tile_model.set_publish_state(self._show_publish, self._active_department)
         self._tile_view = _ClearOnEmptyClickListView()
         self._tile_view.setObjectName("MainViewGrid")
         self._tile_view.setViewMode(QListView.IconMode)
@@ -866,11 +1331,9 @@ class MainView(QWidget):
         self._tile_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._tile_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._tile_view.setSelectionMode(QAbstractItemView.SingleSelection)
-        # Lock cards: no drag/drop/reorder.
-        self._tile_view.setDragEnabled(False)
         self._tile_view.setAcceptDrops(False)
         self._tile_view.setDropIndicatorShown(False)
-        self._tile_view.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self._sync_tile_drag_mode()
         self._tile_view.setIconSize(QSize(self._THUMBNAIL_SIZE_PX, self._THUMBNAIL_SIZE_PX))
         self._tile_view.setModel(self._tile_model)
         self._tile_view.doubleClicked.connect(self._on_tile_activated)
@@ -885,6 +1348,7 @@ class MainView(QWidget):
 
         self._grid_delegate = _GridCardDelegate(view=self._tile_view)
         self._grid_delegate.set_gap_px(self._GRID_GAP_PX)
+        self._grid_delegate.set_show_publish(self._show_publish)
         self._tile_view.setItemDelegate(self._grid_delegate)
         self._tile_view.entered.connect(self._grid_delegate.set_hovered_index)
         self._tile_view.viewportEntered.connect(lambda: self._grid_delegate.set_hovered_index(None))
@@ -938,6 +1402,8 @@ class MainView(QWidget):
         self._list_view.doubleClicked.connect(self._on_list_activated)
         self._list_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_view.customContextMenuRequested.connect(self._on_list_context_menu)
+        self._list_row_delegate = _ListRowDelegate(view=self._list_view)
+        self._list_view.setItemDelegate(self._list_row_delegate)
 
         self._list_placeholder = QLabel("")
         self._list_placeholder.setAlignment(Qt.AlignCenter)
@@ -971,9 +1437,10 @@ class MainView(QWidget):
         header_layout.addStretch(1)
         header_layout.addWidget(self._btn_card_size, 0, Qt.AlignVCenter)
         header_layout.addWidget(self._btn_search_icon, 0, Qt.AlignVCenter)
-        header_layout.addWidget(self._primary_action, 0, Qt.AlignVCenter)
+        header_layout.addWidget(self._work_publish_switch, 0, Qt.AlignVCenter)
 
         self.set_selected_asset_type(None)
+        self._work_publish_switch.setVisible(self._browser_context in ("asset", "shot"))
 
         self._tile_view.selectionModel().selectionChanged.connect(self._on_any_selection_changed)
         self._list_view.selectionModel().selectionChanged.connect(self._on_any_selection_changed)
@@ -994,14 +1461,6 @@ class MainView(QWidget):
         self._items: dict[str, int] = {}
         self._order: list[str] = []
         self._selection_driven_by_state = False
-        self._accept_inbox_drop = False
-
-    def set_accept_inbox_drop(self, enabled: bool) -> None:
-        """When True, MainView accepts drag-drop of files/folders and emits inbox_drop_requested(paths)."""
-        if self._accept_inbox_drop == enabled:
-            return
-        self._accept_inbox_drop = enabled
-        self.setAcceptDrops(enabled)
 
     def _on_search_text_changed(self, _text: str) -> None:
         self._btn_search_clear.setVisible(bool((self._search_input.text() or "").strip()))
@@ -1038,29 +1497,47 @@ class MainView(QWidget):
             self._search_input.blockSignals(False)
         self._btn_search_clear.setVisible(bool((query or "").strip()))
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if not self._accept_inbox_drop or not event.mimeData().hasUrls():
-            super().dragEnterEvent(event)
-            return
-        event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        if not self._accept_inbox_drop or not event.mimeData().hasUrls():
-            super().dropEvent(event)
-            return
-        paths: list[Path] = []
-        for url in event.mimeData().urls():
-            if url.isLocalFile():
-                p = Path(url.toLocalFile())
-                if p.exists():
-                    paths.append(p)
-        event.acceptProposedAction()
-        if paths:
-            self.inbox_drop_requested.emit(paths)
+    def _dcc_badge_hit(self, pos) -> tuple[ViewItem | None, str | None, str | None]:
+        """Hit-test DCC badges at viewport pos. Returns (item, dcc_id, department) or (None, None, None)."""
+        if self._view_mode != "tile" or self._show_publish:
+            return None, None, None
+        index = self._tile_view.indexAt(pos)
+        if not index.isValid():
+            return None, None, None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem):
+            return None, None, None
+        active_dep = (getattr(self._grid_delegate, "_active_department", None) or "").strip()
+        if not active_dep:
+            return None, None, None
+        cell_rect = self._tile_view.visualRect(index)
+        dcc_ids = _dcc_ids_for_item(item, active_dep)
+        if not dcc_ids:
+            return None, None, None
+        rects = _dcc_badge_rects(cell_rect, self._GRID_GAP_PX, dcc_ids)
+        for rect, dcc_id in rects:
+            if rect.contains(pos):
+                return item, dcc_id, active_dep
+        return None, None, None
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched is self._tile_view.viewport() and event.type() == QEvent.Resize:
             self._schedule_grid_layout_sync()
+
+        # Left-click on DCC badge: set active DCC
+        if (
+            watched is self._tile_view.viewport()
+            and event.type() == QEvent.MouseButtonPress
+            and self._view_mode == "tile"
+        ):
+            if event.button() == Qt.MouseButton.LeftButton:
+                hit_item, hit_dcc, hit_dep = self._dcc_badge_hit(event.pos())
+                if hit_item and hit_dcc and hit_dep:
+                    self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
+                    self.active_dcc_changed.emit(hit_item.path, hit_dep, hit_dcc)
+                    event.accept()
+                    return True
+
         if (
             watched is self._tile_view.viewport()
             and event.type() == QEvent.ToolTip
@@ -1085,6 +1562,28 @@ class MainView(QWidget):
                             QToolTip.showText(event.globalPos(), active_dep)
                             event.accept()
                             return True
+                        # DCC badge tooltip: DCC name — Department
+                        hit_item, hit_dcc, hit_dep = self._dcc_badge_hit(pos)
+                        if hit_item and hit_dcc:
+                            try:
+                                reg = get_default_dcc_registry()
+                                info = reg.get_dcc_info(hit_dcc)
+                                dcc_name = info.get("label", hit_dcc) if isinstance(info, dict) else hit_dcc
+                            except Exception:
+                                dcc_name = hit_dcc
+                            dept_display = (hit_dep or "").replace("_", " ").strip().title() or "—"
+                            tooltip_text = f"{dcc_name} — {dept_display}"
+                            QToolTip.showText(event.globalPos(), tooltip_text)
+                            event.accept()
+                            return True
+                        # Khi không chọn department (hoặc hover vùng không phải badge): vẫn hiện tooltip với tên item
+                        fallback_tt = display_name_for_item(item) or (getattr(item, "name", None) or "").strip() or "—"
+                        type_label = _TYPE_TOOLTIP_MAP.get((item.type_badge or "").strip().lower()) or _TYPE_TOOLTIP_MAP.get((item.type_badge or "").strip()) or (item.type_badge or "")
+                        if type_label:
+                            fallback_tt = f"{fallback_tt} — {type_label}"
+                        QToolTip.showText(event.globalPos(), fallback_tt)
+                        event.accept()
+                        return True
         return super().eventFilter(watched, event)
 
     def _schedule_grid_layout_sync(self) -> None:
@@ -1154,14 +1653,31 @@ class MainView(QWidget):
         label: str | None = None,
         icon_name: str | None = None,
     ) -> None:
+        prev_dept = self._active_department
         self._active_department = (department or "").strip() or None
         self._active_department_label = (label or "").strip() or None
         self._active_department_icon_name = (icon_name or "").strip() or None
         self.update_title(base_title=self._base_title or self._context_title.text(), department=self._active_department)
+        self._tile_model.set_publish_state(self._show_publish, self._active_department)
         try:
             self._grid_delegate.set_active_department(self._active_department, icon_name=self._active_department_icon_name)
         except Exception:
             pass
+        if prev_dept != self._active_department:
+            self._reset_thumb_states_and_prefetch()
+
+    def get_active_dcc(self, item_path: Path | None, department: str | None) -> str | None:
+        """Forward to grid delegate (cache + persistence)."""
+        if getattr(self, "_grid_delegate", None) is None:
+            return None
+        return self._grid_delegate.get_active_dcc(item_path, department)
+
+    def set_active_dcc(self, item_path: Path, department: str, dcc_id: str) -> None:
+        """Forward to grid delegate; repaint tile view."""
+        if getattr(self, "_grid_delegate", None) is None:
+            return
+        self._grid_delegate.set_active_dcc(item_path, department, dcc_id)
+        self._tile_view.viewport().update()
 
     def update_title(self, *, base_title: str, department: str | None) -> None:
         """
@@ -1210,10 +1726,53 @@ class MainView(QWidget):
         self._type_badge.setVisible(True)
 
     def set_primary_action(self, *, label: str, enabled: bool, tooltip: str | None) -> None:
-        # Always visible; enabled and tooltip reflect current context requirements.
-        self._primary_action.setText(f"+ {label}".strip())
-        self._primary_action.setEnabled(bool(enabled))
-        self._primary_action.setToolTip(tooltip or "")
+        pass
+
+    def _sync_work_publish_pill(self) -> None:
+        on = self._show_publish
+        label = "Published" if on else "Work"
+        self._work_publish_switch.setText(label)
+        _pill_base = (
+            "border: none; border-radius: 12px; padding: 4px 14px; "
+            "font-family: 'Inter'; font-size: 11px; font-weight: 700; "
+            "min-height: 22px; min-width: 72px; max-width: 72px; "
+        )
+        if on:
+            self._work_publish_switch.setStyleSheet(
+                f"QPushButton#WorkPublishPill {{ "
+                f"background: {MONOS_COLORS['blue_600']}; color: #fafafa; "
+                f"{_pill_base} font-style: italic; }}"
+                f"QPushButton#WorkPublishPill:hover {{ background: {MONOS_COLORS['blue_500']}; }}"
+            )
+        else:
+            self._work_publish_switch.setStyleSheet(
+                f"QPushButton#WorkPublishPill {{ "
+                f"background: #2a2a2c; color: {MONOS_COLORS['text_meta']}; "
+                f"{_pill_base} }}"
+                f"QPushButton#WorkPublishPill:hover {{ background: #3f3f46; color: #fafafa; }}"
+            )
+
+    def _sync_tile_drag_mode(self) -> None:
+        if self._show_publish:
+            self._tile_view.setDragEnabled(True)
+            self._tile_view.setDragDropMode(QAbstractItemView.DragOnly)
+            self._tile_view.setDefaultDropAction(Qt.CopyAction)
+        else:
+            self._tile_view.setDragEnabled(False)
+            self._tile_view.setDragDropMode(QAbstractItemView.NoDragDrop)
+
+    def _on_work_publish_toggled(self, checked: bool) -> None:
+        self._show_publish = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_SHOW_PUBLISH, self._show_publish)
+        self._sync_work_publish_pill()
+        self._grid_delegate.set_show_publish(self._show_publish)
+        self._tile_model.set_publish_state(self._show_publish, self._active_department)
+        self._sync_tile_drag_mode()
+        self._tile_view.viewport().update()
+        self.show_publish_changed.emit(self._show_publish)
+
+    def get_show_publish(self) -> bool:
+        return self._show_publish
 
     def set_browser_context(self, context: str) -> None:
         """
@@ -1228,6 +1787,8 @@ class MainView(QWidget):
         self._browser_context = context
         self._card_size_preset = self._load_card_size_preset()
         self._update_card_size_button()
+        if getattr(self, "_work_publish_switch", None) is not None:
+            self._work_publish_switch.setVisible(context in ("asset", "shot"))
 
         title = "Project" if context == "project" else ("Shot" if context == "shot" else "Asset")
         self.set_context_title(title)
@@ -1248,7 +1809,12 @@ class MainView(QWidget):
     def set_project_root(self, path: str | None) -> None:
         # Store only; no validation, no scanning (per requirements).
         self._project_root = path or None
+        self._grid_delegate.set_active_project_root(self._project_root)
+        if getattr(self, "_list_row_delegate", None) is not None:
+            self._list_row_delegate.set_active_project_root(self._project_root)
         self._update_empty_states()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
 
     def set_empty_override(self, message: str | None) -> None:
         # Allows higher-level flows (e.g. workspace discovery) to present a neutral empty state.
@@ -1310,16 +1876,17 @@ class MainView(QWidget):
                 return True
         return False
 
-    def invalidate_thumbnail(self, item_root: Path) -> None:
+    def invalidate_thumbnail(self, item_root: Path, department: str | None = None) -> None:
         """
-        Force a thumbnail refresh for a specific item.
+        Force a thumbnail refresh for a specific item (and optionally a department).
         Uses ThumbnailManager when set; else legacy cache invalidation.
         """
         root = Path(item_root)
         asset_id = str(root)
+        active_dept = department or (self._active_department or "").strip() or None
         mgr = getattr(self, "_thumbnail_manager", None)
         if mgr is not None and hasattr(mgr, "invalidate"):
-            mgr.invalidate(asset_id)
+            mgr.invalidate(asset_id, department=active_dept)
         else:
             for name in ("thumbnail.user.png", "thumbnail.user.jpg", "thumbnail.png", "thumbnail.jpg"):
                 self._thumb_cache.invalidate_file(root / name)
@@ -1343,7 +1910,7 @@ class MainView(QWidget):
                 continue
             std_item.setData(None, self._THUMB_STATE_ROLE)
             if mgr is not None and hasattr(mgr, "request_thumbnail"):
-                pix = mgr.request_thumbnail(asset_id)
+                pix = mgr.request_thumbnail(asset_id, department=active_dept)
                 if pix is not None:
                     std_item.setIcon(QIcon(pix))
                     std_item.setData("loaded", self._THUMB_STATE_ROLE)
@@ -1372,7 +1939,8 @@ class MainView(QWidget):
 
     def refresh_thumbnails_for(self, asset_ids: list[str]) -> None:
         """
-        Refresh tile thumbnails for the given asset ids (e.g. after thumbnail ready or invalidate).
+        Refresh tile thumbnails for the given asset ids or cache keys
+        (e.g. after thumbnail ready or invalidate).
         Uses ThumbnailManager when set; only updates visible/cached rows.
         """
         if not asset_ids:
@@ -1380,12 +1948,17 @@ class MainView(QWidget):
         mgr = getattr(self, "_thumbnail_manager", None)
         if mgr is None or not hasattr(mgr, "request_thumbnail"):
             return
-        for asset_id in asset_ids:
-            if not asset_id or not str(asset_id).strip():
+        active_dept = (self._active_department or "").strip() or None
+        from monostudio.ui_qt.thumbnails import parse_department_cache_key
+        seen_rows: set[int] = set()
+        for raw_id in asset_ids:
+            if not raw_id or not str(raw_id).strip():
                 continue
-            row = self._row_for_item_id(asset_id)
-            if row is None:
+            entity_path, _ = parse_department_cache_key(str(raw_id).strip())
+            row = self._row_for_item_id(entity_path)
+            if row is None or row in seen_rows:
                 continue
+            seen_rows.add(row)
             idx = self._tile_model.index(row, 0)
             if not idx.isValid():
                 continue
@@ -1395,7 +1968,7 @@ class MainView(QWidget):
             std_item = self._tile_model.itemFromIndex(idx)
             if std_item is None:
                 continue
-            pix = mgr.request_thumbnail(asset_id)
+            pix = mgr.request_thumbnail(entity_path, department=active_dept)
             if pix is not None:
                 std_item.setIcon(QIcon(pix))
                 std_item.setData("loaded", self._THUMB_STATE_ROLE)
@@ -1938,10 +2511,24 @@ class MainView(QWidget):
             pass
         self.valid_selection_changed.emit(self.has_valid_selection())
 
+    def _is_item_dimmed(self, item: ViewItem | None) -> bool:
+        """True when item should be non-interactive (Published mode, no publish for dept or any dept)."""
+        if item is None:
+            return False
+        if not self._show_publish:
+            return False
+        if not isinstance(item.ref, (Asset, Shot)):
+            return False
+        return not _item_has_publish_for_department(item.ref, self._active_department)
+
     def _on_any_selection_changed(self, *_args) -> None:
         if getattr(self, "_selection_driven_by_state", False):
             return
         item = self.selected_view_item()
+        if self._is_item_dimmed(item):
+            view = self._tile_view if self._view_mode == "tile" else self._list_view
+            view.clearSelection()
+            return
         sid = str(item.path) if item is not None else None
         self.selection_id_changed.emit(sid)
         self.valid_selection_changed.emit(self.has_valid_selection())
@@ -1972,21 +2559,134 @@ class MainView(QWidget):
 
     def _on_tile_activated(self, index) -> None:
         item = index.data(Qt.UserRole)
-        if isinstance(item, ViewItem):
-            self.item_activated.emit(item)
+        if not isinstance(item, ViewItem) or self._is_item_dimmed(item):
+            return
+        if isinstance(item.ref, (Asset, Shot)):
+            if self._show_publish:
+                folder = _resolve_latest_publish_folder(item.ref, self._active_department)
+                if folder is not None:
+                    self.open_publish_folder_requested.emit(folder)
+                return
+            if not (self._active_department or "").strip():
+                self._notify_select_department()
+                return
+        self.item_activated.emit(item)
 
     def _on_list_activated(self, index) -> None:
         item = index.data(Qt.UserRole)
-        if isinstance(item, ViewItem):
-            self.item_activated.emit(item)
+        if not isinstance(item, ViewItem) or self._is_item_dimmed(item):
+            return
+        if isinstance(item.ref, (Asset, Shot)):
+            if self._show_publish:
+                folder = _resolve_latest_publish_folder(item.ref, self._active_department)
+                if folder is not None:
+                    self.open_publish_folder_requested.emit(folder)
+                return
+            if not (self._active_department or "").strip():
+                self._notify_select_department()
+                return
+        self.item_activated.emit(item)
+
+    def _notify_select_department(self) -> None:
+        from PySide6.QtGui import QCursor
+        if getattr(self, "_hint_popup", None) is not None:
+            self._hint_popup.deleteLater()
+            self._hint_popup = None
+        lbl = QLabel("Select a department filter first", self)
+        lbl.setStyleSheet(
+            "QLabel { background: #18181b; color: #fafafa; border: 1px solid #3f3f46; "
+            "border-radius: 8px; padding: 8px 14px; font-family: 'Inter'; font-size: 12px; font-weight: 500; }"
+        )
+        lbl.setWindowFlags(Qt.ToolTip)
+        lbl.adjustSize()
+        pos = QCursor.pos()
+        lbl.move(pos.x() + 12, pos.y() + 12)
+        lbl.show()
+        self._hint_popup = lbl
+        QTimer.singleShot(2500, lambda: self._dismiss_hint_popup(lbl))
+
+    def _dismiss_hint_popup(self, lbl: QLabel) -> None:
+        try:
+            lbl.hide()
+            lbl.deleteLater()
+        except RuntimeError:
+            pass
+        if self._hint_popup is lbl:
+            self._hint_popup = None
+
+    def _build_dcc_badge_context_menu(self, item: ViewItem, dcc_id: str, department: str) -> QMenu | None:
+        """Build context menu for right-click on a DCC badge."""
+        try:
+            reg = get_default_dcc_registry()
+            info = reg.get_dcc_info(dcc_id)
+            dcc_label = info.get("label", dcc_id) if isinstance(info, dict) else dcc_id
+            slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+            color = info.get("brand_color_hex") if isinstance(info, dict) else None
+        except Exception:
+            dcc_label = dcc_id
+            slug = None
+            color = None
+
+        if isinstance(slug, str) and slug.strip():
+            dcc_icon = brand_icon(slug.strip(), size=16, color_hex=(color if isinstance(color, str) else None))
+        else:
+            dcc_icon = lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"])
+
+        menu = QMenu(self)
+        open_act = menu.addAction(dcc_icon, f"Open with {dcc_label}")
+        menu.addSeparator()
+        folder_act = menu.addAction(
+            lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+            f"Open {dcc_label} Folder",
+        )
+        copy_act = menu.addAction(
+            lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
+            f"Copy {dcc_label} Work Path",
+        )
+        menu.addSeparator()
+        delete_act = menu.addAction(
+            lucide_icon("trash-2", size=16, color_hex="#ef4444"),
+            f"Delete {dcc_label} Work Folder\u2026",
+        )
+        delete_act.setProperty("class", "danger-action")
+
+        menu.setProperty("_dcc_open", open_act)
+        menu.setProperty("_dcc_folder", folder_act)
+        menu.setProperty("_dcc_copy", copy_act)
+        menu.setProperty("_dcc_delete", delete_act)
+        menu.setProperty("_dcc_id", dcc_id)
+        menu.setProperty("_department", department)
+        return menu
+
+    def _dispatch_dcc_badge_action(self, chosen, item: ViewItem, dcc_id: str, department: str) -> None:
+        if chosen is None:
+            return
+        text = getattr(chosen, "text", lambda: "")()
+        if text.startswith("Open with "):
+            self.dcc_open_requested.emit(item, dcc_id, department)
+        elif text.startswith("Open ") and text.endswith(" Folder"):
+            self.dcc_folder_requested.emit(item, dcc_id, department)
+        elif text.startswith("Copy ") and "Work Path" in text:
+            self.dcc_copy_path_requested.emit(item, dcc_id, department)
+        elif text.startswith("Delete ") and "Work Folder" in text:
+            self.dcc_delete_requested.emit(item, dcc_id, department)
 
     def _on_tile_context_menu(self, pos) -> None:
+        # DCC badge right-click takes priority
+        hit_item, hit_dcc, hit_dep = self._dcc_badge_hit(pos)
+        if hit_item and hit_dcc and hit_dep:
+            menu = self._build_dcc_badge_context_menu(hit_item, hit_dcc, hit_dep)
+            if menu:
+                chosen = menu.exec(self._tile_view.viewport().mapToGlobal(pos))
+                self._dispatch_dcc_badge_action(chosen, hit_item, hit_dcc, hit_dep)
+            return
+
         index = self._tile_view.indexAt(pos)
         if not index.isValid():
             self.root_context_menu_requested.emit(self._tile_view.viewport().mapToGlobal(pos))
             return
         item = index.data(Qt.UserRole)
-        if not isinstance(item, ViewItem):
+        if not isinstance(item, ViewItem) or self._is_item_dimmed(item):
             return
         menu = self._build_item_context_menu(item)
         if menu is None:
@@ -2000,7 +2700,7 @@ class MainView(QWidget):
             self.root_context_menu_requested.emit(self._list_view.viewport().mapToGlobal(pos))
             return
         item = index.data(Qt.UserRole)
-        if not isinstance(item, ViewItem):
+        if not isinstance(item, ViewItem) or self._is_item_dimmed(item):
             return
         menu = self._build_item_context_menu(item)
         if menu is None:
@@ -2009,11 +2709,29 @@ class MainView(QWidget):
         self._dispatch_item_context_action(chosen, item)
 
     def _build_item_context_menu(self, item: ViewItem) -> QMenu | None:
-        # Asset / Shot / Department / Inbox item. Section headers (inbox_section) have no menu.
-        if item.kind.value not in ("asset", "shot", "department", "inbox_item"):
+        if item.kind.value not in ("asset", "shot", "department", "inbox_item", "project"):
             return None
 
         menu = QMenu(self)
+
+        if item.kind.value == "project":
+            switch_action = menu.addAction(
+                lucide_icon("arrow-right", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Switch to Project",
+            )
+            menu.addSeparator()
+            copy_full_path = menu.addAction(
+                lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Copy Full Path",
+            )
+            open_folder = menu.addAction(
+                lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Open Folder",
+            )
+            menu.setProperty("_act_switch_project", switch_action)
+            menu.setProperty("_act_copy_full_path", copy_full_path)
+            menu.setProperty("_act_open_folder", open_folder)
+            return menu
 
         open_action = None
         open_with_action = None
@@ -2030,16 +2748,58 @@ class MainView(QWidget):
             menu.setProperty("_act_delete", None)
             menu.setProperty("_act_refresh", None)
             return menu
-        if item.kind.value in ("asset", "shot"):
-            open_action = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open")
-            open_with_action = menu.addAction(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]), "Open With…")
-            create_new_action = menu.addAction(lucide_icon("file-plus", size=16, color_hex=MONOS_COLORS["text_label"]), "Create New…")
+        has_dept_filter = bool((self._active_department or "").strip())
+
+        if item.kind.value in ("asset", "shot") and self._show_publish:
+            open_latest = menu.addAction(lucide_icon("package-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Latest Publish")
+            open_pub_root = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Publish Folder")
             menu.addSeparator()
-            copy_inventory = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Inventory")
+            if has_dept_filter:
+                copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Publish Path")
+            else:
+                copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Path")
+            menu.addSeparator()
+            open_folder = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Folder")
+            menu.setProperty("_act_open_latest_publish", open_latest)
+            menu.setProperty("_act_open_publish_root", open_pub_root)
+            menu.setProperty("_act_copy_context_path", copy_ctx)
+            menu.setProperty("_act_open_folder", open_folder)
+            menu.setProperty("_act_open", None)
+            menu.setProperty("_act_open_with", None)
+            menu.setProperty("_act_create_new", None)
+            menu.setProperty("_act_refresh", None)
+            menu.setProperty("_act_delete", None)
+            menu.setProperty("_act_open_work", None)
+            menu.setProperty("_act_open_publish", None)
+            return menu
+
+        if item.kind.value in ("asset", "shot"):
+            _no_dept_hint = "Select a department filter first"
+            _dim = MONOS_COLORS.get("text_muted", "#52525b")
+            open_action = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim), "Open")
+            open_with_action = menu.addAction(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim), "Open With…")
+            create_new_action = menu.addAction(lucide_icon("file-plus", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim), "Create New…")
+            if not has_dept_filter:
+                open_action.setEnabled(False)
+                open_action.setToolTip(_no_dept_hint)
+                open_with_action.setEnabled(False)
+                open_with_action.setToolTip(_no_dept_hint)
+                create_new_action.setEnabled(False)
+                create_new_action.setToolTip(_no_dept_hint)
+            menu.addSeparator()
+            if has_dept_filter:
+                copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Work Path")
+            else:
+                copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Path")
             menu.addSeparator()
 
-        copy_full_path = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Full Path")
         open_folder = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Folder")
+        open_publish_folder = None
+        if item.kind.value in ("asset", "shot"):
+            open_publish_folder = menu.addAction(
+                lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Open Publish Folder",
+            )
 
         menu.addSeparator()
 
@@ -2049,26 +2809,16 @@ class MainView(QWidget):
         open_publish = None
 
         if item.kind.value in ("asset", "shot"):
-            # Set status submenu (user override)
-            set_status_menu = QMenu("Set status", menu)
-            for label, key in (("Ready", "ready"), ("Progress", "progress"), ("Waiting", "waiting"), ("Blocked", "blocked")):
-                act = set_status_menu.addAction(label)
-                act.setData(key)
-            menu.addMenu(set_status_menu)
-            # Existing v1 behavior: Refresh on Asset/Shot items.
             refresh_action = menu.addAction(lucide_icon("download", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
             delete_action = menu.addAction(lucide_icon("x", size=16, color_hex=MONOS_COLORS["text_label"]), "Delete…")
             if delete_action is not None:
                 delete_action.setProperty("class", "danger-action")
         elif item.kind.value == "department":
-            # Optional (already meaningful in UI): open work/publish folders
             open_work = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Work Folder")
             open_publish = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Publish Folder")
 
-        # Store action ids on the menu for dispatch without global state
-        menu.setProperty("_act_copy_full_path", copy_full_path)
         menu.setProperty("_act_open_folder", open_folder)
-        menu.setProperty("_act_copy_inventory", copy_inventory)
+        menu.setProperty("_act_open_publish_folder", open_publish_folder)
         menu.setProperty("_act_open", open_action)
         menu.setProperty("_act_open_with", open_with_action)
         menu.setProperty("_act_create_new", create_new_action)
@@ -2082,17 +2832,13 @@ class MainView(QWidget):
         if chosen is None:
             return
 
-        # User-set status (submenu action carries data)
-        status_val = chosen.data() if hasattr(chosen, "data") else None
-        if isinstance(status_val, str) and status_val in ("ready", "progress", "waiting", "blocked"):
-            self.status_set_requested.emit(item, status_val)
-            return
-
         # Compare by label text; labels are fixed by spec.
         text = getattr(chosen, "text", lambda: "")()
 
+        if text == "Switch to Project":
+            self.switch_project_requested.emit(item)
+            return
         if text == "Copy Inventory":
-            # v1.2 extension: delegate generation to MainWindow (in-memory index)
             self.copy_inventory_requested.emit(item)
             return
         if text == "Open":
@@ -2107,6 +2853,18 @@ class MainView(QWidget):
         if text == "Copy Full Path":
             path_str, _ = self._resolved_path_and_folder_for_item(item)
             self._copy_full_path(path_str)
+            return
+        if text == "Copy Path":
+            self._copy_full_path(str(item.path))
+            return
+        if text == "Copy Work Path":
+            if isinstance(item.ref, (Asset, Shot)):
+                dep = (self._active_department or "").strip()
+                for d in (item.ref.departments or ()):
+                    if (d.name or "").strip().casefold() == dep.casefold():
+                        self._copy_full_path(str(d.work_path))
+                        return
+            self._copy_full_path(str(item.path))
             return
         if text == "Open Folder":
             _, folder = self._resolved_path_and_folder_for_item(item)
@@ -2123,8 +2881,28 @@ class MainView(QWidget):
                 self._open_folder(Path(item.ref.work_path))
             return
         if text == "Open Publish Folder":
-            if hasattr(item, "ref") and item.ref is not None and hasattr(item.ref, "publish_path"):
+            if isinstance(item.ref, (Asset, Shot)):
+                folder = _resolve_publish_root_folder_any(item.ref, self._active_department)
+                if folder is not None:
+                    self._open_folder(folder)
+            elif hasattr(item, "ref") and item.ref is not None and hasattr(item.ref, "publish_path"):
                 self._open_folder(Path(item.ref.publish_path))
+            return
+        if text == "Open Latest Publish":
+            if isinstance(item.ref, (Asset, Shot)):
+                folder = _resolve_latest_publish_folder(item.ref, self._active_department)
+                if folder is not None:
+                    self._open_folder(folder)
+            return
+        if text == "Copy Publish Path":
+            if isinstance(item.ref, (Asset, Shot)):
+                primary = _resolve_primary_publish_file(item.ref, self._active_department)
+                if primary is not None:
+                    self._copy_full_path(str(primary))
+                else:
+                    folder = _resolve_latest_publish_folder(item.ref, self._active_department)
+                    if folder is not None:
+                        self._copy_full_path(str(folder))
             return
 
     def _resolved_path_and_folder_for_item(self, item: ViewItem) -> tuple[str, Path]:
@@ -2142,7 +2920,10 @@ class MainView(QWidget):
             return (str(default_path), default_path)
         for d in ref.departments:
             if (d.name or "").strip().casefold() == active_dep.casefold():
-                return (str(d.work_path), d.work_path)
+                wp = d.work_path
+                if wp.exists():
+                    return (str(wp), wp)
+                return (str(d.path), d.path)
         return (str(default_path), default_path)
 
     def _copy_full_path(self, path_text: str) -> None:
@@ -2152,9 +2933,10 @@ class MainView(QWidget):
         if cb is None:
             return
         cb.setText(path_text)
+        from monostudio.ui_qt.notification import notify as notification_service
+        notification_service.success(f"Copied: {path_text}")
 
     def _open_folder(self, folder: Path) -> None:
-        # Silent no-op if missing/invalid.
         try:
             if not folder.exists():
                 return
@@ -2162,8 +2944,15 @@ class MainView(QWidget):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
+    def _reset_thumb_states_and_prefetch(self) -> None:
+        """Clear all thumb states so thumbnails reload for the new department context."""
+        for row in range(self._tile_model.rowCount()):
+            std_item = self._tile_model.item(row)
+            if std_item is not None:
+                std_item.setData(None, self._THUMB_STATE_ROLE)
+        self._schedule_thumbnail_prefetch()
+
     def _schedule_thumbnail_prefetch(self) -> None:
-        # Lazy loading: only attempt thumbnails for visible tile items.
         if self._thumb_prefetch_scheduled:
             return
         self._thumb_prefetch_scheduled = True
@@ -2172,7 +2961,6 @@ class MainView(QWidget):
     def _prefetch_visible_thumbnails(self) -> None:
         self._thumb_prefetch_scheduled = False
 
-        # Tile-only integration
         if self._view_mode != "tile":
             return
         if self._tile_model.rowCount() == 0:
@@ -2182,6 +2970,7 @@ class MainView(QWidget):
 
         viewport = self._tile_view.viewport()
         vp_rect = viewport.rect()
+        active_dept = (self._active_department or "").strip() or None
 
         for row in range(self._tile_model.rowCount()):
             index = self._tile_model.index(row, 0)
@@ -2207,17 +2996,17 @@ class MainView(QWidget):
             asset_id = str(item.path)
             mgr = getattr(self, "_thumbnail_manager", None)
             if mgr is not None and hasattr(mgr, "request_thumbnail"):
-                pix = mgr.request_thumbnail(asset_id)
+                pix = mgr.request_thumbnail(asset_id, department=active_dept)
                 if pix is not None:
                     std_item.setIcon(QIcon(pix))
                     std_item.setData("loaded", self._THUMB_STATE_ROLE)
                     continue
-                thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path)
+                thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path, department=active_dept)
                 if thumb_file is None:
                     std_item.setData("missing", self._THUMB_STATE_ROLE)
                 continue
 
-            thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path)
+            thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path, department=active_dept)
             if thumb_file is None:
                 std_item.setData("missing", self._THUMB_STATE_ROLE)
                 continue

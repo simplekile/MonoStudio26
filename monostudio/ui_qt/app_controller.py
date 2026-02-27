@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from monostudio.core.dcc_blender import BlenderDccAdapter
 from monostudio.core.dcc_houdini import HoudiniDccAdapter
 from monostudio.core.dcc_maya import MayaDccAdapter
+from monostudio.core.dcc_rizomuv import RizomUVDccAdapter
 from monostudio.core.dcc_substance_painter import SubstancePainterDccAdapter
 from monostudio.core.dcc_registry import DccRegistry, get_default_dcc_registry
 from monostudio.core.department_registry import DepartmentRegistry
@@ -26,6 +27,7 @@ from monostudio.core.fs_reader import (
 )
 from monostudio.core.models import Asset, Shot
 from monostudio.core.pending_create import add as pending_create_add
+from monostudio.ui_qt.import_source_dialog import ImportSourceDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.open_resolver_dialog import OpenResolverDialog
 from monostudio.ui_qt.style import MONOS_COLORS
@@ -162,6 +164,7 @@ class AppController(QObject):
                     break
 
         remember_for_item = False
+        choice = None
         show_dialog = force_dialog or force_open_with or force_create_new or not resolved_department or not resolved_dcc or not resolved_dept_has_work_file
         # When no work file exists (e.g. double-click on new item), show Create New dialog instead of Open With.
         # force_open_with: always show Open With… dialog, never Create New.
@@ -200,12 +203,12 @@ class AppController(QObject):
                 else:
                     allowed_dcc_ids = []
             if use_create_new_dialog and resolved_department:
-                # Disable DCCs whose work folder already exists for this item in this department.
+                # Disable DCCs that already have a work file for this item in this department.
                 _disabled: set[str] = set()
                 for (dept_id, dcc_id), state in getattr(item, "dcc_work_states", None) or ():
                     if self._norm(str(dept_id)) == self._norm(resolved_department) and getattr(
-                        state, "work_folder_exists", False
-                    ):
+                        state, "work_file_path", None
+                    ) is not None:
                         _d = (dcc_id or "").strip()
                         if _d:
                             _disabled.add(_d)
@@ -244,12 +247,24 @@ class AppController(QObject):
         if not resolved_department or not resolved_dcc:
             raise RuntimeError("Failed to resolve Department or DCC.")
 
-        action = self._open_or_create_work_file(
-            item=item,
-            department=resolved_department,
-            dcc=resolved_dcc,
-            force_create=force_create_new or use_create_new_dialog,
-        )
+        import_source = getattr(choice, "import_source", False) if choice is not None else False
+
+        if import_source:
+            action = self._import_source_flow(
+                item=item,
+                department=resolved_department,
+                dcc=resolved_dcc,
+                parent=parent,
+            )
+            if action is None:
+                return
+        else:
+            action = self._open_or_create_work_file(
+                item=item,
+                department=resolved_department,
+                dcc=resolved_dcc,
+                force_create=force_create_new or use_create_new_dialog,
+            )
 
         # Success: persist last-open metadata and which action was taken (open or create).
         self._write_item_open_metadata(
@@ -266,8 +281,33 @@ class AppController(QObject):
                 item_path=item.path,
                 item_name=getattr(item, "name", None) or item.path.name,
                 item_type="asset" if isinstance(item, Asset) else "shot",
+                asset_type=(getattr(item, "asset_type", None) or "") if isinstance(item, Asset) else "",
                 department=resolved_department,
                 dcc=resolved_dcc,
+            )
+
+    def open_with_dcc(
+        self,
+        *,
+        item: Asset | Shot,
+        department: str,
+        dcc: str,
+        parent=None,
+    ) -> None:
+        """Open item directly with a specific department + DCC (no resolution / dialog)."""
+        if self._project_root is None:
+            raise RuntimeError("No project is selected; cannot open DCC.")
+        action = self._open_or_create_work_file(item=item, department=department, dcc=dcc)
+        self._write_item_open_metadata(item.path, department=department, dcc=dcc, remember_for_item=False, action=action)
+        if self._recent_tasks_store is not None and self._project_root is not None:
+            self._recent_tasks_store.push(
+                project_root=self._project_root,
+                item_path=item.path,
+                item_name=getattr(item, "name", None) or item.path.name,
+                item_type="asset" if isinstance(item, Asset) else "shot",
+                asset_type=(getattr(item, "asset_type", None) or "") if isinstance(item, Asset) else "",
+                department=department,
+                dcc=dcc,
             )
 
     def _available_departments(self, item: Asset | Shot) -> list[str]:
@@ -329,6 +369,15 @@ class AppController(QObject):
         return None
 
     def _resolve_dcc(self, *, department: str, meta: dict[str, Any], project_defaults: dict[str, Any]) -> str | None:
+        # 0) User-selected active DCC (highest priority — set via badge click)
+        active_by_dep = meta.get("active_dcc_by_department") if isinstance(meta, dict) else None
+        if isinstance(active_by_dep, dict):
+            dep_key = (department or "").strip().casefold()
+            active_val = active_by_dep.get(dep_key) or active_by_dep.get(department)
+            if isinstance(active_val, str) and active_val.strip():
+                if self._dcc_registry.is_dcc_allowed(active_val.strip(), department):
+                    return active_val.strip()
+
         # 1) Asset/Department last-used DCC
         last_used: str | None = None
         by_dep = meta.get("last_open_by_department") if isinstance(meta, dict) else None
@@ -362,6 +411,18 @@ class AppController(QObject):
         """
         return "open" if work_file_path.is_file() else "create"
 
+    def _scanned_work_file_path(self, *, item: Asset | Shot, department: str, dcc: str) -> Path | None:
+        """Return the work file path from scan (dcc_work_states) if present and existing; else None."""
+        dep_norm = (department or "").strip().casefold()
+        dcc_norm = (dcc or "").strip().casefold()
+        for (dept_id, dcc_id), state in getattr(item, "dcc_work_states", None) or ():
+            if (dept_id or "").strip().casefold() == dep_norm and (dcc_id or "").strip().casefold() == dcc_norm:
+                wp = getattr(state, "work_file_path", None)
+                if isinstance(wp, Path) and wp.is_file():
+                    return wp
+                return None
+        return None
+
     def _open_or_create_work_file(
         self, *, item: Asset | Shot, department: str, dcc: str, force_create: bool = False
     ) -> Literal["open", "create"]:
@@ -371,6 +432,10 @@ class AppController(QObject):
         Returns the action taken for recording (metadata, future analytics).
         """
         work_file = self._resolve_work_file(item=item, department=department, dcc=dcc)
+        # When opening, prefer the actual path from scan (e.g. correct extension .obj vs .fbx) so DCC opens the right file.
+        scanned = self._scanned_work_file_path(item=item, department=department, dcc=dcc)
+        if scanned is not None:
+            work_file = scanned
         action = "create" if force_create else self._resolve_open_action(work_file)
         work_dir = work_file.parent
         if not work_dir.is_dir():
@@ -388,8 +453,10 @@ class AppController(QObject):
         if action == "open":
             adapter.open_file(filepath=str(work_file), context=ctx)
         else:
-            # Record pending create so UI shows "Creating…" and we avoid false "new" from immediate scan.
-            pending_create_add(str(item.path), department, dcc)
+            # Record pending create so UI shows "Creating…" — skip for requires_import DCCs
+            # whose create_new_file only creates a dir (no actual work file produced).
+            if not self._dcc_registry.requires_import(dcc):
+                pending_create_add(str(item.path), department, dcc)
             if dcc == "maya":
                 # on_ready is called from worker thread; emit signal so slot runs on main thread (QTimer from thread has no event loop)
                 adapter.create_new_file(
@@ -414,8 +481,55 @@ class AppController(QObject):
                 adapter.create_new_file(filepath=str(work_file), context=ctx)
         return action
 
+    def _import_source_flow(
+        self,
+        *,
+        item: Asset | Shot,
+        department: str,
+        dcc: str,
+        parent=None,
+    ) -> Literal["create"] | None:
+        """
+        Import Source flow: user picks a source file, it is copied into the work
+        folder with the pipeline-standard name, then the DCC opens it.
+        Returns "create" on success, None if user cancelled.
+        """
+        import shutil
+
+        work_file = self._resolve_work_file(item=item, department=department, dcc=dcc)
+        exts = self._dcc_registry.get_dcc_info(dcc).get("workfile_extensions", []) if self._dcc_registry.get_dcc_info(dcc) else []
+
+        dlg = ImportSourceDialog(
+            target_path=work_file,
+            allowed_extensions=exts if exts else None,
+            parent=parent,
+        )
+        if dlg.exec() != ImportSourceDialog.Accepted:
+            return None
+
+        source = dlg.source_path()
+        if not source:
+            return None
+
+        work_dir = work_file.parent
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        src_path = Path(source)
+        if work_file.suffix.lower() != src_path.suffix.lower():
+            work_file = work_file.with_suffix(src_path.suffix)
+
+        shutil.copy2(str(src_path), str(work_file))
+
+        pending_create_add(str(item.path), department, dcc)
+        ctx = self._build_context(item=item, department=department, dcc=dcc)
+        adapter = self._dcc_adapter(dcc)
+        if adapter is None:
+            raise RuntimeError(f"Unsupported DCC: {dcc!r}")
+        adapter.open_file(filepath=str(work_file), context=ctx)
+        return "create"
+
     def _resolve_work_file(self, *, item: Asset | Shot, department: str, dcc: str) -> Path:
-        """Resolve work file path: {name}_{department_folder}_v###{ext}. Respects use_dcc_folders (dept/<dcc>/work)."""
+        """Resolve work file path: {name}_{department_id}_v###{ext}. Respects use_dcc_folders (dept/<dcc>/work)."""
         ext = self._dcc_workfile_extension(dcc)
         dep_norm = (department or "").strip().casefold()
         use_dcc_folders = (
@@ -423,7 +537,7 @@ class AppController(QObject):
         )
         for d in item.departments:
             if (d.name or "").strip().casefold() == dep_norm:
-                prefix = work_file_prefix(name=item.name, department=d.path.name)
+                prefix = work_file_prefix(name=item.name, department=d.name)
                 work_path = resolve_work_path(
                     d.path, dcc, use_dcc_folders, self._dcc_registry
                 )
@@ -437,9 +551,7 @@ class AppController(QObject):
             work_path = resolve_work_path(
                 dept_dir, dcc, use_dcc_folders, self._dcc_registry
             )
-            # Nested: prefix dùng segment cuối (vd 01_sculpt), không dùng full path
-            dept_segment = Path(dept_folder).name if "/" in (dept_folder or "") else (dept_folder or "")
-            prefix = work_file_prefix(name=item.name, department=dept_segment)
+            prefix = work_file_prefix(name=item.name, department=department)
             return get_work_file_path(work_path, prefix, ext)
         prefix = work_file_prefix(name=item.name, department=department)
         return get_work_file_path(item.path / department / "work", prefix, ext)
@@ -528,9 +640,22 @@ class AppController(QObject):
             repo_root=self._repo_root,
         )
 
+    def _rizomuv_executable(self) -> str:
+        exe = self._settings.value("integrations/rizomuv_exe", "", str)
+        exe = (exe or "").strip()
+        if exe:
+            return exe
+        try:
+            return str(self._dcc_registry.get_dcc_info("rizomuv").get("executable") or "rizomuv")
+        except Exception:
+            return "rizomuv"
+
+    def _rizomuv_adapter(self) -> RizomUVDccAdapter:
+        return RizomUVDccAdapter(rizomuv_executable=self._rizomuv_executable(), repo_root=self._repo_root)
+
     def _dcc_adapter(
         self, dcc: str
-    ) -> BlenderDccAdapter | MayaDccAdapter | HoudiniDccAdapter | SubstancePainterDccAdapter | None:
+    ) -> BlenderDccAdapter | MayaDccAdapter | HoudiniDccAdapter | SubstancePainterDccAdapter | RizomUVDccAdapter | None:
         if dcc == "blender":
             return self._blender_adapter()
         if dcc == "maya":
@@ -539,6 +664,8 @@ class AppController(QObject):
             return self._houdini_adapter()
         if dcc == "substance_painter":
             return self._substance_painter_adapter()
+        if dcc == "rizomuv":
+            return self._rizomuv_adapter()
         return None
 
     def _on_maya_launch_requested(

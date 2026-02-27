@@ -4,10 +4,12 @@ ReferenceTreePane for Project Guide page. Used by InboxPageWidget, ReferencePage
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QFileInfo, QRect, QSize, Qt, Signal, QTimer
+from PySide6.QtCore import QEvent, QFileInfo, QPoint, QRect, QSize, Qt, Signal, QTimer, QUrl
 from PySide6.QtGui import (
+    QAction,
     QAbstractFileIconProvider,
     QBrush,
     QColor,
@@ -16,12 +18,15 @@ from PySide6.QtGui import (
     QPainter,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QFileIconProvider,
     QFileSystemModel,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
+    QMessageBox,
     QPushButton,
     QStyle,
     QStyledItemDelegate,
@@ -29,6 +34,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from PySide6.QtGui import QDesktopServices
+
+import shutil
 
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import FILE_TYPE_ICON_COLORS, MONOS_COLORS, monos_font
@@ -139,15 +148,19 @@ class _InboxTreeDelegate(QStyledItemDelegate):
 
 
 class InboxTreePane(QWidget):
-    """Breadcrumb + file tree for one date folder. Emits back_requested, tree_selection_changed, open_folder_requested."""
+    """Breadcrumb + file tree for one date folder. Emits back_requested, tree_selection_changed, open_folder_requested, import_requested, history_requested (if show_history_action)."""
 
     back_requested = Signal()
     tree_selection_changed = Signal(object)  # Path | None
     open_folder_requested = Signal(object)  # Path (date folder)
+    import_requested = Signal()
+    history_requested = Signal()
 
-    def __init__(self, date_folder_path: Path, parent=None) -> None:
+    def __init__(self, date_folder_path: Path, parent=None, *, show_history_action: bool = False, breadcrumb_title: str = "Inbox") -> None:
         super().__init__(parent)
         self._date_folder_path = Path(date_folder_path)
+        self._show_history_action = show_history_action
+        self._breadcrumb_title = breadcrumb_title or "Inbox"
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
@@ -157,13 +170,6 @@ class InboxTreePane(QWidget):
         bar_lay.setSpacing(8)
         bar_lay.addWidget(self._make_breadcrumb(), 0)
         bar_lay.addStretch(1)
-        open_btn = QPushButton("Open folder", bar)
-        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        _open_icon = lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"])
-        if not _open_icon.isNull():
-            open_btn.setIcon(_open_icon)
-        open_btn.clicked.connect(self._on_open_folder)
-        bar_lay.addWidget(open_btn, 0)
         lay.addWidget(bar, 0)
         self._fs_model = QFileSystemModel(self)
         self._fs_model.setRootPath("")
@@ -181,7 +187,10 @@ class InboxTreePane(QWidget):
         self._tree.hideColumn(2)
         self._tree.hideColumn(3)
         self._tree.setItemDelegate(_InboxTreeDelegate(self._tree))
+        self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         self._tree.selectionModel().selectionChanged.connect(self._emit_tree_selection)
+        self._tree.doubleClicked.connect(self._on_tree_double_clicked)
         self._tree.installEventFilter(self)
         lay.addWidget(self._tree, 1)
 
@@ -198,7 +207,7 @@ class InboxTreePane(QWidget):
             "QPushButton { color: #a1a1aa; font-size: 11px; border: none; background: transparent; }"
             "QPushButton:hover { color: #60a5fa; }"
         )
-        segments = ["Inbox", *trail]
+        segments = [self._breadcrumb_title, *trail]
         for i, name in enumerate(segments):
             if i > 0:
                 sep = QLabel("›", wrap)
@@ -230,9 +239,127 @@ class InboxTreePane(QWidget):
         path = Path(self._fs_model.filePath(idx))
         self.tree_selection_changed.emit(path)
 
-    def _on_open_folder(self) -> None:
-        if self._date_folder_path.is_dir():
-            self.open_folder_requested.emit(self._date_folder_path)
+    def _on_tree_context_menu(self, pos: QPoint) -> None:
+        """Context menu: when click on empty area → Open folder, Import [, History]. When click on an item → full menu. Use only indexAt(pos), not currentIndex()."""
+        idx = self._tree.indexAt(pos)
+        has_selection = idx.isValid()
+        path = None
+        if has_selection:
+            path = Path(self._fs_model.filePath(idx))
+            if not path.exists():
+                has_selection = False
+                path = None
+
+        menu = QMenu(self._tree)
+        _icon = lambda name: lucide_icon(name, size=16, color_hex=MONOS_COLORS["text_label"])
+        _icon_red = lambda name: lucide_icon(name, size=16, color_hex=MONOS_COLORS.get("destructive", "#ef4444"))
+
+        if not has_selection:
+            open_folder_act = menu.addAction(_icon("folder-open"), "Open folder")
+            import_act = menu.addAction(_icon("upload"), "Import")
+            if self._show_history_action:
+                menu.addSeparator()
+                history_act = menu.addAction(_icon("layers"), "History")
+            else:
+                history_act = None
+            action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+            if action is None:
+                return
+            if action == open_folder_act:
+                self.open_folder_requested.emit(self._date_folder_path)
+            elif action == import_act:
+                self.import_requested.emit()
+            elif action == history_act and self._show_history_action:
+                self.history_requested.emit()
+            return
+
+        open_act = menu.addAction(_icon("file"), "Open")
+        open_folder_act = menu.addAction(_icon("folder-open"), "Open folder")
+        rename_act = menu.addAction(_icon("copy"), "Rename")
+        menu.addSeparator()
+        delete_act = menu.addAction(_icon_red("x"), "Delete")
+        menu.addSeparator()
+        import_act = menu.addAction(_icon("upload"), "Import")
+        if self._show_history_action:
+            menu.addSeparator()
+            history_act = menu.addAction(_icon("layers"), "History")
+        else:
+            history_act = None
+        action = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if action is None:
+            return
+        if action == open_act:
+            self._tree_open_path(path)
+        elif action == open_folder_act:
+            self._tree_open_folder(path)
+        elif action == rename_act:
+            self._tree.edit(idx)
+        elif action == delete_act:
+            self._tree_delete_path(path, idx)
+        elif action == import_act:
+            self.import_requested.emit()
+        elif action == history_act and self._show_history_action:
+            self.history_requested.emit()
+
+    def _tree_open_path(self, path: Path) -> None:
+        """Open file with default app or folder in explorer."""
+        if path.is_dir():
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+            except Exception:
+                pass
+        else:
+            try:
+                os.startfile(path.resolve())
+            except (OSError, AttributeError):
+                try:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+                except Exception:
+                    pass
+
+    def _tree_open_folder(self, path: Path) -> None:
+        """Open containing folder in explorer (parent if item is file)."""
+        target = path if path.is_dir() else path.parent
+        if target.is_dir():
+            self.open_folder_requested.emit(target)
+
+    def _tree_delete_path(self, path: Path, index) -> None:
+        """Delete file or folder after confirmation."""
+        name = path.name or str(path)
+        if path.is_dir():
+            msg = f"Delete folder \"{name}\" and all its contents?"
+        else:
+            msg = f"Delete file \"{name}\"?"
+        if QMessageBox.question(
+            self._tree,
+            "Delete",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            parent_idx = index.parent()
+            if parent_idx.isValid():
+                self._fs_model.refresh(parent_idx)
+            else:
+                self._fs_model.refresh(index)
+        except OSError as e:
+            QMessageBox.warning(self._tree, "Delete", f"Could not delete: {e}")
+
+    def _on_tree_double_clicked(self, index) -> None:
+        if not index.isValid():
+            return
+        path = Path(self._fs_model.filePath(index))
+        if path.is_file():
+            try:
+                os.startfile(path.resolve())
+            except OSError:
+                pass
 
     def eventFilter(self, obj: QWidget, event: QEvent) -> bool:
         if obj is self._tree and event.type() == QEvent.Type.FocusIn:
@@ -300,7 +427,8 @@ class InboxTreePane(QWidget):
                 if idx.isValid():
                     self._tree.expand(idx)
 
-        QTimer.singleShot(0, apply)
+        # Defer so root index and model are ready (e.g. after set_date_folder_path / setRootIndex).
+        QTimer.singleShot(50, apply)
 
 
 class ReferenceTreePane(QWidget):

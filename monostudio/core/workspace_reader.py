@@ -24,9 +24,14 @@ def read_project_quick_stats(project_root: Path) -> ProjectQuickStats:
     Lightweight, read-only project stats for the Projects browser.
     Avoid deep scans: counts only folder structure.
     """
+    from monostudio.core.structure_registry import StructureRegistry
+
+    struct_reg = StructureRegistry.for_project(project_root)
+    _assets_folder = struct_reg.get_folder("assets")
+    _shots_folder = struct_reg.get_folder("shots")
 
     def _count_shots() -> int | None:
-        shots_dir = project_root / "shots"
+        shots_dir = project_root / _shots_folder
         try:
             if not shots_dir.is_dir():
                 return 0
@@ -35,7 +40,7 @@ def read_project_quick_stats(project_root: Path) -> ProjectQuickStats:
             return None
 
     def _count_assets() -> int | None:
-        assets_dir = project_root / "assets"
+        assets_dir = project_root / _assets_folder
         try:
             if not assets_dir.is_dir():
                 return 0
@@ -51,13 +56,9 @@ def read_project_quick_stats(project_root: Path) -> ProjectQuickStats:
         except OSError:
             return None
 
-    # Status is derived (no user-facing enforcement):
-    # - BLOCKED: required folders missing
-    # - PROGRESS: has any assets/shots
-    # - WAITING: structure exists but empty / unknown
     try:
-        has_assets_dir = (project_root / "assets").is_dir()
-        has_shots_dir = (project_root / "shots").is_dir()
+        has_assets_dir = (project_root / _assets_folder).is_dir()
+        has_shots_dir = (project_root / _shots_folder).is_dir()
     except OSError:
         has_assets_dir = False
         has_shots_dir = False

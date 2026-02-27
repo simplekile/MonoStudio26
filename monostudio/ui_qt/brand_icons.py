@@ -52,11 +52,27 @@ def _apply_fill(svg: str, color_hex: str) -> str:
     return svg
 
 
+def _render_brand_pixmap(renderer: QSvgRenderer, size_px: int) -> QPixmap:
+    """Render SVG into a pixmap at size_px x size_px (antialiased)."""
+    pix = QPixmap(size_px, size_px)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    try:
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        renderer.render(p, QRect(0, 0, size_px, size_px))
+    finally:
+        p.end()
+    return pix
+
+
 @lru_cache(maxsize=256)
 def brand_icon(slug: str, *, size: int = 16, color_hex: str | None = None) -> QIcon:
     """
     Render a brand SVG (from monostudio_data/icons/brands) into a QIcon at fixed size.
     Cached to avoid per-paint parsing.
+    Adds @1x and @2x pixmaps so icons stay sharp on HiDPI.
     """
     svg = _read_svg_text(slug)
     if not svg:
@@ -68,14 +84,10 @@ def brand_icon(slug: str, *, size: int = 16, color_hex: str | None = None) -> QI
     if not renderer.isValid():
         return QIcon()
 
-    pix = QPixmap(size, size)
-    pix.fill(Qt.transparent)
-    p = QPainter(pix)
-    try:
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setRenderHint(QPainter.TextAntialiasing, True)
-        renderer.render(p, QRect(0, 0, size, size))
-    finally:
-        p.end()
-    return QIcon(pix)
+    pix_1x = _render_brand_pixmap(renderer, size)
+    out = QIcon(pix_1x)
+    pix_2x = _render_brand_pixmap(renderer, size * 2)
+    pix_2x.setDevicePixelRatio(2.0)
+    out.addPixmap(pix_2x)
+    return out
 

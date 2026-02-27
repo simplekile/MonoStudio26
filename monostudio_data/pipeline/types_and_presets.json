@@ -4,7 +4,7 @@
       "id": "shot",
       "name": "Shot",
       "short_name": "sh",
-      "departments": ["layout", "anim", "fx", "lighting"],
+      "departments": ["layout", "anim", "fx", "lighting", "comp"],
       "icon_name": "clapperboard"
     },
     "character": {
@@ -27,23 +27,30 @@
       "short_name": "env",
       "departments": ["layout", "sculpt", "retopo", "uv", "lighting", "lookdev"],
       "icon_name": "trees"
+    },
+    "vehicle": {
+      "id": "_vehicles",
+      "name": "Vehicle",
+      "short_name": "veh",
+      "departments": ["sculpt", "retopo", "uv", "geoclean", "rig", "baking", "texturing", "lookdev"],
+      "icon_name": "car"
     }
   },
   "departments": {
     "layout": {"name": "Layout", "short_name": "lay", "icon_name": "layout-dashboard"},
     "modelling": {"name": "Modelling", "short_name": "mod", "icon_name": "box"},
-    "sculpt": {"name": "Sculpt", "short_name": "scl", "icon_name": "box", "parent": "modelling"},
-    "retopo": {"name": "Retopo", "short_name": "rto", "icon_name": "box", "parent": "modelling"},
-    "uv": {"name": "UV", "short_name": "uv", "icon_name": "box", "parent": "modelling"},
+    "sculpt": {"name": "Sculpt", "short_name": "scl", "icon_name": "zbrush", "parent": "modelling"},
+    "retopo": {"name": "Retopo", "short_name": "rto", "icon_name": "hexagon", "parent": "modelling"},
+    "uv": {"name": "UV", "short_name": "uv", "icon_name": "checkerboard", "parent": "modelling"},
     "rigging": {"name": "Rigging", "short_name": "rig", "icon_name": "bone"},
-    "geoclean": {"name": "Clean Geo", "short_name": "geo", "icon_name": "box", "parent": "rigging"},
+    "geoclean": {"name": "Clean Geo", "short_name": "geo", "icon_name": "brush-cleaning", "parent": "rigging"},
     "rig": {"name": "Build Rig", "short_name": "br", "icon_name": "bone", "parent": "rigging"},
     "surfacing": {"name": "Surfacing", "short_name": "surf", "icon_name": "palette"},
-    "baking": {"name": "Baking", "short_name": "bak", "icon_name": "palette", "parent": "surfacing"},
+    "baking": {"name": "Baking", "short_name": "bak", "icon_name": "chef-hat", "parent": "surfacing"},
     "texturing": {"name": "Texturing", "short_name": "tex", "icon_name": "palette", "parent": "surfacing"},
     "grooming": {"name": "Grooming", "short_name": "grm", "icon_name": "scissors"},
     "lookdev": {"name": "Lookdev", "short_name": "ldv", "icon_name": "sparkles"},
-    "anim": {"name": "Animation", "short_name": "anim", "icon_name": "clapperboard"},
+    "anim": {"name": "Animation", "short_name": "anim", "icon_name": "spline"},
     "fx": {"name": "FX", "short_name": "fx", "icon_name": "zap"},
     "lighting": {"name": "Lighting", "short_name": "lgt", "icon_name": "lightbulb"},
     "comp": {"name": "Comp", "short_name": "comp", "icon_name": "sliders-horizontal"}

@@ -30,12 +30,27 @@ def _read_svg_text(name: str) -> str | None:
         return None
 
 
+def _render_lucide_pixmap(renderer: QSvgRenderer, size_px: int) -> QPixmap:
+    """Render SVG into a pixmap at size_px x size_px (antialiased)."""
+    pix = QPixmap(size_px, size_px)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    try:
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        renderer.render(p, QRect(0, 0, size_px, size_px))
+    finally:
+        p.end()
+    return pix
+
+
 @lru_cache(maxsize=512)
 def lucide_icon(name: str, *, size: int = 16, color_hex: str | None = None) -> QIcon:
     """
     Render a Lucide SVG into a QIcon at a fixed size.
     - Uses cached pixmaps (no per-paint parsing)
     - Replaces "currentColor" with provided color
+    - Adds @1x and @2x pixmaps so icons stay sharp on HiDPI (no blur)
     """
     svg = _read_svg_text(name)
     if not svg:
@@ -48,14 +63,14 @@ def lucide_icon(name: str, *, size: int = 16, color_hex: str | None = None) -> Q
     if not renderer.isValid():
         return QIcon()
 
-    pix = QPixmap(size, size)
-    pix.fill(Qt.transparent)
-    p = QPainter(pix)
-    try:
-        p.setRenderHint(QPainter.Antialiasing, True)
-        renderer.render(p, QRect(0, 0, size, size))
-    finally:
-        p.end()
+    # @1x: logical size (e.g. 16x16)
+    pix_1x = _render_lucide_pixmap(renderer, size)
+    out = QIcon(pix_1x)
 
-    return QIcon(pix)
+    # @2x: double resolution so HiDPI displays use crisp icon (no scaling blur)
+    pix_2x = _render_lucide_pixmap(renderer, size * 2)
+    pix_2x.setDevicePixelRatio(2.0)
+    out.addPixmap(pix_2x)
+
+    return out
 

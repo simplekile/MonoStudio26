@@ -4,11 +4,12 @@ import base64
 import json
 import logging
 import shutil
+import sys
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, Qt, QSettings, Signal, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, Qt, QRect, QSettings, Signal, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
-from PySide6.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMenu, QMessageBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget
 from qframelesswindow import FramelessMainWindow
 
 from monostudio.core.app_paths import get_app_base_path
@@ -21,6 +22,7 @@ from monostudio.core.fs_reader import (
     run_incremental_scan,
 )
 from monostudio.core.models import Asset, ProjectIndex, Shot
+from monostudio.core.structure_registry import StructureRegistry
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.workspace_reader import DiscoveredProject, ProjectQuickStats, discover_projects, read_project_quick_stats
 from monostudio.core.project_create import create_new_project
@@ -30,11 +32,13 @@ from monostudio.core.pipeline_types_and_presets import (
     seed_project_from_user_default,
 )
 from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
-from monostudio.core.item_status import read_item_status, write_item_status
 from monostudio.core.pending_create import remove_by_entity, remove_for_entities, clear_all as pending_clear_all
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
 from monostudio.core.inbox_reader import add_to_inbox, append_inbox_distributed
+from monostudio.core.outbox_reader import add_to_outbox
+from monostudio.ui_qt.inbox_drop_dialog import InboxDropDialog
 from monostudio.ui_qt.inbox_page_widget import InboxPageWidget
+from monostudio.ui_qt.outbox_page_widget import OutboxPageWidget
 from monostudio.ui_qt.reference_page_widget import ReferencePageWidget
 from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
@@ -102,7 +106,7 @@ class MainWindow(FramelessMainWindow):
             self,
             app_state=self._app_state,
             worker_manager=self._worker_manager,
-            size_px=384,
+            size_px=512,
             max_memory=200,
         )
         self._fs_watcher = QFileSystemWatcher(self)
@@ -117,6 +121,12 @@ class MainWindow(FramelessMainWindow):
         self.current_type: str | None = None
         self.current_search_query: str = ""
         meta = load_pipeline_types_and_presets()
+        self._dept_icon_map: dict[str, str] = {
+            k: v.icon_name for k, v in meta.departments.items() if v.icon_name
+        }
+        self._type_short_name_map: dict[str, str] = {
+            k: v.short_name for k, v in meta.types.items() if v.short_name
+        }
         self._type_name_by_id: dict[str, str] = {k: v.name for k, v in meta.types.items()}
         # Type aliases allow robust matching against filesystem folder names:
         # e.g. "environment" may appear as "env" or "Environment" in legacy projects.
@@ -138,6 +148,7 @@ class MainWindow(FramelessMainWindow):
         self._content_stack = QStackedWidget()
         self._content_stack.addWidget(self._main_view)
         self._inbox_page_widget: InboxPageWidget | None = None
+        self._outbox_page_widget: OutboxPageWidget | None = None
         self._reference_page_widget: ReferencePageWidget | None = None
         self._inspector = InspectorPanel()
         self._inspector.set_thumbnail_manager(self._thumbnail_manager)
@@ -145,6 +156,7 @@ class MainWindow(FramelessMainWindow):
         self._top_bar = TopBar(self)
         self._top_bar.setFixedHeight(56)  # so FramelessMainWindow resize keeps height
         self.setTitleBar(self._top_bar)  # replace library title bar with MONOS TopBar
+        self._geometry_before_maximize: QRect | None = None  # restore về đúng kích thước khi bấm restore
         self._clipboard_thumbs = ClipboardThumbnailHandler(parent=self)
 
         # Topbar replaces the menu bar (no menus).
@@ -198,6 +210,7 @@ class MainWindow(FramelessMainWindow):
         self._sidebar.context_menu_requested.connect(self._on_sidebar_context_menu_requested)
         self._sidebar.settings_requested.connect(self._open_settings)
         self._sidebar.recent_task_clicked.connect(self._on_recent_task_clicked)
+        self._sidebar.recent_task_double_clicked.connect(self._on_recent_task_double_clicked)
         # Metadata-driven filter sidebar (UI-only; wiring stub).
         self._sidebar.filters().departmentClicked.connect(self._controller.on_department_clicked)
         self._sidebar.filters().typeClicked.connect(self._controller.on_type_clicked)
@@ -215,6 +228,7 @@ class MainWindow(FramelessMainWindow):
         self._top_bar.title_double_clicked.connect(self._toggle_maximize)
         self._inspector.close_requested.connect(self._main_view.clear_selection)
         self._inspector.paste_thumbnail_requested.connect(self._on_paste_thumbnail_requested)
+        self._inspector.remove_thumbnail_requested.connect(self._on_remove_thumbnail_requested)
         self._main_view.valid_selection_changed.connect(self._on_valid_selection_changed)
         self._main_view.item_activated.connect(self._on_item_activated)
         self._main_view.refresh_requested.connect(self._on_refresh_requested)
@@ -233,14 +247,21 @@ class MainWindow(FramelessMainWindow):
         # Clipboard thumbnail overrides: refresh UI after successful paste.
         self._clipboard_thumbs.thumbnailUpdated.connect(self._on_thumbnail_updated)
         self._main_view.delete_requested.connect(self._on_delete_requested)
-        self._main_view.status_set_requested.connect(self._on_status_set_requested)
+        self._main_view.switch_project_requested.connect(self._on_switch_project_requested)
         self._main_view.primary_action_requested.connect(self._on_primary_action_requested)
         self._main_view.search_query_changed.connect(self._on_search_query_changed)
+        self._main_view.show_publish_changed.connect(self._on_show_publish_changed)
+        self._main_view.open_publish_folder_requested.connect(self._on_open_publish_folder_requested)
+        self._main_view.dcc_open_requested.connect(self._on_dcc_open_requested)
+        self._main_view.dcc_folder_requested.connect(self._on_dcc_folder_requested)
+        self._main_view.dcc_copy_path_requested.connect(self._on_dcc_copy_path_requested)
+        self._main_view.dcc_delete_requested.connect(self._on_dcc_delete_requested)
 
         # Inspector intents (explicit)
         self._inspector.open_folder_requested.connect(self._on_inspector_open_folder_requested)
-        self._inspector.status_change_requested.connect(self._on_status_set_requested)
         self._inspector.inbox_distribute_finished.connect(self._on_inbox_distribute_finished)
+        self._inspector.active_dcc_changed.connect(self._on_inspector_active_dcc_changed)
+        self._main_view.active_dcc_changed.connect(self._on_main_view_active_dcc_changed)
 
         # Restore last nav page (Assets/Shots/Inbox/...) after connections so Inbox switch builds split view.
         self._restore_sidebar_context()
@@ -349,7 +370,7 @@ class MainWindow(FramelessMainWindow):
         if getattr(self, "_context_switch_in_progress", False):
             return
         ctx = self._sidebar.current_context()
-        if ctx not in ("Assets", "Inbox", "Project Guide"):
+        if ctx not in ("Assets", "Inbox", "Project Guide", "Outbox"):
             return
         if ctx == "Inbox" and getattr(self, "_inbox_switch_cooldown", False):
             return
@@ -376,10 +397,11 @@ class MainWindow(FramelessMainWindow):
                 pass
 
     def _set_main_view_department(self, _value: object = None) -> None:
-        """Sync main view header + thumb badge with current department (pipeline label/icon for subdepartments)."""
+        """Sync main view header + thumb badge + inspector preview with current department."""
         dep = self._controller.current_department
         label, icon_name = self._sidebar.filters().get_department_display(dep) if dep else (None, None)
         self._main_view.set_active_department(dep, label=label, icon_name=icon_name)
+        self._inspector.set_active_department(dep)
 
     def _set_main_view_type(self) -> None:
         """Sync main view type badge: Assets = asset type (Character, Prop, …)."""
@@ -412,6 +434,14 @@ class MainWindow(FramelessMainWindow):
             return
         self.current_type = new
         self._app_state.set_filters(self.current_department, self.current_type)
+        # When on Inbox, keep page filter in sync and restore tree for that type if we had one open.
+        if self._sidebar.current_context() == "Inbox" and self._inbox_page_widget is not None:
+            self._inbox_page_widget.set_type_filter(self.current_type or "")
+            self._restore_inbox_date_folder_state()
+        # When on Outbox, same: restore tree for that type if we had a date folder open.
+        if self._sidebar.current_context() == "Outbox" and self._outbox_page_widget is not None:
+            self._outbox_page_widget.set_type_filter(self.current_type or "")
+            self._restore_outbox_date_folder_state()
         self.typeChanged.emit(new)
 
     def _sync_filter_state_from_sidebar(self) -> None:
@@ -434,6 +464,12 @@ class MainWindow(FramelessMainWindow):
                     self._app_state.set_filters(self.current_department, self.current_type)
                 if d is not None:
                     self.current_department = d
+                    self._app_state.set_filters(self.current_department, self.current_type)
+            elif ctx == "Outbox":
+                filters = self._sidebar.filters()
+                t = filters.current_type()
+                if t is not None:
+                    self.current_type = t
                     self._app_state.set_filters(self.current_department, self.current_type)
             elif ctx == "Project Guide":
                 filters = self._sidebar.filters()
@@ -624,7 +660,8 @@ class MainWindow(FramelessMainWindow):
         """
         Explicit override only:
         - Available only from Inspector thumbnail UI / preview context menu.
-        - Reads image from clipboard, normalizes, writes thumbnail.user.(png|jpg).
+        - Reads image from clipboard, normalizes, writes thumbnail.
+        - When a department is active, writes to .meta/thumb_{dept}.user.png.
         """
         if not isinstance(item, ViewItem):
             return
@@ -632,17 +669,55 @@ class MainWindow(FramelessMainWindow):
             return
 
         kind = "asset" if item.kind == ViewItemKind.ASSET else "shot"
+        active_dept = (self._controller.current_department or "").strip() or None
         try:
-            # Use absolute path as a stable item id for refresh routing.
-            self._clipboard_thumbs.paste_thumbnail(item_root=item.path, kind=kind, item_id=str(item.path), fmt="png")
+            self._clipboard_thumbs.paste_thumbnail(
+                item_root=item.path,
+                kind=kind,
+                item_id=str(item.path),
+                department=active_dept,
+                fmt="png",
+            )
         except Exception as e:
-            # Explicit error; do not crash app.
             QMessageBox.critical(self, "Paste Thumbnail", str(e))
             return
 
-        # Refresh Inspector + grid immediately.
         self._inspector.refresh_thumbnail()
-        self._main_view.invalidate_thumbnail(item.path)
+        self._main_view.invalidate_thumbnail(item.path, department=active_dept)
+
+    def _on_remove_thumbnail_requested(self, item: object) -> None:
+        """Remove user thumbnail files for the item (and active department if set)."""
+        if not isinstance(item, ViewItem):
+            return
+        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        active_dept = (self._controller.current_department or "").strip() or None
+        root = Path(item.path)
+        if not root.is_dir():
+            return
+        removed = False
+        for name in ("thumbnail.user.png", "thumbnail.user.jpg"):
+            p = root / name
+            if p.is_file():
+                try:
+                    p.unlink()
+                    removed = True
+                except OSError:
+                    pass
+        if active_dept:
+            meta = root / ".meta"
+            for name in (f"thumb_{active_dept}.user.png", f"thumb_{active_dept}.user.jpg"):
+                p = meta / name
+                if p.is_file():
+                    try:
+                        p.unlink()
+                        removed = True
+                    except OSError:
+                        pass
+        if removed:
+            self._app_state.invalidate_thumbnails([str(item.path)])
+            self._inspector.refresh_thumbnail()
+            self._main_view.invalidate_thumbnail(item.path, department=active_dept)
 
     def _on_thumbnail_updated(self, item_id: object) -> None:
         """
@@ -704,22 +779,6 @@ class MainWindow(FramelessMainWindow):
             self._inspector.set_item(None)
         self._sync_primary_action()
 
-    def _on_status_set_requested(self, item: ViewItem, status: str) -> None:
-        """Write user-set status to .monostudio/status.json and refresh list (no rescan)."""
-        if item.kind.value not in ("asset", "shot"):
-            return
-        try:
-            write_item_status(Path(item.path), status)
-        except (ValueError, OSError) as e:
-            logging.warning("Failed to write item status: %s", e)
-            return
-        self._reload_main_view()
-        if self._main_view.select_item_by_path(item.path):
-            cur = self._main_view.selected_view_item()
-            if cur:
-                self._inspector.set_item(cur)
-        self._sync_primary_action()
-
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)
         self._apply_workspace_root(path or None, save=False)
@@ -729,8 +788,8 @@ class MainWindow(FramelessMainWindow):
         self._apply_project_root(path or None, save=False)
 
     def _restore_sidebar_context(self) -> None:
-        """Restore last selected nav page (Assets/Shots/Inbox/Projects/Library) from QSettings."""
-        _valid = ("Assets", "Shots", "Inbox", "Project Guide", "Projects", "Library")
+        """Restore last selected nav page (Assets/Shots/Inbox/Projects/Outbox) from QSettings."""
+        _valid = ("Assets", "Shots", "Inbox", "Project Guide", "Projects", "Outbox")
         ctx = (self._settings.value("ui/sidebar_context", "Assets", str) or "Assets").strip()
         if ctx in _valid:
             self._sidebar.set_current_context(ctx)
@@ -749,7 +808,7 @@ class MainWindow(FramelessMainWindow):
 
             self._main_view.set_context_title(context_name)
             self._entered_parent = None
-            if context_name not in ("Inbox", "Project Guide"):
+            if context_name not in ("Inbox", "Project Guide", "Outbox"):
                 self._content_stack.setCurrentWidget(self._main_view)
                 self._main_view.clear()
                 self._inspector.set_inbox_distribute_paths([], None, None)
@@ -781,6 +840,8 @@ class MainWindow(FramelessMainWindow):
                     self._inbox_page_widget.tree_distribute_paths_changed.connect(self._on_inbox_tree_distribute_paths_changed)
                     self._inbox_page_widget.open_folder_requested.connect(self._on_inbox_open_folder_requested)
                     self._inbox_page_widget.drop_requested.connect(self._on_inbox_drop_requested)
+                    self._inbox_page_widget.import_requested.connect(self._on_inbox_import_requested)
+                    self._inbox_page_widget.date_folder_entered.connect(self._on_inbox_date_folder_entered)
                     self._content_stack.addWidget(self._inbox_page_widget)
                 self._inbox_page_widget.set_project_root(self._project_root)
                 self._inbox_page_widget.set_type_filter(self._sidebar.filters().current_type() or "")
@@ -797,6 +858,21 @@ class MainWindow(FramelessMainWindow):
                 self._reference_page_widget.set_project_root(self._project_root)
                 self._reference_page_widget.set_department(self._sidebar.filters().current_department() or "reference")
                 self._content_stack.setCurrentWidget(self._reference_page_widget)
+                self._inspector.set_inbox_tree_preview(None)
+            elif context_name == "Outbox":
+                self._sync_filter_state_from_sidebar()
+                if self._outbox_page_widget is None:
+                    self._outbox_page_widget = OutboxPageWidget(self)
+                    self._outbox_page_widget.tree_selection_changed.connect(self._on_outbox_tree_selection_changed)
+                    self._outbox_page_widget.open_folder_requested.connect(self._on_outbox_open_folder_requested)
+                    self._outbox_page_widget.drop_requested.connect(self._on_outbox_drop_requested)
+                    self._outbox_page_widget.import_requested.connect(self._on_outbox_import_requested)
+                    self._outbox_page_widget.date_folder_entered.connect(self._on_outbox_date_folder_entered)
+                    self._content_stack.addWidget(self._outbox_page_widget)
+                self._outbox_page_widget.set_project_root(self._project_root)
+                self._outbox_page_widget.set_type_filter(self._sidebar.filters().current_type() or "")
+                self._content_stack.setCurrentWidget(self._outbox_page_widget)
+                self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
             elif context_name == "Projects":
                 self._reload_main_view()
@@ -830,6 +906,9 @@ class MainWindow(FramelessMainWindow):
                     self._main_view.clear()
                 self._reload_main_view()
             elif context_name == "Inbox":
+                self._sync_filter_state_from_sidebar()
+                self._reload_main_view()
+            elif context_name == "Outbox":
                 self._sync_filter_state_from_sidebar()
                 self._reload_main_view()
             elif context_name == "Project Guide":
@@ -874,7 +953,7 @@ class MainWindow(FramelessMainWindow):
             return
 
         selected = self._main_view.selected_view_item()
-        self._inspector.set_item(selected)
+        self._inspector.set_item(selected, active_department_hint=self.current_department)
 
     def _asset_passes_filter(self, asset: Asset | None) -> bool:
         if asset is None:
@@ -925,7 +1004,6 @@ class MainWindow(FramelessMainWindow):
 
         def view_item_builder(asset: Asset) -> ViewItem:
             type_folder = (type_reg.get_type_folder(asset.asset_type) or "").strip() if type_reg else ""
-            user_status = read_item_status(asset.path)
             return ViewItem(
                 kind=ViewItemKind.ASSET,
                 name=asset.name,
@@ -934,7 +1012,6 @@ class MainWindow(FramelessMainWindow):
                 departments_count=len(asset.departments),
                 ref=asset,
                 type_folder=type_folder,
-                user_status=user_status,
             )
 
         # Capture before apply: apply may clear selection and emit None, overwriting AppState
@@ -954,7 +1031,6 @@ class MainWindow(FramelessMainWindow):
             s = self._app_state.get_shot(item_id)
             if s is None:
                 return None
-            user_status = read_item_status(s.path)
             return ViewItem(
                 kind=ViewItemKind.SHOT,
                 name=s.name,
@@ -962,7 +1038,6 @@ class MainWindow(FramelessMainWindow):
                 path=s.path,
                 departments_count=len(s.departments),
                 ref=s,
-                user_status=user_status,
             )
 
         _sid = self._app_state.selection_id()
@@ -1135,10 +1210,16 @@ class MainWindow(FramelessMainWindow):
             try:
                 dept_reg = DepartmentRegistry.for_project(self._project_root)
                 self._inspector.set_department_registry(dept_reg)
+                self._inspector.set_department_icon_map(self._dept_icon_map)
+                self._inspector.set_type_short_name_map(self._type_short_name_map)
             except Exception:
                 self._inspector.set_department_registry(None)
+                self._inspector.set_department_icon_map({})
+                self._inspector.set_type_short_name_map({})
         else:
             self._inspector.set_department_registry(None)
+            self._inspector.set_department_icon_map({})
+            self._inspector.set_type_short_name_map({})
 
         # Reload index if root set; otherwise clear.
         if self._project_root is None:
@@ -1317,8 +1398,9 @@ class MainWindow(FramelessMainWindow):
         to_add: list[str] = []
         if root.is_dir():
             to_add.append(str(root))
-        assets_dir = root / "assets"
-        shots_dir = root / "shots"
+        struct_reg = StructureRegistry.for_project(root)
+        assets_dir = root / struct_reg.get_folder("assets")
+        shots_dir = root / struct_reg.get_folder("shots")
         if assets_dir.is_dir():
             to_add.append(str(assets_dir))
         if shots_dir.is_dir():
@@ -1387,6 +1469,12 @@ class MainWindow(FramelessMainWindow):
                             if s not in _seen:
                                 _seen.add(s)
                                 to_add.append(s)
+                    pp = dept.publish_path if Path(dept.publish_path).is_absolute() else (root / dept.publish_path).resolve()
+                    if pp.is_dir() and len(to_add) < _max_paths:
+                        s = str(pp)
+                        if s not in _seen:
+                            _seen.add(s)
+                            to_add.append(s)
             for shot in self._project_index.shots:
                 base = Path(shot.path)
                 if not base.is_absolute():
@@ -1417,6 +1505,12 @@ class MainWindow(FramelessMainWindow):
                             if s not in _seen:
                                 _seen.add(s)
                                 to_add.append(s)
+                    pp = dept.publish_path if Path(dept.publish_path).is_absolute() else (root / dept.publish_path).resolve()
+                    if pp.is_dir() and len(to_add) < _max_paths:
+                        s = str(pp)
+                        if s not in _seen:
+                            _seen.add(s)
+                            to_add.append(s)
         if to_add:
             added = self._fs_watcher.addPaths(to_add)
             failed = len(to_add) - len(added)
@@ -1452,6 +1546,10 @@ class MainWindow(FramelessMainWindow):
             self._inbox_page_widget.set_project_root(self._project_root)
             self._inbox_page_widget.set_type_filter(self._sidebar.filters().current_type() or "")
             return
+        if context == "Outbox" and self._outbox_page_widget is not None:
+            self._outbox_page_widget.set_project_root(self._project_root)
+            self._outbox_page_widget.set_type_filter(self._sidebar.filters().current_type() or "")
+            return
         if context == "Project Guide" and self._reference_page_widget is not None:
             self._reference_page_widget.set_project_root(self._project_root)
             self._reference_page_widget.set_department(self._sidebar.filters().current_department() or "reference")
@@ -1463,6 +1561,7 @@ class MainWindow(FramelessMainWindow):
 
         # Projects context: show workspace discovery results (read-only).
         if context == "Projects":
+            self._main_view.set_active_department(None)
             self._main_view.set_selected_asset_type(None)
             for proj in self._workspace_projects:
                 stats: ProjectQuickStats | None
@@ -1503,7 +1602,6 @@ class MainWindow(FramelessMainWindow):
             type_reg = TypeRegistry.for_project(self._project_root) if self._project_root else None
             for asset in filtered_assets:
                 type_folder = (type_reg.get_type_folder(asset.asset_type) or "").strip() if type_reg else ""
-                user_status = read_item_status(asset.path)
                 items.append(
                     ViewItem(
                         kind=ViewItemKind.ASSET,
@@ -1513,12 +1611,10 @@ class MainWindow(FramelessMainWindow):
                         departments_count=len(asset.departments),
                         ref=asset,
                         type_folder=type_folder,
-                        user_status=user_status,
                     )
                 )
         elif context == "Shots":
             for shot in self._app_state.get_shots_in_order():
-                user_status = read_item_status(shot.path)
                 items.append(
                     ViewItem(
                         kind=ViewItemKind.SHOT,
@@ -1527,7 +1623,6 @@ class MainWindow(FramelessMainWindow):
                         path=shot.path,
                         departments_count=len(shot.departments),
                         ref=shot,
-                        user_status=user_status,
                     )
                 )
         else:
@@ -1544,6 +1639,7 @@ class MainWindow(FramelessMainWindow):
         if context in ("Assets", "Shots"):
             self._set_main_view_department()
             self._set_main_view_type()
+            self._inspector.set_show_publish(self._main_view.get_show_publish())
         else:
             self._main_view.set_active_department(None)
             self._main_view.set_selected_asset_type(None)
@@ -1587,25 +1683,42 @@ class MainWindow(FramelessMainWindow):
             return
         return
 
-    def _inbox_date_folder_settings_key(self) -> str:
-        return "inbox/last_date_folder_path"
+    def _inbox_date_folder_settings_key(self, source_type: str) -> str:
+        key = (source_type or "client").strip().lower()
+        if key not in ("client", "freelancer"):
+            key = "client"
+        return f"inbox/last_date_folder_path/{key}"
 
     def _inbox_restore_split_key(self) -> str:
         return "inbox/restore_split_view"
 
-    def _save_inbox_date_folder_state(self, path: Path) -> None:
-        if path and path.is_dir() and self._project_root and str(path).startswith(str(self._project_root)):
-            self._settings.setValue(self._inbox_date_folder_settings_key(), str(path.resolve()))
+    def _on_inbox_date_folder_entered(self, source_type: str, path: Path) -> None:
+        """Persist which date folder is open per Client/Freelancer so we can restore when switching back."""
+        self._save_inbox_date_folder_state(source_type, path)
+
+    def _save_inbox_date_folder_state(self, source_type: str, path: Path) -> None:
+        if not path or not path.is_dir() or not self._project_root:
+            return
+        if not str(path).startswith(str(self._project_root)):
+            return
+        key = self._inbox_date_folder_settings_key(source_type)
+        self._settings.setValue(key, str(path.resolve()))
 
     def _restore_inbox_date_folder_state(self) -> bool:
-        """Restore Inbox date folder (tree) when user had it open. Returns True if restored."""
-        if not self._inbox_page_widget:
+        """Restore Inbox date folder (tree) for current type when user had it open. Returns True if restored."""
+        if not self._inbox_page_widget or not self._project_root:
             return False
         raw = self._settings.value(self._inbox_restore_split_key(), True)
         if raw in (False, "false", "0", 0):
             return False
-        path_str = self._settings.value(self._inbox_date_folder_settings_key(), "", str)
-        if not path_str or not self._project_root:
+        # Already in tree view (same type) → state kept by widget, nothing to restore
+        if self._inbox_page_widget.is_showing_tree():
+            return False
+        source_type = (self._sidebar.filters().current_type() or "client").strip().lower()
+        if source_type not in ("client", "freelancer"):
+            source_type = "client"
+        path_str = self._settings.value(self._inbox_date_folder_settings_key(source_type), "", str)
+        if not path_str:
             return False
         path = Path(path_str)
         if not path.is_dir():
@@ -1616,6 +1729,53 @@ class MainWindow(FramelessMainWindow):
         except OSError:
             return False
         self._inbox_page_widget._enter_date_folder(path)
+        return True
+
+    def _outbox_date_folder_settings_key(self, source_type: str) -> str:
+        key = (source_type or "client").strip().lower()
+        if key not in ("client", "freelancer"):
+            key = "client"
+        return f"outbox/last_date_folder_path/{key}"
+
+    def _outbox_restore_split_key(self) -> str:
+        return "outbox/restore_split_view"
+
+    def _on_outbox_date_folder_entered(self, source_type: str, path: Path) -> None:
+        """Persist which date folder is open per Client/Freelancer so we can restore when switching back."""
+        self._save_outbox_date_folder_state(source_type, path)
+
+    def _save_outbox_date_folder_state(self, source_type: str, path: Path) -> None:
+        if not path or not path.is_dir() or not self._project_root:
+            return
+        if not str(path).startswith(str(self._project_root)):
+            return
+        key = self._outbox_date_folder_settings_key(source_type)
+        self._settings.setValue(key, str(path.resolve()))
+
+    def _restore_outbox_date_folder_state(self) -> bool:
+        """Restore Outbox date folder (tree) for current type when user had it open. Returns True if restored."""
+        if not self._outbox_page_widget or not self._project_root:
+            return False
+        raw = self._settings.value(self._outbox_restore_split_key(), True)
+        if raw in (False, "false", "0", 0):
+            return False
+        if self._outbox_page_widget.is_showing_tree():
+            return False
+        source_type = (self._sidebar.filters().current_type() or "client").strip().lower()
+        if source_type not in ("client", "freelancer"):
+            source_type = "client"
+        path_str = self._settings.value(self._outbox_date_folder_settings_key(source_type), "", str)
+        if not path_str:
+            return False
+        path = Path(path_str)
+        if not path.is_dir():
+            return False
+        try:
+            if not str(path.resolve()).startswith(str(self._project_root.resolve())):
+                return False
+        except OSError:
+            return False
+        self._outbox_page_widget._enter_date_folder(path)
         return True
 
     def _on_inbox_tree_selection_changed(self, path) -> None:
@@ -1632,6 +1792,57 @@ class MainWindow(FramelessMainWindow):
             except Exception:
                 pass
 
+    def _on_outbox_tree_selection_changed(self, path) -> None:
+        """Outbox: inspector preview only (no distribute)."""
+        self._inspector.set_inbox_tree_preview(Path(path) if path else None)
+
+    def _on_outbox_open_folder_requested(self, path) -> None:
+        if path:
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            except Exception:
+                pass
+
+    def _on_outbox_import_requested(self, _date_path=None) -> None:
+        """Import (header or context menu): open file dialog, then Outbox drop dialog."""
+        if not self._project_root:
+            return
+        files, _ = QFileDialog.getOpenFileNames(self, "Import to Outbox", "", "All Files (*)")
+        if not files:
+            return
+        path_list = [Path(f) for f in files if f and Path(f).exists()]
+        if not path_list:
+            return
+        self._on_outbox_drop_requested(path_list)
+
+    def _on_outbox_drop_requested(self, paths: list) -> None:
+        """Files/folders dropped onto Outbox page: open dialog, then copy into outbox/<source>/<date>/."""
+        if not paths or not self._project_root:
+            return
+        path_list = [Path(p) for p in paths if p and Path(p).exists()]
+        if not path_list:
+            return
+        initial_source = (self._sidebar.filters().current_type() or "").strip().lower()
+        if initial_source not in ("client", "freelancer"):
+            initial_source = "client"
+        dialog = InboxDropDialog(path_list, self._project_root, initial_source, self, target="outbox")
+        if dialog.exec() != QDialog.Accepted:
+            return
+        source, date_str, description = dialog.result_values()
+        if not date_str:
+            return
+        added = 0
+        for p in path_list:
+            try:
+                result = add_to_outbox(self._project_root, p, source, date_str, description)
+                if result is not None:
+                    added += 1
+            except Exception as e:
+                logging.warning("Add to outbox failed for %s: %s", p, e)
+        if added > 0:
+            self._reload_main_view()
+            notification_service.success(f"Added {added} item{'s' if added != 1 else ''} to Outbox.")
+
     def _on_inbox_tree_distribute_paths_changed(self, paths: list) -> None:
         path_list = [Path(p) for p in paths if p] if paths else []
         self._inspector.set_inbox_distribute_paths(
@@ -1640,44 +1851,84 @@ class MainWindow(FramelessMainWindow):
             self._project_index,
         )
 
-    def _on_inbox_distribute_finished(self, paths: list) -> None:
+    def _on_inbox_distribute_finished(self, payload: list) -> None:
         from datetime import datetime, timezone
-        path_list = [Path(p) for p in paths if p] if paths else []
-        if not path_list or not self._project_root:
+        if not payload or not self._project_root:
             return
         type_filter = (self._sidebar.filters().current_type() or "client").strip().lower()
         if type_filter not in ("client", "freelancer"):
             type_filter = "client"
         iso_now = datetime.now(timezone.utc).isoformat()
-        for p in path_list:
-            append_inbox_distributed(
-                self._project_root,
-                type_filter,
-                {"path": str(p.resolve()), "distributed_at": iso_now},
-            )
+        count = 0
+        dest_label = ""
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            p = item.get("path")
+            path_str = str(Path(p).resolve()) if p else ""
+            if not path_str:
+                continue
+            if not dest_label and item.get("destination_label"):
+                dest_label = (item.get("destination_label") or "").strip()
+            entry = {
+                "path": path_str,
+                "distributed_at": iso_now,
+                "destination_id": item.get("destination_id") or "",
+                "destination_label": item.get("destination_label") or "",
+                "scope": item.get("scope") or "",
+                "entity_name": item.get("entity_name") or "",
+                "target_path": item.get("target_path") or "",
+            }
+            append_inbox_distributed(self._project_root, type_filter, entry)
+            count += 1
         if self._inbox_page_widget:
             self._inbox_page_widget.refresh_history_dialog_if_open()
+        if count > 0:
+            msg = f"Distributed {count} item{'s' if count != 1 else ''}"
+            if dest_label:
+                msg += f" to {dest_label}"
+            msg += "."
+            notification_service.success(msg)
+
+    def _on_inbox_import_requested(self, _date_path=None) -> None:
+        """Import (header or context menu): open file dialog, then InboxDropDialog."""
+        if not self._project_root:
+            return
+        files, _ = QFileDialog.getOpenFileNames(self, "Import to Inbox", "", "All Files (*)")
+        if not files:
+            return
+        path_list = [Path(f) for f in files if f and Path(f).exists()]
+        if not path_list:
+            return
+        self._on_inbox_drop_requested(path_list)
 
     def _on_inbox_drop_requested(self, paths: list) -> None:
-        """Files/folders dropped onto Inbox page: copy into inbox/<source>/<today>/ (no dialog)."""
+        """Files/folders dropped onto Inbox page: open InboxDropDialog, then copy into inbox/<source>/<date>/."""
         if not paths or not self._project_root:
             return
         path_list = [Path(p) for p in paths if p and Path(p).exists()]
         if not path_list:
             return
-        source = (self._sidebar.filters().current_type() or "").strip().lower()
-        if source not in ("client", "freelancer"):
-            source = "client"
+        initial_source = (self._sidebar.filters().current_type() or "").strip().lower()
+        if initial_source not in ("client", "freelancer"):
+            initial_source = "client"
+        dialog = InboxDropDialog(path_list, self._project_root, initial_source, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        source, date_str, description = dialog.result_values()
+        if not date_str:
+            return
         added = 0
         for p in path_list:
             try:
-                result = add_to_inbox(self._project_root, p, source, None, None)
+                result = add_to_inbox(self._project_root, p, source, date_str, description)
                 if result is not None:
                     added += 1
             except Exception as e:
                 logging.warning("Add to inbox failed for %s: %s", p, e)
         if added > 0:
             self._reload_main_view()
+            notification_service.success(f"Added {added} item{'s' if added != 1 else ''} to Inbox.")
 
     def _on_open_requested(self, item: object) -> None:
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
@@ -1727,13 +1978,150 @@ class MainWindow(FramelessMainWindow):
             logging.warning("DCC launch failed (create new): %s", e, exc_info=True)
             QMessageBox.critical(self, "Create New…", str(e))
 
-    def _on_inspector_open_folder_requested(self, item: object) -> None:
-        if not isinstance(item, ViewItem) or not getattr(item, "path", None):
+    def _on_dcc_open_requested(self, item: object, dcc_id: str, department: str) -> None:
+        if not isinstance(item, ViewItem):
             return
-        path = item.path
-        if not path.exists():
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            self._controller.open_with_dcc(item=ref, department=department, dcc=dcc_id, parent=self)
+            self._refresh_recent_tasks()
+        except Exception as e:
+            logging.warning("DCC badge open failed: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Open DCC", str(e))
+
+    def _on_dcc_folder_requested(self, item: object, dcc_id: str, department: str) -> None:
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            from monostudio.core.dcc_registry import get_default_dcc_registry
+            reg = get_default_dcc_registry()
+            use_dcc_folders = read_use_dcc_folders(self._project_root)
+            for d in ref.departments:
+                if (d.name or "").strip().casefold() == department.strip().casefold():
+                    work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
+                    folder = work_path if work_path.is_dir() else work_path.parent
+                    if folder.is_dir():
+                        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+                    return
+        except Exception as e:
+            logging.warning("DCC badge open folder failed: %s", e, exc_info=True)
+
+    def _on_dcc_copy_path_requested(self, item: object, dcc_id: str, department: str) -> None:
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            from monostudio.core.dcc_registry import get_default_dcc_registry
+            reg = get_default_dcc_registry()
+            use_dcc_folders = read_use_dcc_folders(self._project_root)
+            for d in ref.departments:
+                if (d.name or "").strip().casefold() == department.strip().casefold():
+                    work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
+                    cb = QApplication.clipboard()
+                    if cb:
+                        cb.setText(str(work_path))
+                    notification_service.success("Copied work path to clipboard.")
+                    return
+        except Exception as e:
+            logging.warning("DCC badge copy path failed: %s", e, exc_info=True)
+
+    def _on_dcc_delete_requested(self, item: object, dcc_id: str, department: str) -> None:
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        try:
+            from monostudio.core.dcc_registry import get_default_dcc_registry
+            reg = get_default_dcc_registry()
+            info = reg.get_dcc_info(dcc_id)
+            dcc_label = info.get("label", dcc_id) if isinstance(info, dict) else dcc_id
+            use_dcc_folders = read_use_dcc_folders(self._project_root)
+            target_path: Path | None = None
+            for d in ref.departments:
+                if (d.name or "").strip().casefold() == department.strip().casefold():
+                    work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
+                    target_path = work_path
+                    break
+            if target_path is None:
+                return
+            if not target_path.is_dir():
+                QMessageBox.information(self, f"Delete {dcc_label} Work Folder", "Folder does not exist.")
+                return
+            reply = QMessageBox.warning(
+                self,
+                f"Delete {dcc_label} Work Folder",
+                f"Delete the work folder and all its contents?\n\n{target_path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            import shutil
+            shutil.rmtree(target_path, ignore_errors=True)
+            notification_service.success(f"Deleted {dcc_label} work folder.")
+            self._reload_main_view()
+        except Exception as e:
+            logging.warning("DCC badge delete failed: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Delete Work Folder", str(e))
+
+    def _on_inspector_open_folder_requested(self, path_or_item: object) -> None:
+        if isinstance(path_or_item, Path):
+            path = path_or_item
+        elif isinstance(path_or_item, ViewItem) and getattr(path_or_item, "path", None):
+            path = path_or_item.path
+        else:
+            return
+        try:
+            if not path.exists():
+                if (path.name or "").strip().casefold() == "work":
+                    path.mkdir(parents=True, exist_ok=True)
+                else:
+                    return
+        except (OSError, TypeError):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _on_inspector_active_dcc_changed(self, path: object, department: str, dcc_id: str) -> None:
+        """Đồng bộ active DCC từ Inspector sang Main View (cache + repaint)."""
+        p = path if isinstance(path, Path) else (Path(str(path)) if path else None)
+        if p is None or not department or not dcc_id:
+            return
+        self._main_view.set_active_dcc(p, department, dcc_id)
+
+    def _on_main_view_active_dcc_changed(self, path: object, department: str, dcc_id: str) -> None:
+        """Đồng bộ active DCC từ Main View sang Inspector (refresh identity)."""
+        item = self._main_view.selected_view_item()
+        if not item:
+            return
+        item_path = getattr(item, "path", None)
+        if not item_path or str(item_path) != str(path):
+            return
+        self._inspector.set_item(item, active_department_hint=department)
+
+    def _on_open_publish_folder_requested(self, path: object) -> None:
+        if not isinstance(path, Path):
+            return
+        try:
+            if not path.exists():
+                return
+        except (OSError, TypeError):
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _on_show_publish_changed(self, show_publish: bool) -> None:
+        self._inspector.set_show_publish(show_publish)
+        if self._main_view.has_valid_selection():
+            item = self._main_view.selected_view_item()
+            if item is not None:
+                self._inspector.set_item(item, active_department_hint=self.current_department)
 
     def _on_recent_task_clicked(self, task: object) -> None:
         from monostudio.ui_qt.recent_tasks_store import RecentTask
@@ -1748,6 +2136,29 @@ class MainWindow(FramelessMainWindow):
         self._sidebar.filters().set_selected_department(task.department, emit=False)
         # Select the item in main view.
         self._main_view.select_item_by_path(Path(task.item_path))
+
+    def _on_recent_task_double_clicked(self, task: object) -> None:
+        from monostudio.ui_qt.recent_tasks_store import RecentTask
+        if not isinstance(task, RecentTask):
+            return
+        self._on_recent_task_clicked(task)
+        item = self._main_view.selected_view_item()
+        if item is None:
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        dept = (task.department or "").strip()
+        dcc = (task.dcc or "").strip()
+        if not dept or not dcc:
+            self._on_open_requested(item)
+            return
+        try:
+            self._controller.open_with_dcc(item=ref, department=dept, dcc=dcc, parent=self)
+            self._refresh_recent_tasks()
+        except Exception as e:
+            logging.warning("DCC launch failed (recent task): %s", e, exc_info=True)
+            QMessageBox.critical(self, "Open DCC", str(e))
 
     def _new_project(self) -> None:
         if self._workspace_root is None:
@@ -1832,28 +2243,63 @@ class MainWindow(FramelessMainWindow):
         return get_app_base_path() / "monostudio_data" / "config" / "app_settings.json"
 
     def _toggle_maximize(self) -> None:
-        if self.isMaximized():
-            self.showNormal()
+        if sys.platform == "win32":
+            from qframelesswindow.utils import toggleMaxState
+            from qframelesswindow.utils.win32_utils import isMaximized as win32_is_maximized
+            hwnd = int(self.winId())
+            was_max = win32_is_maximized(hwnd)
+            if not was_max:
+                self._geometry_before_maximize = self.geometry()
+            toggleMaxState(self)
+            self._top_bar.set_maximized(not was_max)
+            if was_max and self._geometry_before_maximize is not None and self._geometry_before_maximize.isValid():
+                QTimer.singleShot(50, self._apply_geometry_before_maximize)
         else:
-            self._maximize_to_screen()
+            if self.isMaximized():
+                if self._geometry_before_maximize is not None and self._geometry_before_maximize.isValid():
+                    self.showNormal()
+                    QTimer.singleShot(0, self._apply_geometry_before_maximize)
+                else:
+                    self.showNormal()
+                self._top_bar.set_maximized(False)
+            else:
+                self._geometry_before_maximize = self.geometry()
+                self.showMaximized()
+                QTimer.singleShot(0, self._on_maximize_applied)
+
+    def _on_maximize_applied(self) -> None:
+        """Chạy sau showMaximized (non-Win): ép geometry và cập nhật icon."""
+        self._apply_maximized_geometry_if_needed()
         self._top_bar.set_maximized(self.isMaximized())
 
-    def _maximize_to_screen(self) -> None:
-        """Maximize khít màn hình (giống drag title bar lên top), không để khoảng hở border/round corner."""
-        screen = self.screen() or QApplication.primaryScreen()
-        if not screen:
-            self.showMaximized()
+    def _apply_geometry_before_maximize(self) -> None:
+        """Áp lại kích thước/vị trí đã lưu trước khi maximize (restore về đúng cửa sổ cũ)."""
+        if self._geometry_before_maximize is None or not self._geometry_before_maximize.isValid():
             return
-        rect = screen.availableGeometry()
-        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
-        self.setGeometry(rect)
-        # Qt/WM có thể áp lại geometry có margin; ép lại sau khi layout ổn định
-        QTimer.singleShot(0, lambda: self._apply_maximized_geometry_if_needed())
+        self.setGeometry(self._geometry_before_maximize)
+        self._update_title_bar_geometry()
+        notification_service.update_overlay_geometry()
+
+    def _maximize_to_screen(self) -> None:
+        """Maximize khi restore từ settings; trên Win32 dùng Win32 API để khít màn hình."""
+        if sys.platform == "win32":
+            from qframelesswindow.utils.win32_utils import isMaximized as win32_is_maximized
+            import win32con
+            import win32gui
+            if not win32_is_maximized(int(self.winId())):
+                win32gui.PostMessage(int(self.winId()), win32con.WM_SYSCOMMAND, win32con.SC_MAXIMIZE, 0)
+            self._top_bar.set_maximized(True)
+        else:
+            screen = self.screen() or QApplication.primaryScreen()
+            if not screen:
+                self.showMaximized()
+            else:
+                self.showMaximized()
+            QTimer.singleShot(0, self._on_maximize_applied)
 
     def _apply_restore_maximized(self) -> None:
-        """Restore maximized state khi load; 6b B: cập nhật icon sau showMaximized."""
+        """Restore maximized state khi load; icon cập nhật trong _on_maximize_applied."""
         self._maximize_to_screen()
-        self._top_bar.set_maximized(True)
 
     def _restore_window_geometry(self) -> None:
         """
@@ -1938,18 +2384,31 @@ class MainWindow(FramelessMainWindow):
             name = self._project_root.name or ""
             notification_service.info(f"Switched to {name}")
 
+    def _on_switch_project_requested(self, item) -> None:
+        if hasattr(item, "path") and item.path:
+            self._switch_project(str(item.path))
+
     def _on_root_context_menu_requested(self, global_pos) -> None:
-        # Entry points (context menu only):
-        # - Assets root -> Create Asset…
-        # - Shots root  -> Create Shot…
-        #
-        # Root here means: user is at top-level list (not inside an asset/shot).
+        context = self._sidebar.current_context()
+
+        if context == "Projects":
+            if self._workspace_root is None:
+                return
+            menu = QMenu(self)
+            new_proj = menu.addAction(
+                lucide_icon("folder-plus", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "New Project…",
+            )
+            chosen = menu.exec(global_pos)
+            if chosen is not None and chosen == new_proj:
+                self._new_project()
+            return
+
         if self._project_root is None or self._project_index is None:
             return
         if self._entered_parent is not None:
             return
 
-        context = self._sidebar.current_context()
         if context not in ("Assets", "Shots"):
             return
         menu = QMenu(self)
@@ -1998,8 +2457,9 @@ class MainWindow(FramelessMainWindow):
 
         type_reg = TypeRegistry.for_project(self._project_root)
         dept_reg = DepartmentRegistry.for_project(self._project_root)
+        struct_reg = StructureRegistry.for_project(self._project_root)
         type_folder = type_reg.get_type_folder(asset_type)
-        target = self._project_root / "assets" / type_folder / asset_name
+        target = self._project_root / struct_reg.get_folder("assets") / type_folder / asset_name
         if target.exists():
             return
 
@@ -2008,7 +2468,8 @@ class MainWindow(FramelessMainWindow):
             use_dcc_folders = read_use_dcc_folders(self._project_root)
             to_create: list[Path] = [target]
             for d in departments:
-                dept_folder = dept_reg.get_department_folder(d, "asset")
+                # Nested: relative path can be multi-segment (e.g. 01_modelling/01_sculpt) when mapping has parent.
+                dept_folder = dept_reg.get_department_relative_path(d, "asset")
                 dept_dir = target / dept_folder
                 to_create.append(dept_dir)
                 if create_subfolders:
@@ -2053,7 +2514,8 @@ class MainWindow(FramelessMainWindow):
         if not shot_name:
             return
 
-        target = self._project_root / "shots" / shot_name
+        struct_reg = StructureRegistry.for_project(self._project_root)
+        target = self._project_root / struct_reg.get_folder("shots") / shot_name
         if target.exists():
             return
 
@@ -2063,7 +2525,8 @@ class MainWindow(FramelessMainWindow):
         try:
             to_create: list[Path] = [target]
             for d in departments:
-                dept_folder = dept_reg.get_department_folder(d, "shot")
+                # Nested: relative path can be multi-segment (e.g. 01_modelling/01_sculpt) when mapping has parent.
+                dept_folder = dept_reg.get_department_relative_path(d, "shot")
                 dept_dir = target / dept_folder
                 to_create.append(dept_dir)
                 if create_subfolders:

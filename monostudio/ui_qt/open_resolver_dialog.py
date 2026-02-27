@@ -36,6 +36,7 @@ class OpenResolverChoice:
     department: str  # logical department ID
     dcc: str
     remember_for_item: bool
+    import_source: bool = False
 
 
 class DccCard(QFrame):
@@ -136,8 +137,18 @@ class OpenResolverDialog(MonosDialog):
         self._dcc_registry = dcc_registry
         self._dept_registry = department_registry
         self._initial_dcc = (initial_dcc or "").strip() or None
-        self._allowed_dcc_ids: set[str] = set(allowed_dcc_ids) if allowed_dcc_ids else set()
+        # Keep `None` vs empty distinct:
+        # - None: no filtering (show all registered DCCs)
+        # - empty set: explicit filter with zero matches (show no DCC cards)
+        self._allowed_dcc_ids: set[str] | None = None
+        if allowed_dcc_ids is not None:
+            self._allowed_dcc_ids = {
+                d.strip()
+                for d in allowed_dcc_ids
+                if isinstance(d, str) and d.strip()
+            }
         self._disabled_dcc_ids: set[str] = set(disabled_dcc_ids) if disabled_dcc_ids else set()
+        self._is_create_mode = (primary_button_text or "").strip().casefold() == "create"
         self._show_department_picker = show_department_picker
         self._fixed_department = (initial_department or "").strip() or None
 
@@ -264,12 +275,17 @@ class OpenResolverDialog(MonosDialog):
 
         self._remember = QCheckBox("Remember as default for this item", self)
 
+        self._import_source_cb = QCheckBox("Import source file", self)
+        self._import_source_cb.setToolTip("Browse or drag-drop a file to copy into the work folder with the correct naming.")
+        self._import_source_cb.setVisible(self._is_create_mode)
+
         wrap = QWidget(self)
         wrap_l = QVBoxLayout(wrap)
         wrap_l.setContentsMargins(0, 0, 0, 0)
         wrap_l.setSpacing(8)
         wrap_l.addWidget(grp, 0)
         wrap_l.addWidget(self._remember, 0)
+        wrap_l.addWidget(self._import_source_cb, 0)
         wrap_l.addWidget(self._no_dcc_hint, 0)
         root.addWidget(wrap, 0)
 
@@ -289,6 +305,16 @@ class OpenResolverDialog(MonosDialog):
         button_row_l.addStretch(1)
         root.addWidget(button_row, 0)
 
+        def _sync_import_checkbox(dcc_id: str | None) -> None:
+            if not self._is_create_mode or dcc_id is None:
+                return
+            forced = self._dcc_registry.requires_import(dcc_id)
+            if forced:
+                self._import_source_cb.setChecked(True)
+                self._import_source_cb.setEnabled(False)
+            else:
+                self._import_source_cb.setEnabled(True)
+
         def on_card_clicked(dcc_id: str) -> None:
             if dcc_id in self._disabled_dcc_ids:
                 return
@@ -297,6 +323,7 @@ class OpenResolverDialog(MonosDialog):
                 card.set_selected(card.isEnabled() and card.dcc_id() == self._selected_dcc_id)
             if self._btn_ok is not None:
                 self._btn_ok.setEnabled(bool(self._selected_dcc_id))
+            _sync_import_checkbox(self._selected_dcc_id)
 
         def sync_dcc_list(_idx: int | None = None) -> None:
             # When _allowed_dcc_ids is set (Open With), only show DCCs that have created work files.
@@ -308,7 +335,7 @@ class OpenResolverDialog(MonosDialog):
             self._selected_dcc_id = None
 
             dcc_ids = self._dcc_registry.get_all_dccs()
-            if self._allowed_dcc_ids:
+            if self._allowed_dcc_ids is not None:
                 dcc_ids = [d for d in dcc_ids if d in self._allowed_dcc_ids]
             for col, dcc_id in enumerate(dcc_ids):
                 info = self._dcc_registry.get_dcc_info(dcc_id)
@@ -356,12 +383,16 @@ class OpenResolverDialog(MonosDialog):
                     self._no_dcc_hint.setText(
                         "All DCCs already have a folder for this department."
                     )
-                elif self._allowed_dcc_ids:
-                    self._no_dcc_hint.setText("No DCCs with work files yet.")
+                elif self._allowed_dcc_ids is not None:
+                    if self._is_create_mode:
+                        self._no_dcc_hint.setText("No DCCs configured for this department.")
+                    else:
+                        self._no_dcc_hint.setText("No DCCs with work files yet.")
                 else:
                     self._no_dcc_hint.setText("No DCCs registered.")
             if self._btn_ok is not None:
                 self._btn_ok.setEnabled(has and bool(self._selected_dcc_id))
+            _sync_import_checkbox(self._selected_dcc_id)
 
         self._dept.currentIndexChanged.connect(sync_dcc_list)
         sync_dcc_list(None)
@@ -378,6 +409,11 @@ class OpenResolverDialog(MonosDialog):
         dcc = (self._selected_dcc_id or "").strip() or None
         if not dept or not dcc:
             return
-        self._choice = OpenResolverChoice(department=dept, dcc=dcc, remember_for_item=bool(self._remember.isChecked()))
+        self._choice = OpenResolverChoice(
+            department=dept,
+            dcc=dcc,
+            remember_for_item=bool(self._remember.isChecked()),
+            import_source=bool(self._import_source_cb.isChecked()),
+        )
         self.accept()
 

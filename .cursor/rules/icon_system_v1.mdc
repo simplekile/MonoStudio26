@@ -1,0 +1,40 @@
+---
+description: MONOS icon system — Lucide/Brand, HiDPI, sizes, when to use setIcon vs setPixmap
+globs: monostudio/ui_qt/**/*.py, monostudio_data/icons/**/*
+alwaysApply: false
+---
+
+# MONOS Icon System (v1)
+
+## Nguồn icon
+
+- **Lucide (UI)**: `monostudio_data/icons/lucide/<name>.svg` — dùng `lucide_icon(name, size=..., color_hex=...)` từ `monostudio.ui_qt.lucide_icons`. Tên file = tên Lucide (vd `inbox`, `folder`, `maximize-2`).
+- **Brand (DCC / thương hiệu)**: `monostudio_data/icons/brands/<slug>.svg` — dùng `brand_icon(slug, size=..., color_hex=...)` từ `monostudio.ui_qt.brand_icons`.
+
+## HiDPI (sắc nét, không mờ)
+
+- `lucide_icon` và `brand_icon` **luôn** tạo QIcon có cả pixmap @1x và @2x (setDevicePixelRatio(2) cho bản 2x). Không render chỉ một kích thước logic rồi để Qt scale.
+- Khi thêm/sửa logic render icon trong `lucide_icons.py` hoặc `brand_icons.py`: giữ cơ chế @1x + @2x; không xóa hoặc chỉ dùng 1x.
+
+## Cách dùng trong UI
+
+- **Ưu tiên** `setIcon(icon)` + `setIconSize(QSize(w, h))` (nút, menu, list item). Qt tự chọn pixmap theo DPR khi vẽ.
+- **Chỉ khi bắt buộc** (vd QLabel chỉ hiện hình): `setPixmap(icon.pixmap(w, h))`. Trên HiDPI có thể mờ hơn vì `QIcon.pixmap()` mặc định có thể trả 1x; nếu cần sắc hơn, lấy DPR từ `QApplication.primaryScreen().devicePixelRatio()` và tạo/yêu cầu pixmap tương ứng (hoặc ưu tiên chuyển sang dùng setIcon trên widget hỗ trợ icon).
+
+## Kích thước chuẩn
+
+- **16 px**: Sidebar, tree, list item, nút nhỏ, menu item.
+- **24 px**: Nút title bar (min/max/close).
+- **14 px**: Recent task row (dept + DCC icon).
+- **64 px / 128 px**: Placeholder, header lớn (khi cần).
+
+## Màu
+
+- Mặc định: `MONOS_COLORS["text_label"]` (vd `#a1a1aa`).
+- Active/selected: `MONOS_COLORS["blue_400"]`.
+- Title bar: `#d4d4d8` (trắng xám nhạt).
+
+## Enforcement
+
+- Icon mới trong UI: dùng `lucide_icon` hoặc `brand_icon`, không load SVG/PNG tùy tiện rồi vẽ vào QPixmap một size duy nhất.
+- Không hardcode path tới `monostudio_data/icons` trong UI; dùng hàm trong `lucide_icons` / `brand_icons`.

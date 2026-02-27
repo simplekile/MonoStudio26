@@ -1,12 +1,12 @@
 [
-  {"id": "global_reference", "label": "Global Reference", "path_template": "reference", "context": "project"},
-  {"id": "reference_script", "label": "Reference / Script", "path_template": "reference/script", "context": "project"},
-  {"id": "reference_storyboard", "label": "Reference / Storyboard", "path_template": "reference/storyboard", "context": "project"},
-  {"id": "reference_guideline", "label": "Reference / Guideline", "path_template": "reference/guideline", "context": "project"},
-  {"id": "reference_concept", "label": "Reference / Concept", "path_template": "reference/concept", "context": "project"},
+  {"id": "global_reference", "label": "Project Guide / Reference", "path_template": "project_guide/reference", "context": "project"},
+  {"id": "reference_script", "label": "Project Guide / Script", "path_template": "project_guide/script", "context": "project"},
+  {"id": "reference_storyboard", "label": "Project Guide / Storyboard", "path_template": "project_guide/storyboard", "context": "project"},
+  {"id": "reference_guideline", "label": "Project Guide / Guideline", "path_template": "project_guide/guideline", "context": "project"},
+  {"id": "reference_concept", "label": "Project Guide / Concept", "path_template": "project_guide/concept", "context": "project"},
   {"id": "reference", "label": "Reference (asset/shot)", "path_template": "reference", "context": "both"},
   {"id": "concept", "label": "Concept (asset/shot)", "path_template": "concept", "context": "both"},
-  {"id": "texture", "label": "Texture", "path_template": "surfacing/texturing/ref", "context": "asset"},
-  {"id": "character_sculpt", "label": "Character Sculpt", "path_template": "modelling/sculpt/ref", "context": "asset"},
+  {"id": "texture", "label": "Texture", "dept_id": "texturing", "subfolder": "ref", "context": "asset"},
+  {"id": "character_sculpt", "label": "Character Sculpt", "dept_id": "sculpt", "subfolder": "ref", "context": "asset"},
   {"id": "shot_reference", "label": "Shot Reference", "path_template": "reference", "context": "shot"}
 ]

@@ -42,6 +42,8 @@ def _classify_path(
     project_root: Path,
     path: Path,
     type_registry: "TypeRegistry",
+    assets_folder: str = "assets",
+    shots_folder: str = "shots",
 ) -> tuple[str | None, str | None, str | None]:
     """
     Classify a path under project_root into scope.
@@ -60,29 +62,27 @@ def _classify_path(
     parts = rel.parts
     if not parts:
         return (None, None, None)
-    if parts[0] == "assets":
+    if parts[0] == assets_folder:
         if len(parts) == 1:
-            return (None, None, None)  # assets dir itself
+            return (None, None, None)
         if len(parts) == 2:
-            # assets/<type_folder> — type scope
             type_folder = parts[1]
             if type_registry.get_type_by_folder(type_folder) is not None:
                 return (None, None, type_folder)
             return (None, None, None)
         if len(parts) >= 3:
-            # assets/<type_folder>/<asset_name>[/...] — single asset
             type_folder = parts[1]
             asset_name = parts[2]
             if type_registry.get_type_by_folder(type_folder) is not None:
-                asset_dir = project_root / "assets" / type_folder / asset_name
+                asset_dir = project_root / assets_folder / type_folder / asset_name
                 return (str(asset_dir), None, None)
         return (None, None, None)
-    if parts[0] == "shots":
+    if parts[0] == shots_folder:
         if len(parts) == 1:
             return (None, None, None)
         if len(parts) >= 2:
             shot_name = parts[1]
-            shot_dir = project_root / "shots" / shot_name
+            shot_dir = project_root / shots_folder / shot_name
             return (None, str(shot_dir), None)
     return (None, None, None)
 
@@ -164,11 +164,15 @@ class FsEventCollector(QObject):
         if project_root is None or type_reg is None:
             logger.debug("FsEventCollector: no project root or type registry; skipping batch")
             return
+        from monostudio.core.structure_registry import StructureRegistry
+        struct_reg = StructureRegistry.for_project(project_root)
+        _assets_f = struct_reg.get_folder("assets")
+        _shots_f = struct_reg.get_folder("shots")
         for raw in paths:
             p = _normalize_path(raw)
             if p is None:
                 continue
-            aid, sid, tf = _classify_path(project_root, p, type_reg)
+            aid, sid, tf = _classify_path(project_root, p, type_reg, _assets_f, _shots_f)
             if aid:
                 asset_ids.add(aid)
             if sid:

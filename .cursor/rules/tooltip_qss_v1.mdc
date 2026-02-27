@@ -1,0 +1,35 @@
+---
+description: MONOS tooltip QSS (Deep Dark, minimal) — global only, one place
+alwaysApply: true
+---
+
+# MONOS Tooltip QSS (v1)
+
+## Nguyên tắc
+- Tooltip là **công cụ gợi ý**, tối giản; không chiếm thị giác.
+- **Luôn** style tooltip bằng **global app stylesheet** (`monostudio/ui_qt/style.py`), không QSS rải rác.
+
+## Chuẩn visual
+- Nền: `#18181b`, viền `1px solid #3f3f46`, `border-radius: 8px`
+- Padding: `8px 12px` (8px grid)
+- Font: Inter 12px, weight 500, màu `#fafafa`
+- Chi tiết đầy đủ: `.cursor/rules/plan_tooltip_design_v1.mdc`
+
+## QSS (trong style.py)
+
+```css
+QToolTip {
+    background-color: #18181b;
+    color: #fafafa;
+    border: 1px solid #3f3f46;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-family: "Inter";
+    font-size: 12px;
+    font-weight: 500;
+}
+```
+
+## Hành vi
+- Show delay: do style/OS quyết định (Qt6/PySide6 không có `QToolTip.setShowDelay`).
+- Palette: giữ `ToolTipBase` / `ToolTipText` trong `apply_dark_theme`.

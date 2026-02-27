@@ -1,0 +1,85 @@
+# Plan: Hiển thị Departments và Types ở Sidebar khi quá nhiều item (v1)
+
+Tài liệu này mô tả cách xử lý khi số lượng **departments** hoặc **types** hiển thị trong sidebar (và trong dialog chọn) **quá nhiều** — tránh list dài vô hạn, sidebar tràn, hoặc dialog khó dùng.
+
+---
+
+## 1. Hiện trạng
+
+### Sidebar (SidebarWidget)
+
+- **DEPARTMENTS** và **TYPES** là hai list: chỉ hiển thị tập **visible** (user chọn qua nút "+").
+- Mặc định visible = **6** item (`_max_visible = 6`); user có thể chọn thêm qua picker (không giới hạn số lượng).
+- List dùng **ScrollBarAlwaysOff** + **\_fit_list_height()**: chiều cao list = tổng chiều cao tất cả dòng (section + spacer + dept/type row) → **không scroll**.
+- Hệ quả: nếu user pin 15 departments + 12 types, hai list sẽ rất cao → **SidebarWidget** cao → vùng scroll của sidebar (QScrollArea) hiện cũng **ScrollBarAlwaysOff** → không cuộn được → sidebar có thể tràn, đẩy Recent Tasks xuống hoặc bị cắt.
+
+### Picker dialog (Select Departments / Select Types)
+
+- List trong dialog đã dùng **ScrollBarAsNeeded** và có **setMinimumHeight** (580px dept, 240px type).
+- Khi có rất nhiều departments/types (50+), list scroll được nhưng dialog có thể cao hoặc cần tìm kiếm nhanh.
+
+---
+
+## 2. Mục tiêu
+
+1. **Sidebar lists (DEPARTMENTS / TYPES):** Khi số visible item vượt ngưỡng, không để list cao vô hạn; user vẫn xem/chọn được mọi item đã pin (scroll hoặc collapse/expand).
+2. **Picker dialogs:** Khi rất nhiều item, vẫn dùng được (scroll + tùy chọn search), dialog không chiếm full màn hình.
+3. Giữ **8px grid**, typography và scrollbar QSS theo rules hiện có (scrollbar minimal, DPI-safe).
+
+---
+
+## 3. Phương án cho Sidebar lists (DEPARTMENTS / TYPES)
+
+### 3.1. Option A — Scroll trong list (khuyến nghị)
+
+- **Ý tưởng:** Giữ nguyên mô hình "visible = danh sách đã pin", nhưng **giới hạn chiều cao tối đa** của mỗi list; vượt quá thì **bật scroll** trong list.
+- **Cụ thể:**
+  - Định nghĩa **max height** cho `_dept_list` và `_type_list` (vd. **max_list_height_px** từ style hoặc constant, ví dụ 240–280px, hoặc ~50% chiều cao sidebar nếu tính được).
+  - Thay vì luôn `setFixedHeight(total_h)` trong `_fit_list_height`, dùng:
+    - Nếu `total_h <= max_list_height_px`: `setFixedHeight(total_h)`, `setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)`.
+    - Nếu `total_h > max_list_height_px`: `setMaximumHeight(max_list_height_px)`, `setMinimumHeight(0)` (hoặc min nhỏ), `setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)`.
+  - Scrollbar dùng **global QSS** đã có (scrollbar_qss_v1): 8px, minimal, hover rõ hơn.
+- **Ưu:** Đơn giản, nhất quán với "pin bao nhiêu cũng được"; không thêm nút "Show more". **Nhược:** Khi scroll, một số item bị khuất (có thể highlight "active" item visible).
+
+### 3.2. Option B — Collapse / "Show N more"
+
+- **Ý tưởng:** Luôn hiển thị tối đa N dòng (vd. 6); phần còn lại ẩn, có nút **"Show X more"** (X = số còn lại) mở rộng thêm N dòng hoặc toàn bộ; có thể có "Collapse" để thu gọn lại.
+- **Cụ thể:**
+  - `_fit_list_height` chỉ tính cho **số dòng đang hiển thị** (capped); thêm item "footer" (Show X more / Collapse) vào cuối list hoặc widget riêng dưới list.
+  - Khi "Show more": tăng số dòng hiển thị (vd. thêm 6), hoặc chuyển sang chế độ "show all" + scroll (kết hợp A).
+- **Ưu:** Sidebar gọn khi ít dùng. **Nhược:** Logic phức tạp hơn (phân trang ảo, sync selection khi expand).
+
+### 3.3. Khuyến nghị triển khai
+
+- **Ưu tiên Option A:** Cap height + scroll trong list. Constant ví dụ: `SIDEBAR_DEPT_LIST_MAX_HEIGHT_PX = 280` (hoặc đưa vào `SIDEBAR_DEPT_LIST_STYLE`). Áp dụng cho **cả** `_dept_list` và `_type_list`.
+- **Sidebar QScrollArea:** Có thể giữ **ScrollBarAlwaysOff** nếu hai list tự scroll; nếu muốn toàn bộ khối Filters (nav + dept + type) cuộn chung thì đổi scroll area thành **ScrollBarAsNeeded** và bỏ stretch bên trong (tùy layout mong muốn).
+
+---
+
+## 4. Picker dialog khi rất nhiều item
+
+- **Scroll:** Đã có `ScrollBarAsNeeded`; giữ nguyên.
+- **Max height dialog:** Set **maximum height** cho list (vd. 400–480px) hoặc cho toàn dialog để không full screen khi 100+ item; list scroll bên trong.
+- **Search/filter (optional):** Nếu sau này số department/type lên rất lớn (50+), có thể thêm ô tìm kiếm phía trên list (filter theo label); không bắt buộc cho v1.
+
+---
+
+## 5. Touchpoints trong code
+
+| Vị trí | Thay đổi |
+|--------|----------|
+| `monostudio/ui_qt/style.py` | Thêm key vào `SIDEBAR_DEPT_LIST_STYLE`: `max_list_height_px` (vd. 280). Hoặc constant riêng trong sidebar. |
+| `monostudio/ui_qt/sidebar.py` | **SidebarWidget:** Trong `_fit_list_height` (hoặc gọi sau khi set_departments/set_types): đọc max height; nếu `total_h > max` thì `setMaximumHeight(max)`, `setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)` cho list tương ứng; ngược lại `setFixedHeight(total_h)`, `ScrollBarAlwaysOff`. Đảm bảo **cả** _dept_list và _type_list đều áp dụng. |
+| `monostudio/ui_qt/sidebar.py` | **Picker dialog:** Tùy chọn set `setMaximumHeight` cho `_list` (vd. 480) để dialog không quá cao. |
+
+---
+
+## 6. Tóm tắt
+
+- **Sidebar:** Cap chiều cao tối đa cho list DEPARTMENTS và TYPES; vượt ngưỡng thì bật scroll trong list (Option A). Scrollbar dùng QSS global (minimal, 8px).
+- **Picker:** Giữ scroll; có thể thêm max height cho list/dialog. Search/filter để sau nếu cần.
+- **Layout:** 8px grid, typography theo typography_font_stack_v1; không thay đổi cấu trúc section/spacer/dept đã có.
+
+---
+
+*Tạo: plan hiển thị departments/types khi quá nhiều item trong sidebar.*

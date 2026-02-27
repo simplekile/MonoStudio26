@@ -17,6 +17,7 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import QApplication, QDialog, QMenu, QWidget
+from PySide6.QtWidgets import QStyle, QProxyStyle
 
 
 # Dialog panel: background, radius, border (paintEvent draws with antialiasing for smooth corners)
@@ -148,7 +149,7 @@ class MonosDialog(QDialog):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_StyledBackground, True)
         pal = self.palette()
-        pal.setColor(pal.ColorRole.Window, QColor(0, 0, 0, 0))
+        pal.setColor(pal.ColorRole.Window, QColor(_MONOS_DIALOG_BG))
         pal.setColor(pal.ColorRole.Base, QColor(_MONOS_DIALOG_BG))
         self.setPalette(pal)
         self.setAutoFillBackground(False)
@@ -244,12 +245,36 @@ MONOS_COLORS: dict[str, str] = {
     # Semantic
     "emerald_500": "#10b981",
     "amber_500": "#f59e0b",
+    "amber_400": "#fbbf24",  # lighter orange (active project)
     "red_500": "#ef4444",
     "waiting": "#71717a",  # Zinc-500
     # Card
     "card_bg": "#18181b",
     "card_hover": "#1f1f22",
 }
+
+# Deterministic accent palette for projects (visually distinct on dark bg).
+PROJECT_ACCENT_PALETTE: tuple[str, ...] = (
+    "#60a5fa",  # Blue-400
+    "#34d399",  # Emerald-400
+    "#fbbf24",  # Amber-400
+    "#f87171",  # Rose-400
+    "#a78bfa",  # Violet-400
+    "#22d3ee",  # Cyan-400
+    "#fb923c",  # Orange-400
+    "#f472b6",  # Pink-400
+    "#4ade80",  # Green-400
+    "#e879f9",  # Fuchsia-400
+)
+
+
+def project_accent_color(project_name: str) -> str:
+    """Return a deterministic accent hex from the palette, based on project name hash."""
+    h = 0
+    for ch in project_name.lower().strip():
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return PROJECT_ACCENT_PALETTE[h % len(PROJECT_ACCENT_PALETTE)]
+
 
 # File-type icon colors (Inbox tree / mapping list: folder, image, video, DCC, …)
 FILE_TYPE_ICON_COLORS: dict[str, str] = {
@@ -262,6 +287,40 @@ FILE_TYPE_ICON_COLORS: dict[str, str] = {
     "document": "#a1a1aa", # Zinc-400
     "file": "#a1a1aa",     # Zinc-400 default
 }
+
+# Extension sets for file_icon_spec_for_path (đồng bộ với inbox_split_view)
+_FILE_EXT_IMAGE = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tga", ".tif", ".tiff", ".exr", ".hdr", ".ico", ".svg"})
+_FILE_EXT_VIDEO = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg"})
+_FILE_EXT_AUDIO = frozenset({".mp3", ".wav", ".aiff", ".aif", ".ogg", ".flac", ".m4a", ".wma", ".aac"})
+_FILE_EXT_ARCHIVE = frozenset({".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".zst"})
+_FILE_EXT_DOCUMENT = frozenset({".pdf", ".doc", ".docx", ".txt", ".rtf", ".md", ".odt", ".xls", ".xlsx", ".csv"})
+_FILE_EXT_DCC = frozenset({".blend", ".ma", ".mb", ".hip", ".hiplc", ".hipnc", ".spp"})
+
+
+def file_icon_spec_for_path(path: Path) -> tuple[str, str]:
+    """Return (lucide_icon_name, color_hex) for path. Đồng bộ với Inbox tree / mapping list."""
+    colors = FILE_TYPE_ICON_COLORS
+    try:
+        if path.is_dir():
+            return ("folder", colors["folder"])
+    except OSError:
+        pass
+    ext = (path.suffix or "").strip().lower()
+    if not ext.startswith("."):
+        ext = "." + ext if ext else ""
+    if ext in _FILE_EXT_IMAGE:
+        return ("file-image", colors["image"])
+    if ext in _FILE_EXT_VIDEO:
+        return ("file-video", colors["video"])
+    if ext in _FILE_EXT_AUDIO:
+        return ("file-music", colors["audio"])
+    if ext in _FILE_EXT_DCC:
+        return ("box", colors["dcc"])
+    if ext in _FILE_EXT_ARCHIVE:
+        return ("file-archive", colors["archive"])
+    if ext in _FILE_EXT_DOCUMENT:
+        return ("file-text", colors["document"])
+    return ("file", colors["file"])
 
 # Thumb overlay tag spec (used by custom painters, not QSS).
 # Keep ALL tags consistent: same font/padding/radius/alpha; only color changes.
@@ -336,6 +395,24 @@ def _install_fonts(app: QApplication) -> None:
     app.setFont(font)
 
 
+class _MonosAppStyle(QProxyStyle):
+    """App-wide style: no focus rect (yellow frame) on tooltips."""
+
+    def __init__(self, base_key: str = "Fusion") -> None:
+        super().__init__(base_key)
+
+    def drawPrimitive(self, element, option, painter, widget):
+        if element == QStyle.PrimitiveElement.PE_FrameFocusRect and widget is not None:
+            # Skip focus frame on tooltip (Qt.Tool) to avoid yellow border; check widget và top-level window
+            from PySide6.QtCore import Qt as QtCore
+            if widget.windowFlags() & QtCore.WindowType.Tool:
+                return
+            win = widget.window()
+            if win is not None and win is not widget and (win.windowFlags() & QtCore.WindowType.Tool):
+                return
+        return super().drawPrimitive(element, option, painter, widget)
+
+
 def apply_dark_theme(app: QApplication) -> None:
     """
     MONOS Deep Dark UI palette (Tailwind v4 inspired):
@@ -344,7 +421,7 @@ def apply_dark_theme(app: QApplication) -> None:
     - Semantic: Emerald/Amber/Red
     No animations. (Gradients may be used sparingly for active navigation states.)
     """
-    app.setStyle("Fusion")
+    app.setStyle(_MonosAppStyle())
     _install_fonts(app)
 
     palette = QPalette()
@@ -457,27 +534,90 @@ def apply_dark_theme(app: QApplication) -> None:
             background: none;
         }
 
-        /* Inbox Destination Block – Option C (card theo nhóm) */
+        /* ---- MONOS :: Tooltip (Deep Dark, minimal) ---- */
+        QToolTip {
+            background-color: #18181b;
+            color: #fafafa;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 500;
+            outline: none;
+        }
+
+        /* Inbox Destination Block – card nhóm (WHERE / TARGET inside scroll, ACTION pinned bottom) */
         QWidget#InboxDestinationBlock {
             background: transparent;
         }
-        QWidget#InboxDestinationBlock QFrame#InboxDestCardWhere,
-        QWidget#InboxDestinationBlock QFrame#InboxDestCardTarget,
-        QWidget#InboxDestinationBlock QFrame#InboxDestCardAction {
+        QWidget#InboxActionWrapper {
+            background: transparent;
+        }
+        QFrame#InboxDestCardWhere,
+        QFrame#InboxDestCardTarget,
+        QFrame#InboxDestCardAction {
             background-color: #18181b;
             border: 1px solid #27272a;
             border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 10px;
         }
-        QWidget#InboxDestinationBlock QLabel#InboxDestCardTitle {
+        QLabel#InboxDestCardTitle {
             color: #71717a;
             font-size: 10px;
             font-weight: 800;
             letter-spacing: 0.05em;
-            margin-bottom: 8px;
         }
-        QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton {
+        QLabel#InboxFieldLabel {
+            color: #a1a1aa;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        /* Scope toggle buttons (horizontal row) */
+        QPushButton#InboxScopeButton {
+            background: transparent;
+            border: 1px solid #27272a;
+            border-radius: 6px;
+            color: #a1a1aa;
+            padding: 5px 10px;
+            font-size: 12px;
+            font-weight: 500;
+            text-align: left;
+        }
+        QPushButton#InboxScopeButton:hover {
+            background-color: rgba(255, 255, 255, 0.05);
+            color: #e4e4e7;
+        }
+        QPushButton#InboxScopeButton:checked {
+            background-color: rgba(37, 99, 235, 0.15);
+            border-color: #3b82f6;
+            color: #93c5fd;
+        }
+
+        /* Destination / Type selectable item buttons (vertical list) */
+        QPushButton#InboxDestItemButton,
+        QPushButton#InboxTypeItemButton {
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+            color: #a1a1aa;
+            padding: 5px 8px;
+            font-size: 12px;
+            font-weight: 500;
+            text-align: left;
+        }
+        QPushButton#InboxDestItemButton:hover,
+        QPushButton#InboxTypeItemButton:hover {
+            background-color: rgba(255, 255, 255, 0.05);
+            color: #e4e4e7;
+        }
+        QPushButton#InboxDestItemButton:checked,
+        QPushButton#InboxTypeItemButton:checked {
+            background-color: rgba(37, 99, 235, 0.12);
+            color: #93c5fd;
+        }
+
+        QPushButton#InboxDistributeButton {
             background-color: #2563eb;
             color: white;
             border: none;
@@ -485,10 +625,10 @@ def apply_dark_theme(app: QApplication) -> None:
             min-height: 36px;
             font-weight: 600;
         }
-        QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton:hover {
+        QPushButton#InboxDistributeButton:hover {
             background-color: #3b82f6;
         }
-        QWidget#InboxDestinationBlock QPushButton#InboxDistributeButton:pressed {
+        QPushButton#InboxDistributeButton:pressed {
             background-color: #1d4ed8;
         }
 
@@ -606,9 +746,11 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #ffffff;
             font-weight: 600;
         }
+        /* Active = current project (checked) — 1px left bar Blue-400 (distinct from selected/hover) */
         QMenu#ProjectSwitchMenu::item:checked {
             background: rgba(37, 99, 235, 0.10);
             border: 1px solid rgba(37, 99, 235, 0.30);
+            border-left: 1px solid #60a5fa;
             color: #60a5fa;
             font-weight: 600;
         }
@@ -634,10 +776,12 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowMaxBtn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: #e4e4e7;
+            border-radius: 8px;
         }
         QToolButton#WindowCloseBtn:hover {
             background: #ef4444;
             color: white;
+            border-radius: 8px;
         }
         /* Panel separators (splitter handles) */
         QSplitter::handle {
@@ -690,7 +834,7 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #60a5fa;
         }
 
-        /* --- Inbox split: file tree (modern flat look) --- */
+        /* --- Inbox tree pane: file tree (modern flat look, full-row selection) --- */
         QTreeView#InboxSplitTree {
             background-color: #121214;
             border: none;
@@ -698,6 +842,9 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #a1a1aa;
             font-size: 13px;
             padding: 8px 0;
+            /* Nền selection do delegate vẽ full-row; tránh style vẽ thêm từng vùng */
+            selection-background-color: transparent;
+            selection-color: #60a5fa;
         }
         QTreeView#InboxSplitTree::item {
             padding: 6px 12px;
@@ -705,16 +852,28 @@ def apply_dark_theme(app: QApplication) -> None:
             margin: 1px 8px;
         }
         QTreeView#InboxSplitTree::item:hover {
-            background-color: rgba(255, 255, 255, 0.06);
+            background-color: transparent;
             color: #fafafa;
         }
         QTreeView#InboxSplitTree::item:selected {
-            background-color: rgba(59, 130, 246, 0.12);
+            background-color: transparent;
             color: #60a5fa;
         }
         QTreeView#InboxSplitTree::item:selected:!active {
-            background-color: rgba(255, 255, 255, 0.04);
+            background-color: transparent;
             color: #a1a1aa;
+        }
+        /* Branch: ẩn mũi tên mặc định, dùng Lucide chevron vẽ trong delegate */
+        QTreeView#InboxSplitTree::branch {
+            background: transparent;
+            image: none;
+        }
+        QTreeView#InboxSplitTree::branch:has-children:!has-siblings:closed,
+        QTreeView#InboxSplitTree::branch:has-children:has-siblings:closed,
+        QTreeView#InboxSplitTree::branch:has-children:!has-siblings:open,
+        QTreeView#InboxSplitTree::branch:has-children:has-siblings:open {
+            background: transparent;
+            image: none;
         }
 
         /* --- Inbox mapping list (match tree + list style) --- */
@@ -803,12 +962,12 @@ def apply_dark_theme(app: QApplication) -> None:
             font-weight: 700;
         }
         QWidget#MainViewDepartmentBadge {
-            background: rgba(59, 130, 246, 0.26);  /* Blue-400, more prominent */
-            border: 1px solid rgba(63, 63, 70, 0.80);
+            background: rgba(59, 130, 246, 0.42);  /* Blue-500 tint, nổi bật hơn */
+            border: 1px solid rgba(96, 165, 250, 0.55);  /* Blue-400 viền */
             border-radius: 6px;
         }
         QLabel#MainViewDepartmentBadgeLabel {
-            color: #a1a1aa;
+            color: #e0e7ff;  /* Indigo-100, dễ đọc trên nền xanh */
             font-weight: 700;
         }
         QToolButton {
@@ -1007,6 +1166,121 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QDialog#SidebarFilterPickDialog {
             background-color: transparent;
+        }
+        /* MONOS calendar (Inbox drop: date picker) — Deep Dark, 8px radius embed */
+        QCalendarWidget#MonosCalendar {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+            color: #d4d4d8;
+            font-family: "Inter";
+            font-size: 13px;
+        }
+        QCalendarWidget#MonosCalendar QWidget#qt_calendar_navigationbar {
+            background: transparent;
+            min-height: 36px;
+        }
+        QCalendarWidget#MonosCalendar QToolButton {
+            background: transparent;
+            color: #a1a1aa;
+            border: none;
+            border-radius: 4px;
+            min-width: 28px;
+            min-height: 28px;
+        }
+        QCalendarWidget#MonosCalendar QToolButton:hover {
+            background: rgba(255, 255, 255, 0.06);
+            color: #fafafa;
+        }
+        QCalendarWidget#MonosCalendar QAbstractItemView {
+            background: transparent;
+            selection-background-color: transparent;
+            color: #d4d4d8;
+            font-size: 13px;
+            outline: none;
+            border: none;
+            gridline-color: transparent;
+        }
+        QCalendarWidget#MonosCalendar QAbstractItemView:focus {
+            outline: none;
+            border: none;
+        }
+        QCalendarWidget#MonosCalendar QAbstractItemView:disabled {
+            color: #71717a;
+        }
+        /* Weekday header: avoid "..." elision; match code section size 56px */
+        QCalendarWidget#MonosCalendar QHeaderView::section {
+            font-size: 10px;
+            font-weight: 600;
+            color: #71717a;
+            padding: 6px 2px;
+            min-width: 52px;
+        }
+        /* Custom nav bar buttons (MonosCalendarWidget) */
+        QPushButton#MonosCalendarPrevBtn,
+        QPushButton#MonosCalendarNextBtn {
+            background: transparent;
+            border: none;
+            border-radius: 6px;
+        }
+        QPushButton#MonosCalendarPrevBtn:hover,
+        QPushButton#MonosCalendarNextBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        /* Inbox Drop Dialog: panel bg #18181b (override app_bg #09090b) */
+        QDialog#InboxDropDialog {
+            background-color: #18181b;
+        }
+        /* Inbox Drop Dialog: nút Add to Inbox (primary) và Cancel (secondary) */
+        QDialog#InboxDropDialog QDialogButtonBox QPushButton#DialogPrimaryButton {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(37, 99, 235, 0.70);
+            background: rgba(37, 99, 235, 0.22);
+            color: #fafafa;
+        }
+        QDialog#InboxDropDialog QDialogButtonBox QPushButton#DialogPrimaryButton:hover {
+            background: rgba(37, 99, 235, 0.35);
+            border-color: rgba(59, 130, 246, 0.80);
+        }
+        QDialog#InboxDropDialog QDialogButtonBox QPushButton#DialogSecondaryButton {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            background: rgba(24, 24, 27, 0.35);
+            color: #a1a1aa;
+        }
+        QDialog#InboxDropDialog QDialogButtonBox QPushButton#DialogSecondaryButton:hover {
+            background: rgba(24, 24, 27, 0.55);
+            border-color: rgba(39, 39, 42, 0.70);
+            color: #fafafa;
+        }
+        QScrollArea#InboxDropScroll {
+            background-color: #18181b;
+            border: none;
+        }
+        QScrollArea#InboxDropScroll::viewport {
+            background-color: #18181b;
+        }
+        QScrollArea#InboxDropScroll QWidget#scrollAreaWidgetContents,
+        QWidget#InboxDropForm {
+            background-color: #18181b;
+        }
+        /* Inbox Drop Dialog: nút calendar (mở date picker) */
+        QPushButton#InboxDropCalendarBtn {
+            background: rgba(24, 24, 27, 0.35);
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 8px;
+        }
+        QPushButton#InboxDropCalendarBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(63, 63, 70, 0.80);
+        }
+        /* Inbox Drop Dialog: items list frame */
+        QFrame#InboxDropItemsList {
+            background-color: #1e1e20;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
         }
         QLabel#DialogHint {
             color: #a1a1aa;
@@ -1411,6 +1685,16 @@ def apply_dark_theme(app: QApplication) -> None:
             color: rgba(161, 161, 170, 0.5);
             background: rgba(24, 24, 27, 0.25);
         }
+        /* Nút đồng ý trong dialog: ghi đè QDialog QPushButton, luôn màu primary */
+        QDialog QPushButton#DialogPrimaryButton {
+            background: rgba(37, 99, 235, 0.22);
+            border: 1px solid rgba(37, 99, 235, 0.70);
+            color: #fafafa;
+        }
+        QDialog QPushButton#DialogPrimaryButton:hover {
+            background: rgba(37, 99, 235, 0.35);
+            border-color: rgba(59, 130, 246, 0.80);
+        }
         QPushButton#DialogPrimaryButton {
             padding: 8px 12px;
             border-radius: 8px;
@@ -1582,6 +1866,48 @@ def apply_dark_theme(app: QApplication) -> None:
             background: transparent;
         }
 
+        /* Scope pill: Project | Shot | Asset (one pill, three segments) */
+        QWidget#SidebarScopePill {
+            background-color: #1e1e20;
+            border-radius: 12px;
+        }
+        QToolButton#SidebarScopePillSegment {
+            background: transparent;
+            border: none;
+            color: #a1a1aa;
+            padding: 0 10px;
+            margin: 0;
+            font-size: 13px;
+            min-height: 32px;
+        }
+        QToolButton#SidebarScopePillSegment[position="left"] {
+            border-top-left-radius: 10px;
+            border-bottom-left-radius: 10px;
+        }
+        QToolButton#SidebarScopePillSegment[position="center"] {
+            border-radius: 0;
+        }
+        QToolButton#SidebarScopePillSegment[position="center"][active="true"] {
+            border-radius: 8px;
+        }
+        QToolButton#SidebarScopePillSegment[position="right"] {
+            border-top-right-radius: 10px;
+            border-bottom-right-radius: 10px;
+        }
+        QToolButton#SidebarScopePillSegment[active="true"] {
+            background-color: #2a2a2c;
+            color: #60a5fa;
+            font-weight: 700;
+            font-style: italic;
+        }
+        QToolButton#SidebarScopePillSegment:hover {
+            color: #fafafa;
+        }
+        QToolButton#SidebarScopePillSegment[active="true"]:hover {
+            background-color: #2a2a2c;
+            color: #60a5fa;
+        }
+
         /* Primary Nav item widget (Alignment Matrix) */
         QWidget#SidebarNavItem {
             border-radius: 8px;
@@ -1593,7 +1919,7 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#SidebarNavItem[active="true"] {
             background: qlineargradient(
                 x1: 0, y1: 0, x2: 1, y2: 0,
-                stop: 0 rgba(59, 130, 246, 0.10), /* active glow */
+                stop: 0 rgba(59, 130, 246, 0.4), /* active glow */
                 stop: 1 rgba(59, 130, 246, 0.00)
             );
         }
@@ -1609,6 +1935,8 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QWidget#SidebarNavItem[active="true"] QLabel#SidebarNavLabel {
             color: #fafafa;
+            font-weight: 700;
+            font-style: italic;
         }
         QLabel#SidebarNavBadge {
             min-height: 18px;
@@ -1741,18 +2069,18 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#SidebarBottom {
             border-top: 1px solid rgba(39, 39, 42, 0.50);
         }
-        QPushButton#SidebarSettingsButton {
-            padding: 8px 12px;
-            border: 1px solid rgba(39, 39, 42, 0.50);
-            border-radius: 8px;
-            background: rgba(24, 24, 27, 0.35);
-            color: #a1a1aa;
-            text-align: left;
+        QFrame#SidebarNavSeparator {
+            background-color: rgba(63, 63, 70, 0.6);
+            border: none;
+            max-height: 1px;
         }
-        QPushButton#SidebarSettingsButton:hover {
-            background: rgba(24, 24, 27, 0.55);
-            border: 1px solid rgba(39, 39, 42, 0.70);
-            color: #fafafa;
+        QToolButton#SidebarFooterNavButton {
+            background: transparent;
+            border: none;
+            border-radius: 6px;
+        }
+        QToolButton#SidebarFooterNavButton:hover {
+            background: rgba(255, 255, 255, 0.06);
         }
 
         /* --- Metadata-driven navigation (SidebarWidget + AssetGridWidget) --- */

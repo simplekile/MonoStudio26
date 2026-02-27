@@ -1,0 +1,66 @@
+# Plan: Thumbnail Paste — Tránh crop 2 lần (mất thông tin)
+
+## Vấn đề hiện tại
+
+Khi user **screenshot → Paste thumbnail** (Inspector / context menu), ảnh bị **crop hai lần** nên mất quá nhiều nội dung:
+
+1. **Crop lần 1 — khi lưu** (`ClipboardThumbnailHandler.paste_thumbnail`):
+   - `crop_to_fill=True` (mặc định).
+   - Target: asset = 512×512, shot = 512×288.
+   - Ảnh clipboard được scale **KeepAspectRatioByExpanding** (phủ kín khung) rồi **center-crop** về đúng 512×512 / 512×288.
+   - Screenshot (thường 16:9 hoặc 4:3) bị ép vào khung vuông (asset) hoặc 16:9 cố định (shot) → **mất một phần lớn ảnh**.
+
+2. **Crop lần 2 — khi hiển thị**:
+   - **Inspector** (`_PreviewWidget.paintEvent`): Asset/Shot dùng **KeepAspectRatioByExpanding** + center-crop theo `r.size()` của preview. Ảnh đã lưu (vuông hoặc 16:9) lại bị fill + crop theo tỉ lệ ô preview → **mất thêm**.
+   - **MainView tile**: Delegate vẽ từ icon (pixmap) với **KeepAspectRatioByExpanding** + center-crop vào vùng 16:9 của thẻ. Ảnh vuông (asset) bị crop thêm lần nữa khi hiển thị 16:9.
+
+Kết quả: nội dung screenshot bị cắt hai lần (save + display), user mất nhiều thông tin.
+
+---
+
+## Nguyên tắc xử lý
+
+- **Lưu (paste)**: Ưu tiên **giữ toàn bộ nội dung** ảnh — không crop khi save. Chỉ scale (fit) hoặc lưu với kích thước tối đa, giữ tỉ lệ.
+- **Hiển thị**: Nếu nguồn là **user thumbnail** (thumbnail.user.* / thumb_*.user.*), ưu tiên **fit** (KeepAspectRatio) trong Inspector để không cắt thêm; tile có thể giữ fill 16:9 nếu cần thẩm mỹ đồng nhất, nhưng ảnh gốc đã không bị cắt ở bước lưu.
+
+---
+
+## Thay đổi đề xuất
+
+### 1. Paste: không crop khi lưu (`clipboard_thumbnail_handler.py`)
+
+- **Option A (khuyến nghị)**: Đổi mặc định `crop_to_fill=False` khi paste. Kết quả:
+  - Ảnh clipboard được scale **fit** vào 512×512 (asset) hoặc 512×288 (shot), giữ tỉ lệ, phần còn lại là **trong suốt** (RGBA).
+  - File lưu vẫn đúng 512×512 / 512×288; nội dung ảnh nằm gọn trong khung, **không mất vùng nào**.
+- **Option B**: Giữ `crop_to_fill` nhưng tăng kích thước lưu (ví dụ 1024 cạnh dài) và/hoặc lưu “max 512 cạnh dài, giữ tỉ lệ” (canvas 512×512 hoặc 512×288, ảnh fit bên trong). Cùng ý tưởng “không crop nội dung”.
+- **Call site** (`main_window._on_paste_thumbnail_requested`): Có thể truyền `crop_to_fill=False` rõ ràng, hoặc bỏ tham số để dùng mặc định mới.
+
+### 2. Inspector preview: fit cho thumbnail user-paste (`inspector.py`)
+
+- Hiện tại Asset/Shot luôn dùng **fill + center-crop** trong `_PreviewWidget.paintEvent`.
+- Đề xuất: với thumbnail **user** (file `thumbnail.user.*` / `thumb_*.user.*`), dùng **fit** (KeepAspectRatio) giống Inbox — không crop lần hai. Cần truyền xuống preview biết “đang hiển thị user thumbnail” (ví dụ flag từ resolve path hoặc từ layer Inspector khi load).
+- Cách đơn giản: Inspector/Preview biết item hiện tại và path file thumbnail đang dùng; nếu basename chứa `.user.` thì vẽ **fit**, ngược lại (thumbnail auto) giữ **fill** nếu muốn.
+
+### 3. MainView tile (tùy chọn)
+
+- Tile luôn vẽ 16:9 center-crop để đồng nhất thẻ. Nếu đã sửa bước 1 + 2 thì ảnh lưu đã “full content” (fit); việc tile vẫn crop để 16:9 chỉ ảnh hưởng hiển thị grid, không xóa thêm dữ liệu. Có thể giữ như cũ hoặc sau này thêm “fit trong 16:9” (letterbox) cho tile khi là user thumbnail.
+
+### 4. ThumbnailManager / cache
+
+- Không đổi: worker vẫn scale **KeepAspectRatio** (fit) khi load file; không crop ở bước cache.
+
+---
+
+## Thứ tự triển khai gợi ý
+
+1. **ClipboardThumbnailHandler**: Đổi mặc định `crop_to_fill=False` (và/hoặc gọi paste với `crop_to_fill=False` từ main_window). Kiểm tra paste screenshot → mở file thumbnail.user.png → nội dung đầy đủ, có vùng trong suốt nếu tỉ lệ khác khung.
+2. **Inspector**: Trong preview, nhận biết user thumbnail (path hoặc flag) và dùng **fit** thay vì fill khi vẽ. Kiểm tra Inspector không cắt thêm ảnh đã paste.
+3. (Tùy chọn) **MainView tile**: Nếu cần, áp dụng fit/letterbox cho user thumbnail; ưu tiên thấp hơn so với bước 1 và 2.
+
+---
+
+## Tóm tắt
+
+- **Crop 1**: Bỏ bằng cách lưu paste với **fit** (crop_to_fill=False) — toàn bộ screenshot nằm trong file, không cắt khi save.
+- **Crop 2**: Giảm bằng cách Inspector vẽ **fit** khi đang hiển thị user thumbnail — không center-crop lần hai trong preview.
+- Kết quả: screenshot paste giữ được tối đa nội dung, chỉ scale (và có thể letterbox), không bị crop hai lần.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,16 +18,123 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_THUMB_SIZE_PX = 384
+
+# Extensions that Qt can load as image — use file itself as thumbnail
+_IMAGE_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tga", ".tif", ".tiff",
+    ".exr", ".hdr", ".ico", ".svg", ".ppm", ".xbm", ".xpm",
+})
+# Video: extract one frame via ffmpeg (fast seek -ss before -i)
+_VIDEO_EXTENSIONS = frozenset({
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg",
+})
 DEFAULT_MEMORY_CACHE_MAX = 200
 
 
-def resolve_thumbnail_path(item_root: Path) -> Path | None:
-    """Resolve thumbnail file path under item root (user override then auto). No IO cache."""
+def _load_video_frame_via_ffmpeg(video_path: Path, size_px: int) -> QPixmap | None:
+    """
+    Extract one frame from video using ffmpeg (fast: -ss before -i), output PNG to pipe.
+    Returns scaled QPixmap or None if ffmpeg missing/fails.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    path_str = str(video_path.resolve())
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-loglevel", "error",
+                "-ss", "0",
+                "-i", path_str,
+                "-vframes", "1",
+                "-f", "image2pipe",
+                "-c:v", "png",
+                "-",
+            ],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        img = QImage()
+        if not img.loadFromData(proc.stdout):
+            return None
+        pix = QPixmap.fromImage(img)
+        if pix.isNull():
+            return None
+        return pix.scaled(
+            size_px,
+            size_px,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+        logger.debug("Video thumbnail ffmpeg failed for %s: %s", path_str, e)
+        return None
+
+
+_DEPT_THUMB_CACHE_SEP = "::dept::"
+
+
+def resolve_department_thumbnail_path(item_root: Path, department: str) -> Path | None:
+    """Resolve department-specific thumbnail from .meta/ folder. Returns None if not found."""
+    dep = (department or "").strip()
+    if not dep:
+        return None
+    meta = item_root / ".meta"
+    for name in (
+        f"thumb_{dep}.user.png",
+        f"thumb_{dep}.user.jpg",
+        f"thumb_{dep}.png",
+        f"thumb_{dep}.jpg",
+    ):
+        p = meta / name
+        if p.is_file():
+            return p
+    return None
+
+
+def resolve_thumbnail_path(item_root: Path, department: str | None = None) -> Path | None:
+    """
+    Resolve thumbnail path with department fallback:
+      1. department thumb in .meta/  (if department given)
+      2. entity-level thumb
+      3. direct file (image/video)
+    """
+    if item_root.is_file():
+        ext = (item_root.suffix or "").strip().lower()
+        if ext in _IMAGE_EXTENSIONS or ext in _VIDEO_EXTENSIONS:
+            return item_root
+        return None
+    dep = (department or "").strip()
+    if dep:
+        dept_thumb = resolve_department_thumbnail_path(item_root, dep)
+        if dept_thumb is not None:
+            return dept_thumb
     for name in ("thumbnail.user.png", "thumbnail.user.jpg", "thumbnail.png", "thumbnail.jpg"):
         p = item_root / name
         if p.is_file():
             return p
     return None
+
+
+def make_department_cache_key(entity_path: str, department: str | None) -> str:
+    """Build cache key: entity path alone, or entity::dept::department when filtered."""
+    dep = (department or "").strip()
+    if dep:
+        return f"{entity_path}{_DEPT_THUMB_CACHE_SEP}{dep}"
+    return entity_path
+
+
+def parse_department_cache_key(cache_key: str) -> tuple[str, str | None]:
+    """Split cache key back into (entity_path, department_or_None)."""
+    if _DEPT_THUMB_CACHE_SEP in cache_key:
+        parts = cache_key.split(_DEPT_THUMB_CACHE_SEP, 1)
+        return (parts[0], parts[1] if len(parts) > 1 else None)
+    return (cache_key, None)
 
 
 @dataclass
@@ -44,24 +153,8 @@ class ThumbnailCache:
         self._size_px = size_px
         self._cache: dict[str, _CachedPixmap] = {}
 
-    def resolve_thumbnail_file(self, item_root: Path) -> Path | None:
-        # Spec (v1.2): prefer explicit user override, then auto/default.
-        # - User override: thumbnail.user.(png|jpg)
-        # - Auto/default:  thumbnail.(png|jpg)
-        user_png = item_root / "thumbnail.user.png"
-        if user_png.is_file():
-            return user_png
-        user_jpg = item_root / "thumbnail.user.jpg"
-        if user_jpg.is_file():
-            return user_jpg
-
-        png = item_root / "thumbnail.png"
-        if png.is_file():
-            return png
-        jpg = item_root / "thumbnail.jpg"
-        if jpg.is_file():
-            return jpg
-        return None
+    def resolve_thumbnail_file(self, item_root: Path, department: str | None = None) -> Path | None:
+        return resolve_thumbnail_path(item_root, department=department)
 
     def invalidate_file(self, file_path: Path) -> None:
         # Best-effort; safe if missing.
@@ -82,6 +175,13 @@ class ThumbnailCache:
         if cached is not None and cached.mtime_ns == mtime_ns:
             return cached.pixmap
 
+        ext = (file_path.suffix or "").strip().lower()
+        if file_path.is_file() and ext in _VIDEO_EXTENSIONS:
+            pix = _load_video_frame_via_ffmpeg(file_path, self._size_px)
+            if pix is not None:
+                self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
+            return pix
+
         pix = QPixmap(key)
         if pix.isNull():
             return None
@@ -96,10 +196,10 @@ class ThumbnailCache:
         return scaled
 
 
-def _load_thumbnail_image_worker(file_path: str, size_px: int) -> tuple[str, QImage] | None:
+def _load_thumbnail_image_worker(file_path: str, size_px: int, cache_key: str | None = None) -> tuple[str, QImage] | None:
     """
-    Run in worker thread: load file, decode to QImage, scale. Returns (asset_id, QImage).
-    asset_id is the parent path (item root) as string; file_path is the resolved thumbnail path.
+    Run in worker thread: load file, decode to QImage, scale.
+    Returns (cache_key, QImage). cache_key is provided explicitly or derived from parent path.
     """
     from PySide6.QtCore import Qt
     p = Path(file_path)
@@ -115,9 +215,8 @@ def _load_thumbnail_image_worker(file_path: str, size_px: int) -> tuple[str, QIm
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        # asset_id = item root (parent of thumbnail file is item root)
-        item_root = p.parent
-        return (str(item_root), scaled)
+        key = cache_key if cache_key else str(p.parent)
+        return (key, scaled)
     except Exception as e:
         logger.warning("Thumbnail load failed %s: %s", file_path, e)
         return None
@@ -153,51 +252,54 @@ class ThumbnailManager(QObject):
         if isinstance(self._worker_manager, WorkerManager):
             self._worker_manager.taskFinished.connect(self._on_task_finished)
 
-    def request_thumbnail(self, asset_id: str) -> QPixmap | None:
+    def request_thumbnail(self, asset_id: str, department: str | None = None) -> QPixmap | None:
         """
         Return pixmap from memory cache if present; else return None (caller shows placeholder)
         and schedule async load if not already pending. Duplicate requests coalesced.
+        When department is given, looks for department-specific thumb first (fallback to entity).
         """
         if not asset_id or not str(asset_id).strip():
             return None
-        aid = str(asset_id).strip()
-        if aid in self._cache:
-            self._cache.move_to_end(aid)
+        cache_key = make_department_cache_key(str(asset_id).strip(), department)
+        if cache_key in self._cache:
+            self._cache.move_to_end(cache_key)
             try:
                 from monostudio.ui_qt.stress_profiler import enabled, record_thumbnail_hit
                 if enabled():
                     record_thumbnail_hit()
             except Exception:
                 pass
-            return self._cache[aid]
+            return self._cache[cache_key]
         try:
             from monostudio.ui_qt.stress_profiler import enabled, record_thumbnail_miss
             if enabled():
                 record_thumbnail_miss()
         except Exception:
             pass
-        if aid not in self._pending:
-            self._pending.add(aid)
-            self._schedule_load(aid)
+        if cache_key not in self._pending:
+            self._pending.add(cache_key)
+            self._schedule_load(str(asset_id).strip(), department, cache_key)
         return None
 
-    def _schedule_load(self, asset_id: str) -> None:
-        path = resolve_thumbnail_path(Path(asset_id))
+    def _schedule_load(self, entity_path: str, department: str | None, cache_key: str) -> None:
+        dep = (department or "").strip() or None
+        path = resolve_thumbnail_path(Path(entity_path), department=dep)
         if path is None:
-            self._pending.discard(asset_id)
+            self._pending.discard(cache_key)
             return
         file_path = str(path)
         size_px = self._size_px
+        key = cache_key
 
         def run() -> object:
-            return _load_thumbnail_image_worker(file_path, size_px)
+            return _load_thumbnail_image_worker(file_path, size_px, cache_key=key)
 
         from monostudio.ui_qt.worker_manager import WorkerTask
         task = WorkerTask("thumbnail_load", run, manager=self._worker_manager)
-        task._schedule_category = f"thumbnail_load:{asset_id}"
+        task._schedule_category = f"thumbnail_load:{cache_key}"
         self._worker_manager.submit_task(
             task,
-            category=f"thumbnail_load:{asset_id}",
+            category=f"thumbnail_load:{cache_key}",
             replace_existing=True,
         )
 
@@ -205,32 +307,38 @@ class ThumbnailManager(QObject):
         if not category.startswith("thumbnail_load:") or error is not None:
             return
         if result is None:
-            aid = category.replace("thumbnail_load:", "", 1) if ":" in category else ""
-            self._pending.discard(aid)
+            cache_key = category.replace("thumbnail_load:", "", 1) if ":" in category else ""
+            self._pending.discard(cache_key)
             return
         pair = result if isinstance(result, tuple) and len(result) == 2 else None
         if pair is None:
             return
-        asset_id, qimg = pair
-        if not isinstance(asset_id, str) or not isinstance(qimg, QImage) or qimg.isNull():
-            self._pending.discard(asset_id if isinstance(asset_id, str) else "")
+        cache_key, qimg = pair
+        if not isinstance(cache_key, str) or not isinstance(qimg, QImage) or qimg.isNull():
+            self._pending.discard(cache_key if isinstance(cache_key, str) else "")
             return
-        self._pending.discard(asset_id)
+        self._pending.discard(cache_key)
         pix = QPixmap.fromImage(qimg)
         if pix.isNull():
             return
-        self._cache[asset_id] = pix
-        self._cache.move_to_end(asset_id)
+        self._cache[cache_key] = pix
+        self._cache.move_to_end(cache_key)
         while len(self._cache) > self._max_memory:
             self._cache.popitem(last=False)
-        self._app_state.notify_thumbnail_ready([asset_id])
+        entity_path, _ = parse_department_cache_key(cache_key)
+        self._app_state.notify_thumbnail_ready([cache_key, entity_path])
 
-    def invalidate(self, asset_id: str) -> None:
+    def invalidate(self, asset_id: str, department: str | None = None) -> None:
         """Remove from memory cache; allow reload on next request. Emit so UI refreshes."""
         aid = (asset_id or "").strip()
         if not aid:
             return
-        self._cache.pop(aid, None)
-        self._pending.discard(aid)
-        self._app_state.invalidate_thumbnails([aid])
+        cache_key = make_department_cache_key(aid, department)
+        self._cache.pop(cache_key, None)
+        self._pending.discard(cache_key)
+        # Also invalidate entity-level key if department was given (ensures fallback refreshes).
+        if department:
+            self._cache.pop(aid, None)
+            self._pending.discard(aid)
+        self._app_state.invalidate_thumbnails([cache_key, aid])
 

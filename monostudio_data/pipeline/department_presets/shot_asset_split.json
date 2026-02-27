@@ -10,5 +10,18 @@
     "fx": {"label": "FX", "folder": "fx", "shot_folder": "02_fx", "asset_folder": "06_fx", "order": 8},
     "lighting": {"label": "Lighting", "folder": "lighting", "shot_folder": "03_lighting", "asset_folder": "lighting", "order": 9},
     "comp": {"label": "Comp", "folder": "comp", "shot_folder": "04_comp", "asset_folder": "comp", "order": 10}
+  },
+  "types": {
+    "_characters": {"label": "Character", "folder": "_characters"},
+    "_props": {"label": "Prop", "folder": "_props"},
+    "_environment": {"label": "Environment", "folder": "_environment"},
+    "_vehicles": {"label": "Vehicle", "folder": "_vehicles"}
+  },
+  "folders": {
+    "assets": {"label": "Assets", "folder": "assets"},
+    "shots": {"label": "Shots", "folder": "shots"},
+    "inbox": {"label": "Inbox", "folder": "inbox"},
+    "outbox": {"label": "Outbox", "folder": "outbox"},
+    "project_guide": {"label": "Project Guide", "folder": "project_guide"}
   }
 }

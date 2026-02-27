@@ -11,7 +11,6 @@ class ViewItemKind(str, Enum):
     SHOT = "shot"
     DEPARTMENT = "department"
     INBOX_ITEM = "inbox_item"
-    INBOX_SECTION = "inbox_section"  # section title when showing both Client and Freelancer
 
 
 @dataclass(frozen=True)
@@ -24,8 +23,6 @@ class ViewItem:
     ref: object | None = None
     # Folder name for this type (e.g. "char") for stripping prefix from name; empty if N/A.
     type_folder: str = ""
-    # User-set status (ready|progress|waiting|blocked); None = use computed status.
-    user_status: str | None = None
 
 
 def display_name_for_item(item: ViewItem) -> str:

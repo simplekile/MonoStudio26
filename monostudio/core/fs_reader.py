@@ -152,7 +152,7 @@ def _build_asset_departments(
             continue
         publish_path = dept_dir / "publish"
         publish_exists = publish_path.is_dir()
-        prefix = work_file_prefix(name=asset_dir.name, department=dept_dir.name)
+        prefix = work_file_prefix(name=asset_dir.name, department=dept_id)
 
         if use_dcc_folders and reg is not None:
             available_dccs = reg.get_available_dccs(dept_id)
@@ -254,7 +254,7 @@ def _build_shot_departments(
             continue
         publish_path = dept_dir / "publish"
         publish_exists = publish_path.is_dir()
-        prefix = work_file_prefix(name=shot_dir.name, department=dept_dir.name)
+        prefix = work_file_prefix(name=shot_dir.name, department=dept_id)
 
         if use_dcc_folders and reg is not None:
             available_dccs = reg.get_available_dccs(dept_id)
@@ -346,8 +346,8 @@ def _dcc_by_workfile_extension(ext: str) -> str | None:
 def work_file_prefix(*, name: str, department: str) -> str:
     """
     Build work file name prefix (before _v001 and extension).
-    Convention: {name}_{department_folder}. Department is the physical folder name (e.g. 01_model).
-    Asset name already includes type prefix (e.g. char_aya). e.g. char_aya_01_model, shot_01_02_anim
+    Convention: {name}_{department_id}. Department is the logical ID (e.g. sculpt, uv).
+    Asset name already includes type prefix (e.g. char_aya). e.g. char_aya_sculpt, shot_01_anim
     """
     name = (name or "").strip()
     department = (department or "").strip()
@@ -357,11 +357,15 @@ def work_file_prefix(*, name: str, department: str) -> str:
 
 
 def _parse_workfile_version(filename: str, prefix: str, ext: str) -> int | None:
-    """Parse version from filename like {prefix}_v001{ext}. Returns int or None."""
+    """Parse version from filename like {prefix}_v001[_{description}]{ext}. Returns int or None."""
     if not filename.startswith(prefix + "_v") or not filename.endswith(ext):
         return None
-    mid = filename[len(prefix) + 2 : -len(ext)]  # between "_v" and ext
-    if len(mid) != 3 or not mid.isdigit():
+    # Version is exactly 3 digits after "_v"; optional _description may follow before ext
+    start = len(prefix) + 2  # first char after "_v"
+    if len(filename) < start + 3 + len(ext):
+        return None
+    mid = filename[start : start + 3]
+    if not mid.isdigit():
         return None
     return int(mid)
 
@@ -459,7 +463,7 @@ def _scan_work_dccs(work_path: Path, prefix: str, reg: "DccRegistry | None" = No
 
 
 def _max_work_version_for_ext(work_path: Path, prefix: str, ext: str) -> int | None:
-    """Return the maximum version number for files {prefix}_v###{ext} in work_path, or None."""
+    """Return the maximum version number for files {prefix}_v###[_{description}]{ext} in work_path, or None."""
     ext = (ext or "").strip()
     if not ext.startswith("."):
         ext = "." + ext
@@ -476,6 +480,31 @@ def _max_work_version_for_ext(work_path: Path, prefix: str, ext: str) -> int | N
     except OSError:
         pass
     return max_ver
+
+
+def _resolve_latest_work_file_path(work_path: Path, prefix: str, ext: str) -> Path | None:
+    """
+    Return path to the latest existing workfile matching {prefix}_v###[_{description}]{ext}.
+    Used so that work_file_path points to the actual file on disk (e.g. with _fixNecklace suffix).
+    """
+    ext = (ext or "").strip()
+    if not ext.startswith("."):
+        ext = "." + ext
+    if not prefix:
+        return None
+    best_ver: int | None = None
+    best_path: Path | None = None
+    try:
+        for p in work_path.iterdir():
+            if not p.is_file() or not p.name.startswith(prefix + "_v") or not p.name.endswith(ext):
+                continue
+            v = _parse_workfile_version(p.name, prefix, ext)
+            if v is not None and (best_ver is None or v > best_ver):
+                best_ver = v
+                best_path = p
+    except OSError:
+        pass
+    return best_path
 
 
 def get_work_file_path(work_path: Path, prefix: str, ext: str) -> Path:
@@ -532,8 +561,8 @@ def _dcc_work_states_for_department(
                         if not e.startswith("."):
                             e = "." + e if e else ""
                         if e:
-                            p = get_work_file_path(work_folder, prefix, e)
-                            if p.is_file():
+                            p = _resolve_latest_work_file_path(work_folder, prefix, e)
+                            if p is not None and p.is_file():
                                 work_file_path = p
                                 break
             except (RuntimeError, OSError):
@@ -551,7 +580,7 @@ def _detect_workfile(
 ) -> tuple[bool, str | None]:
     """
     Detect whether a recognized work file exists and which DCC it belongs to.
-    Convention: <work_path>/<prefix>_v###<ext> with prefix = name_department_folder (department = folder name).
+    Convention: <work_path>/<prefix>_v###<ext> with prefix = name_department_id (department = logical ID).
     """
     prefix = work_file_prefix(name=basename, department=department)
     if not prefix:
@@ -600,21 +629,23 @@ def build_project_index(
 ) -> ProjectIndex:
     """
     Phase 1: Filesystem is source of truth.
-    - Scan only: project_root/assets and project_root/shots (top-level)
+    - Scan only: project_root/<assets_folder> and project_root/<shots_folder> (top-level)
     - Type folders under assets/ resolved via TypeRegistry (logical ID = Asset.asset_type)
     - Department folders resolved via DepartmentRegistry (logical ID = Department.name)
     - Skip folders that do not map to a known type or department
     - No validation, no auto-creation, no publish/version logic
     """
     from monostudio.core.department_registry import DepartmentRegistry
+    from monostudio.core.structure_registry import StructureRegistry
     from monostudio.core.type_registry import TypeRegistry
 
     dept_registry = department_registry if department_registry is not None else DepartmentRegistry.for_project(project_root)
     type_reg = type_registry if type_registry is not None else TypeRegistry.for_project(project_root)
+    struct_reg = StructureRegistry.for_project(project_root)
     use_dcc_folders = read_use_dcc_folders(project_root)
     dcc_reg = get_default_dcc_registry()
-    assets_dir = project_root / "assets"
-    shots_dir = project_root / "shots"
+    assets_dir = project_root / struct_reg.get_folder("assets")
+    shots_dir = project_root / struct_reg.get_folder("shots")
 
     assets: list[Asset] = []
     for asset_type_dir in _iter_dirs(assets_dir):
@@ -673,7 +704,9 @@ def scan_single_asset(
 
     dept_reg = department_registry or DepartmentRegistry.for_project(project_root)
     type_reg = type_registry or TypeRegistry.for_project(project_root)
-    assets_dir = project_root / "assets"
+    from monostudio.core.structure_registry import StructureRegistry
+    struct_reg = StructureRegistry.for_project(project_root)
+    assets_dir = project_root / struct_reg.get_folder("assets")
     try:
         asset_dir = asset_dir.resolve()
         project_root = project_root.resolve()
@@ -685,7 +718,6 @@ def scan_single_asset(
         asset_dir.relative_to(assets_dir)
     except ValueError:
         return None
-    # asset_dir must be assets/<type_folder>/<asset_name>
     if len(asset_dir.parents) < 2 or asset_dir.parent.parent != assets_dir:
         return None
     type_folder = asset_dir.parent.name
@@ -719,7 +751,9 @@ def scan_single_shot(
     from monostudio.core.department_registry import DepartmentRegistry
 
     dept_reg = department_registry or DepartmentRegistry.for_project(project_root)
-    shots_dir = project_root / "shots"
+    from monostudio.core.structure_registry import StructureRegistry
+    struct_reg = StructureRegistry.for_project(project_root)
+    shots_dir = project_root / struct_reg.get_folder("shots")
     try:
         shot_dir = shot_dir.resolve()
         project_root = project_root.resolve()
@@ -765,7 +799,9 @@ def scan_assets_in_type(
     type_id = type_reg.get_type_by_folder(type_folder_name)
     if type_id is None:
         return []
-    assets_dir = project_root / "assets"
+    from monostudio.core.structure_registry import StructureRegistry
+    struct_reg = StructureRegistry.for_project(project_root)
+    assets_dir = project_root / struct_reg.get_folder("assets")
     type_dir = assets_dir / type_folder_name
     if not type_dir.is_dir():
         return []
