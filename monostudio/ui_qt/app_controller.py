@@ -310,6 +310,25 @@ class AppController(QObject):
                 dcc=dcc,
             )
 
+    def open_file_path_with_dcc(
+        self,
+        *,
+        item: Asset | Shot,
+        department: str,
+        dcc: str,
+        file_path: Path,
+    ) -> None:
+        """Open a specific work file path with the given DCC (e.g. older version from context menu)."""
+        if self._project_root is None:
+            raise RuntimeError("No project is selected; cannot open DCC.")
+        if not file_path.is_file():
+            raise RuntimeError(f"Work file does not exist: {file_path!s}")
+        ctx = self._build_context(item=item, department=department, dcc=dcc)
+        adapter = self._dcc_adapter(dcc)
+        if adapter is None:
+            raise RuntimeError(f"Unsupported DCC: {dcc!r}")
+        adapter.open_file(filepath=str(file_path), context=ctx)
+
     def _available_departments(self, item: Asset | Shot) -> list[str]:
         # Deterministic ordering (filesystem scan is already sorted).
         if isinstance(item, Asset):

@@ -15,10 +15,12 @@ if not os.path.isfile(icon_path):
         'Expected: %s' % icon_path
     )
 
-# Data: same layout as repo so get_app_base_path() / "monostudio_data" | "fonts" works
+# Data: same layout as repo so get_app_base_path() / "monostudio_data" | "fonts" works.
+# monos_blender is required for Blender DCC: launched Blender runs --python-expr that imports monos_blender.adapter.
 datas = [
     (os.path.join(repo, 'monostudio_data'), 'monostudio_data'),
     (os.path.join(repo, 'fonts'), 'fonts'),
+    (os.path.join(repo, 'monos_blender'), 'monos_blender'),
 ]
 
 a = Analysis(

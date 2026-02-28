@@ -6,8 +6,10 @@ from datetime import datetime
 from pathlib import Path
 import re
 
+from collections import OrderedDict
+
 from PySide6.QtCore import Qt, Signal, QSize, QPoint, QTimer, QSettings, QEvent
-from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -38,6 +40,8 @@ from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.style import MONOS_COLORS, file_icon_spec_for_path, monos_font
 from monostudio.ui_qt.thumbnails import ThumbnailCache
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
+from monostudio.ui_qt.shell_thumbnail import get_windows_shell_thumbnail
+from monostudio.ui_qt.worker_manager import WorkerTask
 
 # Active DCC persistence + version parsing (cùng nguồn với main view)
 def _inspector_get_active_dcc(item_path: Path | None, department: str | None) -> str | None:
@@ -208,6 +212,7 @@ class InspectorPanel(QWidget):
         self._current_item: ViewItem | None = None
         self._previous_item: ViewItem | None = None
         self._thumbnail_manager: object | None = None
+        self._worker_manager: object | None = None
         self._department_label_resolver: object | None = None  # callable[[str], str] | None
         self._department_registry: object | None = None  # DepartmentRegistry | None (để biết subdepartment, display name)
         self._department_icon_map: dict[str, str] = {}  # dept_id -> lucide icon name
@@ -236,6 +241,19 @@ class InspectorPanel(QWidget):
         """Use ThumbnailManager for async loading; None to use legacy ThumbnailCache only."""
         self._thumbnail_manager = manager
         self._preview.set_thumbnail_manager(manager)
+
+    def set_worker_manager(self, manager: object | None) -> None:
+        """Optional WorkerManager: load preview thumb in background + loading spinner (như Explorer)."""
+        self._worker_manager = manager
+        self._preview.set_worker_manager(manager)
+
+    def apply_preview_thumb(self, path_str: str, image_or_none: QImage | None, use_fit: bool) -> None:
+        """Main thread: áp dụng thumb đã load từ worker (chỉ khi path khớp item hiện tại)."""
+        self._preview.apply_preview_thumb(path_str, image_or_none, use_fit)
+
+    def clear_preview_loading(self) -> None:
+        """Tắt loading spinner (khi worker lỗi hoặc hủy)."""
+        self._preview.clear_preview_loading()
 
     def set_active_department(self, department: str | None) -> None:
         """Sync active department from sidebar for department-specific thumbnails."""
@@ -582,6 +600,17 @@ def _status_from_department(dept: Department) -> str:
     return "WAITING"
 
 
+def _status_display_label(status: str) -> str:
+    """Display label for department status in Inspector: READY→Published, PROGRESS→Working."""
+    if status == "READY":
+        return "Published"
+    if status == "PROGRESS":
+        return "Working"
+    if status == "BLOCKED":
+        return "Blocked"
+    return "Waiting"
+
+
 def _status_color(status: str) -> str:
     if status == "READY":
         return MONOS_COLORS["emerald_500"]
@@ -658,6 +687,9 @@ class _PreviewWidget(QWidget):
         self._inbox_mode = False  # True = Inbox (tỉ lệ theo ảnh), False = 16:9 (Asset/Shot)
         self._display_fit = False  # from path (user thumb); only used when no user override
         self._user_fit = False  # user toggle: False = fill (default), True = fit
+        self._loading = False  # True = đang load thumb (hiện spinner như Explorer)
+        self._loading_angle = 0.0  # độ (0–360) để vẽ icon quay
+        self._loading_timer: QTimer | None = None
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
     def get_user_fit(self) -> bool:
@@ -690,6 +722,28 @@ class _PreviewWidget(QWidget):
     def set_placeholder_file_icon(self, icon_name: str, color_hex: str) -> None:
         """Inbox: hiển thị icon theo loại file (folder, file-text, box/DCC, …) khi không có thumbnail."""
         self._placeholder_file_icon = ((icon_name or "file").strip(), (color_hex or "").strip())
+        self.update()
+
+    def set_loading(self, loading: bool) -> None:
+        """Bật/tắt trạng thái loading (spinner quay) khi load thumb nặng."""
+        if self._loading == loading:
+            return
+        self._loading = loading
+        if loading:
+            if self._loading_timer is None:
+                self._loading_timer = QTimer(self)
+                self._loading_timer.timeout.connect(self._on_loading_tick)
+            self._loading_angle = 0.0
+            self._loading_timer.start(50)
+        else:
+            if self._loading_timer is not None:
+                self._loading_timer.stop()
+        self.update()
+
+    def _on_loading_tick(self) -> None:
+        if not self._loading:
+            return
+        self._loading_angle = (self._loading_angle + 30.0) % 360.0
         self.update()
 
     def set_placeholder_letter(self, letter: str) -> None:
@@ -754,6 +808,21 @@ class _PreviewWidget(QWidget):
             # Background
             p.fillRect(r, QColor(MONOS_COLORS["content_bg"]))
 
+            # Loading spinner: icon loader-2 quay tròn
+            if self._loading:
+                icon = lucide_icon("loader-2", size=40, color_hex=MONOS_COLORS["text_meta"])
+                src = icon.pixmap(40, 40)
+                if not src.isNull():
+                    cx = r.x() + r.width() // 2
+                    cy = r.y() + r.height() // 2
+                    p.save()
+                    p.translate(cx, cy)
+                    p.rotate(self._loading_angle)
+                    p.translate(-20, -20)
+                    p.drawPixmap(0, 0, src)
+                    p.restore()
+                return
+
             if self._has_image and self._pix is not None:
                 # Inbox: fit. Asset/Shot: theo nút fill/fit (mặc định fill)
                 use_fit = self._inbox_mode or self._user_fit
@@ -789,7 +858,12 @@ class _PreviewWidget(QWidget):
             if self._placeholder_file_icon:
                 icon_name, color_hex = self._placeholder_file_icon
                 color = color_hex or MONOS_COLORS["text_meta"]
-                icon = lucide_icon(icon_name, size=64, color_hex=color)
+                if icon_name.startswith("brand:"):
+                    icon = brand_icon(icon_name[6:], size=64, color_hex=color)
+                    if icon.isNull():
+                        icon = lucide_icon("box", size=64, color_hex=color)
+                else:
+                    icon = lucide_icon(icon_name, size=64, color_hex=color)
                 src = icon.pixmap(64, 64)
                 if not src.isNull():
                     x = r.x() + (r.width() - 64) // 2
@@ -937,12 +1011,16 @@ class _InspectorPreview(QWidget):
     paste_requested = Signal()
     remove_requested = Signal(object)  # emits ViewItem (asset/shot only)
 
+    _PREVIEW_CACHE_MAX = 50
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._thumbs = ThumbnailCache(size_px=1024)
         self._thumbnail_manager: object | None = None
+        self._worker_manager: object | None = None
         self._active_department: str | None = None
         self._item: ViewItem | None = None
+        self._preview_thumb_cache: OrderedDict[str, tuple[QPixmap, bool]] = OrderedDict()
         self._preview_layout = QVBoxLayout(self)
         self._preview_layout.setContentsMargins(0, 0, 0, 0)
         self._preview_layout.setSpacing(0)
@@ -964,8 +1042,48 @@ class _InspectorPreview(QWidget):
         """Use ThumbnailManager for async loading; None to use legacy ThumbnailCache only."""
         self._thumbnail_manager = manager
 
+    def set_worker_manager(self, manager: object | None) -> None:
+        """Optional: load preview thumb in background, show loading spinner."""
+        self._worker_manager = manager
+
+    def apply_preview_thumb(self, path_str: str, image_or_none: QImage | None, use_fit: bool) -> None:
+        """Main thread only: apply thumb from worker. path_str must match current item."""
+        w = self._container._w
+        w.set_loading(False)
+        item = self._item
+        if item is None or str(item.path) != path_str:
+            return
+        cache_key = self._preview_cache_key(Path(path_str))
+        pix: QPixmap | None = None
+        if image_or_none is not None and not image_or_none.isNull():
+            pix = QPixmap.fromImage(image_or_none)
+            if not pix.isNull():
+                w.set_pixmap(pix, use_fit=use_fit)
+        if pix is None:
+            if item.kind == ViewItemKind.INBOX_ITEM and item.path:
+                try:
+                    icon_name, color_hex = file_icon_spec_for_path(item.path)
+                    w.set_placeholder_file_icon(icon_name, color_hex)
+                except Exception:
+                    pass
+            w.set_pixmap(None)
+        while len(self._preview_thumb_cache) >= self._PREVIEW_CACHE_MAX:
+            self._preview_thumb_cache.popitem(last=False)
+        self._preview_thumb_cache[cache_key] = (pix, use_fit)
+        self._preview_thumb_cache.move_to_end(cache_key)
+
+    def clear_preview_loading(self) -> None:
+        """Tắt loading spinner (khi worker lỗi)."""
+        self._container._w.set_loading(False)
+
     def set_active_department(self, department: str | None) -> None:
         self._active_department = (department or "").strip() or None
+
+    def _preview_cache_key(self, path: Path) -> str:
+        try:
+            return str(path.resolve())
+        except Exception:
+            return str(path)
 
     def set_item(self, item: ViewItem) -> None:
         self._item = item
@@ -980,17 +1098,72 @@ class _InspectorPreview(QWidget):
         w.set_user_fit(False)  # default fill when switching item
         w.set_pixmap(None)
         path = item.path
-        asset_id = str(path)
+        path_str = str(path)
+        cache_key = self._preview_cache_key(path)
         dept = self._active_department
+        mgr = self._worker_manager
+
+        # Đã load rồi thì dùng cache, không load lại
+        if cache_key in self._preview_thumb_cache:
+            cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
+            self._preview_thumb_cache.move_to_end(cache_key)
+            if cached_pix is not None and not cached_pix.isNull():
+                w.set_pixmap(cached_pix, use_fit=cached_fit)
+                return
+            # cache lưu (None, fit) khi không có thumb → hiện placeholder
+            if is_inbox and path:
+                try:
+                    icon_name, color_hex = file_icon_spec_for_path(path)
+                    w.set_placeholder_file_icon(icon_name, color_hex)
+                except Exception:
+                    pass
+            w.set_pixmap(None)
+            return
+
+        def run_load() -> tuple[str, QImage | None, bool]:
+            """Chạy trong worker: trả (path_str, QImage|None, use_fit)."""
+            p = Path(path_str)
+            if is_inbox and p.is_file():
+                pix = get_windows_shell_thumbnail(p, 1024)
+                if pix is not None and not pix.isNull():
+                    return (path_str, pix.toImage(), True)
+            cache = ThumbnailCache(size_px=1024)
+            thumb = cache.resolve_thumbnail_file(p, department=dept)
+            if thumb is None:
+                return (path_str, None, False)
+            use_fit = ".user." in str(thumb)
+            pix = cache.load_thumbnail_pixmap(thumb)
+            if pix is None or pix.isNull():
+                return (path_str, None, use_fit)
+            return (path_str, pix.toImage(), use_fit)
+
+        if mgr is not None and hasattr(mgr, "submit_task"):
+            w.set_loading(True)
+            w.update()
+            QApplication.processEvents()
+
+            def submit() -> None:
+                if getattr(self, "_item", None) is not item or str(self._item.path) != path_str:
+                    w.set_loading(False)
+                    return
+                task = WorkerTask("inspector_preview_thumb", run_load, manager=mgr)
+                mgr.submit_task(task, category="inspector_preview_thumb", replace_existing=True)
+
+            QTimer.singleShot(0, submit)
+            return
 
         def load() -> None:
-            is_inbox = getattr(self, "_item", None) and getattr(self._item, "kind", None) == ViewItemKind.INBOX_ITEM
+            is_inbox_check = getattr(self, "_item", None) and getattr(self._item, "kind", None) == ViewItemKind.INBOX_ITEM
+            if getattr(self, "_item", None) and self._item.path == path and is_inbox_check and path and path.is_file():
+                shell_pix = get_windows_shell_thumbnail(path, size_px=1024)
+                if shell_pix is not None and not shell_pix.isNull():
+                    self._container._w.set_pixmap(shell_pix, use_fit=True)
+                    return
             thumb = self._thumbs.resolve_thumbnail_file(path, department=dept)
             use_fit = thumb is not None and ".user." in str(thumb)
-            # Inspector always uses local cache at 1024 (no Manager) so preview is 1024
             if thumb is None:
                 if getattr(self, "_item", None) and self._item.path == path:
-                    if is_inbox and path:
+                    if is_inbox_check and path:
                         try:
                             icon_name, color_hex = file_icon_spec_for_path(path)
                             self._container._w.set_placeholder_file_icon(icon_name, color_hex)
@@ -1010,14 +1183,68 @@ class _InspectorPreview(QWidget):
         if item is None:
             return
         path = item.path
-        asset_id = str(path)
+        path_str = str(path)
+        cache_key = self._preview_cache_key(path)
         dept = self._active_department
+        is_inbox = item.kind == ViewItemKind.INBOX_ITEM
+        mgr = self._worker_manager
+
+        if cache_key in self._preview_thumb_cache:
+            cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
+            self._preview_thumb_cache.move_to_end(cache_key)
+            w = self._container._w
+            if cached_pix is not None and not cached_pix.isNull():
+                w.set_pixmap(cached_pix, use_fit=cached_fit)
+                return
+            if is_inbox and path:
+                try:
+                    icon_name, color_hex = file_icon_spec_for_path(path)
+                    w.set_placeholder_file_icon(icon_name, color_hex)
+                except Exception:
+                    pass
+            w.set_pixmap(None)
+            return
+
+        def run_load() -> tuple[str, QImage | None, bool]:
+            p = Path(path_str)
+            if is_inbox and p.is_file():
+                pix = get_windows_shell_thumbnail(p, 1024)
+                if pix is not None and not pix.isNull():
+                    return (path_str, pix.toImage(), True)
+            cache = ThumbnailCache(size_px=1024)
+            thumb = cache.resolve_thumbnail_file(p, department=dept)
+            if thumb is None:
+                return (path_str, None, False)
+            use_fit = ".user." in str(thumb)
+            pix = cache.load_thumbnail_pixmap(thumb)
+            if pix is None or pix.isNull():
+                return (path_str, None, use_fit)
+            return (path_str, pix.toImage(), use_fit)
+
+        if mgr is not None and hasattr(mgr, "submit_task"):
+            w = self._container._w
+            w.set_loading(True)
+            w.update()
+            QApplication.processEvents()
+
+            def submit() -> None:
+                if self._item is not item or str(self._item.path) != path_str:
+                    w.set_loading(False)
+                    return
+                task = WorkerTask("inspector_preview_thumb", run_load, manager=mgr)
+                mgr.submit_task(task, category="inspector_preview_thumb", replace_existing=True)
+
+            QTimer.singleShot(0, submit)
+            return
 
         def load() -> None:
-            is_inbox = getattr(self, "_item", None) and getattr(self._item, "kind", None) == ViewItemKind.INBOX_ITEM
+            if is_inbox and path and path.is_file():
+                shell_pix = get_windows_shell_thumbnail(path, size_px=1024)
+                if shell_pix is not None and not shell_pix.isNull():
+                    self._container._w.set_pixmap(shell_pix, use_fit=True)
+                    return
             thumb = self._thumbs.resolve_thumbnail_file(path, department=dept)
             use_fit = thumb is not None and ".user." in str(thumb)
-            # Inspector always uses local cache at 1024
             if thumb is None:
                 if is_inbox and path:
                     try:
@@ -1036,6 +1263,7 @@ class _InspectorPreview(QWidget):
         item = self._item
         if item is None:
             return
+        self._preview_thumb_cache.pop(self._preview_cache_key(item.path), None)
         mgr = getattr(self, "_thumbnail_manager", None)
         if mgr is not None and hasattr(mgr, "invalidate"):
             mgr.invalidate(str(item.path), department=self._active_department)
@@ -1267,8 +1495,29 @@ class _IdentityBlock(QWidget):
                     badges.append((dcc_id, status, dn))
                     seen.add((dn, dcc_id))
 
+        chip_size = 32
+        icon_size = 28
+        amber_border_rgba = "rgba(251, 191, 36, 0.45)"  # amber_400 với alpha thấp
+
         if not badges:
-            self._dcc_badges_row.setVisible(False)
+            # Một badge rỗng (icon trống) khi không có DCC nào
+            btn = QToolButton(self._dcc_badges_row)
+            btn.setCursor(Qt.ArrowCursor)
+            btn.setToolTip("No DCC")
+            btn.setAutoRaise(True)
+            btn.setFixedSize(chip_size, chip_size)
+            btn.setProperty("dcc_id", "")
+            btn.setIcon(QIcon())  # icon rỗng
+            btn.setIconSize(QSize(icon_size, icon_size))
+            btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            btn.setStyleSheet(
+                "border-radius: 16px; border: 1px solid transparent; background-color: #0Fffffff; padding: 4px; margin: 0;"
+            )
+            btn.setEnabled(False)
+            self._dcc_badges_l.addWidget(btn, 0)
+            self._dcc_chip_buttons.append(btn)
+            self._dcc_badges_l.addStretch(1)
+            self._dcc_badges_row.setVisible(True)
             return
 
         # Giới hạn số badge hiển thị (khi không chọn department có thể rất nhiều)
@@ -1277,9 +1526,6 @@ class _IdentityBlock(QWidget):
         overflow_count = len(badges) - len(badges_to_show)
 
         # Inspector badge: chip 32px, icon to (28px), padding tối thiểu; border active dùng rgba để giảm alpha
-        chip_size = 32
-        icon_size = 28
-        amber_border_rgba = "rgba(251, 191, 36, 0.45)"  # amber_400 với alpha thấp
         active_dcc = self._active_dcc_id or (badges[0][0] if badges else None)
         for dcc_id, status, dept_id in badges_to_show:
             try:
@@ -1547,9 +1793,7 @@ class _ProductionHealth(QWidget):
             return
 
         color = _status_color(status)
-        display = status if status.isupper() else status.upper()
-        if len(display) >= 2:
-            display = display[0] + display[1:].lower()
+        display = _status_display_label(status)
         self._pill.setText(display)
         self._pill.setStyleSheet(
             f"padding: 1px 6px; border-radius: 8px; border: none; "
@@ -1621,7 +1865,7 @@ class _DeptCard(QFrame):
         ico = lucide_icon((icon_name or "").strip() or "layers", size=14, color_hex=MONOS_COLORS["text_label"])
         self._icon_label.setPixmap(ico.pixmap(14, 14))
         status = _status_from_department(dept)
-        self._pill.setText(status)
+        self._pill.setText(_status_display_label(status))
         self._pill.setStyleSheet(
             f"padding: 1px 6px; border-radius: 8px; border: none; background: rgba(255,255,255,0.06); color: {_status_color(status)};"
         )

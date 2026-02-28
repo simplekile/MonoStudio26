@@ -7,8 +7,8 @@ import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, Qt, QRect, QSettings, Signal, QTimer, QUrl
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QPoint, Qt, QRect, QSettings, Signal, QTimer, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMenu, QMessageBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget
 from qframelesswindow import FramelessMainWindow
 
@@ -152,6 +152,7 @@ class MainWindow(FramelessMainWindow):
         self._reference_page_widget: ReferencePageWidget | None = None
         self._inspector = InspectorPanel()
         self._inspector.set_thumbnail_manager(self._thumbnail_manager)
+        self._inspector.set_worker_manager(self._worker_manager)
         self._inspector.setMinimumWidth(240)
         self._top_bar = TopBar(self)
         self._top_bar.setFixedHeight(56)  # so FramelessMainWindow resize keeps height
@@ -200,6 +201,8 @@ class MainWindow(FramelessMainWindow):
 
         self.setCentralWidget(self._main_splitter)
         self._restore_splitter_sizes()
+        # Frameless window on Windows often receives drop at window level; forward to current page
+        self.setAcceptDrops(True)
         # Title bar only over right pane (not over sidebar); update when splitter/window resizes.
         self._update_title_bar_geometry()
         self._top_bar.raise_()
@@ -211,9 +214,12 @@ class MainWindow(FramelessMainWindow):
         self._sidebar.settings_requested.connect(self._open_settings)
         self._sidebar.recent_task_clicked.connect(self._on_recent_task_clicked)
         self._sidebar.recent_task_double_clicked.connect(self._on_recent_task_double_clicked)
+        self._sidebar.clear_recent_tasks_requested.connect(self._on_clear_recent_tasks)
         # Metadata-driven filter sidebar (UI-only; wiring stub).
         self._sidebar.filters().departmentClicked.connect(self._controller.on_department_clicked)
         self._sidebar.filters().typeClicked.connect(self._controller.on_type_clicked)
+        self._sidebar.filters().tagClicked.connect(self._on_tag_filter_changed)
+        self._sidebar.filters().tagsDefinitionsChanged.connect(self._on_tag_definitions_changed)
         self._controller.departmentChanged.connect(lambda v: self._set_current_department(v, toggle_if_same=False))
         self._controller.typeChanged.connect(lambda v: self._set_current_type(v, toggle_if_same=False))
         self._controller.departmentChanged.connect(self._on_department_changed_notify)
@@ -256,6 +262,7 @@ class MainWindow(FramelessMainWindow):
         self._main_view.dcc_folder_requested.connect(self._on_dcc_folder_requested)
         self._main_view.dcc_copy_path_requested.connect(self._on_dcc_copy_path_requested)
         self._main_view.dcc_delete_requested.connect(self._on_dcc_delete_requested)
+        self._main_view.dcc_open_version_requested.connect(self._on_dcc_open_version_requested)
 
         # Inspector intents (explicit)
         self._inspector.open_folder_requested.connect(self._on_inspector_open_folder_requested)
@@ -275,6 +282,7 @@ class MainWindow(FramelessMainWindow):
         self._app_state.set_filters(self.current_department, self.current_type)
 
         notification_service.set_main_window(self, self._main_view)
+        notification_service.set_general_toast_anchor_widget(self._top_bar.get_noti_button())
 
     def _update_title_bar_geometry(self) -> None:
         """Place title bar over right pane only (x = sidebar width), not over sidebar."""
@@ -305,6 +313,60 @@ class MainWindow(FramelessMainWindow):
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
             self._top_bar.set_maximized(self.isMaximized())
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if not event.mimeData().hasUrls():
+            super().dropEvent(event)
+            return
+        paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        paths = [p for p in paths if p.exists()]
+        event.acceptProposedAction()
+        if not paths:
+            return
+        # Forward to current content page (frameless window on Windows often gets drop at window level)
+        current = self._content_stack.currentWidget()
+        logging.debug("MainWindow dropEvent: paths=%s current=%s", [str(p) for p in paths], type(current).__name__)
+        pos_in_window = event.position().toPoint()
+        if current is self._reference_page_widget and self._reference_page_widget is not None:
+            pos_in_page = self._reference_page_widget.mapFrom(self, pos_in_window)
+            tree_pane = self._reference_page_widget._tree_pane
+            pos_in_pane = tree_pane.mapFrom(self._reference_page_widget, pos_in_page)
+            if tree_pane.rect().contains(pos_in_pane):
+                target = tree_pane.get_drop_target_folder(pos_in_pane)
+                if target and target.is_dir():
+                    root = getattr(tree_pane, "_root_path", None)
+                    try:
+                        use_move = (
+                            root is not None
+                            and paths
+                            and all(
+                                p.resolve().exists() and p.resolve().is_relative_to(Path(root).resolve())
+                                for p in paths
+                            )
+                        )
+                    except (ValueError, OSError):
+                        use_move = False
+                    if use_move:
+                        tree_pane.move_files_to_folder(paths, target)
+                        notification_service.success(f"Moved {len(paths)} item{'s' if len(paths) != 1 else ''} in Project Guide.")
+                    else:
+                        tree_pane.drop_files_to_folder(paths, target)
+                        notification_service.success(f"Added {len(paths)} item{'s' if len(paths) != 1 else ''} to Project Guide.")
+                    return
+            self._on_reference_drop_requested(paths)
+        elif current is self._inbox_page_widget and self._inbox_page_widget is not None:
+            self._on_inbox_drop_requested(paths)
+        elif current is self._outbox_page_widget and self._outbox_page_widget is not None:
+            self._on_outbox_drop_requested(paths)
+        else:
+            # Other pages: no drop handling
+            pass
 
     @staticmethod
     def _norm(s: str | None) -> str:
@@ -744,8 +806,8 @@ class MainWindow(FramelessMainWindow):
         Guarded delete (asset/shot only):
         - Confirmation requires typing exact folder name
         - Deletes folder recursively from disk
-        - On success: update in-memory index and refresh UI (NO rescan)
-        - On failure: silent no-op (log only)
+        - On success: update in-memory index and app_state, clear inspector if needed, refresh UI (NO rescan)
+        - On failure: show notification (e.g. file in use on Windows)
         """
         if self._project_index is None:
             return
@@ -768,16 +830,29 @@ class MainWindow(FramelessMainWindow):
 
         try:
             shutil.rmtree(path)
-        except OSError as e:
+        except (OSError, PermissionError) as e:
             logging.warning("Delete failed: %s", e)
+            notification_service.error(f"Delete failed: {e}. Close any app using files in this folder and try again.")
+            return
+        except Exception as e:
+            logging.exception("Delete failed unexpectedly: %s", e)
+            notification_service.error(f"Delete failed: {e}")
             return
 
-        self._project_index = build_project_index(self._project_index.root, project_root=self._project_index.root)
-        self._reload_main_view()
+        # Clear inspector and thumbnails for deleted path before reload so nothing accesses the removed folder.
         cur = self._main_view.selected_view_item()
-        if cur and cur.path == path:
+        if cur is not None and getattr(cur, "path", None) == path:
             self._inspector.set_item(None)
+        self._app_state.invalidate_thumbnails([str(path)])
+
+        self._project_index = build_project_index(self._project_index.root)
+        self._app_state.update_assets(list(self._project_index.assets))
+        self._app_state.update_shots(list(self._project_index.shots))
+        self._app_state.commit_immediate()
+        self._sidebar.set_project_index(self._project_index)
+        self._reload_main_view()
         self._sync_primary_action()
+        notification_service.success(f"Deleted {kind_label} '{name}'.")
 
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)
@@ -854,9 +929,14 @@ class MainWindow(FramelessMainWindow):
                 if self._reference_page_widget is None:
                     self._reference_page_widget = ReferencePageWidget(self)
                     self._reference_page_widget.tree_selection_changed.connect(self._on_reference_tree_selection_changed)
+                    self._reference_page_widget.drop_requested.connect(self._on_reference_drop_requested)
+                    self._reference_page_widget.import_requested.connect(self._on_reference_import_requested)
+                    self._reference_page_widget.open_folder_requested.connect(self._on_reference_open_folder_requested)
+                    self._reference_page_widget.item_tags_changed.connect(self._on_reference_item_tags_changed)
                     self._content_stack.addWidget(self._reference_page_widget)
                 self._reference_page_widget.set_project_root(self._project_root)
                 self._reference_page_widget.set_department(self._sidebar.filters().current_department() or "reference")
+                self._sidebar.filters().set_tag_item_tags(self._reference_page_widget.get_item_tags())
                 self._content_stack.setCurrentWidget(self._reference_page_widget)
                 self._inspector.set_inbox_tree_preview(None)
             elif context_name == "Outbox":
@@ -925,14 +1005,10 @@ class MainWindow(FramelessMainWindow):
             self._context_switch_in_progress = False
 
     def _on_department_changed_notify(self, department: str | None) -> None:
-        if getattr(self, "_context_switch_in_progress", False):
-            return
-        # Sidebar notifications disabled.
+        pass  # No toast for department filter change
 
     def _on_type_changed_notify(self, type_id: str | None) -> None:
-        if getattr(self, "_context_switch_in_progress", False):
-            return
-        # Sidebar notifications disabled.
+        pass  # No toast for type filter change
 
     def _empty_message_for_context(self, context_name: str) -> str:
         if context_name == "Projects":
@@ -1073,6 +1149,12 @@ class MainWindow(FramelessMainWindow):
         if error is not None:
             logging.getLogger(__name__).warning("Worker task %s failed: %s", category, error)
             _dcc_log.debug("worker taskFinished category=%s error=%s", category, error)
+            if category == "inspector_preview_thumb":
+                self._inspector.clear_preview_loading()
+            return
+        if category == "inspector_preview_thumb" and isinstance(result, tuple) and len(result) >= 3:
+            path_str, image_or_none, use_fit = result[0], result[1], result[2]
+            self._inspector.apply_preview_thumb(path_str, image_or_none, use_fit)
             return
         if category == "incremental_scan" and not (isinstance(result, tuple) and len(result) >= 4):
             _dcc_log.debug("worker taskFinished incremental_scan result type=%s len=%s (expected tuple len>=4)",
@@ -1176,7 +1258,7 @@ class MainWindow(FramelessMainWindow):
             if _to_clear:
                 _dcc_log.debug("incremental_scan clearing pending for entity_ids=%s", _to_clear)
                 remove_for_entities(_to_clear)
-            _dcc_log.debug("incremental_scan calling _reload_main_view + repaint_tile_and_list_views (singleShot 0)")
+            _dcc_log.debug("incremental_scan updating project_index + repaint (skip full reload for Assets/Shots to avoid flicker)")
             if self._project_index is not None:
                 self._project_index = ProjectIndex(
                     root=self._project_index.root,
@@ -1186,7 +1268,10 @@ class MainWindow(FramelessMainWindow):
                 self._sidebar.set_project_index(self._project_index)
                 # So new assets/shots (e.g. just created) get their paths watched
                 self._update_fs_watcher_paths()
-            self._reload_main_view()
+            # Grid already updated via assetsChanged/shotsChanged from commit_immediate(); full reload would clear+repopulate and cause flicker.
+            ctx = self._sidebar.current_context()
+            if ctx not in ("Assets", "Shots"):
+                self._reload_main_view()
             QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
             self._sync_primary_action()
             self._sync_top_bar()
@@ -1203,6 +1288,7 @@ class MainWindow(FramelessMainWindow):
 
         self._project_root = Path(folder) if folder else None
         self._controller.set_project_root(self._project_root)
+        self._sidebar.filters().set_project_root(self._project_root)
         self._main_view.set_project_root(folder)
         self._main_view.set_empty_override(None)
 
@@ -1553,6 +1639,7 @@ class MainWindow(FramelessMainWindow):
         if context == "Project Guide" and self._reference_page_widget is not None:
             self._reference_page_widget.set_project_root(self._project_root)
             self._reference_page_widget.set_department(self._sidebar.filters().current_department() or "reference")
+            self._sidebar.filters().set_tag_item_tags(self._reference_page_widget.get_item_tags())
             return
         # Placeholder for search input (context-aware).
         placeholders = {"Assets": "Search assets", "Shots": "Search shots", "Projects": "Search projects"}
@@ -1669,6 +1756,7 @@ class MainWindow(FramelessMainWindow):
             try:
                 self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
                 self._refresh_recent_tasks()
+                notification_service.success(f"Opened Asset '{item.ref.name}'.")
             except Exception as e:
                 logging.warning("DCC launch failed (asset): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
@@ -1677,6 +1765,7 @@ class MainWindow(FramelessMainWindow):
             try:
                 self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
                 self._refresh_recent_tasks()
+                notification_service.success(f"Opened Shot '{item.ref.name}'.")
             except Exception as e:
                 logging.warning("DCC launch failed (shot): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
@@ -1781,9 +1870,80 @@ class MainWindow(FramelessMainWindow):
     def _on_inbox_tree_selection_changed(self, path) -> None:
         self._inspector.set_inbox_tree_preview(Path(path) if path else None)
 
+    def _on_tag_filter_changed(self, tag_id) -> None:
+        """Sidebar tag filter changed: forward to Project Guide tree proxy."""
+        if self._reference_page_widget is not None:
+            self._reference_page_widget.set_tag_filter(tag_id)
+
+    def _on_tag_definitions_changed(self) -> None:
+        """Tag definitions were modified (add/rename/delete/recolor). Reload on tree pane."""
+        if self._reference_page_widget is not None:
+            self._reference_page_widget.reload_tag_definitions()
+
     def _on_reference_tree_selection_changed(self, path) -> None:
         """Reference page: show file preview in inspector (same as Inbox tree selection)."""
         self._inspector.set_inbox_tree_preview(Path(path) if path else None)
+
+    def _on_reference_item_tags_changed(self) -> None:
+        """Tags were updated in Project Guide tree; refresh sidebar tag counts."""
+        if self._reference_page_widget is not None:
+            self._sidebar.filters().set_tag_item_tags(self._reference_page_widget.get_item_tags())
+
+    def _on_reference_import_requested(self) -> None:
+        """Import (header or context menu): open file dialog, then copy to project_guide/<current_department>/."""
+        if not self._project_root:
+            return
+        files, _ = QFileDialog.getOpenFileNames(self, "Import to Project Guide", "", "All Files (*)")
+        if not files:
+            return
+        path_list = [Path(f) for f in files if f and Path(f).exists()]
+        if not path_list:
+            return
+        self._on_reference_drop_requested(path_list)
+
+    def _on_reference_drop_requested(self, paths: list) -> None:
+        """Files/folders dropped onto Project Guide page: copy to project_guide/<current_department>/ (fallback when not over tree)."""
+        logging.debug("Project Guide _on_reference_drop_requested: paths=%s", [str(p) for p in (paths or [])])
+        if not paths or not self._project_root:
+            return
+        path_list = [Path(p) for p in paths if p and Path(p).exists()]
+        if not path_list:
+            return
+        dept = (self._sidebar.filters().current_department() or "reference").strip().lower()
+        struct_reg = StructureRegistry.for_project(self._project_root)
+        guide_folder = struct_reg.get_folder("project_guide")
+        dest_root = Path(self._project_root) / guide_folder / dept
+        dest_root.mkdir(parents=True, exist_ok=True)
+        added = 0
+        for src in path_list:
+            try:
+                dest = dest_root / src.name
+                if src.is_dir():
+                    if dest.exists():
+                        for item in src.iterdir():
+                            d = dest / item.name
+                            if item.is_file():
+                                shutil.copy2(item, d)
+                            else:
+                                shutil.copytree(item, d)
+                    else:
+                        shutil.copytree(src, dest)
+                else:
+                    shutil.copy2(src, dest)
+                added += 1
+            except OSError as e:
+                logging.warning("Project Guide copy failed for %s: %s", src, e)
+        if added > 0:
+            if self._reference_page_widget is not None:
+                self._reference_page_widget.set_project_root(self._project_root)
+            notification_service.success(f"Added {added} item{'s' if added != 1 else ''} to Project Guide.")
+
+    def _on_reference_open_folder_requested(self, path) -> None:
+        if path:
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path))))
+            except Exception:
+                pass
 
     def _on_inbox_open_folder_requested(self, path) -> None:
         if path:
@@ -1941,6 +2101,8 @@ class MainWindow(FramelessMainWindow):
         try:
             self._controller.smart_open(item=ref, force_dialog=False, parent=self)
             self._refresh_recent_tasks()
+            kind_label = "Asset" if isinstance(ref, Asset) else "Shot"
+            notification_service.success(f"Opened {kind_label} '{ref.name}'.")
         except Exception as e:
             logging.warning("DCC launch failed: %s", e, exc_info=True)
             QMessageBox.critical(self, "Open DCC", str(e))
@@ -1973,6 +2135,8 @@ class MainWindow(FramelessMainWindow):
             # Repaint tile so delegate shows "Creating…" from resolve_dcc_status (pending already recorded).
             self._main_view.repaint_tiles_for_entity(str(ref.path))
             self._refresh_recent_tasks()
+            kind_label = "Asset" if isinstance(ref, Asset) else "Shot"
+            notification_service.success(f"Creating new work file for {kind_label} '{ref.name}'.")
             # Pending cleared when watcher triggers incremental_scan and scan finds work_file_path (or via assetsChanged).
         except Exception as e:
             logging.warning("DCC launch failed (create new): %s", e, exc_info=True)
@@ -1990,6 +2154,23 @@ class MainWindow(FramelessMainWindow):
         except Exception as e:
             logging.warning("DCC badge open failed: %s", e, exc_info=True)
             QMessageBox.critical(self, "Open DCC", str(e))
+
+    def _on_dcc_open_version_requested(
+        self, item: object, dcc_id: str, department: str, file_path: object
+    ) -> None:
+        if not isinstance(item, ViewItem):
+            return
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        path = Path(file_path) if not isinstance(file_path, Path) else file_path
+        try:
+            self._controller.open_file_path_with_dcc(
+                item=ref, department=department, dcc=dcc_id, file_path=path
+            )
+        except Exception as e:
+            logging.warning("DCC open version failed: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Open older version", str(e))
 
     def _on_dcc_folder_requested(self, item: object, dcc_id: str, department: str) -> None:
         if not isinstance(item, ViewItem):
@@ -2018,17 +2199,30 @@ class MainWindow(FramelessMainWindow):
         if not isinstance(ref, (Asset, Shot)):
             return
         try:
-            from monostudio.core.dcc_registry import get_default_dcc_registry
-            reg = get_default_dcc_registry()
-            use_dcc_folders = read_use_dcc_folders(self._project_root)
-            for d in ref.departments:
-                if (d.name or "").strip().casefold() == department.strip().casefold():
-                    work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
-                    cb = QApplication.clipboard()
-                    if cb:
-                        cb.setText(str(work_path))
-                    notification_service.success("Copied work path to clipboard.")
-                    return
+            dep_norm = (department or "").strip().casefold()
+            dcc_norm = (dcc_id or "").strip().casefold()
+            path_to_copy: str | None = None
+            for (dept_id, dc_id), state in getattr(ref, "dcc_work_states", ()) or ():
+                if (dept_id or "").strip().casefold() != dep_norm or (dc_id or "").strip().casefold() != dcc_norm:
+                    continue
+                wp = getattr(state, "work_file_path", None)
+                if isinstance(wp, Path) and wp.is_file():
+                    path_to_copy = str(wp)
+                    break
+            if path_to_copy is None:
+                from monostudio.core.dcc_registry import get_default_dcc_registry
+                reg = get_default_dcc_registry()
+                use_dcc_folders = read_use_dcc_folders(self._project_root)
+                for d in ref.departments:
+                    if (d.name or "").strip().casefold() == dep_norm:
+                        work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
+                        path_to_copy = str(work_path)
+                        break
+            if path_to_copy:
+                cb = QApplication.clipboard()
+                if cb:
+                    cb.setText(path_to_copy)
+                notification_service.success("Copied work path to clipboard.")
         except Exception as e:
             logging.warning("DCC badge copy path failed: %s", e, exc_info=True)
 
@@ -2136,6 +2330,31 @@ class MainWindow(FramelessMainWindow):
         self._sidebar.filters().set_selected_department(task.department, emit=False)
         # Select the item in main view.
         self._main_view.select_item_by_path(Path(task.item_path))
+        # Sidebar toast for task selection (single-click).
+        # Anchor vertically to the recent task row instead of raw cursor Y.
+        try:
+            tasks_list = getattr(self._sidebar, "_tasks_list", None)
+            if tasks_list is not None:
+                row = tasks_list.currentRow()
+                if row >= 0:
+                    item = tasks_list.item(row)
+                    if item is not None:
+                        rect = tasks_list.visualItemRect(item)
+                        top_left = tasks_list.viewport().mapToGlobal(rect.topLeft())
+                        notification_service.set_sidebar_anchor_from_global_y(top_left.y())
+            else:
+                notification_service.set_sidebar_anchor_from_cursor()
+        except Exception:
+            notification_service.set_sidebar_anchor_from_cursor()
+        label = (task.department or "").strip()
+        dcc = (task.dcc or "").strip()
+        if label and dcc:
+            msg = f"Task: {task.item_name} · {label} · {dcc}"
+        elif label:
+            msg = f"Task: {task.item_name} · {label}"
+        else:
+            msg = f"Task: {task.item_name}"
+        notification_service.info(msg, category="sidebar")
 
     def _on_recent_task_double_clicked(self, task: object) -> None:
         from monostudio.ui_qt.recent_tasks_store import RecentTask
@@ -2159,6 +2378,12 @@ class MainWindow(FramelessMainWindow):
         except Exception as e:
             logging.warning("DCC launch failed (recent task): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open DCC", str(e))
+
+    def _on_clear_recent_tasks(self) -> None:
+        if self._project_root is None:
+            return
+        self._recent_tasks_store.clear_for_project(self._project_root)
+        self._refresh_recent_tasks()
 
     def _new_project(self) -> None:
         if self._workspace_root is None:
@@ -2194,6 +2419,7 @@ class MainWindow(FramelessMainWindow):
         self._workspace_projects.append(discovered)
         # Auto-switch to new project (sets project/root, triggers existing autoscan, resets Inspector).
         self._apply_project_root(str(created.root), save=True)
+        notification_service.success(f"Created Project '{created.display_name}'.")
 
     def _open_stress_diagnostics(self) -> None:
         """Open stress diagnostics dialog (only when MONOS_STRESS=1 or MONOS_PROFILE=1)."""
@@ -2444,7 +2670,9 @@ class MainWindow(FramelessMainWindow):
         if self._project_root is None:
             return
 
-        dialog = CreateAssetDialog(self._project_root, self)
+        dialog = CreateAssetDialog(
+            self._project_root, self, initial_type_id=self.current_type
+        )
         if dialog.exec() != QDialog.Accepted:
             return
 
@@ -2494,17 +2722,21 @@ class MainWindow(FramelessMainWindow):
                     pass
             return
 
-        # After creation, trigger existing autoscan logic (Phase 1) for current project.
+        # After creation: rescan so app_state has the new asset; commit_immediate() emits
+        # assetsChanged and apply_assets_diff updates the grid incrementally (no full reload = no flicker).
         self._entered_parent = None
         self._rescan_project()
-        self._reload_main_view()
         self._inspector.set_item(None)
+        QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
+        notification_service.success(f"Created Asset '{asset_name}'.")
 
     def _create_shot(self) -> None:
         if self._project_root is None:
             return
 
-        dialog = CreateShotDialog(self._project_root, self)
+        dialog = CreateShotDialog(
+            self._project_root, self, initial_type_id=self.current_type
+        )
         if dialog.exec() != QDialog.Accepted:
             return
 
@@ -2549,9 +2781,11 @@ class MainWindow(FramelessMainWindow):
                     pass
             return
 
-        # After creation, trigger existing autoscan logic (Phase 1) for current project.
+        # After creation: rescan so app_state has the new shot; commit_immediate() emits
+        # shotsChanged and apply_assets_diff updates the grid incrementally (no full reload = no flicker).
         self._entered_parent = None
         self._rescan_project()
-        self._reload_main_view()
         self._inspector.set_item(None)
+        QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
+        notification_service.success(f"Created Shot '{shot_name}'.")
 

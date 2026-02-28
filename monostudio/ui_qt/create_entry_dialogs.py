@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QLineEdit
 
 from monostudio.core.pipeline_types_and_presets import TypeDef, load_department_vocabulary, load_pipeline_types_and_presets
+from monostudio.core.structure_registry import StructureRegistry
+from monostudio.core.type_registry import TypeRegistry
 from monostudio.ui_qt.style import MonosDialog
 
 
@@ -174,12 +176,13 @@ class CreateAssetDialog(MonosDialog):
     - Final asset folder name is derived from type.short_name
     """
 
-    def __init__(self, project_root: Path, parent=None) -> None:
+    def __init__(self, project_root: Path, parent=None, *, initial_type_id: str | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Create Asset")
         self.setModal(True)
 
         self._project_root = project_root
+        self._initial_type_id = (initial_type_id or "").strip() or None
         self._types: dict[str, TypeDef] = load_pipeline_types_and_presets().types
         self._dept_vocab: set[str] = set(load_department_vocabulary())
 
@@ -209,6 +212,12 @@ class CreateAssetDialog(MonosDialog):
         self._final_name_preview.setVisible(False)
         self._final_name_preview.setWordWrap(True)
         self._final_name_preview.setObjectName("DialogHelper")
+
+        # Asset already exists warning (shown when target path exists)
+        self._exists_warning = QLabel("This asset already exists.")
+        self._exists_warning.setVisible(False)
+        self._exists_warning.setWordWrap(True)
+        self._exists_warning.setObjectName("DialogWarning")
 
         button_row = QWidget()
         button_row_l = QHBoxLayout(button_row)
@@ -246,6 +255,7 @@ class CreateAssetDialog(MonosDialog):
                 "Final folder name derives from Type short_name + '_' + name.",
             )
         )
+        layout.addWidget(self._exists_warning)
 
         layout.addSpacing(12)  # top margin above button row (>= 12px)
         layout.addWidget(button_row)
@@ -253,9 +263,14 @@ class CreateAssetDialog(MonosDialog):
         self._update_ok_enabled()
         self._update_type_preview()
         self._update_final_name_preview()
-        first_id = self._get_first_asset_type_id()
-        if first_id is not None:
-            self._set_type(first_id)
+        # Prefer filter type if valid asset type; else fallback to first in list
+        type_to_set = None
+        if self._initial_type_id and self._initial_type_id in self._types and not _is_shot_type_id(self._initial_type_id):
+            type_to_set = self._initial_type_id
+        if type_to_set is None:
+            type_to_set = self._get_first_asset_type_id()
+        if type_to_set is not None:
+            self._set_type(type_to_set)
 
     def asset_type(self) -> str:
         return (self._selected_type_id or "").strip()
@@ -331,18 +346,42 @@ class CreateAssetDialog(MonosDialog):
         self._type_preview.setText("Departments: " + " / ".join(depts))
         self._type_preview.setVisible(True)
 
+    def _get_asset_target_path(self) -> Path | None:
+        """Path that would be used for the asset folder; None if type/name not ready."""
+        asset_name = self.asset_name()
+        if not asset_name or not self._selected_type_id:
+            return None
+        try:
+            struct_reg = StructureRegistry.for_project(self._project_root)
+            type_reg = TypeRegistry.for_project(self._project_root)
+            type_folder = type_reg.get_type_folder(self._selected_type_id)
+            assets_folder = struct_reg.get_folder("assets")
+            return self._project_root / assets_folder / type_folder / asset_name
+        except Exception:
+            return None
+
+    def _asset_exists(self) -> bool:
+        path = self._get_asset_target_path()
+        return path is not None and path.exists()
+
     def _update_final_name_preview(self) -> None:
         final_name = self.asset_name()
         if not final_name:
             self._final_name_preview.setVisible(False)
             self._debug_name_fields()
+            self._update_exists_warning()
             return
         self._final_name_preview.setText(f"Final folder name: {final_name}")
         self._final_name_preview.setVisible(True)
         self._debug_name_fields()
+        self._update_exists_warning()
+
+    def _update_exists_warning(self) -> None:
+        self._exists_warning.setVisible(self._asset_exists())
 
     def _update_ok_enabled(self) -> None:
-        self._ok_btn.setEnabled(bool(self._selected_type_id and self._asset_name.text().strip()))
+        can_create = bool(self._selected_type_id and self._asset_name.text().strip()) and not self._asset_exists()
+        self._ok_btn.setEnabled(can_create)
 
     def _debug_name_fields(self) -> None:
         t = self._types.get(self._selected_type_id or "")
@@ -371,12 +410,13 @@ class CreateShotDialog(MonosDialog):
     - Departments are read-only preview from selected preset
     """
 
-    def __init__(self, project_root: Path, parent=None) -> None:
+    def __init__(self, project_root: Path, parent=None, *, initial_type_id: str | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Create Shot")
         self.setModal(True)
 
         self._project_root = project_root
+        self._initial_type_id = (initial_type_id or "").strip() or None
         self._types: dict[str, TypeDef] = load_pipeline_types_and_presets().types
         self._dept_vocab: set[str] = set(load_department_vocabulary())
 
@@ -484,9 +524,14 @@ class CreateShotDialog(MonosDialog):
 
         self._update_final_name_preview()
         self._update_ok_enabled()
-        first_id = self._get_first_shot_type_id()
-        if first_id is not None:
-            self._set_type(first_id)
+        # Prefer filter type if valid shot type; else fallback to first in list
+        type_to_set = None
+        if self._initial_type_id and self._initial_type_id in self._types and _is_shot_type_id(self._initial_type_id):
+            type_to_set = self._initial_type_id
+        if type_to_set is None:
+            type_to_set = self._get_first_shot_type_id()
+        if type_to_set is not None:
+            self._set_type(type_to_set)
 
     def shot_name(self) -> str:
         # Must match the previewed final folder name exactly.

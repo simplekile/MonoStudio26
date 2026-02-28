@@ -50,6 +50,12 @@ from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.dcc_status import resolve_dcc_status
+from monostudio.core.fs_reader import (
+    list_work_file_versions,
+    read_use_dcc_folders,
+    resolve_work_path,
+    work_file_prefix,
+)
 from monostudio.core.workspace_reader import ProjectQuickStats
 from monostudio.core.models import Asset, Shot
 
@@ -201,6 +207,37 @@ def _resolve_publish_department(ref: Asset | Shot, active_department: str | None
         if (getattr(d, "publish_version_count", 0) or 0) > 0:
             return d
     return None
+
+
+def _resolved_work_path_for_copy(
+    ref: Asset | Shot, department: str, active_dcc_id: str | None = None
+) -> Path | None:
+    """
+    Path to copy for "Copy Work Path": work file path if it exists, else work folder.
+    Uses dcc_work_states when available; falls back to department work_path.
+    """
+    dep = (department or "").strip().casefold()
+    if not dep:
+        return None
+    dept_obj = None
+    for d in getattr(ref, "departments", ()) or ():
+        if (d.name or "").strip().casefold() == dep:
+            dept_obj = d
+            break
+    if dept_obj is None:
+        return None
+    # Prefer actual work file path from scan (any DCC for this department, or active DCC)
+    states = getattr(ref, "dcc_work_states", ()) or ()
+    for (dept_id, dcc_id), state in states:
+        if (dept_id or "").strip().casefold() != dep:
+            continue
+        if active_dcc_id and (dcc_id or "").strip().casefold() != (active_dcc_id or "").strip().casefold():
+            continue
+        wp = getattr(state, "work_file_path", None)
+        if isinstance(wp, Path) and wp.is_file():
+            return wp
+    # No file from scan: return work folder so user still gets a usable path
+    return Path(dept_obj.work_path)
 
 
 def _resolve_latest_publish_folder(ref: Asset | Shot, active_department: str | None) -> Path | None:
@@ -1124,6 +1161,7 @@ class MainView(QWidget):
     dcc_folder_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
     dcc_copy_path_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
     dcc_delete_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
+    dcc_open_version_requested = Signal(object, str, str, object)  # (ViewItem, dcc_id, department, file_path: Path)
     active_dcc_changed = Signal(object, str, str)  # (path, department, dcc_id) — đồng bộ Inspector
 
     _SETTINGS_KEY_VIEW_MODE_PREFIX = "main_view/mode"
@@ -1140,6 +1178,7 @@ class MainView(QWidget):
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
         self._project_root: str | None = None
         self._empty_override: str | None = None
+        self._in_batch_set_items: bool = False  # skip stack switch to placeholder during set_items (avoids flicker)
         self._thumb_cache = ThumbnailCache(size_px=self._THUMBNAIL_SIZE_PX)
         self._thumbnail_manager: object | None = None
         self._thumb_prefetch_scheduled = False
@@ -1581,7 +1620,8 @@ class MainView(QWidget):
                         type_label = _TYPE_TOOLTIP_MAP.get((item.type_badge or "").strip().lower()) or _TYPE_TOOLTIP_MAP.get((item.type_badge or "").strip()) or (item.type_badge or "")
                         if type_label:
                             fallback_tt = f"{fallback_tt} — {type_label}"
-                        QToolTip.showText(event.globalPos(), fallback_tt)
+                        hint_html = '<span style="font-size:80%; color:#71717a;">Double-click to open</span>'
+                        QToolTip.showText(event.globalPos(), f"<html>{fallback_tt}<br/><br/>{hint_html}</html>")
                         event.accept()
                         return True
         return super().eventFilter(watched, event)
@@ -1838,16 +1878,31 @@ class MainView(QWidget):
 
     def set_items(self, items: list[ViewItem], preserve_selection_id: str | None = None) -> None:
         # Explicit input only; no hidden filtering here (filter tree lives in Sidebar).
-        self._all_items = list(items)
-        self._populate_views(items)
-        self._order = [str(vi.path) for vi in self._all_items]
-        self._rebuild_items_from_order()
-        # Restore selection in same update to avoid flicker (Option C, plan_focus_system_v1).
-        if preserve_selection_id and preserve_selection_id.strip():
-            try:
-                self.select_item_by_path(Path(preserve_selection_id))
-            except (TypeError, OSError):
-                pass
+        # Avoid "all items disappear then reappear": freeze view + block model signals, re-enable next frame.
+        self._in_batch_set_items = True
+        self.setUpdatesEnabled(False)
+        self._tile_model.blockSignals(True)
+        self._list_model.blockSignals(True)
+        try:
+            self._all_items = list(items)
+            self._populate_views(items)
+            self._order = [str(vi.path) for vi in self._all_items]
+            self._rebuild_items_from_order()
+            if preserve_selection_id and preserve_selection_id.strip():
+                try:
+                    self.select_item_by_path(Path(preserve_selection_id))
+                except (TypeError, OSError):
+                    pass
+        finally:
+            self._tile_model.blockSignals(False)
+            self._list_model.blockSignals(False)
+            self._in_batch_set_items = False
+
+        def _reenable_and_update():
+            self.setUpdatesEnabled(True)
+            self._update_empty_states()
+
+        QTimer.singleShot(0, _reenable_and_update)
 
     def _paths_equal(self, a: Path | str, b: Path | str) -> bool:
         """Compare paths for equality (resolved when possible so absolute/relative match)."""
@@ -2545,6 +2600,9 @@ class MainView(QWidget):
         self._tile_placeholder.setText(empty_text)
         self._list_placeholder.setText(empty_text)
 
+        # During set_items (clear then populate), do not switch stack to placeholder or we get "all items disappear then reappear".
+        if getattr(self, "_in_batch_set_items", False):
+            return
         tile_has_rows = self._tile_model.rowCount() > 0
         list_has_rows = self._list_model.rowCount() > 0
         idx_tile = 1 if tile_has_rows else 0
@@ -2634,6 +2692,34 @@ class MainView(QWidget):
 
         menu = QMenu(self)
         open_act = menu.addAction(dcc_icon, f"Open with {dcc_label}")
+        # Submenu "Open older version" when multiple work file versions exist
+        older_versions: list[tuple[int, Path]] = []
+        if isinstance(item.ref, (Asset, Shot)) and self._project_root:
+            dep_norm = (department or "").strip().casefold()
+            for d in getattr(item.ref, "departments", ()) or ():
+                if (d.name or "").strip().casefold() == dep_norm:
+                    use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
+                    try:
+                        work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
+                        prefix = work_file_prefix(
+                            name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
+                            department=department,
+                        )
+                        older_versions = list_work_file_versions(work_path, prefix, dcc_id, reg)
+                    except Exception:
+                        older_versions = []
+                    break
+        if len(older_versions) >= 1:
+            open_older_menu = QMenu(self)
+            open_older_menu.setTitle("Open older version")
+            for i, (ver, path) in enumerate(older_versions):
+                if i == 0:
+                    act = open_older_menu.addAction(f"v{ver:03d} (newest)")
+                    act.setEnabled(False)
+                else:
+                    act = open_older_menu.addAction(f"v{ver:03d}")
+                    act.setData(path)
+            menu.addMenu(open_older_menu)
         menu.addSeparator()
         folder_act = menu.addAction(
             lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
@@ -2660,6 +2746,11 @@ class MainView(QWidget):
 
     def _dispatch_dcc_badge_action(self, chosen, item: ViewItem, dcc_id: str, department: str) -> None:
         if chosen is None:
+            return
+        # Open older version: action has path in data()
+        path_data = chosen.data() if hasattr(chosen, "data") else None
+        if path_data is not None and isinstance(path_data, Path):
+            self.dcc_open_version_requested.emit(item, dcc_id, department, path_data)
             return
         text = getattr(chosen, "text", lambda: "")()
         if text.startswith("Open with "):
@@ -2786,6 +2877,44 @@ class MainView(QWidget):
                 open_with_action.setToolTip(_no_dept_hint)
                 create_new_action.setEnabled(False)
                 create_new_action.setToolTip(_no_dept_hint)
+            # "Open older version" submenu when right-click on thumbnail: use active DCC for this item+department
+            if has_dept_filter and isinstance(item.ref, (Asset, Shot)) and self._project_root:
+                active_dcc = self.get_active_dcc(getattr(item.ref, "path", None), self._active_department)
+                if not active_dcc and getattr(item.ref, "departments", None):
+                    for d in item.ref.departments:
+                        if (d.name or "").strip().casefold() == (self._active_department or "").strip().casefold():
+                            active_dcc = getattr(d, "work_file_dcc", None) or (
+                                (d.work_file_dccs[0].strip() if d.work_file_dccs else None)
+                            )
+                            break
+                if active_dcc:
+                    dep_norm = (self._active_department or "").strip().casefold()
+                    for d in getattr(item.ref, "departments", ()) or ():
+                        if (d.name or "").strip().casefold() == dep_norm:
+                            use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
+                            try:
+                                work_path = resolve_work_path(d.path, active_dcc, use_dcc_folders, get_default_dcc_registry())
+                                prefix = work_file_prefix(
+                                    name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
+                                    department=self._active_department,
+                                )
+                                older_versions = list_work_file_versions(
+                                    work_path, prefix, active_dcc, get_default_dcc_registry()
+                                )
+                            except Exception:
+                                older_versions = []
+                            if len(older_versions) >= 1:
+                                open_older_menu = QMenu(self)
+                                open_older_menu.setTitle("Open older version")
+                                for i, (ver, path) in enumerate(older_versions):
+                                    if i == 0:
+                                        act = open_older_menu.addAction(f"v{ver:03d} (newest)")
+                                        act.setEnabled(False)
+                                    else:
+                                        act = open_older_menu.addAction(f"v{ver:03d}")
+                                        act.setData((path, active_dcc, self._active_department or ""))
+                                menu.addMenu(open_older_menu)
+                            break
             menu.addSeparator()
             if has_dept_filter:
                 copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Work Path")
@@ -2832,6 +2961,14 @@ class MainView(QWidget):
         if chosen is None:
             return
 
+        # Open older version (from thumbnail context menu): action data is (path, dcc_id, department)
+        data = getattr(chosen, "data", lambda: None)()
+        if isinstance(data, tuple) and len(data) == 3:
+            path, dcc_id, department = data[0], data[1], data[2]
+            if path is not None and dcc_id and department:
+                self.dcc_open_version_requested.emit(item, dcc_id, department, path)
+                return
+
         # Compare by label text; labels are fixed by spec.
         text = getattr(chosen, "text", lambda: "")()
 
@@ -2860,10 +2997,11 @@ class MainView(QWidget):
         if text == "Copy Work Path":
             if isinstance(item.ref, (Asset, Shot)):
                 dep = (self._active_department or "").strip()
-                for d in (item.ref.departments or ()):
-                    if (d.name or "").strip().casefold() == dep.casefold():
-                        self._copy_full_path(str(d.work_path))
-                        return
+                active_dcc = self.get_active_dcc(getattr(item, "path", None), dep) if getattr(item, "path", None) else None
+                path_to_copy = _resolved_work_path_for_copy(item.ref, dep, active_dcc)
+                if path_to_copy:
+                    self._copy_full_path(str(path_to_copy))
+                    return
             self._copy_full_path(str(item.path))
             return
         if text == "Open Folder":

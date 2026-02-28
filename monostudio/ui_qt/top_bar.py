@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -14,6 +15,8 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.notification.notification_dropdown import NotificationDropdown
+from monostudio.ui_qt.notification.notification_list_dialog import NotificationListDialog
 from monostudio.ui_qt.style import MonosMenu, project_accent_color
 
 
@@ -33,6 +36,8 @@ class TopBar(QWidget):
         self._project_menu = MonosMenu(self, rounded=False)
         self._project_menu.setObjectName("ProjectSwitchMenu")
         self._project_menu.setWindowOpacity(1.0)
+        self._project_menu_closed_at = 0.0  # avoid reopen on same click + clear hover
+        self._project_menu.aboutToHide.connect(self._on_project_menu_closed)
 
         shadow = QGraphicsDropShadowEffect(self._project_menu)
         shadow.setBlurRadius(15)
@@ -78,20 +83,84 @@ class TopBar(QWidget):
         self._btn_close.setFixedSize(44, 36)
         self._btn_close.clicked.connect(self.close_clicked.emit)
 
+        # Notification button (right side, before window buttons)
+        self._btn_noti = QToolButton(self)
+        self._btn_noti.setObjectName("TopBarNotiBtn")
+        self._btn_noti.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_noti.setIcon(lucide_icon("bell", size=20, color_hex=_win_icon_color))
+        self._btn_noti.setFixedSize(40, 36)
+        self._btn_noti.setToolTip("Notifications")
+        self._noti_dropdown_closed_at = 0.0  # monotonic time when dropdown last closed (avoid reopen on same click)
+        self._noti_dropdown = NotificationDropdown(self)
+        self._noti_dropdown.show_all_requested.connect(self._open_notification_list_dialog)
+        self._noti_dropdown.closed.connect(self._on_noti_dropdown_closed)
+        self._btn_noti.clicked.connect(self._show_noti_dropdown)
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 10, 8, 10)
         layout.setSpacing(0)
         layout.addWidget(self._project_switch, 0, Qt.AlignLeft | Qt.AlignVCenter)
         layout.addStretch(1)
+        layout.addWidget(self._btn_noti, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_min, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_max, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_close, 0, Qt.AlignRight | Qt.AlignVCenter)
 
+    # Grace period (seconds): if popup was closed less than this ago, next button click is treated as "close" not "open"
+    _POPUP_REOPEN_GRACE = 0.25
+
     def _show_project_menu_left_aligned(self) -> None:
         """Show project menu with left edge aligned to button's left edge."""
+        if (time.monotonic() - self._project_menu_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
         btn = self._project_switch
         pos = btn.mapToGlobal(btn.rect().bottomLeft())
         self._project_menu.popup(pos)
+
+    def _on_project_menu_closed(self) -> None:
+        """Record close time and clear project switch button hover/pressed (deferred)."""
+        self._project_menu_closed_at = time.monotonic()
+        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._project_switch))
+
+    def _clear_tool_button_hover(self, btn: QToolButton) -> None:
+        """Clear stuck hover/pressed state on a tool button (used after popup/dropdown closes)."""
+        QApplication.sendEvent(btn, QEvent(QEvent.Type.Leave))
+        btn.setDown(False)
+        try:
+            st = btn.style()
+            if st:
+                st.unpolish(btn)
+                st.polish(btn)
+        except Exception:
+            pass
+        btn.update()
+
+    def _show_noti_dropdown(self) -> None:
+        """Toggle notification dropdown: if open, close; else if just closed (same click), do nothing; else show."""
+        if self._noti_dropdown.isVisible():
+            self._noti_dropdown.close()
+            return
+        if (time.monotonic() - self._noti_dropdown_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
+        btn = self._btn_noti
+        pos = btn.mapToGlobal(btn.rect().bottomLeft())
+        self._noti_dropdown.move(pos.x(), pos.y() + 4)
+        self._noti_dropdown.show()
+
+    def _on_noti_dropdown_closed(self) -> None:
+        """Record close time and clear tool button hover/pressed state (deferred so it takes effect)."""
+        self._noti_dropdown_closed_at = time.monotonic()
+        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._btn_noti))
+
+    def get_noti_button(self) -> QToolButton:
+        """Return the notification toolbar button (for anchoring general toasts below it)."""
+        return self._btn_noti
+
+    def _open_notification_list_dialog(self) -> None:
+        """Open the full notification list dialog (lazy-created)."""
+        win = self.window()
+        dlg = NotificationListDialog(win)
+        dlg.show()
 
     def set_maximized(self, maximized: bool) -> None:
         """Update window button icon (Max vs Restore)."""

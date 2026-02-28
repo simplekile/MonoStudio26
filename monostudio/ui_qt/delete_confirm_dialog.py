@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -14,6 +15,46 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.ui_qt.style import MonosDialog
+
+
+def ask_delete(parent, title: str, message: str) -> bool:
+    """Show MONOS-styled delete confirmation; returns True if user confirmed Delete."""
+    dlg = SimpleDeleteConfirmDialog(parent=parent, title=title, message=message)
+    return dlg.exec() == QDialog.DialogCode.Accepted
+
+
+class SimpleDeleteConfirmDialog(MonosDialog):
+    """Simple delete confirmation: message + Cancel + Delete (styled). Replaces QMessageBox.question."""
+
+    def __init__(self, *, parent=None, title: str = "Delete", message: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setObjectName("SimpleDeleteConfirmDialog")
+
+        body = QLabel(message or "Delete this item?")
+        body.setWordWrap(True)
+        body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        btn_row = QWidget()
+        btn_l = QHBoxLayout(btn_row)
+        btn_l.setContentsMargins(0, 0, 0, 0)
+        btn_l.setSpacing(10)
+        btn_l.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        delete_btn = QPushButton("Delete")
+        delete_btn.setObjectName("DialogDestructiveButton")
+        delete_btn.clicked.connect(self.accept)
+        btn_l.addWidget(cancel_btn)
+        btn_l.addWidget(delete_btn)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+        root.addWidget(body)
+        root.addWidget(btn_row)
 
 
 class DeleteConfirmDialog(MonosDialog):

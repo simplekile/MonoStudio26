@@ -170,3 +170,13 @@ class RecentTasksStore:
         if not proot:
             return []
         return [t for t in self._tasks if _norm_path(t.project_root) == proot]
+
+    def clear_for_project(self, project_root: Path | None) -> None:
+        """Remove all recent tasks for the given project and persist."""
+        if project_root is None:
+            return
+        proot = _norm_path(project_root)
+        if not proot:
+            return
+        self._tasks = [t for t in self._tasks if _norm_path(t.project_root) != proot]
+        self._save()

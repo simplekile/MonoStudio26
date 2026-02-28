@@ -289,12 +289,24 @@ FILE_TYPE_ICON_COLORS: dict[str, str] = {
 }
 
 # Extension sets for file_icon_spec_for_path (đồng bộ với inbox_split_view)
-_FILE_EXT_IMAGE = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tga", ".tif", ".tiff", ".exr", ".hdr", ".ico", ".svg"})
-_FILE_EXT_VIDEO = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg"})
+_FILE_EXT_IMAGE = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tga", ".tif", ".tiff", ".exr", ".hdr", ".ico", ".svg", ".pur"})  # .pur = PureRef
+_FILE_EXT_VIDEO = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg", ".ts"})
 _FILE_EXT_AUDIO = frozenset({".mp3", ".wav", ".aiff", ".aif", ".ogg", ".flac", ".m4a", ".wma", ".aac"})
 _FILE_EXT_ARCHIVE = frozenset({".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".zst"})
-_FILE_EXT_DOCUMENT = frozenset({".pdf", ".doc", ".docx", ".txt", ".rtf", ".md", ".odt", ".xls", ".xlsx", ".csv"})
-_FILE_EXT_DCC = frozenset({".blend", ".ma", ".mb", ".hip", ".hiplc", ".hipnc", ".spp"})
+_FILE_EXT_DOCUMENT = frozenset({".pdf", ".txt", ".rtf", ".md", ".odt", ".xls", ".xlsx", ".csv"})
+_FILE_EXT_DCC = frozenset({".blend", ".ma", ".mb", ".hip", ".hiplc", ".hipnc"})
+_FILE_EXT_SPP = frozenset({".spp"})  # Substance Painter → brand:substancepainter
+_FILE_EXT_PS = frozenset({".psd", ".psb"})
+_FILE_EXT_3DSMAX = frozenset({".max"})
+_FILE_EXT_ZBRUSH = frozenset({".zbr", ".ztl", ".zpr"})
+_FILE_EXT_FBX = frozenset({".fbx"})
+_FILE_EXT_OBJ = frozenset({".obj"})
+_FILE_EXT_ABC = frozenset({".abc"})
+_FILE_EXT_USD = frozenset({".usd", ".usda", ".usdc"})
+_FILE_EXT_UNITY = frozenset({".unity", ".prefab"})
+_FILE_EXT_UNREAL = frozenset({".uproject", ".umap"})
+_FILE_EXT_PPTX = frozenset({".pptx", ".ppt"})
+_FILE_EXT_DOC = frozenset({".doc", ".docx"})
 
 
 def file_icon_spec_for_path(path: Path) -> tuple[str, str]:
@@ -314,6 +326,26 @@ def file_icon_spec_for_path(path: Path) -> tuple[str, str]:
         return ("file-video", colors["video"])
     if ext in _FILE_EXT_AUDIO:
         return ("file-music", colors["audio"])
+    if ext in _FILE_EXT_PS:
+        return ("brand:photoshop", colors["dcc"])
+    if ext in _FILE_EXT_3DSMAX:
+        return ("brand:3dsmax", colors["dcc"])
+    if ext in _FILE_EXT_ZBRUSH:
+        return ("zbrush", colors["dcc"])
+    if ext in _FILE_EXT_FBX:
+        return ("box", colors["dcc"])
+    if ext in _FILE_EXT_USD:
+        return ("brand:usd", colors["dcc"])
+    if ext in _FILE_EXT_OBJ or ext in _FILE_EXT_ABC:
+        return ("box", colors["dcc"])
+    if ext in _FILE_EXT_UNITY:
+        return ("brand:unity", colors["dcc"])
+    if ext in _FILE_EXT_UNREAL:
+        return ("brand:unrealengine", colors["dcc"])
+    if ext in _FILE_EXT_PPTX or ext in _FILE_EXT_DOC:
+        return ("file-text", colors["document"])
+    if ext in _FILE_EXT_SPP:
+        return ("brand:substancepainter", colors["dcc"])
     if ext in _FILE_EXT_DCC:
         return ("box", colors["dcc"])
     if ext in _FILE_EXT_ARCHIVE:
@@ -540,7 +572,7 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #fafafa;
             border: 1px solid #3f3f46;
             border-radius: 8px;
-            padding: 8px 12px;
+            padding: 4px 6px;
             font-family: "Inter";
             font-size: 12px;
             font-weight: 500;
@@ -766,14 +798,16 @@ def apply_dark_theme(app: QApplication) -> None:
         /* Borderless window buttons (TopBar) */
         QToolButton#WindowMinBtn,
         QToolButton#WindowMaxBtn,
-        QToolButton#WindowCloseBtn {
+        QToolButton#WindowCloseBtn,
+        QToolButton#TopBarNotiBtn {
             border: none;
             border-radius: 0;
             background: transparent;
             color: #d4d4d8;
         }
         QToolButton#WindowMinBtn:hover,
-        QToolButton#WindowMaxBtn:hover {
+        QToolButton#WindowMaxBtn:hover,
+        QToolButton#TopBarNotiBtn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: #e4e4e7;
             border-radius: 8px;
@@ -1339,6 +1373,11 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #a1a1aa;
             font-size: 11px;
         }
+        QLabel#DialogWarning {
+            color: #f59e0b;
+            font-size: 11px;
+            font-weight: 600;
+        }
         QLabel#DialogLabelMeta {
             color: #71717a;
         }
@@ -1728,6 +1767,19 @@ def apply_dark_theme(app: QApplication) -> None:
             color: rgba(161, 161, 170, 0.5);
             background: rgba(24, 24, 27, 0.25);
         }
+        /* Dialog: nút Delete (destructive) — đỏ */
+        QPushButton#DialogDestructiveButton {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(239, 68, 68, 0.60);
+            background: rgba(239, 68, 68, 0.18);
+            color: #fca5a5;
+        }
+        QPushButton#DialogDestructiveButton:hover {
+            background: rgba(239, 68, 68, 0.30);
+            border-color: rgba(239, 68, 68, 0.85);
+            color: #fafafa;
+        }
         /* Categories (Asset/Shot Depts): nút Create/Delete Type — style giống nhau cho cả hai trang */
         QPushButton#SettingsCategoryActionButton {
             padding: 8px 12px;
@@ -1974,9 +2026,7 @@ def apply_dark_theme(app: QApplication) -> None:
 
         /* Sidebar filter lists (replaces Hierarchy tree) */
         QListWidget#SidebarFilterList {
-
             border-radius: 10px;
-
             color: #a1a1aa; /* Zinc-400 */
             padding: 6px;
         }
@@ -1993,6 +2043,52 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(59, 130, 246, 0.10);
             color: #60a5fa; /* Blue-400 */
             border: 1px solid rgba(59, 130, 246, 0.30);
+        }
+
+        QListWidget#SidebarTagList {
+            border-radius: 10px;
+            color: #a1a1aa;
+            padding: 6px;
+            font-size: 10px;
+            font-weight: 400;
+        }
+        QListWidget#SidebarTagList::item {
+            height: 26px;
+            padding: 2px 10px 2px 6px;
+            border-radius: 6px;
+        }
+        QListWidget#SidebarTagList::item:hover {
+            background: rgba(130, 130, 130, 0.10);
+            color: #fafafa;
+        }
+        QListWidget#SidebarTagList::item:selected {
+            background: rgba(59, 130, 246, 0.10);
+            color: #60a5fa;
+            border: 1px solid rgba(59, 130, 246, 0.30);
+        }
+
+        /* Tag empty overlay (Project Guide tree) */
+        QWidget#TagEmptyOverlay {
+            background: transparent;
+        }
+        QLabel#TagEmptyOverlayText {
+            color: #52525b;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 500;
+            background: transparent;
+        }
+
+        /* Department empty overlay (Project Guide tree, same as Inbox) */
+        QWidget#RefDeptEmptyOverlay {
+            background: transparent;
+        }
+        QLabel#RefDeptEmptyOverlayText {
+            color: #71717a;
+            font-family: "Inter";
+            font-size: 13px;
+            font-weight: 500;
+            background: transparent;
         }
 
         /* Recent tasks list (sidebar) */
@@ -2080,6 +2176,15 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 6px;
         }
         QToolButton#SidebarFooterNavButton:hover {
+            background: rgba(255, 255, 255, 0.06);
+        }
+        QToolButton#SidebarRecentTasksClearButton {
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+            padding: 2px;
+        }
+        QToolButton#SidebarRecentTasksClearButton:hover:enabled {
             background: rgba(255, 255, 255, 0.06);
         }
 

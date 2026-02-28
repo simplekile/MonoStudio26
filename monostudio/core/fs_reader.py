@@ -522,6 +522,50 @@ def get_work_file_path(work_path: Path, prefix: str, ext: str) -> Path:
     return work_path / f"{prefix}_v{version:03d}{ext}"
 
 
+def list_work_file_versions(
+    work_path: Path,
+    prefix: str,
+    dcc_id: str,
+    reg: "DccRegistry",
+) -> list[tuple[int, Path]]:
+    """
+    List all work file versions for (work_path, prefix, dcc_id).
+    Returns list of (version_number, path) sorted by version descending (newest first).
+    Used for "Open older version" context menu.
+    """
+    out: list[tuple[int, Path]] = []
+    dcc_id = (dcc_id or "").strip()
+    if not prefix or not dcc_id:
+        return out
+    try:
+        info = reg.get_dcc_info(dcc_id)
+    except Exception:
+        return out
+    exts = info.get("workfile_extensions") if isinstance(info, dict) else None
+    if not isinstance(exts, list) or not exts:
+        return out
+    seen: set[tuple[int, str]] = set()
+    try:
+        for p in work_path.iterdir():
+            if not p.is_file():
+                continue
+            for ext in exts:
+                e = (ext or "").strip() if isinstance(ext, str) else ""
+                if not e.startswith("."):
+                    e = "." + e if e else ""
+                if not e or not p.name.endswith(e) or not p.name.startswith(prefix + "_v"):
+                    continue
+                v = _parse_workfile_version(p.name, prefix, e)
+                if v is not None and (v, p.name) not in seen:
+                    seen.add((v, p.name))
+                    out.append((v, p))
+                    break
+    except OSError:
+        pass
+    out.sort(key=lambda x: (-x[0], str(x[1])))
+    return out
+
+
 def _dcc_work_states_for_department(
     dept_dir: Path,
     dept_id: str,

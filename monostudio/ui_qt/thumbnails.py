@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import subprocess
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,26 +29,59 @@ _IMAGE_EXTENSIONS = frozenset({
 # Video: extract one frame via ffmpeg (fast seek -ss before -i)
 _VIDEO_EXTENSIONS = frozenset({
     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg",
+    ".ts",  # MPEG Transport Stream
 })
 DEFAULT_MEMORY_CACHE_MAX = 200
 
 
+def _get_video_duration_seconds(video_path: Path) -> float | None:
+    """Get video duration in seconds via ffprobe; None if unavailable or invalid."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    path_str = str(video_path.resolve())
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path_str,
+            ],
+            capture_output=True,
+            timeout=5,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout or not proc.stdout.strip():
+            return None
+        return float(proc.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+        logger.debug("ffprobe duration failed for %s: %s", path_str, e)
+        return None
+
+
 def _load_video_frame_via_ffmpeg(video_path: Path, size_px: int) -> QPixmap | None:
     """
-    Extract one frame from video using ffmpeg (fast: -ss before -i), output PNG to pipe.
-    Returns scaled QPixmap or None if ffmpeg missing/fails.
+    Extract one frame from video at 1/4 duration using ffmpeg (fast: -ss before -i).
+    Falls back to frame at 0s if duration unknown. Returns scaled QPixmap or None.
     """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return None
     path_str = str(video_path.resolve())
+    seek_sec = 0.0
+    duration = _get_video_duration_seconds(video_path)
+    if duration is not None and duration > 0:
+        seek_sec = duration / 4.0
     try:
         proc = subprocess.run(
             [
                 ffmpeg,
                 "-y",
                 "-loglevel", "error",
-                "-ss", "0",
+                "-ss", str(seek_sec),
                 "-i", path_str,
                 "-vframes", "1",
                 "-f", "image2pipe",
@@ -77,6 +112,18 @@ def _load_video_frame_via_ffmpeg(video_path: Path, size_px: int) -> QPixmap | No
 
 
 _DEPT_THUMB_CACHE_SEP = "::dept::"
+
+
+def _thumbnail_disk_cache_dir() -> Path:
+    """Thumbnail disk cache root: Windows temp (or system temp) / MonoStudio26 / thumbnails. Not deleted by app."""
+    return Path(tempfile.gettempdir()) / "MonoStudio26" / "thumbnails"
+
+
+def _disk_cache_path(source_path: Path, mtime_ns: int, size_px: int) -> Path:
+    """Path to cached PNG for this source file; same path+mtime+size always yields same file."""
+    raw = f"{source_path.resolve()!s}\n{mtime_ns}\n{size_px}"
+    h = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:32]
+    return _thumbnail_disk_cache_dir() / f"{h}.png"
 
 
 def resolve_department_thumbnail_path(item_root: Path, department: str) -> Path | None:
@@ -175,11 +222,27 @@ class ThumbnailCache:
         if cached is not None and cached.mtime_ns == mtime_ns:
             return cached.pixmap
 
+        # Disk cache in Windows temp: read first; never deleted by app
+        dc_path = _disk_cache_path(file_path, mtime_ns, self._size_px)
+        try:
+            if dc_path.is_file():
+                pix = QPixmap(str(dc_path))
+                if not pix.isNull():
+                    self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
+                    return pix
+        except OSError:
+            pass
+
         ext = (file_path.suffix or "").strip().lower()
         if file_path.is_file() and ext in _VIDEO_EXTENSIONS:
             pix = _load_video_frame_via_ffmpeg(file_path, self._size_px)
             if pix is not None:
                 self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
+                try:
+                    dc_path.parent.mkdir(parents=True, exist_ok=True)
+                    pix.save(str(dc_path), "PNG")
+                except OSError:
+                    pass
             return pix
 
         pix = QPixmap(key)
@@ -193,6 +256,11 @@ class ThumbnailCache:
             Qt.SmoothTransformation,
         )
         self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=scaled)
+        try:
+            dc_path.parent.mkdir(parents=True, exist_ok=True)
+            scaled.save(str(dc_path), "PNG")
+        except OSError:
+            pass
         return scaled
 
 

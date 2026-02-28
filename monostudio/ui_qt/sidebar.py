@@ -23,9 +23,12 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -39,6 +42,22 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.core.dcc_registry import get_default_dcc_registry
+from monostudio.core.version import get_app_version
+from monostudio.core.project_guide_tags import (
+    ALL_TAG_IDS,
+    DEFAULT_TAG_DEFINITIONS,
+    TAG_COLOR_BY_ID,
+    TAG_COLOR_PALETTE,
+    TAG_LABEL_BY_ID,
+    add_tag_definition,
+    build_color_map,
+    build_label_map,
+    delete_tag_definition,
+    paths_with_tag,
+    read_tag_definitions,
+    recolor_tag_definition,
+    rename_tag_definition,
+)
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets
 from monostudio.core.app_paths import get_app_base_path
@@ -64,6 +83,9 @@ class SidebarContext(str, Enum):
 
 # Single nav item that holds the scope pill (Project | Shot | Asset).
 _NAV_SCOPE_ITEM_ROLE = "_scope"
+
+# Tag list: UserRole = tag_id, UserRole+1 = item count for badge
+TAG_COUNT_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 
 def _is_shot_type(type_id: str) -> bool:
@@ -170,6 +192,46 @@ def _rounded_rect_path(rect: QRectF, radius: float, round_top: bool, round_botto
         return path
     path.addRect(rect)
     return path
+
+
+class _TagListDelegate(QStyledItemDelegate):
+    """Paints tag list item: default icon + text, then a small rounded count badge on the right."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[override]
+        super().paint(painter, option, index)
+        count = index.data(TAG_COUNT_ROLE)
+        if count is None or (isinstance(count, int) and count <= 0):
+            return
+        try:
+            n = int(count)
+        except (TypeError, ValueError):
+            return
+        rect = option.rect
+        pad = 4
+        font = QFont(option.font)
+        font.setPointSize(max(8, font.pointSize() - 2))
+        fm = QFontMetrics(font)
+        tw = fm.horizontalAdvance(str(n))
+        badge_w = max(14, tw + 8)
+        badge_h = 14
+        badge_x = rect.right() - badge_w - pad
+        badge_y = rect.center().y() - badge_h // 2
+        badge_rect = QRect(badge_x, badge_y, badge_w, badge_h)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        border = QColor(MONOS_COLORS.get("border_subtle", "#3f3f46"))
+        painter.setPen(border)
+        painter.setBrush(QColor(39, 39, 42, 180))
+        painter.drawRoundedRect(badge_rect, 7, 7)
+        painter.setPen(QColor(MONOS_COLORS.get("text_body", "#d4d4d8")))
+        painter.setFont(font)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, str(n))
+        painter.restore()
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # type: ignore[override]
+        s = super().sizeHint(option, index)
+        return s
 
 
 class _SidebarDeptListDelegate(QStyledItemDelegate):
@@ -534,6 +596,8 @@ class SidebarWidget(QWidget):
 
     departmentClicked = Signal(object)  # str | None
     typeClicked = Signal(object)  # str | None
+    tagClicked = Signal(object)  # str | None  (tag_id or None for "All")
+    tagsDefinitionsChanged = Signal()  # emitted when user modifies tag definitions
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -543,6 +607,7 @@ class SidebarWidget(QWidget):
 
         self._active_department: str | None = None
         self._active_type: str | None = None
+        self._active_tag: str | None = None
 
         self._mode: str = "assets"  # "assets" | "shots" (UI-only context)
         # Default number of items shown per section (user can pick any count).
@@ -661,8 +726,65 @@ class SidebarWidget(QWidget):
         type_section_lay.addWidget(type_header_row, 0)
         type_section_lay.addWidget(self._type_list, 0)
 
+        # --- TAGS section (visible only in "reference" mode) ---
+        tag_header_row = QWidget(self)
+        tag_header_row.setObjectName("SidebarFilterHeaderRow")
+        tag_header_row_l = QHBoxLayout(tag_header_row)
+        tag_header_row_l.setContentsMargins(0, 0, 0, 0)
+        tag_header_row_l.setSpacing(8)
+
+        tag_header_icon = QLabel(tag_header_row)
+        tag_header_icon.setObjectName("SidebarFilterHeaderIcon")
+        tag_header_icon.setFixedSize(16, 16)
+        tag_header_icon.setAlignment(Qt.AlignCenter)
+        tag_header_icon.setPixmap(lucide_icon("tag", size=16, color_hex=MONOS_COLORS["text_label"]).pixmap(16, 16))
+
+        tag_header_label = QLabel("TAGS", tag_header_row)
+        tag_header_label.setObjectName("SidebarSectionHeader")
+        tag_header_label.setFont(f_h)
+
+        self._btn_tag_pick = QToolButton(tag_header_row)
+        self._btn_tag_pick.setObjectName("SidebarFilterAddButton")
+        self._btn_tag_pick.setText("+")
+        self._btn_tag_pick.setCursor(Qt.PointingHandCursor)
+        self._btn_tag_pick.clicked.connect(self._open_tag_picker)
+
+        tag_header_row_l.addWidget(tag_header_icon, 0, Qt.AlignVCenter)
+        tag_header_row_l.addWidget(tag_header_label, 0, Qt.AlignVCenter)
+        tag_header_row_l.addStretch(1)
+        tag_header_row_l.addWidget(self._btn_tag_pick, 0, Qt.AlignVCenter)
+
+        self._tag_list = QListWidget(self)
+        self._tag_list.setObjectName("SidebarTagList")
+        self._tag_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._tag_list.setFocusPolicy(Qt.NoFocus)
+        self._tag_list.setIconSize(QSize(20, 16))
+        self._tag_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._tag_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._tag_list.setItemDelegate(_TagListDelegate(self._tag_list))
+        self._tag_list.itemClicked.connect(self._on_tag_clicked)
+
+        self._tag_definitions: list[dict[str, str]] = list(DEFAULT_TAG_DEFINITIONS)
+        self._tag_color_map: dict[str, str] = dict(TAG_COLOR_BY_ID)
+        self._tag_label_map: dict[str, str] = dict(TAG_LABEL_BY_ID)
+        self._visible_tags: list[str] = list(ALL_TAG_IDS)
+        self._tag_item_tags: dict[str, list[str]] = {}  # path -> tag_ids (from Project Guide tree)
+        self._project_root: Path | None = None
+        self._rebuild_tag_list()
+
+        self._tag_section = QWidget(self)
+        self._tag_section.setObjectName("SidebarFilterTagSection")
+        tag_section_lay = QVBoxLayout(self._tag_section)
+        tag_section_lay.setContentsMargins(0, 0, 0, 0)
+        tag_section_lay.setSpacing(0)
+        tag_section_lay.addWidget(tag_header_row, 0)
+        tag_section_lay.addWidget(self._tag_list, 0)
+
+        self._tag_section.setVisible(False)
+
         root.addWidget(self._dept_section, 0)
         root.addWidget(self._type_section, 0)
+        root.addWidget(self._tag_section, 0)
         root.addStretch(1)
 
         # Load from pipeline metadata (single source of truth), scoped by current mode.
@@ -691,6 +813,7 @@ class SidebarWidget(QWidget):
             self.set_types(self._all_types)
             self._dept_section.setVisible(False)
             self._type_section.setVisible(True)
+            self._tag_section.setVisible(False)
             return
 
         if self._mode == "reference":
@@ -712,6 +835,8 @@ class SidebarWidget(QWidget):
             self.set_types([])
             self._dept_section.setVisible(True)
             self._type_section.setVisible(False)
+            self._tag_section.setVisible(True)
+            self._sync_tag_selection()
             return
 
         meta = load_pipeline_types_and_presets()
@@ -784,12 +909,16 @@ class SidebarWidget(QWidget):
         self.set_types(self._all_types)
         self._dept_section.setVisible(True)
         self._type_section.setVisible(True)
+        self._tag_section.setVisible(False)
 
     def current_department(self) -> str | None:
         return self._active_department
 
     def current_type(self) -> str | None:
         return self._active_type
+
+    def current_tag(self) -> str | None:
+        return self._active_tag
 
     def get_department_display(self, dept_id: str | None) -> tuple[str | None, str | None]:
         """Return (label, icon_name) for pipeline display (header + thumb badge). Subdepartment-safe."""
@@ -804,6 +933,25 @@ class SidebarWidget(QWidget):
         if not tid:
             return (None, None)
         return (self._type_label_by_id.get(tid), self._type_icon_by_id.get(tid))
+
+    def get_tag_display(self, tag_id: str | None) -> str | None:
+        """Return display label for tag (for notifications)."""
+        if not tag_id:
+            return None
+        return self._tag_label_map.get(tag_id) or tag_id
+
+    def set_tag_item_tags(self, item_tags: dict[str, list[str]]) -> None:
+        """Set item->tag_ids map from Project Guide tree (for tag count badges)."""
+        self._tag_item_tags = dict(item_tags) if item_tags else {}
+        for i in range(self._tag_list.count()):
+            item = self._tag_list.item(i)
+            if item is None:
+                continue
+            tid = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(tid, str):
+                count = len(paths_with_tag(self._tag_item_tags, tid))
+                item.setData(TAG_COUNT_ROLE, count)
+        self._tag_list.viewport().update()
 
     def set_settings(self, settings: QSettings) -> None:
         """
@@ -1153,6 +1301,98 @@ class SidebarWidget(QWidget):
         self._state_by_mode[self._mode] = self._snapshot_state()
         self._save_state_for_mode(self._mode)
 
+    def _on_tag_clicked(self, item: QListWidgetItem) -> None:
+        tag_id = item.data(Qt.ItemDataRole.UserRole)  # str | None
+        if tag_id == self._active_tag:
+            self._active_tag = None
+            self._sync_tag_selection()
+            self.tagClicked.emit(None)
+            return
+        self._active_tag = tag_id
+        self._sync_tag_selection()
+        self.tagClicked.emit(tag_id)
+
+    def _sync_tag_selection(self) -> None:
+        if self._active_tag is None:
+            self._tag_list.clearSelection()
+            self._tag_list.setCurrentRow(-1)
+        for i in range(self._tag_list.count()):
+            item = self._tag_list.item(i)
+            if item is None:
+                continue
+            tid = item.data(Qt.ItemDataRole.UserRole)
+            is_active = tid == self._active_tag
+            if is_active:
+                item.setForeground(QColor(MONOS_COLORS.get("blue_400", "#60a5fa")))
+            else:
+                item.setForeground(QColor(MONOS_COLORS.get("text_body", "#d4d4d8")))
+
+    def set_project_root(self, project_root: Path | None) -> None:
+        self._project_root = project_root
+        if project_root is not None:
+            self._tag_definitions = read_tag_definitions(project_root)
+        else:
+            self._tag_definitions = list(DEFAULT_TAG_DEFINITIONS)
+        self._tag_color_map = build_color_map(self._tag_definitions)
+        self._tag_label_map = build_label_map(self._tag_definitions)
+        all_ids = [d["id"] for d in self._tag_definitions]
+        self._visible_tags = [tid for tid in self._visible_tags if tid in set(all_ids)]
+        for tid in all_ids:
+            if tid not in self._visible_tags:
+                self._visible_tags.append(tid)
+        self._rebuild_tag_list()
+
+    def _rebuild_tag_list(self) -> None:
+        self._tag_list.clear()
+        f_tag = monos_font("Inter", 10, QFont.Weight.Normal)
+        visible_set = set(self._visible_tags)
+        for tdef in self._tag_definitions:
+            tid = tdef["id"]
+            if tid not in visible_set:
+                continue
+            item = QListWidgetItem(tdef["label"])
+            item.setData(Qt.ItemDataRole.UserRole, tid)
+            count = len(paths_with_tag(self._tag_item_tags, tid))
+            item.setData(TAG_COUNT_ROLE, count)
+            item.setFont(f_tag)
+            item.setForeground(QColor(MONOS_COLORS.get("text_body", "#d4d4d8")))
+            item.setIcon(self._tag_dot_icon(tdef["color"]))
+            self._tag_list.addItem(item)
+        row_h = self._tag_list.sizeHintForRow(0) if self._tag_list.count() > 0 else 26
+        self._tag_list.setFixedHeight(row_h * self._tag_list.count() + 4)
+        self._sync_tag_selection()
+
+    @staticmethod
+    def _tag_dot_icon(color_hex: str) -> QIcon:
+        src = lucide_icon("tag-filled", size=12, color_hex=color_hex)
+        src_px = src.pixmap(12, 12)
+        canvas = QPixmap(20, 16)
+        canvas.fill(QColor(0, 0, 0, 0))
+        p = QPainter(canvas)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawPixmap(2, 2, src_px)
+        p.end()
+        return QIcon(canvas)
+
+    def _open_tag_picker(self) -> None:
+        dlg = _TagPickerDialog(
+            tag_definitions=self._tag_definitions,
+            visible_tags=list(self._visible_tags),
+            project_root=self._project_root,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._tag_definitions = dlg.tag_definitions()
+        self._tag_color_map = build_color_map(self._tag_definitions)
+        self._tag_label_map = build_label_map(self._tag_definitions)
+        self._visible_tags = dlg.visible_tag_ids()
+        if self._active_tag and self._active_tag not in {d["id"] for d in self._tag_definitions}:
+            self._active_tag = None
+            self.tagClicked.emit(None)
+        self._rebuild_tag_list()
+        self.tagsDefinitionsChanged.emit()
+
     def _open_department_picker(self) -> None:
         dlg = _FilterPickDialog(
             title="Select Departments",
@@ -1433,6 +1673,179 @@ class _FilterPickDialog(MonosDialog):
         self._hint.setText(f"Selected {n}")
 
 
+class _TagPickerDialog(MonosDialog):
+    """
+    Manage tags: toggle visibility (checkbox), right-click to rename / recolor / delete.
+    """
+
+    def __init__(
+        self,
+        *,
+        tag_definitions: list[dict[str, str]],
+        visible_tags: list[str],
+        project_root: Path | None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Manage Tags")
+        self.setModal(True)
+        self.setObjectName("SidebarFilterPickDialog")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        self._defs = [dict(d) for d in tag_definitions]
+        self._visible = set(visible_tags)
+        self._project_root = project_root
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        self._hint = QLabel("Right-click tag to rename, change color, or delete", self)
+        self._hint.setObjectName("SidebarFilterPickHint")
+
+        self._list = QListWidget(self)
+        self._list.setObjectName("SelectableListMulti")
+        self._list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self._list.setFocusPolicy(Qt.StrongFocus)
+        self._list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._list.setIconSize(QSize(16, 16))
+        self._list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._on_context_menu)
+        self._list.setMinimumHeight(260)
+
+        self._populate()
+
+        btn_row = QWidget(self)
+        btn_l = QHBoxLayout(btn_row)
+        btn_l.setContentsMargins(0, 0, 0, 0)
+        btn_l.setSpacing(8)
+
+        add_btn = QPushButton("+ New Tag", btn_row)
+        add_btn.setObjectName("SidebarFilterPickCancel")
+        add_btn.setCursor(Qt.PointingHandCursor)
+        add_btn.clicked.connect(self._add_tag)
+
+        btn_l.addWidget(add_btn, 0)
+        btn_l.addStretch(1)
+        cancel = QPushButton("Cancel", btn_row)
+        cancel.setObjectName("SidebarFilterPickCancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Done", btn_row)
+        ok.setObjectName("SidebarFilterPickDone")
+        ok.clicked.connect(self.accept)
+        btn_l.addWidget(cancel, 0)
+        btn_l.addWidget(ok, 0)
+
+        root.addWidget(self._hint, 0)
+        root.addWidget(self._list, 1)
+        root.addWidget(btn_row, 0)
+
+    def _populate(self) -> None:
+        self._list.clear()
+        for d in self._defs:
+            it = QListWidgetItem(d["label"])
+            it.setData(Qt.UserRole, d["id"])
+            it.setIcon(self._dot_icon(d["color"]))
+            self._list.addItem(it)
+            if d["id"] in self._visible:
+                it.setSelected(True)
+
+    @staticmethod
+    def _dot_icon(color_hex: str) -> QIcon:
+        return lucide_icon("tag-filled", size=14, color_hex=color_hex)
+
+    def _on_context_menu(self, pos) -> None:
+        item = self._list.itemAt(pos)
+        if item is None:
+            return
+        tag_id = item.data(Qt.UserRole)
+        menu = QMenu(self)
+        rename_act = menu.addAction("Rename")
+        color_menu = menu.addMenu("Change Color")
+        for c in TAG_COLOR_PALETTE:
+            px = QPixmap(14, 14)
+            px.fill(QColor(0, 0, 0, 0))
+            cp = QPainter(px)
+            cp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            cp.setBrush(QColor(c))
+            cp.setPen(Qt.PenStyle.NoPen)
+            cp.drawEllipse(1, 1, 12, 12)
+            cp.end()
+            act = color_menu.addAction(QIcon(px), c)
+            act.setData(c)
+        menu.addSeparator()
+        delete_act = menu.addAction("Delete")
+
+        chosen = menu.exec(self._list.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == rename_act:
+            self._rename_tag(tag_id, item)
+        elif chosen == delete_act:
+            self._delete_tag(tag_id)
+        elif chosen.data():
+            self._recolor_tag(tag_id, chosen.data(), item)
+
+    def _rename_tag(self, tag_id: str, item: QListWidgetItem) -> None:
+        old_label = item.text()
+        new_label, ok = QInputDialog.getText(
+            self, "Rename Tag", "New name:", QLineEdit.EchoMode.Normal, old_label,
+        )
+        if not ok or not new_label.strip() or new_label.strip() == old_label:
+            return
+        for d in self._defs:
+            if d["id"] == tag_id:
+                d["label"] = new_label.strip()
+                break
+        item.setText(new_label.strip())
+        if self._project_root:
+            rename_tag_definition(self._project_root, tag_id, new_label.strip())
+
+    def _recolor_tag(self, tag_id: str, new_color: str, item: QListWidgetItem) -> None:
+        for d in self._defs:
+            if d["id"] == tag_id:
+                d["color"] = new_color
+                break
+        item.setIcon(self._dot_icon(new_color))
+        if self._project_root:
+            recolor_tag_definition(self._project_root, tag_id, new_color)
+
+    def _delete_tag(self, tag_id: str) -> None:
+        self._defs = [d for d in self._defs if d["id"] != tag_id]
+        self._visible.discard(tag_id)
+        self._populate()
+
+    def _add_tag(self) -> None:
+        label, ok = QInputDialog.getText(
+            self, "New Tag", "Tag name:", QLineEdit.EchoMode.Normal, "",
+        )
+        if not ok or not label.strip():
+            return
+        color = TAG_COLOR_PALETTE[len(self._defs) % len(TAG_COLOR_PALETTE)]
+        if self._project_root:
+            _, self._defs = add_tag_definition(self._project_root, label.strip(), color)
+        else:
+            import uuid as _uuid
+            new_id = f"tag_{_uuid.uuid4().hex[:8]}"
+            self._defs.append({"id": new_id, "color": color, "label": label.strip()})
+        self._visible.add(self._defs[-1]["id"])
+        self._populate()
+
+    def tag_definitions(self) -> list[dict[str, str]]:
+        return list(self._defs)
+
+    def visible_tag_ids(self) -> list[str]:
+        out: list[str] = []
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it and it.isSelected():
+                tid = it.data(Qt.UserRole)
+                if isinstance(tid, str):
+                    out.append(tid)
+        return out
+
+
 # --- Recent Task row: icon type + item name + department icon + DCC icon (right)
 _TASK_ROW_HEIGHT = 26
 _TASK_ICON_SIZE = 14
@@ -1594,6 +2007,7 @@ class Sidebar(QWidget):
     settings_requested = Signal()
     recent_task_clicked = Signal(object)  # RecentTask
     recent_task_double_clicked = Signal(object)  # RecentTask
+    clear_recent_tasks_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1642,8 +2056,17 @@ class Sidebar(QWidget):
         f_brand.setStyle(QFont.Style.StyleItalic)
         brand_label.setFont(f_brand)
 
+        ver_label = QLabel(get_app_version(), brand)
+        ver_label.setObjectName("SidebarVersionLabel")
+        f_ver = monos_font("JetBrains Mono", 9, QFont.Weight.Normal)
+        f_ver.setItalic(True)
+        ver_label.setFont(f_ver)
+        ver_label.setStyleSheet("color: #52525b;")
+
         brand_layout.addWidget(icon_box)
-        brand_layout.addWidget(brand_label, 1)
+        brand_layout.addWidget(brand_label)
+        brand_layout.addWidget(ver_label)
+        brand_layout.addStretch(1)
 
         self._nav = QListWidget(top)
         self._nav.setObjectName("SidebarPrimaryNav")
@@ -1780,9 +2203,30 @@ class Sidebar(QWidget):
         tasks_layout.setContentsMargins(16, 12, 16, 8)  # align with sidebar padding
         tasks_layout.setSpacing(8)
 
-        tasks_header = QLabel("RECENT TASKS", tasks_block)
+        tasks_header_row = QWidget(tasks_block)
+        tasks_header_row.setObjectName("SidebarRecentTasksHeaderRow")
+        tasks_header_layout = QHBoxLayout(tasks_header_row)
+        tasks_header_layout.setContentsMargins(0, 0, 0, 0)
+        tasks_header_layout.setSpacing(8)
+        tasks_header = QLabel("RECENT TASKS", tasks_header_row)
         tasks_header.setObjectName("SidebarSectionHeader")
         tasks_header.setFont(f_h)
+        tasks_header_layout.addWidget(tasks_header, 1)
+        self._tasks_clear_btn = QToolButton(tasks_header_row)
+        self._tasks_clear_btn.setObjectName("SidebarRecentTasksClearButton")
+        self._tasks_clear_btn.setCursor(Qt.PointingHandCursor)
+        self._tasks_clear_btn.setFocusPolicy(Qt.NoFocus)
+        self._tasks_clear_btn.setAutoRaise(True)
+        self._tasks_clear_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._tasks_clear_btn.setFixedSize(18, 18)
+        self._tasks_clear_btn.setToolTip("Clear recent tasks")
+        self._tasks_clear_btn.setEnabled(False)
+        _clear_icon = lucide_icon("trash-2", size=14, color_hex=MONOS_COLORS["text_label"])
+        if not _clear_icon.isNull():
+            self._tasks_clear_btn.setIcon(_clear_icon)
+            self._tasks_clear_btn.setIconSize(QSize(14, 14))
+        self._tasks_clear_btn.clicked.connect(self.clear_recent_tasks_requested.emit)
+        tasks_header_layout.addWidget(self._tasks_clear_btn, 0)
 
         self._tasks_stacked = QStackedWidget(tasks_block)
         self._tasks_stacked.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
@@ -1800,7 +2244,7 @@ class Sidebar(QWidget):
         self._tasks_stacked.addWidget(self._tasks_empty)
         self._tasks_stacked.addWidget(self._tasks_list)
 
-        tasks_layout.addWidget(tasks_header, 0)
+        tasks_layout.addWidget(tasks_header_row, 0)
         tasks_layout.addWidget(self._tasks_stacked, 0)
 
         # --- Block 4: Footer (Global Settings only)
@@ -1811,21 +2255,21 @@ class Sidebar(QWidget):
         bottom_layout.setContentsMargins(16, 12, 16, 16)
         bottom_layout.setSpacing(8)
 
-        bottom_layout.addStretch(1)
         self._settings_btn = QToolButton(bottom)
         self._settings_btn.setObjectName("SidebarFooterNavButton")
         self._settings_btn.setCursor(Qt.PointingHandCursor)
         self._settings_btn.setFocusPolicy(Qt.NoFocus)
         self._settings_btn.setAutoRaise(True)
         self._settings_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self._settings_btn.setFixedSize(32, 32)
+        self._settings_btn.setFixedSize(36, 36)
         self._settings_btn.setToolTip("Global Settings")
-        _settings_icon = lucide_icon("sliders-horizontal", size=16, color_hex=MONOS_COLORS["text_label"])
+        _settings_icon = lucide_icon("settings", size=20, color_hex=MONOS_COLORS["text_label"])
         if not _settings_icon.isNull():
             self._settings_btn.setIcon(_settings_icon)
-            self._settings_btn.setIconSize(QSize(16, 16))
+            self._settings_btn.setIconSize(QSize(20, 20))
         self._settings_btn.clicked.connect(self.settings_requested.emit)
         bottom_layout.addWidget(self._settings_btn, 0)
+        bottom_layout.addStretch(1)
 
         root.addWidget(top, 0)
         root.addWidget(scroll, 1)  # Filters stretch to fill space between nav and Recent Tasks
@@ -1844,6 +2288,7 @@ class Sidebar(QWidget):
 
     def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
         self._tasks_list.clear()
+        self._tasks_clear_btn.setEnabled(bool(tasks))
         if not tasks:
             self._tasks_stacked.setCurrentWidget(self._tasks_empty)
             return
@@ -1852,7 +2297,10 @@ class Sidebar(QWidget):
             it = QListWidgetItem("")
             it.setData(Qt.UserRole, t)
             it.setSizeHint(QSize(0, _TASK_ROW_HEIGHT))
-            it.setToolTip(f"{t.item_name}\n{t.department}" + (f" · {t.dcc}" if t.dcc else ""))
+            base_tt = f"{t.item_name}\n{t.department}" + (f" · {t.dcc}" if t.dcc else "")
+            base_html = base_tt.replace("\n", "<br/>")
+            hint_html = '<span style="font-size:80%; color:#71717a;">Double-click to open</span>'
+            it.setToolTip(f"<html>{base_html}<br/><br/>{hint_html}</html>")
             self._tasks_list.addItem(it)
         # Focus the first (most recently opened) task
         self._tasks_list.setCurrentRow(0)

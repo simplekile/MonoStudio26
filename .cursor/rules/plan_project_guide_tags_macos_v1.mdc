@@ -1,0 +1,226 @@
+---
+description: Plan hệ thống tag cho Project Guide giống macOS – gán tag màu cho file/folder, lọc theo tag, sidebar tag.
+alwaysApply: false
+---
+
+# Plan: Hệ thống Tag cho Project Guide (kiểu macOS) (v1)
+
+Trang **Project Guide** hiển thị cây file/folder dưới `project_guide/<department>` (reference, script, storyboard, guideline, concept). Hệ thống tag cho phép gán **nhãn màu** (và tùy chọn tên) cho từng item, hiển thị tag bên cạnh tên trong tree, và **lọc theo tag** trong **sidebar** (section TAGS) giống Finder trên macOS.
+
+---
+
+## 1. Mục đích & phạm vi
+
+- **Gán tag**: Mỗi file/folder trong Project Guide có thể có **nhiều tag** (màu + tên tùy chọn).
+- **Hiển thị**: Trong tree, bên cạnh tên item hiển thị **chấm màu** (hoặc pill nhỏ) tương ứng tag; nhiều tag = nhiều chấm/pill.
+- **Lọc**: **Sidebar** — khi ở trang Project Guide, section **TAGS** trong sidebar cho phép chọn tag để lọc cây; "All" = không lọc.
+- **Không làm (Phase 1)**: Sync tag qua cloud, tag cho asset/shot (chỉ áp dụng cho Project Guide). Không dùng xattr/filesystem tag — lưu metadata trong `.monostudio/`.
+
+---
+
+## 2. Tham chiếu hành vi macOS Finder
+
+| Tính năng | macOS | MONOS (đề xuất) |
+|-----------|--------|------------------|
+| Palette mặc định | Red, Orange, Yellow, Green, Blue, Purple, Gray | Cùng 7 màu (hex chuẩn); có thể thêm tag tùy chỉnh (màu + tên). |
+| Gán tag | Right-click → Tags → chọn tag | Context menu item "Tags" → submenu chọn/bỏ tag (checkmark). |
+| Hiển thị trong list | Colored dot bên trái tên | Delegate vẽ 1–N chấm/pill bên phải tên (hoặc dưới icon) trong tree. |
+| Sidebar filter | Click tag trong sidebar → filter | **Section TAGS trong sidebar** (khi context = Project Guide): All + 7 tag màu; click tag → filter cây. |
+| Lưu trữ | xattr (macOS) / NTFS streams (Windows) | JSON trong project: `.monostudio/project_guide_tags.json`. |
+
+---
+
+## 3. Dữ liệu & lưu trữ
+
+### 3.1 File metadata
+
+- **Path**: `<project_root>/.monostudio/project_guide_tags.json`
+- **Schema đề xuất**:
+
+```json
+{
+  "version": 1,
+  "tag_definitions": [
+    { "id": "red", "color": "#FF3B30", "label": "Red" },
+    { "id": "orange", "color": "#FF9500", "label": "Orange" },
+    { "id": "yellow", "color": "#FFCC00", "label": "Yellow" },
+    { "id": "green", "color": "#34C759", "label": "Green" },
+    { "id": "blue", "color": "#007AFF", "label": "Blue" },
+    { "id": "purple", "color": "#AF52DE", "label": "Purple" },
+    { "id": "gray", "color": "#8E8E93", "label": "Gray" }
+  ],
+  "item_tags": {
+    "reference/characters/sheet.pdf": ["red", "green"],
+    "script/ep01_v01.docx": ["blue"],
+    "guideline/style_guide/": ["purple", "gray"]
+  }
+}
+```
+
+- **`item_tags`**: Key = **đường dẫn tương đối** từ **root của project_guide** (không phải từ department). Ví dụ: item trong `project_guide/reference/characters/sheet.pdf` → key `"reference/characters/sheet.pdf"`. Dùng `/` làm separator; chuẩn hóa không trailing slash cho file, có thể có hoặc không cho folder (chốt một convention).
+- **`tag_definitions`**: Có thể chỉ đọc 7 tag mặc định (không lưu trong file) hoặc cho phép project/user thêm tag tùy chỉnh (khi đó lưu trong file). Phase 1: **chỉ 7 tag mặc định**, không custom tag.
+
+### 3.2 Module Python
+
+- **Vị trí**: `monostudio/core/project_guide_tags.py` (hoặc trong `monostudio/core/` với tên rõ ràng).
+- **API đề xuất**:
+  - `get_project_guide_tags_path(project_root: Path) -> Path`
+  - `read_project_guide_tags(project_root: Path) -> dict` (full JSON hoặc dataclass)
+  - `write_project_guide_tags(project_root: Path, data: dict) -> bool`
+  - `get_tags_for_item(project_root: Path, project_guide_relative_path: str) -> list[str]` (tag ids)
+  - `set_tags_for_item(project_root: Path, project_guide_relative_path: str, tag_ids: list[str]) -> bool` (merge vào structure, write file)
+  - `get_default_tag_definitions() -> list[dict]` (7 màu cố định, không đọc file)
+
+---
+
+## 4. UI – Tree (ReferenceTreePane / Project Guide)
+
+### 4.1 Hiển thị tag trên từng dòng
+
+- **ReferenceTreePane** dùng `QFileSystemModel` + `_InboxTreeDelegate`. Cần **đọc tag** theo path của từng index (suy ra relative path từ project_guide root).
+- **Delegate**: Trong `paint()`, sau khi vẽ nội dung mặc định (icon + text), vẽ thêm **các chấm màu** (hoặc pill nhỏ) bên phải tên, dựa trên `get_tags_for_item(project_root, relative_path)`. Mỗi tag = một hình tròn nhỏ (vd 6–8px) với màu từ `tag_definitions`; nhiều tag xếp ngang, cách nhau 2–4px.
+- **Project root**: Delegate cần nhận `project_root` và **project_guide root path** để tính `relative_path` từ `filePath(index)`. Có thể truyền qua `ReferenceTreePane` → set property trên delegate hoặc gọi hàm lấy tag trong delegate.
+
+### 4.2 Context menu – gán tag
+
+- Trong `_on_ref_tree_context_menu`: thêm action **"Tags"** với submenu.
+- Submenu: một item cho mỗi tag (Red, Orange, …); mỗi item có **checkbox** (trạng thái = item hiện tại có tag đó hay không). Click = toggle tag cho selection.
+- **Multi-selection**: Khi chọn nhiều item, toggle tag áp dụng cho **tất cả** item đang chọn (thêm/bỏ tag đồng loạt).
+- Cần **path → relative_path**: từ `project_guide_root` và `filePath(index)` suy ra key cho `item_tags`.
+
+---
+
+## 5. UI – Filter theo tag (trong Sidebar)
+
+### 5.1 Vị trí: Sidebar
+
+- Khi context = **Project Guide**, sidebar đã dùng `set_mode("reference")` và hiện section **DEPARTMENTS** (reference, script, storyboard, guideline, concept).
+- **Thêm section TAGS** trong sidebar, chỉ hiện khi `_mode == "reference"`:
+  - Header "TAGS" (cùng style SidebarFilterHeaderRow).
+  - Danh sách: 7 tag (Red, Orange, Yellow, Green, Blue, Purple, Gray), mỗi item có chấm màu bên trái. Không có item "All".
+  - Single-select, toggle-to-none (giống department filter ở Assets page): click tag → filter cây; click lại tag đang chọn → deselect (không filter, hiện tất cả).
+- **Không** đặt filter tag trên bar của tree (breadcrumb); toàn bộ filter tag nằm ở **sidebar**.
+
+### 5.2 Cách lọc (tree)
+
+- **QFileSystemModel** không hỗ trợ filter theo metadata. Dùng **QSortFilterProxyModel** bọc `QFileSystemModel`: override `filterAcceptsRow()` — với mỗi index lấy path → relative_path từ project_guide root → `get_tags_for_item()`; nếu sidebar đang chọn một tag (khác "All") và item không có tag đó thì return False.
+- Filter state (tag đang chọn trong sidebar) cần **đồng bộ** từ SidebarWidget sang nơi giữ ReferenceTreePane / proxy: qua signal (vd `tagFilterChanged(str | None)`) từ sidebar, MainWindow hoặc ReferencePageWidget nhận và set filter lên proxy + `invalidateFilter()`.
+
+### 5.3 "All" vs chọn tag
+
+- Mặc định: **All** (không lọc).
+- Khi user chọn một tag trong sidebar: chỉ hiển thị item có **tag đó**. Chọn lại "All" = không lọc.
+- Phase 1: **single tag filter** (chọn 1 tag). Multi-tag (OR) có thể mở rộng sau.
+
+### 5.4 Khi không có item nào có tag (filter đang chọn một tag)
+
+- User chọn một tag trong sidebar (vd Red) nhưng **không có file/folder nào** trong cây có tag đó.
+- Proxy: chỉ accept root (luôn hiện) + row có path trong set “có tag” + ancestor của chúng. Nếu set rỗng → chỉ còn **root** được accept.
+- **View**: Cây chỉ còn **một dòng** — folder root (vd `reference`). Không có con hiển thị (tất cả con đều bị ẩn vì không có tag). Root vẫn có thể expand nhưng khi expand sẽ không thấy gì (hoặc Qt có thể không vẽ nút expand nếu proxy báo không có con thỏa filter).
+- **UX đề xuất**: (1) Giữ nguyên — user thấy cây “trống” (chỉ root), tự hiểu là không có item nào có tag đó; hoặc (2) Hiển thị **empty state** trong vùng tree khi filter tag đang bật và 0 item match: text nhẹ kiểu “No items with this tag” / “Không có item nào có tag này” (có thể dùng overlay/placeholder trên tree hoặc một dòng thay cho nội dung). Plan chốt: **Phase 1 giữ (1)** — chỉ root, không thêm empty state; có thể bổ sung (2) sau.
+
+### 5.5 Alternative: Chỉ hiện item có tag (flat list) + double-click folder → mở tree và locate
+
+- **Ý tưởng**: Khi filter theo tag: không hiện cây có ancestor, mà chỉ hiện **danh sách phẳng** các item có tag (file và folder). Double-click vào một **folder** trong list → chuyển sang (hoặc "mở") tree đầy đủ và **locate** folder đó (expand đường dẫn từ root tới folder, scroll tới folder, select).
+- **Có phức tạp hơn không?** **Có.** Lý do:
+  1. **Hai chế độ hiển thị**: "Chỉ item có tag" = **flat list** (mỗi dòng một path), không phải tree. Tree view không thể "chỉ hiện item đó" mà không hiện đường dẫn (parent) — nếu bỏ ancestor thì không còn cấu trúc cây. Nên khi filter tag cần **list view** (QListView hoặc tương đương) với model là danh sách path có tag; khi filter = All dùng **tree** như hiện tại. → Cần chuyển đổi view (stacked: list vs tree) hoặc một view đổi model/layout theo filter.
+  2. **Model cho list**: Cần nguồn dữ liệu "các path có tag X" (đã có từ item_tags). List model có thể là QStandardItemModel hoặc custom model trả về path + name + is_dir; cập nhật khi đổi tag hoặc khi tag data thay đổi.
+  3. **Double-click folder → locate trong tree**: Khi user double-click folder trong list: (1) set filter = All (hoặc chuyển sang tree); (2) expand path từ root tới folder đó (expand từng parent); (3) setCurrentIndex + scrollTo folder. Logic expand-to-path + scroll có thể dùng tương tự _select_paths_in_tree / set_tree_state. Phần này ít phức tạp hơn.
+- **So sánh**: Plan hiện tại (tree + proxy, accept ancestor + item có tag) chỉ dùng **một view** (tree), một proxy, không cần list. Alternative (flat list khi có tag + double-click → locate) cần **hai view** hoặc một view hai mode, thêm list model và logic chuyển mode. Phase 1 nên giữ **tree + ancestor**; nếu sau cần UX "chỉ list item có tag + locate" thì bổ sung theo mục 5.5 này.
+
+### 5.6 Tree hiện tại có filter theo tag được không?
+
+- **Không** — với logic tree hiện tại (chỉ `QFileSystemModel` + `setModel(_fs_model)`), **không** filter được theo tag. `QFileSystemModel` chỉ biết cấu trúc file/folder, không có metadata tag.
+- **Có** — nếu thêm **QSortFilterProxyModel** bọc `_fs_model`:
+  - `_tree.setModel(proxy)` thay vì `setModel(_fs_model)`; `setRootIndex(proxy.mapFromSource(_fs_model.index(str(root_path))))`.
+  - Trong proxy override `filterAcceptsRow(source_row, source_parent)`: lấy path từ source index → relative path từ project_guide root → tra `item_tags`; nếu đang filter theo tag X và item không có tag X thì return False. **Quan trọng**: phải accept cả **folder cha** nếu bất kỳ con (trực tiếp hoặc đệ quy) có tag — nếu không sẽ mất đường xuống item có tag. Cách làm: khi filter tag X, build set `S` = { path có tag X }; accept row nếu path ∈ S hoặc path là prefix của một path trong S (tức là ancestor của item có tag).
+  - Mọi chỗ lấy **index từ tree** (vd `indexAt()`, `selectedIndexes()`) rồi gọi `_fs_model.filePath(idx)` hiện đang đúng vì idx là source index; sau khi dùng proxy, idx từ tree là **proxy index** → phải `_fs_model.filePath(proxy.mapToSource(idx))`. Mọi chỗ tạo index từ **path** để select/scroll (vd `_select_paths_in_tree`) hiện dùng `_fs_model.index(str(path))` rồi đưa vào tree; sau khi dùng proxy phải `proxy.mapFromSource(src_idx)` rồi mới `select`/`setCurrentIndex`. Nên thêm helper: `_path_from_tree_index(idx)` (mapToSource rồi filePath), `_tree_index_from_path(path)` (mapFromSource) để tránh sai.
+
+---
+
+## 6. Palette màu (mặc định)
+
+Dùng bảng màu giống macOS (Apple Human Interface):
+
+| id     | Hex      | Label   |
+|--------|----------|---------|
+| red    | #FF3B30  | Red     |
+| orange | #FF9500  | Orange  |
+| yellow | #FFCC00  | Yellow  |
+| green  | #34C759  | Green   |
+| blue   | #007AFF  | Blue    |
+| purple | #AF52DE  | Purple  |
+| gray   | #8E8E93  | Gray    |
+
+- Trong UI (delegate, filter bar): dùng hex; không phụ thuộc theme app (tag là identity màu cố định).
+
+---
+
+## 7. Inspector (Project Guide)
+
+- Khi chọn một item trong Project Guide, Inspector hiển thị preview (đã có). Có thể thêm block **Tags**: hiển thị list tag của item + nút "Edit" mở submenu/popover gán tag (trùng với context menu) để không bắt buộc right-click.
+
+---
+
+## 8. Tóm tắt implementation
+
+| Thành phần | Hành động |
+|------------|-----------|
+| **Core** | Thêm `project_guide_tags.py`: read/write `.monostudio/project_guide_tags.json`, get/set tags per relative path, default 7 tag definitions. |
+| **ReferenceTreePane** | Truyền `project_root` + project_guide root vào delegate; đọc tag trong delegate và vẽ chấm màu. |
+| **Context menu** | Thêm "Tags" → submenu 7 tag với checkbox, toggle cho selection. |
+| **Filter** | **Sidebar**: section TAGS (chỉ khi mode = reference): All + 7 tag; signal `tagFilterChanged` → ReferenceTreePane/proxy filter. QSortFilterProxyModel filter theo tag. |
+| **Inspector** | (Optional Phase 1) Block Tags cho item đang chọn + Edit = cùng logic gán tag. |
+| **Style** | Tag dot/pill: 6–8px, border-radius 50%, màu từ definition; đồng bộ 8px grid (spacing 4px giữa các chấm). |
+
+---
+
+## 9. Ghi chú
+
+- **Đường dẫn tương đối**: Cần thống nhất key là từ **project_guide** root (gồm cả department), ví dụ `reference/characters/sheet.pdf`, không phải `characters/sheet.pdf` khi đang ở department "reference". Như vậy khi đổi department hoặc dùng chung một file tags, key nhất quán.
+- **Rename/Delete item**: Khi user đổi tên hoặc xóa file/folder trong tree, cần **cập nhật hoặc xóa** entry tương ứng trong `item_tags` (path cũ → xóa; rename → key mới). Có thể hook sau khi `QFileSystemModel` đã refresh hoặc lắng nghe file system change; nếu không có event, ít nhất khi mở project hoặc refresh, quét và xóa key không còn tồn tại (cleanup).
+- **Performance**: Với cây rất lớn, đọc toàn bộ `project_guide_tags.json` một lần khi vào trang Project Guide và cache trong memory; ghi khi user thay đổi tag. Tránh đọc file từ delegate mỗi lần paint.
+
+---
+
+## 10. Rủi ro khi dùng QSortFilterProxyModel + filter theo tag
+
+### 10.1 Index mapping (mức độ cao)
+
+- Sau khi `_tree.setModel(proxy)`, mọi index từ tree (selection, `indexAt()`, double-click, context menu, delegate) là **proxy index**. Nếu bất kỳ chỗ nào vẫn gọi `_fs_model.filePath(idx)` trực tiếp → path sai hoặc crash (proxy index không hợp lệ với source model).
+- **Giảm rủi ro**: Một nơi duy nhất chuyển index ↔ path: `_path_from_tree_index(idx)` = `_fs_model.filePath(proxy.mapToSource(idx))`, `_tree_index_from_path(path)` = `proxy.mapFromSource(_fs_model.index(str(path)))`. Toàn bộ code dùng hai helper này; không gọi `_fs_model.filePath` với index lấy từ view.
+
+### 10.2 Root index và setRootIndex
+
+- `setRootIndex` phải nhận **proxy index**: `proxy.mapFromSource(_fs_model.index(str(root_path)))`. Nếu quên map, root có thể không hiển thị đúng.
+- Khi filter đang bật (vd chỉ tag Red): folder root (project_guide/reference) có thể không có tag → proxy có thể ẩn luôn root. Cần quy ước: **luôn accept root** (path = root_path) trong `filterAcceptsRow`, không filter mất root.
+
+### 10.3 Expand / collapse và state
+
+- Khi đổi filter (All → Red, Red → All), proxy gọi `invalidateFilter()` → hàng ẩn/hiện lại. Trạng thái expand có thể bị mất hoặc thay đổi (Qt thường giữ theo source index, nhưng khi nhiều row ẩn đi UX có thể “nhảy”.
+- Save/restore expanded state (`get_tree_state` / `set_tree_state`): nếu walk tree và lấy path từ index, phải dùng mapToSource; nếu expand bằng path, phải mapFromSource rồi mới `expand()`. Bỏ qua map → restore sai hoặc không expand được.
+
+### 10.4 Hiệu năng
+
+- `filterAcceptsRow` gọi cho **mỗi row** mỗi khi model refresh hoặc `invalidateFilter()`. Nếu trong đó đọc file JSON hoặc làm logic nặng → cây lớn sẽ chậm.
+- **Giảm rủi ro**: Cache `item_tags` (và set “paths có tag X”) trong memory; trong proxy chỉ tra map/set. “Accept parent nếu có con có tag”: dùng set path có tag, accept row nếu path ∈ set hoặc path là prefix của một phần tử trong set — tránh duyệt con đệ quy trong filterAcceptsRow.
+
+### 10.5 Delegate và paint
+
+- Delegate nhận `option.index` — đây là proxy index. Nếu delegate cần path để vẽ tag chấm màu, phải lấy path qua mapToSource (hoặc pane truyền vào delegate một callback `get_path(proxy_index)` dùng mapToSource nội bộ). Dùng nhầm source model với proxy index → vẽ sai hoặc lỗi.
+
+### 10.6 Rename / Delete và tag metadata
+
+- User đổi tên hoặc xóa file/folder trong tree → filesystem đổi, `item_tags` vẫn giữ key cũ → **dữ liệu tag rác**, item mới (nếu có) không có tag.
+- **Giảm rủi ro**: Hook sau rename/delete (nếu Qt cho phép) để cập nhật/xóa key trong `item_tags`; hoặc định kỳ / khi mở project chạy cleanup (xóa key mà path không còn tồn tại).
+
+### 10.7 Đồng bộ filter state
+
+- Sidebar emit `tagFilterChanged(tag_id | None)`; ReferenceTreePane hoặc MainWindow set vào proxy. Nếu project_guide_root thay đổi (đổi project, đổi department) mà filter state không reset hoặc không gửi lại đúng root → proxy có thể dùng sai project_guide_root khi tính relative path → filter sai.
+- **Giảm rủi ro**: Khi đổi department hoặc project, set lại filter = None (All) và cập nhật lại project_guide_root trong proxy/pane.
+
+### 10.8 Fallback ra drives (root rỗng / không hợp lệ)
+
+- **Hiện tại**: Khi `_root_path` là `None` hoặc không phải thư mục, ReferenceTreePane gọi `setRootIndex(self._fs_model.index(""))`. Với QFileSystemModel, root `""` = root filesystem → trên **Windows** view sẽ hiển thị **danh sách ổ đĩa** (C:\, D:\, …) thay vì nội dung project_guide. Đây là rủi ro có sẵn, không phải do proxy.
+- **Khi thêm proxy**: Cùng logic — nếu root_path không hợp lệ vẫn set root = `proxy.mapFromSource(_fs_model.index(""))` → vẫn fallback ra drives.
+- **Giảm rủi ro**: Khi `_root_path` là None hoặc không tồn tại / không phải dir, **không** gọi `setRootIndex(index(""))`. Chọn một trong: (1) Ẩn tree và hiển thị placeholder “No project” / “Chọn project hoặc department”; (2) Set root tới một index “trống” (vd path tạm không tồn tại hoặc thư mục rỗng tạm) để tree không list drives; (3) Giữ một “dummy” root path (vd project_guide khi chưa có project) và set root tới đó để view trống nhưng không lộ drives. Khuyến nghị: **(1)** — ẩn tree, hiện placeholder khi không có root hợp lệ.

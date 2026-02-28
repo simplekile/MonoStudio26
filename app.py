@@ -15,9 +15,8 @@ from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.crash_recovery import install_crash_logging
 from monostudio.core.pipeline_types_and_presets import ensure_user_default_config_dir
 from monostudio.ui_qt.main_window import MainWindow
+from monostudio.core.version import get_app_version
 from monostudio.ui_qt.style import apply_dark_theme
-
-APP_MAJOR_VERSION = 26
 
 SPLASH_DISPLAY_MS = 2000
 SPLASH_LOADING_UPDATE_MS = 50
@@ -29,21 +28,6 @@ SPLASH_SUBTITLE_COLOR = "#71717a"  # Zinc-500
 SPLASH_STATUS_COLOR = "#52525b"   # Zinc-600 (status text)
 SPLASH_LOADING_COLOR = "#3f3f46"  # track
 SPLASH_LOADING_FILL = "#2563eb"   # Electric Blue (active)
-
-
-def _get_app_version() -> str:
-    """Return version string like 'v26.21' (major + git commit count)."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD"],
-            capture_output=True, text=True, timeout=5,
-            cwd=str(get_app_base_path()),
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return f"v{APP_MAJOR_VERSION}.{result.stdout.strip()}"
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-    return f"v{APP_MAJOR_VERSION}"
 
 
 def _make_splash_pixmap(
@@ -65,15 +49,24 @@ def _make_splash_pixmap(
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-    # Logo centered
+    # Logo container (rounded rect, subtle bg)
+    icon_box_pad = 16
+    icon_box_size = SPLASH_ICON_SIZE + icon_box_pad * 2
+    icon_box_x = (w - icon_box_size) // 2
+    icon_box_y = 44
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(QColor(255, 255, 255, 18)))
+    painter.drawRoundedRect(icon_box_x, icon_box_y, icon_box_size, icon_box_size, 14, 14)
+
+    # Logo centered inside container
     icon_pix = icon.pixmap(SPLASH_ICON_SIZE, SPLASH_ICON_SIZE)
     if not icon_pix.isNull():
-        ix = (w - SPLASH_ICON_SIZE) // 2
-        iy = 48
+        ix = icon_box_x + icon_box_pad
+        iy = icon_box_y + icon_box_pad
         painter.drawPixmap(ix, iy, SPLASH_ICON_SIZE, SPLASH_ICON_SIZE, icon_pix)
 
     # Title: MONOS (italic)
-    title_y = 48 + SPLASH_ICON_SIZE + 20
+    title_y = icon_box_y + icon_box_size + 16
     title_font = QFont("Inter", 16, QFont.Weight.Bold)
     title_font.setItalic(True)
     title_font.setLetterSpacing(QFont.PercentageSpacing, 98)
@@ -81,12 +74,12 @@ def _make_splash_pixmap(
     painter.setPen(QColor(SPLASH_TITLE_COLOR))
     painter.drawText(0, title_y, w, 24, Qt.AlignmentFlag.AlignCenter, "MONOS")
 
-    # Subtitle: Mono Studio v26.xx
-    sub_font = QFont("Inter", 11, QFont.Weight.Normal)
+    # Subtitle: Mono Studio v26.xx (smaller)
+    sub_font = QFont("Inter", 9, QFont.Weight.Normal)
     painter.setFont(sub_font)
     painter.setPen(QColor(SPLASH_SUBTITLE_COLOR))
     subtitle = f"Mono Studio {version}" if version else "Mono Studio"
-    painter.drawText(0, title_y + 26, w, 18, Qt.AlignmentFlag.AlignCenter, subtitle)
+    painter.drawText(0, title_y + 24, w, 16, Qt.AlignmentFlag.AlignCenter, subtitle)
 
     # Status text (above loading bar)
     bar_margin = 32
@@ -169,7 +162,7 @@ def main() -> int:
     app = QApplication(sys.argv)
 
     # Resolve version once (git commit count)
-    _version = _get_app_version()
+    _version = get_app_version()
 
     # Splash first — show immediately (before theme/font/icon loading)
     splash_start = time.monotonic()

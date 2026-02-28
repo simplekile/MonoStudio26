@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication
 
 from monostudio.ui_qt.notification.overlay import NotificationOverlayWidget
+from monostudio.ui_qt.notification.store import append as _store_append
 from monostudio.ui_qt.notification.toast import ToastType
 
 if TYPE_CHECKING:
@@ -53,7 +55,34 @@ class _NotificationService:
             cls._overlay.raise_()
 
     @classmethod
+    def set_general_toast_anchor_widget(cls, widget: "QWidget | None") -> None:
+        """Position general toasts below this widget (e.g. topbar noti button). Call after set_main_window."""
+        overlay = cls._get_overlay()
+        if overlay is None:
+            return
+        overlay.set_general_toast_anchor_widget(widget)
+
+    @classmethod
+    def set_sidebar_anchor_from_cursor(cls) -> None:
+        """Anchor sidebar toasts vertically near current cursor position (typically sidebar click)."""
+        overlay = cls._get_overlay()
+        if overlay is None:
+            return
+        pos = QCursor.pos()
+        overlay.set_sidebar_anchor_y_from_global(pos.y())
+
+    @classmethod
+    def set_sidebar_anchor_from_global_y(cls, y: int | None) -> None:
+        """Anchor sidebar toasts vertically using an explicit global Y coordinate (item row)."""
+        overlay = cls._get_overlay()
+        if overlay is None:
+            return
+        overlay.set_sidebar_anchor_y_from_global(y)
+
+    @classmethod
     def _notify(cls, level: ToastType, message: str, *, category: str = "general") -> None:
+        if category == "general":
+            _store_append(level, message)
         overlay = cls._get_overlay()
         if overlay is None:
             return

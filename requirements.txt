@@ -3,6 +3,8 @@ PySide6>=6.6.0
 
 # Frameless window (PySide6 branch); Windows needs pywin32 for native resize/drag
 pywin32; sys_platform == "win32"
+# Windows shell thumbnail in Inspector (Inbox/Project Guide file preview)
+comtypes; sys_platform == "win32"
 git+https://github.com/zhiyiYo/PyQt-Frameless-Window.git@PySide6
 
 # Build / installer (optional, for maintainers)
