@@ -1,17 +1,21 @@
-# MonoStudio 26 — Release v26.1.5
+# MonoStudio 26 — Release v26.1.7
 
 ## Highlights
 
-- **In-app update**: Check for updates from Settings → General → Updates (GitHub Releases). Version display with Major · Minor · Patch. **Download fix**: follow redirects manually and send User-Agent on every request so GitHub CDN accepts the installer download; Updates tab layout (version card beside check/actions, notes area expands); release notes line spacing (165%).
-- **Build & release**: Auto-commit before build, version bump from commit type (fix → patch, feat/style/docs → minor). Publish to GitHub via `publish_release.ps1`; release notes from RELEASE_NOTES.md or auto-generated from git log.
-- **Settings → Updates**: Version card, “Latest on GitHub” hint, release notes always shown after check. Clear errors when GITHUB_REPO not set or repo/release not found.
-- **Pipeline**: Scan rules (Publish ignore extensions). Inbox (split view, distribute from tree, History dialog). Splash screen, version in sidebar.
+- **Update on startup**: App checks for updates shortly after launch; result is cached so Settings → Updates shows it without clicking "Check for updates" again.
+- **Top bar update button**: New button (download icon) next to the notifications bell. Red dot when an update is available; tooltip auto-shows for 5 seconds at startup if update available; click opens Settings → General → Updates.
+- **In-app update**: Check for updates from Settings → General → Updates (GitHub Releases). Download fix (manual redirect + User-Agent for GitHub CDN); version card beside check/actions; release notes line spacing 165%.
+- **Debug**: Set `MONOSTUDIO_FAKE_UPDATE=1` to simulate "update available" for testing the update UI.
+- **Build & release**: Auto-commit before build, version bump from commit type. Publish via `publish_release.ps1`; release notes from RELEASE_NOTES.md.
+- **Pipeline**: Scan rules, Inbox, splash, version in sidebar.
 
 ## Changes in this release
 
-- fix: update checker — manual redirect handling so User-Agent is sent to GitHub CDN; download no longer fails
-- fix: Settings Updates tab — version card beside check/actions; release notes area expands; line spacing 165%
-- chore: prepare build
+- feat: update check on startup; top bar update button with red dot, auto tooltip, open to Settings → Updates
+- feat: cached update result so Settings → Updates shows startup check without re-checking
+- fix: update checker — manual redirect + User-Agent for GitHub CDN; download no longer fails
+- fix: Settings Updates tab — version card beside check/actions; notes area expands; line spacing 165%
+- chore: debug fake update (MONOSTUDIO_FAKE_UPDATE=1)
 - chore: prepare build
 - feat: ui update (Updates tab, version card, release notes)
 - fix: fixes (core/ui) — CheckResult, release notes when up to date

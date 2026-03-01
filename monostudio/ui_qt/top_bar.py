@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap, QMouseEvent
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsDropShadowEffect,
@@ -20,12 +20,31 @@ from monostudio.ui_qt.notification.notification_list_dialog import NotificationL
 from monostudio.ui_qt.style import MonosMenu, project_accent_color
 
 
+class _UpdateBadge(QWidget):
+    """Red dot badge on update button when a new release is available."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setFixedSize(10, 10)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ef4444"))
+        p.drawEllipse(1, 1, 8, 8)
+        p.end()
+
+
 class TopBar(QWidget):
     project_switch_requested = Signal(str)  # project root path
     minimize_clicked = Signal()
     maximize_clicked = Signal()
     close_clicked = Signal()
     title_double_clicked = Signal()
+    update_button_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -83,6 +102,19 @@ class TopBar(QWidget):
         self._btn_close.setFixedSize(44, 36)
         self._btn_close.clicked.connect(self.close_clicked.emit)
 
+        # Update button (right side, before noti) — icon: download for "update"
+        self._btn_update = QToolButton(self)
+        self._btn_update.setObjectName("TopBarUpdateBtn")
+        self._btn_update.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_update.setIcon(lucide_icon("download", size=20, color_hex=_win_icon_color))
+        self._btn_update.setFixedSize(40, 36)
+        self._btn_update.setToolTip("Check for updates")
+        self._btn_update.clicked.connect(self.update_button_clicked.emit)
+        self._update_badge = _UpdateBadge(self._btn_update)
+        self._update_badge.move(26, 4)
+        self._update_badge.hide()
+        self._update_badge.raise_()
+
         # Notification button (right side, before window buttons)
         self._btn_noti = QToolButton(self)
         self._btn_noti.setObjectName("TopBarNotiBtn")
@@ -101,6 +133,7 @@ class TopBar(QWidget):
         layout.setSpacing(0)
         layout.addWidget(self._project_switch, 0, Qt.AlignLeft | Qt.AlignVCenter)
         layout.addStretch(1)
+        layout.addWidget(self._btn_update, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_noti, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_min, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_max, 0, Qt.AlignRight | Qt.AlignVCenter)
@@ -175,6 +208,19 @@ class TopBar(QWidget):
         """Return the notification toolbar button (for anchoring general toasts below it)."""
         return self._btn_noti
 
+    def get_update_button(self) -> QToolButton:
+        """Return the update toolbar button (e.g. for showing tooltip at startup)."""
+        return self._btn_update
+
+    def set_update_available(self, available: bool, latest_version: str = "") -> None:
+        """Show/hide red dot on update button and set tooltip (e.g. after startup check)."""
+        if available:
+            self._update_badge.show()
+            self._btn_update.setToolTip(f"Update available: {latest_version}. Click to open Settings → Updates.")
+        else:
+            self._update_badge.hide()
+            self._btn_update.setToolTip("Check for updates")
+
     def _open_notification_list_dialog(self) -> None:
         """Open the full notification list dialog (lazy-created)."""
         win = self.window()
@@ -194,6 +240,8 @@ class TopBar(QWidget):
             self._btn_min.geometry().contains(pos)
             or self._btn_max.geometry().contains(pos)
             or self._btn_close.geometry().contains(pos)
+            or self._btn_update.geometry().contains(pos)
+            or self._btn_noti.geometry().contains(pos)
         )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:

@@ -7,6 +7,7 @@ Uses https://api.github.com/repos/OWNER/REPO/releases/latest (tag_name, assets, 
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -140,6 +141,21 @@ def parse_manifest(data: dict[str, Any]) -> UpdateInfo | None:
     return UpdateInfo(version=version, url=url, notes=notes, html_url=html_url)
 
 
+# Cache for startup check result; Settings → Updates can use it without re-checking.
+_cached_check_result: CheckResult | None = None
+
+
+def get_cached_check_result() -> CheckResult | None:
+    """Return the last update check result (e.g. from startup)."""
+    return _cached_check_result
+
+
+def set_cached_check_result(result: CheckResult | None) -> None:
+    """Store update check result so Settings → Updates can show it without re-checking."""
+    global _cached_check_result
+    _cached_check_result = result
+
+
 def check_for_update(
     current_version: str,
     manifest_url: str | None = None,
@@ -148,8 +164,23 @@ def check_for_update(
     """
     Check for update via GitHub Releases API; returns update (if newer) and latest release notes.
     UI can always show release notes for the latest version, even when up to date.
+    Set env MONOSTUDIO_FAKE_UPDATE=1 to force update available (for testing).
     Raises on network/HTTP error or invalid response.
     """
+    if os.environ.get("MONOSTUDIO_FAKE_UPDATE", "").strip() in ("1", "true", "yes"):
+        fake_version = "v99.0.0"
+        return CheckResult(
+            update_available=True,
+            update_info=UpdateInfo(
+                version=fake_version,
+                url="https://github.com/simplekile/MonoStudio26/releases/latest",
+                notes="**Debug fake update** – Set `MONOSTUDIO_FAKE_UPDATE=0` to disable.",
+                html_url="https://github.com/simplekile/MonoStudio26/releases",
+            ),
+            latest_version=fake_version,
+            latest_notes="**Debug fake update** – Used for testing the update UI.",
+            latest_html_url="https://github.com/simplekile/MonoStudio26/releases",
+        )
     if manifest_url is None:
         manifest_url = GITHUB_API_LATEST
     if "your-org" in manifest_url or GITHUB_REPO.startswith("your-org"):

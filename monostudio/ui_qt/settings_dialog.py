@@ -76,6 +76,7 @@ from monostudio.core.pipeline_types_and_presets import (
 from monostudio.core.update_checker import (
     CheckResult,
     UpdateInfo,
+    get_cached_check_result,
     check_for_update,
     download_installer,
     run_installer_and_exit,
@@ -270,6 +271,40 @@ class SettingsDialog(MonosDialog):
         if getattr(self, "_pipeline_tier2_buttons", None) and len(self._pipeline_tier2_buttons) > 1:
             self._pipeline_tier2_buttons[1].setChecked(True)
 
+    def open_to_updates_tab(self) -> None:
+        """Switch to General → Updates and apply cached check result if any (from startup)."""
+        self._nav.setCurrentRow(0)
+        self._content_stack.setCurrentIndex(0)
+        stack = getattr(self, "_general_tier2_stack", None)
+        buttons = getattr(self, "_general_tier2_buttons", None)
+        if stack is not None and buttons is not None and len(buttons) > 3:
+            stack.setCurrentIndex(3)
+            for i, b in enumerate(buttons):
+                b.setChecked(i == 3)
+        self._apply_cached_update_result(get_cached_check_result())
+
+    def _apply_cached_update_result(self, result: CheckResult | None) -> None:
+        """Apply cached update check result to Updates tab UI (no new network check)."""
+        if result is None:
+            return
+        self._update_latest_github_label.setText(f"Latest on GitHub: {result.latest_version}")
+        if result.latest_notes:
+            self._update_changelog.setMarkdown(result.latest_notes)
+        else:
+            self._update_changelog.setPlainText("No release notes for this version.")
+        self._apply_changelog_line_height()
+        self._update_latest_html_url = result.latest_html_url
+        if result.update_available and result.update_info is not None:
+            self._pending_update_info = result.update_info
+            self._update_status_label.setText(f"Update {result.latest_version} available.")
+            self._update_download_btn.setVisible(True)
+            self._update_view_github_btn.setVisible(bool(result.latest_html_url))
+        else:
+            self._pending_update_info = None
+            self._update_status_label.setText("You're on the latest version.")
+            self._update_download_btn.setVisible(False)
+            self._update_view_github_btn.setVisible(bool(result.latest_html_url))
+
     def _build_tier2_page_buttons(
         self,
         items: list[tuple[str, QWidget]],
@@ -314,8 +349,18 @@ class SettingsDialog(MonosDialog):
             self._pipeline_tier2_stack = stack
         if store_buttons == "pipeline":
             self._pipeline_tier2_buttons = buttons
+        if store_stack == "general":
+            self._general_tier2_stack = stack
+            stack.currentChanged.connect(self._on_general_tier2_changed)
+        if store_buttons == "general":
+            self._general_tier2_buttons = buttons
 
         return container
+
+    def _on_general_tier2_changed(self, index: int) -> None:
+        """When General → Updates tab is shown, apply cached check result if any."""
+        if index == 3:
+            self._apply_cached_update_result(get_cached_check_result())
 
     def _on_page_button_clicked(
         self,
@@ -329,12 +374,16 @@ class SettingsDialog(MonosDialog):
 
     def _build_general_page(self) -> QWidget:
         """Tier 2: General → Workspace | UI | Behavior | Updates (nút page ngang)."""
-        return self._build_tier2_page_buttons([
-            ("Workspace", self._build_app_workspace_tab()),
-            ("UI", self._build_ui_tab()),
-            ("Behavior", self._build_behavior_tab()),
-            ("Updates", self._build_updates_tab()),
-        ])
+        return self._build_tier2_page_buttons(
+            [
+                ("Workspace", self._build_app_workspace_tab()),
+                ("UI", self._build_ui_tab()),
+                ("Behavior", self._build_behavior_tab()),
+                ("Updates", self._build_updates_tab()),
+            ],
+            store_stack="general",
+            store_buttons="general",
+        )
 
     def _build_ui_tab(self) -> QWidget:
         """General → UI: notifications and other UI options."""

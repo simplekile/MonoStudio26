@@ -799,7 +799,8 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowMinBtn,
         QToolButton#WindowMaxBtn,
         QToolButton#WindowCloseBtn,
-        QToolButton#TopBarNotiBtn {
+        QToolButton#TopBarNotiBtn,
+        QToolButton#TopBarUpdateBtn {
             border: none;
             border-radius: 0;
             background: transparent;
@@ -807,7 +808,8 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QToolButton#WindowMinBtn:hover,
         QToolButton#WindowMaxBtn:hover,
-        QToolButton#TopBarNotiBtn:hover {
+        QToolButton#TopBarNotiBtn:hover,
+        QToolButton#TopBarUpdateBtn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: #e4e4e7;
             border-radius: 8px;

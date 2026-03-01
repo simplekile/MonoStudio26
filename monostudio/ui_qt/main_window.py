@@ -7,12 +7,14 @@ import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QPoint, Qt, QRect, QSettings, Signal, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QPoint, Qt, QRect, QSettings, Signal, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDropEvent
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMenu, QMessageBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMenu, QMessageBox, QSplitter, QStackedWidget, QToolTip, QVBoxLayout, QWidget
 from qframelesswindow import FramelessMainWindow
 
 from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.update_checker import check_for_update, set_cached_check_result
+from monostudio.core.version import get_app_version
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.fs_reader import (
@@ -59,6 +61,19 @@ from monostudio.ui_qt.stress_profiler import enabled as stress_profiler_enabled
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS
 from monostudio.ui_qt.notification import notify as notification_service
+
+
+class _StartupUpdateCheckWorker(QThread):
+    """Runs check_for_update in background at startup; emits (CheckResult | None, error_message)."""
+
+    check_finished = Signal(object, str)
+
+    def run(self) -> None:
+        try:
+            result = check_for_update(get_app_version())
+            self.check_finished.emit(result, "")
+        except Exception as e:
+            self.check_finished.emit(None, str(e))
 
 
 class MainWindow(FramelessMainWindow):
@@ -283,6 +298,57 @@ class MainWindow(FramelessMainWindow):
 
         notification_service.set_main_window(self, self._main_view)
         notification_service.set_general_toast_anchor_widget(self._top_bar.get_noti_button())
+
+        self._top_bar.update_button_clicked.connect(self._open_settings_to_updates)
+        self._startup_update_check_worker: _StartupUpdateCheckWorker | None = None
+        QTimer.singleShot(800, self._start_startup_update_check)
+
+    def _start_startup_update_check(self) -> None:
+        """Run update check in background; on result cache it and show red dot + tooltip if update available."""
+        self._startup_update_check_worker = _StartupUpdateCheckWorker(self)
+        self._startup_update_check_worker.check_finished.connect(self._on_startup_update_check_finished)
+        self._startup_update_check_worker.finished.connect(lambda: setattr(self, "_startup_update_check_worker", None))
+        self._startup_update_check_worker.start()
+
+    def _on_startup_update_check_finished(self, result, error_message: str) -> None:
+        if error_message or result is None:
+            return
+        set_cached_check_result(result)
+        self._top_bar.set_update_available(result.update_available, result.latest_version)
+        if result.update_available:
+            btn = self._top_bar.get_update_button()
+            pos = btn.mapToGlobal(btn.rect().bottomRight())
+            QToolTip.showText(
+                pos,
+                f"Update available: {result.latest_version}. Check it out!",
+                btn,
+                btn.rect(),
+                5000,
+            )
+
+    def _open_settings_to_updates(self) -> None:
+        """Open Settings dialog with General → Updates tab (e.g. from top bar update button)."""
+        dialog = SettingsDialog(
+            workspace_root=self._workspace_root,
+            project_root=self._project_root,
+            settings=self._settings,
+            parent=self,
+        )
+        dialog.workspace_root_selected.connect(lambda p: self._apply_workspace_root(p, save=True))
+        dialog.project_root_selected.connect(lambda p: self._apply_project_root(p, save=True))
+        dialog.open_to_updates_tab()
+        dialog.exec()
+        renamed_to = dialog.project_root_renamed_to()
+        if renamed_to is None:
+            return
+        old = self._project_root
+        self._apply_project_root(str(renamed_to), save=True)
+        if old is not None:
+            updated = []
+            for p in self._workspace_projects:
+                updated.append(DiscoveredProject(name=p.name, root=renamed_to if p.root == old else p.root))
+            self._workspace_projects = updated
+            self._sync_top_bar()
 
     def _update_title_bar_geometry(self) -> None:
         """Place title bar over right pane only (x = sidebar width), not over sidebar."""
