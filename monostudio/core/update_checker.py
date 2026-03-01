@@ -13,6 +13,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from urllib.parse import urljoin
 from pathlib import Path
 from typing import Any
 
@@ -173,17 +174,37 @@ def check_for_update(
     )
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent automatic redirect so we can re-send User-Agent on the next request (GitHub CDN)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # do not follow; caller will request newurl with same headers
+
+
 def download_installer(url: str, dest_path: Path, timeout: int = 300, progress_callback: Any = None) -> None:
     """
     Download installer from url to dest_path.
     progress_callback(current: int, total: int | None) optional; total may be None if unknown.
+    Follows redirects manually so User-Agent is sent to GitHub CDN (urllib does not re-send headers on redirect).
     Raises on failure.
     """
-    headers = {"Accept": "application/octet-stream"}
-    if "github" in url.lower():
-        headers["User-Agent"] = GITHUB_REQUEST_HEADERS.get("User-Agent", "MonoStudio26-UpdateCheck")
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    headers = {"Accept": "application/octet-stream", "User-Agent": "MonoStudio26-UpdateCheck/1.0"}
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    current_url = url
+    redirect_limit = 10
+    while redirect_limit > 0:
+        redirect_limit -= 1
+        req = urllib.request.Request(current_url, headers=headers, method="GET")
+        try:
+            resp = opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get("Location")
+                if location:
+                    current_url = urljoin(current_url, location)
+                    continue
+            raise
+        # 200 OK
         total = resp.headers.get("Content-Length")
         total = int(total) if total else None
         read = 0
@@ -197,6 +218,9 @@ def download_installer(url: str, dest_path: Path, timeout: int = 300, progress_c
                 read += len(chunk)
                 if progress_callback:
                     progress_callback(read, total)
+        resp.close()
+        return
+    raise RuntimeError("Too many redirects while downloading installer")
 
 
 def run_installer_and_exit(installer_path: Path) -> None:
