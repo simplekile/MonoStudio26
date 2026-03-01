@@ -590,9 +590,13 @@ class AppController(QObject):
 
     def _dcc_workfile_extension(self, dcc_id: str) -> str:
         """
-        DCC workfile extension is defined by the DCC registry config.
-        If multiple are available, use the first one deterministically.
+        DCC workfile extension: for Houdini use Settings (Indie .hiplc / Commercial .hip / Non-Commercial .hipnc);
+        otherwise from DCC registry (first in list).
         """
+        if dcc_id == "houdini":
+            override = (self._settings.value("integrations/houdini_workfile_ext", ".hiplc", str) or "").strip().lower()
+            if override in (".hip", ".hiplc", ".hipnc"):
+                return override
         info = self._dcc_registry.get_dcc_info(dcc_id)
         exts = info.get("workfile_extensions") if isinstance(info, dict) else None
         if isinstance(exts, list) and exts:

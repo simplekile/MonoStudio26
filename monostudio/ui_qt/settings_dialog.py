@@ -4,8 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QRegularExpression, QSettings, Signal, QStandardPaths
-from PySide6.QtGui import QColor, QFont, QRegularExpressionValidator
+from PySide6.QtCore import QSize, Qt, QRegularExpression, QSettings, Signal, QStandardPaths, QThread, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -65,9 +66,54 @@ from monostudio.core.pipeline_types_and_presets import (
     save_pipeline_types_and_presets_to_project,
     save_pipeline_types_and_presets_to_user_default,
 )
+from monostudio.core.update_checker import (
+    UpdateInfo,
+    check_for_update,
+    download_installer,
+    run_installer_and_exit,
+)
+from monostudio.core.version import get_app_version
 from monostudio.ui_qt.force_rename_project_id_dialog import ForceRenameProjectIdDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
+
+
+class _UpdateCheckWorker(QThread):
+    """Runs update check in background; emits check_finished(UpdateInfo | None, error_message: str)."""
+
+    check_finished = Signal(object, str)  # UpdateInfo | None, error str
+
+    def __init__(self, manifest_url: str, current_version: str, parent=None) -> None:
+        super().__init__(parent)
+        self._manifest_url = manifest_url
+        self._current_version = current_version
+
+    def run(self) -> None:
+        err = ""
+        try:
+            info = check_for_update(self._current_version, self._manifest_url)
+            self.check_finished.emit(info, "")
+        except Exception as e:
+            err = str(e) or "Check failed"
+            self.check_finished.emit(None, err)
+
+
+class _DownloadWorker(QThread):
+    """Downloads installer to path; emits download_finished(success: bool, path: str)."""
+
+    download_finished = Signal(bool, str)
+
+    def __init__(self, url: str, dest_path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self._url = url
+        self._dest_path = dest_path
+
+    def run(self) -> None:
+        try:
+            download_installer(self._url, self._dest_path)
+            self.download_finished.emit(True, str(self._dest_path))
+        except Exception:
+            self.download_finished.emit(False, str(self._dest_path))
 
 
 def _is_valid_type_id(type_id: str) -> bool:
@@ -275,11 +321,12 @@ class SettingsDialog(MonosDialog):
             b.setChecked(i == index)
 
     def _build_general_page(self) -> QWidget:
-        """Tier 2: General → Workspace | UI | Behavior (nút page ngang)."""
+        """Tier 2: General → Workspace | UI | Behavior | Updates (nút page ngang)."""
         return self._build_tier2_page_buttons([
             ("Workspace", self._build_app_workspace_tab()),
             ("UI", self._build_ui_tab()),
             ("Behavior", self._build_behavior_tab()),
+            ("Updates", self._build_updates_tab()),
         ])
 
     def _build_ui_tab(self) -> QWidget:
@@ -344,6 +391,165 @@ class SettingsDialog(MonosDialog):
         layout.addWidget(grp)
         layout.addStretch(1)
         return root
+
+    def _build_updates_tab(self) -> QWidget:
+        """General → Updates: version card, check action, release notes, download."""
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        # ── Version card ──
+        version_card = QFrame(root)
+        version_card.setObjectName("UpdateVersionCard")
+        version_card_l = QVBoxLayout(version_card)
+        version_card_l.setContentsMargins(16, 12, 16, 12)
+        version_card_l.setSpacing(4)
+        current = get_app_version()
+        self._update_current_label = QLabel(current, version_card)
+        self._update_current_label.setObjectName("UpdateVersionValue")
+        self._update_current_label.setProperty("mono", True)
+        version_card_l.addWidget(self._update_current_label)
+        # Parse v26.minor.patch for hint (e.g. "Major 26 · Minor 1 · Patch 2" or legacy "Major 26 · Patch 24")
+        raw = current.strip().lstrip("vV")
+        parts = raw.split(".")
+        if len(parts) >= 3:
+            hint_text = f"Major {parts[0]} · Minor {parts[1]} · Patch {parts[2]}"
+        elif len(parts) == 2:
+            hint_text = f"Major {parts[0]} · Patch {parts[1]}"
+        else:
+            hint_text = "Major 26 · Minor / Patch from last build"
+        self._update_version_hint = QLabel(hint_text, version_card)
+        self._update_version_hint.setObjectName("DialogHelper")
+        version_card_l.addWidget(self._update_version_hint)
+        layout.addWidget(version_card)
+
+        # ── Check & status ──
+        check_row = QWidget(root)
+        check_row_l = QHBoxLayout(check_row)
+        check_row_l.setContentsMargins(0, 0, 0, 0)
+        check_row_l.setSpacing(12)
+        self._update_check_btn = QPushButton("Check for updates", check_row)
+        self._update_check_btn.setObjectName("DialogPrimaryButton")
+        self._update_check_btn.clicked.connect(self._on_check_for_updates)
+        check_row_l.addWidget(self._update_check_btn)
+        check_row_l.addStretch(1)
+        layout.addWidget(check_row)
+
+        self._update_status_label = QLabel("", root)
+        self._update_status_label.setWordWrap(True)
+        self._update_status_label.setObjectName("UpdateStatusText")
+        self._update_status_label.setMinimumHeight(20)
+        layout.addWidget(self._update_status_label)
+
+        # ── Update actions (when available) ──
+        action_row = QWidget(root)
+        action_row_l = QHBoxLayout(action_row)
+        action_row_l.setContentsMargins(0, 0, 0, 0)
+        action_row_l.setSpacing(8)
+        self._update_download_btn = QPushButton("Download and install", action_row)
+        self._update_download_btn.setObjectName("DialogPrimaryButton")
+        self._update_download_btn.setVisible(False)
+        self._update_download_btn.clicked.connect(self._on_download_and_install)
+        action_row_l.addWidget(self._update_download_btn)
+        self._update_view_github_btn = QPushButton("View on GitHub", action_row)
+        self._update_view_github_btn.setObjectName("SettingsCategoryActionButton")
+        self._update_view_github_btn.setVisible(False)
+        self._update_view_github_btn.clicked.connect(self._on_view_release_on_github)
+        action_row_l.addWidget(self._update_view_github_btn)
+        action_row_l.addStretch(1)
+        layout.addWidget(action_row)
+
+        # ── Release notes ──
+        notes_label = QLabel("RELEASE NOTES", root)
+        notes_label.setObjectName("UpdateSectionLabel")
+        layout.addWidget(notes_label)
+        self._update_changelog = QTextEdit(root)
+        self._update_changelog.setReadOnly(True)
+        self._update_changelog.setPlaceholderText("Click \"Check for updates\" to fetch the latest release notes from GitHub.")
+        self._update_changelog.setMinimumHeight(140)
+        self._update_changelog.setMaximumHeight(240)
+        self._update_changelog.setObjectName("UpdateChangelog")
+        layout.addWidget(self._update_changelog)
+
+        hint = QLabel(
+            "Updates are delivered via GitHub Releases. Download runs the installer and closes the app.",
+            root,
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("DialogHelper")
+        layout.addWidget(hint)
+        layout.addStretch(1)
+
+        self._pending_update_info: UpdateInfo | None = None
+        self._update_check_worker: _UpdateCheckWorker | None = None
+        self._update_download_worker: _DownloadWorker | None = None
+        return root
+
+    def _on_check_for_updates(self) -> None:
+        self._update_check_btn.setEnabled(False)
+        self._update_status_label.setText("Checking…")
+        self._update_download_btn.setVisible(False)
+        self._update_view_github_btn.setVisible(False)
+        self._update_changelog.clear()
+        self._pending_update_info = None
+        self._update_check_worker = _UpdateCheckWorker(
+            None,  # use default: GitHub Releases API
+            get_app_version(),
+            self,
+        )
+        self._update_check_worker.check_finished.connect(self._on_update_check_finished)
+        self._update_check_worker.finished.connect(self._on_update_check_thread_finished)
+        self._update_check_worker.start()
+
+    def _on_update_check_finished(self, info: UpdateInfo | None, error_message: str) -> None:
+        if error_message:
+            self._update_status_label.setText(f"Check failed: {error_message}")
+            return
+        if info is not None:
+            self._pending_update_info = info
+            self._update_status_label.setText(f"Update {info.version} available.")
+            self._update_download_btn.setVisible(True)
+            if info.notes:
+                self._update_changelog.setMarkdown(info.notes)
+            else:
+                self._update_changelog.setPlainText("No release notes for this version.")
+            if info.html_url:
+                self._update_view_github_btn.setVisible(True)
+        else:
+            self._update_status_label.setText("You're on the latest version.")
+            self._update_changelog.setPlainText("")
+            self._update_view_github_btn.setVisible(False)
+
+    def _on_update_check_thread_finished(self) -> None:
+        self._update_check_btn.setEnabled(True)
+        self._update_check_worker = None
+
+    def _on_download_and_install(self) -> None:
+        info = self._pending_update_info
+        if info is None:
+            return
+        import tempfile
+        dest = Path(tempfile.gettempdir()) / "MonoStudio26_Setup.exe"
+        self._update_download_btn.setEnabled(False)
+        self._update_status_label.setText("Downloading…")
+        self._update_download_worker = _DownloadWorker(info.url, dest, self)
+        self._update_download_worker.download_finished.connect(self._on_download_finished)
+        self._update_download_worker.start()
+
+    def _on_view_release_on_github(self) -> None:
+        info = self._pending_update_info
+        if info and info.html_url:
+            QDesktopServices.openUrl(QUrl(info.html_url))
+
+    def _on_download_finished(self, success: bool, path: str) -> None:
+        self._update_download_worker = None
+        self._update_download_btn.setEnabled(True)
+        if success:
+            self._update_status_label.setText("Launching installer…")
+            run_installer_and_exit(Path(path))
+        else:
+            self._update_status_label.setText("Download failed. Try downloading from the release page.")
 
     def _build_pipeline_page(self) -> QWidget:
         """Tier 2: Pipeline → Mapping Folders | Categories | Scan rules | Statuses."""

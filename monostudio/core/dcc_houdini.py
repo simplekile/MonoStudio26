@@ -146,7 +146,7 @@ class HoudiniDccAdapter:
     Desktop-side Houdini launcher for MonoStudio.
 
     - open_file: launches Houdini with the file path as argument.
-    - create_new_file: uses hython to create an empty .hip (clear + save), then launches Houdini with that file.
+    - create_new_file: uses hython to create an empty scene file (clear + save); extension is from registry (default .hiplc for Indie), then launches Houdini with that file.
     """
 
     def __init__(self, *, houdini_executable: str, repo_root: Path) -> None:
@@ -177,7 +177,7 @@ class HoudiniDccAdapter:
         Path(filepath).parent.mkdir(parents=True, exist_ok=True)
         filepath_norm = filepath.replace("\\", "/")
 
-        # Use hython to create an empty .hip: hou.hipFile.clear(); hou.hipFile.save(path)
+        # Use hython to create an empty scene file (.hiplc/.hip/.hipnc per path): hou.hipFile.clear(); hou.hipFile.save(path)
         hython_exe = _hython_executable(exe)
         if hython_exe:
             env = os.environ.copy()

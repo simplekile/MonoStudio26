@@ -1320,6 +1320,37 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #a1a1aa;
             font-size: 11px;
         }
+        QTextEdit#UpdateChangelog {
+            background-color: #121214;
+            color: #e4e4e7;
+            border: 1px solid #27272a;
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 12px;
+            font-family: "Inter", sans-serif;
+        }
+        QFrame#UpdateVersionCard {
+            background-color: #1e1e20;
+            border: 1px solid #27272a;
+            border-radius: 8px;
+        }
+        QLabel#UpdateVersionValue {
+            font-size: 18px;
+            font-weight: 700;
+            color: #fafafa;
+            font-family: "JetBrains Mono", "Consolas", monospace;
+        }
+        QLabel#UpdateStatusText {
+            font-size: 13px;
+            color: #a1a1aa;
+            min-height: 20px;
+        }
+        QLabel#UpdateSectionLabel {
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            color: #71717a;
+        }
         /* Open Resolver / Create New: header icon + bold title */
         QLabel#OpenResolverDialogTitle {
             font-weight: 700;

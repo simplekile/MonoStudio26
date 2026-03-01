@@ -136,7 +136,8 @@ class TopBar(QWidget):
         btn.update()
 
     def _show_noti_dropdown(self) -> None:
-        """Toggle notification dropdown: if open, close; else if just closed (same click), do nothing; else show."""
+        """Toggle notification dropdown: if open, close; else if just closed (same click), do nothing; else show.
+        Position is clamped so the dropdown stays inside the main window."""
         if self._noti_dropdown.isVisible():
             self._noti_dropdown.close()
             return
@@ -144,7 +145,25 @@ class TopBar(QWidget):
             return
         btn = self._btn_noti
         pos = btn.mapToGlobal(btn.rect().bottomLeft())
-        self._noti_dropdown.move(pos.x(), pos.y() + 4)
+        win = self.window()
+        frame = win.frameGeometry()  # main window rect in global coords
+        dw = self._noti_dropdown.width()
+        dh = self._noti_dropdown.height()
+        gap = 4
+        margin = 8  # inset from window edges (8px grid)
+        x = pos.x()
+        y = pos.y() + gap
+        # Clamp horizontally: keep dropdown inside window with margin
+        if x + dw > frame.right() - margin:
+            x = frame.right() - margin - dw
+        if x < frame.left() + margin:
+            x = frame.left() + margin
+        # Clamp vertically: if would go below window, show above button; respect bottom margin
+        if y + dh > frame.bottom() - margin:
+            y = pos.y() - gap - dh
+        if y < frame.top() + margin:
+            y = frame.top() + margin
+        self._noti_dropdown.move(x, y)
         self._noti_dropdown.show()
 
     def _on_noti_dropdown_closed(self) -> None:

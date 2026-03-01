@@ -1,6 +1,10 @@
 ; Inno Setup 6 — MonoStudio 26 installer
 ; Run after: pyinstaller monostudio26.spec
-; Compile: iscc installer\MonoStudio26.iss   (or open in Inno Setup Compiler)
+; Compile: iscc /DMyAppVersion=26.0.21 installer\MonoStudio26.iss   (build_installer.ps1 passes version from git)
+
+#ifndef MyAppVersion
+#define MyAppVersion "26.0.0"
+#endif
 
 #define MyAppName "MonoStudio 26"
 #define MyAppExe "MonoStudio26.exe"
@@ -10,7 +14,7 @@
 [Setup]
 AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
 AppName={#MyAppName}
-AppVersion=26.0.0
+AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\MonoStudio26
 DefaultGroupName={#MyAppName}
 OutputDir=..\dist
@@ -19,7 +23,7 @@ SetupIconFile=..\monostudio_data\icons\app.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=currentUser
+PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 

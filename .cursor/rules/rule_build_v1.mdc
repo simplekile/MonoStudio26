@@ -1,0 +1,88 @@
+---
+description: MONOS build pipeline — PyInstaller onedir, VERSION, Inno Setup, GitHub release
+globs: build_installer.ps1, build_version.py, build_icon.py, monostudio26.spec, installer/*.iss, monostudio/core/version.py, monostudio/core/update_checker.py
+alwaysApply: false
+---
+
+# MONOS — Build Rule (v1)
+
+## Bắt buộc: Commit xong mới build
+
+- **Luôn commit xong** trước khi build. `build_installer.ps1` **mặc định tự commit**: nếu có uncommitted changes thì `git add -A` rồi commit với message **tự ước lượng** từ diff:
+  - **fix:** nếu diff/file có từ fix/bug/error/… hoặc path fix_/bugfix → patch.
+  - **feat:** có sửa `monostudio/core` hoặc `monostudio/ui_qt` (logic, UI) → minor.
+  - **style:** chỉ sửa `style.py` (không file .py khác) → style.
+  - **docs:** chỉ file .md/.mdc hoặc docs/ → docs.
+  - **chore:** chỉ build/spec/installer → chore build config; còn lại → chore prepare build.
+- Bỏ qua auto-commit: chạy `.\build_installer.ps1 -NoCommit` (khi đã tự commit trước đó).
+- Lý do: `build_version.py` lấy version từ `git rev-list --count HEAD`. Nếu chưa commit, số commit không khớp với code đang build → version sai.
+- Sau build có thể push: `git push` (script không tự push).
+
+## Tổng quan
+
+- Build **một lệnh**: chạy `build_installer.ps1` từ repo root (PowerShell), **sau khi đã commit**.
+- Luồng: **app.ico** → **VERSION** → **PyInstaller (onedir)** → **Inno Setup** (optional).
+- Phiên bản: **v26.minor.patch** (vd. v26.1.2). Bump theo commit message vừa tạo: fix → patch+1, feat/style/docs → minor+1 patch=0, chore → patch+1. Đồng bộ app, build, installer, GitHub Release.
+
+## Prerequisites
+
+- **Python**: môi trường có PySide6, PyInstaller.
+- **build_icon.py**: tạo `monostudio_data/icons/app.ico` từ logo (cho EXE + installer).
+- **Inno Setup 6** (optional): tạo file cài đặt `.exe`. Cài từ https://jrsoftware.org/isinfo.php. `build_installer.ps1` tìm `iscc` trong PATH hoặc `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`.
+
+## Thứ tự build (không đổi)
+
+1. **build_icon.py** — Generate `app.ico` (EXE + installer icon). Nếu fail: cảnh báo, build vẫn chạy.
+2. **build_version.py** — Ghi `monostudio_data/VERSION` từ `git rev-list --count HEAD` → format `v26.<count>`. Nếu fail: version fallback `v26`.
+3. **PyInstaller** — `python -m PyInstaller --clean --noconfirm monostudio26.spec`. Output: `dist/MonoStudio26/` (onedir).
+4. **Inno Setup** — Nếu tìm thấy `iscc`: build installer với version từ VERSION (26.0.&lt;count&gt;). Output: `dist/MonoStudio26_Setup.exe`.
+
+## Version
+
+- **Format**: `26.minor.patch` trong file (vd. `26.1.2`), hiển thị `v26.1.2`. Nguồn sự thật: `monostudio_data/VERSION`.
+- **build_version.py** (chạy sau bước commit): đọc VERSION hiện tại + last commit message; fix: → patch+1; feat:/style:/docs: → minor+1, patch=0; chore: → patch+1. Ghi lại VERSION. Legacy `26.24` đọc thành `26.0.24`.
+- **Trong app**: `get_app_version()` đọc VERSION (frozen) hoặc VERSION + fallback git count (dev).
+- **Inno Setup**: đọc VERSION, truyền `26.minor.patch` qua `/DMyAppVersion=26.1.2`.
+- **APP_MAJOR_VERSION = 26**: giữ đồng bộ trong `build_version.py` và `monostudio/core/version.py`.
+
+## monostudio26.spec
+
+- **Mode**: onedir (một thư mục chứa exe + deps + data). Không onefile.
+- **Entry**: `app.py` trong repo root.
+- **Icon**: bắt buộc có `monostudio_data/icons/app.ico` trước khi chạy spec (chạy `build_icon.py`).
+- **datas**: giữ layout giống repo để `get_app_base_path()` trỏ đúng:
+  - `monostudio_data` → `monostudio_data`
+  - `fonts` → `fonts`
+  - `monos_blender` → `monos_blender` (Blender DCC adapter)
+- **hiddenimports**: PySide6 QtCore, QtGui, QtWidgets, QtSvg. Thêm module PySide6 nếu app dùng.
+- **EXE**: name `MonoStudio26`, `console=False`, icon từ `app.ico`.
+- Khi thêm **data folder** hoặc **binary**: cập nhật `datas` / `binaries` trong spec; không thêm đường dẫn hardcode ngoài spec.
+
+## Inno Setup (installer/MonoStudio26.iss)
+
+- **Source**: `..\dist\MonoStudio26` (output PyInstaller onedir).
+- **Output**: `..\dist\MonoStudio26_Setup.exe` (OutputBaseFilename = MonoStudio26_Setup).
+- **Version**: truyền từ build script qua `#define MyAppVersion`; default 26.0.0.
+- **AppId**: giữ cố định để upgrade/reinstall đúng ứng dụng.
+- Không đổi cấu trúc SourceDir/OutputDir khi đổi tên output PyInstaller.
+
+## GitHub Release (in-app update)
+
+- **Tag**: format `v26.<số>` (vd. v26.21) khớp với VERSION và `get_app_version()`.
+- **Assets**: đính kèm file cài đặt Windows (vd. `MonoStudio26_Setup.exe`). Update checker lấy `browser_download_url` từ asset (ưu tiên .exe / "Setup").
+- **Release body**: dùng làm changelog; hiển thị trong Settings → General → Updates khi có bản mới.
+- **GITHUB_REPO** trong `monostudio/core/update_checker.py`: đặt đúng `owner/repo`.
+
+## Checklist khi sửa build
+
+- [ ] Thêm data/binary mới → cập nhật `datas`/`binaries` trong `monostudio26.spec`.
+- [ ] Thêm import PySide6 mới → thêm vào `hiddenimports` trong spec.
+- [ ] Đổi major version → cập nhật APP_MAJOR_VERSION trong `build_version.py` và `monostudio/core/version.py`; đổi tên app/installer nếu cần.
+- [ ] Release mới: tạo tag v26.xx, đính kèm .exe, điền changelog vào release body.
+
+## Enforcement
+
+- **Commit xong mới build**: không chạy build để tạo bản release khi còn uncommitted changes; commit (và push) trước, rồi mới `build_installer.ps1`.
+- Không bỏ bước build_version.py trước PyInstaller (VERSION phải có trong build).
+- Không đổi onedir → onefile mà không cập nhật app_paths / version đọc từ đâu.
+- Inno Setup dùng đúng SourceDir = output PyInstaller; không trỏ thẳng vào repo.

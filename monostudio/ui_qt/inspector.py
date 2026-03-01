@@ -519,8 +519,8 @@ def _version_from_path(path: Path | None) -> str:
     if not path:
         return "—"
     name = path.name or ""
-    # Tên file: ..._v002.blend hoặc ..._v002
-    m = re.search(r"_v(\d{3})(?:\.\w+)?$", name) or re.search(r"_v(\d{3})\b", name)
+    # Tên file: ..._v002.blend hoặc ..._v002 hoặc ..._v002_fixEar.blend
+    m = re.search(r"_v(\d{3})(?:_[^.]*)?(?:\.\w+)?$", name)
     if m:
         return f"v{m.group(1)}"
     # Folder tên v001, v002
@@ -569,6 +569,17 @@ def _path_for_version(
         best = max(paths_with_version, key=lambda pv: pv[1])
         return best[0]
     return item.path
+
+
+def _description_from_work_path(path: Path | None) -> str:
+    """Extract description suffix from work file path (e.g. prefix_v005_fixNecklace.ext -> fixNecklace)."""
+    if not path:
+        return ""
+    stem = path.stem or ""
+    m = re.search(r"_v\d{3}_(.*)", stem)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 def _format_mtime(path: Path) -> str:
@@ -824,18 +835,25 @@ class _PreviewWidget(QWidget):
                 return
 
             if self._has_image and self._pix is not None:
-                # Inbox: fit. Asset/Shot: theo nút fill/fit (mặc định fill)
                 use_fit = self._inbox_mode or self._user_fit
+                dpr = self.devicePixelRatioF()
+                target = QSize(round(r.width() * dpr), round(r.height() * dpr))
                 if use_fit:
-                    scaled = self._pix.scaled(r.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    x = r.x() + (r.width() - scaled.width()) // 2
-                    y = r.y() + (r.height() - scaled.height()) // 2
+                    scaled = self._pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    scaled.setDevicePixelRatio(dpr)
+                    lw = scaled.width() / dpr
+                    lh = scaled.height() / dpr
+                    x = r.x() + int((r.width() - lw) / 2)
+                    y = r.y() + int((r.height() - lh) / 2)
                     p.drawPixmap(x, y, scaled)
                 else:
-                    scaled = self._pix.scaled(r.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-                    sx = max(0, (scaled.width() - r.width()) // 2)
-                    sy = max(0, (scaled.height() - r.height()) // 2)
-                    crop = scaled.copy(sx, sy, r.width(), r.height())
+                    scaled = self._pix.scaled(target, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                    pw = round(r.width() * dpr)
+                    ph = round(r.height() * dpr)
+                    sx = max(0, (scaled.width() - pw) // 2)
+                    sy = max(0, (scaled.height() - ph) // 2)
+                    crop = scaled.copy(sx, sy, pw, ph)
+                    crop.setDevicePixelRatio(dpr)
                     p.drawPixmap(r, crop)
                 return
 
@@ -1081,9 +1099,13 @@ class _InspectorPreview(QWidget):
 
     def _preview_cache_key(self, path: Path) -> str:
         try:
-            return str(path.resolve())
+            base = str(path.resolve())
         except Exception:
-            return str(path)
+            base = str(path)
+        dep = (self._active_department or "").strip()
+        if dep:
+            return f"{base}::dept::{dep}"
+        return base
 
     def set_item(self, item: ViewItem) -> None:
         self._item = item
@@ -1329,9 +1351,21 @@ class _IdentityBlock(QWidget):
         self._meta_version.setProperty("mono", True)
         self._meta_version.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
 
+        self._meta_desc_sep = QLabel("·", self)
+        self._meta_desc_sep.setFont(monos_font("Inter", 14, QFont.Weight.Bold))
+        self._meta_desc_sep.setStyleSheet(f"color: {MONOS_COLORS['placeholder']};")
+        self._meta_desc_sep.setVisible(False)
+
+        self._meta_description = QLabel("", self)
+        self._meta_description.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
+        self._meta_description.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
+        self._meta_description.setVisible(False)
+
         meta_l.addWidget(self._meta_type_badge, 0)
         meta_l.addWidget(self._meta_dept_badge, 0)
         meta_l.addWidget(self._meta_version, 0)
+        meta_l.addWidget(self._meta_desc_sep, 0)
+        meta_l.addWidget(self._meta_description, 0)
         meta_l.addStretch(1)
 
         l.addWidget(self._name, 0)
@@ -1436,6 +1470,15 @@ class _IdentityBlock(QWidget):
             version = version_str if (version_str and version_str != "—") else "—"
 
         self._meta_version.setText(version)
+
+        # Description suffix from work file (e.g. _v005_fixNecklace -> "fixNecklace")
+        desc = ""
+        if isinstance(ref, (Asset, Shot)) and not show_publish:
+            work_path = _path_for_version(item, self._active_department, self._active_dcc_id)
+            desc = _description_from_work_path(work_path)
+        self._meta_desc_sep.setVisible(bool(desc))
+        self._meta_description.setText(desc)
+        self._meta_description.setVisible(bool(desc))
 
         # DCC badges (chỉ khi asset/shot + department đang focus, không phải publish mode)
         self._update_dcc_badges()

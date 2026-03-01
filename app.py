@@ -110,8 +110,12 @@ def _make_splash_pixmap(
 
 
 def _ensure_comtypes_on_windows() -> None:
-    """Install comtypes if missing on Windows (needed for shell thumbnail in Inspector)."""
+    """Install comtypes if missing on Windows (needed for shell thumbnail in Inspector).
+    Skipped in frozen builds (comtypes must be bundled by PyInstaller).
+    """
     if sys.platform != "win32":
+        return
+    if getattr(sys, "frozen", False):
         return
     try:
         import comtypes  # noqa: F401

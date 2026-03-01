@@ -72,7 +72,7 @@
         "fx",
         "lighting"
       ],
-      "workfile_extensions": [".hip", ".hiplc", ".hipnc"],
+      "workfile_extensions": [".hiplc", ".hip", ".hipnc"],
       "brand_icon_slug": "houdini",
       "brand_color_hex": "#FF4713"
     },
