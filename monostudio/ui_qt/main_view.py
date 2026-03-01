@@ -275,8 +275,32 @@ def _resolve_publish_root_folder_any(ref: Asset | Shot, active_department: str |
 
 _PREVIEW_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".tga", ".bmp", ".tiff", ".tif"})
 
+# Setting: file extensions to ignore when listing files in publish version folders (comma-separated in UI).
+SETTINGS_KEY_PUBLISH_IGNORE_EXT = "pipeline/publish_ignore_extensions"
+DEFAULT_PUBLISH_IGNORE_EXTENSIONS = ".tmp,.bak,.mtl,.mb.bak,.ma.bak,.blend1,Thumbs.db,.DS_Store"
 
-def _resolve_primary_publish_file(ref: Asset | Shot, active_department: str | None) -> Path | None:
+
+def get_publish_ignore_extensions(settings: QSettings | None) -> frozenset[str]:
+    """Parse pipeline/publish_ignore_extensions from QSettings; returns normalized set (lowercase, leading dot)."""
+    raw = (DEFAULT_PUBLISH_IGNORE_EXTENSIONS if settings is None else
+           (settings.value(SETTINGS_KEY_PUBLISH_IGNORE_EXT, DEFAULT_PUBLISH_IGNORE_EXTENSIONS, str) or DEFAULT_PUBLISH_IGNORE_EXTENSIONS))
+    result: set[str] = set()
+    for part in (raw or "").split(","):
+        ext = (part or "").strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = "." + ext
+        result.add(ext)
+    return frozenset(result)
+
+
+def _resolve_primary_publish_file(
+    ref: Asset | Shot,
+    active_department: str | None,
+    *,
+    ignore_extensions: frozenset[str] | None = None,
+) -> Path | None:
     """
     Primary file inside the latest publish version folder.
     Prefers non-preview files; falls back to first file alphabetically.
@@ -289,21 +313,31 @@ def _resolve_primary_publish_file(ref: Asset | Shot, active_department: str | No
         files = sorted(f for f in folder.iterdir() if f.is_file())
     except (OSError, FileNotFoundError):
         return None
+    if ignore_extensions:
+        files = [f for f in files if (f.suffix or "").strip().lower() not in ignore_extensions]
     if not files:
         return None
     non_preview = [f for f in files if f.suffix.lower() not in _PREVIEW_EXTENSIONS]
     return non_preview[0] if non_preview else files[0]
 
 
-def _resolve_all_publish_files(ref: Asset | Shot, active_department: str | None) -> list[Path]:
-    """All files inside the latest publish version folder (for drag & drop)."""
+def _resolve_all_publish_files(
+    ref: Asset | Shot,
+    active_department: str | None,
+    *,
+    ignore_extensions: frozenset[str] | None = None,
+) -> list[Path]:
+    """All files inside the latest publish version folder (for drag & drop). Excludes extensions in ignore_extensions."""
     folder = _resolve_latest_publish_folder(ref, active_department)
     if folder is None:
         return []
     try:
-        return sorted(f for f in folder.iterdir() if f.is_file())
+        files = sorted(f for f in folder.iterdir() if f.is_file())
     except (OSError, FileNotFoundError):
         return []
+    if ignore_extensions:
+        files = [f for f in files if (f.suffix or "").strip().lower() not in ignore_extensions]
+    return files
 
 
 def _item_last_opened_dcc(item_path: Path, active_department: str) -> str | None:
@@ -1097,10 +1131,14 @@ class _PublishDragModel(QStandardItemModel):
         super().__init__(parent)
         self._show_publish = False
         self._active_department: str | None = None
+        self._ignore_extensions: frozenset[str] = frozenset()
 
     def set_publish_state(self, show_publish: bool, active_department: str | None) -> None:
         self._show_publish = show_publish
         self._active_department = active_department
+
+    def set_publish_ignore_extensions(self, ignore_extensions: frozenset[str]) -> None:
+        self._ignore_extensions = ignore_extensions or frozenset()
 
     def flags(self, index):
         default = super().flags(index)
@@ -1127,7 +1165,9 @@ class _PublishDragModel(QStandardItemModel):
             item = idx.data(Qt.UserRole)
             if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
                 continue
-            files = _resolve_all_publish_files(item.ref, self._active_department)
+            files = _resolve_all_publish_files(
+                item.ref, self._active_department, ignore_extensions=self._ignore_extensions
+            )
             for f in files:
                 urls.append(QUrl.fromLocalFile(str(f)))
         if urls:
@@ -1358,6 +1398,7 @@ class MainView(QWidget):
         # Tile view (IconMode) skeleton
         self._tile_model = _PublishDragModel(self)
         self._tile_model.set_publish_state(self._show_publish, self._active_department)
+        self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
         self._tile_view = _ClearOnEmptyClickListView()
         self._tile_view.setObjectName("MainViewGrid")
         self._tile_view.setViewMode(QListView.IconMode)
@@ -1699,6 +1740,7 @@ class MainView(QWidget):
         self._active_department_icon_name = (icon_name or "").strip() or None
         self.update_title(base_title=self._base_title or self._context_title.text(), department=self._active_department)
         self._tile_model.set_publish_state(self._show_publish, self._active_department)
+        self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
         try:
             self._grid_delegate.set_active_department(self._active_department, icon_name=self._active_department_icon_name)
         except Exception:
@@ -1807,6 +1849,7 @@ class MainView(QWidget):
         self._sync_work_publish_pill()
         self._grid_delegate.set_show_publish(self._show_publish)
         self._tile_model.set_publish_state(self._show_publish, self._active_department)
+        self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
         self._sync_tile_drag_mode()
         self._tile_view.viewport().update()
         self.show_publish_changed.emit(self._show_publish)
@@ -3034,7 +3077,10 @@ class MainView(QWidget):
             return
         if text == "Copy Publish Path":
             if isinstance(item.ref, (Asset, Shot)):
-                primary = _resolve_primary_publish_file(item.ref, self._active_department)
+                ign = get_publish_ignore_extensions(self._settings)
+                primary = _resolve_primary_publish_file(
+                    item.ref, self._active_department, ignore_extensions=ign
+                )
                 if primary is not None:
                     self._copy_full_path(str(primary))
                 else:

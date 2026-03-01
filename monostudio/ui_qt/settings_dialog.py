@@ -128,6 +128,7 @@ class SettingsDialog(MonosDialog):
         self._blender_exe_field: QLineEdit | None = None
         self._maya_exe_field: QLineEdit | None = None
         self._houdini_exe_field: QLineEdit | None = None
+        self._houdini_workfile_ext_combo: QComboBox | None = None
         self._substance_painter_exe_field: QLineEdit | None = None
         self._rizomuv_exe_field: QLineEdit | None = None
         self._dept_mapping_table: QTableWidget | None = None
@@ -135,6 +136,7 @@ class SettingsDialog(MonosDialog):
         self._structure_mapping_table: QTableWidget | None = None
         self._use_dcc_folders_cb: QCheckBox | None = None
         self._notification_max_visible_combo: QComboBox | None = None
+        self._publish_ignore_ext_field: QLineEdit | None = None
 
         # Tier 1: left nav — General | Pipeline | DCCs | Project
         self._content_stack = QStackedWidget(self)
@@ -344,10 +346,11 @@ class SettingsDialog(MonosDialog):
         return root
 
     def _build_pipeline_page(self) -> QWidget:
-        """Tier 2: Pipeline → Mapping Folders | Categories | Statuses."""
+        """Tier 2: Pipeline → Mapping Folders | Categories | Scan rules | Statuses."""
         return self._build_tier2_page_buttons([
             ("Mapping Folders", self._build_mapping_folders_page()),
             ("Categories", self._build_categories_page()),
+            ("Scan rules", self._build_pipeline_scan_rules_tab()),
             ("Statuses", self._placeholder("Pipeline → Statuses (placeholder)")),
         ], store_stack="pipeline", store_buttons="pipeline")
 
@@ -362,6 +365,42 @@ class SettingsDialog(MonosDialog):
             ("Integrations", self._placeholder("Project → Integrations (placeholder)")),
             ("Advanced", self._build_project_advanced_tab()),
         ])
+
+    def _build_pipeline_scan_rules_tab(self) -> QWidget:
+        """Pipeline → Scan rules: rules for file/folder scanning (e.g. ignore extensions per context)."""
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        default_ext = ".tmp,.bak,.mtl,.mb.bak,.ma.bak,.blend1,Thumbs.db,.DS_Store"
+        grp = QGroupBox("Publish", root)
+        grp_layout = QVBoxLayout(grp)
+        form = QFormLayout()
+        self._publish_ignore_ext_field = QLineEdit(grp)
+        self._publish_ignore_ext_field.setPlaceholderText(default_ext)
+        self._publish_ignore_ext_field.setProperty("mono", True)
+        try:
+            if self._settings is not None:
+                v = self._settings.value("pipeline/publish_ignore_extensions", default_ext, str)
+                self._publish_ignore_ext_field.setText((v or default_ext).strip())
+            else:
+                self._publish_ignore_ext_field.setText(default_ext)
+        except Exception:
+            self._publish_ignore_ext_field.setText(default_ext)
+        form.addRow("Ignore extensions (comma-separated):", self._publish_ignore_ext_field)
+        hint = QLabel(
+            "File extensions to exclude when listing files inside publish version folders (e.g. v001). "
+            "Used for primary file, drag-and-drop, and copy path. Use leading dot (e.g. .tmp) or not; stored normalized.",
+            grp,
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("DialogHelper")
+        grp_layout.addLayout(form)
+        grp_layout.addWidget(hint)
+        layout.addWidget(grp)
+        layout.addStretch(1)
+        return root
 
     def _build_categories_page(self) -> QWidget:
         """Pipeline → Categories: Tier 3 nút Asset Depts | Shot Depts (types & presets by kind)."""
@@ -1269,6 +1308,23 @@ class SettingsDialog(MonosDialog):
         row_houdini_l.addWidget(btn_browse_houdini, 0)
         form.addRow("Houdini Executable", row_houdini)
 
+        # Houdini new file extension (Indie .hiplc / Commercial .hip / Non-Commercial .hipnc)
+        combo_houdini_ext = QComboBox(self)
+        combo_houdini_ext.setProperty("mono", True)
+        combo_houdini_ext.addItem("Indie (.hiplc)", ".hiplc")
+        combo_houdini_ext.addItem("Commercial (.hip)", ".hip")
+        combo_houdini_ext.addItem("Non-Commercial (.hipnc)", ".hipnc")
+        self._houdini_workfile_ext_combo = combo_houdini_ext
+        if self._settings is not None:
+            cur_ext = (self._settings.value("integrations/houdini_workfile_ext", ".hiplc", str) or ".hiplc").strip().lower()
+            for i in range(combo_houdini_ext.count()):
+                if (combo_houdini_ext.itemData(i) or "").strip().lower() == cur_ext:
+                    combo_houdini_ext.setCurrentIndex(i)
+                    break
+        else:
+            combo_houdini_ext.setEnabled(False)
+        form.addRow("Houdini new file extension", combo_houdini_ext)
+
         # Substance Painter
         field_sp = QLineEdit(self)
         field_sp.setPlaceholderText("Auto-detect, or browse to Adobe Substance 3D Painter.exe")
@@ -1955,6 +2011,16 @@ class SettingsDialog(MonosDialog):
         except Exception:
             pass
 
+        # Persist publish ignore extensions.
+        try:
+            if self._settings is not None and self._publish_ignore_ext_field is not None:
+                self._settings.setValue(
+                    "pipeline/publish_ignore_extensions",
+                    (self._publish_ignore_ext_field.text() or "").strip(),
+                )
+        except Exception:
+            pass
+
         # Persist integrations (best-effort; should not block saving pipeline config).
         try:
             if self._settings is not None and self._blender_exe_field is not None:
@@ -1963,6 +2029,9 @@ class SettingsDialog(MonosDialog):
                 self._settings.setValue("integrations/maya_exe", (self._maya_exe_field.text() or "").strip())
             if self._settings is not None and self._houdini_exe_field is not None:
                 self._settings.setValue("integrations/houdini_exe", (self._houdini_exe_field.text() or "").strip())
+            if self._settings is not None and self._houdini_workfile_ext_combo is not None:
+                ext = self._houdini_workfile_ext_combo.currentData()
+                self._settings.setValue("integrations/houdini_workfile_ext", (ext if isinstance(ext, str) else ".hiplc"))
             if self._settings is not None and self._substance_painter_exe_field is not None:
                 self._settings.setValue(
                     "integrations/substance_painter_exe",
