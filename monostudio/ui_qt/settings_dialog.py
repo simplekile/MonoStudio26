@@ -107,21 +107,22 @@ class _UpdateCheckWorker(QThread):
 
 
 class _DownloadWorker(QThread):
-    """Downloads installer to path; emits download_finished(success: bool, path: str)."""
+    """Downloads installer to path; emits download_finished(success: bool, path: str, error_message: str)."""
 
-    download_finished = Signal(bool, str)
+    download_finished = Signal(bool, str, str)
 
-    def __init__(self, url: str, dest_path: Path, parent=None) -> None:
+    def __init__(self, url: str, dest_path: Path, fallback_url: str | None = None, parent=None) -> None:
         super().__init__(parent)
         self._url = url
         self._dest_path = dest_path
+        self._fallback_url = (fallback_url or "").strip() or None
 
     def run(self) -> None:
         try:
-            download_installer(self._url, self._dest_path)
-            self.download_finished.emit(True, str(self._dest_path))
-        except Exception:
-            self.download_finished.emit(False, str(self._dest_path))
+            download_installer(self._url, self._dest_path, fallback_url=self._fallback_url)
+            self.download_finished.emit(True, str(self._dest_path), "")
+        except Exception as e:
+            self.download_finished.emit(False, str(self._dest_path), str(e))
 
 
 def _is_valid_type_id(type_id: str) -> bool:
@@ -613,9 +614,12 @@ class SettingsDialog(MonosDialog):
             return
         import tempfile
         dest = Path(tempfile.gettempdir()) / "MonoStudio26_Setup.exe"
+        # url = link thực tế tự tính (releases/download/tag/filename); fallback = asset API nếu cần
+        primary = info.url
+        fallback = (info.asset_api_url or "").strip() or None
         self._update_download_btn.setEnabled(False)
         self._update_status_label.setText("Downloading…")
-        self._update_download_worker = _DownloadWorker(info.url, dest, self)
+        self._update_download_worker = _DownloadWorker(primary, dest, fallback_url=fallback, parent=self)
         self._update_download_worker.download_finished.connect(self._on_download_finished)
         self._update_download_worker.start()
 
@@ -628,14 +632,21 @@ class SettingsDialog(MonosDialog):
         if url:
             QDesktopServices.openUrl(QUrl(url))
 
-    def _on_download_finished(self, success: bool, path: str) -> None:
+    def _on_download_finished(self, success: bool, path: str, error_message: str = "") -> None:
         self._update_download_worker = None
         self._update_download_btn.setEnabled(True)
         if success:
             self._update_status_label.setText("Launching installer…")
-            run_installer_and_exit(Path(path))
+            try:
+                run_installer_and_exit(Path(path))
+            except (OSError, RuntimeError) as e:
+                msg = str(e).replace("\n", " ")[:200]
+                self._update_status_label.setText(
+                    f"Cannot run installer: {msg} Download from the release page below instead."
+                )
         else:
-            self._update_status_label.setText("Download failed. Try downloading from the release page.")
+            msg = (error_message.strip() or "Download failed.").replace("\n", " ")[:200]
+            self._update_status_label.setText(f"Download failed: {msg} Or get the installer from the release page below.")
 
     def _build_pipeline_page(self) -> QWidget:
         """Tier 2: Pipeline → Mapping Folders | Categories | Scan rules | Statuses."""
