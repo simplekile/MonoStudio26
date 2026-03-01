@@ -441,6 +441,10 @@ class SettingsDialog(MonosDialog):
         self._update_status_label.setObjectName("UpdateStatusText")
         self._update_status_label.setMinimumHeight(20)
         layout.addWidget(self._update_status_label)
+        self._update_latest_github_label = QLabel("", root)
+        self._update_latest_github_label.setObjectName("DialogHelper")
+        self._update_latest_github_label.setProperty("mono", True)
+        layout.addWidget(self._update_latest_github_label)
 
         # ── Update actions (when available) ──
         action_row = QWidget(root)
@@ -490,6 +494,7 @@ class SettingsDialog(MonosDialog):
     def _on_check_for_updates(self) -> None:
         self._update_check_btn.setEnabled(False)
         self._update_status_label.setText("Checking…")
+        self._update_latest_github_label.setText("")
         self._update_download_btn.setVisible(False)
         self._update_view_github_btn.setVisible(False)
         self._update_changelog.clear()
@@ -506,10 +511,13 @@ class SettingsDialog(MonosDialog):
     def _on_update_check_finished(self, result: CheckResult | None, error_message: str) -> None:
         if error_message:
             self._update_status_label.setText(f"Check failed: {error_message}")
+            self._update_latest_github_label.setText("")
             self._update_changelog.clear()
             return
         if result is None:
             return
+        # Hiển thị bản latest trên GitHub để user biết đang so sánh với gì
+        self._update_latest_github_label.setText(f"Latest on GitHub: {result.latest_version}")
         # Luôn hiển thị release notes của bản latest (dù có update hay không)
         if result.latest_notes:
             self._update_changelog.setMarkdown(result.latest_notes)
