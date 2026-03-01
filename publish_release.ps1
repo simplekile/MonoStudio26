@@ -34,8 +34,33 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Publishing release $tag to GitHub..."
 Write-Host "  Tag: $tag"
 Write-Host "  File: $exe"
-$notes = "Release $tag. See commit history for changes."
-gh release create $tag $exe --title $tag --notes $notes
+
+# Release notes: uu tien file RELEASE_NOTES.md hoac CHANGELOG.md; khong co thi lay commit messages tu git
+$notesFile = $null
+foreach ($f in "RELEASE_NOTES.md", "CHANGELOG.md", "release_notes.md") {
+    $p = Join-Path $root $f
+    if (Test-Path $p) { $notesFile = $p; break }
+}
+if ($notesFile) {
+    Write-Host "  Notes: $notesFile"
+    gh release create $tag $exe --title $tag --notes-file $notesFile
+} else {
+    # Sinh notes tu git: cac commit tu tag truoc (hoac 15 commit gan nhat)
+    $prevTag = git describe --tags --abbrev=0 2>$null
+    $log = if ($prevTag) {
+        git log "$prevTag..HEAD" --oneline --no-merges -30 2>$null
+    } else {
+        git log -15 --oneline --no-merges 2>$null
+    }
+    $notes = "## $tag`n`n"
+    if ($log) {
+        $notes += "### Changes`n`n"
+        $log | ForEach-Object { $notes += "- $_`n" }
+    } else {
+        $notes += "See commit history for details.`n"
+    }
+    gh release create $tag $exe --title $tag --notes $notes
+}
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Co the tag $tag da ton tai. Xoa hoac dung version moi: gh release delete $tag"
     exit $LASTEXITCODE

@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# GitHub repo for releases: "owner/repo". Replace with your repo.
-GITHUB_REPO = "your-org/MonoStudio26"
+# GitHub repo for releases: "owner/repo"
+GITHUB_REPO = "simplekile/MonoStudio26"
 
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 # User-Agent required by GitHub API when not authenticated
