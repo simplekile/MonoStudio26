@@ -67,6 +67,7 @@ from monostudio.core.pipeline_types_and_presets import (
     save_pipeline_types_and_presets_to_user_default,
 )
 from monostudio.core.update_checker import (
+    CheckResult,
     UpdateInfo,
     check_for_update,
     download_installer,
@@ -79,9 +80,9 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 
 
 class _UpdateCheckWorker(QThread):
-    """Runs update check in background; emits check_finished(UpdateInfo | None, error_message: str)."""
+    """Runs update check in background; emits check_finished(CheckResult | None, error_message: str)."""
 
-    check_finished = Signal(object, str)  # UpdateInfo | None, error str
+    check_finished = Signal(object, str)  # CheckResult | None, error str
 
     def __init__(self, manifest_url: str, current_version: str, parent=None) -> None:
         super().__init__(parent)
@@ -89,10 +90,9 @@ class _UpdateCheckWorker(QThread):
         self._current_version = current_version
 
     def run(self) -> None:
-        err = ""
         try:
-            info = check_for_update(self._current_version, self._manifest_url)
-            self.check_finished.emit(info, "")
+            result = check_for_update(self._current_version, self._manifest_url)
+            self.check_finished.emit(result, "")
         except Exception as e:
             err = str(e) or "Check failed"
             self.check_finished.emit(None, err)
@@ -482,6 +482,7 @@ class SettingsDialog(MonosDialog):
         layout.addStretch(1)
 
         self._pending_update_info: UpdateInfo | None = None
+        self._update_latest_html_url: str = ""
         self._update_check_worker: _UpdateCheckWorker | None = None
         self._update_download_worker: _DownloadWorker | None = None
         return root
@@ -502,24 +503,29 @@ class SettingsDialog(MonosDialog):
         self._update_check_worker.finished.connect(self._on_update_check_thread_finished)
         self._update_check_worker.start()
 
-    def _on_update_check_finished(self, info: UpdateInfo | None, error_message: str) -> None:
+    def _on_update_check_finished(self, result: CheckResult | None, error_message: str) -> None:
         if error_message:
             self._update_status_label.setText(f"Check failed: {error_message}")
+            self._update_changelog.clear()
             return
-        if info is not None:
-            self._pending_update_info = info
-            self._update_status_label.setText(f"Update {info.version} available.")
-            self._update_download_btn.setVisible(True)
-            if info.notes:
-                self._update_changelog.setMarkdown(info.notes)
-            else:
-                self._update_changelog.setPlainText("No release notes for this version.")
-            if info.html_url:
-                self._update_view_github_btn.setVisible(True)
+        if result is None:
+            return
+        # Luôn hiển thị release notes của bản latest (dù có update hay không)
+        if result.latest_notes:
+            self._update_changelog.setMarkdown(result.latest_notes)
         else:
+            self._update_changelog.setPlainText("No release notes for this version.")
+        self._update_latest_html_url = result.latest_html_url
+        if result.update_available and result.update_info is not None:
+            self._pending_update_info = result.update_info
+            self._update_status_label.setText(f"Update {result.latest_version} available.")
+            self._update_download_btn.setVisible(True)
+            self._update_view_github_btn.setVisible(bool(result.latest_html_url))
+        else:
+            self._pending_update_info = None
             self._update_status_label.setText("You're on the latest version.")
-            self._update_changelog.setPlainText("")
-            self._update_view_github_btn.setVisible(False)
+            self._update_download_btn.setVisible(False)
+            self._update_view_github_btn.setVisible(bool(result.latest_html_url))
 
     def _on_update_check_thread_finished(self) -> None:
         self._update_check_btn.setEnabled(True)
@@ -538,9 +544,13 @@ class SettingsDialog(MonosDialog):
         self._update_download_worker.start()
 
     def _on_view_release_on_github(self) -> None:
-        info = self._pending_update_info
-        if info and info.html_url:
-            QDesktopServices.openUrl(QUrl(info.html_url))
+        url = None
+        if self._pending_update_info and self._pending_update_info.html_url:
+            url = self._pending_update_info.html_url
+        elif getattr(self, "_update_latest_html_url", None):
+            url = self._update_latest_html_url
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
 
     def _on_download_finished(self, success: bool, path: str) -> None:
         self._update_download_worker = None

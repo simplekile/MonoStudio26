@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,17 @@ class UpdateInfo:
     url: str  # download URL for installer
     notes: str = ""  # release body / changelog (markdown)
     html_url: str = ""  # link to release page on GitHub
+
+
+@dataclass
+class CheckResult:
+    """Result of check_for_update: optional update + always latest release notes for UI."""
+
+    update_available: bool
+    update_info: UpdateInfo | None  # set when update_available
+    latest_version: str
+    latest_notes: str
+    latest_html_url: str = ""
 
 
 def parse_version(version_str: str) -> tuple[int, int, int]:
@@ -69,8 +81,16 @@ def fetch_manifest(url: str, timeout: int = 15, headers: dict[str, str] | None =
     if headers is None:
         headers = {"Accept": "application/json"}
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError(
+                "Repository or release not found. Set GITHUB_REPO in monostudio/core/update_checker.py "
+                "to your repo (e.g. owner/MonoStudio26) and create a Release with tag v26.0.x and an installer .exe asset."
+            ) from e
+        raise RuntimeError(f"Update server returned {e.code}: {e.reason}") from e
     return json.loads(data)
 
 
@@ -123,24 +143,34 @@ def check_for_update(
     current_version: str,
     manifest_url: str | None = None,
     timeout: int = 15,
-) -> UpdateInfo | None:
+) -> CheckResult:
     """
-    Check for update via GitHub Releases API (default) or custom manifest_url.
-    Returns UpdateInfo if there is a newer version, else None.
-    Returns None on any error (network, parse, or not newer).
+    Check for update via GitHub Releases API; returns update (if newer) and latest release notes.
+    UI can always show release notes for the latest version, even when up to date.
+    Raises on network/HTTP error or invalid response.
     """
     if manifest_url is None:
         manifest_url = GITHUB_API_LATEST
-    try:
-        data = fetch_manifest(manifest_url, timeout=timeout)
-        info = parse_manifest(data)
-        if info is None:
-            return None
-        if is_newer_than(current_version, info.version):
-            return info
-        return None
-    except Exception:
-        return None
+    if "your-org" in manifest_url or GITHUB_REPO.startswith("your-org"):
+        raise RuntimeError(
+            "GITHUB_REPO is not configured. Edit monostudio/core/update_checker.py and set "
+            "GITHUB_REPO = 'owner/repo' to your GitHub repository."
+        )
+    data = fetch_manifest(manifest_url, timeout=timeout)
+    info = parse_manifest(data)
+    if info is None:
+        raise RuntimeError(
+            "Latest release has no tag or installer asset. Create a Release on GitHub with a tag (e.g. v26.0.25) "
+            "and attach MonoStudio26_Setup.exe."
+        )
+    update_available = is_newer_than(current_version, info.version)
+    return CheckResult(
+        update_available=update_available,
+        update_info=info if update_available else None,
+        latest_version=info.version,
+        latest_notes=info.notes or "",
+        latest_html_url=info.html_url or "",
+    )
 
 
 def download_installer(url: str, dest_path: Path, timeout: int = 300, progress_callback: Any = None) -> None:
