@@ -1,6 +1,6 @@
 ---
 description: MONOS build pipeline — PyInstaller onedir, VERSION, Inno Setup, GitHub release
-globs: build_installer.ps1, build_version.py, build_icon.py, publish_release.ps1, monostudio26.spec, installer/*.iss, monostudio/core/version.py, monostudio/core/update_checker.py
+globs: build_installer.ps1, build_version.py, build_icon.py, publish_release.ps1, RELEASE_NOTES.md, monostudio26.spec, installer/*.iss, monostudio/core/version.py, monostudio/core/update_checker.py
 alwaysApply: false
 ---
 
@@ -72,6 +72,7 @@ alwaysApply: false
 - **Assets**: đính kèm file cài đặt Windows (vd. `MonoStudio26_Setup.exe`). Update checker lấy `browser_download_url` từ asset (ưu tiên .exe / "Setup").
 - **Release body**: dùng làm changelog; hiển thị trong Settings → General → Updates khi có bản mới.
 - **GITHUB_REPO** trong `monostudio/core/update_checker.py`: đặt đúng `owner/repo`.
+- **Changelog (RELEASE_NOTES.md)**: Trước khi publish (hoặc sau build), cập nhật `RELEASE_NOTES.md` ở repo root — version (vd. v26.1.3), Highlights, Changes in this release, Install. `publish_release.ps1` ưu tiên đọc file này; không có thì tự sinh từ git log. Sửa release đã đăng: `gh release edit <tag> --notes-file RELEASE_NOTES.md`.
 
 ## Publish release lên GitHub (GitHub CLI)
 
@@ -85,6 +86,7 @@ alwaysApply: false
 - [ ] Thêm data/binary mới → cập nhật `datas`/`binaries` trong `monostudio26.spec`.
 - [ ] Thêm import PySide6 mới → thêm vào `hiddenimports` trong spec.
 - [ ] Đổi major version → cập nhật APP_MAJOR_VERSION trong `build_version.py` và `monostudio/core/version.py`; đổi tên app/installer nếu cần.
+- [ ] **Cập nhật changelog**: sửa `RELEASE_NOTES.md` (version, Highlights, Changes) trước hoặc sau build khi chuẩn bị release; nếu không có file thì script tự sinh từ git log.
 - [ ] Release mới: chạy `.\publish_release.ps1` (sau build) hoặc tạo release tay trên GitHub với tag v26.minor.patch, đính kèm .exe, điền changelog.
 
 ## Enforcement

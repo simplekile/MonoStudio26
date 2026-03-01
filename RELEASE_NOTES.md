@@ -1,24 +1,25 @@
-# MonoStudio 26 — Release v26.1.1
+# MonoStudio 26 — Release v26.1.3
 
 ## Highlights
 
-- **In-app update**: Check for updates from Settings → General → Updates (GitHub Releases). Version display with Major · Minor · Patch.
-- **Build & release**: Auto-commit before build, version bump from commit type (fix → patch, feat/style/docs → minor). Publish to GitHub via `publish_release.ps1` (GitHub CLI).
-- **Settings → Updates**: Redesigned UI (version card, release notes, “Latest on GitHub” hint). Release notes always shown after check (even when up to date).
-- **Pipeline**: Scan rules tab with Publish ignore extensions (.tmp, .bak, .mtl, …). Inbox improvements (split view, distribute from tree, History dialog). Splash screen and version in sidebar.
+- **In-app update**: Check for updates from Settings → General → Updates (GitHub Releases). Version display with Major · Minor · Patch. Fix: download installer with User-Agent for GitHub CDN.
+- **Build & release**: Auto-commit before build, version bump from commit type (fix → patch, feat/style/docs → minor). Publish to GitHub via `publish_release.ps1`; release notes from RELEASE_NOTES.md or auto-generated from git log.
+- **Settings → Updates**: Version card, “Latest on GitHub” hint, release notes always shown after check. Clear errors when GITHUB_REPO not set or repo/release not found.
+- **Pipeline**: Scan rules (Publish ignore extensions). Inbox (split view, distribute from tree, History dialog). Splash screen, version in sidebar.
 
 ## Changes in this release
 
 - chore: prepare build
+- fix: fixes (core/ui) — update checker download (User-Agent for GitHub assets), error messages
+- chore: prepare build
 - feat: ui update (Updates tab, version card, release notes)
-- fix: fixes (core/ui) — update checker, CheckResult, error messages
+- fix: fixes (core/ui) — CheckResult, release notes when up to date
 - feat(settings): Scan rules tab with Publish ignore extensions
 - feat: splash polish, version module, sidebar version, icons, notifications, tags
 - feat: add splash screen with loading progress and git version
 - feat: Inbox/Outbox, thumbnails paste, icons, build & installer setup
 - feat(inbox): remove mapping view, distribute from tree, History dialog
 - feat(inbox): add Inbox page (core + sidebar + main view)
-- UI: borderless/resize plans, Lucide icons, style updates
 
 ## Install
 

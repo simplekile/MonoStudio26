@@ -5,7 +5,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QRegularExpression, QSettings, Signal, QStandardPaths, QThread, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QRegularExpressionValidator
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QRegularExpressionValidator,
+    QTextBlockFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -393,15 +400,21 @@ class SettingsDialog(MonosDialog):
         return root
 
     def _build_updates_tab(self) -> QWidget:
-        """General → Updates: version card, check action, release notes, download."""
+        """General → Updates: version card bên cạnh check/status; release notes chiếm hết không gian bên dưới."""
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(16)
 
-        # ── Version card ──
-        version_card = QFrame(root)
+        # ── Hàng ngang: version card (ảnh 1) bên cạnh cụm check/status/actions (ảnh 2) ──
+        top_row = QWidget(root)
+        top_row_l = QHBoxLayout(top_row)
+        top_row_l.setContentsMargins(0, 0, 0, 0)
+        top_row_l.setSpacing(16)
+
+        version_card = QFrame(top_row)
         version_card.setObjectName("UpdateVersionCard")
+        version_card.setFixedWidth(200)
         version_card_l = QVBoxLayout(version_card)
         version_card_l.setContentsMargins(16, 12, 16, 12)
         version_card_l.setSpacing(4)
@@ -410,7 +423,6 @@ class SettingsDialog(MonosDialog):
         self._update_current_label.setObjectName("UpdateVersionValue")
         self._update_current_label.setProperty("mono", True)
         version_card_l.addWidget(self._update_current_label)
-        # Parse v26.minor.patch for hint (e.g. "Major 26 · Minor 1 · Patch 2" or legacy "Major 26 · Patch 24")
         raw = current.strip().lstrip("vV")
         parts = raw.split(".")
         if len(parts) >= 3:
@@ -422,32 +434,26 @@ class SettingsDialog(MonosDialog):
         self._update_version_hint = QLabel(hint_text, version_card)
         self._update_version_hint.setObjectName("DialogHelper")
         version_card_l.addWidget(self._update_version_hint)
-        layout.addWidget(version_card)
+        top_row_l.addWidget(version_card, 0)
 
-        # ── Check & status ──
-        check_row = QWidget(root)
-        check_row_l = QHBoxLayout(check_row)
-        check_row_l.setContentsMargins(0, 0, 0, 0)
-        check_row_l.setSpacing(12)
-        self._update_check_btn = QPushButton("Check for updates", check_row)
+        right_cluster = QWidget(top_row)
+        right_cluster_l = QVBoxLayout(right_cluster)
+        right_cluster_l.setContentsMargins(0, 0, 0, 0)
+        right_cluster_l.setSpacing(8)
+        self._update_check_btn = QPushButton("Check for updates", right_cluster)
         self._update_check_btn.setObjectName("DialogPrimaryButton")
         self._update_check_btn.clicked.connect(self._on_check_for_updates)
-        check_row_l.addWidget(self._update_check_btn)
-        check_row_l.addStretch(1)
-        layout.addWidget(check_row)
-
-        self._update_status_label = QLabel("", root)
+        right_cluster_l.addWidget(self._update_check_btn)
+        self._update_status_label = QLabel("", right_cluster)
         self._update_status_label.setWordWrap(True)
         self._update_status_label.setObjectName("UpdateStatusText")
         self._update_status_label.setMinimumHeight(20)
-        layout.addWidget(self._update_status_label)
-        self._update_latest_github_label = QLabel("", root)
+        right_cluster_l.addWidget(self._update_status_label)
+        self._update_latest_github_label = QLabel("", right_cluster)
         self._update_latest_github_label.setObjectName("DialogHelper")
         self._update_latest_github_label.setProperty("mono", True)
-        layout.addWidget(self._update_latest_github_label)
-
-        # ── Update actions (when available) ──
-        action_row = QWidget(root)
+        right_cluster_l.addWidget(self._update_latest_github_label)
+        action_row = QWidget(right_cluster)
         action_row_l = QHBoxLayout(action_row)
         action_row_l.setContentsMargins(0, 0, 0, 0)
         action_row_l.setSpacing(8)
@@ -462,19 +468,20 @@ class SettingsDialog(MonosDialog):
         self._update_view_github_btn.clicked.connect(self._on_view_release_on_github)
         action_row_l.addWidget(self._update_view_github_btn)
         action_row_l.addStretch(1)
-        layout.addWidget(action_row)
+        right_cluster_l.addWidget(action_row)
+        top_row_l.addWidget(right_cluster, 1)
+        layout.addWidget(top_row)
 
-        # ── Release notes ──
+        # ── Release notes: chiếm hết không gian bên dưới ──
         notes_label = QLabel("RELEASE NOTES", root)
         notes_label.setObjectName("UpdateSectionLabel")
         layout.addWidget(notes_label)
         self._update_changelog = QTextEdit(root)
         self._update_changelog.setReadOnly(True)
         self._update_changelog.setPlaceholderText("Click \"Check for updates\" to fetch the latest release notes from GitHub.")
-        self._update_changelog.setMinimumHeight(140)
-        self._update_changelog.setMaximumHeight(240)
+        self._update_changelog.setMinimumHeight(200)
         self._update_changelog.setObjectName("UpdateChangelog")
-        layout.addWidget(self._update_changelog)
+        layout.addWidget(self._update_changelog, 1)
 
         hint = QLabel(
             "Updates are delivered via GitHub Releases. Download runs the installer and closes the app.",
@@ -482,8 +489,7 @@ class SettingsDialog(MonosDialog):
         )
         hint.setWordWrap(True)
         hint.setObjectName("DialogHelper")
-        layout.addWidget(hint)
-        layout.addStretch(1)
+        layout.addWidget(hint, 0)
 
         self._pending_update_info: UpdateInfo | None = None
         self._update_latest_html_url: str = ""
@@ -523,6 +529,7 @@ class SettingsDialog(MonosDialog):
             self._update_changelog.setMarkdown(result.latest_notes)
         else:
             self._update_changelog.setPlainText("No release notes for this version.")
+        self._apply_changelog_line_height()
         self._update_latest_html_url = result.latest_html_url
         if result.update_available and result.update_info is not None:
             self._pending_update_info = result.update_info
@@ -534,6 +541,18 @@ class SettingsDialog(MonosDialog):
             self._update_status_label.setText("You're on the latest version.")
             self._update_download_btn.setVisible(False)
             self._update_view_github_btn.setVisible(bool(result.latest_html_url))
+
+    def _apply_changelog_line_height(self) -> None:
+        """Áp dụng line-height 165% cho mọi block trong release notes (QTextDocument không hỗ trợ line-height qua CSS)."""
+        doc = self._update_changelog.document()
+        block = doc.firstBlock()
+        while block.isValid():
+            cursor = QTextCursor(block)
+            fmt = block.blockFormat()
+            # ProportionalHeight = 1 (QTextBlockFormat.LineHeightTypes)
+            fmt.setLineHeight(165.0, 1)
+            cursor.setBlockFormat(fmt)
+            block = block.next()
 
     def _on_update_check_thread_finished(self) -> None:
         self._update_check_btn.setEnabled(True)

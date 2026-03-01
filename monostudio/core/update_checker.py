@@ -179,7 +179,10 @@ def download_installer(url: str, dest_path: Path, timeout: int = 300, progress_c
     progress_callback(current: int, total: int | None) optional; total may be None if unknown.
     Raises on failure.
     """
-    req = urllib.request.Request(url, headers={"Accept": "application/octet-stream"})
+    headers = {"Accept": "application/octet-stream"}
+    if "github" in url.lower():
+        headers["User-Agent"] = GITHUB_REQUEST_HEADERS.get("User-Agent", "MonoStudio26-UpdateCheck")
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         total = resp.headers.get("Content-Length")
         total = int(total) if total else None
