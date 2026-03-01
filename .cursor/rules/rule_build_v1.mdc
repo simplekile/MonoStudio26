@@ -1,6 +1,6 @@
 ---
 description: MONOS build pipeline — PyInstaller onedir, VERSION, Inno Setup, GitHub release
-globs: build_installer.ps1, build_version.py, build_icon.py, monostudio26.spec, installer/*.iss, monostudio/core/version.py, monostudio/core/update_checker.py
+globs: build_installer.ps1, build_version.py, build_icon.py, publish_release.ps1, monostudio26.spec, installer/*.iss, monostudio/core/version.py, monostudio/core/update_checker.py
 alwaysApply: false
 ---
 
@@ -68,17 +68,24 @@ alwaysApply: false
 
 ## GitHub Release (in-app update)
 
-- **Tag**: format `v26.<số>` (vd. v26.21) khớp với VERSION và `get_app_version()`.
+- **Tag**: format `v26.minor.patch` (vd. v26.1.0) khớp với VERSION và `get_app_version()`.
 - **Assets**: đính kèm file cài đặt Windows (vd. `MonoStudio26_Setup.exe`). Update checker lấy `browser_download_url` từ asset (ưu tiên .exe / "Setup").
 - **Release body**: dùng làm changelog; hiển thị trong Settings → General → Updates khi có bản mới.
 - **GITHUB_REPO** trong `monostudio/core/update_checker.py`: đặt đúng `owner/repo`.
+
+## Publish release lên GitHub (GitHub CLI)
+
+- **Cách làm**: Sau khi build xong, chạy `.\publish_release.ps1`. Script đọc VERSION → tag (vd. v26.1.0), đính kèm `dist\MonoStudio26_Setup.exe`, tạo release qua GitHub API.
+- **Prerequisites**: Cài GitHub CLI (`winget install GitHub.cli`). Lần đầu đăng nhập: `gh auth login` → chọn GitHub.com → HTTPS → Login with browser, nhập mã 8 ký tự. Sau khi cài/đăng nhập, nếu terminal báo "gh not recognized" thì mở lại terminal hoặc refresh PATH: `$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")`.
+- **Quy trình**: `.\build_installer.ps1` → (optional) `git push` → `.\publish_release.ps1`. Repo phải đã push lên GitHub (remote có release).
+- **Ghi chú**: Chỉ chạy trên máy đã `gh auth login`; agent/IDE không truy cập GitHub thay user. Nếu tag đã tồn tại thì `gh release create` lỗi — xóa release cũ hoặc build version mới.
 
 ## Checklist khi sửa build
 
 - [ ] Thêm data/binary mới → cập nhật `datas`/`binaries` trong `monostudio26.spec`.
 - [ ] Thêm import PySide6 mới → thêm vào `hiddenimports` trong spec.
 - [ ] Đổi major version → cập nhật APP_MAJOR_VERSION trong `build_version.py` và `monostudio/core/version.py`; đổi tên app/installer nếu cần.
-- [ ] Release mới: tạo tag v26.xx, đính kèm .exe, điền changelog vào release body.
+- [ ] Release mới: chạy `.\publish_release.ps1` (sau build) hoặc tạo release tay trên GitHub với tag v26.minor.patch, đính kèm .exe, điền changelog.
 
 ## Enforcement
 

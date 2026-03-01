@@ -80,3 +80,4 @@ if ($isccExe) {
 }
 
 Write-Host "Done. Run: dist\MonoStudio26\MonoStudio26.exe"
+Write-Host "Publish to GitHub (optional): .\publish_release.ps1  (can: winget install GitHub.cli  va  gh auth login)"
