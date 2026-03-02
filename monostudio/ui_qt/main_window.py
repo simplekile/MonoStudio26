@@ -49,7 +49,7 @@ from monostudio.ui_qt.settings_dialog import SettingsDialog
 from monostudio.ui_qt.sidebar import Sidebar
 from monostudio.ui_qt.top_bar import TopBar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
-from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog
+from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog, ask_delete_folder
 from monostudio.ui_qt.app_controller import AppController
 from monostudio.ui_qt.app_state import AppState
 from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
@@ -2299,38 +2299,51 @@ class MainWindow(FramelessMainWindow):
         if not isinstance(ref, (Asset, Shot)):
             return
         try:
+            import shutil
             from monostudio.core.dcc_registry import get_default_dcc_registry
             reg = get_default_dcc_registry()
             info = reg.get_dcc_info(dcc_id)
             dcc_label = info.get("label", dcc_id) if isinstance(info, dict) else dcc_id
             use_dcc_folders = read_use_dcc_folders(self._project_root)
-            target_path: Path | None = None
+            work_path: Path | None = None
+            dept_dir: Path | None = None
             for d in ref.departments:
                 if (d.name or "").strip().casefold() == department.strip().casefold():
                     work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
-                    target_path = work_path
+                    dept_dir = d.path
                     break
-            if target_path is None:
+            if work_path is None or dept_dir is None:
                 return
-            if not target_path.is_dir():
-                QMessageBox.information(self, f"Delete {dcc_label} Work Folder", "Folder does not exist.")
+            # Delete DCC folder (parent of work) when use_dcc_folders; else delete work folder only
+            to_delete = work_path.parent if use_dcc_folders else work_path
+            if not to_delete.is_dir():
+                QMessageBox.information(self, f"Delete {dcc_label} folder", "Folder does not exist.")
                 return
-            reply = QMessageBox.warning(
+            # Build structured content: full paths for each section
+            path_str = str(to_delete.resolve())
+            other_in_dcc: list[str] = []
+            sub_in_work: list[str] = []
+            if use_dcc_folders:
+                other_in_dcc = [str(p.resolve()) for p in to_delete.iterdir() if p.is_dir() and p.name != "work"]
+                sub_in_work = [str(p.resolve()) for p in work_path.iterdir() if p.is_dir()] if work_path.is_dir() else []
+            else:
+                sub_in_work = [str(p.resolve()) for p in to_delete.iterdir() if p.is_dir()]
+            intro = f"Delete the {dcc_label} folder and all its contents?" if not (other_in_dcc or sub_in_work) else ""
+            if not ask_delete_folder(
                 self,
-                f"Delete {dcc_label} Work Folder",
-                f"Delete the work folder and all its contents?\n\n{target_path}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+                f"Delete {dcc_label} folder",
+                folder_to_delete=path_str,
+                other_folders=other_in_dcc if other_in_dcc else None,
+                work_subfolders=sub_in_work if sub_in_work else None,
+                intro_text=intro,
+            ):
                 return
-            import shutil
-            shutil.rmtree(target_path, ignore_errors=True)
-            notification_service.success(f"Deleted {dcc_label} work folder.")
+            shutil.rmtree(to_delete, ignore_errors=True)
+            notification_service.success(f"Deleted {dcc_label} folder.")
             self._reload_main_view()
         except Exception as e:
             logging.warning("DCC badge delete failed: %s", e, exc_info=True)
-            QMessageBox.critical(self, "Delete Work Folder", str(e))
+            QMessageBox.critical(self, "Delete folder", str(e))
 
     def _on_inspector_open_folder_requested(self, path_or_item: object) -> None:
         if isinstance(path_or_item, Path):

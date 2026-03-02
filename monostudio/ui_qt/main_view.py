@@ -2775,7 +2775,7 @@ class MainView(QWidget):
         menu.addSeparator()
         delete_act = menu.addAction(
             lucide_icon("trash-2", size=16, color_hex="#ef4444"),
-            f"Delete {dcc_label} Work Folder\u2026",
+            f"Delete {dcc_label} folder\u2026",
         )
         delete_act.setProperty("class", "danger-action")
 
@@ -2802,7 +2802,7 @@ class MainView(QWidget):
             self.dcc_folder_requested.emit(item, dcc_id, department)
         elif text.startswith("Copy ") and "Work Path" in text:
             self.dcc_copy_path_requested.emit(item, dcc_id, department)
-        elif text.startswith("Delete ") and "Work Folder" in text:
+        elif text.startswith("Delete ") and " folder" in text:
             self.dcc_delete_requested.emit(item, dcc_id, department)
 
     def _on_tile_context_menu(self, pos) -> None:
@@ -2910,7 +2910,16 @@ class MainView(QWidget):
         if item.kind.value in ("asset", "shot"):
             _no_dept_hint = "Select a department filter first"
             _dim = MONOS_COLORS.get("text_muted", "#52525b")
-            open_action = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim), "Open")
+            active_dcc = self.get_active_dcc(getattr(item.ref, "path", None), self._active_department) if has_dept_filter else None
+            reg = get_default_dcc_registry()
+            info = reg.get_dcc_info(active_dcc) if active_dcc else {}
+            slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+            color = info.get("brand_color_hex") if isinstance(info, dict) else None
+            if isinstance(slug, str) and slug.strip():
+                open_icon = brand_icon(slug.strip(), size=16, color_hex=(color if isinstance(color, str) else None))
+            else:
+                open_icon = lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim)
+            open_action = menu.addAction(open_icon, "Open")
             open_with_action = menu.addAction(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim), "Open With…")
             create_new_action = menu.addAction(lucide_icon("file-plus", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim), "Create New…")
             if not has_dept_filter:
@@ -2981,8 +2990,8 @@ class MainView(QWidget):
         open_publish = None
 
         if item.kind.value in ("asset", "shot"):
-            refresh_action = menu.addAction(lucide_icon("download", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
-            delete_action = menu.addAction(lucide_icon("x", size=16, color_hex=MONOS_COLORS["text_label"]), "Delete…")
+            refresh_action = menu.addAction(lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
+            delete_action = menu.addAction(lucide_icon("trash-2", size=16, color_hex="#ef4444"), "Delete…")
             if delete_action is not None:
                 delete_action.setProperty("class", "danger-action")
         elif item.kind.value == "department":
@@ -3091,9 +3100,9 @@ class MainView(QWidget):
 
     def _resolved_path_and_folder_for_item(self, item: ViewItem) -> tuple[str, Path]:
         """
-        Resolve path (for copy) and folder (for open) from item and current department/type.
+        Resolve path (for copy) and folder (for Open Folder on card) from item and current department.
         When a department is selected and the item (asset/shot) has that department,
-        returns the department's work folder; otherwise returns item root path.
+        folder is the department folder (d.path); path for copy stays work path when present.
         """
         default_path = Path(item.path)
         active_dep = (self._active_department or "").strip() or None
@@ -3105,9 +3114,8 @@ class MainView(QWidget):
         for d in ref.departments:
             if (d.name or "").strip().casefold() == active_dep.casefold():
                 wp = d.work_path
-                if wp.exists():
-                    return (str(wp), wp)
-                return (str(d.path), d.path)
+                path_str = str(wp) if wp.exists() else str(d.path)
+                return (path_str, d.path)
         return (str(default_path), default_path)
 
     def _copy_full_path(self, path_text: str) -> None:

@@ -1,18 +1,18 @@
-# MonoStudio 26 — Release v26.2.1
+# MonoStudio 26 — Release
 
 ## Highlights
 
-- **Update check**: Download link built from tag + filename (`releases/download/{tag}/MonoStudio26_Setup.exe`) so download is reliable. Cache result 1 hour to avoid GitHub rate limit (60/h); optional `MONOSTUDIO_GITHUB_TOKEN` for 5000/h. Clear message when rate limit exceeded.
-- **Update on startup**: Check runs after launch; cached result shown in Settings → Updates. Top bar update button with red dot, auto tooltip, opens Settings → Updates on click.
-- **Download**: Retry with fallback URL if file invalid; Windows PowerShell fallback; validate installer (size, MZ header) before run. Friendly error if download or launch fails.
-- **Build & release**: Auto-commit, version bump, publish via `publish_release.ps1`. Debug: `MONOSTUDIO_FAKE_UPDATE=1` to test update UI.
+- **DCC (Windows only)**: Open file via `os.startfile` for Houdini, Maya, Substance Painter (no Python env conflict). RizomUV keeps Popen so .fbx always opens in configured RizomUV. Blender unchanged (--python-expr). All DCC adapters simplified for Windows.
+- **Delete folder**: From card/DCC menu, delete DCC folder (or work folder). Warns if folder contains other subfolders; structured confirm dialog with section titles and full paths (mono, selectable). Open Folder on card opens **department folder**.
+- **Card context menu**: Open icon = active DCC brand icon; Open opens active DCC only. Refresh icon = refresh-cw. Delete icon red (trash-2). Rule dialog for delete confirmation.
 
 ## Changes in this release
 
-- fix: update checker — build download URL from tag + filename; cache 1h; token support; 403/rate limit message
-- fix: download retry with fallback URL; PowerShell fallback; validate installer before run; show error in UI
-- feat: update on startup, top bar update button, cached result in Settings
-- chore: rule + doc for GitHub token (optional, free)
+- fix: Houdini/Maya/Substance Painter — open file with os.startfile (avoids python313.dll conflict when launching from build)
+- fix: RizomUV open_file keeps Popen(exe, path) so .fbx opens in configured RizomUV (no startfile)
+- chore: DCC adapters Windows-only; remove _is_windows branches
+- feat: Delete folder — remove DCC folder when use_dcc_folders; warn if other folders or work subfolders; structured DeleteFolderConfirmDialog (section titles + mono paths)
+- feat: Card context — Open Folder opens department folder; Open action uses active DCC icon and opens active DCC only; Refresh icon refresh-cw; Delete icon red (trash-2)
 
 ## Install
 
