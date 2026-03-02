@@ -165,18 +165,19 @@ def parse_manifest(data: dict[str, Any]) -> UpdateInfo | None:
         version = f"v{version}" if isinstance(version, str) else None
     else:
         return None
-    url = data.get("url")
+    # Do NOT use data.get("url") for GitHub: that is the release API URL (e.g. .../releases/291776151), not the installer.
+    url: str | None = None
     asset_api_url = ""
-    if not url and data.get("assets"):
+    if data.get("assets") and isinstance(data["assets"], list):
         assets = data["assets"]
-        if isinstance(assets, list):
-            browser_u, api_u, filename = _pick_installer_asset(assets)
-            asset_api_url = api_u or ""
-            # Link thực tế: https://github.com/owner/repo/releases/download/tag/filename
-            if version and filename and GITHUB_REPO and "your-org" not in GITHUB_REPO:
-                url = GITHUB_DOWNLOAD_TEMPLATE.format(tag=version, filename=filename)
-            else:
-                url = browser_u
+        browser_u, api_u, filename = _pick_installer_asset(assets)
+        asset_api_url = api_u or ""
+        if version and filename and GITHUB_REPO and "your-org" not in GITHUB_REPO:
+            url = GITHUB_DOWNLOAD_TEMPLATE.format(tag=version, filename=filename)
+        else:
+            url = browser_u
+    if not url or not isinstance(url, str):
+        url = data.get("url") if isinstance(data.get("url"), str) else None
     if not url or not isinstance(url, str):
         return None
     notes = data.get("notes") or data.get("body") or ""
@@ -377,12 +378,14 @@ def download_installer(
     fallback_url = (fallback_url or "").strip() or None
     if fallback_url == url:
         fallback_url = None
+    print(f"[MonoStudio] Download URL: {url}", flush=True)
     _do_download(url, dest_path, timeout, progress_callback)
     if fallback_url and not is_valid_installer(dest_path):
         try:
             dest_path.unlink(missing_ok=True)
         except OSError:
             pass
+        print(f"[MonoStudio] Retry download (fallback): {fallback_url}", flush=True)
         _do_download(fallback_url, dest_path, timeout, progress_callback)
 
 

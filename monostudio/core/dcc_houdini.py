@@ -114,6 +114,49 @@ def resolve_houdini_executable(configured: str) -> str | None:
     return None
 
 
+def _env_for_houdini_subprocess() -> dict[str, str]:
+    """
+    Build an environment for Houdini/hython subprocess so it does not load
+    MonoStudio's Python (e.g. python313.dll from PyInstaller bundle).
+    Houdini ships with its own Python (e.g. 3.11); loading another version's DLL causes:
+    "Module use of python313.dll conflicts with this version of Python."
+    """
+    env = os.environ.copy()
+    path_sep = os.pathsep
+    path_raw = env.get("PATH", "")
+    if not path_raw:
+        return env
+    to_remove: set[str] = set()
+    exe_dir = ""
+    # Path of this process (MonoStudio exe or interpreter)
+    try:
+        exe_dir = str(Path(sys.executable).resolve().parent).lower()
+        to_remove.add(exe_dir)
+    except Exception:
+        pass
+    # PyInstaller: _internal next to the exe
+    if getattr(sys, "frozen", False):
+        try:
+            internal = str(Path(sys.executable).resolve().parent / "_internal").lower()
+            to_remove.add(internal)
+        except Exception:
+            pass
+    # Paths containing Python313 / python313 (avoid loading system or bundled 3.13 when Houdini uses 3.11)
+    parts = [p.strip() for p in path_raw.split(path_sep) if p.strip()]
+    filtered = []
+    for p in parts:
+        p_lower = p.lower()
+        if p_lower in to_remove:
+            continue
+        if exe_dir and "_internal" in p_lower and exe_dir in p_lower:
+            continue
+        if "python313" in p_lower:
+            continue
+        filtered.append(p)
+    env["PATH"] = path_sep.join(filtered)
+    return env
+
+
 def _houdini_missing_message(configured: str) -> str:
     configured = _norm_exe(configured) or "houdini"
     msg_lines = [
@@ -161,10 +204,12 @@ class HoudiniDccAdapter:
         if not path.is_absolute():
             filepath = str(path.resolve())
         filepath_norm = filepath.replace("\\", "/")
+        env = _env_for_houdini_subprocess()
         try:
             subprocess.Popen(
                 [exe, filepath_norm],
                 cwd=str(self._repo_root),
+                env=env,
                 close_fds=True,
             )
         except Exception as e:
@@ -180,7 +225,7 @@ class HoudiniDccAdapter:
         # Use hython to create an empty scene file (.hiplc/.hip/.hipnc per path): hou.hipFile.clear(); hou.hipFile.save(path)
         hython_exe = _hython_executable(exe)
         if hython_exe:
-            env = os.environ.copy()
+            env = _env_for_houdini_subprocess()
             env["MONOSTUDIO_HOUDINI_SAVE_PATH"] = filepath_norm
             script_body = (
                 "import os\n"
@@ -214,17 +259,20 @@ class HoudiniDccAdapter:
             except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
                 pass
 
+        env = _env_for_houdini_subprocess()
         try:
             if Path(filepath).is_file():
                 subprocess.Popen(
                     [exe, filepath_norm],
                     cwd=str(self._repo_root),
+                    env=env,
                     close_fds=True,
                 )
             else:
                 subprocess.Popen(
                     [exe],
                     cwd=str(Path(filepath).parent),
+                    env=env,
                     close_fds=True,
                 )
         except Exception as e:
