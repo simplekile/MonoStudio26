@@ -122,6 +122,11 @@ def _env_for_houdini_subprocess() -> dict[str, str]:
     "Module use of python313.dll conflicts with this version of Python."
     """
     env = os.environ.copy()
+
+    # Unset Python env vars so hython uses only Houdini's bundled Python (PyInstaller/parent may set these)
+    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE"):
+        env.pop(key, None)
+
     path_sep = os.pathsep
     path_raw = env.get("PATH", "")
     if not path_raw:
@@ -151,6 +156,9 @@ def _env_for_houdini_subprocess() -> dict[str, str]:
         if exe_dir and "_internal" in p_lower and exe_dir in p_lower:
             continue
         if "python313" in p_lower:
+            continue
+        # When frozen: drop any PATH entry that lives under the app install dir (DLL search can still pick it up)
+        if exe_dir and exe_dir in p_lower:
             continue
         filtered.append(p)
     env["PATH"] = path_sep.join(filtered)
@@ -227,6 +235,8 @@ class HoudiniDccAdapter:
         if hython_exe:
             env = _env_for_houdini_subprocess()
             env["MONOSTUDIO_HOUDINI_SAVE_PATH"] = filepath_norm
+            # Run hython with cwd = Houdini bin so DLL search uses Houdini's Python, not MonoStudio's
+            hython_cwd = str(Path(hython_exe).resolve().parent)
             script_body = (
                 "import os\n"
                 "import hou\n"
@@ -245,7 +255,7 @@ class HoudiniDccAdapter:
                 try:
                     subprocess.run(
                         [hython_exe, tmp_script],
-                        cwd=str(self._repo_root),
+                        cwd=hython_cwd,
                         timeout=60,
                         check=False,
                         capture_output=True,
