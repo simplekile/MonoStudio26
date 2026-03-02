@@ -1,12 +1,13 @@
 """
-Maya DCC adapter for MonoStudio: resolve executable and launch Maya to open/create work files.
+Maya DCC adapter for MonoStudio (Windows only).
+- open_file: os.startfile(path)
+- create_new_file: mayabatch tạo file, rồi os.startfile(path) hoặc Popen(maya)
 """
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
-import sys
 import threading
 from glob import glob
 from pathlib import Path
@@ -20,10 +21,6 @@ def _norm_exe(s: str) -> str:
     return s
 
 
-def _is_windows() -> bool:
-    return os.name == "nt" or sys.platform.startswith("win")
-
-
 def _is_probably_path(s: str) -> bool:
     if not s:
         return False
@@ -35,8 +32,6 @@ def _is_probably_path(s: str) -> bool:
 
 
 def _windows_registry_maya_exe() -> str | None:
-    if not _is_windows():
-        return None
     try:
         import winreg  # type: ignore
     except Exception:
@@ -77,8 +72,6 @@ def _windows_registry_maya_exe() -> str | None:
 
 
 def _windows_common_maya_paths() -> list[str]:
-    if not _is_windows():
-        return []
     patterns = [
         r"C:\Program Files\Autodesk\Maya*\bin\maya.exe",
         r"C:\Program Files (x86)\Autodesk\Maya*\bin\maya.exe",
@@ -134,9 +127,6 @@ def resolve_maya_executable(configured: str) -> str | None:
 
 
 def _maya_batch_executable(maya_exe: str) -> str:
-    """On Windows, use mayabatch.exe for batch; on other platforms maya -batch."""
-    if not _is_windows():
-        return maya_exe
     p = Path(maya_exe)
     batch = p.parent / "mayabatch.exe"
     if batch.is_file():
@@ -156,18 +146,11 @@ def _maya_missing_message(configured: str) -> str:
         "- Set Settings key 'integrations/maya_exe' to the full path of 'maya.exe', OR",
         "- Set env var MONOSTUDIO_MAYA_EXE to the full path of 'maya.exe'.",
     ]
-    if _is_windows():
-        examples = _windows_common_maya_paths()
-        if examples:
-            msg_lines.extend(["", "Detected Maya installs (example):", f"- {examples[0]}"])
-        else:
-            msg_lines.extend(
-                [
-                    "",
-                    "Common install location:",
-                    r"- C:\Program Files\Autodesk\Maya<version>\bin\maya.exe",
-                ]
-            )
+    examples = _windows_common_maya_paths()
+    if examples:
+        msg_lines.extend(["", "Detected Maya installs (example):", f"- {examples[0]}"])
+    else:
+        msg_lines.extend(["", "Common install location:", r"- C:\Program Files\Autodesk\Maya<version>\bin\maya.exe"])
     return "\n".join(msg_lines).strip()
 
 
@@ -184,22 +167,15 @@ class MayaDccAdapter:
         self._repo_root = Path(repo_root)
 
     def open_file(self, *, filepath: str, context: dict[str, Any]) -> None:
-        exe = resolve_maya_executable(self._maya_executable)
-        if not exe:
-            raise RuntimeError(_maya_missing_message(self._maya_executable))
-        _path = Path(filepath)
-        if not _path.is_absolute():
-            filepath = str(_path.resolve())
-        # MEL prefers forward slashes
-        filepath_norm = filepath.replace("\\", "/")
+        path = Path(filepath)
+        if not path.is_absolute():
+            path = path.resolve()
+        if not path.is_file():
+            raise RuntimeError(f"Maya open_file: file not found: {path!r}")
         try:
-            subprocess.Popen(
-                [exe, "-file", filepath_norm],
-                cwd=str(self._repo_root),
-                close_fds=True,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to launch Maya with file: {filepath_norm!r}") from e
+            os.startfile(str(path))
+        except OSError as e:
+            raise RuntimeError(f"Failed to open file with Maya: {path!r}") from e
 
     def create_new_file(
         self,
@@ -225,22 +201,13 @@ class MayaDccAdapter:
 
         def _run_batch() -> None:
             try:
-                if _is_windows():
-                    subprocess.run(
-                        [batch_exe, "-command", mel_script],
-                        cwd=repo_root_str,
-                        timeout=60,
-                        check=False,
-                        capture_output=True,
-                    )
-                else:
-                    subprocess.run(
-                        [batch_exe, "-batch", "-command", mel_script],
-                        cwd=repo_root_str,
-                        timeout=60,
-                        check=False,
-                        capture_output=True,
-                    )
+                subprocess.run(
+                    [batch_exe, "-command", mel_script],
+                    cwd=repo_root_str,
+                    timeout=60,
+                    check=False,
+                    capture_output=True,
+                )
             except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
                 pass
             file_created = Path(filepath).is_file()
@@ -253,18 +220,11 @@ class MayaDccAdapter:
             return
 
         _run_batch()
+        path_abs = Path(filepath).resolve()
         try:
-            if Path(filepath).is_file():
-                subprocess.Popen(
-                    [exe, "-file", filepath_norm],
-                    cwd=repo_root_str,
-                    close_fds=True,
-                )
+            if path_abs.is_file():
+                os.startfile(str(path_abs))
             else:
-                subprocess.Popen(
-                    [exe],
-                    cwd=str(Path(filepath).parent),
-                    close_fds=True,
-                )
+                subprocess.Popen([exe], cwd=str(path_abs.parent), close_fds=True)
         except Exception as e:
             raise RuntimeError(f"Failed to launch Maya: {e!r}") from e

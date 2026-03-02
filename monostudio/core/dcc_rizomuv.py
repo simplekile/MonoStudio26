@@ -1,12 +1,15 @@
 """
-RizomUV DCC adapter for MonoStudio.
+RizomUV DCC adapter for MonoStudio (Windows only).
+RizomUV không có project file, mở trực tiếp file 3D (.fbx, .obj). Luôn dùng exe từ Settings
+để mở đúng RizomUV (không dùng os.startfile vì .fbx có thể gắn app khác).
+- open_file: Popen(exe, path), cwd = thư mục file
+- create_new_file: Popen(exe), cwd = thư mục đích
 """
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
-import sys
 from glob import glob
 from pathlib import Path
 from typing import Any
@@ -17,10 +20,6 @@ def _norm_exe(s: str) -> str:
     if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
         s = s[1:-1].strip()
     return s
-
-
-def _is_windows() -> bool:
-    return os.name == "nt" or sys.platform.startswith("win")
 
 
 def _is_probably_path(s: str) -> bool:
@@ -34,8 +33,6 @@ def _is_probably_path(s: str) -> bool:
 
 
 def _windows_common_rizomuv_paths() -> list[str]:
-    if not _is_windows():
-        return []
     base = r"C:\Program Files\Rizom Lab"
     hits: list[str] = []
     try:
@@ -100,18 +97,11 @@ def _rizomuv_missing_message(configured: str) -> str:
         "- Set Settings key 'integrations/rizomuv_exe' to the full path of the executable, OR",
         "- Set env var MONOSTUDIO_RIZOMUV_EXE.",
     ]
-    if _is_windows():
-        examples = _windows_common_rizomuv_paths()
-        if examples:
-            msg_lines.extend(["", "Detected install (example):", f"- {examples[0]}"])
-        else:
-            msg_lines.extend(
-                [
-                    "",
-                    "Common install:",
-                    r"C:\Program Files\Rizom Lab\RizomUV 2025.0\rizomuv_vs.exe",
-                ]
-            )
+    examples = _windows_common_rizomuv_paths()
+    if examples:
+        msg_lines.extend(["", "Detected install (example):", f"- {examples[0]}"])
+    else:
+        msg_lines.extend(["", "Common install:", r"C:\Program Files\Rizom Lab\RizomUV 2025.0\rizomuv_vs.exe"])
     return "\n".join(msg_lines).strip()
 
 
@@ -140,15 +130,10 @@ class RizomUVDccAdapter:
             path = path.resolve()
         if not path.is_file():
             raise RuntimeError(f"RizomUV open_file: file does not exist: {path!r}")
-        # Use file's parent as cwd so RizomUV resolves the file correctly (same as create_new_file uses dest.parent).
         file_dir = str(path.parent)
         path_arg = str(path)
         try:
-            subprocess.Popen(
-                [exe, path_arg],
-                cwd=file_dir,
-                close_fds=True,
-            )
+            subprocess.Popen([exe, path_arg], cwd=file_dir, close_fds=True)
         except Exception as e:
             raise RuntimeError(f"Failed to launch RizomUV: {path_arg!r}") from e
 

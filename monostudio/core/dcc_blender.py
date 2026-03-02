@@ -1,3 +1,7 @@
+"""
+Blender DCC adapter for MonoStudio (Windows only).
+Launch Blender with --python-expr to run monos_blender.adapter (open_file/create_new_file).
+"""
 from __future__ import annotations
 
 import base64
@@ -5,7 +9,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 from glob import glob
 from pathlib import Path
 from typing import Any
@@ -17,10 +20,6 @@ def _norm_exe(s: str) -> str:
     if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
         s = s[1:-1].strip()
     return s
-
-
-def _is_windows() -> bool:
-    return os.name == "nt" or sys.platform.startswith("win")
 
 
 def _is_probably_path(s: str) -> bool:
@@ -35,8 +34,6 @@ def _is_probably_path(s: str) -> bool:
 
 
 def _windows_registry_blender_exe() -> str | None:
-    if not _is_windows():
-        return None
     try:
         import winreg  # type: ignore
     except Exception:
@@ -72,9 +69,6 @@ def _windows_registry_blender_exe() -> str | None:
 
 
 def _windows_common_blender_paths() -> list[str]:
-    if not _is_windows():
-        return []
-
     patterns: list[str] = [
         r"C:\Program Files\Blender Foundation\Blender*\blender.exe",
         r"C:\Program Files (x86)\Blender Foundation\Blender*\blender.exe",
@@ -157,18 +151,11 @@ def _blender_missing_message(configured: str) -> str:
         "- Set Settings key 'integrations/blender_exe' to the full path of 'blender.exe', OR",
         "- Set env var MONOSTUDIO_BLENDER_EXE to the full path of 'blender.exe'.",
     ]
-    if _is_windows():
-        examples = _windows_common_blender_paths()
-        if examples:
-            msg_lines.extend(["", "Detected Blender installs (example):", f"- {examples[0]}"])
-        else:
-            msg_lines.extend(
-                [
-                    "",
-                    "Common install location:",
-                    r"- C:\Program Files\Blender Foundation\Blender <version>\blender.exe",
-                ]
-            )
+    examples = _windows_common_blender_paths()
+    if examples:
+        msg_lines.extend(["", "Detected Blender installs (example):", f"- {examples[0]}"])
+    else:
+        msg_lines.extend(["", "Common install location:", r"- C:\Program Files\Blender Foundation\Blender <version>\blender.exe"])
     return "\n".join(msg_lines).strip()
 
 

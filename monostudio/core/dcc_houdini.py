@@ -1,5 +1,7 @@
 """
-Houdini DCC adapter for MonoStudio: resolve executable and launch Houdini to open/create work files.
+Houdini DCC adapter for MonoStudio (Windows only).
+- open_file: os.startfile(path) — mở theo association, không dính env app.
+- create_new_file: hython tạo file trống (env làm sạch), rồi os.startfile(path) hoặc Popen(houdini) nếu chưa có file.
 """
 from __future__ import annotations
 
@@ -20,10 +22,6 @@ def _norm_exe(s: str) -> str:
     return s
 
 
-def _is_windows() -> bool:
-    return os.name == "nt" or sys.platform.startswith("win")
-
-
 def _is_probably_path(s: str) -> bool:
     if not s:
         return False
@@ -39,15 +37,13 @@ def _houdini_from_hfs() -> str | None:
     hfs = _norm_exe(os.environ.get("HFS", ""))
     if not hfs:
         return None
-    p = Path(hfs) / "bin" / ("houdini.exe" if _is_windows() else "houdini")
+    p = Path(hfs) / "bin" / "houdini.exe"
     if p.is_file():
         return str(p)
     return None
 
 
 def _windows_common_houdini_paths() -> list[str]:
-    if not _is_windows():
-        return []
     patterns = [
         r"C:\Program Files\Side Effects Software\Houdini*\bin\houdini.exe",
         r"C:\Program Files (x86)\Side Effects Software\Houdini*\bin\houdini.exe",
@@ -67,7 +63,7 @@ def _hython_executable(houdini_exe: str) -> str | None:
     p = Path(houdini_exe)
     if not p.is_file():
         return None
-    name = "hython.exe" if _is_windows() else "hython"
+    name = "hython.exe"
     hython = p.parent / name
     if hython.is_file():
         return str(hython)
@@ -177,51 +173,33 @@ def _houdini_missing_message(configured: str) -> str:
         "- Set Settings key 'integrations/houdini_exe' to the full path of 'houdini.exe', OR",
         "- Set env var MONOSTUDIO_HOUDINI_EXE to the full path of 'houdini.exe'.",
     ]
-    if _is_windows():
-        examples = _windows_common_houdini_paths()
-        if examples:
-            msg_lines.extend(["", "Detected Houdini installs (example):", f"- {examples[0]}"])
-        else:
-            msg_lines.extend(
-                [
-                    "",
-                    "Common install location:",
-                    r"- C:\Program Files\Side Effects Software\Houdini X.X\bin\houdini.exe",
-                ]
-            )
+    examples = _windows_common_houdini_paths()
+    if examples:
+        msg_lines.extend(["", "Detected Houdini installs (example):", f"- {examples[0]}"])
+    else:
+        msg_lines.extend(
+            ["", "Common install location:", r"- C:\Program Files\Side Effects Software\Houdini X.X\bin\houdini.exe"]
+        )
     return "\n".join(msg_lines).strip()
 
 
 class HoudiniDccAdapter:
-    """
-    Desktop-side Houdini launcher for MonoStudio.
-
-    - open_file: launches Houdini with the file path as argument.
-    - create_new_file: uses hython to create an empty scene file (clear + save); extension is from registry (default .hiplc for Indie), then launches Houdini with that file.
-    """
+    """Houdini launcher (Windows): open_file = os.startfile, create_new_file = hython rồi startfile hoặc Popen."""
 
     def __init__(self, *, houdini_executable: str, repo_root: Path) -> None:
         self._houdini_executable = (houdini_executable or "").strip()
         self._repo_root = Path(repo_root)
 
     def open_file(self, *, filepath: str, context: dict[str, Any]) -> None:
-        exe = resolve_houdini_executable(self._houdini_executable)
-        if not exe:
-            raise RuntimeError(_houdini_missing_message(self._houdini_executable))
         path = Path(filepath)
         if not path.is_absolute():
-            filepath = str(path.resolve())
-        filepath_norm = filepath.replace("\\", "/")
-        env = _env_for_houdini_subprocess()
+            path = path.resolve()
+        if not path.is_file():
+            raise RuntimeError(f"Houdini open_file: file not found: {path!r}")
         try:
-            subprocess.Popen(
-                [exe, filepath_norm],
-                cwd=str(self._repo_root),
-                env=env,
-                close_fds=True,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to launch Houdini with file: {filepath_norm!r}") from e
+            os.startfile(str(path))
+        except OSError as e:
+            raise RuntimeError(f"Failed to open file with Houdini: {path!r}") from e
 
     def create_new_file(self, *, filepath: str, context: dict[str, Any]) -> None:
         exe = resolve_houdini_executable(self._houdini_executable)
@@ -269,21 +247,13 @@ class HoudiniDccAdapter:
             except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
                 pass
 
-        env = _env_for_houdini_subprocess()
+        path_abs = Path(filepath).resolve()
         try:
-            if Path(filepath).is_file():
-                subprocess.Popen(
-                    [exe, filepath_norm],
-                    cwd=str(self._repo_root),
-                    env=env,
-                    close_fds=True,
-                )
+            if path_abs.is_file():
+                os.startfile(str(path_abs))
             else:
-                subprocess.Popen(
-                    [exe],
-                    cwd=str(Path(filepath).parent),
-                    env=env,
-                    close_fds=True,
-                )
+                env = _env_for_houdini_subprocess()
+                houdini_bin = str(Path(exe).resolve().parent)
+                subprocess.Popen([exe], cwd=houdini_bin, env=env, close_fds=True)
         except Exception as e:
             raise RuntimeError(f"Failed to launch Houdini: {e!r}") from e

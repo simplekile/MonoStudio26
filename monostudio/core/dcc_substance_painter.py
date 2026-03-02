@@ -1,12 +1,13 @@
 """
-Substance Painter (Adobe Substance 3D Painter) DCC adapter for MonoStudio.
+Substance Painter (Adobe Substance 3D Painter) DCC adapter for MonoStudio (Windows only).
+- open_file: os.startfile(path)
+- create_new_file: copy template rồi open_file, hoặc Popen(exe) với cwd
 """
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
-import sys
 from glob import glob
 from pathlib import Path
 from typing import Any
@@ -17,10 +18,6 @@ def _norm_exe(s: str) -> str:
     if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
         s = s[1:-1].strip()
     return s
-
-
-def _is_windows() -> bool:
-    return os.name == "nt" or sys.platform.startswith("win")
 
 
 def _is_probably_path(s: str) -> bool:
@@ -34,8 +31,6 @@ def _is_probably_path(s: str) -> bool:
 
 
 def _windows_common_substance_painter_paths() -> list[str]:
-    if not _is_windows():
-        return []
     patterns = [
         r"C:\Program Files\Adobe\Adobe Substance 3D Painter\Adobe Substance 3D Painter.exe",
         r"C:\Program Files\Adobe\Adobe Substance Painter\Adobe Substance Painter.exe",
@@ -99,18 +94,11 @@ def _substance_painter_missing_message(configured: str) -> str:
         "- Set Settings key 'integrations/substance_painter_exe' to the full path of the executable, OR",
         "- Set env var MONOSTUDIO_SUBSTANCE_PAINTER_EXE.",
     ]
-    if _is_windows():
-        examples = _windows_common_substance_painter_paths()
-        if examples:
-            msg_lines.extend(["", "Detected install (example):", f"- {examples[0]}"])
-        else:
-            msg_lines.extend(
-                [
-                    "",
-                    "Common install:",
-                    r"C:\Program Files\Adobe\Adobe Substance 3D Painter\Adobe Substance 3D Painter.exe",
-                ]
-            )
+    examples = _windows_common_substance_painter_paths()
+    if examples:
+        msg_lines.extend(["", "Detected install (example):", f"- {examples[0]}"])
+    else:
+        msg_lines.extend(["", "Common install:", r"C:\Program Files\Adobe\Adobe Substance 3D Painter\Adobe Substance 3D Painter.exe"])
     return "\n".join(msg_lines).strip()
 
 
@@ -137,21 +125,15 @@ class SubstancePainterDccAdapter:
         self._repo_root = Path(repo_root)
 
     def open_file(self, *, filepath: str, context: dict[str, Any]) -> None:
-        exe = resolve_substance_painter_executable(self._exe)
-        if not exe:
-            raise RuntimeError(_substance_painter_missing_message(self._exe))
         path = Path(filepath)
         if not path.is_absolute():
-            filepath = str(path.resolve())
-        filepath_norm = filepath.replace("\\", "/")
+            path = path.resolve()
+        if not path.is_file():
+            raise RuntimeError(f"Substance Painter open_file: file not found: {path!r}")
         try:
-            subprocess.Popen(
-                [exe, filepath_norm],
-                cwd=str(self._repo_root),
-                close_fds=True,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to launch Substance Painter: {filepath_norm!r}") from e
+            os.startfile(str(path))
+        except OSError as e:
+            raise RuntimeError(f"Failed to open file with Substance Painter: {path!r}") from e
 
     def create_new_file(self, *, filepath: str, context: dict[str, Any]) -> None:
         exe = resolve_substance_painter_executable(self._exe)
