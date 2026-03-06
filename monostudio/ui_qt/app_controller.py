@@ -29,6 +29,7 @@ from monostudio.core.models import Asset, Shot
 from monostudio.core.pending_create import add as pending_create_add
 from monostudio.ui_qt.import_source_dialog import ImportSourceDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.main_view import _item_active_dcc, _open_metadata_path
 from monostudio.ui_qt.open_resolver_dialog import OpenResolverDialog
 from monostudio.ui_qt.style import MONOS_COLORS
 
@@ -138,30 +139,42 @@ class AppController(QObject):
             project_defaults=project_defaults,
         )
 
-        resolved_dcc = None
-        if resolved_department:
-            resolved_dcc = self._resolve_dcc(
-                department=resolved_department,
-                meta=meta,
-                project_defaults=project_defaults,
-            )
-
         # Only skip dialog when we open the *resolved* department and that department has a work file.
         resolved_dept_has_work_file = False
+        resolved_dcc = None
         if resolved_department:
             for d in item.departments:
                 if self._norm(d.name) == self._norm(resolved_department):
                     resolved_dept_has_work_file = getattr(d, "work_file_exists", False)
-                    # Subdepartment: registry may only list parent, so resolved_dcc can be None.
-                    # Fallback to DCC from scan (work_file_dcc / work_file_dccs) so Open opens directly.
-                    if resolved_dept_has_work_file and not resolved_dcc:
-                        resolved_dcc = getattr(d, "work_file_dcc", None)
-                        if not resolved_dcc:
-                            dccs = getattr(d, "work_file_dccs", ()) or ()
-                            resolved_dcc = (dccs[0].strip() if dccs and dccs[0] else None)
-                        elif isinstance(resolved_dcc, str):
-                            resolved_dcc = resolved_dcc.strip() or None
+                    if resolved_dept_has_work_file:
+                        # Department already has work file(s): open that DCC, never "first in create list".
+                        # User may not have clicked the badge, so meta may have no active_dcc; use scan.
+                        existing_dccs = [(x or "").strip() for x in (getattr(d, "work_file_dccs", ()) or ()) if (x or "").strip()]
+                        work_file_dcc = (getattr(d, "work_file_dcc", None) or "").strip() or None
+                        if work_file_dcc and work_file_dcc not in existing_dccs:
+                            existing_dccs.insert(0, work_file_dcc)
+                        # Prefer persisted active_dcc (single source: _item_active_dcc) if in this department's work files.
+                        meta_dcc = _item_active_dcc(item.path, resolved_department)
+                        if meta_dcc and any((x or "").casefold() == (meta_dcc or "").casefold() for x in existing_dccs):
+                            resolved_dcc = next((x for x in existing_dccs if (x or "").casefold() == (meta_dcc or "").casefold()), meta_dcc)
+                        else:
+                            resolved_dcc = work_file_dcc or (existing_dccs[0] if existing_dccs else None)
+                    else:
+                        # No work file: use registry/default for "Create New" flow.
+                        resolved_dcc = self._resolve_dcc(
+                            item_path=item.path,
+                            department=resolved_department,
+                            meta=meta,
+                            project_defaults=project_defaults,
+                        )
                     break
+            if resolved_dcc is None and resolved_department:
+                resolved_dcc = self._resolve_dcc(
+                    item_path=item.path,
+                    department=resolved_department,
+                    meta=meta,
+                    project_defaults=project_defaults,
+                )
 
         remember_for_item = False
         choice = None
@@ -387,15 +400,19 @@ class AppController(QObject):
 
         return None
 
-    def _resolve_dcc(self, *, department: str, meta: dict[str, Any], project_defaults: dict[str, Any]) -> str | None:
-        # 0) User-selected active DCC (highest priority — set via badge click)
-        active_by_dep = meta.get("active_dcc_by_department") if isinstance(meta, dict) else None
-        if isinstance(active_by_dep, dict):
-            dep_key = (department or "").strip().casefold()
-            active_val = active_by_dep.get(dep_key) or active_by_dep.get(department)
-            if isinstance(active_val, str) and active_val.strip():
-                if self._dcc_registry.is_dcc_allowed(active_val.strip(), department):
-                    return active_val.strip()
+    def _resolve_dcc(
+        self,
+        *,
+        item_path: Path,
+        department: str,
+        meta: dict[str, Any],
+        project_defaults: dict[str, Any],
+    ) -> str | None:
+        # 0) User-selected active DCC (single source: _item_active_dcc from open.json)
+        active_val = _item_active_dcc(item_path, department)
+        if isinstance(active_val, str) and active_val.strip():
+            if self._dcc_registry.is_dcc_allowed(active_val.strip(), department):
+                return active_val.strip()
 
         # 1) Asset/Department last-used DCC
         last_used: str | None = None
@@ -713,7 +730,7 @@ class AppController(QObject):
 
     @staticmethod
     def _item_meta_path(item_root: Path) -> Path:
-        return Path(item_root) / ".monostudio" / "open.json"
+        return _open_metadata_path(item_root)
 
     def _read_item_open_metadata(self, item_root: Path) -> dict[str, Any]:
         path = self._item_meta_path(item_root)

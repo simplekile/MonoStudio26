@@ -1,0 +1,102 @@
+# Selectable List Pattern (Single + Multi + Picker Dialog) (v1)
+
+Prompt/rule để áp dụng vào project khác — **chỉ phần list**: single list, multi-select list, và dialog picker "Add" (chọn nhiều rồi trả về).
+
+---
+
+## 1. Hai kiểu list
+
+| Kiểu | Mục đích | Selection | ObjectName (Qt) | Dùng khi |
+|------|----------|-----------|-----------------|----------|
+| **Single** | Chọn đúng một mục | `SingleSelection` | `SelectableList` | Nav, filter active (ví dụ: chọn 1 department đang xem). |
+| **Multi** | Chọn nhiều mục (visibility/toggle) | `MultiSelection` | `SelectableListMulti` | Trong **picker dialog**: chọn tập "visible" (ví dụ: chọn department nào hiện trong sidebar). |
+
+---
+
+## 2. Dữ liệu mỗi item
+
+- **ID**: định danh (string) — dùng để so sánh, lưu state, emit signal.
+- **Label**: text hiển thị.
+- **Icon** (optional): icon 16px cho item.
+
+Lưu **id** vào item:
+- **Flat list**: `item.setData(Qt.UserRole, item_id)` (string).
+- **Structured list** (có section/spacer): row thật dùng `{"type": "row", "id": item_id}` hoặc tương đương; section/spacer không selectable, không có id dùng cho selection.
+
+---
+
+## 3. Picker dialog (pattern "Add" trong filter)
+
+**Mục đích**: Mở dialog → user bật/tắt chọn nhiều mục → Done → trả về danh sách id đã chọn để cập nhật "visible" (hoặc tập tương đương).
+
+**Input dialog**:
+- `items: list[(id, label, icon?)]` — toàn bộ mục có thể chọn.
+- `selected: set[str]` — id đang được chọn (pre-select khi mở).
+
+**UI dialog**:
+- Một `QListWidget` (hoặc tương đương):
+  - `objectName="SelectableListMulti"`.
+  - `SelectionMode = MultiSelection`.
+  - Build list từ `items`; với mỗi item, nếu `id in selected` thì `setSelected(True)`.
+- **Flat**: mỗi dòng = một (id, label, icon); `UserRole = id`.
+- **Structured** (optional): thêm section header + spacer; chỉ dòng "row" có `ItemIsSelectable`, `UserRole` = dict chứa `id` (ví dụ `dept_id`); khi đọc selection chỉ lấy dòng có type row và lấy `id` từ dict.
+- Hint: "Selected N" cập nhật khi `selectionChanged`.
+- Nút **Cancel** → `reject()`; **Done** → `accept()`.
+
+**Output**:
+- Hàm `selected_items() -> list[str]`: duyệt toàn bộ item, với item đang selected và có id (string hoặc từ dict) thì append id vào list, giữ thứ tự → return.
+
+**Caller** (ví dụ sidebar):
+1. Click nút "+" → mở dialog với `items` = full list, `selected` = visible hiện tại.
+2. Nếu `exec() != Accepted` → return.
+3. `picked = dlg.selected_items()`.
+4. Cập nhật state (ví dụ `visible_departments = picked`).
+5. Nếu có "active" (mục đang chọn để xem) mà không còn trong `picked` → clear active và emit.
+6. Rebuild list hiển thị từ state mới.
+
+---
+
+## 4. Build list (flat)
+
+```text
+for (item_id, label, icon_name) in items:
+  it = QListWidgetItem(label)
+  it.setData(Qt.UserRole, item_id)
+  if icon_name: it.setIcon(...)
+  list.addItem(it)
+  if item_id in selected: it.setSelected(True)
+```
+
+---
+
+## 5. Đọc selection từ list (sau Done)
+
+- **Flat** (UserRole = string): với mỗi item, nếu `item.isSelected()` thì `out.append(item.data(Qt.UserRole))`.
+- **Structured** (UserRole = dict): chỉ append khi `data["type"] == "row"` (hoặc tên key tương đương) và lấy `data["id"]` (hoặc `dept_id` / key tương ứng).
+
+Trả về **list[str]** theo thứ tự trong list để giữ order hiển thị.
+
+---
+
+## 6. Style (QSS) — áp dụng global
+
+- **SelectableList** (single): item có `border-left` khi selected (visual anchor); hover/selected background + color.
+- **SelectableListMulti**: giống nhưng không cần border-left; item selected = background + color (checkbox-like).
+
+Ví dụ tối thiểu:
+- List: nền tối, no border, padding.
+- Item: transparent nền, padding 8px 12px, border-radius 6px.
+- Item hover: nền nhạt.
+- Item selected: nền blue nhạt + chữ blue (single có thể thêm border-left 3px blue).
+
+---
+
+## 7. Tóm tắt flow "Add" (chỉ phần list)
+
+1. Nút "+" → mở Picker Dialog.
+2. Dialog: `QListWidget` (SelectableListMulti), build từ `items`, pre-select theo `selected`.
+3. User click để chọn/bỏ chọn nhiều mục.
+4. Done → `selected_items()` → list id đã chọn (giữ thứ tự).
+5. Caller gán state (visible) từ list đó và rebuild list hiển thị (single list hoặc danh sách visible).
+
+Không phụ thuộc department/type/tag — pattern áp dụng cho bất kỳ "chọn tập con từ tập đầy đủ" (filter visibility, tags, categories, v.v.).

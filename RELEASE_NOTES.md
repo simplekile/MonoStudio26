@@ -1,18 +1,17 @@
-# MonoStudio 26 — Release
+# MonoStudio 26 — Release v26.3.0
 
 ## Highlights
 
-- **DCC (Windows only)**: Open file via `os.startfile` for Houdini, Maya, Substance Painter (no Python env conflict). RizomUV keeps Popen so .fbx always opens in configured RizomUV. Blender unchanged (--python-expr). All DCC adapters simplified for Windows.
-- **Delete folder**: From card/DCC menu, delete DCC folder (or work folder). Warns if folder contains other subfolders; structured confirm dialog with section titles and full paths (mono, selectable). Open Folder on card opens **department folder**.
-- **Card context menu**: Open icon = active DCC brand icon; Open opens active DCC only. Refresh icon = refresh-cw. Delete icon red (trash-2). Rule dialog for delete confirmation.
+- **Double-click / Smart Open**: Khi item đã có work file (vd. Rizom) nhưng user chưa click active badge, double-click thumb mở đúng DCC có file (Rizom), không còn tạo folder + mở DCC đầu tiên trong list (vd. Blender).
+- **Active DCC một nguồn**: Đọc active DCC qua `_item_active_dcc()` (open.json); path open.json qua `_open_metadata_path()`. App controller + Inspector dùng chung; ghi chỉ qua `main_view.set_active_dcc()` (Inspector chỉ emit, không ghi trùng).
+- **Context menu (card)**: Icon "Open" = brand icon DCC (fallback work_file_dcc khi chưa chọn badge). Khi không có work file trong department: disable Open, Open With…, Copy Work Path + tooltip "No work file in this department."
 
 ## Changes in this release
 
-- fix: Houdini/Maya/Substance Painter — open file with os.startfile (avoids python313.dll conflict when launching from build)
-- fix: RizomUV open_file keeps Popen(exe, path) so .fbx opens in configured RizomUV (no startfile)
-- chore: DCC adapters Windows-only; remove _is_windows branches
-- feat: Delete folder — remove DCC folder when use_dcc_folders; warn if other folders or work subfolders; structured DeleteFolderConfirmDialog (section titles + mono paths)
-- feat: Card context — Open Folder opens department folder; Open action uses active DCC icon and opens active DCC only; Refresh icon refresh-cw; Delete icon red (trash-2)
+- fix: Smart Open — khi department đã có work file, ưu tiên mở DCC từ scan (work_file_dcc / work_file_dccs), không dùng registry "first in list"
+- refactor: Active DCC — main_view: `_open_metadata_path()`, dùng trong _item_active_dcc / _write_active_dcc / _item_last_opened_dcc; app_controller dùng _item_active_dcc + _open_metadata_path, _resolve_dcc(item_path, …) đọc active từ _item_active_dcc
+- refactor: Inspector đổi active DCC chỉ emit; ghi file qua main_view.set_active_dcc (single write path)
+- feat: Context menu — Open icon fallback work_file_dcc khi chưa có active_dcc; disable Open, Open With, Copy Work Path khi không có work file trong department
 
 ## Install
 

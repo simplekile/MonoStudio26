@@ -51,11 +51,6 @@ def _inspector_get_active_dcc(item_path: Path | None, department: str | None) ->
     return _item_active_dcc(item_path, department)
 
 
-def _inspector_set_active_dcc(item_path: Path, department: str, dcc_id: str) -> None:
-    from monostudio.ui_qt.main_view import _write_active_dcc
-    _write_active_dcc(item_path, department, dcc_id)
-
-
 def _work_file_version_from_path_for_inspector(path: Path | None) -> int | None:
     """Cùng logic main view: parse version từ path stem (hỗ trợ suffix như _fixNecklace)."""
     from monostudio.ui_qt.main_view import _work_file_version_from_path
@@ -1660,7 +1655,7 @@ class _IdentityBlock(QWidget):
         path = getattr(self._current_item, "path", None)
         if not path:
             return
-        _inspector_set_active_dcc(path, self._active_department, dcc_id)
+        # Single write path: emit only; MainWindow calls main_view.set_active_dcc() which persists.
         self._active_dcc_id = dcc_id
         self.active_dcc_changed.emit(path, self._active_department, dcc_id)
         self._update_dcc_badges()

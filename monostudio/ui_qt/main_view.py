@@ -194,6 +194,39 @@ def _item_has_publish_for_department(ref: Asset | Shot, active_department: str |
     return False
 
 
+def _item_has_work_for_department(ref: Asset | Shot, active_department: str | None) -> bool:
+    """True if the item has at least one work file for the department (from dcc_work_states)."""
+    dep = (active_department or "").strip().casefold()
+    if not dep:
+        return False
+    states = getattr(ref, "dcc_work_states", ()) or ()
+    for (dept_id, _dcc_id), state in states:
+        if (dept_id or "").strip().casefold() != dep:
+            continue
+        wp = getattr(state, "work_file_path", None)
+        if isinstance(wp, Path) and wp.is_file():
+            return True
+    return False
+
+
+def _resolve_work_files_for_drag(ref: Asset | Shot, active_department: str | None) -> list[Path]:
+    """Work file path(s) for drag in work mode; only actual files from dcc_work_states."""
+    dep = (active_department or "").strip().casefold()
+    if not dep:
+        return []
+    out: list[Path] = []
+    seen: set[Path] = set()
+    states = getattr(ref, "dcc_work_states", ()) or ()
+    for (dept_id, _dcc_id), state in states:
+        if (dept_id or "").strip().casefold() != dep:
+            continue
+        wp = getattr(state, "work_file_path", None)
+        if isinstance(wp, Path) and wp.is_file() and wp not in seen:
+            seen.add(wp)
+            out.append(wp)
+    return out
+
+
 def _resolve_publish_department(ref: Asset | Shot, active_department: str | None):
     """Return the Department with a publish, respecting active filter. Returns None if nothing found."""
     dep = (active_department or "").strip()
@@ -340,11 +373,16 @@ def _resolve_all_publish_files(
     return files
 
 
+def _open_metadata_path(item_path: Path) -> Path:
+    """Single source for item open.json path. Used by main_view, app_controller, inspector."""
+    return item_path / ".monostudio" / "open.json"
+
+
 def _item_last_opened_dcc(item_path: Path, active_department: str) -> str | None:
     """Read last-opened DCC for this item from .monostudio/open.json. Returns dcc_id or None."""
     if not item_path or not isinstance(item_path, Path):
         return None
-    meta_path = item_path / ".monostudio" / "open.json"
+    meta_path = _open_metadata_path(item_path)
     try:
         if not meta_path.is_file():
             return None
@@ -479,7 +517,7 @@ def _item_active_dcc(item_path: Path, active_department: str) -> str | None:
     """Read active_dcc for this item+department from .monostudio/open.json."""
     if not item_path or not isinstance(item_path, Path):
         return None
-    meta_path = item_path / ".monostudio" / "open.json"
+    meta_path = _open_metadata_path(item_path)
     try:
         if not meta_path.is_file():
             return None
@@ -501,8 +539,8 @@ def _write_active_dcc(item_path: Path, active_department: str, dcc_id: str) -> N
     """Persist active_dcc for this item+department to .monostudio/open.json."""
     if not item_path or not isinstance(item_path, Path):
         return
-    meta_dir = item_path / ".monostudio"
-    meta_path = meta_dir / "open.json"
+    meta_path = _open_metadata_path(item_path)
+    meta_dir = meta_path.parent
     try:
         data: dict = {}
         if meta_path.is_file():
@@ -743,7 +781,7 @@ class _GridCardDelegate(QStyledItemDelegate):
                 and str(item.path) == self._active_project_root
             )
 
-            # Dim card when showing Published mode but item has no publish
+            # Dim card when showing Published mode but item has no publish (strong dim, no selection)
             _dim_card = False
             if (
                 self._show_publish
@@ -758,6 +796,21 @@ class _GridCardDelegate(QStyledItemDelegate):
                     p.setOpacity(0.45)
                 else:
                     p.setOpacity(0.1)
+            # Work mode: lighter dim when item has no work file (card still selectable)
+            _dim_card_work = False
+            if (
+                not self._show_publish
+                and isinstance(item.ref, (Asset, Shot))
+                and not _item_has_work_for_department(item.ref, self._active_department)
+            ):
+                _dim_card_work = True
+            if _dim_card_work:
+                if selected:
+                    p.setOpacity(1.0)
+                elif hover:
+                    p.setOpacity(0.8)
+                else:
+                    p.setOpacity(0.4)
 
             border_px = 2 if (selected or active) else 1
             if selected:
@@ -1142,11 +1195,16 @@ class _PublishDragModel(QStandardItemModel):
 
     def flags(self, index):
         default = super().flags(index)
-        if not index.isValid() or not self._show_publish:
+        if not index.isValid():
             return default
         item = index.data(Qt.UserRole)
-        if isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
+        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
+            return default
+        if self._show_publish:
             if _item_has_publish_for_department(item.ref, self._active_department):
+                return default | Qt.ItemIsDragEnabled
+        else:
+            if _item_has_work_for_department(item.ref, self._active_department):
                 return default | Qt.ItemIsDragEnabled
         return default
 
@@ -1165,9 +1223,12 @@ class _PublishDragModel(QStandardItemModel):
             item = idx.data(Qt.UserRole)
             if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
                 continue
-            files = _resolve_all_publish_files(
-                item.ref, self._active_department, ignore_extensions=self._ignore_extensions
-            )
+            if self._show_publish:
+                files = _resolve_all_publish_files(
+                    item.ref, self._active_department, ignore_extensions=self._ignore_extensions
+                )
+            else:
+                files = _resolve_work_files_for_drag(item.ref, self._active_department)
             for f in files:
                 urls.append(QUrl.fromLocalFile(str(f)))
         if urls:
@@ -1835,7 +1896,8 @@ class MainView(QWidget):
             )
 
     def _sync_tile_drag_mode(self) -> None:
-        if self._show_publish:
+        # Both modes: drag enabled; model flags control which rows are draggable (has publish / has work file).
+        if self._browser_context in ("asset", "shot"):
             self._tile_view.setDragEnabled(True)
             self._tile_view.setDragDropMode(QAbstractItemView.DragOnly)
             self._tile_view.setDefaultDropAction(Qt.CopyAction)
@@ -2910,7 +2972,23 @@ class MainView(QWidget):
         if item.kind.value in ("asset", "shot"):
             _no_dept_hint = "Select a department filter first"
             _dim = MONOS_COLORS.get("text_muted", "#52525b")
+            _has_work = False
+            if has_dept_filter:
+                for d in getattr(item.ref, "departments", ()) or ():
+                    if (d.name or "").strip().casefold() == (self._active_department or "").strip().casefold():
+                        if getattr(d, "work_file_exists", False):
+                            _has_work = True
+                        break
             active_dcc = self.get_active_dcc(getattr(item.ref, "path", None), self._active_department) if has_dept_filter else None
+            # Icon for "Open": if user never clicked badge, use DCC from existing work file (same as double-click).
+            if not active_dcc and has_dept_filter and getattr(item.ref, "departments", None):
+                for d in item.ref.departments:
+                    if (d.name or "").strip().casefold() == (self._active_department or "").strip().casefold():
+                        if getattr(d, "work_file_exists", False):
+                            active_dcc = getattr(d, "work_file_dcc", None) or (
+                                (d.work_file_dccs[0].strip() if d.work_file_dccs else None)
+                            )
+                        break
             reg = get_default_dcc_registry()
             info = reg.get_dcc_info(active_dcc) if active_dcc else {}
             slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
@@ -2929,47 +3007,48 @@ class MainView(QWidget):
                 open_with_action.setToolTip(_no_dept_hint)
                 create_new_action.setEnabled(False)
                 create_new_action.setToolTip(_no_dept_hint)
-            # "Open older version" submenu when right-click on thumbnail: use active DCC for this item+department
-            if has_dept_filter and isinstance(item.ref, (Asset, Shot)) and self._project_root:
-                active_dcc = self.get_active_dcc(getattr(item.ref, "path", None), self._active_department)
-                if not active_dcc and getattr(item.ref, "departments", None):
-                    for d in item.ref.departments:
-                        if (d.name or "").strip().casefold() == (self._active_department or "").strip().casefold():
-                            active_dcc = getattr(d, "work_file_dcc", None) or (
-                                (d.work_file_dccs[0].strip() if d.work_file_dccs else None)
+            else:
+                # Disable Open / Open With when no work file in this department.
+                if not _has_work:
+                    open_action.setEnabled(False)
+                    open_action.setToolTip("No work file in this department.")
+                    open_with_action.setEnabled(False)
+                    open_with_action.setToolTip("No work file in this department.")
+            # "Open older version" submenu when right-click on thumbnail: use same active_dcc as icon (already resolved above).
+            if has_dept_filter and isinstance(item.ref, (Asset, Shot)) and self._project_root and active_dcc:
+                dep_norm = (self._active_department or "").strip().casefold()
+                for d in getattr(item.ref, "departments", ()) or ():
+                    if (d.name or "").strip().casefold() == dep_norm:
+                        use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
+                        try:
+                            work_path = resolve_work_path(d.path, active_dcc, use_dcc_folders, get_default_dcc_registry())
+                            prefix = work_file_prefix(
+                                name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
+                                department=self._active_department,
                             )
-                            break
-                if active_dcc:
-                    dep_norm = (self._active_department or "").strip().casefold()
-                    for d in getattr(item.ref, "departments", ()) or ():
-                        if (d.name or "").strip().casefold() == dep_norm:
-                            use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
-                            try:
-                                work_path = resolve_work_path(d.path, active_dcc, use_dcc_folders, get_default_dcc_registry())
-                                prefix = work_file_prefix(
-                                    name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
-                                    department=self._active_department,
-                                )
-                                older_versions = list_work_file_versions(
-                                    work_path, prefix, active_dcc, get_default_dcc_registry()
-                                )
-                            except Exception:
-                                older_versions = []
-                            if len(older_versions) >= 1:
-                                open_older_menu = QMenu(self)
-                                open_older_menu.setTitle("Open older version")
-                                for i, (ver, path) in enumerate(older_versions):
-                                    if i == 0:
-                                        act = open_older_menu.addAction(f"v{ver:03d} (newest)")
-                                        act.setEnabled(False)
-                                    else:
-                                        act = open_older_menu.addAction(f"v{ver:03d}")
-                                        act.setData((path, active_dcc, self._active_department or ""))
-                                menu.addMenu(open_older_menu)
-                            break
+                            older_versions = list_work_file_versions(
+                                work_path, prefix, active_dcc, get_default_dcc_registry()
+                            )
+                        except Exception:
+                            older_versions = []
+                        if len(older_versions) >= 1:
+                            open_older_menu = QMenu(self)
+                            open_older_menu.setTitle("Open older version")
+                            for i, (ver, path) in enumerate(older_versions):
+                                if i == 0:
+                                    act = open_older_menu.addAction(f"v{ver:03d} (newest)")
+                                    act.setEnabled(False)
+                                else:
+                                    act = open_older_menu.addAction(f"v{ver:03d}")
+                                    act.setData((path, active_dcc, self._active_department or ""))
+                            menu.addMenu(open_older_menu)
+                        break
             menu.addSeparator()
             if has_dept_filter:
                 copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Work Path")
+                if not _has_work:
+                    copy_ctx.setEnabled(False)
+                    copy_ctx.setToolTip("No work file in this department.")
             else:
                 copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Path")
             menu.addSeparator()
