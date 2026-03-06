@@ -6,6 +6,13 @@ Uses https://api.github.com/repos/OWNER/REPO/releases/latest (tag_name, assets, 
 Rate limit: Không token = 60 request/giờ. Set env MONOSTUDIO_GITHUB_TOKEN (hoặc GITHUB_TOKEN)
 = Personal Access Token từ GitHub → Settings → Developer settings → Personal access tokens
 để được 5000 request/giờ, miễn phí. Không commit token vào repo.
+
+Extra tools (e.g. MonoFXSuite) — install location and version detection:
+- MonoStudio install dir: from get_app_base_path() (frozen = exe dir, e.g. C:\\Program Files\\MonoStudio26).
+- Recommended install for MonoFXSuite: {MonoStudio base}/tools/MonoFXSuite/
+  so that MonoStudio can read installed version from tools/MonoFXSuite/VERSION (or .../monofxsuite_data/VERSION).
+- Fallback: %LOCALAPPDATA%\\MonoStudio\\tools\\MonoFXSuite\\VERSION for user-level installs.
+- VERSION file format: one line, e.g. "1.0.2" or "v1.0.2".
 """
 
 from __future__ import annotations
@@ -23,11 +30,23 @@ from urllib.parse import urljoin
 from pathlib import Path
 from typing import Any
 
+from monostudio.core.app_paths import get_app_base_path
+
 # Cache kết quả check 1 giờ để tránh vượt rate limit GitHub (60 request/giờ khi không token)
 CACHE_TTL_SECONDS = 3600
 
 # GitHub repo for releases: "owner/repo"
 GITHUB_REPO = "simplekile/MonoStudio26"
+
+# Extra repos to show latest version in Settings → Updates; display_name used as install folder (e.g. MonoFXSuite)
+EXTRA_REPOS: list[tuple[str, str]] = [
+    ("MonoFXSuite", "simplekile/MonoFXSuite"),
+]
+
+# Subfolder under tools/ for version file (optional; e.g. "monofxsuite_data" mirrors monostudio_data)
+EXTRA_TOOL_VERSION_PATHS: dict[str, str] = {
+    "MonoFXSuite": "monofxsuite_data",  # tools/MonoFXSuite/monofxsuite_data/VERSION
+}
 
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 # Direct download URL pattern: không phụ thuộc browser_download_url từ API
@@ -56,6 +75,52 @@ class CheckResult:
     latest_version: str
     latest_notes: str
     latest_html_url: str = ""
+
+
+@dataclass
+class ExtraRepoRelease:
+    """Latest release info for an extra repo (e.g. MonoFXSuite); may include download_url for in-app update."""
+
+    name: str  # display name
+    version: str
+    html_url: str = ""
+    notes: str = ""
+    download_url: str = ""  # installer asset URL (e.g. .exe) when available
+
+
+def get_extra_tool_installed_version(display_name: str) -> str:
+    """
+    Return installed version of an extra tool (e.g. MonoFXSuite) so MonoStudio can show it in Settings → Updates.
+
+    Lookup order:
+    1. {MonoStudio base}/tools/{display_name}/VERSION or .../tools/{display_name}/{subfolder}/VERSION
+    2. %LOCALAPPDATA%/MonoStudio/tools/{display_name}/VERSION
+
+    Returns version string with "v" prefix (e.g. "v1.0.2") or "" if not found.
+    """
+    if not (display_name or "").strip():
+        return ""
+    name = display_name.strip()
+    subfolder = EXTRA_TOOL_VERSION_PATHS.get(name, "")
+    base = get_app_base_path()
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    candidates: list[Path] = []
+    if subfolder:
+        candidates.append(base / "tools" / name / subfolder / "VERSION")
+    candidates.append(base / "tools" / name / "VERSION")
+    if localappdata:
+        if subfolder:
+            candidates.append(Path(localappdata) / "MonoStudio" / "tools" / name / subfolder / "VERSION")
+        candidates.append(Path(localappdata) / "MonoStudio" / "tools" / name / "VERSION")
+    for p in candidates:
+        try:
+            if p.is_file():
+                raw = p.read_text(encoding="utf-8").strip().lstrip("vV")
+                if raw:
+                    return f"v{raw}" if not raw.startswith("v") else raw
+        except OSError:
+            continue
+    return ""
 
 
 def parse_version(version_str: str) -> tuple[int, int, int]:
@@ -208,6 +273,103 @@ def set_cached_check_result(result: CheckResult | None) -> None:
     global _cached_check_result, _cached_check_time
     _cached_check_result = result
     _cached_check_time = time.time() if result is not None else 0.0
+
+
+# Cache for extra repos (e.g. MonoFXSuite): name -> ExtraRepoRelease
+_cached_extra_repos: dict[str, ExtraRepoRelease] = {}
+_cached_extra_repos_time: float = 0.0
+
+
+def _pick_installer_asset_extra(assets: list[dict[str, Any]], tag: str, repo: str) -> tuple[str, str]:
+    """Pick first .exe/Setup asset from release; return (download_url, filename)."""
+    if not assets or "/" not in repo:
+        return "", ""
+    owner_repo = repo.strip()
+    for a in assets:
+        name = (a.get("name") or "").strip()
+        name_lower = name.lower()
+        browser_u = a.get("browser_download_url")
+        if browser_u and isinstance(browser_u, str) and (".exe" in name_lower or "setup" in name_lower):
+            return browser_u, name or "Setup.exe"
+    a0 = assets[0]
+    browser_u = a0.get("browser_download_url") if isinstance(a0.get("browser_download_url"), str) else None
+    fname = (a0.get("name") or "").strip() or "Setup.exe"
+    if browser_u:
+        return browser_u, fname
+    if tag and fname:
+        return f"https://github.com/{owner_repo}/releases/download/{tag}/{fname}", fname
+    return "", ""
+
+
+def _parse_release_to_extra(data: dict[str, Any], repo: str) -> ExtraRepoRelease | None:
+    """Parse GitHub release JSON to ExtraRepoRelease (version, html_url, notes, download_url)."""
+    version = data.get("tag_name") or data.get("version")
+    if not version or not isinstance(version, str):
+        return None
+    if not version.startswith("v"):
+        version = f"v{version}"
+    html_url = (data.get("html_url") or "").strip() if isinstance(data.get("html_url"), str) else ""
+    notes = (data.get("body") or data.get("notes") or "")
+    notes = notes.strip()[:2000] if isinstance(notes, str) else ""
+    name = repo.split("/")[-1] if "/" in repo else repo
+    download_url = ""
+    if data.get("assets") and isinstance(data["assets"], list):
+        download_url, _ = _pick_installer_asset_extra(data["assets"], version, repo)
+    return ExtraRepoRelease(name=name, version=version, html_url=html_url, notes=notes, download_url=download_url)
+
+
+def get_latest_release_for_repo(
+    repo: str,
+    timeout: int = 15,
+) -> ExtraRepoRelease | None:
+    """
+    Fetch latest release for a GitHub repo (owner/repo). Returns version, html_url, notes.
+    Uses /releases/latest; if 404 (e.g. only prereleases exist) falls back to /releases and takes first.
+    """
+    if not repo or "/" not in repo:
+        return None
+    api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        data = fetch_manifest(api_url, timeout=timeout)
+        out = _parse_release_to_extra(data, repo)
+        if out:
+            return out
+        return None
+    except Exception as e:
+        # 404 / not found: often means no "latest" (e.g. only prereleases) — try listing releases
+        err_msg = str(e).lower()
+        is_404 = getattr(e, "code", None) == 404 or "404" in err_msg or "not found" in err_msg
+        if is_404:
+            try:
+                list_url = f"https://api.github.com/repos/{repo}/releases?per_page=5"
+                raw = fetch_manifest(list_url, timeout=timeout)
+                if isinstance(raw, list) and raw:
+                    data = raw[0]
+                    out = _parse_release_to_extra(data, repo)
+                    if out:
+                        return out
+            except Exception:
+                pass
+        print(f"[MonoStudio] Extra repo {repo}: {e}", flush=True)
+        return None
+
+
+def fetch_extra_repos(timeout: int = 15) -> dict[str, ExtraRepoRelease]:
+    """Fetch latest release for all EXTRA_REPOS; update cache and return."""
+    global _cached_extra_repos, _cached_extra_repos_time
+    result: dict[str, ExtraRepoRelease] = {}
+    for display_name, repo in EXTRA_REPOS:
+        info = get_latest_release_for_repo(repo, timeout=timeout)
+        if info:
+            result[display_name] = info
+    _cached_extra_repos = result
+    _cached_extra_repos_time = time.time()
+    return result
+
+
+def get_cached_extra_repos() -> dict[str, ExtraRepoRelease]:
+    """Return cached extra repo releases (e.g. from last check)."""
+    return dict(_cached_extra_repos)
 
 
 def check_for_update(
@@ -408,10 +570,10 @@ def is_valid_installer(path: Path) -> bool:
         return False
 
 
-def run_installer_and_exit(installer_path: Path) -> None:
+def launch_installer(installer_path: Path) -> None:
     """
-    Launch the installer (e.g. Inno Setup exe) and exit the app so files can be replaced.
-    Raises RuntimeError if the file is not a valid Windows executable (e.g. download was HTML).
+    Launch the installer (e.g. .exe) without exiting the app.
+    Raises RuntimeError if the file is not a valid Windows executable.
     """
     if not is_valid_installer(installer_path):
         raise RuntimeError(
@@ -425,4 +587,12 @@ def run_installer_and_exit(installer_path: Path) -> None:
         )
     else:
         subprocess.Popen([str(installer_path)])
+
+
+def run_installer_and_exit(installer_path: Path) -> None:
+    """
+    Launch the installer and exit the app so MonoStudio's files can be replaced.
+    For other tools use launch_installer() so the app stays open.
+    """
+    launch_installer(installer_path)
     sys.exit(0)

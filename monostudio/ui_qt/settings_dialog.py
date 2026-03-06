@@ -4,15 +4,18 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QRegularExpression, QSettings, Signal, QStandardPaths, QThread, QUrl
+from PySide6.QtCore import QByteArray, QRect, QSize, Qt, QRegularExpression, QSettings, Signal, QStandardPaths, QThread, QUrl
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
+    QPainter,
+    QPixmap,
     QRegularExpressionValidator,
     QTextBlockFormat,
     QTextCursor,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -30,6 +33,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -38,6 +42,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -75,22 +80,61 @@ from monostudio.core.pipeline_types_and_presets import (
 )
 from monostudio.core.update_checker import (
     CheckResult,
+    ExtraRepoRelease,
+    EXTRA_REPOS,
     UpdateInfo,
     get_cached_check_result,
+    get_cached_extra_repos,
     check_for_update,
     download_installer,
+    fetch_extra_repos,
+    get_extra_tool_installed_version,
+    launch_installer,
     run_installer_and_exit,
 )
+from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.version import get_app_version
 from monostudio.ui_qt.force_rename_project_id_dialog import ForceRenameProjectIdDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 
+# Icon size for update list rows
+_UPDATE_ROW_ICON_SIZE = 24
+# Fixed size for Download/Latest button and loading bar (same size so layout doesn't jump)
+_UPDATE_ACTION_WIDTH = 96
+_UPDATE_ACTION_HEIGHT = 28
+
+
+def _update_product_icon_pixmap(product_id: str, size: int = _UPDATE_ROW_ICON_SIZE) -> QPixmap:
+    """Icon for update list row: MonoStudio uses logo.svg if present, else fallback; others use fallback."""
+    if product_id == "monostudio":
+        base = get_app_base_path()
+        logo_path = base / "monostudio_data" / "icons" / "logo.svg"
+        if logo_path.is_file():
+            try:
+                svg = logo_path.read_text(encoding="utf-8").replace("currentColor", "#e4e4e7")
+                renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+                if renderer.isValid():
+                    pix = QPixmap(size, size)
+                    pix.fill(Qt.GlobalColor.transparent)
+                    p = QPainter(pix)
+                    try:
+                        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                        renderer.render(p, QRect(0, 0, size, size))
+                    finally:
+                        p.end()
+                    return pix
+            except OSError:
+                pass
+    # Fallback: Lucide package (app) or box (other products)
+    icon = lucide_icon("package" if product_id == "monostudio" else "box", size=size, color_hex="#a1a1aa")
+    return icon.pixmap(size, size)
+
 
 class _UpdateCheckWorker(QThread):
-    """Runs update check in background; emits check_finished(CheckResult | None, error_message: str)."""
+    """Runs update check in background; emits check_finished(result, error_message, extra_repos)."""
 
-    check_finished = Signal(object, str)  # CheckResult | None, error str
+    check_finished = Signal(object, str, object)  # CheckResult | None, error str, dict[str, ExtraRepoRelease]
 
     def __init__(self, manifest_url: str, current_version: str, parent=None) -> None:
         super().__init__(parent)
@@ -100,27 +144,46 @@ class _UpdateCheckWorker(QThread):
     def run(self) -> None:
         try:
             result = check_for_update(self._current_version, self._manifest_url)
-            self.check_finished.emit(result, "")
+            extra = fetch_extra_repos(timeout=10)
+            self.check_finished.emit(result, "", extra)
         except Exception as e:
             err = str(e) or "Check failed"
-            self.check_finished.emit(None, err)
+            self.check_finished.emit(None, err, {})
 
 
 class _DownloadWorker(QThread):
-    """Downloads installer to path; emits download_finished(success: bool, path: str, error_message: str)."""
+    """Downloads installer to path; emits progress(read, total) and download_finished(success, path, error_message). Supports cancel()."""
 
     download_finished = Signal(bool, str, str)
+    progress = Signal(int, int)  # read, total (0 = unknown)
 
     def __init__(self, url: str, dest_path: Path, fallback_url: str | None = None, parent=None) -> None:
         super().__init__(parent)
         self._url = url
         self._dest_path = dest_path
         self._fallback_url = (fallback_url or "").strip() or None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _progress_callback(self, read: int, total: int | None) -> None:
+        if self._cancelled:
+            raise RuntimeError("Cancelled")
+        self.progress.emit(read, total or 0)
 
     def run(self) -> None:
         try:
-            download_installer(self._url, self._dest_path, fallback_url=self._fallback_url)
-            self.download_finished.emit(True, str(self._dest_path), "")
+            download_installer(
+                self._url,
+                self._dest_path,
+                fallback_url=self._fallback_url,
+                progress_callback=self._progress_callback,
+            )
+            if self._cancelled:
+                self.download_finished.emit(False, str(self._dest_path), "Cancelled")
+            else:
+                self.download_finished.emit(True, str(self._dest_path), "")
         except Exception as e:
             self.download_finished.emit(False, str(self._dest_path), str(e))
 
@@ -286,25 +349,23 @@ class SettingsDialog(MonosDialog):
 
     def _apply_cached_update_result(self, result: CheckResult | None) -> None:
         """Apply cached update check result to Updates tab UI (no new network check)."""
-        if result is None:
-            return
-        self._update_latest_github_label.setText(f"Latest on GitHub: {result.latest_version}")
-        if result.latest_notes:
-            self._update_changelog.setMarkdown(result.latest_notes)
+        if result is not None:
+            if result.latest_notes:
+                self._update_changelog.setMarkdown(result.latest_notes)
+            else:
+                self._update_changelog.setPlainText("No release notes for this version.")
+            self._apply_changelog_line_height()
+            self._update_latest_html_url = result.latest_html_url
+            if result.update_available and result.update_info is not None:
+                self._pending_update_info = result.update_info
+                self._update_status_label.setText(f"Update {result.latest_version} available.")
+            else:
+                self._pending_update_info = None
+                self._update_status_label.setText("You're on the latest version.")
+            self._apply_monostudio_row(result)
         else:
-            self._update_changelog.setPlainText("No release notes for this version.")
-        self._apply_changelog_line_height()
-        self._update_latest_html_url = result.latest_html_url
-        if result.update_available and result.update_info is not None:
-            self._pending_update_info = result.update_info
-            self._update_status_label.setText(f"Update {result.latest_version} available.")
-            self._update_download_btn.setVisible(True)
-            self._update_view_github_btn.setVisible(bool(result.latest_html_url))
-        else:
-            self._pending_update_info = None
-            self._update_status_label.setText("You're on the latest version.")
-            self._update_download_btn.setVisible(False)
-            self._update_view_github_btn.setVisible(bool(result.latest_html_url))
+            self._apply_monostudio_row(None)
+        self._apply_extra_repos_ui(get_cached_extra_repos())
 
     def _build_tier2_page_buttons(
         self,
@@ -450,79 +511,173 @@ class SettingsDialog(MonosDialog):
         return root
 
     def _build_updates_tab(self) -> QWidget:
-        """General → Updates: version card bên cạnh check/status; release notes chiếm hết không gian bên dưới."""
+        """General → Updates: one list (MonoStudio + other products), each row: icon, name, version, View release notes, action button."""
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(16)
 
-        # ── Hàng ngang: version card (ảnh 1) bên cạnh cụm check/status/actions (ảnh 2) ──
-        top_row = QWidget(root)
-        top_row_l = QHBoxLayout(top_row)
-        top_row_l.setContentsMargins(0, 0, 0, 0)
-        top_row_l.setSpacing(16)
-
-        version_card = QFrame(top_row)
-        version_card.setObjectName("UpdateVersionCard")
-        version_card.setFixedWidth(200)
-        version_card_l = QVBoxLayout(version_card)
-        version_card_l.setContentsMargins(16, 12, 16, 12)
-        version_card_l.setSpacing(4)
-        current = get_app_version()
-        self._update_current_label = QLabel(current, version_card)
-        self._update_current_label.setObjectName("UpdateVersionValue")
-        self._update_current_label.setProperty("mono", True)
-        version_card_l.addWidget(self._update_current_label)
-        raw = current.strip().lstrip("vV")
-        parts = raw.split(".")
-        if len(parts) >= 3:
-            hint_text = f"Major {parts[0]} · Minor {parts[1]} · Patch {parts[2]}"
-        elif len(parts) == 2:
-            hint_text = f"Major {parts[0]} · Patch {parts[1]}"
-        else:
-            hint_text = "Major 26 · Minor / Patch from last build"
-        self._update_version_hint = QLabel(hint_text, version_card)
-        self._update_version_hint.setObjectName("DialogHelper")
-        version_card_l.addWidget(self._update_version_hint)
-        top_row_l.addWidget(version_card, 0)
-
-        right_cluster = QWidget(top_row)
-        right_cluster_l = QVBoxLayout(right_cluster)
-        right_cluster_l.setContentsMargins(0, 0, 0, 0)
-        right_cluster_l.setSpacing(8)
-        self._update_check_btn = QPushButton("Check for updates", right_cluster)
+        # Check for updates + status
+        self._update_check_btn = QPushButton("Check for updates", root)
         self._update_check_btn.setObjectName("DialogPrimaryButton")
         self._update_check_btn.clicked.connect(self._on_check_for_updates)
-        right_cluster_l.addWidget(self._update_check_btn)
-        self._update_status_label = QLabel("", right_cluster)
+        layout.addWidget(self._update_check_btn)
+        self._update_status_label = QLabel("", root)
         self._update_status_label.setWordWrap(True)
         self._update_status_label.setObjectName("UpdateStatusText")
         self._update_status_label.setMinimumHeight(20)
-        right_cluster_l.addWidget(self._update_status_label)
-        self._update_latest_github_label = QLabel("", right_cluster)
-        self._update_latest_github_label.setObjectName("DialogHelper")
-        self._update_latest_github_label.setProperty("mono", True)
-        right_cluster_l.addWidget(self._update_latest_github_label)
-        action_row = QWidget(right_cluster)
-        action_row_l = QHBoxLayout(action_row)
-        action_row_l.setContentsMargins(0, 0, 0, 0)
-        action_row_l.setSpacing(8)
-        self._update_download_btn = QPushButton("Download and install", action_row)
-        self._update_download_btn.setObjectName("DialogPrimaryButton")
-        self._update_download_btn.setVisible(False)
-        self._update_download_btn.clicked.connect(self._on_download_and_install)
-        action_row_l.addWidget(self._update_download_btn)
-        self._update_view_github_btn = QPushButton("View on GitHub", action_row)
-        self._update_view_github_btn.setObjectName("SettingsCategoryActionButton")
-        self._update_view_github_btn.setVisible(False)
-        self._update_view_github_btn.clicked.connect(self._on_view_release_on_github)
-        action_row_l.addWidget(self._update_view_github_btn)
-        action_row_l.addStretch(1)
-        right_cluster_l.addWidget(action_row)
-        top_row_l.addWidget(right_cluster, 1)
-        layout.addWidget(top_row)
+        layout.addWidget(self._update_status_label)
 
-        # ── Release notes: chiếm hết không gian bên dưới ──
+        # Unified product list: MonoStudio 26 first, then EXTRA_REPOS (e.g. MonoFXSuite)
+        list_container = QFrame(root)
+        list_container.setObjectName("UpdateProductList")
+        list_layout = QVBoxLayout(list_container)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(0)
+
+        # (product_id, display_name, repo_or_none). repo for fallback "View on GitHub" URL.
+        products: list[tuple[str, str, str | None]] = [("monostudio", "MonoStudio 26", None)] + [
+            (display_name, display_name, repo) for display_name, repo in EXTRA_REPOS
+        ]
+
+        self._update_monostudio_version_label: QLabel | None = None
+        self._update_monostudio_link_btn: QPushButton | None = None
+        self._update_monostudio_action_btn: QPushButton | None = None
+        self._update_extra_cards: dict[str, tuple[QLabel, QPushButton, QPushButton]] = {}
+        self._update_extra_loading: dict[str, tuple[QWidget, QProgressBar, QToolButton]] = {}
+        self._update_extra_html_url: dict[str, str] = {}
+        self._update_extra_fallback_url: dict[str, str] = {}
+        self._update_extra_download_url: dict[str, str] = {}
+        self._update_download_product: str = ""  # "monostudio" or extra display_name
+
+        for idx, (product_id, display_name, repo) in enumerate(products):
+            row = QWidget(list_container)
+            row.setObjectName("UpdateProductListRow")
+            row.setFixedHeight(44)
+            if idx == len(products) - 1:
+                row.setProperty("last", "true")
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(12, 0, 12, 0)
+            row_l.setSpacing(12)
+
+            icon_l = QLabel(row)
+            icon_l.setFixedSize(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
+            icon_l.setScaledContents(True)
+            icon_l.setPixmap(_update_product_icon_pixmap(product_id))
+            row_l.addWidget(icon_l)
+
+            name_l = QLabel(display_name, row)
+            name_l.setObjectName("UpdateProductListName")
+            row_l.addWidget(name_l)
+
+            ver_l = QLabel(
+                get_app_version() if product_id == "monostudio" else (get_extra_tool_installed_version(display_name) or "—"),
+                row,
+            )
+            ver_l.setObjectName("UpdateProductListVersion")
+            ver_l.setProperty("mono", True)
+            row_l.addWidget(ver_l)
+
+            row_l.addStretch(1)
+
+            link_btn = QPushButton("View release notes", row)
+            link_btn.setObjectName("UpdateProductListLink")
+            link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            link_btn.setVisible(False)
+            row_l.addWidget(link_btn)
+
+            if product_id == "monostudio":
+                self._update_monostudio_version_label = ver_l
+                self._update_monostudio_link_btn = link_btn
+                action_btn = QPushButton("Latest", row)
+                action_btn.setObjectName("UpdateProductListBtnLatest")
+                action_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
+                action_btn.clicked.connect(self._on_download_and_install)
+                link_btn.clicked.connect(self._on_view_release_on_github)
+                self._update_monostudio_action_btn = action_btn
+
+                loading_widget = QWidget(row)
+                loading_widget.setObjectName("UpdateDownloadLoading")
+                loading_widget.setFixedSize(_UPDATE_ACTION_WIDTH + 6 + 24, _UPDATE_ACTION_HEIGHT)
+                loading_l = QHBoxLayout(loading_widget)
+                loading_l.setContentsMargins(0, 0, 0, 0)
+                loading_l.setSpacing(6)
+                progress_bar = QProgressBar(loading_widget)
+                progress_bar.setObjectName("UpdateDownloadProgress")
+                progress_bar.setMinimum(0)
+                progress_bar.setMaximum(0)
+                progress_bar.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
+                loading_l.addWidget(progress_bar)
+                cancel_btn = QToolButton(loading_widget)
+                cancel_btn.setObjectName("UpdateDownloadCancelBtn")
+                cancel_btn.setIcon(lucide_icon("x", size=14, color_hex="#a1a1aa"))
+                cancel_btn.setFixedSize(24, _UPDATE_ACTION_HEIGHT)
+                cancel_btn.setToolTip("Cancel download")
+                loading_l.addWidget(cancel_btn)
+                loading_widget.hide()
+
+                self._update_monostudio_loading_widget = loading_widget
+                self._update_monostudio_progress_bar = progress_bar
+                self._update_monostudio_cancel_btn = cancel_btn
+
+                action_container = QWidget(row)
+                action_container.setFixedSize(_UPDATE_ACTION_WIDTH + 6 + 24, _UPDATE_ACTION_HEIGHT)
+                action_container_l = QHBoxLayout(action_container)
+                action_container_l.setContentsMargins(0, 0, 0, 0)
+                action_container_l.setSpacing(0)
+                action_container_l.addWidget(action_btn)
+                action_container_l.addWidget(loading_widget)
+                row_l.addWidget(action_container)
+            else:
+                action_btn = QPushButton("View on GitHub", row)
+                action_btn.setObjectName("SettingsCategoryActionButton")
+                action_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
+                if repo:
+                    fallback_url = f"https://github.com/{repo}/releases"
+                    self._update_extra_fallback_url[display_name] = fallback_url
+                    self._update_extra_html_url[display_name] = fallback_url
+                    action_btn.setVisible(True)
+                else:
+                    action_btn.setVisible(False)
+                action_btn.clicked.connect(lambda checked=False, n=display_name: self._on_extra_repo_action_clicked(n))
+                link_btn.clicked.connect(lambda checked=False, n=display_name: self._on_extra_repo_release_link_clicked(n))
+                self._update_extra_cards[display_name] = (ver_l, link_btn, action_btn)
+
+                loading_widget = QWidget(row)
+                loading_widget.setObjectName("UpdateDownloadLoading")
+                loading_widget.setFixedSize(_UPDATE_ACTION_WIDTH + 6 + 24, _UPDATE_ACTION_HEIGHT)
+                loading_l = QHBoxLayout(loading_widget)
+                loading_l.setContentsMargins(0, 0, 0, 0)
+                loading_l.setSpacing(6)
+                progress_bar = QProgressBar(loading_widget)
+                progress_bar.setObjectName("UpdateDownloadProgress")
+                progress_bar.setMinimum(0)
+                progress_bar.setMaximum(0)
+                progress_bar.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
+                loading_l.addWidget(progress_bar)
+                cancel_btn = QToolButton(loading_widget)
+                cancel_btn.setObjectName("UpdateDownloadCancelBtn")
+                cancel_btn.setIcon(lucide_icon("x", size=14, color_hex="#a1a1aa"))
+                cancel_btn.setFixedSize(24, _UPDATE_ACTION_HEIGHT)
+                cancel_btn.setToolTip("Cancel download")
+                loading_l.addWidget(cancel_btn)
+                loading_widget.hide()
+                self._update_extra_loading[display_name] = (loading_widget, progress_bar, cancel_btn)
+
+                action_container = QWidget(row)
+                action_container.setFixedSize(_UPDATE_ACTION_WIDTH + 6 + 24, _UPDATE_ACTION_HEIGHT)
+                action_container_l = QHBoxLayout(action_container)
+                action_container_l.setContentsMargins(0, 0, 0, 0)
+                action_container_l.setSpacing(0)
+                action_container_l.addWidget(action_btn)
+                action_container_l.addWidget(loading_widget)
+                row_l.addWidget(action_container)
+
+            list_layout.addWidget(row)
+
+        layout.addWidget(list_container)
+
+        # Release notes
         notes_label = QLabel("RELEASE NOTES", root)
         notes_label.setObjectName("UpdateSectionLabel")
         layout.addWidget(notes_label)
@@ -550,11 +705,10 @@ class SettingsDialog(MonosDialog):
     def _on_check_for_updates(self) -> None:
         self._update_check_btn.setEnabled(False)
         self._update_status_label.setText("Checking…")
-        self._update_latest_github_label.setText("")
-        self._update_download_btn.setVisible(False)
-        self._update_view_github_btn.setVisible(False)
         self._update_changelog.clear()
         self._pending_update_info = None
+        self._apply_monostudio_row(None)
+        self._apply_extra_repos_ui({})
         self._update_check_worker = _UpdateCheckWorker(
             None,  # use default: GitHub Releases API
             get_app_version(),
@@ -564,17 +718,21 @@ class SettingsDialog(MonosDialog):
         self._update_check_worker.finished.connect(self._on_update_check_thread_finished)
         self._update_check_worker.start()
 
-    def _on_update_check_finished(self, result: CheckResult | None, error_message: str) -> None:
+    def _on_update_check_finished(
+        self,
+        result: CheckResult | None,
+        error_message: str,
+        extra_repos: dict[str, ExtraRepoRelease] | None = None,
+    ) -> None:
         if error_message:
             self._update_status_label.setText(f"Check failed: {error_message}")
-            self._update_latest_github_label.setText("")
             self._update_changelog.clear()
+            self._apply_monostudio_row(None)
+            self._apply_extra_repos_ui(extra_repos or {})
             return
         if result is None:
+            self._apply_extra_repos_ui(extra_repos or {})
             return
-        # Hiển thị bản latest trên GitHub để user biết đang so sánh với gì
-        self._update_latest_github_label.setText(f"Latest on GitHub: {result.latest_version}")
-        # Luôn hiển thị release notes của bản latest (dù có update hay không)
         if result.latest_notes:
             self._update_changelog.setMarkdown(result.latest_notes)
         else:
@@ -584,13 +742,11 @@ class SettingsDialog(MonosDialog):
         if result.update_available and result.update_info is not None:
             self._pending_update_info = result.update_info
             self._update_status_label.setText(f"Update {result.latest_version} available.")
-            self._update_download_btn.setVisible(True)
-            self._update_view_github_btn.setVisible(bool(result.latest_html_url))
         else:
             self._pending_update_info = None
             self._update_status_label.setText("You're on the latest version.")
-            self._update_download_btn.setVisible(False)
-            self._update_view_github_btn.setVisible(bool(result.latest_html_url))
+        self._apply_monostudio_row(result)
+        self._apply_extra_repos_ui(extra_repos or {})
 
     def _apply_changelog_line_height(self) -> None:
         """Áp dụng line-height 165% cho mọi block trong release notes (QTextDocument không hỗ trợ line-height qua CSS)."""
@@ -614,13 +770,22 @@ class SettingsDialog(MonosDialog):
             return
         import tempfile
         dest = Path(tempfile.gettempdir()) / "MonoStudio26_Setup.exe"
-        # url = link thực tế tự tính (releases/download/tag/filename); fallback = asset API nếu cần
         primary = info.url
         fallback = (info.asset_api_url or "").strip() or None
-        self._update_download_btn.setEnabled(False)
+        self._update_download_product = "monostudio"
+        if self._update_monostudio_action_btn:
+            self._update_monostudio_action_btn.hide()
+        if getattr(self, "_update_monostudio_loading_widget", None):
+            self._update_monostudio_loading_widget.show()
+        if getattr(self, "_update_monostudio_progress_bar", None):
+            self._update_monostudio_progress_bar.setMinimum(0)
+            self._update_monostudio_progress_bar.setMaximum(0)
         self._update_status_label.setText("Downloading…")
         self._update_download_worker = _DownloadWorker(primary, dest, fallback_url=fallback, parent=self)
+        self._update_download_worker.progress.connect(self._on_download_progress)
         self._update_download_worker.download_finished.connect(self._on_download_finished)
+        if getattr(self, "_update_monostudio_cancel_btn", None):
+            self._update_monostudio_cancel_btn.clicked.connect(self._on_cancel_download)
         self._update_download_worker.start()
 
     def _on_view_release_on_github(self) -> None:
@@ -632,21 +797,177 @@ class SettingsDialog(MonosDialog):
         if url:
             QDesktopServices.openUrl(QUrl(url))
 
+    def _apply_monostudio_row(self, result: CheckResult | None) -> None:
+        """Update MonoStudio row: version, View release notes link, Download vX.X.X / Latest button."""
+        ver_l = getattr(self, "_update_monostudio_version_label", None)
+        link_btn = getattr(self, "_update_monostudio_link_btn", None)
+        action_btn = getattr(self, "_update_monostudio_action_btn", None)
+        if ver_l is None or link_btn is None or action_btn is None:
+            return
+        ver_l.setText(get_app_version())
+        if result and result.latest_html_url:
+            link_btn.setVisible(True)
+        else:
+            link_btn.setVisible(False)
+        if result and result.update_available and result.update_info is not None:
+            action_btn.setText(f"Download {result.latest_version}")
+            action_btn.setObjectName("UpdateProductListBtnDownload")
+            action_btn.setStyleSheet("")  # force re-apply stylesheet
+            action_btn.style().unpolish(action_btn)
+            action_btn.style().polish(action_btn)
+        else:
+            action_btn.setText("Latest")
+            action_btn.setObjectName("UpdateProductListBtnLatest")
+            action_btn.setStyleSheet("")
+            action_btn.style().unpolish(action_btn)
+            action_btn.style().polish(action_btn)
+
+    def _apply_extra_repos_ui(self, extra_repos: dict[str, ExtraRepoRelease]) -> None:
+        """Update extra-repo rows: version, release notes link, Download (when asset URL present) or View on GitHub."""
+        fallbacks = getattr(self, "_update_extra_fallback_url", {})
+        for name, (ver_l, link_btn, action_btn) in getattr(self, "_update_extra_cards", {}).items():
+            info = extra_repos.get(name)
+            if info:
+                # Show installed version so user sees current vs latest; keep latest from API for download/links
+                ver_l.setText(get_extra_tool_installed_version(name) or "—")
+                self._update_extra_html_url[name] = info.html_url or fallbacks.get(name, "")
+                self._update_extra_download_url[name] = getattr(info, "download_url", "") or ""
+                link_btn.setVisible(bool(info.html_url))
+                action_btn.setVisible(True)
+                if self._update_extra_download_url.get(name):
+                    action_btn.setText("Download")
+                    action_btn.setObjectName("UpdateProductListBtnDownload")
+                else:
+                    action_btn.setText("View on GitHub")
+                    action_btn.setObjectName("SettingsCategoryActionButton")
+                action_btn.style().unpolish(action_btn)
+                action_btn.style().polish(action_btn)
+            else:
+                ver_l.setText("—")
+                self._update_extra_html_url[name] = fallbacks.get(name, "")
+                self._update_extra_download_url[name] = ""
+                link_btn.setVisible(False)
+                action_btn.setVisible(bool(fallbacks.get(name)))
+                action_btn.setText("View on GitHub")
+                action_btn.setObjectName("SettingsCategoryActionButton")
+
+    def _on_extra_repo_release_link_clicked(self, name: str) -> None:
+        url = self._update_extra_html_url.get(name)
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _on_extra_repo_action_clicked(self, name: str) -> None:
+        """Download installer if URL available, else open GitHub releases page."""
+        download_url = self._update_extra_download_url.get(name)
+        if download_url:
+            self._start_extra_repo_download(name, download_url)
+        else:
+            url = self._update_extra_html_url.get(name)
+            if url:
+                QDesktopServices.openUrl(QUrl(url))
+
+    def _start_extra_repo_download(self, name: str, url: str) -> None:
+        """Start download of extra-repo installer; show loading in that product's row only."""
+        import re
+        import tempfile
+        safe = re.sub(r"[^\w\-]", "", name)[:32] or "Tool"
+        dest = Path(tempfile.gettempdir()) / f"{safe}_Setup.exe"
+        self._update_download_product = name
+        cards = getattr(self, "_update_extra_cards", {})
+        loading_map = getattr(self, "_update_extra_loading", {})
+        if name in cards:
+            _, _, action_btn = cards[name]
+            action_btn.hide()
+        if name in loading_map:
+            loading_widget, progress_bar, cancel_btn = loading_map[name]
+            progress_bar.setMinimum(0)
+            progress_bar.setMaximum(0)
+            loading_widget.show()
+            cancel_btn.clicked.connect(self._on_cancel_download)
+        self._update_status_label.setText(f"Downloading {name}…")
+        self._update_download_worker = _DownloadWorker(url, dest, parent=self)
+        self._update_download_worker.progress.connect(self._on_download_progress)
+        self._update_download_worker.download_finished.connect(self._on_download_finished)
+        self._update_download_worker.start()
+
+    def _on_extra_repo_github_clicked(self, name: str) -> None:
+        url = self._update_extra_html_url.get(name)
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _on_download_progress(self, read: int, total: int) -> None:
+        product = getattr(self, "_update_download_product", "") or "monostudio"
+        if product == "monostudio":
+            bar = getattr(self, "_update_monostudio_progress_bar", None)
+        else:
+            loading_map = getattr(self, "_update_extra_loading", {})
+            bar = loading_map.get(product, (None, None, None))[1] if product in loading_map else None
+        if not bar:
+            return
+        if total > 0:
+            bar.setMinimum(0)
+            bar.setMaximum(total)
+            bar.setValue(read)
+        else:
+            bar.setMinimum(0)
+            bar.setMaximum(0)
+
+    def _on_cancel_download(self) -> None:
+        if self._update_download_worker:
+            self._update_download_worker.cancel()
+
     def _on_download_finished(self, success: bool, path: str, error_message: str = "") -> None:
-        self._update_download_worker = None
-        self._update_download_btn.setEnabled(True)
+        product = getattr(self, "_update_download_product", "") or "monostudio"
+        if product == "monostudio":
+            if getattr(self, "_update_monostudio_loading_widget", None):
+                self._update_monostudio_loading_widget.hide()
+            if getattr(self, "_update_monostudio_action_btn", None):
+                self._update_monostudio_action_btn.show()
+                self._update_monostudio_action_btn.setEnabled(True)
+            if getattr(self, "_update_monostudio_cancel_btn", None):
+                try:
+                    self._update_monostudio_cancel_btn.clicked.disconnect(self._on_cancel_download)
+                except Exception:
+                    pass
+        else:
+            cards = getattr(self, "_update_extra_cards", {})
+            loading_map = getattr(self, "_update_extra_loading", {})
+            if product in cards:
+                _, _, action_btn = cards[product]
+                action_btn.show()
+            if product in loading_map:
+                loading_widget, _, cancel_btn = loading_map[product]
+                loading_widget.hide()
+                try:
+                    cancel_btn.clicked.disconnect(self._on_cancel_download)
+                except Exception:
+                    pass
+        if self._update_download_worker:
+            try:
+                self._update_download_worker.progress.disconnect(self._on_download_progress)
+            except Exception:
+                pass
+            self._update_download_worker = None
         if success:
             self._update_status_label.setText("Launching installer…")
             try:
-                run_installer_and_exit(Path(path))
+                if product == "monostudio":
+                    run_installer_and_exit(Path(path))
+                else:
+                    launch_installer(Path(path))
+                    self._update_status_label.setText("Installer launched. You can continue using MonoStudio.")
             except (OSError, RuntimeError) as e:
                 msg = str(e).replace("\n", " ")[:200]
                 self._update_status_label.setText(
                     f"Cannot run installer: {msg} Download from the release page below instead."
                 )
         else:
-            msg = (error_message.strip() or "Download failed.").replace("\n", " ")[:200]
-            self._update_status_label.setText(f"Download failed: {msg} Or get the installer from the release page below.")
+            if (error_message or "").strip() == "Cancelled":
+                self._update_status_label.setText("Download cancelled.")
+            else:
+                msg = (error_message.strip() or "Download failed.").replace("\n", " ")[:200]
+                self._update_status_label.setText(f"Download failed: {msg} Or get the installer from the release page below.")
+        self._update_download_product = ""
 
     def _build_pipeline_page(self) -> QWidget:
         """Tier 2: Pipeline → Mapping Folders | Categories | Scan rules | Statuses."""

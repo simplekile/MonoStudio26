@@ -1336,6 +1336,91 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid #27272a;
             border-radius: 8px;
         }
+        /* Product list (other products): one row per product, Maxon-style */
+        QFrame#UpdateProductList {
+            background-color: #18181b;
+            border: 1px solid #27272a;
+            border-radius: 8px;
+        }
+        QWidget#UpdateProductListRow {
+            border-bottom: 1px solid #27272a;
+            min-height: 44px;
+        }
+        QWidget#UpdateProductListRow[last="true"] {
+            border-bottom: none;
+        }
+        QLabel#UpdateProductListName {
+            font-size: 13px;
+            font-weight: 600;
+            color: #fafafa;
+        }
+        QLabel#UpdateProductListVersion {
+            font-size: 12px;
+            color: #a1a1aa;
+            font-family: "JetBrains Mono", "Consolas", monospace;
+        }
+        /* Link-style button (View release notes) */
+        QPushButton#UpdateProductListLink {
+            background: transparent;
+            border: none;
+            color: #818cf8;
+            font-size: 12px;
+            text-decoration: underline;
+        }
+        QPushButton#UpdateProductListLink:hover {
+            color: #a5b4fc;
+        }
+        /* Primary: Download vX.X.X */
+        QPushButton#UpdateProductListBtnDownload {
+            background-color: #6366f1;
+            color: #ffffff;
+            border: none;
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        QPushButton#UpdateProductListBtnDownload:hover {
+            background-color: #4f46e5;
+        }
+        QPushButton#UpdateProductListBtnDownload:disabled {
+            background-color: #4338ca;
+            opacity: 0.7;
+        }
+        /* Muted: Latest (already up to date) */
+        QPushButton#UpdateProductListBtnLatest {
+            background-color: #27272a;
+            color: #71717a;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        QPushButton#UpdateProductListBtnLatest:hover {
+            background-color: #3f3f46;
+            color: #a1a1aa;
+        }
+        /* Download loading: progress bar + cancel */
+        QProgressBar#UpdateDownloadProgress {
+            background-color: #27272a;
+            border: none;
+            border-radius: 4px;
+            text-align: center;
+            min-height: 8px;
+        }
+        QProgressBar#UpdateDownloadProgress::chunk {
+            background-color: #6366f1;
+            border-radius: 4px;
+        }
+        QToolButton#UpdateDownloadCancelBtn {
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+        }
+        QToolButton#UpdateDownloadCancelBtn:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+        }
         QLabel#UpdateVersionValue {
             font-size: 18px;
             font-weight: 700;

@@ -75,6 +75,15 @@ alwaysApply: false
 - **Rate limit**: Không token = 60 request/giờ/IP. Kết quả check được cache 1 giờ để giảm gọi API. Tùy chọn: set env **MONOSTUDIO_GITHUB_TOKEN** (hoặc GITHUB_TOKEN) = GitHub Personal Access Token → 5000 request/giờ, miễn phí. Không commit token.
 - **Changelog (RELEASE_NOTES.md)**: Trước khi publish (hoặc sau build), cập nhật `RELEASE_NOTES.md` ở repo root — version (vd. v26.1.3), Highlights, Changes in this release, Install. `publish_release.ps1` ưu tiên đọc file này; không có thì tự sinh từ git log. Sửa release đã đăng: `gh release edit <tag> --notes-file RELEASE_NOTES.md`.
 
+## MonoStudio cài ở đâu / Extra tools (MonoFXSuite) — vị trí cài để MonoStudio nhận version
+
+- **MonoStudio**: Inno Setup mặc định cài vào `{autopf}\MonoStudio26` (vd. `C:\Program Files\MonoStudio26`). Khi chạy, `get_app_base_path()` = thư mục chứa exe (install dir). Phiên bản đọc từ `monostudio_data/VERSION`.
+- **MonoFXSuite (và tool tương tự)** nên cài sao cho MonoStudio đọc được file **VERSION**:
+  - **Khuyến nghị**: `{MonoStudio base}\tools\MonoFXSuite\` — tức cùng ổ/partition, thư mục con `tools\MonoFXSuite`. Ví dụ MonoStudio tại `C:\Program Files\MonoStudio26` thì cài MonoFXSuite tại `C:\Program Files\MonoStudio26\tools\MonoFXSuite`.
+  - **Cấu trúc**: trong `tools/MonoFXSuite/` cần có file VERSION (một dòng, vd. `1.0.2` hoặc `v1.0.2`). Nếu MonoFXSuite dùng layout giống MonoStudio thì đặt tại `tools/MonoFXSuite/monofxsuite_data/VERSION` (đã cấu hình trong `update_checker.EXTRA_TOOL_VERSION_PATHS`).
+  - **Fallback**: `%LOCALAPPDATA%\MonoStudio\tools\MonoFXSuite\VERSION` (hoặc `...\monofxsuite_data\VERSION`) cho cài đặt user-level.
+- **Kết quả**: Settings → Updates hiển thị đúng phiên bản đang cài (cột Version) và so sánh với bản mới từ GitHub để hiện nút Download.
+
 ## Publish release lên GitHub (GitHub CLI)
 
 - **Cách làm**: Sau khi build xong, chạy `.\publish_release.ps1`. Script đọc VERSION → tag (vd. v26.1.0), đính kèm `dist\MonoStudio26_Setup.exe`, tạo release qua GitHub API.
