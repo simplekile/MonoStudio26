@@ -8,6 +8,22 @@
 
 ---
 
+# MonoStudio 26 — Release v26.5.3
+
+## Highlights
+
+- **Fix**: Ưu tiên đọc VERSION MonoFXSuite từ thư mục chứa exe đang chạy — Settings → Updates hiển thị đúng version.
+
+## Changes in this release
+
+- fix: get_extra_tool_installed_version — thêm candidate từ sys.executable parent (install root) khi frozen
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.5.2
 
 ## Highlights

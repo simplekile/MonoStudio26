@@ -89,7 +89,7 @@ class ExtraRepoRelease:
 
 
 def _extra_tool_version_candidates(display_name: str) -> list[Path]:
-    """Build list of VERSION file paths to try (tools_root, install_path.txt, LOCALAPPDATA)."""
+    """Build list of VERSION file paths to try (exe dir, tools_root, install_path.txt, LOCALAPPDATA)."""
     name = (display_name or "").strip()
     if not name:
         return []
@@ -102,6 +102,12 @@ def _extra_tool_version_candidates(display_name: str) -> list[Path]:
             candidates.append(root / "tools" / name / subfolder / "VERSION")
         candidates.append(root / "tools" / name / "VERSION")
 
+    # First: folder containing the running exe (reliable when frozen — install root)
+    if getattr(sys, "frozen", False) and getattr(sys, "executable", None):
+        exe_dir = Path(sys.executable).resolve().parent
+        if exe_dir.name == "_internal":
+            exe_dir = exe_dir.parent
+        add_for_root(exe_dir)
     add_for_root(get_tools_install_root())
     # Fallback: path we wrote in install_path.txt (actual install dir) in case _MEIPASS layout differs
     try:
