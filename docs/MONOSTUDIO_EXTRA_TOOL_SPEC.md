@@ -65,3 +65,19 @@ MonoStudio sẽ:
 - [x] **GitHub Release**: tag `vx.y.z`, release, RELEASE_NOTES.md, đính kèm `.exe` — đúng spec.
 
 Build installer: `build/output/MonoFXSuite_Setup.exe`. Khi user chọn Option A hoặc B, MonoStudio đọc được phiên bản đang cài và hiển thị nút Download khi có bản mới.
+
+---
+
+## 5. Thêm nhiều app (tool) khác
+
+MonoStudio dùng **một danh sách** `EXTRA_REPOS` trong `monostudio/core/update_checker.py`. Để thêm app mới (vd. ToolB):
+
+1. **Trong MonoStudio (update_checker.py):**
+   - Thêm một dòng vào `EXTRA_REPOS`: `("ToolB", "owner/ToolB")`.  
+     `"ToolB"` = tên hiển thị trong Settings → Updates và tên thư mục cài (`tools/ToolB/`).
+   - Nếu ToolB lưu file VERSION trong subfolder (vd. `tools/ToolB/toolb_data/VERSION`), thêm vào `EXTRA_TOOL_VERSION_PATHS`: `"ToolB": "toolb_data"`. Nếu VERSION nằm ngay `tools/ToolB/VERSION` thì không cần.
+
+2. **Bên phía tool (ToolB):**  
+   Giống MonoFXSuite: GitHub Release (tag, asset .exe), file VERSION trong bản cài, installer có thể đọc `install_path.txt` nếu cài “Under MonoStudio”.
+
+UI (danh sách sản phẩm, nút Download/Latest, trạng thái “Updates available for N products”) **tự động** thêm 1 dòng cho mỗi entry trong `EXTRA_REPOS`; không cần sửa Settings dialog hay main window.

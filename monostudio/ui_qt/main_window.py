@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from datetime import datetime
 import shutil
 import sys
 from pathlib import Path
@@ -13,8 +14,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMenu, QMessag
 from qframelesswindow import FramelessMainWindow
 
 from monostudio.core.app_paths import get_app_base_path
-from monostudio.core.update_checker import check_for_update, set_cached_check_result
-from monostudio.core.version import get_app_version
+from monostudio.core.update_checker import run_full_update_check
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.fs_reader import (
@@ -64,16 +64,13 @@ from monostudio.ui_qt.notification import notify as notification_service
 
 
 class _StartupUpdateCheckWorker(QThread):
-    """Runs check_for_update in background at startup; emits (CheckResult | None, error_message)."""
+    """Runs full update check (MonoStudio + extra repos) in background at startup; emits (result, error_message)."""
 
     check_finished = Signal(object, str)
 
     def run(self) -> None:
-        try:
-            result = check_for_update(get_app_version())
-            self.check_finished.emit(result, "")
-        except Exception as e:
-            self.check_finished.emit(None, str(e))
+        result, _extra, err = run_full_update_check()
+        self.check_finished.emit(result, err)
 
 
 class MainWindow(FramelessMainWindow):
@@ -313,7 +310,7 @@ class MainWindow(FramelessMainWindow):
     def _on_startup_update_check_finished(self, result, error_message: str) -> None:
         if error_message or result is None:
             return
-        set_cached_check_result(result)
+        self._settings.setValue("updates/last_check_time", datetime.now().isoformat())
         self._top_bar.set_update_available(result.update_available, result.latest_version)
         if result.update_available:
             btn = self._top_bar.get_update_button()

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from monostudio.core.app_paths import get_app_base_path, get_tools_install_root
+from monostudio.core.version import get_app_version
 
 # Cache kết quả check 1 giờ để tránh vượt rate limit GitHub (60 request/giờ khi không token)
 CACHE_TTL_SECONDS = 3600
@@ -38,14 +39,17 @@ CACHE_TTL_SECONDS = 3600
 # GitHub repo for releases: "owner/repo"
 GITHUB_REPO = "simplekile/MonoStudio26"
 
-# Extra repos to show latest version in Settings → Updates; display_name used as install folder (e.g. MonoFXSuite)
+# Extra repos to show latest version in Settings → Updates.
+# Thêm app mới: append (display_name, "owner/repo") vào EXTRA_REPOS. UI + check tự động thêm 1 dòng.
+# display_name dùng cho: tên hiển thị, thư mục cài (tools/{display_name}/), và đọc VERSION.
 EXTRA_REPOS: list[tuple[str, str]] = [
     ("MonoFXSuite", "simplekile/MonoFXSuite"),
 ]
 
-# Subfolder under tools/ for version file (optional; e.g. "monofxsuite_data" mirrors monostudio_data)
+# Nếu app lưu VERSION trong subfolder (vd. tools/MonoFXSuite/monofxsuite_data/VERSION), thêm entry ở đây.
+# Bỏ qua thì mặc định đọc tools/{display_name}/VERSION.
 EXTRA_TOOL_VERSION_PATHS: dict[str, str] = {
-    "MonoFXSuite": "monofxsuite_data",  # tools/MonoFXSuite/monofxsuite_data/VERSION
+    "MonoFXSuite": "monofxsuite_data",
 }
 
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -395,6 +399,33 @@ def fetch_extra_repos(timeout: int = 15) -> dict[str, ExtraRepoRelease]:
 def get_cached_extra_repos() -> dict[str, ExtraRepoRelease]:
     """Return cached extra repo releases (e.g. from last check)."""
     return dict(_cached_extra_repos)
+
+
+def run_full_update_check(
+    current_version: str | None = None,
+    manifest_url: str | None = None,
+    extra_timeout: int = 10,
+) -> tuple[CheckResult | None, dict[str, ExtraRepoRelease], str]:
+    """
+    Chạy check MonoStudio + fetch extra repos; cập nhật cache; trả về (result, extra_repos, error_message).
+    Dùng chung cho: startup (main_window) và nút Check for updates (settings_dialog).
+    """
+    err = ""
+    result: CheckResult | None = None
+    try:
+        result = check_for_update(
+            current_version or get_app_version(),
+            manifest_url,
+            timeout=15,
+        )
+    except Exception as e:
+        err = str(e) or "Check failed"
+    extra: dict[str, ExtraRepoRelease] = {}
+    try:
+        extra = fetch_extra_repos(timeout=extra_timeout)
+    except Exception:
+        pass
+    return (result, extra, err)
 
 
 def check_for_update(

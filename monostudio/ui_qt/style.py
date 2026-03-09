@@ -1427,10 +1427,19 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #fafafa;
             font-family: "JetBrains Mono", "Consolas", monospace;
         }
-        QLabel#UpdateStatusText {
+        /* Updates tab: status row (Windows Update style) */
+        QWidget#UpdateStatusRow {
+            min-height: 44px;
+        }
+        QLabel#UpdateStatusMessage {
             font-size: 13px;
-            color: #a1a1aa;
+            font-weight: 600;
+            color: #fafafa;
             min-height: 20px;
+        }
+        QLabel#UpdateStatusLastChecked {
+            font-size: 11px;
+            color: #71717a;
         }
         QLabel#UpdateSectionLabel {
             font-size: 10px;

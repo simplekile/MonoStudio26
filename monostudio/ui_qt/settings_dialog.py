@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QRect, QSize, Qt, QRegularExpression, QSettings, Signal, QStandardPaths, QThread, QUrl
@@ -83,11 +84,11 @@ from monostudio.core.update_checker import (
     ExtraRepoRelease,
     EXTRA_REPOS,
     UpdateInfo,
+    fetch_extra_repos,
     get_cached_check_result,
     get_cached_extra_repos,
-    check_for_update,
+    run_full_update_check,
     download_installer,
-    fetch_extra_repos,
     get_extra_tool_installed_version,
     is_newer_than,
     launch_installer,
@@ -104,6 +105,7 @@ _UPDATE_ROW_ICON_SIZE = 24
 # Fixed size for Download/Latest button and loading bar (same size so layout doesn't jump)
 _UPDATE_ACTION_WIDTH = 96
 _UPDATE_ACTION_HEIGHT = 28
+_UPDATE_STATUS_ICON_SIZE = 32
 
 
 def _update_product_icon_pixmap(product_id: str, size: int = _UPDATE_ROW_ICON_SIZE) -> QPixmap:
@@ -133,7 +135,7 @@ def _update_product_icon_pixmap(product_id: str, size: int = _UPDATE_ROW_ICON_SI
 
 
 class _UpdateCheckWorker(QThread):
-    """Runs update check in background; emits check_finished(result, error_message, extra_repos)."""
+    """Runs full update check (MonoStudio + extra repos) in background; emits check_finished(result, error_message, extra_repos)."""
 
     check_finished = Signal(object, str, object)  # CheckResult | None, error str, dict[str, ExtraRepoRelease]
 
@@ -143,13 +145,25 @@ class _UpdateCheckWorker(QThread):
         self._current_version = current_version
 
     def run(self) -> None:
+        result, extra, err = run_full_update_check(
+            self._current_version,
+            self._manifest_url,
+            extra_timeout=10,
+        )
+        self.check_finished.emit(result, err, extra)
+
+
+class _ExtraReposFetchWorker(QThread):
+    """Fetches only extra repos (e.g. MonoFXSuite) in background; emits extra_repos_fetched(extra_repos)."""
+
+    extra_repos_fetched = Signal(object)  # dict[str, ExtraRepoRelease]
+
+    def run(self) -> None:
         try:
-            result = check_for_update(self._current_version, self._manifest_url)
             extra = fetch_extra_repos(timeout=10)
-            self.check_finished.emit(result, "", extra)
-        except Exception as e:
-            err = str(e) or "Check failed"
-            self.check_finished.emit(None, err, {})
+            self.extra_repos_fetched.emit(extra)
+        except Exception:
+            self.extra_repos_fetched.emit({})
 
 
 class _DownloadWorker(QThread):
@@ -348,8 +362,23 @@ class SettingsDialog(MonosDialog):
                 b.setChecked(i == 3)
         self._apply_cached_update_result(get_cached_check_result())
 
+    def _load_persisted_last_check_time(self) -> None:
+        """Load last check time from settings so 'Last checked' is visible across sessions."""
+        if self._update_last_checked_time is not None:
+            return
+        if not self._settings:
+            return
+        last_check_str = self._settings.value("updates/last_check_time", None, str)
+        if last_check_str:
+            try:
+                self._update_last_checked_time = datetime.fromisoformat(last_check_str)
+            except (ValueError, TypeError):
+                pass
+
     def _apply_cached_update_result(self, result: CheckResult | None) -> None:
         """Apply cached update check result to Updates tab UI (no new network check)."""
+        self._load_persisted_last_check_time()
+        extra = get_cached_extra_repos()
         if result is not None:
             if result.latest_notes:
                 self._update_changelog.setMarkdown(result.latest_notes)
@@ -359,14 +388,14 @@ class SettingsDialog(MonosDialog):
             self._update_latest_html_url = result.latest_html_url
             if result.update_available and result.update_info is not None:
                 self._pending_update_info = result.update_info
-                self._update_status_label.setText(f"Update {result.latest_version} available.")
             else:
                 self._pending_update_info = None
-                self._update_status_label.setText("You're on the latest version.")
             self._apply_monostudio_row(result)
         else:
             self._apply_monostudio_row(None)
-        self._apply_extra_repos_ui(get_cached_extra_repos())
+        self._apply_extra_repos_ui(extra)
+        msg, icon_name, icon_color = self._compute_update_summary(result, extra)
+        self._set_update_status_display(msg, icon_name, icon_color)
 
     def _build_tier2_page_buttons(
         self,
@@ -421,9 +450,19 @@ class SettingsDialog(MonosDialog):
         return container
 
     def _on_general_tier2_changed(self, index: int) -> None:
-        """When General → Updates tab is shown, apply cached check result if any."""
+        """When General → Updates tab is shown, apply cached result; if no extra repos yet, fetch in background."""
         if index == 3:
             self._apply_cached_update_result(get_cached_check_result())
+            if not get_cached_extra_repos() and not getattr(self, "_extra_repos_fetch_worker", None):
+                w = _ExtraReposFetchWorker(self)
+                self._extra_repos_fetch_worker = w
+                w.extra_repos_fetched.connect(self._on_extra_repos_fetched)
+                w.finished.connect(lambda: setattr(self, "_extra_repos_fetch_worker", None))
+                w.start()
+
+    def _on_extra_repos_fetched(self, extra_repos: dict) -> None:
+        """Apply extra repos data from background fetch (so Download/Latest shows without clicking Check)."""
+        self._apply_extra_repos_ui(extra_repos)
 
     def _on_page_button_clicked(
         self,
@@ -518,16 +557,52 @@ class SettingsDialog(MonosDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(16)
 
-        # Check for updates + status
-        self._update_check_btn = QPushButton("Check for updates", root)
+        # Status row (Windows Update style): left = icon + message + last checked, right = Check button
+        status_row = QWidget(root)
+        status_row.setObjectName("UpdateStatusRow")
+        status_row_l = QHBoxLayout(status_row)
+        status_row_l.setContentsMargins(0, 0, 0, 0)
+        status_row_l.setSpacing(12)
+
+        self._update_status_icon = QLabel(status_row)
+        self._update_status_icon.setFixedSize(_UPDATE_STATUS_ICON_SIZE, _UPDATE_STATUS_ICON_SIZE)
+        self._update_status_icon.setScaledContents(True)
+        self._update_status_icon.setObjectName("UpdateStatusIcon")
+        status_row_l.addWidget(self._update_status_icon)
+
+        status_text_col = QWidget(status_row)
+        status_text_col.setObjectName("UpdateStatusTextCol")
+        status_text_l = QVBoxLayout(status_text_col)
+        status_text_l.setContentsMargins(0, 0, 0, 0)
+        status_text_l.setSpacing(2)
+        self._update_status_label = QLabel("", status_text_col)
+        self._update_status_label.setWordWrap(True)
+        self._update_status_label.setObjectName("UpdateStatusMessage")
+        status_text_l.addWidget(self._update_status_label)
+        self._update_last_checked_label = QLabel("", status_text_col)
+        self._update_last_checked_label.setObjectName("UpdateStatusLastChecked")
+        status_text_l.addWidget(self._update_last_checked_label)
+        status_row_l.addWidget(status_text_col, 1)
+
+        self._update_check_btn = QPushButton("Check for updates", status_row)
         self._update_check_btn.setObjectName("DialogPrimaryButton")
         self._update_check_btn.clicked.connect(self._on_check_for_updates)
-        layout.addWidget(self._update_check_btn)
-        self._update_status_label = QLabel("", root)
-        self._update_status_label.setWordWrap(True)
-        self._update_status_label.setObjectName("UpdateStatusText")
-        self._update_status_label.setMinimumHeight(20)
-        layout.addWidget(self._update_status_label)
+        status_row_l.addWidget(self._update_check_btn, 0)
+        layout.addWidget(status_row)
+
+        self._update_last_checked_time: datetime | None = None
+        if self._settings:
+            last_check_str = self._settings.value("updates/last_check_time", None, str)
+            if last_check_str:
+                try:
+                    self._update_last_checked_time = datetime.fromisoformat(last_check_str)
+                except (ValueError, TypeError):
+                    pass
+        self._set_update_status_display(
+            "You're up to date",
+            "square-check",
+            MONOS_COLORS.get("emerald_500", "#10b981"),
+        )
 
         # Unified product list: MonoStudio 26 first, then EXTRA_REPOS (e.g. MonoFXSuite)
         list_container = QFrame(root)
@@ -703,9 +778,58 @@ class SettingsDialog(MonosDialog):
         self._update_download_worker: _DownloadWorker | None = None
         return root
 
+    def _format_last_checked(self, dt: datetime) -> str:
+        """Format last check time like 'Today, 8:25 AM' or 'Yesterday, 3:00 PM'."""
+        now = datetime.now()
+        if dt.date() == now.date():
+            return f"Last checked: Today, {dt.strftime('%I:%M %p').lstrip('0')}"
+        if (now.date() - dt.date()).days == 1:
+            return f"Last checked: Yesterday, {dt.strftime('%I:%M %p').lstrip('0')}"
+        return f"Last checked: {dt.strftime('%b %d, %I:%M %p').replace(' 0', ' ')}"
+
+    def _refresh_last_checked_label(self) -> None:
+        if self._update_last_checked_time is None:
+            self._update_last_checked_label.setText("")
+            self._update_last_checked_label.setVisible(False)
+        else:
+            self._update_last_checked_label.setText(self._format_last_checked(self._update_last_checked_time))
+            self._update_last_checked_label.setVisible(True)
+
+    def _set_update_status_display(self, message: str, icon_name: str, icon_color_hex: str) -> None:
+        """Set status message, icon (lucide name + color), and refresh last-checked line."""
+        self._update_status_label.setText(message)
+        icon = lucide_icon(icon_name, size=_UPDATE_STATUS_ICON_SIZE, color_hex=icon_color_hex)
+        self._update_status_icon.setPixmap(icon.pixmap(_UPDATE_STATUS_ICON_SIZE, _UPDATE_STATUS_ICON_SIZE))
+        self._refresh_last_checked_label()
+
+    def _compute_update_summary(
+        self,
+        result: CheckResult | None,
+        extra_repos: dict[str, ExtraRepoRelease],
+    ) -> tuple[str, str, str]:
+        """Return (message, icon_name, icon_color_hex) for overall status (all apps, Windows Update style)."""
+        products_with_update: list[str] = []
+        if result and result.update_available:
+            products_with_update.append("MonoStudio 26")
+        for name, info in extra_repos.items():
+            if not info or not info.version:
+                continue
+            installed = get_extra_tool_installed_version(name) or ""
+            if installed and is_newer_than(installed, info.version):
+                products_with_update.append(name)
+        if products_with_update:
+            if len(products_with_update) == 1:
+                msg = f"Update available for {products_with_update[0]}."
+            elif len(products_with_update) == 2:
+                msg = f"Updates available for {products_with_update[0]} and {products_with_update[1]}."
+            else:
+                msg = f"Updates available for {len(products_with_update)} products."
+            return (msg, "refresh-cw", MONOS_COLORS.get("blue_400", "#60a5fa"))
+        return ("You're up to date", "square-check", MONOS_COLORS.get("emerald_500", "#10b981"))
+
     def _on_check_for_updates(self) -> None:
         self._update_check_btn.setEnabled(False)
-        self._update_status_label.setText("Checking…")
+        self._set_update_status_display("Checking…", "loader-2", MONOS_COLORS.get("blue_400", "#60a5fa"))
         self._update_changelog.clear()
         self._pending_update_info = None
         self._apply_monostudio_row(None)
@@ -725,15 +849,25 @@ class SettingsDialog(MonosDialog):
         error_message: str,
         extra_repos: dict[str, ExtraRepoRelease] | None = None,
     ) -> None:
+        extra = extra_repos or {}
         if error_message:
-            self._update_status_label.setText(f"Check failed: {error_message}")
+            self._set_update_status_display(
+                f"Check failed: {error_message}",
+                "refresh-cw",
+                MONOS_COLORS.get("text_meta", "#71717a"),
+            )
             self._update_changelog.clear()
             self._apply_monostudio_row(None)
-            self._apply_extra_repos_ui(extra_repos or {})
+            self._apply_extra_repos_ui(extra)
             return
         if result is None:
-            self._apply_extra_repos_ui(extra_repos or {})
+            self._apply_extra_repos_ui(extra)
+            msg, icon_name, icon_color = self._compute_update_summary(None, extra)
+            self._set_update_status_display(msg, icon_name, icon_color)
             return
+        self._update_last_checked_time = datetime.now()
+        if self._settings:
+            self._settings.setValue("updates/last_check_time", self._update_last_checked_time.isoformat())
         if result.latest_notes:
             self._update_changelog.setMarkdown(result.latest_notes)
         else:
@@ -742,12 +876,12 @@ class SettingsDialog(MonosDialog):
         self._update_latest_html_url = result.latest_html_url
         if result.update_available and result.update_info is not None:
             self._pending_update_info = result.update_info
-            self._update_status_label.setText(f"Update {result.latest_version} available.")
         else:
             self._pending_update_info = None
-            self._update_status_label.setText("You're on the latest version.")
         self._apply_monostudio_row(result)
-        self._apply_extra_repos_ui(extra_repos or {})
+        self._apply_extra_repos_ui(extra)
+        msg, icon_name, icon_color = self._compute_update_summary(result, extra)
+        self._set_update_status_display(msg, icon_name, icon_color)
 
     def _apply_changelog_line_height(self) -> None:
         """Áp dụng line-height 165% cho mọi block trong release notes (QTextDocument không hỗ trợ line-height qua CSS)."""
@@ -781,7 +915,7 @@ class SettingsDialog(MonosDialog):
         if getattr(self, "_update_monostudio_progress_bar", None):
             self._update_monostudio_progress_bar.setMinimum(0)
             self._update_monostudio_progress_bar.setMaximum(0)
-        self._update_status_label.setText("Downloading…")
+        self._set_update_status_display("Downloading…", "loader-2", MONOS_COLORS.get("blue_400", "#60a5fa"))
         self._update_download_worker = _DownloadWorker(primary, dest, fallback_url=fallback, parent=self)
         self._update_download_worker.progress.connect(self._on_download_progress)
         self._update_download_worker.download_finished.connect(self._on_download_finished)
@@ -892,7 +1026,7 @@ class SettingsDialog(MonosDialog):
             progress_bar.setMaximum(0)
             loading_widget.show()
             cancel_btn.clicked.connect(self._on_cancel_download)
-        self._update_status_label.setText(f"Downloading {name}…")
+        self._set_update_status_display(f"Downloading {name}…", "loader-2", MONOS_COLORS.get("blue_400", "#60a5fa"))
         self._update_download_worker = _DownloadWorker(url, dest, parent=self)
         self._update_download_worker.progress.connect(self._on_download_progress)
         self._update_download_worker.download_finished.connect(self._on_download_finished)
@@ -956,25 +1090,36 @@ class SettingsDialog(MonosDialog):
             except Exception:
                 pass
             self._update_download_worker = None
+        zinc = MONOS_COLORS.get("text_meta", "#71717a")
         if success:
-            self._update_status_label.setText("Launching installer…")
+            self._set_update_status_display("Launching installer…", "loader-2", MONOS_COLORS.get("blue_400", "#60a5fa"))
             try:
                 if product == "monostudio":
                     run_installer_and_exit(Path(path))
                 else:
                     launch_installer(Path(path))
-                    self._update_status_label.setText("Installer launched. You can continue using MonoStudio.")
+                    self._set_update_status_display(
+                        "Installer launched. You can continue using MonoStudio.",
+                        "square-check",
+                        MONOS_COLORS.get("emerald_500", "#10b981"),
+                    )
             except (OSError, RuntimeError) as e:
                 msg = str(e).replace("\n", " ")[:200]
-                self._update_status_label.setText(
-                    f"Cannot run installer: {msg} Download from the release page below instead."
+                self._set_update_status_display(
+                    f"Cannot run installer: {msg} Download from the release page below instead.",
+                    "refresh-cw",
+                    zinc,
                 )
         else:
             if (error_message or "").strip() == "Cancelled":
-                self._update_status_label.setText("Download cancelled.")
+                self._set_update_status_display("Download cancelled.", "refresh-cw", zinc)
             else:
                 msg = (error_message.strip() or "Download failed.").replace("\n", " ")[:200]
-                self._update_status_label.setText(f"Download failed: {msg} Or get the installer from the release page below.")
+                self._set_update_status_display(
+                    f"Download failed: {msg} Or get the installer from the release page below.",
+                    "refresh-cw",
+                    zinc,
+                )
         self._update_download_product = ""
 
     def _build_pipeline_page(self) -> QWidget:

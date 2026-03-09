@@ -8,6 +8,28 @@
 
 ---
 
+# MonoStudio 26 — Release v26.7.0
+
+## Highlights
+
+- **Settings → Updates**: Layout kiểu Windows Update — status (icon + message + "Last checked") bên trái, nút "Check for updates" gọn bên phải; trạng thái tổng cho tất cả app (MonoStudio + extra tools).
+- **Last checked**: Lưu và hiển thị thời điểm check gần nhất (kể cả khi mở app hoặc bấm Check); format "Today, 8:25 AM" / "Yesterday, 3:00 PM".
+- **Một hàm check chung**: `run_full_update_check()` — dùng cho cả check lúc mở app và nút "Check for updates" (MonoStudio + extra repos).
+- **Thêm app mới**: Chỉ cần thêm vào `EXTRA_REPOS` trong `update_checker.py`; UI và logic check tự mở rộng. Doc: `docs/MONOSTUDIO_EXTRA_TOOL_SPEC.md` §5.
+
+## Changes in this release
+
+- feat: Updates tab — status row (icon + message + last checked) trái, button phải; status tổng all apps; icon/màu theo rule MonoStudio.
+- feat: Last checked persist (QSettings); hiển thị khi mở tab; startup check cũng ghi last check time.
+- refactor: run_full_update_check() trong update_checker — startup + Check button dùng chung; cả hai chạy MonoStudio + fetch_extra_repos.
+- docs: EXTRA_REPOS comment + MONOSTUDIO_EXTRA_TOOL_SPEC.md §5 — hướng dẫn thêm nhiều app.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.6.0
 
 ## Highlights
