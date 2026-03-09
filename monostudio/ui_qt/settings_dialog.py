@@ -103,7 +103,7 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 # Icon size for update list rows
 _UPDATE_ROW_ICON_SIZE = 24
 # Fixed size for Download/Latest button and loading bar (same size so layout doesn't jump)
-_UPDATE_ACTION_WIDTH = 96
+_UPDATE_ACTION_WIDTH = 128  # 96 + 1/3
 _UPDATE_ACTION_HEIGHT = 28
 _UPDATE_STATUS_ICON_SIZE = 32
 
@@ -947,12 +947,14 @@ class SettingsDialog(MonosDialog):
         if result and result.update_available and result.update_info is not None:
             action_btn.setText(f"Download {result.latest_version}")
             action_btn.setObjectName("UpdateProductListBtnDownload")
+            action_btn.setEnabled(True)
             action_btn.setStyleSheet("")  # force re-apply stylesheet
             action_btn.style().unpolish(action_btn)
             action_btn.style().polish(action_btn)
         else:
             action_btn.setText("Latest")
             action_btn.setObjectName("UpdateProductListBtnLatest")
+            action_btn.setEnabled(False)
             action_btn.setStyleSheet("")
             action_btn.style().unpolish(action_btn)
             action_btn.style().polish(action_btn)
@@ -975,12 +977,15 @@ class SettingsDialog(MonosDialog):
                 if update_available and download_url:
                     action_btn.setText(f"Download {info.version}")
                     action_btn.setObjectName("UpdateProductListBtnDownload")
+                    action_btn.setEnabled(True)
                 elif download_url:
                     action_btn.setText("Latest")
                     action_btn.setObjectName("UpdateProductListBtnLatest")
+                    action_btn.setEnabled(False)
                 else:
                     action_btn.setText("View on GitHub")
                     action_btn.setObjectName("SettingsCategoryActionButton")
+                    action_btn.setEnabled(True)
                 action_btn.style().unpolish(action_btn)
                 action_btn.style().polish(action_btn)
             else:
@@ -992,6 +997,7 @@ class SettingsDialog(MonosDialog):
                 action_btn.setVisible(bool(fallbacks.get(name)))
                 action_btn.setText("View on GitHub")
                 action_btn.setObjectName("SettingsCategoryActionButton")
+                action_btn.setEnabled(True)
 
     def _on_extra_repo_release_link_clicked(self, name: str) -> None:
         url = self._update_extra_html_url.get(name)

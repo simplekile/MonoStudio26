@@ -8,6 +8,23 @@
 
 ---
 
+# MonoStudio 26 — Release v26.7.1
+
+## Highlights
+
+- **Settings → Updates**: Nút "Latest" (MonoStudio + extra tools) disable khi đã mới nhất — không bấm nhầm; nút action dài thêm 1/3 (128px).
+
+## Changes in this release
+
+- fix: Nút Download/Latest — setEnabled(False) khi trạng thái Latest (MonoStudio + extra repos).
+- style: _UPDATE_ACTION_WIDTH 96 → 128 (dài thêm 1/3).
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.7.0
 
 ## Highlights
