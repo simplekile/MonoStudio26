@@ -8,6 +8,22 @@
 
 ---
 
+# MonoStudio 26 — Release v26.7.2
+
+## Highlights
+
+- **Settings → Updates**: Nút "Check for updates" luôn gọi API mới (bỏ qua cache) — tìm thấy bản release mới ngay, không cần restart app.
+
+## Changes in this release
+
+- fix: check_for_update(skip_cache=True) khi user bấm "Check for updates"; startup check vẫn dùng cache 1h.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.7.1
 
 ## Highlights

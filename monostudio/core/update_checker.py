@@ -405,10 +405,11 @@ def run_full_update_check(
     current_version: str | None = None,
     manifest_url: str | None = None,
     extra_timeout: int = 10,
+    skip_cache: bool = False,
 ) -> tuple[CheckResult | None, dict[str, ExtraRepoRelease], str]:
     """
     Chạy check MonoStudio + fetch extra repos; cập nhật cache; trả về (result, extra_repos, error_message).
-    Dùng chung cho: startup (main_window) và nút Check for updates (settings_dialog).
+    skip_cache=True: bỏ qua cache, luôn gọi API (dùng khi user bấm "Check for updates").
     """
     err = ""
     result: CheckResult | None = None
@@ -417,6 +418,7 @@ def run_full_update_check(
             current_version or get_app_version(),
             manifest_url,
             timeout=15,
+            skip_cache=skip_cache,
         )
     except Exception as e:
         err = str(e) or "Check failed"
@@ -432,10 +434,11 @@ def check_for_update(
     current_version: str,
     manifest_url: str | None = None,
     timeout: int = 15,
+    skip_cache: bool = False,
 ) -> CheckResult:
     """
     Check for update via GitHub Releases API; returns update (if newer) and latest release notes.
-    Kết quả cache 1 giờ để tránh vượt rate limit GitHub (chỉ gọi API khi cache hết hạn).
+    Kết quả cache 1 giờ để tránh vượt rate limit GitHub. skip_cache=True: bỏ qua cache, luôn gọi API.
     Set env MONOSTUDIO_FAKE_UPDATE=1 to force "update available" for testing.
     Raises on network/HTTP error or invalid response.
     """
@@ -446,9 +449,9 @@ def check_for_update(
             "GITHUB_REPO is not configured. Edit monostudio/core/update_checker.py and set "
             "GITHUB_REPO = 'owner/repo' to your GitHub repository."
         )
-    # Dùng cache nếu còn hạn → không gọi API, tránh rate limit
+    # Dùng cache nếu còn hạn và không skip_cache → tránh rate limit
     global _cached_check_result, _cached_check_time
-    if _cached_check_result is not None and (_cached_check_time > 0 and (time.time() - _cached_check_time) < CACHE_TTL_SECONDS):
+    if not skip_cache and _cached_check_result is not None and (_cached_check_time > 0 and (time.time() - _cached_check_time) < CACHE_TTL_SECONDS):
         c = _cached_check_result
         update_available = os.environ.get("MONOSTUDIO_FAKE_UPDATE", "").strip() in ("1", "true", "yes") or is_newer_than(current_version, c.latest_version)
         return CheckResult(

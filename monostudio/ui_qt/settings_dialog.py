@@ -139,16 +139,18 @@ class _UpdateCheckWorker(QThread):
 
     check_finished = Signal(object, str, object)  # CheckResult | None, error str, dict[str, ExtraRepoRelease]
 
-    def __init__(self, manifest_url: str, current_version: str, parent=None) -> None:
+    def __init__(self, manifest_url: str, current_version: str, parent=None, *, skip_cache: bool = False) -> None:
         super().__init__(parent)
         self._manifest_url = manifest_url
         self._current_version = current_version
+        self._skip_cache = skip_cache
 
     def run(self) -> None:
         result, extra, err = run_full_update_check(
             self._current_version,
             self._manifest_url,
             extra_timeout=10,
+            skip_cache=self._skip_cache,
         )
         self.check_finished.emit(result, err, extra)
 
@@ -838,6 +840,7 @@ class SettingsDialog(MonosDialog):
             None,  # use default: GitHub Releases API
             get_app_version(),
             self,
+            skip_cache=True,  # user clicked "Check for updates" → always fetch fresh
         )
         self._update_check_worker.check_finished.connect(self._on_update_check_finished)
         self._update_check_worker.finished.connect(self._on_update_check_thread_finished)
