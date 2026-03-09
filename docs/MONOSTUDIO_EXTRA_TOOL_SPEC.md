@@ -8,40 +8,37 @@ Tài liệu này dành cho team phát triển **MonoFXSuite** (hoặc tool tươ
 
 ## 1. Vị trí cài đặt (để MonoStudio đọc được version)
 
-MonoStudio cài mặc định tại: **`C:\Program Files\MonoStudio26`** (hoặc thư mục user chọn khi cài).
+MonoStudio **không** luôn cài ở `C:\Program Files\` — user có thể chọn thư mục khác khi cài. Để installer MonoFXSuite điền đúng đường dẫn “Under MonoStudio”:
 
-**MonoFXSuite nên cài vào một trong hai vị trí sau:**
+**MonoStudio ghi đường dẫn cài thực tế** vào file:
+- **`%LOCALAPPDATA%\MonoStudio\install_path.txt`**  
+  Nội dung: một dòng là đường dẫn thư mục cài MonoStudio (vd. `D:\Apps\MonoStudio26`). File được cập nhật mỗi lần chạy MonoStudio.
 
-### Option A — Cùng gốc với MonoStudio (khuyến nghị)
+**Installer MonoFXSuite (Option A — Under MonoStudio) nên:**
+1. Đọc file `%LOCALAPPDATA%\MonoStudio\install_path.txt`.
+2. Nếu tồn tại và hợp lệ: mặc định đường dẫn = `{path trong file}\tools\MonoFXSuite`.
+3. Nếu không có file (MonoStudio chưa từng chạy): fallback `C:\Program Files\MonoStudio26\tools\MonoFXSuite` hoặc để user duyệt chọn thư mục MonoStudio.
 
-- **Đường dẫn**: `{Thư mục cài MonoStudio}\tools\MonoFXSuite\`  
-  Ví dụ: `C:\Program Files\MonoStudio26\tools\MonoFXSuite\`
-- Khi build installer (Inno Setup / MSI), mặc định **DefaultDirName** nên trỏ tới:
-  - `{pf}\MonoStudio26\tools\MonoFXSuite`  
-  hoặc cho user chọn thư mục cài MonoStudio rồi thêm `\tools\MonoFXSuite`.
+**Trang “Install location” trong installer MonoFXSuite (đã triển khai):**
 
-### Option B — Thư mục user (không cần quyền Admin)
+| Lựa chọn | Đường dẫn mặc định | MonoStudio nhận version? |
+|----------|---------------------|---------------------------|
+| **Under MonoStudio** (mặc định) | Đọc từ `install_path.txt` + `\tools\MonoFXSuite`; fallback `{pf}\MonoStudio26\tools\MonoFXSuite` | Có |
+| **User folder** | `%LOCALAPPDATA%\MonoStudio\tools\MonoFXSuite` | Có |
+| **Standalone** | Trang sau: chọn thư mục (mặc định `{autopf}\MonoFXSuite`) | Không — cột Version hiển thị "—", vẫn có nút Download. |
 
-- **Đường dẫn**: `%LOCALAPPDATA%\MonoStudio\tools\MonoFXSuite\`  
-  Ví dụ: `C:\Users\<User>\AppData\Local\MonoStudio\tools\MonoFXSuite\`
-
-MonoStudio sẽ tìm file VERSION theo thứ tự: Option A trước, sau đó Option B.
+Trên trang “Select Destination Location”, đường dẫn điền sẵn theo lựa chọn; user có thể sửa. MonoStudio tìm VERSION: Option A trước, rồi Option B. Option C không nằm trong hai path đó.
 
 ---
 
 ## 2. File VERSION (bắt buộc để MonoStudio hiển thị “phiên bản hiện tại”)
 
-Sau khi cài, trong thư mục gốc của MonoFXSuite **phải có file VERSION** tại một trong hai vị trí:
+Sau khi cài, trong **thư mục gốc** của MonoFXSuite (`{app}`) **phải có file VERSION**.
 
-- **Cách 1**: `tools\MonoFXSuite\VERSION`
-- **Cách 2**: `tools\MonoFXSuite\monofxsuite_data\VERSION` (nếu project có cấu trúc thư mục kiểu `monofxsuite_data` giống MonoStudio)
+- **Vị trí**: `tools\MonoFXSuite\VERSION` (tức `{app}\VERSION` khi cài Option A/B).
+- MonoFXSuite installer (vd. trong `.iss`): `Source: "..\..\VERSION"; DestDir: "{app}"; Flags: ignoreversion` — bản cài luôn có VERSION ở thư mục gốc.
 
-**Nội dung file VERSION**: một dòng duy nhất, format phiên bản semantic.
-
-- Ví dụ: `1.0.2` hoặc `v1.0.2`
-- MonoStudio sẽ hiển thị đúng chuỗi này (có hoặc không có tiền tố `v`) trong cột Version tại Settings → Updates.
-
-**Khi build installer**: đảm bảo file VERSION được đóng gói và cài đúng vào một trong hai đường dẫn trên (tương ứng với Option A hoặc B).
+**Nội dung file VERSION**: một dòng duy nhất, format semantic (vd. `1.0.2` hoặc `v1.0.2`). MonoStudio hiển thị đúng chuỗi này trong cột Version tại Settings → Updates.
 
 ---
 
@@ -61,10 +58,10 @@ MonoStudio sẽ:
 
 ---
 
-## 4. Tóm tắt checklist cho team MonoFXSuite
+## 4. Tóm tắt checklist (đã triển khai bên MonoFXSuite)
 
-- [ ] **Installer** cài MonoFXSuite vào `{MonoStudio install dir}\tools\MonoFXSuite\` (hoặc `%LOCALAPPDATA%\MonoStudio\tools\MonoFXSuite\`).
-- [ ] **File VERSION** có trong bản cài tại `VERSION` hoặc `monofxsuite_data\VERSION`, nội dung một dòng (vd. `1.0.2`).
-- [ ] **GitHub Release**: tag dạng `v1.0.2`, có đính kèm file `.exe` installer; điền release notes (body) cho mỗi release.
+- [x] **VERSION** trong bản cài ở thư mục gốc `{app}` (MonoFXSuite.iss: `Source: "..\..\VERSION"; DestDir: "{app}"`).
+- [x] **Trang “Install location”**: Option A (Under MonoStudio, mặc định), Option B (User folder), Option C (Standalone); đường dẫn điền sẵn trên trang Select Destination, user có thể sửa.
+- [x] **GitHub Release**: tag `vx.y.z`, release, RELEASE_NOTES.md, đính kèm `.exe` — đúng spec.
 
-Sau khi thỏa mãn các mục trên, MonoStudio sẽ tự nhận phiên bản đang cài và hiển thị nút Download khi có bản mới.
+Build installer: `build/output/MonoFXSuite_Setup.exe`. Khi user chọn Option A hoặc B, MonoStudio đọc được phiên bản đang cài và hiển thị nút Download khi có bản mới.

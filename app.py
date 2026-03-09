@@ -11,7 +11,7 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
-from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.app_paths import get_app_base_path, write_install_path_for_tools
 from monostudio.core.crash_recovery import install_crash_logging
 from monostudio.core.pipeline_types_and_presets import ensure_user_default_config_dir
 from monostudio.ui_qt.main_window import MainWindow
@@ -190,6 +190,7 @@ def main() -> int:
     QImageReader.setAllocationLimit(0)
     QApplication.setWheelScrollLines(1)
     ensure_user_default_config_dir()
+    write_install_path_for_tools()  # so MonoFXSuite etc. can discover install dir for "Under MonoStudio"
 
     _splash_step("Applying theme…", 0.25)
     apply_dark_theme(app)

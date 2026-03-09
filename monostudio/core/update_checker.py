@@ -8,10 +8,10 @@ Rate limit: Không token = 60 request/giờ. Set env MONOSTUDIO_GITHUB_TOKEN (ho
 để được 5000 request/giờ, miễn phí. Không commit token vào repo.
 
 Extra tools (e.g. MonoFXSuite) — install location and version detection:
-- MonoStudio install dir: from get_app_base_path() (frozen = exe dir, e.g. C:\\Program Files\\MonoStudio26).
-- Recommended install for MonoFXSuite: {MonoStudio base}/tools/MonoFXSuite/
-  so that MonoStudio can read installed version from tools/MonoFXSuite/VERSION (or .../monofxsuite_data/VERSION).
-- Fallback: %LOCALAPPDATA%\\MonoStudio\\tools\\MonoFXSuite\\VERSION for user-level installs.
+- MonoStudio install dir: from get_app_base_path() (frozen = exe dir; may be anywhere, not necessarily Program Files).
+- MonoStudio writes actual install path to %LOCALAPPDATA%\\MonoStudio\\install_path.txt on each run so other installers can default "Under MonoStudio" correctly.
+- Recommended install for MonoFXSuite: {MonoStudio base}/tools/MonoFXSuite/ so MonoStudio can read tools/MonoFXSuite/VERSION (or .../monofxsuite_data/VERSION).
+- Fallback: %LOCALAPPDATA%\\MonoStudio\\tools\\MonoFXSuite\\VERSION for user-folder installs.
 - VERSION file format: one line, e.g. "1.0.2" or "v1.0.2".
 """
 

@@ -77,12 +77,13 @@ alwaysApply: false
 
 ## MonoStudio cài ở đâu / Extra tools (MonoFXSuite) — vị trí cài để MonoStudio nhận version
 
-- **MonoStudio**: Inno Setup mặc định cài vào `{autopf}\MonoStudio26` (vd. `C:\Program Files\MonoStudio26`). Khi chạy, `get_app_base_path()` = thư mục chứa exe (install dir). Phiên bản đọc từ `monostudio_data/VERSION`.
+- **MonoStudio**: Inno Setup mặc định cài vào `{autopf}\MonoStudio26`; user có thể chọn thư mục khác. Khi chạy, `get_app_base_path()` = thư mục chứa exe (install dir). Phiên bản đọc từ `monostudio_data/VERSION`.
+- **Ghi đường dẫn cài cho installer khác**: Mỗi lần chạy, MonoStudio ghi `get_app_base_path()` vào **`%LOCALAPPDATA%\MonoStudio\install_path.txt`** (một dòng). Installer MonoFXSuite (và tool tương tự) nên đọc file này để điền sẵn "Under MonoStudio" đúng chỗ user thực sự cài (không mặc định cứng Program Files). Chi tiết: `docs/MONOSTUDIO_EXTRA_TOOL_SPEC.md`.
 - **MonoFXSuite (và tool tương tự)** nên cài sao cho MonoStudio đọc được file **VERSION**:
-  - **Khuyến nghị**: `{MonoStudio base}\tools\MonoFXSuite\` — tức cùng ổ/partition, thư mục con `tools\MonoFXSuite`. Ví dụ MonoStudio tại `C:\Program Files\MonoStudio26` thì cài MonoFXSuite tại `C:\Program Files\MonoStudio26\tools\MonoFXSuite`.
-  - **Cấu trúc**: trong `tools/MonoFXSuite/` cần có file VERSION (một dòng, vd. `1.0.2` hoặc `v1.0.2`). Nếu MonoFXSuite dùng layout giống MonoStudio thì đặt tại `tools/MonoFXSuite/monofxsuite_data/VERSION` (đã cấu hình trong `update_checker.EXTRA_TOOL_VERSION_PATHS`).
-  - **Fallback**: `%LOCALAPPDATA%\MonoStudio\tools\MonoFXSuite\VERSION` (hoặc `...\monofxsuite_data\VERSION`) cho cài đặt user-level.
-- **Kết quả**: Settings → Updates hiển thị đúng phiên bản đang cài (cột Version) và so sánh với bản mới từ GitHub để hiện nút Download.
+  - **Khuyến nghị**: `{MonoStudio base}\tools\MonoFXSuite\` — installer đọc `install_path.txt` → `{path}\tools\MonoFXSuite`.
+  - **Cấu trúc**: trong `tools/MonoFXSuite/` cần có file VERSION (một dòng). Có thể đặt tại `tools/MonoFXSuite/VERSION` hoặc `tools/MonoFXSuite/monofxsuite_data/VERSION` (đã cấu hình trong `update_checker.EXTRA_TOOL_VERSION_PATHS`).
+  - **Fallback**: `%LOCALAPPDATA%\MonoStudio\tools\MonoFXSuite\` cho cài user-level.
+- **Kết quả**: Settings → Updates hiển thị phiên bản đang cài và nút Download khi có bản mới.
 
 ## Publish release lên GitHub (GitHub CLI)
 
