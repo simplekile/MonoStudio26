@@ -8,7 +8,23 @@
 
 ---
 
-# MonoStudio 26 — Release v26.5.0 (dự kiến)
+# MonoStudio 26 — Release v26.5.1
+
+## Highlights
+
+- **Fix**: Settings → Updates hiển thị đúng phiên bản MonoFXSuite khi cài "Under MonoStudio" (onedir: dùng tools root = parent của _internal).
+
+## Changes in this release
+
+- fix: get_tools_install_root() — đọc VERSION extra tools từ {install}/tools/ (không phải _internal/tools/) để MonoFXSuite version hiện đúng
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
+# MonoStudio 26 — Release v26.5.0
 
 ## Highlights
 

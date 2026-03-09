@@ -17,12 +17,24 @@ def get_app_base_path() -> Path:
     """
     Root directory containing monostudio_data/ and fonts/.
     - Development: repo root (parent of monostudio/).
-    - Frozen (PyInstaller): sys._MEIPASS (onedir/onefile extracted files).
+    - Frozen (PyInstaller): sys._MEIPASS (onedir = _internal folder; onefile = temp extract).
     """
     if getattr(sys, "frozen", False):
         return Path(sys._MEIPASS)
     # Development: from this file monostudio/core/app_paths.py -> parents[2] = repo root
     return Path(__file__).resolve().parents[2]
+
+
+def get_tools_install_root() -> Path:
+    """
+    Root directory for tools/ (e.g. tools/MonoFXSuite) when looking for extra tools' VERSION.
+    - Frozen onedir: PyInstaller puts app in _internal/, so tools/ is next to _internal (parent of base).
+    - Frozen onefile / dev: same as get_app_base_path().
+    """
+    base = get_app_base_path()
+    if getattr(sys, "frozen", False) and base.name == "_internal":
+        return base.parent
+    return base
 
 
 def write_install_path_for_tools() -> None:

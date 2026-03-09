@@ -30,7 +30,7 @@ from urllib.parse import urljoin
 from pathlib import Path
 from typing import Any
 
-from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.app_paths import get_app_base_path, get_tools_install_root
 
 # Cache kết quả check 1 giờ để tránh vượt rate limit GitHub (60 request/giờ khi không token)
 CACHE_TTL_SECONDS = 3600
@@ -93,7 +93,8 @@ def get_extra_tool_installed_version(display_name: str) -> str:
     Return installed version of an extra tool (e.g. MonoFXSuite) so MonoStudio can show it in Settings → Updates.
 
     Lookup order:
-    1. {MonoStudio base}/tools/{display_name}/VERSION or .../tools/{display_name}/{subfolder}/VERSION
+    1. {tools root}/tools/{display_name}/VERSION or .../tools/{display_name}/{subfolder}/VERSION
+       (tools root = install dir; when frozen onedir, base is _internal so tools root = parent of base)
     2. %LOCALAPPDATA%/MonoStudio/tools/{display_name}/VERSION
 
     Returns version string with "v" prefix (e.g. "v1.0.2") or "" if not found.
@@ -102,12 +103,12 @@ def get_extra_tool_installed_version(display_name: str) -> str:
         return ""
     name = display_name.strip()
     subfolder = EXTRA_TOOL_VERSION_PATHS.get(name, "")
-    base = get_app_base_path()
+    tools_root = get_tools_install_root()
     localappdata = os.environ.get("LOCALAPPDATA", "").strip()
     candidates: list[Path] = []
     if subfolder:
-        candidates.append(base / "tools" / name / subfolder / "VERSION")
-    candidates.append(base / "tools" / name / "VERSION")
+        candidates.append(tools_root / "tools" / name / subfolder / "VERSION")
+    candidates.append(tools_root / "tools" / name / "VERSION")
     if localappdata:
         if subfolder:
             candidates.append(Path(localappdata) / "MonoStudio" / "tools" / name / subfolder / "VERSION")
