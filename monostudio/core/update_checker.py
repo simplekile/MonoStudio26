@@ -88,31 +88,49 @@ class ExtraRepoRelease:
     download_url: str = ""  # installer asset URL (e.g. .exe) when available
 
 
-def get_extra_tool_installed_version(display_name: str) -> str:
-    """
-    Return installed version of an extra tool (e.g. MonoFXSuite) so MonoStudio can show it in Settings → Updates.
-
-    Lookup order:
-    1. {tools root}/tools/{display_name}/VERSION or .../tools/{display_name}/{subfolder}/VERSION
-       (tools root = install dir; when frozen onedir, base is _internal so tools root = parent of base)
-    2. %LOCALAPPDATA%/MonoStudio/tools/{display_name}/VERSION
-
-    Returns version string with "v" prefix (e.g. "v1.0.2") or "" if not found.
-    """
-    if not (display_name or "").strip():
-        return ""
-    name = display_name.strip()
+def _extra_tool_version_candidates(display_name: str) -> list[Path]:
+    """Build list of VERSION file paths to try (tools_root, install_path.txt, LOCALAPPDATA)."""
+    name = (display_name or "").strip()
+    if not name:
+        return []
     subfolder = EXTRA_TOOL_VERSION_PATHS.get(name, "")
-    tools_root = get_tools_install_root()
     localappdata = os.environ.get("LOCALAPPDATA", "").strip()
     candidates: list[Path] = []
-    if subfolder:
-        candidates.append(tools_root / "tools" / name / subfolder / "VERSION")
-    candidates.append(tools_root / "tools" / name / "VERSION")
+
+    def add_for_root(root: Path) -> None:
+        if subfolder:
+            candidates.append(root / "tools" / name / subfolder / "VERSION")
+        candidates.append(root / "tools" / name / "VERSION")
+
+    add_for_root(get_tools_install_root())
+    # Fallback: path we wrote in install_path.txt (actual install dir) in case _MEIPASS layout differs
+    try:
+        if localappdata:
+            install_txt = Path(localappdata) / "MonoStudio" / "install_path.txt"
+            if install_txt.is_file():
+                saved = install_txt.read_text(encoding="utf-8").strip()
+                if saved:
+                    root = Path(saved)
+                    if root.name == "_internal":
+                        root = root.parent
+                    add_for_root(root)
+    except OSError:
+        pass
     if localappdata:
         if subfolder:
             candidates.append(Path(localappdata) / "MonoStudio" / "tools" / name / subfolder / "VERSION")
         candidates.append(Path(localappdata) / "MonoStudio" / "tools" / name / "VERSION")
+    return candidates
+
+
+def get_extra_tool_installed_version(display_name: str) -> str:
+    """
+    Return installed version of an extra tool (e.g. MonoFXSuite) so MonoStudio can show it in Settings → Updates.
+
+    Lookup: tools root (install dir), then path from install_path.txt, then %LOCALAPPDATA%/MonoStudio/tools/...
+    Returns version string with "v" prefix (e.g. "v1.0.2") or "" if not found.
+    """
+    candidates = _extra_tool_version_candidates(display_name)
     for p in candidates:
         try:
             if p.is_file():

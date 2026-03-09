@@ -8,6 +8,22 @@
 
 ---
 
+# MonoStudio 26 — Release v26.5.2
+
+## Highlights
+
+- **Fix**: Đọc version MonoFXSuite thêm fallback từ `install_path.txt` — hiển thị đúng dù cấu trúc thư mục cài khác (vd. không có _internal).
+
+## Changes in this release
+
+- fix: get_extra_tool_installed_version — fallback đọc VERSION từ path trong %LOCALAPPDATA%\\MonoStudio\\install_path.txt (chuẩn hóa _internal → parent)
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.5.1
 
 ## Highlights
