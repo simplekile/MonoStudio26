@@ -8,6 +8,22 @@
 
 ---
 
+# MonoStudio 26 — Release v26.6.0
+
+## Highlights
+
+- **Settings → Updates**: Extra tools (MonoFXSuite) giống MonoStudio — so sánh version đang cài với latest từ GitHub; chỉ hiện "Download vX.X.X" khi có bản mới, đã mới nhất thì hiện "Latest".
+
+## Changes in this release
+
+- feat: _apply_extra_repos_ui — dùng is_newer_than(installed, info.version); Download vX.X.X khi update available, Latest khi đã latest
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.5.4
 
 ## Highlights

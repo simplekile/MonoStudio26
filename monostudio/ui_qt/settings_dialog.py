@@ -89,6 +89,7 @@ from monostudio.core.update_checker import (
     download_installer,
     fetch_extra_repos,
     get_extra_tool_installed_version,
+    is_newer_than,
     launch_installer,
     run_installer_and_exit,
 )
@@ -823,20 +824,26 @@ class SettingsDialog(MonosDialog):
             action_btn.style().polish(action_btn)
 
     def _apply_extra_repos_ui(self, extra_repos: dict[str, ExtraRepoRelease]) -> None:
-        """Update extra-repo rows: version, release notes link, Download (when asset URL present) or View on GitHub."""
+        """Update extra-repo rows: version, release notes link; Download vX.X.X (when update available) or Latest, like MonoStudio."""
         fallbacks = getattr(self, "_update_extra_fallback_url", {})
         for name, (ver_l, link_btn, action_btn) in getattr(self, "_update_extra_cards", {}).items():
             info = extra_repos.get(name)
             if info:
-                # Show installed version so user sees current vs latest; keep latest from API for download/links
-                ver_l.setText(get_extra_tool_installed_version(name) or "—")
+                installed = get_extra_tool_installed_version(name) or ""
+                ver_l.setText(installed or "—")
                 self._update_extra_html_url[name] = info.html_url or fallbacks.get(name, "")
-                self._update_extra_download_url[name] = getattr(info, "download_url", "") or ""
+                download_url = getattr(info, "download_url", "") or ""
+                self._update_extra_download_url[name] = download_url
                 link_btn.setVisible(bool(info.html_url))
                 action_btn.setVisible(True)
-                if self._update_extra_download_url.get(name):
-                    action_btn.setText("Download")
+                # Like MonoStudio: compare installed vs latest — only show Download when update available
+                update_available = bool(installed and info.version and is_newer_than(installed, info.version))
+                if update_available and download_url:
+                    action_btn.setText(f"Download {info.version}")
                     action_btn.setObjectName("UpdateProductListBtnDownload")
+                elif download_url:
+                    action_btn.setText("Latest")
+                    action_btn.setObjectName("UpdateProductListBtnLatest")
                 else:
                     action_btn.setText("View on GitHub")
                     action_btn.setObjectName("SettingsCategoryActionButton")
