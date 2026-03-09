@@ -8,6 +8,22 @@
 
 ---
 
+# MonoStudio 26 — Release v26.5.4
+
+## Highlights
+
+- **Fix**: Settings → Updates hiển thị version MonoFXSuite (và extra tools) ngay khi mở, không cần bấm "Check for updates".
+
+## Changes in this release
+
+- fix: _apply_extra_repos_ui — khi chưa có API data vẫn set version = get_extra_tool_installed_version (không ghi "—")
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.5.3
 
 ## Highlights

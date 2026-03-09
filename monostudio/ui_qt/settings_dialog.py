@@ -843,7 +843,8 @@ class SettingsDialog(MonosDialog):
                 action_btn.style().unpolish(action_btn)
                 action_btn.style().polish(action_btn)
             else:
-                ver_l.setText("—")
+                # No API data yet (user hasn't clicked Check) — still show installed version
+                ver_l.setText(get_extra_tool_installed_version(name) or "—")
                 self._update_extra_html_url[name] = fallbacks.get(name, "")
                 self._update_extra_download_url[name] = ""
                 link_btn.setVisible(False)
