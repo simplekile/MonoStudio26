@@ -20,6 +20,7 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -30,7 +31,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QStyle,
@@ -583,6 +583,9 @@ class _SidebarScopePillWidget(QWidget):
             # Optional: set text to "Project (3)" etc.; keeping label only for now, tooltip has count.
 
 
+_SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX = 180
+
+
 class SidebarWidget(QWidget):
     """
     Metadata-driven filter sidebar (UI-only, mock data for now).
@@ -619,6 +622,8 @@ class SidebarWidget(QWidget):
         self._dept_label_by_id: dict[str, str] = {}
         self._dept_icon_by_id: dict[str, str] = {}
         self._dept_parent: dict[str, str] = {}  # dept_id -> parent_id for subdepartment grouping
+        # Mapping from type_id -> list of department ids that type supports (for per-type dept views).
+        self._dept_ids_by_type: dict[str, list[str]] = {}
         # None = not configured yet (will default to first N once). [] is a valid "show none".
         self._visible_departments: list[str] | None = None
         self._visible_types: list[str] | None = None  # type_ids
@@ -668,8 +673,9 @@ class SidebarWidget(QWidget):
         self._dept_list.setFocusPolicy(Qt.NoFocus)
         self._dept_list.setIconSize(QSize(16, 16))
         self._dept_list.setItemDelegate(_SidebarDeptListDelegate(self._dept_list))
-        self._dept_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._dept_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._dept_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._dept_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self._dept_list.itemClicked.connect(self._on_department_clicked)
 
         self._dept_section = QWidget(self)
@@ -678,7 +684,7 @@ class SidebarWidget(QWidget):
         dept_section_lay.setContentsMargins(0, 0, 0, 0)
         dept_section_lay.setSpacing(0)
         dept_section_lay.addWidget(dept_header_row, 0)
-        dept_section_lay.addWidget(self._dept_list, 0)
+        dept_section_lay.addWidget(self._dept_list, 1)
 
         type_header_row = QWidget(self)
         type_header_row.setObjectName("SidebarFilterHeaderRow")
@@ -714,8 +720,9 @@ class SidebarWidget(QWidget):
         self._type_list.setFocusPolicy(Qt.NoFocus)
         self._type_list.setIconSize(QSize(16, 16))
         self._type_list.setItemDelegate(_SidebarDeptListDelegate(self._type_list))
-        self._type_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._type_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._type_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._type_list.setMaximumHeight(_SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX)
         self._type_list.itemClicked.connect(self._on_type_clicked)
 
         self._type_section = QWidget(self)
@@ -790,6 +797,15 @@ class SidebarWidget(QWidget):
         # Load from pipeline metadata (single source of truth), scoped by current mode.
         self.reload_from_pipeline_metadata()
 
+    def dept_section(self) -> QWidget:
+        return self._dept_section
+
+    def type_section(self) -> QWidget:
+        return self._type_section
+
+    def tag_section(self) -> QWidget:
+        return self._tag_section
+
     def reload_from_pipeline_metadata(self) -> None:
         """
         UI-only: load departments/types from pipeline metadata JSON for current mode.
@@ -826,6 +842,7 @@ class SidebarWidget(QWidget):
             self._all_types = []
             self._type_label_by_id = {}
             self._type_icon_by_id = {}
+            self._dept_ids_by_type = {}
             if self._active_department is not None and self._active_department not in set(self._all_departments):
                 self._active_department = None
             if self._active_department is None and self._all_departments:
@@ -844,6 +861,8 @@ class SidebarWidget(QWidget):
         # Types: stable ids + display names.
         types_out: list[tuple[str, str]] = []
         type_icons: dict[str, str] = {}
+        # Rebuild per-type department mapping for current mode.
+        self._dept_ids_by_type = {}
         for type_id, t in meta.types.items():
             if self._mode == "shots":
                 if not _is_shot_type(type_id):
@@ -854,6 +873,15 @@ class SidebarWidget(QWidget):
             types_out.append((type_id, t.name))
             if t.icon_name:
                 type_icons[type_id] = t.icon_name
+            # Per-type department list (for type tabs in Select Departments dialog and sidebar filtering).
+            dept_ids: list[str] = []
+            for d in getattr(t, "departments", []) or []:
+                if isinstance(d, str) and d.strip():
+                    did = d.strip()
+                    if did not in dept_ids:
+                        dept_ids.append(did)
+            if dept_ids:
+                self._dept_ids_by_type[type_id] = dept_ids
         types_out.sort(key=lambda x: x[1].lower())
         self._all_types = [tid for tid, _ in types_out]
         self._type_label_by_id = {tid: name for tid, name in types_out}
@@ -1085,6 +1113,12 @@ class SidebarWidget(QWidget):
             self._visible_departments = [v for v in self._visible_departments if v in cleaned]
 
         visible = self._visible_departments or []
+        # When a type is active in assets/shots mode, restrict visible departments to those
+        # supported by that type. If no type is active, show all departments that pass the
+        # Select Departments filter.
+        if self._mode in ("assets", "shots") and self._active_type and self._active_type in self._dept_ids_by_type:
+            allowed = set(self._dept_ids_by_type.get(self._active_type, []))
+            visible = [d for d in visible if d in allowed]
         parents_with_children = {
             self._dept_parent[d] for d in visible if self._dept_parent.get(d)
         }
@@ -1150,7 +1184,6 @@ class SidebarWidget(QWidget):
                     it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="layers"))
                 self._dept_list.addItem(it)
             self._sync_selection()
-            self._fit_list_height(self._dept_list)
         finally:
             self._dept_list.blockSignals(False)
 
@@ -1210,7 +1243,6 @@ class SidebarWidget(QWidget):
                         it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="folder"))
                     self._type_list.addItem(it)
             self._sync_selection()
-            self._fit_list_height(self._type_list)
         finally:
             self._type_list.blockSignals(False)
 
@@ -1287,7 +1319,9 @@ class SidebarWidget(QWidget):
             return
         # Inbox: không cho unselect type (bắt buộc Client hoặc Freelancer).
         if clicked == self._active_type and self._mode != "inbox":
+            # Toggle off current type (show all departments subject to Select Departments filter).
             self._active_type = None
+            self.set_departments(self._all_departments)
             self._sync_selection()
             self.typeClicked.emit(None)
             self._state_by_mode[self._mode] = self._snapshot_state()
@@ -1296,6 +1330,9 @@ class SidebarWidget(QWidget):
         if clicked == self._active_type:
             return
         self._active_type = clicked
+        # When switching type, refresh department list to show only departments for this type
+        # that also pass the Select Departments visibility filter.
+        self.set_departments(self._all_departments)
         self._sync_selection()
         self.typeClicked.emit(clicked)
         self._state_by_mode[self._mode] = self._snapshot_state()
@@ -1394,6 +1431,18 @@ class SidebarWidget(QWidget):
         self.tagsDefinitionsChanged.emit()
 
     def _open_department_picker(self) -> None:
+        # Build per-type tabs for departments: each tab shows departments that type supports.
+        type_tabs: list[tuple[str, str]] = []
+        dept_ids_by_type: dict[str, list[str]] = {}
+        if self._mode in ("assets", "shots") and self._dept_ids_by_type:
+            for type_id in self._all_types:
+                dept_list = [d for d in self._dept_ids_by_type.get(type_id, []) if d in self._all_departments]
+                if not dept_list:
+                    continue
+                label = self._type_label_by_id.get(type_id, type_id)
+                type_tabs.append((type_id, label))
+                dept_ids_by_type[type_id] = dept_list
+
         dlg = _FilterPickDialog(
             title="Select Departments",
             items=[(d, _title_case_label(self._dept_label_by_id.get(d, d)), self._dept_icon_by_id.get(d)) for d in self._all_departments],
@@ -1402,7 +1451,11 @@ class SidebarWidget(QWidget):
             parent=self,
             dept_parent=self._dept_parent,
             dept_label_by_id=self._dept_label_by_id,
+            type_section_by_id=None,
             list_min_height_px=_FILTER_PICK_LIST_MIN_HEIGHT_DEPT_PX,
+            type_tabs=type_tabs if type_tabs else None,
+            dept_ids_by_type=dept_ids_by_type if dept_ids_by_type else None,
+            current_type_id=self._active_type,
         )
         if dlg.exec() != QDialog.Accepted:
             return
@@ -1480,6 +1533,9 @@ class _FilterPickDialog(MonosDialog):
         dept_label_by_id: dict[str, str] | None = None,
         type_section_by_id: dict[str, str] | None = None,
         list_min_height_px: int | None = None,
+        type_tabs: list[tuple[str, str]] | None = None,  # (type_id, label) for department tabs
+        dept_ids_by_type: dict[str, list[str]] | None = None,
+        current_type_id: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -1496,6 +1552,19 @@ class _FilterPickDialog(MonosDialog):
         self._dept_parent = dept_parent or {}
         self._dept_label_by_id = dept_label_by_id or {}
         self._type_section_by_id = type_section_by_id or {}
+        # Optional per-type tabs for department picker.
+        self._type_tabs: list[tuple[str, str]] = list(type_tabs or [])
+        self._dept_ids_by_type: dict[str, list[str]] = {
+            tid: list(ids) for tid, ids in (dept_ids_by_type or {}).items()
+        }
+        self._current_type_id: str | None = None
+        if self._type_tabs and self._dept_ids_by_type:
+            if current_type_id and current_type_id in self._dept_ids_by_type:
+                self._current_type_id = current_type_id
+            elif self._type_tabs:
+                self._current_type_id = self._type_tabs[0][0]
+        # Global selection set (used when type tabs are enabled).
+        self._selected_ids: set[str] = set(_selected)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -1513,13 +1582,41 @@ class _FilterPickDialog(MonosDialog):
         self._list.setIconSize(QSize(16, 16))
         self._list.selectionModel().selectionChanged.connect(self._sync_hint)
 
+        # Optional type tabs row (for Select Departments dialog).
+        tabs_row: QWidget | None = None
+        if self._type_tabs and self._dept_ids_by_type and self._current_type_id:
+            tabs_row = QWidget(self)
+            tabs_row_l = QHBoxLayout(tabs_row)
+            tabs_row_l.setContentsMargins(0, 0, 0, 0)
+            tabs_row_l.setSpacing(4)
+            self._tab_buttons: list[QPushButton] = []
+            self._tab_group = QButtonGroup(tabs_row)
+            for tid, label in self._type_tabs:
+                btn = QPushButton(label, tabs_row)
+                btn.setObjectName("Tier3Pill")
+                btn.setCheckable(True)
+                btn.setFlat(True)
+                btn.setChecked(tid == self._current_type_id)
+                btn.clicked.connect(lambda _c=False, type_id=tid: self._on_tab_clicked(type_id))
+                self._tab_group.addButton(btn)
+                tabs_row_l.addWidget(btn, 0)
+                self._tab_buttons.append(btn)
+            tabs_row_l.addStretch(1)
+
+        # Build initial list content.
         use_structured = bool(self._dept_parent) or bool(self._type_section_by_id)
-        if use_structured:
+        if self._type_tabs and self._dept_ids_by_type and self._current_type_id:
+            # Tabbed department picker: build list for current type only.
             self._list.setUniformItemSizes(False)
             self._list.setItemDelegate(_SidebarDeptListDelegate(self._list))
-            self._build_structured_list(_selected)
+            self._rebuild_tab_list(self._current_type_id)
         else:
-            self._build_flat_list(_selected)
+            if use_structured:
+                self._list.setUniformItemSizes(False)
+                self._list.setItemDelegate(_SidebarDeptListDelegate(self._list))
+                self._build_structured_list(_selected)
+            else:
+                self._build_flat_list(_selected)
 
         if list_min_height_px is not None:
             self._list.setMinimumHeight(list_min_height_px)
@@ -1542,6 +1639,8 @@ class _FilterPickDialog(MonosDialog):
         btn_l.addWidget(ok, 0)
 
         root.addWidget(self._hint, 0)
+        if tabs_row is not None:
+            root.addWidget(tabs_row, 0)
         root.addWidget(self._list, 1)
         root.addWidget(btn_row, 0)
 
@@ -1559,6 +1658,55 @@ class _FilterPickDialog(MonosDialog):
             self._list.addItem(it)
             if item_id in _selected:
                 it.setSelected(True)
+
+    def _flush_current_tab_selection(self) -> None:
+        """
+        Write current list selection state into _selected_ids for the current tab's
+        departments. Call before switching tab so we don't lose selections.
+        """
+        if not self._type_tabs or not self._dept_ids_by_type or not self._current_type_id:
+            return
+        allowed = set(self._dept_ids_by_type.get(self._current_type_id, []))
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if not it:
+                continue
+            v = it.data(Qt.UserRole)
+            if not isinstance(v, dict) or v.get("type") != _DEPT_ROW_DEPT:
+                continue
+            dept_id = v.get("dept_id")
+            if not isinstance(dept_id, str) or dept_id not in allowed:
+                continue
+            if it.isSelected():
+                self._selected_ids.add(dept_id)
+            else:
+                self._selected_ids.discard(dept_id)
+
+    def _rebuild_tab_list(self, type_id: str) -> None:
+        """
+        Rebuild department list for a given type tab.
+        Uses the same structured department layout but limits items to departments
+        supported by the selected type. Selection is driven by self._selected_ids.
+        Blocks list signals during build so _sync_hint does not run on partial state.
+        """
+        allowed = set(self._dept_ids_by_type.get(type_id, []))
+        sm = self._list.selectionModel()
+        if sm:
+            sm.blockSignals(True)
+        try:
+            self._list.clear()
+            if not allowed:
+                return
+            original_items = self._items
+            self._items = [tup for tup in original_items if tup[0] in allowed]
+            try:
+                self._build_structured_list_depts(self._selected_ids)
+            finally:
+                self._items = original_items
+        finally:
+            if sm:
+                sm.blockSignals(False)
+        self._sync_hint()
 
     def _build_structured_list(self, _selected: set[str]) -> None:
         if self._type_section_by_id:
@@ -1654,6 +1802,19 @@ class _FilterPickDialog(MonosDialog):
 
     def selected_items(self) -> list[str]:
         """Return selected item ids in list order."""
+        # When type tabs are enabled, return union of selected department ids across all tabs
+        # in the stable order of self._items. Otherwise, read directly from the current list.
+        if self._type_tabs and self._dept_ids_by_type:
+            selected: list[str] = []
+            if not self._selected_ids:
+                return selected
+            seen: set[str] = set()
+            for item_id, _label, _icon in self._items:
+                if item_id in self._selected_ids and item_id not in seen:
+                    selected.append(item_id)
+                    seen.add(item_id)
+            return selected
+
         out: list[str] = []
         for i in range(self._list.count()):
             it = self._list.item(i)
@@ -1669,8 +1830,35 @@ class _FilterPickDialog(MonosDialog):
         return out
 
     def _sync_hint(self) -> None:
+        # Keep global selection set in sync when using type tabs.
+        if self._type_tabs and self._dept_ids_by_type and self._current_type_id:
+            allowed = set(self._dept_ids_by_type.get(self._current_type_id, []))
+            # Update self._selected_ids based on current tab's visible rows.
+            for i in range(self._list.count()):
+                it = self._list.item(i)
+                if not it:
+                    continue
+                v = it.data(Qt.UserRole)
+                if isinstance(v, dict) and v.get("type") == _DEPT_ROW_DEPT:
+                    dept_id = v.get("dept_id")
+                    if isinstance(dept_id, str) and dept_id in allowed:
+                        if it.isSelected():
+                            self._selected_ids.add(dept_id)
+                        else:
+                            self._selected_ids.discard(dept_id)
         n = len(self.selected_items())
         self._hint.setText(f"Selected {n}")
+
+    def _on_tab_clicked(self, type_id: str) -> None:
+        """
+        Handle switching between type tabs in Select Departments dialog.
+        Flush current tab selection to _selected_ids before rebuilding so tabs don't overwrite each other.
+        """
+        if type_id == self._current_type_id:
+            return
+        self._flush_current_tab_selection()
+        self._current_type_id = type_id
+        self._rebuild_tab_list(type_id)
 
 
 class _TagPickerDialog(MonosDialog):
@@ -2163,47 +2351,43 @@ class Sidebar(QWidget):
         # Cap top block height so logo + nav never stretch (margins + brand + separators + scope + nav row + spacing)
         top.setMaximumHeight(200)
 
-        # --- Block 2: Scrollable center (Filters only)
-        scroll = QScrollArea(self)
-        scroll.setObjectName("SidebarScrollArea")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-
-        scroll_inner = QWidget(scroll)
-        scroll_layout = QVBoxLayout(scroll_inner)
+        # --- Block 2: Filters (dept/type lists scroll individually; no common scroll)
+        filters_center = QWidget(self)
+        filters_center.setObjectName("SidebarFiltersCenter")
+        filters_center.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scroll_layout = QVBoxLayout(filters_center)
         scroll_layout.setContentsMargins(16, 8, 16, 16)  # 8px top so content doesn’t sit under nav pill
         scroll_layout.setSpacing(24)  # mt-6 between sections
 
         f_h = monos_font("Inter", 10, QFont.Weight.ExtraBold)  # 800
         f_h.setLetterSpacing(QFont.PercentageSpacing, 112)  # tracking-widest-ish
 
-        # Section: FILTERS (metadata-driven; mock data for now)
-        self._filters = SidebarWidget(scroll_inner)
+        # Section: FILTERS — Dept list stretches down to Types; Types+Tags snap bottom.
+        self._filters = SidebarWidget(filters_center)
+        scroll_layout.addWidget(self._filters.dept_section(), 1)
+        scroll_layout.addWidget(self._filters.type_section(), 0)
+        scroll_layout.addWidget(self._filters.tag_section(), 0)
+        self._filters.setFixedSize(0, 0)
+        self._filters.hide()
 
-        scroll_layout.addWidget(self._filters, 1)
-        scroll.setWidget(scroll_inner)
-
-        sep_above_tasks = QFrame(self)
-        sep_above_tasks.setObjectName("SidebarNavSeparator")
-        sep_above_tasks.setFrameShape(QFrame.Shape.HLine)
-        sep_above_tasks.setFrameShadow(QFrame.Shadow.Sunken)
-        sep_above_tasks.setFixedHeight(1)
+        self._sep_above_tasks = QFrame(self)
+        self._sep_above_tasks.setObjectName("SidebarNavSeparator")
+        self._sep_above_tasks.setFrameShape(QFrame.Shape.HLine)
+        self._sep_above_tasks.setFrameShadow(QFrame.Shadow.Sunken)
+        self._sep_above_tasks.setFixedHeight(1)
 
         # --- Block 3: Recent Tasks (fixed height, never stretches when window is maximized)
-        tasks_block = QWidget(self)
-        tasks_block.setObjectName("SidebarRecentTasksBlock")
+        self._tasks_block = QWidget(self)
+        self._tasks_block.setObjectName("SidebarRecentTasksBlock")
         _tasks_list_max = 5 * _TASK_ROW_HEIGHT + 4 * 2
         _tasks_block_h = 12 + 20 + 8 + _tasks_list_max + 8  # margins + header + spacing + list + bottom margin
-        tasks_block.setFixedHeight(_tasks_block_h)
-        tasks_block.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        tasks_layout = QVBoxLayout(tasks_block)
+        self._tasks_block.setFixedHeight(_tasks_block_h)
+        self._tasks_block.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        tasks_layout = QVBoxLayout(self._tasks_block)
         tasks_layout.setContentsMargins(16, 12, 16, 8)  # align with sidebar padding
         tasks_layout.setSpacing(8)
 
-        tasks_header_row = QWidget(tasks_block)
+        tasks_header_row = QWidget(self._tasks_block)
         tasks_header_row.setObjectName("SidebarRecentTasksHeaderRow")
         tasks_header_layout = QHBoxLayout(tasks_header_row)
         tasks_header_layout.setContentsMargins(0, 0, 0, 0)
@@ -2228,11 +2412,11 @@ class Sidebar(QWidget):
         self._tasks_clear_btn.clicked.connect(self.clear_recent_tasks_requested.emit)
         tasks_header_layout.addWidget(self._tasks_clear_btn, 0)
 
-        self._tasks_stacked = QStackedWidget(tasks_block)
+        self._tasks_stacked = QStackedWidget(self._tasks_block)
         self._tasks_stacked.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        self._tasks_empty = QLabel("No tasks", tasks_block)
+        self._tasks_empty = QLabel("No tasks", self._tasks_block)
         self._tasks_empty.setObjectName("SidebarMutedText")
-        self._tasks_list = QListWidget(tasks_block)
+        self._tasks_list = QListWidget(self._tasks_block)
         self._tasks_list.setObjectName("SidebarRecentTasksList")
         self._tasks_list.setItemDelegate(_SidebarRecentTaskDelegate(self._tasks_list))
         self._tasks_list.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -2255,6 +2439,18 @@ class Sidebar(QWidget):
         bottom_layout.setContentsMargins(16, 12, 16, 16)
         bottom_layout.setSpacing(8)
 
+        bottom_layout.addStretch(1)
+
+        self._recent_tasks_visible_btn = QToolButton(bottom)
+        self._recent_tasks_visible_btn.setObjectName("SidebarFooterNavButton")
+        self._recent_tasks_visible_btn.setCursor(Qt.PointingHandCursor)
+        self._recent_tasks_visible_btn.setFocusPolicy(Qt.NoFocus)
+        self._recent_tasks_visible_btn.setAutoRaise(True)
+        self._recent_tasks_visible_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._recent_tasks_visible_btn.setFixedSize(36, 36)
+        self._recent_tasks_visible_btn.clicked.connect(self._on_recent_tasks_visibility_toggled)
+        bottom_layout.addWidget(self._recent_tasks_visible_btn, 0)
+
         self._settings_btn = QToolButton(bottom)
         self._settings_btn.setObjectName("SidebarFooterNavButton")
         self._settings_btn.setCursor(Qt.PointingHandCursor)
@@ -2269,13 +2465,14 @@ class Sidebar(QWidget):
             self._settings_btn.setIconSize(QSize(20, 20))
         self._settings_btn.clicked.connect(self.settings_requested.emit)
         bottom_layout.addWidget(self._settings_btn, 0)
-        bottom_layout.addStretch(1)
 
         root.addWidget(top, 0)
-        root.addWidget(scroll, 1)  # Filters stretch to fill space between nav and Recent Tasks
-        root.addWidget(sep_above_tasks, 0)
-        root.addWidget(tasks_block, 0)
+        root.addWidget(filters_center, 1)
+        root.addWidget(self._sep_above_tasks, 0)
+        root.addWidget(self._tasks_block, 0)
         root.addWidget(bottom, 0)
+
+        self._apply_recent_tasks_visibility()
 
         # Default context: Assets (keeps existing workflow stable)
         self.set_current_context(SidebarContext.ASSETS.value)
@@ -2283,8 +2480,40 @@ class Sidebar(QWidget):
         # Start with empty hierarchy until MainWindow provides an index.
         self.set_project_index(None)
 
+    _RECENT_TASKS_VISIBLE_KEY = "sidebar/recent_tasks_visible"
+    _APP_SETTINGS_ORG, _APP_SETTINGS_APP = "MonoStudio26", "MonoStudio26"
+
     def filters(self) -> SidebarWidget:
         return self._filters
+
+    def _sidebar_settings(self) -> QSettings:
+        return QSettings(self._APP_SETTINGS_ORG, self._APP_SETTINGS_APP)
+
+    def _recent_tasks_visible_from_settings(self) -> bool:
+        raw = self._sidebar_settings().value(self._RECENT_TASKS_VISIBLE_KEY, True)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.lower() not in ("false", "0", "no", "")
+        return bool(raw)
+
+    def _apply_recent_tasks_visibility(self) -> None:
+        visible = self._recent_tasks_visible_from_settings()
+        self._sep_above_tasks.setVisible(visible)
+        self._tasks_block.setVisible(visible)
+        self._recent_tasks_visible_btn.setToolTip("Hide Recent Tasks" if visible else "Show Recent Tasks")
+        # Icon for recent tasks panel visibility (calendar = time / recent).
+        _icon = lucide_icon("calendar", size=20, color_hex=MONOS_COLORS["text_label"])
+        if not _icon.isNull():
+            self._recent_tasks_visible_btn.setIcon(_icon)
+            self._recent_tasks_visible_btn.setIconSize(QSize(20, 20))
+
+    def _on_recent_tasks_visibility_toggled(self, _checked: bool = False) -> None:
+        visible = self._recent_tasks_visible_from_settings()
+        s = self._sidebar_settings()
+        s.setValue(self._RECENT_TASKS_VISIBLE_KEY, not visible)
+        s.sync()
+        self._apply_recent_tasks_visibility()
 
     def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
         self._tasks_list.clear()

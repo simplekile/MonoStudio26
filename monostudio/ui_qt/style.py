@@ -2153,6 +2153,7 @@ def apply_dark_theme(app: QApplication) -> None:
 
         /* Sidebar filter lists (replaces Hierarchy tree) */
         QListWidget#SidebarFilterList {
+            background-color: #121214;
             border-radius: 10px;
             color: #a1a1aa; /* Zinc-400 */
             padding: 6px;
