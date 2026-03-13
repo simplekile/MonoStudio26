@@ -8,7 +8,7 @@
 
 ---
 
-# MonoStudio 26 — Release v26.8.1
+# MonoStudio 26 — Release v26.8.2
 
 ## Highlights
 
