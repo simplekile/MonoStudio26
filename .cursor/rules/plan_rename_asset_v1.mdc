@@ -1,0 +1,131 @@
+---
+description: Kế hoạch Đổi tên Asset — UI, kiểm tra, đổi tên thư mục + work file, rescan
+globs: monostudio/**/*
+alwaysApply: false
+---
+
+# Kế hoạch — Đổi tên Asset (v1)
+
+Đổi tên thư mục asset hiện có và giữ nhất quán pipeline (tên work file, scan, selection). **Shot nằm ngoài phạm vi** kế hoạch này; chỉ áp dụng cho asset.
+
+## Hành vi hiện tại (chưa có đổi tên)
+
+- **Định danh asset**: `Asset.name` = tên thư mục; `item_id` trong app_state / main_view = `str(asset.path)` (đường dẫn tuyệt đối).
+- **Quét**: Asset lấy từ filesystem scan: `assets/<type_folder>/<asset_dir>`; `asset_dir.name` là tên hiển thị và cơ sở cho prefix work file.
+- **Work file**: `work_file_prefix(name=asset_dir.name, department=dept)` → `{name}_{department}_v001.ext`. Scan tìm work file theo prefix này dưới work path của từng department.
+- **Luồng tạo mới**: `CreateAssetDialog` bắt buộc type prefix (vd. `char_` + base) và tên thư mục an toàn; tên thư mục cuối = type short_name + "_" + base.
+
+## Mục tiêu
+
+1. **Điểm vào**: Người dùng có thể gọi "Đổi tên…" từ context menu asset (grid/Inspector).
+2. **Kiểm tra**: Tên mới phải an toàn (không path traversal), không trùng trong cùng type folder, và tuân type prefix (cùng quy tắc như Create).
+3. **Trên đĩa**:
+   - Đổi tên thư mục: `assets/<type>/<tên_cũ>` → `assets/<type>/<tên_mới>` (atomic trên cùng volume).
+   - Đổi tên work file: trong mỗi department, đổi tên file khớp `{tên_cũ}_{dept}_v*.*` thành `{tên_mới}_{dept}_v*.*` để scan vẫn gắn đúng.
+4. **Sau khi đổi tên**: Rescan (hoặc cập nhật tăng dần), cập nhật app_state, reload main view; xóa selection hoặc chọn lại asset theo path mới để UI hiển thị asset đã đổi tên.
+
+## Không nằm trong phạm vi (kế hoạch này)
+
+- Đổi tên shot (kế hoạch riêng nếu cần).
+- Đổi tên inline trong sidebar/tree (chỉ dùng dialog để an toàn).
+- Cập nhật reference bên ngoài (scene DCC, v.v.); trách nhiệm người dùng.
+- Đổi type asset (chuyển sang type folder khác); đó sẽ là "Move asset type" nếu có.
+
+---
+
+## 1. Dữ liệu / core
+
+### 1.1 Đổi tên asset (core)
+
+- **Module mới hoặc thêm vào module có sẵn**: vd. `monostudio/core/asset_rename.py`.
+- **Hàm**: `rename_asset(project_root: Path, asset_path: Path, new_name: str) -> Path`.
+  - **Điều kiện tiên quyết**:
+    - `asset_path` nằm dưới `project_root / assets / <type> / <tên_hiện_tại>` và là thư mục.
+    - `new_name` an toàn (cùng quy tắc `_is_safe_single_folder_name` trong main_window), không rỗng.
+    - `new_name` phải tuân type prefix: lấy type từ thư mục cha qua `TypeRegistry.get_type_by_folder(asset_path.parent.name)`, rồi cùng logic với `CreateAssetDialog.asset_name()`: tên cuối = type short_name + "_" + base (hoặc giữ base nếu đã có prefix). Caller có thể truyền tên đã có prefix; core có thể tùy chọn chuẩn hóa.
+    - Đường dẫn đích `asset_path.parent / new_name` chưa tồn tại.
+  - **Các bước** (thứ tự quan trọng cho rollback):
+    1. Thu thập mọi work file cần đổi tên: với mỗi department dưới `asset_path`, trong work path (theo `use_dcc_folders`: dept hoặc dept/<dcc>/work), tìm file `{tên_cũ}_{dept_id}_v*` (mọi extension DCC từ registry). Xây list `(old_path, new_path)`.
+    2. Đổi tên thư mục: `asset_path.rename(asset_path.parent / new_name)` → `new_asset_path`.
+    3. Đổi tên từng work file: với mỗi `(old_path, new_path)` mà `old_path` nằm dưới asset path cũ, chuyển sang path dưới `new_asset_path` rồi `Path.rename(old, new)`.
+  - **Rollback**: Nếu bước 3 lỗi sau bước 2, best-effort: đổi tên lại work file, rồi đổi tên lại thư mục về tên cũ. Nếu bước 2 lỗi thì không cần rollback.
+  - **Trả về**: `new_asset_path` (Path tới thư mục asset đã đổi tên).
+- **Phụ thuộc**: `StructureRegistry`, `TypeRegistry`, `DepartmentRegistry`, `read_use_dcc_folders`, `get_default_dcc_registry`, `work_file_prefix`, và logic scan để biết thư mục department dưới asset (hoặc duyệt subdir của `asset_path` và khớp với department folders). Ưu tiên tái dùng kiểu lặp `_build_asset_departments` (department folders dưới asset) để biết work path theo từng dept.
+
+### 1.2 Kiểm tra tên / type prefix
+
+- Tái dùng hoặc làm gương `CreateAssetDialog`:
+  - Type từ thư mục cha: `TypeRegistry.get_type_by_folder(asset_path.parent.name)`.
+  - `short_name` của type → prefix (vd. `char_`).
+  - Tên cuối: người dùng nhập "base" hoặc tên đầy đủ; chuẩn hóa thành `prefix + base` (hoặc giữ nguyên nếu đã có prefix). Cùng validation như create: không ký tự path, không `.`/`..`, thư mục đích chưa tồn tại.
+
+---
+
+## 2. UI
+
+### 2.1 Dialog: Đổi tên Asset
+
+- **Tiêu đề**: "Đổi tên Asset"
+- **Trường**:
+  - **Tên hiện tại** (chỉ đọc): `asset_path.name` (monospace).
+  - **Tên mới** (QLineEdit): mặc định = tên hiện tại; placeholder hoặc gợi ý: "vd. char_aya → char_aya_v2". Tùy chọn: hiện preview "Tên thư mục cuối" (đã áp type prefix) như Create.
+- **Validation** (chỉ bật nút Đổi tên khi):
+  - Tên mới an toàn và không rỗng.
+  - Sau khi áp type prefix / chuẩn hóa, tên cuối ≠ tên hiện tại.
+  - Đường dẫn đích chưa tồn tại.
+- **Nút**: Đổi tên (primary), Hủy.
+- **Style**: Theo rule Dialog UI (global stylesheet, DialogPrimaryButton / DialogSecondaryButton, margin 12px, Inter/JetBrains Mono).
+
+### 2.2 Điểm vào
+
+- **Context menu main view (grid)**: Với `item.kind == asset`, thêm action "Đổi tên…" (vd. cạnh "Làm mới", "Xóa…"). Chuyển tới cùng handler bên dưới.
+- **Inspector**: Tùy chọn: khi item chọn là asset, thêm nút hoặc context menu "Đổi tên…" trong identity block; cùng dialog và handler.
+- **Handler** (vd. trong `MainWindow`):
+  - Lấy `asset_path = item.path`, `project_root` từ project hiện tại.
+  - Mở dialog Đổi tên Asset với tên hiện tại = `asset_path.name`.
+  - Khi Accept: gọi `rename_asset(project_root, asset_path, new_name)`; thành công: invalidate thumbnails cho path cũ, chạy cùng luồng refresh sau delete (build_project_index, update_assets/update_shots, commit_immediate, set_project_index, _reload_main_view), rồi tùy chọn chọn asset mới theo path mới và hiện thông báo thành công. Lỗi: hiện lỗi (vd. "Đổi tên thất bại: …").
+
+### 2.3 Nối context menu
+
+- Trong `main_view.py`, `_build_item_context_menu`: với asset (và chỉ asset), thêm:
+  - `rename_act = menu.addAction(lucide_icon("pencil" hoặc "edit-3", ...), "Đổi tên…")`
+  - `menu.setProperty("_act_rename", rename_act)` (nếu dùng properties), và trong `_dispatch_item_context_action` xử lý "Đổi tên…" bằng emit vd. `rename_requested.emit(item)` (chỉ asset).
+- MainWindow kết nối `rename_requested` tới handler mở dialog và chạy `rename_asset` + refresh.
+
+---
+
+## 3. Thứ tự triển khai
+
+1. **Core**: `asset_rename.py` với `rename_asset`, helper kiểm tra tên thư mục an toàn và type prefix, và xây list đổi tên work file (theo work path từng department + khớp prefix). Unit test tùy chọn nhưng hữu ích cho list prefix và rollback.
+2. **Dialog**: `RenameAssetDialog(project_root, asset_path, parent)` với tên hiện tại, ô nhập tên mới, validation, và `new_name()` trả về tên cuối (đã chuẩn hóa).
+3. **Main view**: Thêm "Đổi tên…" vào context menu asset; thêm signal `rename_requested = Signal(object)` (ViewItem); dispatch trong `_dispatch_item_context_action`.
+4. **MainWindow**: Kết nối `rename_requested` → mở dialog → `rename_asset` → refresh (giống sau delete: build index, update_assets, commit_immediate, set_project_index, _reload_main_view), invalidate thumbnails path cũ, tùy chọn chọn asset mới theo path, thông báo thành công.
+
+---
+
+## 4. Trường hợp biên
+
+- **Đổi tên thư mục thất bại** (vd. đích đã tồn tại, quyền): không đổi tên work file nào; hiện lỗi.
+- **Đổi tên work file thất bại** (vd. file đang mở trên Windows): sau khi đã đổi tên thư mục, rollback best-effort work file rồi thư mục; nếu rollback thất bại, hiện lỗi và để thư mục đã đổi tên (người dùng có thể sửa file tay).
+- **Asset rỗng** (không department hoặc không work file): chỉ đổi tên thư mục; không work file cần đổi.
+- **Selection**: Sau refresh, `item_id` theo path; path cũ không còn. Hoặc xóa selection hoặc set selection sang asset mới theo path nếu có trong index mới (ưu tiên chọn asset vừa đổi tên).
+
+---
+
+## 5. Các file cần sửa (tóm tắt)
+
+| Khu vực     | File |
+|-------------|------|
+| Core        | Mới: `monostudio/core/asset_rename.py` (rename_asset, list work file, rollback). Dùng TypeRegistry, DepartmentRegistry, StructureRegistry, fs_reader (work_file_prefix, use_dcc_folders, DCC extensions). |
+| Dialog      | Mới: `monostudio/ui_qt/rename_asset_dialog.py` (RenameAssetDialog). |
+| Context menu / signal | `monostudio/ui_qt/main_view.py` (asset "Đổi tên…", signal rename_requested, dispatch). |
+| Handler     | `monostudio/ui_qt/main_window.py` (kết nối rename_requested, exec dialog, rename_asset, refresh, notification). |
+
+---
+
+## 6. Tham chiếu
+
+- Tạo asset: `CreateAssetDialog` (create_entry_dialogs.py), `_create_asset` (main_window.py), `_is_safe_single_folder_name`, type prefix trong `asset_name()`.
+- Xóa asset: `_on_delete_requested` (main_window.py), `DeleteConfirmDialog`, refresh sau delete (build_project_index, update_assets/update_shots, commit_immediate, _reload_main_view).
+- Đặt tên work file: `work_file_prefix`, `get_work_file_path`, `_scan_work_versions` (fs_reader.py); bố cục department: `_build_asset_departments`, `resolve_work_path`, `read_use_dcc_folders`.
+- Force rename project: `force_rename_project_id` (project_rename.py), dialog có validation và xác nhận (nặng hơn đổi tên asset).

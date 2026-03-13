@@ -307,7 +307,33 @@ class _SidebarDeptListDelegate(QStyledItemDelegate):
                 ir = QRect(x, r.center().y() - icon_size.height() // 2, icon_size.width(), icon_size.height())
                 opt.icon.paint(painter, ir, Qt.AlignCenter, QIcon.Selected if is_selected else QIcon.Normal)
                 x = ir.right() + 8
-            text_rect = QRect(x, r.top(), max(0, inner.right() - x), r.height())
+            text_right = inner.right()
+            count = data.get("count") if isinstance(data, dict) else None
+            if count is not None:
+                badge_font = QFont(opt.font.family(), 8, QFont.Weight.Medium)
+                badge_fm = QFontMetrics(badge_font)
+                badge_text = str(count)
+                badge_pad_h = 4
+                badge_pad_v = 1
+                badge_w = badge_fm.horizontalAdvance(badge_text) + badge_pad_h * 2
+                badge_h = min(badge_fm.height() + badge_pad_v * 2, r.height() - 6)
+                badge_w = max(badge_w, 14)
+                text_right = inner.right() - badge_w - 2
+                badge_rect = QRect(inner.right() - badge_w, r.center().y() - badge_h // 2, badge_w, badge_h)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(Qt.PenStyle.NoPen)
+                is_zero = count == 0
+                if is_zero:
+                    painter.setBrush(QColor(39, 39, 42))
+                    painter.drawRoundedRect(badge_rect, 3, 3)
+                    painter.setPen(QColor(MONOS_COLORS.get("text_meta", "#71717a")))
+                else:
+                    painter.setBrush(QColor(MONOS_COLORS.get("blue_700", "#075985")))
+                    painter.drawRoundedRect(badge_rect, 3, 3)
+                    painter.setPen(QColor(255, 255, 255, 180))
+                painter.setFont(badge_font)
+                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+            text_rect = QRect(x, r.top(), max(0, text_right - x), r.height())
             fm = QFontMetrics(opt.font)
             text = fm.elidedText(opt.text, Qt.ElideRight, text_rect.width())
             pen_color = QColor(MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"])
@@ -630,6 +656,11 @@ class SidebarWidget(QWidget):
 
         # Per-page state (Assets vs Shots). Keep UI selections when switching pages.
         self._state_by_mode: dict[str, dict[str, object]] = {}
+        # Per-type department selection (type_id -> department_id); restored when switching type.
+        self._department_by_type: dict[str, str | None] = {}
+        # Item counts for label display (set by sidebar container from ProjectIndex).
+        self._count_by_type: dict[str, int] = {}
+        self._count_by_department: dict[str, int] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -932,6 +963,11 @@ class SidebarWidget(QWidget):
             self._active_type = None
         if self._active_department is not None and self._active_department not in set(self._all_departments):
             self._active_department = None
+        # When a type is active, department must be in that type's allowed list (per-type restore).
+        if self._active_type and self._active_type in self._dept_ids_by_type:
+            allowed = set(self._dept_ids_by_type[self._active_type])
+            if self._active_department not in allowed:
+                self._active_department = self._dept_ids_by_type[self._active_type][0] if self._dept_ids_by_type[self._active_type] else None
 
         self.set_departments(self._all_departments)
         self.set_types(self._all_types)
@@ -1011,6 +1047,7 @@ class SidebarWidget(QWidget):
         typ = self._settings.value(self._settings_key(mode, "active_type"), "", str)
         vd_raw = self._settings.value(self._settings_key(mode, "visible_departments"), "", str)
         vt_raw = self._settings.value(self._settings_key(mode, "visible_types"), "", str)
+        dbt_raw = self._settings.value(self._settings_key(mode, "department_by_type"), "", str) if mode != "inbox" else ""
 
         def load_list(raw: str) -> list[str] | None:
             s = (raw or "").strip()
@@ -1024,9 +1061,22 @@ class SidebarWidget(QWidget):
                 pass
             return None
 
+        def load_department_by_type(raw: str) -> dict[str, str | None]:
+            s = (raw or "").strip()
+            if not s:
+                return {}
+            try:
+                data = json.loads(s)
+                if isinstance(data, dict):
+                    return {k: (v if isinstance(v, str) and v.strip() else None) for k, v in data.items() if isinstance(k, str) and k.strip()}
+            except json.JSONDecodeError:
+                pass
+            return {}
+
         state: dict[str, object] = {
             "active_department": dep.strip() if dep and dep.strip() else None,
             "active_type": typ.strip() if typ and typ.strip() else None,
+            "department_by_type": load_department_by_type(dbt_raw) if mode in ("assets", "shots") else {},
             "visible_departments": load_list(vd_raw) if mode != "inbox" else None,
             "visible_types": load_list(vt_raw),
         }
@@ -1043,6 +1093,12 @@ class SidebarWidget(QWidget):
             self._state_by_mode[mode] = state
         self._settings.setValue(self._settings_key(mode, "active_department"), state.get("active_department") or "")
         self._settings.setValue(self._settings_key(mode, "active_type"), state.get("active_type") or "")
+        if mode in ("assets", "shots"):
+            dbt = state.get("department_by_type")
+            self._settings.setValue(
+                self._settings_key(mode, "department_by_type"),
+                json.dumps(dbt if isinstance(dbt, dict) else {}, ensure_ascii=False),
+            )
         self._settings.setValue(
             self._settings_key(mode, "visible_departments"),
             json.dumps(state.get("visible_departments"), ensure_ascii=False),
@@ -1076,6 +1132,7 @@ class SidebarWidget(QWidget):
         return {
             "active_department": self._active_department,
             "active_type": self._active_type,
+            "department_by_type": dict(self._department_by_type),
             "visible_departments": list(self._visible_departments) if self._visible_departments is not None else None,
             "visible_types": list(self._visible_types) if self._visible_types is not None else None,
         }
@@ -1084,11 +1141,21 @@ class SidebarWidget(QWidget):
         if not state:
             self._active_department = None
             self._active_type = None
+            self._department_by_type = {}
             self._visible_departments = None
             self._visible_types = None
             return
-        self._active_department = state.get("active_department") if isinstance(state.get("active_department"), str) else None
         self._active_type = state.get("active_type") if isinstance(state.get("active_type"), str) else None
+        dbt = state.get("department_by_type")
+        if isinstance(dbt, dict):
+            self._department_by_type = {k: v if isinstance(v, str) and v.strip() else None for k, v in dbt.items() if isinstance(k, str) and k.strip()}
+        else:
+            self._department_by_type = {}
+        # Restore department for current type when available; else fallback to legacy active_department.
+        if self._active_type and self._active_type in self._department_by_type and self._department_by_type[self._active_type]:
+            self._active_department = self._department_by_type[self._active_type]
+        else:
+            self._active_department = state.get("active_department") if isinstance(state.get("active_department"), str) else None
 
         vd = state.get("visible_departments")
         if vd is None:
@@ -1167,17 +1234,18 @@ class SidebarWidget(QWidget):
                     next_parent = self._dept_parent.get(visible[i + 1])
                     last_in_block = next_parent != parent_id
 
-                label = self._dept_label_by_id.get(dept_id, dept_id)
-                it = QListWidgetItem(_title_case_label(label))
-                it.setData(
-                    Qt.UserRole,
-                    {
-                        "type": _DEPT_ROW_DEPT,
-                        "dept_id": dept_id,
-                        "round_top": next_dept_round_top,
-                        "round_bottom": last_in_block,
-                    },
-                )
+                label = _title_case_label(self._dept_label_by_id.get(dept_id, dept_id))
+                count = self._count_by_department.get(dept_id)
+                it = QListWidgetItem(label)
+                role: dict = {
+                    "type": _DEPT_ROW_DEPT,
+                    "dept_id": dept_id,
+                    "round_top": next_dept_round_top,
+                    "round_bottom": last_in_block,
+                }
+                if count is not None:
+                    role["count"] = count
+                it.setData(Qt.UserRole, role)
                 next_dept_round_top = False
                 icon_name = self._dept_icon_by_id.get(dept_id)
                 if icon_name:
@@ -1194,6 +1262,9 @@ class SidebarWidget(QWidget):
             self._visible_types = cleaned[: self._max_visible]
         else:
             self._visible_types = [v for v in self._visible_types if v in cleaned]
+        # After Assets→Shots→Assets restore, ensure all types are visible so user can select any (e.g. Character).
+        if self._mode in ("assets", "shots") and cleaned and (not self._visible_types or len(self._visible_types) < len(cleaned)):
+            self._visible_types = cleaned[: self._max_visible]
 
         visible = self._visible_types or []
         # Group by section: Assets vs Shots (same structure as department list).
@@ -1226,17 +1297,18 @@ class SidebarWidget(QWidget):
                 next_type_round_top = False
                 for i, type_id in enumerate(type_ids):
                     last_in_block = i + 1 >= len(type_ids)
-                    label = self._type_label_by_id.get(type_id, type_id)
-                    it = QListWidgetItem(_title_case_label(label))
-                    it.setData(
-                        Qt.UserRole,
-                        {
-                            "type": _DEPT_ROW_DEPT,
-                            "dept_id": type_id,
-                            "round_top": next_type_round_top,
-                            "round_bottom": last_in_block,
-                        },
-                    )
+                    label = _title_case_label(self._type_label_by_id.get(type_id, type_id))
+                    count = self._count_by_type.get(type_id)
+                    it = QListWidgetItem(label)
+                    role = {
+                        "type": _DEPT_ROW_DEPT,
+                        "dept_id": type_id,
+                        "round_top": next_type_round_top,
+                        "round_bottom": last_in_block,
+                    }
+                    if count is not None:
+                        role["count"] = count
+                    it.setData(Qt.UserRole, role)
                     next_type_round_top = False
                     icon_name = self._type_icon_by_id.get(type_id)
                     if icon_name:
@@ -1245,6 +1317,22 @@ class SidebarWidget(QWidget):
             self._sync_selection()
         finally:
             self._type_list.blockSignals(False)
+
+    def set_item_counts(
+        self,
+        count_by_type: dict[str, int] | None = None,
+        count_by_department: dict[str, int] | None = None,
+    ) -> None:
+        """Set counts for types and departments (from ProjectIndex). None = clear counts."""
+        self._count_by_type = dict(count_by_type) if count_by_type is not None else {}
+        self._count_by_department = dict(count_by_department) if count_by_department is not None else {}
+
+    def refresh_list_counts(self) -> None:
+        """Rebuild department and type lists so counts are visible. Call after set_item_counts."""
+        if self._all_departments:
+            self.set_departments(self._all_departments)
+        if self._all_types:
+            self.set_types(self._all_types)
 
     def set_selected_department(self, dept_id: str | None, *, emit: bool = True) -> None:
         """Set department selection. If emit=True, emit departmentClicked (user click).
@@ -1305,6 +1393,8 @@ class SidebarWidget(QWidget):
             self._save_state_for_mode(self._mode)
             return
         self._active_department = clicked
+        if self._active_type:
+            self._department_by_type[self._active_type] = clicked
         self._sync_selection()
         self.departmentClicked.emit(clicked)
         self._state_by_mode[self._mode] = self._snapshot_state()
@@ -1319,6 +1409,9 @@ class SidebarWidget(QWidget):
             return
         # Inbox: không cho unselect type (bắt buộc Client hoặc Freelancer).
         if clicked == self._active_type and self._mode != "inbox":
+            # Save current department for this type before clearing type.
+            if self._active_type:
+                self._department_by_type[self._active_type] = self._active_department
             # Toggle off current type (show all departments subject to Select Departments filter).
             self._active_type = None
             self.set_departments(self._all_departments)
@@ -1329,7 +1422,18 @@ class SidebarWidget(QWidget):
             return
         if clicked == self._active_type:
             return
+        # Save current department for current type before switching.
+        if self._active_type:
+            self._department_by_type[self._active_type] = self._active_department
         self._active_type = clicked
+        # Restore department for the new type; validate it is allowed for this type.
+        allowed_list = self._dept_ids_by_type.get(clicked, [])
+        allowed_set = set(allowed_list)
+        restored = self._department_by_type.get(clicked) if clicked else None
+        if restored and restored in allowed_set:
+            self._active_department = restored
+        else:
+            self._active_department = allowed_list[0] if allowed_list else None
         # When switching type, refresh department list to show only departments for this type
         # that also pass the Select Departments visibility filter.
         self.set_departments(self._all_departments)
@@ -2604,10 +2708,76 @@ class Sidebar(QWidget):
         """
         UI-only:
         - Keep nav badges (Assets/Shots counts) in sync from already-loaded memory.
-        - No hierarchy tree (replaced by metadata-driven filter panel).
+        - Push type/department counts to filter panel for label display.
         """
         self._project_index = project_index
         self._sync_nav_badges()
+        self._push_filter_counts()
+
+    def _compute_filter_counts(self) -> tuple[dict[str, int], dict[str, int]]:
+        """Compute count_by_type and count_by_department from current project index and scope (Assets vs Shots)."""
+        count_by_type: dict[str, int] = {}
+        count_by_department: dict[str, int] = {}
+        pi = self._project_index
+        if pi is None:
+            return count_by_type, count_by_department
+
+        def norm(s: str) -> str:
+            return (s or "").strip().casefold()
+
+        ctx = self.current_context()
+        filter_types = getattr(self._filters, "_all_types", []) or []
+        filter_depts = getattr(self._filters, "_all_departments", []) or []
+
+        if ctx == SidebarContext.ASSETS.value:
+            by_type_norm: dict[str, int] = {}
+            by_dept_norm: dict[str, int] = {}
+            active_type = self._filters.current_type()
+            active_type_norm = norm(active_type or "")
+            for a in pi.assets:
+                at = norm(a.asset_type or "")
+                if at:
+                    by_type_norm[at] = by_type_norm.get(at, 0) + 1
+                # Department count: only assets of the currently selected type (if any), and only if dept has work file.
+                if active_type_norm and at != active_type_norm:
+                    continue
+                for d in a.departments:
+                    if not getattr(d, "work_file_exists", False):
+                        continue
+                    dn = norm(getattr(d, "name", None) or "")
+                    if dn:
+                        by_dept_norm[dn] = by_dept_norm.get(dn, 0) + 1
+            for tid in filter_types:
+                count_by_type[tid] = by_type_norm.get(norm(tid), 0)
+            for did in filter_depts:
+                count_by_department[did] = by_dept_norm.get(norm(did), 0)
+        elif ctx == SidebarContext.SHOTS.value:
+            shots_list = list(pi.shots)
+            for type_id in filter_types:
+                if _is_shot_type(type_id):
+                    count_by_type[type_id] = len(shots_list)
+            by_dept_norm: dict[str, int] = {}
+            for s in shots_list:
+                for d in s.departments:
+                    if not getattr(d, "work_file_exists", False):
+                        continue
+                    dn = norm(getattr(d, "name", None) or "")
+                    if dn:
+                        by_dept_norm[dn] = by_dept_norm.get(dn, 0) + 1
+            for did in filter_depts:
+                count_by_department[did] = by_dept_norm.get(norm(did), 0)
+
+        return count_by_type, count_by_department
+
+    def _push_filter_counts(self) -> None:
+        """Update filter panel with current type/department counts and refresh list labels."""
+        ctx = self.current_context()
+        if ctx not in (SidebarContext.ASSETS.value, SidebarContext.SHOTS.value):
+            self._filters.set_item_counts(None, None)
+            return
+        count_by_type, count_by_department = self._compute_filter_counts()
+        self._filters.set_item_counts(count_by_type, count_by_department)
+        self._filters.refresh_list_counts()
 
     def _on_current_nav_item_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         if current is None:

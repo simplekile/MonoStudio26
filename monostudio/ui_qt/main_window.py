@@ -34,6 +34,7 @@ from monostudio.core.pipeline_types_and_presets import (
     seed_project_from_user_default,
 )
 from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
+from monostudio.core.asset_rename import rename_asset
 from monostudio.core.pending_create import remove_by_entity, remove_for_entities, clear_all as pending_clear_all
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
 from monostudio.core.inbox_reader import add_to_inbox, append_inbox_distributed
@@ -50,6 +51,7 @@ from monostudio.ui_qt.sidebar import Sidebar
 from monostudio.ui_qt.top_bar import TopBar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog, ask_delete_folder
+from monostudio.ui_qt.rename_asset_dialog import RenameAssetDialog
 from monostudio.ui_qt.app_controller import AppController
 from monostudio.ui_qt.app_state import AppState
 from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
@@ -265,6 +267,7 @@ class MainWindow(FramelessMainWindow):
         # Clipboard thumbnail overrides: refresh UI after successful paste.
         self._clipboard_thumbs.thumbnailUpdated.connect(self._on_thumbnail_updated)
         self._main_view.delete_requested.connect(self._on_delete_requested)
+        self._main_view.rename_requested.connect(self._on_rename_asset_requested)
         self._main_view.switch_project_requested.connect(self._on_switch_project_requested)
         self._main_view.primary_action_requested.connect(self._on_primary_action_requested)
         self._main_view.search_query_changed.connect(self._on_search_query_changed)
@@ -512,6 +515,10 @@ class MainWindow(FramelessMainWindow):
             return
         self._filter_switch_in_progress = True
         try:
+            # Force sync filter from sidebar before reload (fixes type desync: Assets→Shots→Assets then switch to Character).
+            if ctx == "Assets":
+                self._sync_filter_state_from_sidebar()
+                self._main_view.clear()
             self._reload_main_view()
         finally:
             self._filter_switch_in_progress = False
@@ -917,6 +924,72 @@ class MainWindow(FramelessMainWindow):
         self._sync_primary_action()
         notification_service.success(f"Deleted {kind_label} '{name}'.")
 
+    def _on_rename_asset_requested(self, item: ViewItem) -> None:
+        """
+        Rename (asset only):
+        - Dialog validates target name
+        - Renames asset folder on disk + renames work files to match pipeline prefix
+        - On success: refresh in-memory index and app_state (same style as delete), keep selection on renamed asset
+        """
+        if self._project_index is None or self._project_root is None:
+            return
+        if item.kind.value != "asset":
+            return
+
+        old_path = Path(item.path)
+        try:
+            if not old_path.exists():
+                return
+        except OSError:
+            return
+
+        dlg = RenameAssetDialog(project_root=self._project_root, asset_path=old_path, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        try:
+            result = rename_asset(
+                project_root=self._project_root,
+                asset_path=old_path,
+                new_name=dlg.final_name(),
+            )
+        except (OSError, PermissionError, ValueError, FileExistsError) as e:
+            logging.warning("Rename asset failed: %s", e)
+            notification_service.error(f"Rename failed: {e}")
+            return
+        except Exception as e:
+            logging.exception("Rename asset failed unexpectedly: %s", e)
+            notification_service.error(f"Rename failed: {e}")
+            return
+
+        new_path = result.new_path
+
+        # Clear inspector if it points at old or new path (will be reloaded by selection).
+        cur = self._main_view.selected_view_item()
+        if cur is not None and getattr(cur, "path", None) in (old_path, new_path):
+            self._inspector.set_item(None)
+
+        # Invalidate thumbnails for both ids (ids are absolute path strings).
+        self._app_state.invalidate_thumbnails([str(old_path), str(new_path)])
+
+        # Refresh index/state; simplest is rebuild index (consistent with delete).
+        self._project_index = build_project_index(self._project_index.root)
+        self._app_state.update_assets(list(self._project_index.assets))
+        self._app_state.update_shots(list(self._project_index.shots))
+        self._app_state.commit_immediate()
+        self._sidebar.set_project_index(self._project_index)
+        self._reload_main_view()
+        self._sync_primary_action()
+
+        # Keep selection on renamed asset if it exists in the refreshed index.
+        try:
+            if new_path.exists():
+                self._app_state.set_selection(str(new_path))
+        except Exception:
+            pass
+
+        notification_service.success(f"Renamed Asset '{old_path.name}' → '{new_path.name}'.")
+
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)
         self._apply_workspace_root(path or None, save=False)
@@ -966,8 +1039,8 @@ class MainWindow(FramelessMainWindow):
                 self._sync_filter_state_from_sidebar()
                 # Clear so diff application does not mix with previous context data.
                 self._main_view.clear()
-                # Deterministic autoscan trigger (locked rule).
-                self._rescan_project()
+                # Scan in background to avoid blocking UI when switching between Assets/Shots.
+                self._submit_rescan_task()
                 self._reload_main_view()
             elif context_name == "Inbox":
                 self._sync_filter_state_from_sidebar()
@@ -1104,6 +1177,10 @@ class MainWindow(FramelessMainWindow):
         _dcc_log.debug("assetsChanged signal added=%s removed=%s updated=%s", added, removed, updated)
         if self._sidebar.current_context() != "Assets":
             _dcc_log.debug("assetsChanged ignored (context != Assets)")
+            return
+        # Do not apply diff during filter switch (type/department change); _reload_main_view does full replace.
+        if getattr(self, "_filter_switch_in_progress", False):
+            _dcc_log.debug("assetsChanged ignored (_filter_switch_in_progress)")
             return
         # Build Asset lists so grid receives diffs only; grid does not query AppState.
         added_assets = []
@@ -1742,6 +1819,10 @@ class MainWindow(FramelessMainWindow):
             return
 
         if context == "Assets":
+            # Sync type from sidebar so filter matches visible selection (fixes desync after Assets→Shots→Assets then type change).
+            _type_from_sidebar = self._sidebar.filters().current_type()
+            if _type_from_sidebar is not None:
+                self.current_type = _type_from_sidebar
             # Render from AppState; filter and build ViewItems (used for initial load and on filtersChanged).
             assets_ordered = self._app_state.get_assets_in_order()
             filtered_assets = self.filter_assets(

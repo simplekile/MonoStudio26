@@ -8,6 +8,52 @@
 
 ---
 
+# MonoStudio 26 — Release v26.8.1
+
+## Highlights
+
+- **Inspector — Department Pipeline mới**: Hiển thị rõ subdepartment theo group Modelling/Rigging/Surfacing…, kèm border focus (sidebar vs Inspector) và nút nhanh tới folder từng department.
+- **Inspector — Identity & DCC badges**: Double‑click badge DCC mở thẳng work file mới nhất của DCC đó; hàng nút Asset/Work/Publish folder giúp truy cập thư mục nhanh hơn.
+- **Assets/Shots switch mượt hơn**: Khi chuyển giữa Assets và Shots, app chỉ reload UI từ dữ liệu sẵn có; filesystem scan chạy nền qua WorkerManager nên UI không bị khựng.
+- **Inspector thumbnail gọn hơn**: Các nút Fill/Fit, Paste, Remove trên thumbnail trong Inspector chỉ hiện khi hover vào vùng thumbnail, không chiếm chỗ khi xem nhanh.
+
+## Changes in this release
+
+- feat: Department Pipeline trong Inspector ẩn hàng department cha dư thừa (Modelling, Rigging, Surfacing…) khi đã có subdepartment; thêm section header nhỏ, đồng bộ typography/hover, và folder icon riêng từng department.
+- feat: Department focus: sidebar focus hiển thị border vàng (persistent), click ngay trong Inspector tạo temp focus border xanh; click nền bỏ temp focus và revert về sidebar focus; khi mở app + chọn asset đầu tiên, Inspector tự sync focus với sidebar filter.
+- feat: Inspector Identity — double‑click vào DCC badge dùng `_path_for_version()` để mở trực tiếp work file mới nhất cho department + DCC đó.
+- feat: Inspector Asset row — nút `Open folder` đổi thành ba nút `Asset folder`, `Work folder`, `Publish folder` (work/publish mở theo department đang focus trong Inspector).
+- fix: Assets/Shots context switch dùng `_submit_rescan_task()` (scan nền) thay cho `_rescan_project()` đồng bộ; giữ lại trigger rescan khi Refresh và các luồng khác.
+- fix: Inspector preview thumbnail — nút overlay (Fill/Fit, Paste, Remove) chỉ hiện khi hover, xử lý hover ổn định cả khi rê chuột chậm từ khoảng trống bên trái, không bị nháy khi đi qua icon.
+- feat: Inspector thumbnail actions — khi bấm Paste hoặc Remove, hiển thị cặp nút Apply (icon square‑check, xanh lá) và Cancel (icon x, đỏ) ở góc phải; chỉ khi bấm Apply mới thực sự paste/xóa thumbnail, Cancel thì giữ nguyên.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
+# MonoStudio 26 — Release v26.8.0
+
+## Highlights
+
+- **Sidebar — Departments / Types**: Departments snap trên cùng, list kéo dài xuống sát header Types; Types có danh sách riêng, nằm sát Recent Tasks / footer.
+- **Select Departments dialog**: Thêm tabs theo loại (type); mỗi tab chỉ hiển thị những department mà type đó hỗ trợ, đồng bộ với filter ở sidebar.
+- **Recent Tasks**: Nút icon `calendar` cạnh nút Settings để ẩn/hiện block Recent Tasks; trạng thái được lưu qua QSettings.
+
+## Changes in this release
+
+- feat: Sidebar filters — Departments list stretch tới vị trí Types; Types + Tags snap phía dưới, mỗi list có scroll riêng.
+- feat: Select Departments dialog — per-type tabs, chọn department theo từng type, đồng bộ với filter sidebar.
+- feat: Sidebar footer — nút toggle visibility Recent Tasks (icon calendar), lưu `sidebar/recent_tasks_visible` trong QSettings (MonoStudio26).
+- style: SidebarFilterList container nền tối hơn sidebar một chút (`#101012`), giữ border-radius 10px.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.7.2
 
 ## Highlights
@@ -169,13 +215,13 @@ Tải **MonoStudio26_Setup.exe** từ Assets bên dưới và chạy. Installer 
 
 - **Build & Release docs**: Thêm `docs/BUILD_AND_RELEASE.md` — quick reference build → push → publish; chi tiết trong `.cursor/rules/rule_build_v1.mdc`.
 - **Extra tool spec**: Thêm `docs/MONOSTUDIO_EXTRA_TOOL_SPEC.md` — yêu cầu tích hợp cho tool ngoài (vd. MonoFXSuite): vị trí cài, file VERSION, GitHub Release.
-- **UI / Settings / Style**: Cập nhật settings dialog, style, update checker.
+- **Sidebar**: Thêm / cập nhật tính năng mới ở sidebar (layout + selectable list pattern thống nhất với rule `selectable_list_pattern_v1`).
 
 ## Changes in this release
 
 - docs: BUILD_AND_RELEASE.md (build → publish flow)
 - docs: MONOSTUDIO_EXTRA_TOOL_SPEC.md (vị trí cài, VERSION, release cho extra tools)
-- feat: ui update (settings, style, update_checker)
+- feat: sidebar ui update (selectable list pattern, style)
 
 ---
 

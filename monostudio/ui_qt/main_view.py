@@ -1248,6 +1248,7 @@ class MainView(QWidget):
     refresh_requested = Signal()
     root_context_menu_requested = Signal(object)  # emits global QPoint
     copy_inventory_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    rename_requested = Signal(object)  # emits ViewItem (asset only)
     delete_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_with_requested = Signal(object)  # emits ViewItem (asset/shot only)
@@ -1806,8 +1807,11 @@ class MainView(QWidget):
             self._grid_delegate.set_active_department(self._active_department, icon_name=self._active_department_icon_name)
         except Exception:
             pass
+        # Always reset thumb states and prefetch when department changes; also run prefetch when only type changed (set_items already scheduled it, but ensure delegate/context is in sync).
         if prev_dept != self._active_department:
             self._reset_thumb_states_and_prefetch()
+        else:
+            self._schedule_thumbnail_prefetch()
 
     def get_active_dcc(self, item_path: Path | None, department: str | None) -> str | None:
         """Forward to grid delegate (cache + persistence)."""
@@ -2006,6 +2010,8 @@ class MainView(QWidget):
         def _reenable_and_update():
             self.setUpdatesEnabled(True)
             self._update_empty_states()
+            # Schedule thumbnail prefetch after stack has switched to tile view (fixes missing thumbnails on type/department toggle).
+            self._schedule_thumbnail_prefetch()
 
         QTimer.singleShot(0, _reenable_and_update)
 
@@ -3064,12 +3070,15 @@ class MainView(QWidget):
         menu.addSeparator()
 
         delete_action = None
+        rename_action = None
         refresh_action = None
         open_work = None
         open_publish = None
 
         if item.kind.value in ("asset", "shot"):
             refresh_action = menu.addAction(lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
+            if item.kind.value == "asset":
+                rename_action = menu.addAction(lucide_icon("pencil", size=16, color_hex=MONOS_COLORS["text_label"]), "Rename…")
             delete_action = menu.addAction(lucide_icon("trash-2", size=16, color_hex="#ef4444"), "Delete…")
             if delete_action is not None:
                 delete_action.setProperty("class", "danger-action")
@@ -3083,6 +3092,7 @@ class MainView(QWidget):
         menu.setProperty("_act_open_with", open_with_action)
         menu.setProperty("_act_create_new", create_new_action)
         menu.setProperty("_act_refresh", refresh_action)
+        menu.setProperty("_act_rename", rename_action)
         menu.setProperty("_act_delete", delete_action)
         menu.setProperty("_act_open_work", open_work)
         menu.setProperty("_act_open_publish", open_publish)
@@ -3141,6 +3151,10 @@ class MainView(QWidget):
             return
         if text == "Refresh":
             self.refresh_requested.emit()
+            return
+        if text == "Rename…":
+            if item.kind.value == "asset":
+                self.rename_requested.emit(item)
             return
         if text == "Delete…":
             self.delete_requested.emit(item)

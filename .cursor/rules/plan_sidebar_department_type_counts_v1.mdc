@@ -1,0 +1,137 @@
+---
+description: Plan hiển thị số đếm asset/shot ở DEPARTMENTS và TYPES trong sidebar filter.
+alwaysApply: false
+---
+
+# Plan: Hiển thị số đếm ở Departments và Types (Sidebar)
+
+Kế hoạch hiển thị **số đếm** (count) cạnh mỗi mục trong danh sách **DEPARTMENTS** và **TYPES** của sidebar filter panel (trang Assets / Shots), để user thấy nhanh có bao nhiêu asset/shot thuộc từng type hoặc có department tương ứng.
+
+---
+
+## 1. Phạm vi
+
+- **Vị trí:** `SidebarWidget` (filter panel) — danh sách DEPARTMENTS và danh sách TYPES.
+- **Context:** Chỉ khi mode = **assets** hoặc **shots** (không áp dụng cho Inbox / Reference).
+- **Nguồn dữ liệu:** Đếm từ `ProjectIndex` (assets, shots) đã load — không quét filesystem thêm.
+
+---
+
+## 2. Định nghĩa số đếm
+
+### 2.1 TYPES (Character, Env, Shot type, …)
+
+- **Assets page:** Với mỗi **type_id** (Character, Env, …):  
+  `count = số asset có asset_type == type_id`.
+- **Shots page:** Với mỗi **type_id** (shot type, nếu có):  
+  `count = số shot thuộc type đó`. (Nếu project không phân shot theo type thì có thể dùng tổng shots cho mọi type hoặc ẩn count.)
+
+Công thức (Assets):  
+`count_by_type[type_id] = len([a for a in project_index.assets if (a.asset_type or "").strip() == type_id])`  
+Chuẩn hóa so sánh (casefold) nếu pipeline dùng alias.
+
+### 2.2 DEPARTMENTS (Model, Rig, Texture, …)
+
+- **Ý nghĩa:** Số asset (hoặc shot) **có tồn tại department đó** (có folder / work cho department).
+- **Assets page:**  
+  `count_by_dept[dept_id] = len([a for a in project_index.assets if any((d.name or "").strip() == dept_id for d in a.departments)])`.  
+  Nếu đang chọn **type** (Character, Env, …): có thể hiển thị count **trong type đó** (chặt chẽ hơn):  
+  `count = số asset thỏa asset_type == current_type và có department dept_id`.
+- **Shots page:**  
+  Tương tự với `project_index.shots` và `shot.departments`.
+
+Đề xuất: **Luôn đếm trong toàn project** (không lọc theo type đang chọn) để label ổn định khi user toggle type; nếu muốn “count theo type” có thể làm phase 2.
+
+---
+
+## 3. Luồng dữ liệu
+
+### 3.1 Ai sở hữu ProjectIndex?
+
+- **Sidebar container** (chứa nav + scope pill + `_filters`: SidebarWidget) có `_project_index` và gọi `set_project_index(project_index)` (từ main_window khi load / rescan project).
+- **SidebarWidget** (filter panel) hiện **không** nhận project_index; nó chỉ nhận pipeline metadata (types, departments từ JSON) và mode.
+
+### 3.2 Cách truyền counts vào filter panel
+
+**Option A – Truyền counts từ sidebar container (đề xuất):**
+
+- Sidebar container khi gọi `_filters.set_mode("assets")` hoặc sau `set_project_index()` tính sẵn:
+  - `count_by_type: dict[str, int]`  # type_id -> count
+  - `count_by_department: dict[str, int]`  # dept_id -> count
+- Thêm API trên SidebarWidget:  
+  `set_item_counts(count_by_type: dict[str, int] | None, count_by_department: dict[str, int] | None) -> None`.  
+  Khi None: ẩn count (hoặc hiển thị "—").
+- Sidebar container trong `_sync_nav_badges()` hoặc sau khi set project index / set mode gọi `_filters.set_item_counts(...)` rồi gọi lại `_filters.set_departments()` / `_filters.set_types()` để rebuild list (có count).
+
+**Option B – Truyền ProjectIndex vào SidebarWidget:**
+
+- SidebarWidget nhận `set_project_index(ProjectIndex | None)` và tự đếm khi build list.  
+  Nhược: filter panel phụ thuộc core model; logic đếm nằm trong UI.
+
+Đề xuất: **Option A** — container tính counts, filter panel chỉ hiển thị.
+
+---
+
+## 4. Cách hiển thị count trong UI
+
+### 4.1 Vị trí
+
+- **TYPES:** Cạnh label mỗi type (vd: `Character` → `Character (5)` hoặc `Character · 5`).
+- **DEPARTMENTS:** Cạnh label mỗi department (vd: `Model` → `Model (12)`).
+
+### 4.2 Format
+
+- Text đơn giản: `Label (N)` hoặc `Label · N`.
+- Style: Số dùng font/size nhỏ hơn hoặc màu muted (Zinc-500) theo typography rule; không cần badge riêng trừ khi thiết kế yêu cầu.
+- Khi không có dữ liệu (chưa load project, None): không hiển thị count hoặc hiển thị "—".
+
+### 4.3 Cập nhật khi nào?
+
+- Khi `set_project_index(...)` (load/rescan project).
+- Khi chuyển mode (assets ↔ shots) — vì nguồn đếm đổi (assets vs shots).
+- Không cần cập nhật realtime khi user thêm/xóa asset trong session (có thể phase 2: subscribe assetsChanged/shotsChanged và refresh counts).
+
+---
+
+## 5. Thay đổi code (tóm tắt)
+
+### 5.1 SidebarWidget (filter panel)
+
+- Thêm `_count_by_type: dict[str, int]` và `_count_by_department: dict[str, int]` (có thể rỗng).
+- Thêm `set_item_counts(count_by_type: dict[str, int] | None, count_by_department: dict[str, int] | None)` — lưu vào instance, không rebuild list ngay.
+- Trong `set_types()`: khi tạo `QListWidgetItem` cho mỗi type_id, nếu `_count_by_type` có key thì set text = `f"{label} ({count})"` hoặc dùng secondary label (tùy layout).
+- Trong `set_departments()`: tương tự, dùng `_count_by_department` để hiển thị count cạnh từng department.
+- Khi counts là None/rỗng: chỉ hiển thị label (không "(0)" để tránh nhiễu).
+
+### 5.2 Sidebar container (chứa _filters)
+
+- Thêm helper `_compute_filter_counts() -> tuple[dict[str, int], dict[str, int]]` (count_by_type, count_by_department) từ `self._project_index` và `current_context()` (Assets vs Shots).
+- Trong `set_project_index()`: gọi `_compute_filter_counts()`, rồi `_filters.set_item_counts(...)`, rồi nếu đang ở Assets/Shots thì gọi `_filters.set_departments(...)` / `_filters.set_types(...)` với danh sách hiện tại để refresh (hoặc expose một `refresh_counts()` trên filter nếu không muốn gọi lại set_departments/set_types).
+- Khi chuyển context (Assets/Shots) và set_mode: sau khi set_mode, gọi lại set_item_counts + refresh list để cập nhật counts cho đúng mode.
+
+### 5.3 Normalize type / department
+
+- So sánh `asset_type` và `dept_id` với chuẩn hóa (strip, casefold) để khớp với pipeline config (type_id / dept_id từ JSON).
+
+---
+
+## 6. Edge cases
+
+- **Không có project / project_index = None:** Counts = None hoặc rỗng → không hiển thị số.
+- **Type/Dept không có trong pipeline:** Bỏ qua hoặc count = 0.
+- **Inbox / Reference:** Không gọi set_item_counts hoặc truyền None → list không có count.
+- **Shots:** Nếu Shot không có `asset_type` tương đương, dùng một type chung (vd "shot") hoặc đếm tổng shots cho mọi type; nếu có shot-type trong pipeline thì đếm theo shot type.
+
+---
+
+## 7. Tóm tắt
+
+| Mục | Hành động |
+|-----|-----------|
+| **Nguồn count** | ProjectIndex (assets / shots) tại sidebar container |
+| **Tính counts** | Sidebar container: count_by_type, count_by_department |
+| **Đưa vào UI** | SidebarWidget.set_item_counts(...) + rebuild list (set_types / set_departments) |
+| **Hiển thị** | Label (N) hoặc Label · N, style muted cho số |
+| **Cập nhật** | set_project_index, set_mode (assets/shots) |
+
+Sau bước này có thể mở rộng: count theo type đang chọn (department list chỉ đếm trong type đó), hoặc subscribe assetsChanged/shotsChanged để cập nhật count khi data thay đổi trong session.

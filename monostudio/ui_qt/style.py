@@ -1117,6 +1117,20 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid rgba(39, 39, 42, 0.50);
             border-radius: 12px;
         }
+        QFrame#InspectorDeptCard:hover {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(63, 63, 70, 0.80);
+        }
+        /* Sidebar-focused department (persistent) — yellow border */
+        QFrame#InspectorDeptCard[sidebarFocused="true"] {
+            border: 1px solid #fbbf24;  /* amber-400 */
+            background: rgba(251, 191, 36, 0.06);
+        }
+        /* Temporarily focused from Inspector click — blue border overrides yellow */
+        QFrame#InspectorDeptCard[focused="true"] {
+            border: 1px solid rgba(59, 130, 246, 0.95); /* blue-500-ish */
+            background: rgba(37, 99, 235, 0.20);        /* subtle blue fill */
+        }
         QToolButton#InspectorManageButton {
             color: #a1a1aa;
         }
@@ -1128,11 +1142,25 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#InspectorManageButton:disabled {
             color: rgba(161, 161, 170, 0.45);
         }
-        /* All tool buttons inside Inspector: ensure hover is visible */
+        /* Folder icon on each department row (lighter hover) */
+        QToolButton#InspectorDeptOpenButton {
+            border: none;
+            padding: 0 6px;
+            background: transparent;
+            color: #e4e4e7;
+            border-radius: 999px;
+        }
+        /* All other tool buttons inside Inspector: ensure hover is visible */
         QWidget#InspectorPanel QToolButton:hover {
             background: rgba(255, 255, 255, 0.12);
             border: 1px solid rgba(63, 63, 70, 0.80);
             color: #e4e4e7;
+        }
+        /* But for the dept folder button, use pill-style hover and no border */
+        QWidget#InspectorPanel QToolButton#InspectorDeptOpenButton:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border: none;
+            border-radius: 999px;
         }
 
         /* --- Badges (QSS + dynamic properties) --- */

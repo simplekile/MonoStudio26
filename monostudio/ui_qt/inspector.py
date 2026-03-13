@@ -9,7 +9,7 @@ import re
 from collections import OrderedDict
 
 from PySide6.QtCore import Qt, Signal, QSize, QPoint, QTimer, QSettings, QEvent
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -109,6 +109,39 @@ class DepartmentStatusData:
     version_count: str  # integer string
 
 
+class _InspectorContent(QWidget):
+    """Scrollable body of the Inspector. Used to clear department focus when clicking background."""
+
+    background_clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event and getattr(event, "button", lambda: None)() == Qt.LeftButton:
+            # Treat any click that is NOT on a department card (or its children)
+            # as a background click → clear department focus.
+            pos_fn = getattr(event, "position", None)
+            if callable(pos_fn):
+                p = pos_fn().toPoint()
+            else:
+                p = event.pos()
+            w = self.childAt(p)
+
+            is_dept_card = False
+            if w is not None:
+                parent = w
+                from PySide6.QtWidgets import QFrame
+
+                while parent is not None:
+                    if isinstance(parent, QFrame) and parent.objectName() == "InspectorDeptCard":
+                        is_dept_card = True
+                        break
+                    parent = parent.parent()
+
+            if not is_dept_card:
+                self.background_clicked.emit()
+
+        super().mousePressEvent(event)
+
+
 class InspectorPanel(QWidget):
     """
     MONOS Inspector (read-mostly):
@@ -147,7 +180,7 @@ class InspectorPanel(QWidget):
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         root.addWidget(self._scroll, 1)
 
-        content = QWidget(self._scroll)
+        content = _InspectorContent(self._scroll)
         content.setObjectName("InspectorContent")
         self._content_layout = QVBoxLayout(content)
         self._content_layout.setContentsMargins(12, 12, 12, 12)
@@ -167,7 +200,9 @@ class InspectorPanel(QWidget):
         self._preview.remove_requested.connect(self._on_remove_requested)
         self._show_publish: bool = False
         self._last_focused_department: str | None = None
-        self._asset_status.open_folder_clicked.connect(self._on_open_folder_requested)
+        self._asset_status.open_asset_folder_clicked.connect(self._on_open_asset_folder_requested)
+        self._asset_status.open_work_folder_clicked.connect(self._on_open_work_folder_requested)
+        self._asset_status.open_publish_folder_clicked.connect(self._on_open_publish_folder_requested)
         self._asset_status._identity.active_dcc_changed.connect(self._on_identity_active_dcc_changed)
 
         self._inbox_destination = _InboxDestinationBlock()
@@ -213,6 +248,10 @@ class InspectorPanel(QWidget):
         self._department_icon_map: dict[str, str] = {}  # dept_id -> lucide icon name
         self._type_short_name_map: dict[str, str] = {}  # type_id -> short_name
         self.set_item(None)
+
+        # Clear department focus when clicking anywhere in the Inspector content
+        # that is not a department card.
+        content.background_clicked.connect(self._dept_pipeline._on_empty_clicked)
 
     def set_department_label_resolver(self, resolver: object | None) -> None:
         """Gán hàm dept_id -> label (từ DepartmentRegistry.get_department_label) để hiển thị tên thay ID; None để dùng id."""
@@ -336,16 +375,20 @@ class InspectorPanel(QWidget):
             self._empty.set_message("Select an item to view details")
             return
 
-        # Đồng bộ department từ sidebar (active_department_hint): khi không chọn department thì None, không mặc định dept đầu
+        # Đồng bộ department từ sidebar (active_department_hint):
+        # - sidebar_focus (vàng) luôn bám theo hint hợp lệ
+        # - _last_focused_department dùng cho logic (Tech row, preview, status, DCC)
         ref = getattr(item, "ref", None)
         if isinstance(ref, (Asset, Shot)) and getattr(ref, "departments", None):
             hint = (active_department_hint or "").strip() or None
             hint_ok = hint and any((d.name or "").strip().casefold() == (hint or "").casefold() for d in ref.departments)
             if hint_ok:
                 self._last_focused_department = hint
+                self._dept_pipeline.set_sidebar_focus(hint)
             else:
-                # Sidebar không chọn department hoặc hint không khớp → không mặc định department đầu
+                # Sidebar không chọn department hoặc hint không khớp
                 self._last_focused_department = None
+                self._dept_pipeline.set_sidebar_focus(None)
 
         scroll_bar = self._scroll.verticalScrollBar()
         scroll_pos = scroll_bar.value() if scroll_bar else 0
@@ -387,6 +430,11 @@ class InspectorPanel(QWidget):
         if scroll_bar and scroll_bar.value() != scroll_pos:
             scroll_bar.setValue(scroll_pos)
 
+        # Khi có department focus (từ sidebar hoặc Inspector), đảm bảo Tech row + preview
+        # được sync ngay cả lần đầu mở Inspector.
+        if self._last_focused_department:
+            self._on_department_focused(self._last_focused_department)
+
     def refresh_thumbnail(self) -> None:
         # Best-effort; safe no-op if nothing selected.
         try:
@@ -409,7 +457,14 @@ class InspectorPanel(QWidget):
         except Exception:
             pass
 
-    def _on_open_folder_requested(self) -> None:
+    def _on_open_asset_folder_requested(self) -> None:
+        item = self._current_item
+        if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        # Always open the asset root folder.
+        self.open_folder_requested.emit(item.path)
+
+    def _on_open_work_folder_requested(self) -> None:
         item = self._current_item
         if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
             return
@@ -418,10 +473,22 @@ class InspectorPanel(QWidget):
             dep = (self._last_focused_department or "").strip().casefold()
             for d in ref.departments:
                 if (d.name or "").strip().casefold() == dep:
-                    path = Path(d.publish_path) if self._show_publish else Path(d.work_path)
+                    path = Path(d.work_path)
                     self.open_folder_requested.emit(path)
                     return
-        self.open_folder_requested.emit(item.path)
+
+    def _on_open_publish_folder_requested(self) -> None:
+        item = self._current_item
+        if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        ref = getattr(item, "ref", None)
+        if isinstance(ref, (Asset, Shot)) and ref.departments and self._last_focused_department:
+            dep = (self._last_focused_department or "").strip().casefold()
+            for d in ref.departments:
+                if (d.name or "").strip().casefold() == dep:
+                    path = Path(d.publish_path)
+                    self.open_folder_requested.emit(path)
+                    return
 
     def _on_paste_requested(self) -> None:
         item = self._current_item
@@ -682,6 +749,7 @@ class _PreviewWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorPreview")
+        self.setMouseTracking(True)
         policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         policy.setHeightForWidth(True)
         self.setSizePolicy(policy)
@@ -925,15 +993,22 @@ class _PreviewContainer(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._hovered = False
+        self._pending_action: str | None = None  # "paste" | "remove" | None
+        self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._container_layout = QVBoxLayout(self)
         self._container_layout.setContentsMargins(0, 0, 0, 0)
         self._container_layout.setSpacing(0)
         self._w = _PreviewWidget(self)
+        self._w.installEventFilter(self)
         self._container_layout.addWidget(self._w, 0)
         self._inbox_mode = False
+        self._show_fill_fit = False
+        self._show_remove = False
 
         self._btn_fill_fit = QToolButton(self)
+        self._btn_fill_fit.setMouseTracking(True)
         self._btn_fill_fit.setCursor(Qt.PointingHandCursor)
         self._btn_fill_fit.setIconSize(QSize(24, 24))
         self._btn_fill_fit.setFixedSize(self._THUMB_BTN_SIZE, self._THUMB_BTN_SIZE)
@@ -941,27 +1016,72 @@ class _PreviewContainer(QWidget):
         self._btn_fill_fit.clicked.connect(self._on_fill_fit_clicked)
         self._update_fill_fit_icon()
         self._btn_fill_fit.setVisible(False)
+        self._btn_fill_fit.installEventFilter(self)
 
         self._btn_paste = QToolButton(self)
+        self._btn_paste.setMouseTracking(True)
         self._btn_paste.setCursor(Qt.PointingHandCursor)
         self._btn_paste.setToolTip("Paste thumbnail from clipboard")
         self._btn_paste.setIcon(lucide_icon("clipboard-paste", size=20, color_hex=MONOS_COLORS["text_label"]))
         self._btn_paste.setIconSize(QSize(24, 24))
         self._btn_paste.setFixedSize(self._THUMB_BTN_SIZE, self._THUMB_BTN_SIZE)
         self._btn_paste.setStyleSheet(_thumb_button_style())
-        self._btn_paste.clicked.connect(self.paste_requested.emit)
+        self._btn_paste.clicked.connect(self._on_paste_clicked)
+        self._btn_paste.setVisible(False)
+        self._btn_paste.installEventFilter(self)
 
         self._btn_remove = QToolButton(self)
+        self._btn_remove.setMouseTracking(True)
         self._btn_remove.setCursor(Qt.PointingHandCursor)
         self._btn_remove.setToolTip("Remove thumbnail")
         self._btn_remove.setIcon(lucide_icon("trash-2", size=20, color_hex=MONOS_COLORS["text_label"]))
         self._btn_remove.setIconSize(QSize(24, 24))
         self._btn_remove.setFixedSize(self._THUMB_BTN_SIZE, self._THUMB_BTN_SIZE)
         self._btn_remove.setStyleSheet(_thumb_button_style())
-        self._btn_remove.clicked.connect(self.remove_requested.emit)
+        self._btn_remove.clicked.connect(self._on_remove_clicked)
         self._btn_remove.setVisible(False)
+        self._btn_remove.installEventFilter(self)
+
+        # Confirm / cancel buttons (top-right) — appear only after paste/remove is requested.
+        self._btn_confirm = QToolButton(self)
+        self._btn_confirm.setMouseTracking(True)
+        self._btn_confirm.setCursor(Qt.PointingHandCursor)
+        self._btn_confirm.setToolTip("Apply thumbnail change")
+        self._btn_confirm.setIcon(
+            lucide_icon("square-check", size=20, color_hex=MONOS_COLORS["emerald_500"])
+        )
+        self._btn_confirm.setIconSize(QSize(24, 24))
+        self._btn_confirm.setFixedSize(self._THUMB_BTN_SIZE, self._THUMB_BTN_SIZE)
+        self._btn_confirm.setStyleSheet(_thumb_button_style())
+        self._btn_confirm.clicked.connect(self._on_confirm_clicked)
+        self._btn_confirm.setVisible(False)
+        self._btn_confirm.installEventFilter(self)
+
+        self._btn_cancel = QToolButton(self)
+        self._btn_cancel.setMouseTracking(True)
+        self._btn_cancel.setCursor(Qt.PointingHandCursor)
+        self._btn_cancel.setToolTip("Cancel thumbnail change")
+        self._btn_cancel.setIcon(
+            lucide_icon("x", size=20, color_hex=MONOS_COLORS["red_500"])
+        )
+        self._btn_cancel.setIconSize(QSize(24, 24))
+        self._btn_cancel.setFixedSize(self._THUMB_BTN_SIZE, self._THUMB_BTN_SIZE)
+        self._btn_cancel.setStyleSheet(_thumb_button_style())
+        self._btn_cancel.clicked.connect(self._on_cancel_clicked)
+        self._btn_cancel.setVisible(False)
+        self._btn_cancel.installEventFilter(self)
 
         self._w.image_changed.connect(self._on_preview_image_changed)
+
+        # Mouse-move fallback scoped to Inspector scroll viewport (not whole app).
+        self._viewport: QWidget | None = None
+        p = self.parent()
+        while p is not None and not isinstance(p, QScrollArea):
+            p = p.parent()
+        if isinstance(p, QScrollArea):
+            self._viewport = p.viewport()
+            if self._viewport is not None:
+                self._viewport.installEventFilter(self)
 
     def _update_fill_fit_icon(self) -> None:
         fit = self._w.get_user_fit()
@@ -975,6 +1095,43 @@ class _PreviewContainer(QWidget):
     def _on_fill_fit_clicked(self) -> None:
         self._w.set_user_fit(not self._w.get_user_fit())
         self._update_fill_fit_icon()
+
+    def _begin_pending_action(self, action: str) -> None:
+        # action: "paste" or "remove"
+        if action not in ("paste", "remove"):
+            return
+        self._pending_action = action
+        # Ensure confirm/cancel visible while hovered; main buttons remain for context.
+        if self._hovered:
+            self._btn_confirm.setVisible(True)
+            self._btn_cancel.setVisible(True)
+        else:
+            self._btn_confirm.setVisible(False)
+            self._btn_cancel.setVisible(False)
+
+    def _on_paste_clicked(self) -> None:
+        # Stage paste; user must confirm to actually emit paste_requested.
+        self._begin_pending_action("paste")
+
+    def _on_remove_clicked(self) -> None:
+        # Stage remove; user must confirm to actually emit remove_requested.
+        self._begin_pending_action("remove")
+
+    def _on_confirm_clicked(self) -> None:
+        action = self._pending_action
+        self._pending_action = None
+        self._btn_confirm.setVisible(False)
+        self._btn_cancel.setVisible(False)
+        if action == "paste":
+            self.paste_requested.emit()
+        elif action == "remove":
+            self.remove_requested.emit()
+
+    def _on_cancel_clicked(self) -> None:
+        # Drop pending state, keep current thumbnail as-is.
+        self._pending_action = None
+        self._btn_confirm.setVisible(False)
+        self._btn_cancel.setVisible(False)
 
     def _on_preview_image_changed(self, has_image: bool) -> None:
         show = not self._inbox_mode and has_image
@@ -995,19 +1152,27 @@ class _PreviewContainer(QWidget):
         self._btn_paste.raise_()
         self._btn_remove.move(x0 + (size + gap) * 2, y0)
         self._btn_remove.raise_()
+        # Confirm / cancel at top-right
+        x_right = r.x() + r.width() - margin - size
+        self._btn_confirm.move(x_right, y0)
+        self._btn_confirm.raise_()
+        self._btn_cancel.move(x_right - (size + gap), y0)
+        self._btn_cancel.raise_()
 
     def set_paste_enabled(self, enabled: bool) -> None:
         on = bool(enabled)
         self._btn_paste.setEnabled(on)
-        self._btn_paste.setVisible(on)
+        self._btn_paste.setVisible(self._hovered and on)
 
     def set_show_fill_fit(self, show: bool) -> None:
-        self._btn_fill_fit.setVisible(bool(show))
-        if show:
+        self._show_fill_fit = bool(show)
+        self._btn_fill_fit.setVisible(self._hovered and self._show_fill_fit)
+        if self._show_fill_fit:
             self._update_fill_fit_icon()
 
     def set_show_remove(self, show: bool) -> None:
-        self._btn_remove.setVisible(bool(show))
+        self._show_remove = bool(show)
+        self._btn_remove.setVisible(self._hovered and self._show_remove)
 
     def set_inbox_mode(self, on: bool) -> None:
         """Inbox: preview widget tự quyết height theo heightForWidth (tỉ lệ ảnh)."""
@@ -1018,6 +1183,112 @@ class _PreviewContainer(QWidget):
         self.set_show_fill_fit(show)
         self.set_show_remove(show)
         self.updateGeometry()
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        self._set_hovered(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        # Only hide when mouse truly leaves the whole overlay area (image + buttons).
+        if not self._any_under_mouse():
+            self._set_hovered(False)
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        # Fallback: some paths into the preview area don't reliably trigger Enter events.
+        # Mouse move is always delivered when tracking is enabled.
+        if self._any_under_mouse():
+            self._set_hovered(True)
+        else:
+            self._set_hovered(False)
+        super().mouseMoveEvent(event)
+
+    def _any_under_mouse(self) -> bool:
+        return bool(
+            self.underMouse()
+            or self._w.underMouse()
+            or self._btn_fill_fit.underMouse()
+            or self._btn_paste.underMouse()
+            or self._btn_remove.underMouse()
+            or self._btn_confirm.underMouse()
+            or self._btn_cancel.underMouse()
+        )
+
+    def _cursor_in_hover_region(self) -> bool:
+        gp = QCursor.pos()
+        for w in (
+            self._w,
+            self._btn_fill_fit,
+            self._btn_paste,
+            self._btn_remove,
+            self._btn_confirm,
+            self._btn_cancel,
+        ):
+            if not w.isVisible():
+                continue
+            try:
+                lp = w.mapFromGlobal(gp)
+            except Exception:
+                continue
+            if w.rect().contains(lp):
+                return True
+        return False
+
+    def _set_hovered(self, on: bool) -> None:
+        self._hovered = bool(on)
+        if not self._hovered:
+            self._btn_fill_fit.setVisible(False)
+            self._btn_paste.setVisible(False)
+            self._btn_remove.setVisible(False)
+            self._btn_confirm.setVisible(False)
+            self._btn_cancel.setVisible(False)
+            return
+        if self._show_fill_fit:
+            self._btn_fill_fit.setVisible(True)
+        if self._btn_paste.isEnabled():
+            self._btn_paste.setVisible(True)
+        if self._show_remove:
+            self._btn_remove.setVisible(True)
+        if self._pending_action is not None:
+            self._btn_confirm.setVisible(True)
+            self._btn_cancel.setVisible(True)
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        # Hover có thể di chuyển giữa preview widget, các nút overlay và khoảng trống trong Inspector viewport.
+        # - watched == viewport: giữ hover state ổn định khi rê chậm từ khoảng trống bên trái.
+        # - watched == preview/buttons: gom thành một vùng hover duy nhất để tránh flicker.
+        try:
+            et = event.type()
+        except Exception:
+            return super().eventFilter(watched, event)
+
+        if watched is self._viewport:
+            if et == QEvent.Type.MouseMove:
+                if self.isVisible() and self._cursor_in_hover_region():
+                    self._set_hovered(True)
+                elif self._hovered and not self._cursor_in_hover_region():
+                    self._set_hovered(False)
+            return super().eventFilter(watched, event)
+
+        if watched in (
+            self._w,
+            self._btn_fill_fit,
+            self._btn_paste,
+            self._btn_remove,
+            self._btn_confirm,
+            self._btn_cancel,
+        ):
+            if et in (QEvent.Type.Enter, QEvent.Type.HoverEnter):
+                self._set_hovered(True)
+            elif et in (QEvent.Type.MouseMove, QEvent.Type.HoverMove):
+                # Keep hovered state alive when moving from left blank area into thumb slowly.
+                if self._any_under_mouse() or self._cursor_in_hover_region():
+                    self._set_hovered(True)
+            elif et in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                if not self._any_under_mouse():
+                    self._set_hovered(False)
+
+        return super().eventFilter(watched, event)
 
 
 class _InspectorPreview(QWidget):
@@ -1637,16 +1908,22 @@ class _IdentityBlock(QWidget):
 
     def eventFilter(self, watched: QWidget, event: QEvent) -> bool:
         """Hiện tooltip giống MainView: QToolTip.showText(globalPos) thay vì tooltip mặc định."""
-        if event.type() == QEvent.ToolTip and watched in self._dcc_chip_buttons:
-            pos = getattr(event, "globalPos", None)
-            if callable(pos):
-                pos = pos()
-            if pos is None:
-                pos = watched.mapToGlobal(watched.rect().center())
-            text = (watched.toolTip() or "").strip()
-            if text:
-                QToolTip.showText(pos, text)
-            return True
+        if watched in self._dcc_chip_buttons:
+            if event.type() == QEvent.ToolTip:
+                pos = getattr(event, "globalPos", None)
+                if callable(pos):
+                    pos = pos()
+                if pos is None:
+                    pos = watched.mapToGlobal(watched.rect().center())
+                text = (watched.toolTip() or "").strip()
+                if text:
+                    QToolTip.showText(pos, text)
+                return True
+            if event.type() == QEvent.MouseButtonDblClick:
+                dcc_id = watched.property("dcc_id")
+                if isinstance(dcc_id, str) and dcc_id.strip():
+                    self._open_work_file_for_dcc(dcc_id.strip())
+                return True
         return super().eventFilter(watched, event)
 
     def _on_dcc_badge_clicked(self, dcc_id: str) -> None:
@@ -1660,10 +1937,33 @@ class _IdentityBlock(QWidget):
         self.active_dcc_changed.emit(path, self._active_department, dcc_id)
         self._update_dcc_badges()
 
+    def _open_work_file_for_dcc(self, dcc_id: str) -> None:
+        """Open the latest work file for the given DCC (double-click on badge)."""
+        if not self._current_item or not self._active_department:
+            return
+        try:
+            path = _path_for_version(self._current_item, self._active_department, dcc_id)
+        except Exception:
+            return
+        if not path:
+            return
+        try:
+            from pathlib import Path as _Path
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            p = path if isinstance(path, _Path) else _Path(str(path))
+            if not p.exists() or not p.is_file():
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+        except Exception:
+            return
+
 
 class _InspectorAssetStatusBlock(QWidget):
-    """One container: row1 = Asset info (name+meta) | Status pill; row2 = Open folder."""
-    open_folder_clicked = Signal()
+    """One container: row1 = Asset info (name+meta) | Status pill; row2 = folder shortcuts."""
+    open_asset_folder_clicked = Signal()
+    open_work_folder_clicked = Signal()
+    open_publish_folder_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1688,21 +1988,45 @@ class _InspectorAssetStatusBlock(QWidget):
         row2_l = QHBoxLayout(row2)
         row2_l.setContentsMargins(0, 0, 0, 0)
         row2_l.setSpacing(8)
-        self._btn_open_folder = QToolButton(row2)
-        self._btn_open_folder.setText("Open folder")
-        self._btn_open_folder.setCursor(Qt.PointingHandCursor)
-        self._btn_open_folder.setAutoRaise(True)
-        self._btn_open_folder.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._btn_open_folder.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
-        self._btn_open_folder.clicked.connect(self._on_open_folder_clicked)
-        row2_l.addWidget(self._btn_open_folder, 0)
+        self._btn_asset_folder = QToolButton(row2)
+        self._btn_asset_folder.setText("Asset folder")
+        self._btn_asset_folder.setCursor(Qt.PointingHandCursor)
+        self._btn_asset_folder.setAutoRaise(True)
+        self._btn_asset_folder.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_asset_folder.setIcon(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_asset_folder.clicked.connect(self._on_open_asset_folder_clicked)
+        row2_l.addWidget(self._btn_asset_folder, 0)
+
+        self._btn_work_folder = QToolButton(row2)
+        self._btn_work_folder.setText("Work folder")
+        self._btn_work_folder.setCursor(Qt.PointingHandCursor)
+        self._btn_work_folder.setAutoRaise(True)
+        self._btn_work_folder.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_work_folder.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_work_folder.clicked.connect(self._on_open_work_folder_clicked)
+        row2_l.addWidget(self._btn_work_folder, 0)
+
+        self._btn_publish_folder = QToolButton(row2)
+        self._btn_publish_folder.setText("Publish folder")
+        self._btn_publish_folder.setCursor(Qt.PointingHandCursor)
+        self._btn_publish_folder.setAutoRaise(True)
+        self._btn_publish_folder.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_publish_folder.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_publish_folder.clicked.connect(self._on_open_publish_folder_clicked)
+        row2_l.addWidget(self._btn_publish_folder, 0)
         row2_l.addStretch(1)
 
         l.addWidget(row1, 0)
         l.addWidget(row2, 0)
 
-    def _on_open_folder_clicked(self) -> None:
-        self.open_folder_clicked.emit()
+    def _on_open_asset_folder_clicked(self) -> None:
+        self.open_asset_folder_clicked.emit()
+
+    def _on_open_work_folder_clicked(self) -> None:
+        self.open_work_folder_clicked.emit()
+
+    def _on_open_publish_folder_clicked(self) -> None:
+        self.open_publish_folder_clicked.emit()
 
     def set_item(
         self,
@@ -1717,7 +2041,9 @@ class _InspectorAssetStatusBlock(QWidget):
         self._identity.set_item(item, show_publish, active_department=active_department, active_dcc_id=active_dcc_id)
         self._health.set_item(item)
         is_asset_or_shot = bool(item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT))
-        self._btn_open_folder.setEnabled(is_asset_or_shot)
+        self._btn_asset_folder.setEnabled(is_asset_or_shot)
+        self._btn_work_folder.setEnabled(is_asset_or_shot)
+        self._btn_publish_folder.setEnabled(is_asset_or_shot)
 
     def set_focused_department(self, dept_name: str | None) -> None:
         self._health.set_focused_department(dept_name)
@@ -1849,6 +2175,9 @@ class _DeptCard(QFrame):
         self.setFrameShape(QFrame.NoFrame)
         self.setFixedHeight(32)
         self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setProperty("focused", False)
+        self.setProperty("sidebarFocused", False)
 
         l = QVBoxLayout(self)
         l.setContentsMargins(8, 4, 8, 4)
@@ -1857,7 +2186,8 @@ class _DeptCard(QFrame):
         row = QWidget(self)
         row_l = QHBoxLayout(row)
         row_l.setContentsMargins(0, 0, 0, 0)
-        row_l.setSpacing(6)
+        # Give more breathing room between label / status pill / folder icon
+        row_l.setSpacing(10)
 
         self._icon_label = QLabel("", self)
         self._icon_label.setFixedSize(14, 14)
@@ -1877,13 +2207,13 @@ class _DeptCard(QFrame):
         )
 
         self._btn_open = QToolButton(self)
+        self._btn_open.setObjectName("InspectorDeptOpenButton")
         self._btn_open.setAutoRaise(True)
         self._btn_open.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self._btn_open.setFixedSize(20, 20)
-        self._btn_open.setIconSize(QSize(14, 14))
-        self._btn_open.setIcon(lucide_icon("folder-open", size=14, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_open.setFixedSize(24, 24)
+        self._btn_open.setIconSize(QSize(16, 16))
+        self._btn_open.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_primary"]))
         self._btn_open.setToolTip("Open folder")
-        self._btn_open.setStyleSheet("QToolButton { border: none; background: transparent; }")
 
         row_l.addWidget(self._icon_label, 0, Qt.AlignVCenter)
         row_l.addWidget(self._name, 1)
@@ -1914,6 +2244,22 @@ class _DeptCard(QFrame):
             self.clicked.emit()
         super().mousePressEvent(event)
 
+    def set_focused(self, focused: bool) -> None:
+        self.setProperty("focused", bool(focused))
+        try:
+            self.style().unpolish(self)
+            self.style().polish(self)
+        except Exception:
+            pass
+
+    def set_sidebar_focused(self, focused: bool) -> None:
+        self.setProperty("sidebarFocused", bool(focused))
+        try:
+            self.style().unpolish(self)
+            self.style().polish(self)
+        except Exception:
+            pass
+
     def _open_folder(self) -> None:
         from PySide6.QtGui import QDesktopServices
         from PySide6.QtCore import QUrl
@@ -1940,6 +2286,31 @@ def _department_display_name(dept_id: str, label_resolver: object | None) -> str
     return (dept_id or "").strip()
 
 
+class _DeptPipelineList(QWidget):
+    clicked_empty = Signal()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event and getattr(event, "button", lambda: None)() == Qt.LeftButton:
+            # Only treat as "empty click" when the user clicked on blank space
+            # (or on the section header label), not when clicking a card/child control.
+            pos = getattr(event, "position", None)
+            if callable(pos):
+                p = pos().toPoint()
+            else:
+                p = event.pos()
+            w = self.childAt(p)
+            if w is None:
+                self.clicked_empty.emit()
+            else:
+                # Allow section header label clicks to act like empty clicks.
+                try:
+                    if isinstance(w, QLabel) and w.objectName() == "InspectorSectionTitle":
+                        self.clicked_empty.emit()
+                except Exception:
+                    pass
+        super().mousePressEvent(event)
+
+
 class _DepartmentPipeline(QWidget):
     manage_clicked = Signal()
     department_focused = Signal(str)
@@ -1954,6 +2325,9 @@ class _DepartmentPipeline(QWidget):
         self._hidden_departments: set[str] = set(self._load_hidden())
         self._current_all_dept_ids: list[str] = []
         self._current_item: ViewItem | None = None
+        self._focused_dept_id: str | None = None
+        self._prev_focused_dept_id: str | None = None
+        self._sidebar_focused_dept_id: str | None = None
 
         l = QVBoxLayout(self)
         l.setContentsMargins(0, 0, 0, 0)
@@ -1981,16 +2355,17 @@ class _DepartmentPipeline(QWidget):
         hdr_l.addWidget(title, 1)
         hdr_l.addWidget(self._manage_btn, 0, Qt.AlignRight)
 
-        self._list = QWidget(self)
+        self._list = _DeptPipelineList(self)
         self._list_l = QVBoxLayout(self._list)
         self._list_l.setContentsMargins(0, 0, 0, 0)
         self._list_l.setSpacing(4)
+        self._list.clicked_empty.connect(self._on_empty_clicked)
 
         self._section_titles: list[QLabel] = []
         for _ in range(_MAX_DEPT_SECTIONS):
             lbl = QLabel(self._list)
             lbl.setObjectName("InspectorSectionTitle")
-            f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
+            f = monos_font("Inter", 9, QFont.Weight.ExtraBold)
             lbl.setFont(f)
             lbl.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
             lbl.setVisible(False)
@@ -2113,6 +2488,16 @@ class _DepartmentPipeline(QWidget):
                         out[parent] = label
         return out
 
+    def set_sidebar_focus(self, dept_name: str | None) -> None:
+        """Highlight the department that is focused from the sidebar (persistent, yellow border)."""
+        self._sidebar_focused_dept_id = (dept_name or "").strip() or None
+        for c in self._dept_cards:
+            if not c.isVisible():
+                continue
+            d = getattr(c, "_dept", None)
+            cid = getattr(d, "name", None) if d is not None else None
+            c.set_sidebar_focused(bool(self._sidebar_focused_dept_id and cid == self._sidebar_focused_dept_id))
+
     def set_item(self, item: ViewItem) -> None:
         self._current_item = item
         ref = item.ref
@@ -2161,17 +2546,50 @@ class _DepartmentPipeline(QWidget):
 
         self._current_all_dept_ids = [d.name for d in ordered_depts if d.name]
 
+        if self._focused_dept_id and self._focused_dept_id not in self._current_all_dept_ids:
+            self._focused_dept_id = None
+        if self._prev_focused_dept_id and self._prev_focused_dept_id not in self._current_all_dept_ids:
+            self._prev_focused_dept_id = None
+        if self._sidebar_focused_dept_id and self._sidebar_focused_dept_id not in self._current_all_dept_ids:
+            self._sidebar_focused_dept_id = None
+
         visible_depts = [d for d in ordered_depts if d.name not in self._hidden_departments]
+
+        # Hide top-level departments that only act as parents for subdepartments.
+        parent_ids_with_visible_children: set[str] = set()
+        if registry and hasattr(registry, "get_parent"):
+            for d in visible_depts:
+                dept_id = d.name or ""
+                parent_id = registry.get_parent(dept_id)
+                if parent_id:
+                    parent_ids_with_visible_children.add(parent_id)
 
         rows: list[tuple[str, object]] = []
         sections_emitted: set[str] = set()
         for d in visible_depts:
             dept_id = d.name or ""
             parent_id = registry.get_parent(dept_id) if registry and hasattr(registry, "get_parent") else None
-            if parent_id and parent_id not in sections_emitted:
-                parent_label = (registry.get_department_label(parent_id) or parent_id).strip().upper()
-                rows.append(("section", parent_label))
-                sections_emitted.add(parent_id)
+
+            # If this department is a parent for any visible subdepartments,
+            # skip rendering its own card and only show the subdepartments.
+            if dept_id in parent_ids_with_visible_children:
+                continue
+
+            # Always emit a section title to visually separate groups.
+            # - If the dept has a parent: section = parent
+            # - Else: section = the dept itself (standalone)
+            section_id = parent_id or dept_id
+            if section_id and section_id not in sections_emitted:
+                if registry and hasattr(registry, "get_department_label"):
+                    section_label = (registry.get_department_label(section_id) or section_id).strip()
+                else:
+                    section_label = (section_id or "").strip()
+                # Capitalize only the first character; rest lower-case.
+                if section_label:
+                    section_label = section_label[:1].upper() + section_label[1:].lower()
+                if section_label:
+                    rows.append(("section", section_label))
+                    sections_emitted.add(section_id)
             rows.append(("dept", d))
 
         for i, card in enumerate(self._dept_cards):
@@ -2205,12 +2623,13 @@ class _DepartmentPipeline(QWidget):
                 display_name = _department_display_name(d.name or "", label_resolver)
                 dept_icon_name = icon_map.get(d.name or "", "layers")
                 card.set_department(d, display_name, dept_icon_name)
+                card.set_sidebar_focused(bool(self._sidebar_focused_dept_id and (d.name or "") == self._sidebar_focused_dept_id))
+                card.set_focused(bool(self._focused_dept_id and (d.name or "") == self._focused_dept_id))
                 card.setVisible(True)
                 dept_name = d.name
 
                 def _emit(dept: str) -> None:
-                    if dept:
-                        self.department_focused.emit(dept)
+                    self._on_dept_clicked(dept)
 
                 slot = lambda _d=dept_name: _emit(_d)
                 card.clicked.connect(slot)
@@ -2223,6 +2642,39 @@ class _DepartmentPipeline(QWidget):
             self._section_titles[i].setVisible(False)
         for i in range(card_idx, len(self._dept_cards)):
             self._dept_cards[i].setVisible(False)
+
+    def _on_dept_clicked(self, dept_id: str | None) -> None:
+        dept_id = (dept_id or "").strip() or None
+        if dept_id == self._focused_dept_id:
+            return
+        self._prev_focused_dept_id = self._focused_dept_id
+        self._focused_dept_id = dept_id
+        # Update focus border for visible cards
+        for c in self._dept_cards:
+            if not c.isVisible():
+                continue
+            d = getattr(c, "_dept", None)
+            cid = getattr(d, "name", None) if d is not None else None
+            c.set_sidebar_focused(bool(self._sidebar_focused_dept_id and cid == self._sidebar_focused_dept_id))
+            c.set_focused(bool(self._focused_dept_id and cid == self._focused_dept_id))
+        self.department_focused.emit(self._focused_dept_id or "")
+
+    def _on_empty_clicked(self) -> None:
+        # Clicking on empty space clears temporary (Inspector) focus.
+        # If there is a sidebar-focused department, revert logic focus back to that.
+        if self._focused_dept_id is None and not self._sidebar_focused_dept_id:
+            return
+        self._prev_focused_dept_id = self._focused_dept_id
+        self._focused_dept_id = None
+        for c in self._dept_cards:
+            if not c.isVisible():
+                continue
+            d = getattr(c, "_dept", None)
+            cid = getattr(d, "name", None) if d is not None else None
+            c.set_sidebar_focused(bool(self._sidebar_focused_dept_id and cid == self._sidebar_focused_dept_id))
+            c.set_focused(bool(self._focused_dept_id and cid == self._focused_dept_id))
+        # Emit sidebar-focused department (if any) so Inspector re-syncs Tech/preview/status.
+        self.department_focused.emit(self._sidebar_focused_dept_id or "")
 
 
 class _TechRow(QWidget):
