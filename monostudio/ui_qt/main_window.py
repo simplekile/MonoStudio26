@@ -371,9 +371,16 @@ class MainWindow(FramelessMainWindow):
         self._top_bar.set_update_available(result.update_available, result.latest_version)
         if result.update_available:
             # Important: show a sticky notification that only disappears when the user closes it.
-            notification_service.important(
-                f"Update available: {result.latest_version}. Check it out!"
+            # Format:
+            # - Line 1: UPDATE AVAILABLE (bold, uppercase)
+            # - Line 2: version name (italic)
+            # - Line 3: "Check it out"
+            message = (
+                "<b>UPDATE AVAILABLE:</b><br>"
+                f"- {result.latest_version}<br>"
+                "<i>Check it out!</i>"
             )
+            notification_service.important(message)
 
     def _open_settings_to_updates(self) -> None:
         """Open Settings dialog with General → Updates tab (e.g. from top bar update button)."""

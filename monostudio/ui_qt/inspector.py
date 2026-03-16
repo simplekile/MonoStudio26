@@ -204,6 +204,10 @@ class InspectorPanel(QWidget):
         self._asset_status.open_work_folder_clicked.connect(self._on_open_work_folder_requested)
         self._asset_status.open_publish_folder_clicked.connect(self._on_open_publish_folder_requested)
         self._asset_status._identity.active_dcc_changed.connect(self._on_identity_active_dcc_changed)
+        # Sync global production status (READY / PROGRESS / WAITING / BLOCKED) to preview thumbnail dot.
+        self._asset_status._health.status_changed.connect(
+            lambda color, label: self._preview._container._w.set_global_status_indicator(color, label)
+        )
 
         self._inbox_destination = _InboxDestinationBlock()
         self._inbox_destination.distribute_finished.connect(self.inbox_distribute_finished.emit)
@@ -765,6 +769,9 @@ class _PreviewWidget(QWidget):
         self._loading_angle = 0.0  # độ (0–360) để vẽ icon quay
         self._loading_timer: QTimer | None = None
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
+        # Global production status indicator (small dot top-right, color + tooltip text).
+        self._status_color_hex: str | None = None
+        self._status_label: str | None = None
 
     def get_user_fit(self) -> bool:
         return self._user_fit
@@ -840,6 +847,37 @@ class _PreviewWidget(QWidget):
             self.setSizePolicy(policy)
             self.setMinimumHeight(0)
         self.updateGeometry()
+
+    def set_global_status_indicator(self, color_hex: str | None, label: str | None) -> None:
+        """Set global status indicator (dot) color and tooltip label."""
+        color_hex = (color_hex or "").strip() or None
+        label = (label or "").strip() or None
+        if self._status_color_hex == color_hex and self._status_label == label:
+            return
+        self._status_color_hex = color_hex
+        self._status_label = label
+        self.update()
+
+    def _draw_status_dot(self, p: QPainter, r: QRect) -> None:
+        """Draw small status dot at top-right inside thumbnail, similar to main view."""
+        if not self._status_color_hex:
+            return
+        try:
+            color = QColor(self._status_color_hex)
+        except Exception:
+            return
+        # Slightly transparent to match main view accent (≈80% opacity).
+        if color.isValid():
+            color.setAlpha(204)
+        pad = 10
+        radius = 6
+        cx = r.right() - pad - radius
+        cy = r.top() + pad + radius
+        p.save()
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QPoint(cx, cy), radius, radius)
+        p.restore()
 
     def heightForWidth(self, w: int) -> int:  # type: ignore[override]
         if self._inbox_mode:
@@ -918,6 +956,8 @@ class _PreviewWidget(QWidget):
                     crop = scaled.copy(sx, sy, pw, ph)
                     crop.setDevicePixelRatio(dpr)
                     p.drawPixmap(r, crop)
+                # Overlay global status dot on top of image.
+                self._draw_status_dot(p, r)
                 return
 
             # Placeholder: icon by kind (asset/shot/project) or letter/em-dash
@@ -934,6 +974,7 @@ class _PreviewWidget(QWidget):
                     x = r.x() + (r.width() - 64) // 2
                     y = r.y() + (r.height() - 64) // 2
                     p.drawPixmap(x, y, src)
+                self._draw_status_dot(p, r)
                 return
 
             if self._placeholder_file_icon:
@@ -950,6 +991,7 @@ class _PreviewWidget(QWidget):
                     x = r.x() + (r.width() - 64) // 2
                     y = r.y() + (r.height() - 64) // 2
                     p.drawPixmap(x, y, src)
+                self._draw_status_dot(p, r)
                 return
 
             if self._placeholder_letter:
@@ -957,6 +999,7 @@ class _PreviewWidget(QWidget):
                 f = monos_font("Inter", 28, QFont.Weight.DemiBold)
                 p.setFont(f)
                 p.drawText(r, Qt.AlignCenter, self._placeholder_letter)
+                self._draw_status_dot(p, r)
                 return
 
             p.setPen(QColor(MONOS_COLORS["text_meta"]))
@@ -1968,6 +2011,7 @@ class _InspectorAssetStatusBlock(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorAssetStatusBlock")
+        self._current_item: ViewItem | None = None
         self._last_show_publish = False
         self._last_active_department: str | None = None
         self._last_active_dcc_id: str | None = None
@@ -1988,32 +2032,61 @@ class _InspectorAssetStatusBlock(QWidget):
         row2_l = QHBoxLayout(row2)
         row2_l.setContentsMargins(0, 0, 0, 0)
         row2_l.setSpacing(8)
-        self._btn_asset_folder = QToolButton(row2)
-        self._btn_asset_folder.setText("Asset folder")
-        self._btn_asset_folder.setCursor(Qt.PointingHandCursor)
-        self._btn_asset_folder.setAutoRaise(True)
-        self._btn_asset_folder.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._btn_asset_folder.setIcon(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]))
-        self._btn_asset_folder.clicked.connect(self._on_open_asset_folder_clicked)
-        row2_l.addWidget(self._btn_asset_folder, 0)
+        self._quick_actions_btn = QToolButton(row2)
+        self._quick_actions_btn.setText("Quick actions")
+        self._quick_actions_btn.setCursor(Qt.PointingHandCursor)
+        self._quick_actions_btn.setAutoRaise(True)
+        self._quick_actions_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._quick_actions_btn.setPopupMode(QToolButton.InstantPopup)
+        self._quick_actions_btn.setIcon(lucide_icon("zap", size=16, color_hex=MONOS_COLORS["text_label"]))
 
-        self._btn_work_folder = QToolButton(row2)
-        self._btn_work_folder.setText("Work folder")
-        self._btn_work_folder.setCursor(Qt.PointingHandCursor)
-        self._btn_work_folder.setAutoRaise(True)
-        self._btn_work_folder.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._btn_work_folder.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
-        self._btn_work_folder.clicked.connect(self._on_open_work_folder_clicked)
-        row2_l.addWidget(self._btn_work_folder, 0)
+        menu = QMenu(self._quick_actions_btn)
+        menu.setObjectName("InspectorQuickActionsMenu")
 
-        self._btn_publish_folder = QToolButton(row2)
-        self._btn_publish_folder.setText("Publish folder")
-        self._btn_publish_folder.setCursor(Qt.PointingHandCursor)
-        self._btn_publish_folder.setAutoRaise(True)
-        self._btn_publish_folder.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._btn_publish_folder.setIcon(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]))
-        self._btn_publish_folder.clicked.connect(self._on_open_publish_folder_clicked)
-        row2_l.addWidget(self._btn_publish_folder, 0)
+        self._act_open_asset_folder = QAction(
+            lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Open Asset Folder",
+            menu,
+        )
+        self._act_open_asset_folder.triggered.connect(self._on_open_asset_folder_clicked)
+        menu.addAction(self._act_open_asset_folder)
+
+        self._act_open_work_folder = QAction(
+            lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Open Work Folder",
+            menu,
+        )
+        self._act_open_work_folder.triggered.connect(self._on_open_work_folder_clicked)
+        menu.addAction(self._act_open_work_folder)
+
+        self._act_open_publish_folder = QAction(
+            lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Open Publish Folder",
+            menu,
+        )
+        self._act_open_publish_folder.triggered.connect(self._on_open_publish_folder_clicked)
+        menu.addAction(self._act_open_publish_folder)
+
+        menu.addSeparator()
+
+        self._act_copy_dcc_work_path = QAction(
+            lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Copy DCC Work File Path",
+            menu,
+        )
+        self._act_copy_dcc_work_path.triggered.connect(self._on_copy_dcc_work_path_clicked)
+        menu.addAction(self._act_copy_dcc_work_path)
+
+        self._act_copy_publish_path = QAction(
+            lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Copy Publish Folder Path",
+            menu,
+        )
+        self._act_copy_publish_path.triggered.connect(self._on_copy_publish_folder_path_clicked)
+        menu.addAction(self._act_copy_publish_path)
+
+        self._quick_actions_btn.setMenu(menu)
+        row2_l.addWidget(self._quick_actions_btn, 0)
         row2_l.addStretch(1)
 
         l.addWidget(row1, 0)
@@ -2035,15 +2108,47 @@ class _InspectorAssetStatusBlock(QWidget):
         active_department: str | None = None,
         active_dcc_id: str | None = None,
     ) -> None:
+        self._current_item = item
         self._last_show_publish = show_publish
         self._last_active_department = active_department
         self._last_active_dcc_id = active_dcc_id
         self._identity.set_item(item, show_publish, active_department=active_department, active_dcc_id=active_dcc_id)
         self._health.set_item(item)
         is_asset_or_shot = bool(item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT))
-        self._btn_asset_folder.setEnabled(is_asset_or_shot)
-        self._btn_work_folder.setEnabled(is_asset_or_shot)
-        self._btn_publish_folder.setEnabled(is_asset_or_shot)
+        self._quick_actions_btn.setEnabled(is_asset_or_shot)
+        self._act_open_asset_folder.setEnabled(is_asset_or_shot)
+        self._act_open_work_folder.setEnabled(is_asset_or_shot)
+        self._act_open_publish_folder.setEnabled(is_asset_or_shot)
+        self._act_copy_dcc_work_path.setEnabled(is_asset_or_shot)
+        self._act_copy_publish_path.setEnabled(is_asset_or_shot)
+
+    def _on_copy_dcc_work_path_clicked(self) -> None:
+        item = self._current_item
+        if not item or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        try:
+            path = _path_for_version(item, self._last_active_department, self._last_active_dcc_id)
+        except Exception:
+            path = None
+        if not path:
+            return
+        _TechnicalSpecs._copy_text(str(path))
+
+    def _on_copy_publish_folder_path_clicked(self) -> None:
+        item = self._current_item
+        if not item or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        ref = getattr(item, "ref", None)
+        if not isinstance(ref, (Asset, Shot)) or not getattr(ref, "departments", None):
+            return
+        dep = (self._last_active_department or "").strip()
+        if not dep:
+            return
+        dep_norm = dep.casefold()
+        for d in ref.departments:
+            if (d.name or "").strip().casefold() == dep_norm:
+                _TechnicalSpecs._copy_text(str(Path(d.publish_path)))
+                return
 
     def set_focused_department(self, dept_name: str | None) -> None:
         self._health.set_focused_department(dept_name)
@@ -2090,7 +2195,10 @@ class _MiniInfoCard(QFrame):
 
 
 class _ProductionHealth(QWidget):
-    """Read-only status pill (computed from department data)."""
+    """Read-only global status indicator; computes overall status and exposes it as a colored dot with tooltip."""
+
+    # color_hex, label
+    status_changed = Signal(str, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -2101,14 +2209,11 @@ class _ProductionHealth(QWidget):
 
         l = QHBoxLayout(self)
         l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(8)
-
-        self._pill = QLabel("", self)
-        self._pill.setObjectName("InspectorStatusPillOverall")
-        pill_font = monos_font("Inter", 9, QFont.Weight.DemiBold)
-        self._pill.setFont(pill_font)
-        l.addWidget(self._pill, 0, Qt.AlignVCenter)
-        l.addStretch(1)
+        l.setSpacing(0)
+        # No visible child; global status is rendered inside the thumbnail via _PreviewWidget.
+        spacer = QWidget(self)
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        l.addWidget(spacer)
 
     def set_focused_department(self, dept_name: str | None) -> None:
         self._focused_department = (dept_name or "").strip() or None
@@ -2127,13 +2232,12 @@ class _ProductionHealth(QWidget):
     def _refresh(self) -> None:
         item = self._current_item
         if item is None:
-            self._pill.setVisible(False)
+            self.status_changed.emit("", "")
             return
         status = "WAITING"
         ref = item.ref
         if isinstance(ref, Department):
             status = _status_from_department(ref)
-            self._pill.setVisible(True)
         elif isinstance(ref, (Asset, Shot)):
             dep = (self._focused_department or "").strip()
             if dep:
@@ -2151,19 +2255,14 @@ class _ProductionHealth(QWidget):
                     status = "PROGRESS"
                 else:
                     status = "WAITING"
-            self._pill.setVisible(True)
         else:
-            self._pill.setVisible(False)
+            self.status_changed.emit("", "")
             return
 
         color = _status_color(status)
         display = _status_display_label(status)
-        self._pill.setText(display)
-        self._pill.setStyleSheet(
-            f"padding: 1px 6px; border-radius: 8px; border: none; "
-            f"background: rgba(255,255,255,0.06); color: {color}; "
-            f"font-size: 10px;"
-        )
+        # Emit for Inspector preview to render as a dot inside thumbnail.
+        self.status_changed.emit(color, display)
 
 
 class _DeptCard(QFrame):
@@ -2338,7 +2437,7 @@ class _DepartmentPipeline(QWidget):
         hdr_l.setContentsMargins(0, 0, 0, 0)
         hdr_l.setSpacing(8)
 
-        title = QLabel("DEPARTMENT PIPELINE", self)
+        title = QLabel("DEPARTMENTS", self)
         title.setObjectName("InspectorSectionTitle")
         f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
         title.setFont(f)

@@ -427,6 +427,47 @@ def _thumb_badge_rects(cell_rect: QRect, gap_px: int, has_dept: bool) -> tuple[Q
     return type_rect, dept_rect
 
 
+def _thumb_status_dot_rect(cell_rect: QRect, gap_px: int) -> QRect:
+    """Compute status dot rect (matches grid delegate layout). Used for tooltip hit-test."""
+    r = cell_rect.adjusted(0, 0, -gap_px, -gap_px)
+    border_px = 1
+    inner = r.adjusted(border_px, border_px, -border_px, -border_px)
+    thumb_w = inner.width()
+    thumb_h = max(1, int(thumb_w * 9 / 16))
+    thumb = QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
+    dot_radius = 5
+    dot_x = thumb.right() - 12 - dot_radius
+    dot_y = thumb.top() + 12 + dot_radius
+    return QRect(dot_x - dot_radius, dot_y - dot_radius, dot_radius * 2, dot_radius * 2)
+
+
+def _overall_status_key_for_item(item: ViewItem, active_department: str | None) -> str:
+    """Overall status for grid card: 'ready' / 'progress' / 'waiting' / 'blocked' (lowercase)."""
+    if item.kind.value == "project":
+        stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
+        return (getattr(stats, "status", None) or "WAITING").strip().lower()
+    ref = item.ref
+    if isinstance(ref, (Asset, Shot)):
+        dep = (active_department or "").strip()
+        if dep:
+            for d in ref.departments:
+                if (d.name or "").strip() == dep:
+                    if d.publish_version_count > 0:
+                        return "ready"
+                    if d.work_exists:
+                        return "progress"
+                    return "waiting"
+            return "waiting"
+        else:
+            depts = ref.departments
+            if depts and all(d.publish_version_count > 0 for d in depts):
+                return "ready"
+            if any(d.work_exists for d in depts):
+                return "progress"
+            return "waiting"
+    return "waiting"
+
+
 def _dcc_ids_for_item(item: ViewItem, active_department: str | None) -> list[tuple[str, str]]:
     """Return [(dcc_id, status), ...] for the item's DCC badges (same logic as paint).
     status is "exists" or "creating". Only includes badges matching the active department."""
@@ -1008,28 +1049,7 @@ class _GridCardDelegate(QStyledItemDelegate):
                     p.drawPixmap(thumb, crop)
 
             def status_key() -> str:
-                if item.kind.value == "project":
-                    stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
-                    return (stats.status if stats else "WAITING").lower()
-                if isinstance(item.ref, (Asset, Shot)):
-                    dep = (self._active_department or "").strip()
-                    if dep:
-                        for d in item.ref.departments:
-                            if (d.name or "").strip() == dep:
-                                if d.publish_version_count > 0:
-                                    return "ready"
-                                if d.work_exists:
-                                    return "progress"
-                                return "waiting"
-                        return "waiting"
-                    else:
-                        depts = item.ref.departments
-                        if depts and all(d.publish_version_count > 0 for d in depts):
-                            return "ready"
-                        if any(d.work_exists for d in depts):
-                            return "progress"
-                        return "waiting"
-                return "waiting"
+                return _overall_status_key_for_item(item, self._active_department)
 
             def status_style(k: str) -> tuple[QColor, QColor, QColor]:
                 # (text, bg, border) with higher alpha for readability over thumbnails.
@@ -1076,6 +1096,9 @@ class _GridCardDelegate(QStyledItemDelegate):
             dot_radius = 5
             dot_x = thumb.right() - 12 - dot_radius
             dot_y = thumb.top() + 12 + dot_radius
+            # Slight transparency (~80%) to match Inspector preview dot.
+            if border_c.isValid():
+                border_c.setAlpha(204)
             p.setPen(QPen(border_c, 1))
             p.setBrush(border_c)
             p.drawEllipse(QPoint(dot_x, dot_y), dot_radius, dot_radius)
@@ -1932,6 +1955,16 @@ class MainView(QWidget):
                             return True
                         if has_dept and dept_rect and dept_rect.contains(pos):
                             QToolTip.showText(event.globalPos(), active_dep)
+                            event.accept()
+                            return True
+                        # Status dot tooltip: Published / Working / Waiting / Blocked
+                        status_rect = _thumb_status_dot_rect(cell_rect, self._GRID_GAP_PX)
+                        if status_rect.contains(pos):
+                            from monostudio.ui_qt.inspector import _status_display_label
+
+                            k = _overall_status_key_for_item(item, getattr(self._grid_delegate, "_active_department", None))
+                            label = _status_display_label((k or "").strip().upper())
+                            QToolTip.showText(event.globalPos(), label)
                             event.accept()
                             return True
                         # DCC badge tooltip: DCC name — Department
