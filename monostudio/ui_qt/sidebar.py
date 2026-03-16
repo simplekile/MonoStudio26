@@ -4,8 +4,11 @@ import json
 from enum import Enum
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QPointF, QRect, QRectF, QSize, Qt, Signal, QSettings
+import time
+from PySide6.QtCore import QByteArray, QEvent, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal, QSettings
 from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
     QColor,
     QFont,
     QFontMetrics,
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QDialog,
     QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -61,6 +65,7 @@ from monostudio.core.project_guide_tags import (
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets
 from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.recent_tasks_store import RecentTask
@@ -68,7 +73,9 @@ from monostudio.ui_qt.style import (
     MONOS_COLORS,
     SIDEBAR_DEPT_LIST_STYLE,
     MonosDialog,
+    MonosMenu,
     monos_font,
+    project_accent_color,
 )
 
 
@@ -1516,11 +1523,12 @@ class SidebarWidget(QWidget):
         return QIcon(canvas)
 
     def _open_tag_picker(self) -> None:
+        # Use top-level window as parent so dialog survives when filter is in compact popup (reparent).
         dlg = _TagPickerDialog(
             tag_definitions=self._tag_definitions,
             visible_tags=list(self._visible_tags),
             project_root=self._project_root,
-            parent=self,
+            parent=self.window(),
         )
         if dlg.exec() != QDialog.Accepted:
             return
@@ -1547,12 +1555,13 @@ class SidebarWidget(QWidget):
                 type_tabs.append((type_id, label))
                 dept_ids_by_type[type_id] = dept_list
 
+        # Use top-level window as parent so dialog survives when filter is in compact popup (reparent).
         dlg = _FilterPickDialog(
             title="Select Departments",
             items=[(d, _title_case_label(self._dept_label_by_id.get(d, d)), self._dept_icon_by_id.get(d)) for d in self._all_departments],
             selected=set(self._visible_departments or []),
             max_selected=None,
-            parent=self,
+            parent=self.window(),
             dept_parent=self._dept_parent,
             dept_label_by_id=self._dept_label_by_id,
             type_section_by_id=None,
@@ -1575,6 +1584,7 @@ class SidebarWidget(QWidget):
 
     def _open_type_picker(self) -> None:
         type_section = {tid: ("Shots" if _is_shot_type(tid) else "Assets") for tid in self._all_types}
+        # Use top-level window as parent so dialog survives when filter is in compact popup (reparent).
         dlg = _FilterPickDialog(
             title="Select Types",
             items=[
@@ -1583,7 +1593,7 @@ class SidebarWidget(QWidget):
             ],
             selected=set(self._visible_types or []),
             max_selected=None,
-            parent=self,
+            parent=self.window(),
             type_section_by_id=type_section,
             list_min_height_px=_FILTER_PICK_LIST_MIN_HEIGHT_TYPE_PX,
         )
@@ -2296,6 +2306,7 @@ class Sidebar(QWidget):
     context_changed = Signal(str)  # emitted when selection changes (nav)
     context_clicked = Signal(str)  # emitted when clicking already-selected nav item
     context_menu_requested = Signal(str, object)  # (context_text, global_pos) for nav items
+    project_switch_requested = Signal(str)  # project root path
     settings_requested = Signal()
     recent_task_clicked = Signal(object)  # RecentTask
     recent_task_double_clicked = Signal(object)  # RecentTask
@@ -2320,45 +2331,60 @@ class Sidebar(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # --- Block 1: Brand + Primary Nav (top fixed, do not stretch when window is resized)
+        # --- Block 1: Project switcher + separator aligned with top bar bottom (56px)
+        _TOP_BAR_HEIGHT = 56
+        top_block_56 = QWidget(self)
+        top_block_56.setFixedHeight(_TOP_BAR_HEIGHT)
+        top_block_56.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        top_block_56_layout = QVBoxLayout(top_block_56)
+        top_block_56_layout.setContentsMargins(16, 11, 16, 0)
+        top_block_56_layout.setSpacing(0)
+
+        self._project_menu = MonosMenu(self, rounded=False)
+        self._project_menu.setObjectName("ProjectSwitchMenu")
+        self._project_menu.setWindowOpacity(1.0)
+        self._project_menu_closed_at = 0.0
+        self._project_menu.aboutToHide.connect(self._on_sidebar_project_menu_closed)
+        _shadow = QGraphicsDropShadowEffect(self._project_menu)
+        _shadow.setBlurRadius(15)
+        _shadow.setOffset(0, 8)
+        _shadow.setColor(QColor(0, 0, 0, int(255 * 0.40)))
+        self._project_menu.setGraphicsEffect(_shadow)
+
+        self._project_switch = QToolButton(top_block_56)
+        self._project_switch.setObjectName("SidebarProjectSwitch")
+        self._project_switch.setProperty("state", "empty")
+        self._project_switch.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._project_switch.setIcon(self._project_dot_icon("#71717a"))
+        self._project_switch.setText("SELECT PROJECT")
+        self._project_switch.setPopupMode(QToolButton.InstantPopup)
+        self._project_switch.setCursor(Qt.PointingHandCursor)
+        self._project_switch.setFocusPolicy(Qt.NoFocus)
+        self._project_switch.setFixedHeight(34)
+        try:
+            bf = self._project_switch.font()
+            bf.setPointSize(11)
+            bf.setWeight(QFont.Weight.DemiBold)
+            self._project_switch.setFont(bf)
+        except Exception:
+            pass
+        self._project_switch.clicked.connect(self._show_sidebar_project_menu)
+
+        top_block_56_layout.addWidget(self._project_switch, 0)
+        top_block_56_layout.addStretch(1)
+        sep_top = QFrame(top_block_56)
+        sep_top.setObjectName("SidebarNavSeparator")
+        sep_top.setFrameShape(QFrame.Shape.HLine)
+        sep_top.setFrameShadow(QFrame.Shadow.Sunken)
+        sep_top.setFixedHeight(1)
+        top_block_56_layout.addWidget(sep_top, 0)
+
+        # --- Primary Nav (scope pill + footer nav)
         top = QWidget(self)
         top.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         top_layout = QVBoxLayout(top)
-        top_layout.setContentsMargins(16, 16, 16, 16)  # p-4
+        top_layout.setContentsMargins(16, 12, 16, 16)
         top_layout.setSpacing(12)
-
-        brand = QWidget(top)
-        brand.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        brand_layout = QHBoxLayout(brand)
-        brand_layout.setContentsMargins(0, 0, 0, 0)
-        brand_layout.setSpacing(12)  # icon-to-text ~12px
-
-        icon_box = QLabel(brand)
-        icon_box.setObjectName("SidebarBrandIcon")
-        icon_box.setAlignment(Qt.AlignCenter)
-        icon_box.setFixedSize(28, 28)
-        _logo_pix = _load_logo_pixmap(20, "#ffffff")
-        if not _logo_pix.isNull():
-            icon_box.setPixmap(_logo_pix)
-
-        brand_label = QLabel("MONOS", brand)
-        brand_label.setObjectName("SidebarBrandLabel")
-        f_brand = monos_font("Inter", 16, QFont.Weight.ExtraBold)  # 800
-        f_brand.setLetterSpacing(QFont.PercentageSpacing, 97)  # tracking-tight
-        f_brand.setStyle(QFont.Style.StyleItalic)
-        brand_label.setFont(f_brand)
-
-        ver_label = QLabel(get_app_version(), brand)
-        ver_label.setObjectName("SidebarVersionLabel")
-        f_ver = monos_font("JetBrains Mono", 9, QFont.Weight.Normal)
-        f_ver.setItalic(True)
-        ver_label.setFont(f_ver)
-        ver_label.setStyleSheet("color: #52525b;")
-
-        brand_layout.addWidget(icon_box)
-        brand_layout.addWidget(brand_label)
-        brand_layout.addWidget(ver_label)
-        brand_layout.addStretch(1)
 
         self._nav = QListWidget(top)
         self._nav.setObjectName("SidebarPrimaryNav")
@@ -2394,15 +2420,6 @@ class Sidebar(QWidget):
             lambda pos: self.context_menu_requested.emit(self._scope_context, scope_pill_wrapper.mapToGlobal(pos))
         )
         scope_wrap_layout.addWidget(self._scope_pill, 0, Qt.AlignmentFlag.AlignHCenter)
-
-        top_layout.addWidget(brand, 0)
-
-        sep_above_nav = QFrame(top)
-        sep_above_nav.setObjectName("SidebarNavSeparator")
-        sep_above_nav.setFrameShape(QFrame.Shape.HLine)
-        sep_above_nav.setFrameShadow(QFrame.Shadow.Sunken)
-        sep_above_nav.setFixedHeight(1)
-        top_layout.addWidget(sep_above_nav, 0)
 
         nav_container = QWidget(top)
         nav_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
@@ -2456,10 +2473,10 @@ class Sidebar(QWidget):
         top.setMaximumHeight(200)
 
         # --- Block 2: Filters (dept/type lists scroll individually; no common scroll)
-        filters_center = QWidget(self)
-        filters_center.setObjectName("SidebarFiltersCenter")
-        filters_center.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        scroll_layout = QVBoxLayout(filters_center)
+        self._filters_center = QWidget(self)
+        self._filters_center.setObjectName("SidebarFiltersCenter")
+        self._filters_center.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scroll_layout = QVBoxLayout(self._filters_center)
         scroll_layout.setContentsMargins(16, 8, 16, 16)  # 8px top so content doesn’t sit under nav pill
         scroll_layout.setSpacing(24)  # mt-6 between sections
 
@@ -2467,7 +2484,7 @@ class Sidebar(QWidget):
         f_h.setLetterSpacing(QFont.PercentageSpacing, 112)  # tracking-widest-ish
 
         # Section: FILTERS — Dept list stretches down to Types; Types+Tags snap bottom.
-        self._filters = SidebarWidget(filters_center)
+        self._filters = SidebarWidget(self._filters_center)
         scroll_layout.addWidget(self._filters.dept_section(), 1)
         scroll_layout.addWidget(self._filters.type_section(), 0)
         scroll_layout.addWidget(self._filters.tag_section(), 0)
@@ -2480,12 +2497,13 @@ class Sidebar(QWidget):
         self._sep_above_tasks.setFrameShadow(QFrame.Shadow.Sunken)
         self._sep_above_tasks.setFixedHeight(1)
 
-        # --- Block 3: Recent Tasks (fixed height, never stretches when window is maximized)
+        # --- Block 3: Recent Tasks (header always visible; list hidden when collapsed)
         self._tasks_block = QWidget(self)
         self._tasks_block.setObjectName("SidebarRecentTasksBlock")
         _tasks_list_max = 5 * _TASK_ROW_HEIGHT + 4 * 2
-        _tasks_block_h = 12 + 20 + 8 + _tasks_list_max + 8  # margins + header + spacing + list + bottom margin
-        self._tasks_block.setFixedHeight(_tasks_block_h)
+        self._tasks_block_h_expanded = 12 + 20 + 8 + _tasks_list_max + 8  # margins + header + spacing + list + bottom
+        self._tasks_block_h_collapsed = 12 + 20 + 8  # margins + header + bottom padding
+        self._tasks_block.setFixedHeight(self._tasks_block_h_expanded)
         self._tasks_block.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         tasks_layout = QVBoxLayout(self._tasks_block)
         tasks_layout.setContentsMargins(16, 12, 16, 8)  # align with sidebar padding
@@ -2496,10 +2514,14 @@ class Sidebar(QWidget):
         tasks_header_layout = QHBoxLayout(tasks_header_row)
         tasks_header_layout.setContentsMargins(0, 0, 0, 0)
         tasks_header_layout.setSpacing(8)
-        tasks_header = QLabel("RECENT TASKS", tasks_header_row)
-        tasks_header.setObjectName("SidebarSectionHeader")
-        tasks_header.setFont(f_h)
-        tasks_header_layout.addWidget(tasks_header, 1)
+        self._tasks_header_btn = QPushButton("RECENT TASKS", tasks_header_row)
+        self._tasks_header_btn.setObjectName("SidebarRecentTasksHeaderButton")
+        self._tasks_header_btn.setFlat(True)
+        self._tasks_header_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tasks_header_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._tasks_header_btn.setFont(f_h)
+        self._tasks_header_btn.clicked.connect(self._on_recent_tasks_visibility_toggled)
+        tasks_header_layout.addWidget(self._tasks_header_btn, 1)
         self._tasks_clear_btn = QToolButton(tasks_header_row)
         self._tasks_clear_btn.setObjectName("SidebarRecentTasksClearButton")
         self._tasks_clear_btn.setCursor(Qt.PointingHandCursor)
@@ -2535,43 +2557,37 @@ class Sidebar(QWidget):
         tasks_layout.addWidget(tasks_header_row, 0)
         tasks_layout.addWidget(self._tasks_stacked, 0)
 
-        # --- Block 4: Footer (Global Settings only)
+        # --- Block 4: Footer (logo + name + version, small)
         bottom = QWidget(self)
         bottom.setObjectName("SidebarBottom")
+        bottom.setFixedHeight(_SIDEBAR_FOOTER_HEIGHT)
         bottom.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         bottom_layout = QHBoxLayout(bottom)
-        bottom_layout.setContentsMargins(16, 12, 16, 16)
-        bottom_layout.setSpacing(8)
-
+        bottom_layout.setContentsMargins(12, 4, 12, 8)
+        bottom_layout.setSpacing(6)
+        bottom_layout.addStretch(1)
+        _logo_footer = QLabel(bottom)
+        _logo_footer.setObjectName("SidebarFooterLogo")
+        _logo_footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _logo_footer.setFixedSize(16, 16)
+        _logo_pix_footer = _load_logo_pixmap(12, "#71717a")
+        if not _logo_pix_footer.isNull():
+            _logo_footer.setPixmap(_logo_pix_footer)
+        _name_footer = QLabel("MONOS", bottom)
+        _name_footer.setObjectName("SidebarFooterName")
+        _name_footer.setFont(monos_font("Inter", 10, QFont.Weight.DemiBold))
+        _ver_footer = QLabel(get_app_version(), bottom)
+        _ver_footer.setObjectName("SidebarFooterVersion")
+        _ver_footer.setFont(monos_font("JetBrains Mono", 8, QFont.Weight.Normal))
+        _ver_footer.setStyleSheet("color: #52525b;")
+        bottom_layout.addWidget(_logo_footer, 0, Qt.AlignmentFlag.AlignVCenter)
+        bottom_layout.addWidget(_name_footer, 0, Qt.AlignmentFlag.AlignVCenter)
+        bottom_layout.addWidget(_ver_footer, 0, Qt.AlignmentFlag.AlignVCenter)
         bottom_layout.addStretch(1)
 
-        self._recent_tasks_visible_btn = QToolButton(bottom)
-        self._recent_tasks_visible_btn.setObjectName("SidebarFooterNavButton")
-        self._recent_tasks_visible_btn.setCursor(Qt.PointingHandCursor)
-        self._recent_tasks_visible_btn.setFocusPolicy(Qt.NoFocus)
-        self._recent_tasks_visible_btn.setAutoRaise(True)
-        self._recent_tasks_visible_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self._recent_tasks_visible_btn.setFixedSize(36, 36)
-        self._recent_tasks_visible_btn.clicked.connect(self._on_recent_tasks_visibility_toggled)
-        bottom_layout.addWidget(self._recent_tasks_visible_btn, 0)
-
-        self._settings_btn = QToolButton(bottom)
-        self._settings_btn.setObjectName("SidebarFooterNavButton")
-        self._settings_btn.setCursor(Qt.PointingHandCursor)
-        self._settings_btn.setFocusPolicy(Qt.NoFocus)
-        self._settings_btn.setAutoRaise(True)
-        self._settings_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self._settings_btn.setFixedSize(36, 36)
-        self._settings_btn.setToolTip("Global Settings")
-        _settings_icon = lucide_icon("settings", size=20, color_hex=MONOS_COLORS["text_label"])
-        if not _settings_icon.isNull():
-            self._settings_btn.setIcon(_settings_icon)
-            self._settings_btn.setIconSize(QSize(20, 20))
-        self._settings_btn.clicked.connect(self.settings_requested.emit)
-        bottom_layout.addWidget(self._settings_btn, 0)
-
+        root.addWidget(top_block_56, 0)
         root.addWidget(top, 0)
-        root.addWidget(filters_center, 1)
+        root.addWidget(self._filters_center, 1)
         root.addWidget(self._sep_above_tasks, 0)
         root.addWidget(self._tasks_block, 0)
         root.addWidget(bottom, 0)
@@ -2590,6 +2606,22 @@ class Sidebar(QWidget):
     def filters(self) -> SidebarWidget:
         return self._filters
 
+    _FILTERS_CENTER_LAYOUT_INDEX = 1  # index in root layout for filters_center
+
+    def take_filters_center(self) -> QWidget | None:
+        """Remove the filter panel from sidebar layout and return it (for compact filter popup)."""
+        w = self._filters_center
+        lay = self.layout()
+        if lay is not None:
+            lay.removeWidget(w)
+        return w
+
+    def restore_filters_center(self, widget: QWidget) -> None:
+        """Put the filter panel back into sidebar layout."""
+        lay = self.layout()
+        if lay is not None:
+            lay.insertWidget(self._FILTERS_CENTER_LAYOUT_INDEX, widget)
+
     def _sidebar_settings(self) -> QSettings:
         return QSettings(self._APP_SETTINGS_ORG, self._APP_SETTINGS_APP)
 
@@ -2604,13 +2636,12 @@ class Sidebar(QWidget):
     def _apply_recent_tasks_visibility(self) -> None:
         visible = self._recent_tasks_visible_from_settings()
         self._sep_above_tasks.setVisible(visible)
-        self._tasks_block.setVisible(visible)
-        self._recent_tasks_visible_btn.setToolTip("Hide Recent Tasks" if visible else "Show Recent Tasks")
-        # Icon for recent tasks panel visibility (calendar = time / recent).
-        _icon = lucide_icon("calendar", size=20, color_hex=MONOS_COLORS["text_label"])
-        if not _icon.isNull():
-            self._recent_tasks_visible_btn.setIcon(_icon)
-            self._recent_tasks_visible_btn.setIconSize(QSize(20, 20))
+        self._tasks_stacked.setVisible(visible)
+        self._tasks_block.setFixedHeight(
+            self._tasks_block_h_expanded if visible else self._tasks_block_h_collapsed
+        )
+        if hasattr(self, "_tasks_header_btn") and self._tasks_header_btn is not None:
+            self._tasks_header_btn.setToolTip("Hide list" if visible else "Show list")
 
     def _on_recent_tasks_visibility_toggled(self, _checked: bool = False) -> None:
         visible = self._recent_tasks_visible_from_settings()
@@ -2618,6 +2649,110 @@ class Sidebar(QWidget):
         s.setValue(self._RECENT_TASKS_VISIBLE_KEY, not visible)
         s.sync()
         self._apply_recent_tasks_visibility()
+
+    _POPUP_REOPEN_GRACE = 0.25
+
+    def _clear_tool_button_hover(self, btn: QToolButton) -> None:
+        """Clear stuck hover/pressed state (after popup closes), same as TopBar."""
+        QApplication.sendEvent(btn, QEvent(QEvent.Type.Leave))
+        btn.setDown(False)
+        try:
+            st = btn.style()
+            if st:
+                st.unpolish(btn)
+                st.polish(btn)
+        except Exception:
+            pass
+        btn.update()
+
+    def _show_sidebar_project_menu(self) -> None:
+        """Same as noti: if menu is open, close it; if just closed (grace), don't reopen."""
+        if self._project_menu.isVisible():
+            self._project_menu.close()
+            return
+        if (time.monotonic() - self._project_menu_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
+        pos = self._project_switch.mapToGlobal(self._project_switch.rect().bottomLeft())
+        self._project_menu.popup(pos)
+
+    def _on_sidebar_project_menu_closed(self) -> None:
+        self._project_menu_closed_at = time.monotonic()
+        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._project_switch))
+
+    @staticmethod
+    def _project_dot_icon(color_hex: str, *, diameter: int = 6) -> QIcon:
+        try:
+            dpr = float(QApplication.primaryScreen().devicePixelRatio())
+        except Exception:
+            dpr = 1.0
+        canvas = max(16, diameter + 8)
+        dev_w = int(round(canvas * dpr))
+        pm = QPixmap(dev_w, dev_w)
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(color_hex))
+        cx = canvas / 2.0
+        cy = canvas / 2.0
+        r = diameter / 2.0
+        p.drawEllipse(QRectF(cx - r, cy - r, diameter, diameter))
+        p.end()
+        return QIcon(pm)
+
+    def set_projects(
+        self,
+        projects: list[DiscoveredProject],
+        *,
+        current_root: Path | None,
+        status_by_root: dict[str, str] | None = None,
+    ) -> None:
+        self._project_menu.clear()
+        current = str(current_root) if current_root else None
+        if not projects:
+            empty = QAction("No projects", self._project_menu)
+            empty.setEnabled(False)
+            self._project_menu.addAction(empty)
+            self._project_switch.setEnabled(False)
+            self._project_switch.setText("NO PROJECTS")
+            self._project_switch.setIcon(self._project_dot_icon("#52525b"))
+            self._project_switch.setProperty("state", "disabled")
+            if self._project_switch.style():
+                self._project_switch.style().unpolish(self._project_switch)
+                self._project_switch.style().polish(self._project_switch)
+            return
+        self._project_switch.setEnabled(True)
+        if current_root is None:
+            self._project_switch.setText("SELECT PROJECT")
+            self._project_switch.setIcon(self._project_dot_icon("#71717a"))
+            self._project_switch.setProperty("state", "empty")
+        else:
+            folder_name = current_root.name or ""
+            self._project_switch.setText(folder_name.upper())
+            accent = project_accent_color(folder_name)
+            self._project_switch.setIcon(self._project_dot_icon(accent, diameter=8))
+            self._project_switch.setProperty("state", "active")
+        if self._project_switch.style():
+            self._project_switch.style().unpolish(self._project_switch)
+            self._project_switch.style().polish(self._project_switch)
+        group = QActionGroup(self._project_menu)
+        group.setExclusive(True)
+        for proj in projects:
+            label = proj.root.name
+            accent = project_accent_color(label)
+            is_current = current == str(proj.root)
+            dot = self._project_dot_icon(accent, diameter=8 if is_current else 6)
+            act = QAction(label, self._project_menu, checkable=True)
+            act.setIcon(dot)
+            act.setChecked(is_current)
+            if is_current:
+                f = act.font()
+                f.setWeight(QFont.Weight.DemiBold)
+                act.setFont(f)
+            act.triggered.connect(lambda checked=False, p=str(proj.root): self.project_switch_requested.emit(p))
+            group.addAction(act)
+            self._project_menu.addAction(act)
 
     def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
         self._tasks_list.clear()
@@ -2899,4 +3034,464 @@ class Sidebar(QWidget):
 
         for name, w in self._nav_widgets.items():
             w.set_count_badge(None)
+
+
+# --- SidebarCompact: icon-only vertical sidebar for narrow windows ---
+
+_SIDEBAR_COMPACT_WIDTH = 56
+_SIDEBAR_FOOTER_HEIGHT = 32  # Same height for normal and compact footer
+
+
+def _sep_line(parent: QWidget, object_name: str = "SidebarNavSeparator") -> QFrame:
+    s = QFrame(parent)
+    s.setObjectName(object_name)
+    s.setFixedHeight(1)
+    s.setFrameShape(QFrame.Shape.HLine)
+    return s
+
+
+class SidebarCompact(QWidget):
+    """
+    Icon-only vertical sidebar (56px) for narrow windows.
+    Layout: project switcher → sep → scope (P/S/A) → sep → Inbox/Guide/Outbox → sep → recent tasks → stretch → sep → footer logo.
+    Recent Tasks: click opens popup list.
+    """
+
+    context_changed = Signal(str)
+    context_clicked = Signal(str)
+    context_menu_requested = Signal(str, object)
+    project_switch_requested = Signal(str)
+    filter_requested = Signal()  # compact: open filter popup (MainWindow shows full filter panel)
+    recent_task_clicked = Signal(object)
+    recent_task_double_clicked = Signal(object)
+    clear_recent_tasks_requested = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("SidebarCompact")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setMinimumWidth(_SIDEBAR_COMPACT_WIDTH)
+        self.setMaximumWidth(_SIDEBAR_COMPACT_WIDTH)
+
+        self._scope_context: str = SidebarContext.ASSETS.value
+        self._footer_context: str | None = None
+        self._last_context_text: str | None = None
+        self._filter_source: SidebarWidget | None = None
+
+        self._project_menu_closed_at = 0.0
+        self._project_menu = MonosMenu(self, rounded=False)
+        self._project_menu.setObjectName("ProjectSwitchMenu")
+        self._project_menu.setWindowOpacity(1.0)
+        self._project_menu.aboutToHide.connect(self._on_compact_project_menu_closed)
+        _shadow = QGraphicsDropShadowEffect(self._project_menu)
+        _shadow.setBlurRadius(15)
+        _shadow.setOffset(0, 8)
+        _shadow.setColor(QColor(0, 0, 0, int(255 * 0.40)))
+        self._project_menu.setGraphicsEffect(_shadow)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Project switcher + separator aligned with top bar bottom (56px)
+        _TOP_BAR_HEIGHT = 56
+        top_block_56 = QWidget(self)
+        top_block_56.setFixedHeight(_TOP_BAR_HEIGHT)
+        top_block_56.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        top_block_56_layout = QVBoxLayout(top_block_56)
+        top_block_56_layout.setContentsMargins(0, 8, 0, 0)
+        top_block_56_layout.setSpacing(0)
+        self._project_switch = QToolButton(top_block_56)
+        self._project_switch.setObjectName("SidebarCompactProjectSwitch")
+        self._project_switch.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._project_switch.setIcon(self._project_dot_icon("#71717a"))
+        self._project_switch.setFixedSize(40, 40)
+        self._project_switch.setCursor(Qt.PointingHandCursor)
+        self._project_switch.setFocusPolicy(Qt.NoFocus)
+        self._project_switch.setToolTip("Switch project")
+        self._project_switch.setPopupMode(QToolButton.InstantPopup)
+        self._project_switch.clicked.connect(self._show_project_menu)
+        top_block_56_layout.addWidget(self._project_switch, 0, Qt.AlignmentFlag.AlignHCenter)
+        top_block_56_layout.addStretch(1)
+        top_block_56_layout.addWidget(_sep_line(top_block_56), 0)
+        root.addWidget(top_block_56, 0)
+
+        # Scope: Projects, Shots, Assets (icon only)
+        scope_btns: dict[str, QToolButton] = {}
+        _scope_tooltips = {
+            SidebarContext.PROJECTS.value: "Projects",
+            SidebarContext.SHOTS.value: "Shots",
+            SidebarContext.ASSETS.value: "Assets",
+        }
+        for ctx_name, icon_name in [
+            (SidebarContext.PROJECTS.value, "folder-kanban"),
+            (SidebarContext.SHOTS.value, "clapperboard"),
+            (SidebarContext.ASSETS.value, "box"),
+        ]:
+            btn = QToolButton(self)
+            btn.setObjectName("SidebarCompactScopeButton")
+            btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            btn.setFixedSize(40, 40)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setToolTip(_scope_tooltips.get(ctx_name, ""))
+            ic = lucide_icon(icon_name, size=20, color_hex=MONOS_COLORS["text_label"])
+            if not ic.isNull():
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(20, 20))
+            btn.setProperty("active", "false")
+            btn.clicked.connect(lambda checked=False, c=ctx_name: self._on_scope_clicked(c))
+            scope_btns[ctx_name] = btn
+            root.addWidget(btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._scope_buttons = scope_btns
+        root.addWidget(_sep_line(self), 0)
+
+        # Footer nav: Inbox, Project Guide, Outbox
+        footer_btns: dict[str, QToolButton] = {}
+        _footer_tooltips = {
+            SidebarContext.INBOX.value: "Inbox",
+            SidebarContext.PROJECT_GUIDE.value: "Project Guide",
+            SidebarContext.OUTBOX.value: "Outbox",
+        }
+        for ctx_name, icon_name in [
+            (SidebarContext.INBOX.value, "inbox"),
+            (SidebarContext.PROJECT_GUIDE.value, "folder-open"),
+            (SidebarContext.OUTBOX.value, "send"),
+        ]:
+            btn = QToolButton(self)
+            btn.setObjectName("SidebarCompactFooterNavButton")
+            btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            btn.setFixedSize(40, 40)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setToolTip(_footer_tooltips.get(ctx_name, ""))
+            ic = lucide_icon(icon_name, size=20, color_hex=MONOS_COLORS["text_label"])
+            if not ic.isNull():
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(20, 20))
+            btn.setProperty("active", "false")
+            btn.clicked.connect(lambda checked=False, c=ctx_name: self._on_footer_nav_clicked(c))
+            footer_btns[ctx_name] = btn
+            root.addWidget(btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._footer_buttons = footer_btns
+        root.addWidget(_sep_line(self), 0)
+
+        # Filter (Departments / Types): icon opens popup — MainWindow will show full filter panel in popup
+        self._filter_btn = QToolButton(self)
+        self._filter_btn.setObjectName("SidebarCompactFilterButton")
+        self._filter_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._filter_btn.setFixedSize(40, 40)
+        self._filter_btn.setCursor(Qt.PointingHandCursor)
+        self._filter_btn.setFocusPolicy(Qt.NoFocus)
+        self._filter_btn.setToolTip("Departments & types")
+        _fic = lucide_icon("sliders-horizontal", size=20, color_hex=MONOS_COLORS["text_label"])
+        if not _fic.isNull():
+            self._filter_btn.setIcon(_fic)
+            self._filter_btn.setIconSize(QSize(20, 20))
+        self._filter_btn.clicked.connect(self._on_filter_clicked)
+        root.addWidget(self._filter_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        root.addStretch(1)
+
+        # Recent tasks (icon only; click → popup) — at bottom above logo
+        self._recent_tasks_btn = QToolButton(self)
+        self._recent_tasks_btn.setObjectName("SidebarCompactRecentTasksButton")
+        self._recent_tasks_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._recent_tasks_btn.setFixedSize(40, 40)
+        self._recent_tasks_btn.setCursor(Qt.PointingHandCursor)
+        self._recent_tasks_btn.setFocusPolicy(Qt.NoFocus)
+        self._recent_tasks_btn.setToolTip("Recent tasks")
+        ic = lucide_icon("calendar", size=20, color_hex=MONOS_COLORS["text_label"])
+        if not ic.isNull():
+            self._recent_tasks_btn.setIcon(ic)
+            self._recent_tasks_btn.setIconSize(QSize(20, 20))
+        self._recent_tasks_btn.clicked.connect(self._show_recent_tasks_popup)
+        root.addWidget(self._recent_tasks_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        # Footer: logo icon only (same height as normal sidebar footer); full width so BG covers sidebar
+        _footer_wrap = QWidget(self)
+        _footer_wrap.setObjectName("SidebarCompactFooter")
+        _footer_wrap.setFixedHeight(_SIDEBAR_FOOTER_HEIGHT)
+        _footer_wrap.setMinimumWidth(_SIDEBAR_COMPACT_WIDTH)
+        _footer_layout = QVBoxLayout(_footer_wrap)
+        _footer_layout.setContentsMargins(0, 0, 0, 0)
+        _footer_layout.setSpacing(0)
+        _footer_layout.addStretch(1)
+        _logo = QLabel(_footer_wrap)
+        _logo.setObjectName("SidebarCompactFooterLogo")
+        _logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _logo.setFixedSize(24, 24)
+        _px = _load_logo_pixmap(20, "#71717a")
+        if not _px.isNull():
+            _logo.setPixmap(_px)
+        _footer_layout.addWidget(_logo, 0, Qt.AlignmentFlag.AlignHCenter)
+        _footer_layout.addStretch(1)
+        root.addWidget(_footer_wrap, 0)
+
+        self._recent_tasks_popup: QFrame | None = None
+        self._recent_tasks_list: QListWidget | None = None
+        self._recent_tasks: list[RecentTask] = []
+        self._recent_tasks_popup_closed_at = 0.0
+
+        self._sync_active_states()
+
+    @staticmethod
+    def _project_dot_icon(color_hex: str, *, diameter: int = 6) -> QIcon:
+        try:
+            dpr = float(QApplication.primaryScreen().devicePixelRatio())
+        except Exception:
+            dpr = 1.0
+        canvas = max(16, diameter + 8)
+        dev_w = int(round(canvas * dpr))
+        pm = QPixmap(dev_w, dev_w)
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(color_hex))
+        cx = canvas / 2.0
+        cy = canvas / 2.0
+        r = diameter / 2.0
+        p.drawEllipse(QRectF(cx - r, cy - r, diameter, diameter))
+        p.end()
+        return QIcon(pm)
+
+    def set_filter_source(self, filters: SidebarWidget | None) -> None:
+        self._filter_source = filters
+
+    def _on_filter_clicked(self) -> None:
+        self.filter_requested.emit()
+
+    def _clear_tool_button_hover(self, btn: QToolButton) -> None:
+        """Clear stuck hover/pressed state (after popup closes), same as TopBar."""
+        QApplication.sendEvent(btn, QEvent(QEvent.Type.Leave))
+        btn.setDown(False)
+        try:
+            st = btn.style()
+            if st:
+                st.unpolish(btn)
+                st.polish(btn)
+        except Exception:
+            pass
+        btn.update()
+
+    def filters(self) -> SidebarWidget | None:
+        return self._filter_source
+
+    def current_context(self) -> str:
+        if self._footer_context is not None:
+            return self._footer_context
+        return self._scope_context
+
+    def set_current_context(self, context_name: str) -> None:
+        if context_name in (SidebarContext.PROJECTS.value, SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
+            self._footer_context = None
+            self._scope_context = context_name
+            self._last_context_text = context_name
+            self._sync_active_states()
+            self.context_changed.emit(context_name)
+            return
+        if context_name in (SidebarContext.INBOX.value, SidebarContext.PROJECT_GUIDE.value, SidebarContext.OUTBOX.value):
+            self._footer_context = context_name
+            self._last_context_text = context_name
+            self._sync_active_states()
+            self.context_changed.emit(context_name)
+
+    def _sync_active_states(self) -> None:
+        ctx = self.current_context()
+        for name, btn in self._scope_buttons.items():
+            active = name == ctx
+            btn.setProperty("active", "true" if active else "false")
+            color = MONOS_COLORS["blue_400"] if active else MONOS_COLORS["text_label"]
+            icon_name = "folder-kanban" if name == SidebarContext.PROJECTS.value else ("clapperboard" if name == SidebarContext.SHOTS.value else "box")
+            ic = lucide_icon(icon_name, size=20, color_hex=color)
+            if not ic.isNull():
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(20, 20))
+            if btn.style():
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+        for name, btn in self._footer_buttons.items():
+            active = name == ctx
+            btn.setProperty("active", "true" if active else "false")
+            color = MONOS_COLORS["blue_400"] if active else MONOS_COLORS["text_label"]
+            icon_name = "inbox" if name == SidebarContext.INBOX.value else ("folder-open" if name == SidebarContext.PROJECT_GUIDE.value else "send")
+            ic = lucide_icon(icon_name, size=20, color_hex=color)
+            if not ic.isNull():
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(20, 20))
+            if btn.style():
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+
+    def _on_scope_clicked(self, context_name: str) -> None:
+        if context_name == self.current_context():
+            self.context_clicked.emit(context_name)
+            return
+        self.set_current_context(context_name)
+
+    def _on_footer_nav_clicked(self, context_name: str) -> None:
+        if context_name == self.current_context():
+            self.context_clicked.emit(context_name)
+            return
+        self.set_current_context(context_name)
+
+    def _show_project_menu(self) -> None:
+        """Same as noti: if menu is open, close it; if just closed (grace), don't reopen."""
+        if self._project_menu.isVisible():
+            self._project_menu.close()
+            return
+        if (time.monotonic() - self._project_menu_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
+        pos = self._project_switch.mapToGlobal(self._project_switch.rect().bottomLeft())
+        self._project_menu.popup(pos)
+
+    def _on_compact_project_menu_closed(self) -> None:
+        self._project_menu_closed_at = time.monotonic()
+        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._project_switch))
+
+    def set_projects(
+        self,
+        projects: list[DiscoveredProject],
+        *,
+        current_root: Path | None,
+        status_by_root: dict[str, str] | None = None,
+    ) -> None:
+        self._project_menu.clear()
+        if not projects:
+            self._project_switch.setEnabled(False)
+            self._project_switch.setIcon(self._project_dot_icon("#52525b"))
+            self._project_switch.setProperty("state", "disabled")
+            if self._project_switch.style():
+                self._project_switch.style().unpolish(self._project_switch)
+                self._project_switch.style().polish(self._project_switch)
+            return
+        self._project_switch.setEnabled(True)
+        current = str(current_root) if current_root else None
+        if current_root is None:
+            self._project_switch.setIcon(self._project_dot_icon("#71717a"))
+            self._project_switch.setProperty("state", "empty")
+        else:
+            folder_name = current_root.name or ""
+            accent = project_accent_color(folder_name)
+            self._project_switch.setIcon(self._project_dot_icon(accent, diameter=8))
+            self._project_switch.setProperty("state", "active")
+        if self._project_switch.style():
+            self._project_switch.style().unpolish(self._project_switch)
+            self._project_switch.style().polish(self._project_switch)
+        group = QActionGroup(self._project_menu)
+        group.setExclusive(True)
+        for proj in projects:
+            label = proj.root.name
+            accent = project_accent_color(label)
+            is_current = current == str(proj.root)
+            dot = self._project_dot_icon(accent, diameter=8 if is_current else 6)
+            act = QAction(label, self._project_menu, checkable=True)
+            act.setIcon(dot)
+            act.setChecked(is_current)
+            if is_current:
+                f = act.font()
+                f.setWeight(QFont.Weight.DemiBold)
+                act.setFont(f)
+            act.triggered.connect(lambda checked=False, p=str(proj.root): self.project_switch_requested.emit(p))
+            group.addAction(act)
+            self._project_menu.addAction(act)
+
+    def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
+        self._recent_tasks = list(tasks) if tasks else []
+        if self._recent_tasks_list is not None:
+            self._recent_tasks_list.clear()
+            for t in self._recent_tasks:
+                it = QListWidgetItem("")
+                it.setData(Qt.UserRole, t)
+                it.setSizeHint(QSize(0, _TASK_ROW_HEIGHT))
+                base_tt = f"{t.item_name}\n{t.department}" + (f" · {t.dcc}" if t.dcc else "")
+                base_html = base_tt.replace("\n", "<br/>")
+                hint_html = '<span style="font-size:80%; color:#71717a;">Double-click to open</span>'
+                it.setToolTip(f"<html>{base_html}<br/><br/>{hint_html}</html>")
+                self._recent_tasks_list.addItem(it)
+            if self._recent_tasks_list.count():
+                self._recent_tasks_list.setCurrentRow(0)
+
+    _POPUP_REOPEN_GRACE = 0.25
+
+    def _show_recent_tasks_popup(self) -> None:
+        if not self._recent_tasks:
+            return
+        # Same as noti button: if popup is open, close it (toggle); if just closed, don't reopen
+        if self._recent_tasks_popup is not None and self._recent_tasks_popup.isVisible():
+            self._recent_tasks_popup.close()
+            return
+        if (time.monotonic() - self._recent_tasks_popup_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
+
+        class _RecentTasksPopupFrame(QFrame):
+            def __init__(self, parent, on_hide_cb):
+                super().__init__(parent)
+                self._on_hide_cb = on_hide_cb
+
+            def hideEvent(self, event):
+                self._on_hide_cb()
+                super().hideEvent(event)
+
+        def _on_recent_popup_hidden():
+            self._recent_tasks_popup_closed_at = time.monotonic()
+            self._recent_tasks_popup = None
+            self._recent_tasks_list = None
+            QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._recent_tasks_btn))
+
+        popup = _RecentTasksPopupFrame(self, _on_recent_popup_hidden)
+        popup.setObjectName("SidebarCompactRecentTasksPopup")
+        popup.setWindowFlags(Qt.WindowType.Popup | Qt.FramelessWindowHint)
+        popup.setAttribute(Qt.WA_TranslucentBackground, False)
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        lst = QListWidget(popup)
+        lst.setObjectName("SidebarRecentTasksList")
+        lst.setItemDelegate(_SidebarRecentTaskDelegate(lst))
+        lst.setSelectionMode(QAbstractItemView.SingleSelection)
+        lst.setFocusPolicy(Qt.NoFocus)
+        lst.setSpacing(2)
+        max_h = 5 * _TASK_ROW_HEIGHT + 4 * 2
+        lst.setMinimumWidth(220)
+        lst.setMaximumHeight(max_h)
+        for t in self._recent_tasks:
+            it = QListWidgetItem("")
+            it.setData(Qt.UserRole, t)
+            it.setSizeHint(QSize(0, _TASK_ROW_HEIGHT))
+            base_tt = f"{t.item_name}\n{t.department}" + (f" · {t.dcc}" if t.dcc else "")
+            base_html = base_tt.replace("\n", "<br/>")
+            hint_html = '<span style="font-size:80%; color:#71717a;">Double-click to open</span>'
+            it.setToolTip(f"<html>{base_html}<br/><br/>{hint_html}</html>")
+            lst.addItem(it)
+        if lst.count():
+            lst.setCurrentRow(0)
+        lst.itemClicked.connect(self._on_popup_task_clicked)
+        lst.itemDoubleClicked.connect(self._on_popup_task_double_clicked)
+        self._recent_tasks_list = lst
+        layout.addWidget(lst)
+        clear_btn = QToolButton(popup)
+        clear_btn.setText("Clear")
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.clicked.connect(lambda: (popup.close(), self.clear_recent_tasks_requested.emit()))
+        layout.addWidget(clear_btn, 0, Qt.AlignmentFlag.AlignRight)
+        self._recent_tasks_popup = popup
+        pos = self._recent_tasks_btn.mapToGlobal(self._recent_tasks_btn.rect().bottomLeft())
+        popup.move(pos.x(), pos.y() + 4)
+        popup.show()
+
+    def _on_popup_task_clicked(self, item: QListWidgetItem) -> None:
+        task = item.data(Qt.UserRole) if item else None
+        if isinstance(task, RecentTask):
+            self.recent_task_clicked.emit(task)
+
+    def _on_popup_task_double_clicked(self, item: QListWidgetItem) -> None:
+        task = item.data(Qt.UserRole) if item else None
+        if isinstance(task, RecentTask):
+            self.recent_task_double_clicked.emit(task)
+        if self._recent_tasks_popup:
+            self._recent_tasks_popup.close()
 

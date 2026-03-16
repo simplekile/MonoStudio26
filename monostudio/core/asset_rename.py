@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -132,7 +135,122 @@ def _collect_work_file_renames(
     return dedup
 
 
-def rename_asset(*, project_root: Path, asset_path: Path, new_name: str) -> RenameAssetResult:
+def _rename_via_subprocess(src: Path, dest: Path) -> bool:
+    """On Windows, rename via cmd move (separate process, no watcher handle). Returns True if success."""
+    if sys.platform != "win32":
+        return False
+    try:
+        subprocess.run(
+            ["cmd", "/c", "move", "/Y", str(src), str(dest)],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _do_rename_with_retry(
+    src: Path, dest: Path, *, max_attempts: int = 8, delay_sec: float = 0.75
+) -> None:
+    """
+    Rename src to dest. On Windows: try subprocess several times with increasing delays,
+    then Path.rename with retries, then subprocess again as fallback (more attempts → higher success rate).
+    """
+    if sys.platform == "win32":
+        for sub_delay in (0.0, 0.5, 1.0, 1.5):
+            if sub_delay > 0:
+                time.sleep(sub_delay)
+            if _rename_via_subprocess(src, dest):
+                return
+    last: OSError | None = None
+    for attempt in range(max_attempts):
+        try:
+            src.rename(dest)
+            return
+        except OSError as e:
+            last = e
+            if sys.platform != "win32" or getattr(e, "winerror", None) != 5:
+                raise
+            if attempt < max_attempts - 1:
+                time.sleep(delay_sec)
+    if sys.platform == "win32":
+        for _ in range(2):
+            time.sleep(1.0)
+            if _rename_via_subprocess(src, dest):
+                return
+    if last is not None:
+        raise last
+
+
+def _rename_folder(src: Path, dest: Path) -> None:
+    """
+    Rename a folder from src to dest. On Windows, if direct rename fails with
+    Access denied (e.g. Dropbox or antivirus holding a handle), retry with delay,
+    then fall back to a two-step rename via a temporary name (each step with retry).
+    """
+    try:
+        _do_rename_with_retry(src, dest)
+        return
+    except OSError as e:
+        if sys.platform != "win32":
+            raise
+        if getattr(e, "winerror", None) != 5:  # ERROR_ACCESS_DENIED
+            raise
+    # Two-step rename: src -> temp -> dest (each step may still hit WinError 5, so retry)
+    parent = src.parent
+    temp_name = f"{src.name}.monos_rename_{int(time.time() * 1000)}"
+    temp_path = parent / temp_name
+    if temp_path.exists():
+        raise FileExistsError(f"Temporary rename path already exists: {temp_path!r}")
+    try:
+        _do_rename_with_retry(src, temp_path)
+        _do_rename_with_retry(temp_path, dest)
+    except Exception:
+        if temp_path.exists() and not dest.exists():
+            try:
+                _do_rename_with_retry(temp_path, src)
+            except OSError:
+                pass
+        raise
+
+
+def prepare_work_file_renames(
+    *,
+    project_root: Path,
+    asset_path: Path,
+    new_name: str,
+) -> list[tuple[Path, Path]]:
+    """
+    Collect the list of (old_rel, new_rel) work file renames for an asset rename.
+    Call this *before* clearing the watcher; then pass the result to rename_asset(..., work_file_renames=...)
+    so the folder is not opened again right before the directory rename (avoids holding a handle).
+    """
+    project_root = Path(project_root)
+    asset_path = Path(asset_path)
+    type_folder = asset_path.parent.name
+    old_name = asset_path.name
+    final_name = _normalize_asset_name_for_type(
+        project_root=project_root, type_folder=type_folder, raw_name=(new_name or "").strip()
+    )
+    if not final_name or old_name == final_name:
+        return []
+    return _collect_work_file_renames(
+        asset_dir=asset_path,
+        old_asset_name=old_name,
+        new_asset_name=final_name,
+        project_root=project_root,
+    )
+
+
+def rename_asset(
+    *,
+    project_root: Path,
+    asset_path: Path,
+    new_name: str,
+    work_file_renames: list[tuple[Path, Path]] | None = None,
+) -> RenameAssetResult:
     """
     Rename an asset folder (assets/<type>/<asset_name>) and rename its work files so the scanner still matches them.
     Does not touch publish files/folders and does not update external DCC references.
@@ -156,17 +274,20 @@ def rename_asset(*, project_root: Path, asset_path: Path, new_name: str) -> Rena
     if target.exists():
         raise FileExistsError(f"Target asset folder already exists: {str(target)!r}")
 
-    renames = _collect_work_file_renames(
-        asset_dir=asset_path,
-        old_asset_name=old_name,
-        new_asset_name=final_name,
-        project_root=project_root,
-    )
+    if work_file_renames is not None:
+        renames = work_file_renames
+    else:
+        renames = _collect_work_file_renames(
+            asset_dir=asset_path,
+            old_asset_name=old_name,
+            new_asset_name=final_name,
+            project_root=project_root,
+        )
 
     renamed_folder = False
     completed: list[tuple[Path, Path]] = []  # (new_abs, old_abs) for rollback
     try:
-        asset_path.rename(target)
+        _rename_folder(asset_path, target)
         renamed_folder = True
 
         # Apply work-file renames inside the new asset folder.
@@ -195,7 +316,7 @@ def rename_asset(*, project_root: Path, asset_path: Path, new_name: str) -> Rena
         finally:
             if renamed_folder:
                 try:
-                    target.rename(asset_path)
+                    _rename_folder(target, asset_path)
                 except OSError:
                     pass
         raise

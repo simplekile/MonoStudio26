@@ -800,7 +800,8 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowMaxBtn,
         QToolButton#WindowCloseBtn,
         QToolButton#TopBarNotiBtn,
-        QToolButton#TopBarUpdateBtn {
+        QToolButton#TopBarUpdateBtn,
+        QToolButton#TopBarWatcherBtn {
             border: none;
             border-radius: 0;
             background: transparent;
@@ -809,7 +810,8 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowMinBtn:hover,
         QToolButton#WindowMaxBtn:hover,
         QToolButton#TopBarNotiBtn:hover,
-        QToolButton#TopBarUpdateBtn:hover {
+        QToolButton#TopBarUpdateBtn:hover,
+        QToolButton#TopBarWatcherBtn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: #e4e4e7;
             border-radius: 8px;
@@ -1072,6 +1074,20 @@ def apply_dark_theme(app: QApplication) -> None:
             background: transparent;
         }
         QToolButton#MainViewSearchIconButton:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 6px;
+        }
+        QFrame#MainViewCardSizePopup {
+            background-color: #1c1c1f;
+            border: 1px solid #2a2a2d;
+            border-radius: 8px;
+        }
+        QToolButton#MainViewCardSizeButton {
+            padding: 6px;
+            border: none;
+            background: transparent;
+        }
+        QToolButton#MainViewCardSizeButton:hover {
             background: rgba(255, 255, 255, 0.08);
             border-radius: 6px;
         }
@@ -2048,6 +2064,41 @@ def apply_dark_theme(app: QApplication) -> None:
         QLabel#SidebarSectionHeader {
             color: #71717a; /* Zinc-500 */
         }
+        QPushButton#SidebarRecentTasksHeaderButton {
+            background: transparent;
+            border: none;
+            color: #71717a;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-align: left;
+            padding: 0;
+        }
+        QPushButton#SidebarRecentTasksHeaderButton:hover {
+            color: #a1a1aa;
+        }
+        QToolButton#SidebarProjectSwitch {
+            padding: 6px 10px;
+            border: none;
+            border-radius: 6px;
+            background: transparent;
+            color: #71717a;
+            font-family: "Inter", sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            text-align: left;
+        }
+        QToolButton#SidebarProjectSwitch[state="active"] {
+            color: #a1a1aa;
+        }
+        QToolButton#SidebarProjectSwitch[state="empty"] {
+            color: #71717a;
+        }
+        QToolButton#SidebarProjectSwitch:hover {
+            background: transparent;
+            color: #e2e2e2;
+        }
+        QToolButton#SidebarProjectSwitch::menu-indicator { image: none; width: 0; }
         QLabel#SidebarMutedText {
             color: #71717a; /* Zinc-500 */
         }
@@ -2319,7 +2370,14 @@ def apply_dark_theme(app: QApplication) -> None:
         }
 
         QWidget#SidebarBottom {
+            background-color: #1e1e21;
             border-top: 1px solid rgba(39, 39, 42, 0.50);
+        }
+        QLabel#SidebarFooterName {
+            color: #a1a1aa;
+        }
+        QLabel#SidebarFooterVersion {
+            color: #52525b;
         }
         QFrame#SidebarNavSeparator {
             background-color: rgba(63, 63, 70, 0.6);
@@ -2342,6 +2400,50 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QToolButton#SidebarRecentTasksClearButton:hover:enabled {
             background: rgba(255, 255, 255, 0.06);
+        }
+
+        /* --- SidebarCompact (icon-only narrow sidebar) --- */
+        QWidget#SidebarCompact {
+            background-color: #18181b;
+        }
+        QToolButton#SidebarCompactProjectSwitch {
+            background: transparent;
+            border: none;
+            border-radius: 6px;
+        }
+        QToolButton#SidebarCompactProjectSwitch:hover {
+            background: rgba(255, 255, 255, 0.06);
+        }
+        QToolButton#SidebarCompactProjectSwitch[state="active"] { }
+        QToolButton#SidebarCompactProjectSwitch[state="empty"] { }
+        QToolButton#SidebarCompactScopeButton,
+        QToolButton#SidebarCompactFooterNavButton,
+        QToolButton#SidebarCompactRecentTasksButton,
+        QToolButton#SidebarCompactFilterButton {
+            background: transparent;
+            border: none;
+            border-radius: 6px;
+            margin: 4px 0;
+        }
+        QToolButton#SidebarCompactScopeButton:hover,
+        QToolButton#SidebarCompactFooterNavButton:hover,
+        QToolButton#SidebarCompactRecentTasksButton:hover,
+        QToolButton#SidebarCompactFilterButton:hover {
+            background: rgba(255, 255, 255, 0.06);
+        }
+        QWidget#SidebarCompactFooter {
+            background-color: #1e1e21;
+            border-top: 1px solid rgba(39, 39, 42, 0.50);
+        }
+        QFrame#SidebarCompactRecentTasksPopup {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+        }
+        QFrame#SidebarCompactFilterPopup {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
         }
 
         /* --- Metadata-driven navigation (SidebarWidget + AssetGridWidget) --- */

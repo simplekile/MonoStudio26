@@ -15,14 +15,16 @@ from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 from monostudio.ui_qt.lucide_icons import lucide_icon
 
 
-ToastType = Literal["info", "success", "warning", "error"]
+ToastType = Literal["info", "success", "warning", "error", "important"]
 
-# Duration (ms) per type; error also allows manual close
+# Duration (ms) per type; error/important also allow manual close
 DURATION_MS = {
     "info": 1800,
     "success": 2200,
     "warning": 3000,
     "error": 4000,
+    # Important = sticky: only closes when user clicks the close icon
+    "important": 0,
 }
 
 # Colors (MONOS dark theme)
@@ -31,6 +33,7 @@ TOAST_COLORS: dict[ToastType, tuple[str, str]] = {
     "success": (MONOS_COLORS["emerald_500"], MONOS_COLORS["text_primary"]),
     "warning": (MONOS_COLORS["amber_500"], MONOS_COLORS["text_primary"]),
     "error": (MONOS_COLORS["red_500"], MONOS_COLORS["text_primary"]),
+    "important": (MONOS_COLORS["blue_400"], MONOS_COLORS["text_primary_selected"]),
 }
 
 # Lucide icon names per type (fallback: no icon if file missing)
@@ -39,6 +42,7 @@ TOAST_ICONS: dict[ToastType, str] = {
     "success": "square-check",
     "warning": "zap",
     "error": "x",
+    "important": "info",
 }
 
 
@@ -100,7 +104,9 @@ class ToastWidget(QFrame):
         layout.addWidget(msg_label, 1)
 
         self._close_btn: QPushButton | None = None
-        if toast_type == "error":
+        # Show explicit close button for error and important toasts,
+        # or whenever duration is non-positive (sticky toast).
+        if toast_type in ("error", "important") or duration_ms <= 0:
             close_icon = lucide_icon("x", size=14, color_hex=MONOS_COLORS["text_meta"])
             self._close_btn = QPushButton(self)
             self._close_btn.setIcon(close_icon)
@@ -166,9 +172,24 @@ class ToastWidget(QFrame):
         self._exit_anim.start()
 
     def _on_close_clicked(self) -> None:
-        self.dismiss()
+        # For explicit user close, remove immediately instead of waiting for fade,
+        # to avoid any animation issues keeping the toast around.
+        self._auto_close_timer.stop()
+        if self._on_dismiss:
+            self._on_dismiss(self)
+        self.deleteLater()
 
     def _on_exit_finished(self) -> None:
         if self._on_dismiss:
             self._on_dismiss(self)
         self.deleteLater()
+
+    def mouseReleaseEvent(self, event) -> None:
+        # Fallback: allow clicking anywhere on a sticky toast to close it,
+        # in case the close button hit area is problematic.
+        if event.button() == Qt.MouseButton.LeftButton and (
+            self._toast_type in ("error", "important") or self._duration_ms <= 0
+        ):
+            self._on_close_clicked()
+            return
+        super().mouseReleaseEvent(event)

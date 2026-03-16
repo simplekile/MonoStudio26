@@ -6,6 +6,8 @@ Exposes notify.info / success / warning / error; all UI and logic use only this 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import os
+import logging
 
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication
@@ -13,6 +15,7 @@ from PySide6.QtWidgets import QApplication
 from monostudio.ui_qt.notification.overlay import NotificationOverlayWidget
 from monostudio.ui_qt.notification.store import append as _store_append
 from monostudio.ui_qt.notification.toast import ToastType
+from monostudio.ui_qt.notification.banner import ImportantNotificationBanner
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QMainWindow, QWidget
@@ -27,6 +30,8 @@ class _NotificationService:
     _main_window: QMainWindow | None = None
     _main_view: QWidget | None = None
     _overlay: NotificationOverlayWidget | None = None
+    _important_banner: ImportantNotificationBanner | None = None
+    _important_anchor_widget: "QWidget | None" = None
 
     @classmethod
     def set_main_window(cls, main_window: QMainWindow, main_view: QWidget | None = None) -> None:
@@ -49,10 +54,20 @@ class _NotificationService:
 
     @classmethod
     def update_overlay_geometry(cls) -> None:
-        """Call from MainWindow.resizeEvent so the overlay fills the window."""
-        if cls._main_window is not None and cls._overlay is not None:
-            cls._overlay.setGeometry(cls._main_window.rect())
-            cls._overlay.raise_()
+        """Call from MainWindow.resizeEvent so overlay and banners follow window geometry."""
+        if cls._main_window is not None:
+            if cls._overlay is not None:
+                cls._overlay.setGeometry(cls._main_window.rect())
+                cls._overlay.raise_()
+            if cls._important_banner is not None:
+                cls._important_banner.update_geometry_for_parent(cls._important_anchor_widget)
+
+    @classmethod
+    def set_important_anchor_widget(cls, widget: "QWidget | None") -> None:
+        """Anchor important banner under this widget (e.g. TopBar update button)."""
+        cls._important_anchor_widget = widget
+        if cls._important_banner is not None:
+            cls._important_banner.update_geometry_for_parent(widget)
 
     @classmethod
     def set_general_toast_anchor_widget(cls, widget: "QWidget | None") -> None:
@@ -81,6 +96,11 @@ class _NotificationService:
 
     @classmethod
     def _notify(cls, level: ToastType, message: str, *, category: str = "general") -> None:
+        # Optional debug: mirror notifications to log when env is set.
+        if os.getenv("MONOS_DEBUG_NOTI"):
+            logging.getLogger("monostudio.notification").info(
+                "NOTI [%s] (%s): %s", level, category, message
+            )
         if category == "general":
             _store_append(level, message)
         overlay = cls._get_overlay()
@@ -104,6 +124,37 @@ class _NotificationService:
     @classmethod
     def error(cls, message: str, *, category: str = "general") -> None:
         cls._notify("error", message, category=category)
+
+    @classmethod
+    def important(cls, message: str, *, category: str = "general") -> None:
+        """
+        Persistent banner for important announcements (e.g. new update, first-run walkthrough).
+        - Stored in notification history like other general notifications.
+        - Shown as a non-modal banner near the top of the main window.
+        """
+        if category == "general":
+            _store_append("important", message)
+
+        if cls._main_window is None:
+            # Fallback: no main window yet, store-only.
+            return
+
+        # Reuse existing banner if present.
+        if cls._important_banner is None:
+            banner = ImportantNotificationBanner(parent=cls._main_window)
+
+            def _on_closed() -> None:
+                # Clear reference when banner is closed.
+                if cls._important_banner is banner:
+                    cls._important_banner = None
+
+            banner.closed.connect(_on_closed)
+            cls._important_banner = banner
+
+        cls._important_banner.set_message(message)
+        cls._important_banner.update_geometry_for_parent(cls._important_anchor_widget)
+        cls._important_banner.show()
+        cls._important_banner.raise_()
 
 
 # Singleton-like instance; use via notify.info(), notify.success(), etc.

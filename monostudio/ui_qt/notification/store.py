@@ -14,7 +14,7 @@ from typing import Literal
 
 from PySide6.QtCore import QSettings
 
-ToastType = Literal["info", "success", "warning", "error"]
+ToastType = Literal["info", "success", "warning", "error", "important"]
 
 # Keep last 200 notifications; dialog shows all stored (or 200 cap).
 MAX_HISTORY = 200
@@ -49,7 +49,7 @@ class NotificationEntry:
         t = data.get("toast_type")
         msg = data.get("message")
         at_raw = data.get("at")
-        if t not in ("info", "success", "warning", "error") or msg is None:
+        if t not in ("info", "success", "warning", "error", "important") or msg is None:
             return None
         try:
             at = datetime.fromisoformat(str(at_raw).replace("Z", "+00:00")) if at_raw else datetime.now()

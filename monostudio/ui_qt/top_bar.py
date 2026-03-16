@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QMouseEvent, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsDropShadowEffect,
@@ -13,11 +12,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.notification.notification_dropdown import NotificationDropdown
 from monostudio.ui_qt.notification.notification_list_dialog import NotificationListDialog
-from monostudio.ui_qt.style import MonosMenu, project_accent_color
 
 
 class _UpdateBadge(QWidget):
@@ -39,46 +36,19 @@ class _UpdateBadge(QWidget):
 
 
 class TopBar(QWidget):
-    project_switch_requested = Signal(str)  # project root path
+    settings_clicked = Signal()
     minimize_clicked = Signal()
     maximize_clicked = Signal()
     close_clicked = Signal()
     title_double_clicked = Signal()
     update_button_clicked = Signal()
+    watcher_toggled = Signal(bool)  # True = watcher on, False = watcher off
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("TopBar")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._drag_start_pos: QPoint | None = None
-
-        self._project_menu = MonosMenu(self, rounded=False)
-        self._project_menu.setObjectName("ProjectSwitchMenu")
-        self._project_menu.setWindowOpacity(1.0)
-        self._project_menu_closed_at = 0.0  # avoid reopen on same click + clear hover
-        self._project_menu.aboutToHide.connect(self._on_project_menu_closed)
-
-        shadow = QGraphicsDropShadowEffect(self._project_menu)
-        shadow.setBlurRadius(15)
-        shadow.setOffset(0, 8)
-        shadow.setColor(QColor(0, 0, 0, int(255 * 0.40)))
-        self._project_menu.setGraphicsEffect(shadow)
-
-        self._project_switch = QToolButton(self)
-        self._project_switch.setObjectName("ProjectSwitch")
-        self._project_switch.setProperty("state", "empty")
-        self._project_switch.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._project_switch.setLayoutDirection(Qt.RightToLeft)
-        self._project_switch.setIcon(lucide_icon("chevron-down", size=12, color_hex="#a1a1aa"))
-        self._project_switch.setText("SELECT PROJECT")
-        self._project_switch.setPopupMode(QToolButton.InstantPopup)
-        self._project_switch.clicked.connect(self._show_project_menu_left_aligned)
-        try:
-            bf = self._project_switch.font()
-            bf.setLetterSpacing(QFont.AbsoluteSpacing, 0.2)
-            self._project_switch.setFont(bf)
-        except Exception:
-            pass
 
         # Window buttons — render at 24px then Qt scales down = sharper on HiDPI
         _win_icon_color = "#d4d4d8"
@@ -115,6 +85,31 @@ class TopBar(QWidget):
         self._update_badge.hide()
         self._update_badge.raise_()
 
+        # File watcher toggle (right side, before noti) — eye = watching, eye-off = paused
+        self._btn_watcher = QToolButton(self)
+        self._btn_watcher.setObjectName("TopBarWatcherBtn")
+        self._btn_watcher.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_watcher.setCheckable(True)
+        self._btn_watcher.setChecked(True)
+        self._btn_watcher.setIcon(lucide_icon("eye", size=20, color_hex="#22c55e"))
+        self._btn_watcher.setFixedSize(40, 36)
+        self._btn_watcher.setToolTip("File watcher: on — pause (click) before rename/delete")
+        self._btn_watcher.toggled.connect(self._on_watcher_toggled)
+        self._watcher_busy = False
+        self._watcher_blink_on = True
+        self._watcher_busy_timer = QTimer(self)
+        self._watcher_busy_timer.setInterval(400)
+        self._watcher_busy_timer.timeout.connect(self._on_watcher_busy_blink)
+
+        # Settings button (next to noti)
+        self._btn_settings = QToolButton(self)
+        self._btn_settings.setObjectName("TopBarSettingsBtn")
+        self._btn_settings.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_settings.setIcon(lucide_icon("settings", size=20, color_hex=_win_icon_color))
+        self._btn_settings.setFixedSize(40, 36)
+        self._btn_settings.setToolTip("Settings")
+        self._btn_settings.clicked.connect(self.settings_clicked.emit)
+
         # Notification button (right side, before window buttons)
         self._btn_noti = QToolButton(self)
         self._btn_noti.setObjectName("TopBarNotiBtn")
@@ -131,9 +126,10 @@ class TopBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 10, 8, 10)
         layout.setSpacing(0)
-        layout.addWidget(self._project_switch, 0, Qt.AlignLeft | Qt.AlignVCenter)
         layout.addStretch(1)
         layout.addWidget(self._btn_update, 0, Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(self._btn_watcher, 0, Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(self._btn_settings, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_noti, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_min, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_max, 0, Qt.AlignRight | Qt.AlignVCenter)
@@ -141,19 +137,6 @@ class TopBar(QWidget):
 
     # Grace period (seconds): if popup was closed less than this ago, next button click is treated as "close" not "open"
     _POPUP_REOPEN_GRACE = 0.25
-
-    def _show_project_menu_left_aligned(self) -> None:
-        """Show project menu with left edge aligned to button's left edge."""
-        if (time.monotonic() - self._project_menu_closed_at) < self._POPUP_REOPEN_GRACE:
-            return
-        btn = self._project_switch
-        pos = btn.mapToGlobal(btn.rect().bottomLeft())
-        self._project_menu.popup(pos)
-
-    def _on_project_menu_closed(self) -> None:
-        """Record close time and clear project switch button hover/pressed (deferred)."""
-        self._project_menu_closed_at = time.monotonic()
-        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._project_switch))
 
     def _clear_tool_button_hover(self, btn: QToolButton) -> None:
         """Clear stuck hover/pressed state on a tool button (used after popup/dropdown closes)."""
@@ -204,6 +187,51 @@ class TopBar(QWidget):
         self._noti_dropdown_closed_at = time.monotonic()
         QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._btn_noti))
 
+    def _on_watcher_toggled(self, checked: bool) -> None:
+        self.watcher_toggled.emit(checked)
+        self._update_watcher_button_appearance(checked)
+
+    def _update_watcher_button_appearance(self, enabled: bool) -> None:
+        if self._watcher_busy:
+            return
+        # On = green (safe to browse); Off = red (required for rename/delete)
+        color = "#22c55e" if enabled else "#ef4444"
+        self._btn_watcher.setIcon(
+            lucide_icon("eye" if enabled else "eye-off", size=20, color_hex=color)
+        )
+        self._btn_watcher.setToolTip(
+            "File watcher: on — pause (click) before rename/delete" if enabled
+            else "File watcher: paused — rename/delete allowed (click to resume)"
+        )
+
+    def _on_watcher_busy_blink(self) -> None:
+        """Timer tick while watcher is turning off: alternate icon brightness."""
+        if not self._watcher_busy:
+            return
+        self._watcher_blink_on = not self._watcher_blink_on
+        color = "#ef4444" if self._watcher_blink_on else "#7f1d1d"
+        self._btn_watcher.setIcon(lucide_icon("eye-off", size=20, color_hex=color))
+
+    def set_watcher_busy(self, busy: bool) -> None:
+        """While True: button disabled and icon blinks (watcher is turning off)."""
+        self._watcher_busy = busy
+        self._btn_watcher.setEnabled(not busy)
+        if busy:
+            self._watcher_blink_on = True
+            self._btn_watcher.setIcon(lucide_icon("eye-off", size=20, color_hex="#ef4444"))
+            self._btn_watcher.setToolTip("Turning off file watcher…")
+            self._watcher_busy_timer.start()
+        else:
+            self._watcher_busy_timer.stop()
+            self._update_watcher_button_appearance(self._btn_watcher.isChecked())
+
+    def set_watcher_enabled(self, enabled: bool) -> None:
+        """Set watcher toggle state and icon (called from MainWindow when watcher is turned on/off)."""
+        self._btn_watcher.blockSignals(True)
+        self._btn_watcher.setChecked(enabled)
+        self._btn_watcher.blockSignals(False)
+        self._update_watcher_button_appearance(enabled)
+
     def get_noti_button(self) -> QToolButton:
         """Return the notification toolbar button (for anchoring general toasts below it)."""
         return self._btn_noti
@@ -241,6 +269,8 @@ class TopBar(QWidget):
             or self._btn_max.geometry().contains(pos)
             or self._btn_close.geometry().contains(pos)
             or self._btn_update.geometry().contains(pos)
+            or self._btn_watcher.geometry().contains(pos)
+            or self._btn_settings.geometry().contains(pos)
             or self._btn_noti.geometry().contains(pos)
         )
 
@@ -272,102 +302,3 @@ class TopBar(QWidget):
             self.title_double_clicked.emit()
         else:
             super().mouseDoubleClickEvent(event)
-
-    def _set_project_switch_state(self, state: str) -> None:
-        # Apply a deterministic state property for QSS styling:
-        # - active: current project selected
-        # - empty: no current project selected
-        # - disabled: no projects available
-        self._project_switch.setProperty("state", state)
-        try:
-            st = self._project_switch.style()
-            st.unpolish(self._project_switch)
-            st.polish(self._project_switch)
-        except Exception:
-            pass
-        self._project_switch.update()
-
-    @staticmethod
-    def _status_color_hex(status: str | None) -> str:
-        s = (status or "").strip().upper()
-        if s in ("READY", "PROGRESS", "ACTIVE"):
-            return "#10b981"  # emerald
-        if s in ("WAITING", "PAUSED"):
-            return "#f59e0b"  # amber
-        if s in ("BLOCKED", "ERROR", "CRITICAL"):
-            return "#ef4444"  # red
-        return "#71717a"  # zinc-500
-
-    @staticmethod
-    def _dot_icon(color_hex: str, *, diameter: int = 6) -> QIcon:
-        try:
-            dpr = float(QApplication.primaryScreen().devicePixelRatio())
-        except Exception:
-            dpr = 1.0
-        # Canvas large enough so QMenu icon column never clips the dot.
-        canvas = max(16, diameter + 8)
-        dev_w = int(round(canvas * dpr))
-        pm = QPixmap(dev_w, dev_w)
-        pm.setDevicePixelRatio(dpr)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(color_hex))
-        cx = canvas / 2.0
-        cy = canvas / 2.0
-        r = diameter / 2.0
-        p.drawEllipse(QRectF(cx - r, cy - r, diameter, diameter))
-        p.end()
-        return QIcon(pm)
-
-    def set_projects(
-        self,
-        projects: list[DiscoveredProject],
-        *,
-        current_root: Path | None,
-        status_by_root: dict[str, str] | None = None,
-    ) -> None:
-        self._project_menu.clear()
-
-        current = str(current_root) if current_root else None
-
-        if not projects:
-            empty = QAction("No projects", self._project_menu)
-            empty.setEnabled(False)
-            self._project_menu.addAction(empty)
-            self._project_switch.setEnabled(False)
-            self._project_switch.setText("NO PROJECTS")
-            self._set_project_switch_state("disabled")
-            return
-
-        self._project_switch.setEnabled(True)
-        if current_root is None:
-            self._project_switch.setText("SELECT PROJECT")
-            self._project_switch.setIcon(lucide_icon("chevron-down", size=12, color_hex="#a1a1aa"))
-            self._set_project_switch_state("empty")
-        else:
-            folder_name = current_root.name or ""
-            self._project_switch.setText(folder_name.upper())
-            accent = project_accent_color(folder_name)
-            self._project_switch.setIcon(lucide_icon("chevron-down", size=12, color_hex=accent))
-            self._set_project_switch_state("active")
-
-        group = QActionGroup(self._project_menu)
-        group.setExclusive(True)
-        for proj in projects:
-            label = proj.root.name
-            accent = project_accent_color(label)
-            is_current = current == str(proj.root)
-            dot = self._dot_icon(accent, diameter=8 if is_current else 6)
-            act = QAction(label, self._project_menu, checkable=True)
-            act.setIcon(dot)
-            act.setChecked(is_current)
-            if is_current:
-                f = act.font()
-                f.setWeight(QFont.Weight.DemiBold)
-                act.setFont(f)
-            act.triggered.connect(lambda checked=False, p=str(proj.root): self.project_switch_requested.emit(p))
-            group.addAction(act)
-            self._project_menu.addAction(act)
-

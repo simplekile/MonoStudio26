@@ -98,6 +98,7 @@ alwaysApply: false
 - [ ] Thêm import PySide6 mới → thêm vào `hiddenimports` trong spec.
 - [ ] Đổi major version → cập nhật APP_MAJOR_VERSION trong `build_version.py` và `monostudio/core/version.py`; đổi tên app/installer nếu cần.
 - [ ] **Cập nhật changelog**: sửa `RELEASE_NOTES.md` (version, Highlights, Changes) trước hoặc sau build khi chuẩn bị release; nếu không có file thì script tự sinh từ git log.
+- [ ] **Không dán build notes vào changelog**: Phần hướng dẫn build/release (commit trước khi build, cách dùng `build_installer.ps1`, `publish_release.ps1`, install_path cho extra tools…) giữ trong rule này và docs; `RELEASE_NOTES.md` chỉ dùng cho nội dung từng bản (Highlights, Changes, Install).
 - [ ] Release mới: chạy `.\publish_release.ps1` (sau build) hoặc tạo release tay trên GitHub với tag v26.minor.patch, đính kèm .exe, điền changelog.
 
 ## Enforcement

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStackedWidget,
     QTableView,
+    QSlider,
     QToolButton,
     QToolTip,
     QVBoxLayout,
@@ -471,6 +474,68 @@ def _dcc_ids_for_item(item: ViewItem, active_department: str | None) -> list[tup
     return out
 
 
+def _list_dcc_badge_info(
+    item: ViewItem,
+    active_department: str | None,
+) -> list[tuple[QIcon | None, str, str]]:
+    """Return [(icon or None, dcc_id, status), ...] for list DCC column paint. status in ('exists', 'creating')."""
+    out: list[tuple[QIcon | None, str, str]] = []
+    ref = item.ref
+    if not isinstance(ref, (Asset, Shot)):
+        return out
+    try:
+        reg = get_default_dcc_registry()
+    except Exception:
+        return out
+    _norm = lambda s: (s or "").strip().casefold()
+    active_key = _norm(active_department)
+    ids_with_status = _dcc_ids_for_item(item, active_department)
+    for dcc_id, status in ids_with_status:
+        if status == "creating":
+            out.append((None, dcc_id, "creating"))
+            continue
+        try:
+            info = reg.get_dcc_info(dcc_id) if dcc_id else None
+        except Exception:
+            info = None
+        slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+        color = info.get("brand_color_hex") if isinstance(info, dict) else None
+        if isinstance(slug, str) and slug.strip():
+            ic = brand_icon(slug.strip(), size=14, color_hex=(color if isinstance(color, str) else None))
+        else:
+            ic = lucide_icon("layers", size=14, color_hex=MONOS_COLORS["text_label"])
+        out.append((ic, dcc_id, "exists"))
+    return out
+
+
+def _list_dcc_badge_rects(
+    cell_rect: QRect,
+    dcc_list: list[tuple[str, str]],
+) -> list[tuple[QRect, str]]:
+    """Compute DCC badge rects inside a list table cell (horizontal row, no thumb). Returns [(rect, dcc_id), ...]."""
+    if not dcc_list:
+        return []
+    size = 14
+    pad = 4
+    gap = 3
+    max_show = 6
+    chip_h = size + pad * 2
+    chip_w = chip_h  # square for exists; creating uses wider
+    creating_w = 44
+    entries = dcc_list[:max_show]
+    widths = [creating_w if st == "creating" else chip_w for (_, st) in entries]
+    row_w = sum(widths) + (len(widths) - 1) * gap
+    base_x = cell_rect.left() + 4
+    base_y = cell_rect.top() + max(0, (cell_rect.height() - chip_h) // 2)
+    result: list[tuple[QRect, str]] = []
+    x_cursor = base_x
+    for i, (dcc_id, _st) in enumerate(entries):
+        w = widths[i]
+        result.append((QRect(x_cursor, base_y, w, chip_h), dcc_id))
+        x_cursor += w + gap
+    return result
+
+
 def _dcc_badge_rects(
     cell_rect: QRect,
     gap_px: int,
@@ -580,11 +645,18 @@ class _ClearOnEmptyClickTableView(QTableView):
 
 
 class _ListRowDelegate(QStyledItemDelegate):
-    """Paints active-project row background on Projects list view."""
+    """Paints thumbnail column, DCC badges column, active-project row (Projects), and status color is via item foreground."""
 
-    def __init__(self, *, view: QTableView) -> None:
+    _LIST_THUMB_SIZE = 40
+    _DCC_BADGE_SIZE = 14
+    _DCC_BADGE_PAD = 4
+    _DCC_BADGE_GAP = 3
+    _DCC_MAX = 6
+
+    def __init__(self, *, view: QTableView, main_view: QWidget) -> None:
         super().__init__(view)
         self._view = view
+        self._main_view = main_view  # MainView: for _active_department, _show_publish, _list_col_dcc
         self._active_project_root: str | None = None
 
     def set_active_project_root(self, path: str | None) -> None:
@@ -596,17 +668,101 @@ class _ListRowDelegate(QStyledItemDelegate):
 
     def paint(self, painter: QPainter, option, index) -> None:
         item = index.data(Qt.UserRole)
+        col = index.column()
+        main = self._main_view
+        list_col_dcc = main._list_col_dcc() if hasattr(main, "_list_col_dcc") else -1
+        active_dep = getattr(main, "_active_department", None) or ""
+        show_publish = getattr(main, "_show_publish", False)
+
+        # Active project row: 2px left border amber (column 0)
         active = (
             isinstance(item, ViewItem)
             and item.kind == ViewItemKind.PROJECT
             and self._active_project_root is not None
             and str(item.path) == self._active_project_root
         )
-        if active and index.column() == 0:
-            # 2px left border Amber-400 @ 70% opacity (active project)
+        if active and col == 0:
             c = QColor(MONOS_COLORS["amber_400"])
             c.setAlphaF(0.7)
             painter.fillRect(option.rect.left(), option.rect.top(), 2, option.rect.height(), c)
+
+        # DCC column: paint badges (asset/shot, not publish mode)
+        if col == list_col_dcc and list_col_dcc >= 0 and isinstance(item, ViewItem) and not show_publish:
+            badge_info = _list_dcc_badge_info(item, active_dep.strip() or None)
+            if badge_info:
+                rects = _list_dcc_badge_rects(option.rect, [(dcc_id, st) for (_, dcc_id, st) in badge_info])
+                chip_h = self._DCC_BADGE_SIZE + self._DCC_BADGE_PAD * 2
+                chip_r = chip_h // 2
+                dcc_bg = QColor(0, 0, 0, 160)
+                active_dcc = _item_active_dcc(getattr(item, "path", None), active_dep) if getattr(item, "path", None) else None
+                existing_ids = {dcc_id for (_, dcc_id, st) in badge_info if st == "exists"}
+                if not active_dcc or active_dcc not in existing_ids:
+                    active_dcc = next((dcc_id for (_, dcc_id, st) in badge_info if st == "exists"), None)
+                c_active = QColor(MONOS_COLORS["amber_400"])
+                c_active.setAlphaF(0.7)
+                pen_active = QPen(c_active, 2)
+                creating_font = monos_font("Inter", 9)
+                for i, (dcc_icon, dcc_id, badge_status) in enumerate(badge_info):
+                    if i >= len(rects):
+                        break
+                    r, _ = rects[i]
+                    is_active = bool(active_dcc and (dcc_id or "").strip() == active_dcc)
+                    if badge_status == "creating":
+                        painter.setPen(Qt.NoPen)
+                        painter.setBrush(dcc_bg)
+                        painter.drawRoundedRect(r, chip_r, chip_r)
+                        if is_active:
+                            painter.setPen(pen_active)
+                            painter.setBrush(Qt.NoBrush)
+                            painter.drawRoundedRect(r, chip_r, chip_r)
+                        painter.setFont(creating_font)
+                        painter.setPen(QColor(255, 255, 255))
+                        painter.drawText(r, Qt.AlignmentFlag.AlignCenter, "Creating…")
+                    else:
+                        cx, cy = r.x() + chip_r, r.y() + chip_r
+                        painter.setPen(Qt.NoPen)
+                        painter.setBrush(dcc_bg)
+                        painter.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
+                        if is_active:
+                            painter.setPen(pen_active)
+                            painter.setBrush(Qt.NoBrush)
+                            painter.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
+                        if dcc_icon is not None and not dcc_icon.isNull():
+                            pix = dcc_icon.pixmap(self._DCC_BADGE_SIZE, self._DCC_BADGE_SIZE)
+                            if not pix.isNull():
+                                painter.drawPixmap(r.x() + self._DCC_BADGE_PAD, r.y() + self._DCC_BADGE_PAD, pix)
+                return
+
+        # Thumbnail column (col 1): draw icon crop-fit to row height (fill height, center-crop width)
+        if col == 1:
+            icon = index.data(Qt.DecorationRole)
+            if isinstance(icon, QIcon) and not icon.isNull():
+                cell_h = max(24, option.rect.height() - 8)
+                cell_w = max(24, option.rect.width() - 8)
+                # Request pixmap large enough for scaling; use actualSize if available
+                actual = icon.actualSize(QSize(cell_w, cell_h))
+                pw = actual.width() or cell_h * 2
+                ph = actual.height() or cell_h * 2
+                pix = icon.pixmap(pw, ph)
+                if not pix.isNull() and pix.width() > 0 and pix.height() > 0:
+                    # Scale to fill height; crop width to cell if needed (center crop)
+                    scale = cell_h / pix.height()
+                    scaled_w = int(pix.width() * scale)
+                    dest_h = cell_h
+                    dest_w = min(scaled_w, cell_w)
+                    src_h = pix.height()
+                    src_w = int(pix.width() * dest_w / scaled_w) if scaled_w > 0 else pix.width()
+                    src_x = (pix.width() - src_w) // 2
+                    src_y = 0
+                    x = option.rect.x() + (option.rect.width() - dest_w) // 2
+                    y = option.rect.y() + (option.rect.height() - dest_h) // 2
+                    painter.drawPixmap(
+                        QRect(x, y, dest_w, dest_h),
+                        pix,
+                        QRect(src_x, src_y, src_w, src_h),
+                    )
+                return
+
         super().paint(painter, option, index)
 
 
@@ -1272,7 +1428,11 @@ class MainView(QWidget):
     _THUMBNAIL_SIZE_PX = 512  # backing cache size (square); painted as 16:9 in grid
     _THUMB_STATE_ROLE = Qt.UserRole + 1  # per-item state in tile model ("loaded"|"missing")
     _GRID_GAP_PX = 12
-    _CARD_SIZE_PRESETS: dict[str, float] = {"small": 0.4, "medium": 0.6, "large": 1.00}
+    _CARD_SCALE_MIN = 0.2
+    _CARD_SCALE_MAX = 1.0
+    _CARD_SLIDER_RANGE = 100  # slider 0..100 → scale 0.2..1.0
+    # Reference width at 100% scale; card size = ref * scale (resize only changes column count).
+    _CARD_REFERENCE_WIDTH = 320
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1287,7 +1447,7 @@ class MainView(QWidget):
 
         self._view_mode: str = "tile"
         self._browser_context: str = "asset"  # "project" | "asset" | "shot"
-        self._card_size_preset: str = self._load_card_size_preset()
+        self._card_scale_value: float = self._load_card_scale()
         # Header context (read-only)
         self._base_title: str = ""
         self._active_department: str | None = None
@@ -1355,7 +1515,19 @@ class MainView(QWidget):
         self._search_debounce_timer.setSingleShot(True)
         self._search_debounce_timer.timeout.connect(self._emit_search_query)
         self._search_debounce_ms = 180
-        self._search_popup = QFrame(self)
+        self._search_popup_closed_at = 0.0
+        self._POPUP_REOPEN_GRACE = 0.25
+
+        class _SearchPopupFrame(QFrame):
+            def __init__(self, parent, on_hide_cb):
+                super().__init__(parent)
+                self._on_hide_cb = on_hide_cb
+
+            def hideEvent(self, event):
+                self._on_hide_cb()
+                super().hideEvent(event)
+
+        self._search_popup = _SearchPopupFrame(self, self._on_search_popup_hidden)
         self._search_popup.setObjectName("MainViewSearchPopup")
         self._search_popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self._search_popup.setFixedSize(260, 40)
@@ -1427,32 +1599,48 @@ class MainView(QWidget):
         toggle_layout.addWidget(self._btn_grid, 0)
         toggle_layout.addWidget(self._btn_list, 0)
 
-        # Right: Card size (Small/Medium/Large) for grid mode
-        self._card_size_menu = QMenu(self)
-        self._card_size_menu.setObjectName("MainViewCardSizeMenu")
-        self._card_size_action_group = QActionGroup(self)
-        self._card_size_action_group.setExclusive(True)
-        self._card_size_actions: dict[str, QAction] = {}
+        # Right: Thumbnail size — button opens popup with slider (5 notches), like search
+        self._card_size_popup_closed_at = 0.0
 
-        def add_card_size_action(preset: str, label: str) -> None:
-            act = QAction(label, self._card_size_menu)
-            act.setCheckable(True)
-            act.triggered.connect(lambda _checked=False, p=preset: self.set_card_size_preset(p, save=True))
-            self._card_size_action_group.addAction(act)
-            self._card_size_menu.addAction(act)
-            self._card_size_actions[preset] = act
+        class _CardSizePopupFrame(QFrame):
+            def __init__(self, parent, on_hide_cb):
+                super().__init__(parent)
+                self._on_hide_cb = on_hide_cb
 
-        add_card_size_action("small", "Small cards")
-        add_card_size_action("medium", "Medium cards")
-        add_card_size_action("large", "Large cards")
+            def hideEvent(self, event):
+                self._on_hide_cb()
+                super().hideEvent(event)
 
+        self._card_size_popup = _CardSizePopupFrame(self, self._on_card_size_popup_hidden)
+        self._card_size_popup.setObjectName("MainViewCardSizePopup")
+        self._card_size_popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._card_size_popup.setAttribute(Qt.WA_StyledBackground, True)
+        popup_card_layout = QHBoxLayout(self._card_size_popup)
+        popup_card_layout.setContentsMargins(12, 10, 12, 10)
+        popup_card_layout.setSpacing(10)
+        _popup_label = QLabel("Size", self._card_size_popup)
+        _popup_label.setObjectName("MainViewCardSizePopupLabel")
+        _popup_label.setStyleSheet("color: #a1a1aa; font-size: 11px; font-weight: 600;")
+        self._card_size_slider = QSlider(Qt.Horizontal, self._card_size_popup)
+        self._card_size_slider.setObjectName("MainViewCardSizeSlider")
+        self._card_size_slider.setMinimum(0)
+        self._card_size_slider.setMaximum(self._CARD_SLIDER_RANGE)
+        self._card_size_slider.setSingleStep(1)
+        self._card_size_slider.setPageStep(10)
+        self._card_size_slider.setTickPosition(QSlider.TicksBelow)
+        self._card_size_slider.setTickInterval(25)
+        self._card_size_slider.setFixedWidth(120)
+        self._card_size_slider.valueChanged.connect(self._on_card_size_slider_changed)
+        popup_card_layout.addWidget(_popup_label, 0, Qt.AlignVCenter)
+        popup_card_layout.addWidget(self._card_size_slider, 0, Qt.AlignVCenter)
+        self._card_size_popup.adjustSize()
         self._btn_card_size = QToolButton(header)
         self._btn_card_size.setObjectName("MainViewCardSizeButton")
+        self._btn_card_size.setToolTip("Thumbnail size")
         self._btn_card_size.setAutoRaise(True)
         self._btn_card_size.setCursor(Qt.PointingHandCursor)
         self._btn_card_size.setIcon(lucide_icon("sliders-horizontal", size=16, color_hex=MONOS_COLORS["text_label"]))
-        self._btn_card_size.setPopupMode(QToolButton.InstantPopup)
-        self._btn_card_size.setMenu(self._card_size_menu)
+        self._btn_card_size.clicked.connect(self._show_card_size_popup)
         self._update_card_size_button()
 
         # (Primary action button removed — replaced by Work/Published pill)
@@ -1514,16 +1702,9 @@ class MainView(QWidget):
         tile_page.setCurrentIndex(0)
         self._tile_page = tile_page
 
-        # List view skeleton
+        # List view skeleton (headers set from _list_headers() per context)
         self._list_model = QStandardItemModel(self)
-        self._list_model.setHorizontalHeaderLabels(
-            [
-                "Name",
-                "Type",
-                "Departments count",
-                "Path",
-            ]
-        )
+        self._list_model.setHorizontalHeaderLabels(self._list_headers())
 
         self._list_view = _ClearOnEmptyClickTableView()
         self._list_view.setObjectName("MainViewList")
@@ -1538,14 +1719,16 @@ class MainView(QWidget):
         self._list_view.horizontalHeader().setStretchLastSection(True)
         self._list_view.setSortingEnabled(False)
         self._list_view.verticalHeader().setVisible(False)
-        self._list_view.verticalHeader().setDefaultSectionSize(28)
+        self._list_view.verticalHeader().setDefaultSectionSize(56)
         self._list_view.setShowGrid(False)
         self._list_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._list_view.doubleClicked.connect(self._on_list_activated)
         self._list_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_view.customContextMenuRequested.connect(self._on_list_context_menu)
-        self._list_row_delegate = _ListRowDelegate(view=self._list_view)
+        self._list_row_delegate = _ListRowDelegate(view=self._list_view, main_view=self)
         self._list_view.setItemDelegate(self._list_row_delegate)
+        self._list_view.viewport().installEventFilter(self)
+        self._list_view.verticalScrollBar().valueChanged.connect(self._schedule_thumbnail_prefetch)
 
         self._list_placeholder = QLabel("")
         self._list_placeholder.setAlignment(Qt.AlignCenter)
@@ -1620,11 +1803,33 @@ class MainView(QWidget):
         self.search_query_changed.emit("")
 
     def _show_search_popup(self) -> None:
-        """Show search popup below the search icon; focus line edit. Called by icon click or Ctrl+F."""
+        """Show search popup below the search icon; focus line edit. Same as noti: toggle if open, grace to avoid reopen."""
+        if self._search_popup.isVisible():
+            self._search_popup.close()
+            return
+        if (time.monotonic() - self._search_popup_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
         pos = self._btn_search_icon.mapToGlobal(self._btn_search_icon.rect().bottomLeft())
         self._search_popup.move(pos.x(), pos.y() + 2)
         self._search_popup.show()
         self._search_input.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def _on_search_popup_hidden(self) -> None:
+        self._search_popup_closed_at = time.monotonic()
+        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._btn_search_icon))
+
+    def _clear_tool_button_hover(self, btn: QToolButton) -> None:
+        """Clear stuck hover/pressed state after popup closes (same as TopBar/noti)."""
+        QApplication.sendEvent(btn, QEvent(QEvent.Type.Leave))
+        btn.setDown(False)
+        try:
+            st = btn.style()
+            if st:
+                st.unpolish(btn)
+                st.polish(btn)
+        except Exception:
+            pass
+        btn.update()
 
     def set_search_placeholder(self, placeholder: str) -> None:
         """Set placeholder text for the search input (e.g. context-aware: Search assets, Search shots)."""
@@ -1639,8 +1844,33 @@ class MainView(QWidget):
             self._search_input.blockSignals(False)
         self._btn_search_clear.setVisible(bool((query or "").strip()))
 
+    def _list_dcc_hit(self, pos: QPoint) -> tuple[ViewItem | None, str | None, str | None]:
+        """Hit-test DCC badges in list view at viewport pos. Returns (item, dcc_id, department) or (None, None, None)."""
+        if self._view_mode != "list" or self._show_publish:
+            return None, None, None
+        index = self._list_view.indexAt(pos)
+        if not index.isValid():
+            return None, None, None
+        col = index.column()
+        if col != self._list_col_dcc():
+            return None, None, None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem):
+            return None, None, None
+        cell_rect = self._list_view.visualRect(index)
+        if not cell_rect.contains(pos):
+            return None, None, None
+        dcc_list = _dcc_ids_for_item(item, (self._active_department or "").strip() or None)
+        if not dcc_list:
+            return None, None, None
+        rects = _list_dcc_badge_rects(cell_rect, dcc_list)
+        for r, dcc_id in rects:
+            if r.contains(pos):
+                return item, dcc_id, (self._active_department or "").strip() or ""
+        return None, None, None
+
     def _dcc_badge_hit(self, pos) -> tuple[ViewItem | None, str | None, str | None]:
-        """Hit-test DCC badges at viewport pos. Returns (item, dcc_id, department) or (None, None, None)."""
+        """Hit-test DCC badges at viewport pos (grid). Returns (item, dcc_id, department) or (None, None, None)."""
         if self._view_mode != "tile" or self._show_publish:
             return None, None, None
         index = self._tile_view.indexAt(pos)
@@ -1727,6 +1957,33 @@ class MainView(QWidget):
                         QToolTip.showText(event.globalPos(), f"<html>{fallback_tt}<br/><br/>{hint_html}</html>")
                         event.accept()
                         return True
+
+        # List view: DCC column click -> set active DCC (only if _list_view exists, e.g. after __init__)
+        list_view = getattr(self, "_list_view", None)
+        if list_view is not None and watched is list_view.viewport():
+            if event.type() == QEvent.MouseButtonPress and self._view_mode == "list":
+                if event.button() == Qt.MouseButton.LeftButton:
+                    hit_item, hit_dcc, hit_dep = self._list_dcc_hit(event.pos())
+                    if hit_item and hit_dcc and hit_dep:
+                        self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
+                        self.active_dcc_changed.emit(hit_item.path, hit_dep, hit_dcc)
+                        list_view.viewport().update()
+                        event.accept()
+                        return True
+            if event.type() == QEvent.ToolTip and self._view_mode == "list":
+                hit_item, hit_dcc, hit_dep = self._list_dcc_hit(event.pos())
+                if hit_item and hit_dcc:
+                    try:
+                        reg = get_default_dcc_registry()
+                        info = reg.get_dcc_info(hit_dcc)
+                        dcc_name = info.get("label", hit_dcc) if isinstance(info, dict) else hit_dcc
+                    except Exception:
+                        dcc_name = hit_dcc
+                    dept_display = (hit_dep or "").replace("_", " ").strip().title() or "—"
+                    QToolTip.showText(event.globalPos(), f"{dcc_name} — {dept_display}")
+                    event.accept()
+                    return True
+
         return super().eventFilter(watched, event)
 
     def _schedule_grid_layout_sync(self) -> None:
@@ -1735,26 +1992,11 @@ class MainView(QWidget):
         self._grid_sync_scheduled = True
         QTimer.singleShot(0, self._sync_grid_layout)
 
-    @staticmethod
-    def _grid_columns_for_width(px: int) -> int:
-        # Tailwind-like breakpoints:
-        # <640: 1 col, <1024: 2 col, <1280: 3 col, <1536: 4 col, else: 5 col
-        if px < 640:
-            return 1
-        if px < 1024:
-            return 2
-        if px < 1280:
-            return 3
-        if px < 1536:
-            return 4
-        return 5
-
     def _sync_grid_layout(self) -> None:
         """
-        Responsive grid:
-        - width adapts to viewport; column count by breakpoints
-        - gap fixed at 24px
-        - thumbnail fixed 16:9 inside card
+        Grid: card size from scale only (no auto-scale on resize).
+        - card_w = reference_width * scale (fixed by slider)
+        - cols = how many cards fit in viewport (resize only changes column count)
         """
         self._grid_sync_scheduled = False
         try:
@@ -1764,26 +2006,25 @@ class MainView(QWidget):
         if vw <= 0:
             return
 
-        cols = self._grid_columns_for_width(vw)
         gap = self._GRID_GAP_PX
-
-        # Available width inside the 24px left margin (right margin is 0 by design).
         inner_w = max(1, vw - 24)
 
-        # Approximate: cols cards with (cols-1) gaps, then apply user card-size preset scale.
-        base_w = max(240, int((inner_w - (cols - 1) * gap) / cols))
-        card_w = max(200, int(base_w * self._card_scale()))
+        # Card size from scale only (0.2..1.0), not from viewport width.
+        card_w = max(80, int(self._CARD_REFERENCE_WIDTH * self._card_scale()))
         thumb_h = int(card_w * 9 / 16)
         meta_h = 16 + 20 + 4 + 16 + 16  # p-4 + name + gap + meta + bottom breathing
         card_h = thumb_h + meta_h
+
+        # How many cards fit in one row (resize changes this, not card size).
+        cell_w = card_w + gap
+        cols = max(1, (inner_w + gap) // cell_w)
 
         sig = (cols, card_w, card_h)
         if getattr(self, "_grid_last", None) == sig:
             return
         self._grid_last = sig
 
-        # Grid cell includes explicit 24px gap on right/bottom.
-        self._tile_view.setGridSize(QSize(card_w + gap, card_h + gap))
+        self._tile_view.setGridSize(QSize(cell_w, card_h + gap))
         self._grid_delegate.set_card_size(QSize(card_w, card_h))
 
     def set_context_title(self, title: str) -> None:
@@ -1934,7 +2175,7 @@ class MainView(QWidget):
         if context not in ("project", "asset", "shot"):
             return
         self._browser_context = context
-        self._card_size_preset = self._load_card_size_preset()
+        self._card_scale_value = self._load_card_scale()
         self._update_card_size_button()
         if getattr(self, "_work_publish_switch", None) is not None:
             self._work_publish_switch.setVisible(context in ("asset", "shot"))
@@ -2075,15 +2316,23 @@ class MainView(QWidget):
             if std_item is None:
                 continue
             std_item.setData(None, self._THUMB_STATE_ROLE)
+            icon = None
             if mgr is not None and hasattr(mgr, "request_thumbnail"):
                 pix = mgr.request_thumbnail(asset_id, department=active_dept)
                 if pix is not None:
-                    std_item.setIcon(QIcon(pix))
+                    icon = QIcon(pix)
+                    std_item.setIcon(icon)
                     std_item.setData("loaded", self._THUMB_STATE_ROLE)
                 else:
-                    std_item.setIcon(self._icon_for_item(item))
+                    icon = self._icon_for_item(item)
+                    std_item.setIcon(icon)
             else:
-                std_item.setIcon(self._icon_for_item(item))
+                icon = self._icon_for_item(item)
+                std_item.setIcon(icon)
+            # Sync list thumbnail column
+            list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
+            if list_thumb is not None and icon is not None:
+                list_thumb.setIcon(icon)
 
         self._schedule_thumbnail_prefetch()
 
@@ -2136,11 +2385,16 @@ class MainView(QWidget):
                 continue
             pix = mgr.request_thumbnail(entity_path, department=active_dept)
             if pix is not None:
-                std_item.setIcon(QIcon(pix))
+                icon = QIcon(pix)
+                std_item.setIcon(icon)
                 std_item.setData("loaded", self._THUMB_STATE_ROLE)
             else:
-                std_item.setIcon(self._icon_for_item(item))
+                icon = self._icon_for_item(item)
+                std_item.setIcon(icon)
                 std_item.setData(None, self._THUMB_STATE_ROLE)
+            list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
+            if list_thumb is not None:
+                list_thumb.setIcon(std_item.icon())
 
     def _row_for_item_id(self, item_id: str) -> int | None:
         """Return the model row index for the item with the given path id; path-normalized so updated_ids match."""
@@ -2189,7 +2443,7 @@ class MainView(QWidget):
         self._insert_list_row_at(row, item, one_based_index)
 
     def _insert_list_row_at(self, row: int, item: ViewItem, one_based_index: int) -> None:
-        """Insert list row at position (asset/shot context)."""
+        """Insert list row at position (asset/shot or project)."""
         mono = monos_font("JetBrains Mono", 11)
         if self._browser_context == "project":
             stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
@@ -2197,16 +2451,24 @@ class MainView(QWidget):
             shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
             assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
             updated = "—" if not stats or not stats.last_modified else stats.last_modified
+            c_index = QStandardItem(str(one_based_index))
+            c_thumb = QStandardItem("")
+            c_thumb.setIcon(self._icon_for_item(item))
+            c_name = QStandardItem(display_name_for_item(item))
+            c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
+            c_status = QStandardItem(status)
+            c_status.setForeground(self._status_foreground(status))
             cells = [
-                QStandardItem(str(one_based_index)),
-                QStandardItem(display_name_for_item(item)),
-                QStandardItem(status),
+                c_index,
+                c_thumb,
+                c_name,
+                c_status,
                 QStandardItem(shots),
                 QStandardItem(assets),
                 QStandardItem(updated),
                 QStandardItem(str(item.path)),
             ]
-            cells[6].setFont(mono)
+            cells[7].setFont(mono)
         else:
             status = "WAITING"
             if isinstance(item.ref, (Asset, Shot)):
@@ -2214,15 +2476,26 @@ class MainView(QWidget):
                     status = "READY"
                 elif any(d.work_exists for d in item.ref.departments):
                     status = "PROGRESS"
+            c_index = QStandardItem(str(one_based_index))
+            c_thumb = QStandardItem("")
+            c_thumb.setIcon(self._icon_for_item(item))
+            c_name = QStandardItem(display_name_for_item(item))
+            c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
+            c_dcc = QStandardItem("")  # painted by delegate
+            c_status = QStandardItem(status)
+            c_status.setForeground(self._status_foreground(status))
+            c_version = QStandardItem(self._list_version_text(item))
+            c_version.setFont(mono)
             cells = [
-                QStandardItem(str(one_based_index)),
-                QStandardItem(display_name_for_item(item)),
-                QStandardItem(status),
-                QStandardItem("—"),
-                QStandardItem("—"),
-                QStandardItem("—"),
+                c_index,
+                c_thumb,
+                c_name,
+                c_dcc,
+                c_status,
+                c_version,
+                QStandardItem(self._list_last_updated(item)),
+                QStandardItem("—"),  # Assignee
             ]
-            cells[3].setFont(mono)
         for c in cells:
             c.setEditable(False)
             c.setData(item, Qt.UserRole)
@@ -2396,38 +2669,47 @@ class MainView(QWidget):
             assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
             updated = "—" if not stats or not stats.last_modified else stats.last_modified
             c_index = QStandardItem(str(row_index))
+            c_thumb = QStandardItem("")
+            c_thumb.setIcon(self._icon_for_item(item))
             c_name = QStandardItem(display_name_for_item(item))
+            c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
             c_status = QStandardItem(status)
+            c_status.setForeground(self._status_foreground(status))
             c_shots = QStandardItem(shots)
             c_assets = QStandardItem(assets)
             c_updated = QStandardItem(updated)
             c_path = QStandardItem(str(item.path))
             c_path.setFont(mono)
-            for cell in (c_index, c_name, c_status, c_shots, c_assets, c_updated, c_path):
+            for cell in (c_index, c_thumb, c_name, c_status, c_shots, c_assets, c_updated, c_path):
                 cell.setEditable(False)
                 cell.setData(item, Qt.UserRole)
-            self._list_model.appendRow([c_index, c_name, c_status, c_shots, c_assets, c_updated, c_path])
+            self._list_model.appendRow([c_index, c_thumb, c_name, c_status, c_shots, c_assets, c_updated, c_path])
         else:
-            c_index = QStandardItem(str(row_index))
-            c_name = QStandardItem(display_name_for_item(item))
             status = "WAITING"
             if isinstance(item.ref, (Asset, Shot)):
                 if any(d.publish_version_count > 0 for d in item.ref.departments):
                     status = "READY"
                 elif any(d.work_exists for d in item.ref.departments):
                     status = "PROGRESS"
+            c_index = QStandardItem(str(row_index))
+            c_thumb = QStandardItem("")
+            c_thumb.setIcon(self._icon_for_item(item))
+            c_name = QStandardItem(display_name_for_item(item))
+            c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
+            c_dcc = QStandardItem("")
             c_status = QStandardItem(status)
-            c_version = QStandardItem("—")
-            c_assignee = QStandardItem("—")
-            c_updated = QStandardItem("—")
+            c_status.setForeground(self._status_foreground(status))
+            c_version = QStandardItem(self._list_version_text(item))
             c_version.setFont(mono)
-            for cell in (c_index, c_name, c_status, c_version, c_assignee, c_updated):
+            c_updated = QStandardItem(self._list_last_updated(item))
+            c_assignee = QStandardItem("—")
+            for cell in (c_index, c_thumb, c_name, c_dcc, c_status, c_version, c_updated, c_assignee):
                 cell.setEditable(False)
                 cell.setData(item, Qt.UserRole)
-            self._list_model.appendRow([c_index, c_name, c_status, c_version, c_assignee, c_updated])
+            self._list_model.appendRow([c_index, c_thumb, c_name, c_dcc, c_status, c_version, c_updated, c_assignee])
 
     def _set_list_row_for_item(self, row: int, item: ViewItem, row_index: int) -> None:
-        """Replace list row at index with item (asset/shot context)."""
+        """Replace list row at index with item (asset/shot or project)."""
         if self._browser_context == "project":
             stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
             status = "WAITING" if not stats else stats.status
@@ -2436,14 +2718,18 @@ class MainView(QWidget):
             updated = "—" if not stats or not stats.last_modified else stats.last_modified
             mono = monos_font("JetBrains Mono", 11)
             self._list_model.item(row, 0).setText(str(row_index))
-            self._list_model.item(row, 1).setText(display_name_for_item(item))
-            self._list_model.item(row, 1).setData(item, Qt.UserRole)
-            self._list_model.item(row, 2).setText(status)
-            self._list_model.item(row, 3).setText(shots)
-            self._list_model.item(row, 4).setText(assets)
-            self._list_model.item(row, 5).setText(updated)
-            self._list_model.item(row, 6).setText(str(item.path))
-            for c in range(7):
+            self._list_model.item(row, 1).setIcon(self._icon_for_item(item))
+            self._list_model.item(row, 2).setText(display_name_for_item(item))
+            self._list_model.item(row, 2).setData(item, Qt.UserRole)
+            self._list_model.item(row, 2).setFont(monos_font("Inter", 13, QFont.Weight.Bold))
+            self._list_model.item(row, 3).setText(status)
+            self._list_model.item(row, 3).setForeground(self._status_foreground(status))
+            self._list_model.item(row, 4).setText(shots)
+            self._list_model.item(row, 5).setText(assets)
+            self._list_model.item(row, 6).setText(updated)
+            self._list_model.item(row, 7).setText(str(item.path))
+            self._list_model.item(row, 7).setFont(mono)
+            for c in range(8):
                 self._list_model.item(row, c).setData(item, Qt.UserRole)
         else:
             status = "WAITING"
@@ -2452,15 +2738,24 @@ class MainView(QWidget):
                     status = "READY"
                 elif any(d.work_exists for d in item.ref.departments):
                     status = "PROGRESS"
+            mono = monos_font("JetBrains Mono", 11)
             self._list_model.item(row, 0).setText(str(row_index))
-            self._list_model.item(row, 1).setText(display_name_for_item(item))
-            self._list_model.item(row, 1).setData(item, Qt.UserRole)
-            self._list_model.item(row, 2).setText(status)
-            for c in range(6):
+            self._list_model.item(row, 1).setIcon(self._icon_for_item(item))
+            self._list_model.item(row, 2).setText(display_name_for_item(item))
+            self._list_model.item(row, 2).setData(item, Qt.UserRole)
+            self._list_model.item(row, 2).setFont(monos_font("Inter", 13, QFont.Weight.Bold))
+            # column 3 = DCC (painted by delegate)
+            self._list_model.item(row, 4).setText(status)
+            self._list_model.item(row, 4).setForeground(self._status_foreground(status))
+            self._list_model.item(row, 5).setText(self._list_version_text(item))
+            self._list_model.item(row, 5).setFont(mono)
+            self._list_model.item(row, 6).setText(self._list_last_updated(item))
+            self._list_model.item(row, 7).setText("—")  # Assignee
+            for c in range(8):
                 self._list_model.item(row, c).setData(item, Qt.UserRole)
 
     def _renumber_list_indices(self) -> None:
-        """Set first column to 1-based row index for all rows."""
+        """Set # column (column 0) to 1-based row index for all rows."""
         for row in range(self._list_model.rowCount()):
             it = self._list_model.item(row, 0)
             if it is not None:
@@ -2496,41 +2791,48 @@ class MainView(QWidget):
                 updated = "—" if not stats or not stats.last_modified else stats.last_modified
 
                 c_index = QStandardItem(str(idx))
+                c_thumb = QStandardItem("")
+                c_thumb.setIcon(self._icon_for_item(item))
                 c_name = QStandardItem(display_name_for_item(item))
+                c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
                 c_status = QStandardItem(status)
+                c_status.setForeground(self._status_foreground(status))
                 c_shots = QStandardItem(shots)
                 c_assets = QStandardItem(assets)
                 c_updated = QStandardItem(updated)
                 c_path = QStandardItem(str(item.path))
                 c_path.setFont(mono)
 
-                for cell in (c_index, c_name, c_status, c_shots, c_assets, c_updated, c_path):
+                for cell in (c_index, c_thumb, c_name, c_status, c_shots, c_assets, c_updated, c_path):
                     cell.setEditable(False)
                     cell.setData(item, Qt.UserRole)
 
-                self._list_model.appendRow([c_index, c_name, c_status, c_shots, c_assets, c_updated, c_path])
+                self._list_model.appendRow([c_index, c_thumb, c_name, c_status, c_shots, c_assets, c_updated, c_path])
             else:
-                # List (high-density): Index, Name, Status, Version, Assignee, Last Updated
-                c_index = QStandardItem(str(idx))
-                c_name = QStandardItem(display_name_for_item(item))
                 status = "WAITING"
                 if isinstance(item.ref, (Asset, Shot)):
                     if any(d.publish_version_count > 0 for d in item.ref.departments):
                         status = "READY"
                     elif any(d.work_exists for d in item.ref.departments):
                         status = "PROGRESS"
+                c_index = QStandardItem(str(idx))
+                c_thumb = QStandardItem("")
+                c_thumb.setIcon(self._icon_for_item(item))
+                c_name = QStandardItem(display_name_for_item(item))
+                c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
+                c_dcc = QStandardItem("")
                 c_status = QStandardItem(status)
-                c_version = QStandardItem("—")
-                c_assignee = QStandardItem("—")
-                c_updated = QStandardItem("—")
-
+                c_status.setForeground(self._status_foreground(status))
+                c_version = QStandardItem(self._list_version_text(item))
                 c_version.setFont(mono)
+                c_updated = QStandardItem(self._list_last_updated(item))
+                c_assignee = QStandardItem("—")
 
-                for cell in (c_index, c_name, c_status, c_version, c_assignee, c_updated):
+                for cell in (c_index, c_thumb, c_name, c_dcc, c_status, c_version, c_updated, c_assignee):
                     cell.setEditable(False)
                     cell.setData(item, Qt.UserRole)
 
-                self._list_model.appendRow([c_index, c_name, c_status, c_version, c_assignee, c_updated])
+                self._list_model.appendRow([c_index, c_thumb, c_name, c_dcc, c_status, c_version, c_updated, c_assignee])
 
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
@@ -2542,46 +2844,172 @@ class MainView(QWidget):
     def _settings_key_card_size(self) -> str:
         return f"{self._SETTINGS_KEY_CARD_SIZE_PREFIX}/{self._browser_context}"
 
-    def _load_card_size_preset(self) -> str:
-        raw = (self._settings.value(self._settings_key_card_size(), "medium", str) or "").strip().lower()
-        return raw if raw in self._CARD_SIZE_PRESETS else "medium"
+    def _scale_from_slider(self, value: int) -> float:
+        """Map slider 0..CARD_SLIDER_RANGE to scale CARD_SCALE_MIN..CARD_SCALE_MAX."""
+        r = self._CARD_SLIDER_RANGE
+        if r <= 0:
+            return self._CARD_SCALE_MIN
+        t = max(0, min(value, r)) / r
+        return self._CARD_SCALE_MIN + t * (self._CARD_SCALE_MAX - self._CARD_SCALE_MIN)
+
+    def _slider_from_scale(self, scale: float) -> int:
+        """Map scale to slider value 0..CARD_SLIDER_RANGE."""
+        s = max(self._CARD_SCALE_MIN, min(scale, self._CARD_SCALE_MAX))
+        r = self._CARD_SLIDER_RANGE
+        t = (s - self._CARD_SCALE_MIN) / (self._CARD_SCALE_MAX - self._CARD_SCALE_MIN)
+        return int(round(t * r))
+
+    def _load_card_scale(self) -> float:
+        raw = self._settings.value(self._settings_key_card_size(), 0.7)
+        if isinstance(raw, (int, float)):
+            s = float(raw)
+            return max(self._CARD_SCALE_MIN, min(s, self._CARD_SCALE_MAX))
+        raw = (str(raw).strip().lower() or "0.7")
+        try:
+            s = float(raw)
+            return max(self._CARD_SCALE_MIN, min(s, self._CARD_SCALE_MAX))
+        except ValueError:
+            pass
+        # Legacy preset names
+        legacy = {"small": 0.4, "medium_small": 0.55, "medium": 0.7, "medium_large": 0.85, "large": 1.0}
+        return float(legacy.get(raw, 0.7))
 
     def _card_scale(self) -> float:
-        return float(self._CARD_SIZE_PRESETS.get(self._card_size_preset, 0.80))
+        return self._card_scale_value
+
+    def _show_card_size_popup(self) -> None:
+        """Show thumbnail size slider popup below the button. Same as noti: toggle if open, grace to avoid reopen."""
+        if self._card_size_popup.isVisible():
+            self._card_size_popup.close()
+            return
+        if (time.monotonic() - self._card_size_popup_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
+        self._card_size_slider.blockSignals(True)
+        self._card_size_slider.setValue(self._slider_from_scale(self._card_scale_value))
+        self._card_size_slider.blockSignals(False)
+        pos = self._btn_card_size.mapToGlobal(self._btn_card_size.rect().bottomLeft())
+        self._card_size_popup.move(pos.x(), pos.y() + 2)
+        self._card_size_popup.show()
+
+    def _on_card_size_popup_hidden(self) -> None:
+        self._card_size_popup_closed_at = time.monotonic()
+        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._btn_card_size))
 
     def _update_card_size_button(self) -> None:
-        # Keep menu check-state + tooltip in sync.
-        for k, act in getattr(self, "_card_size_actions", {}).items():
-            act.setChecked(bool(k == self._card_size_preset))
-        label = self._card_size_preset.capitalize()
-        if hasattr(self, "_btn_card_size"):
-            self._btn_card_size.setToolTip(f"Card size: {label}")
+        if hasattr(self, "_btn_card_size") and self._btn_card_size is not None:
+            pct = int(round(self._card_scale_value * 100))
+            self._btn_card_size.setToolTip(f"Thumbnail size: {pct}%")
             self._btn_card_size.setEnabled(self._view_mode == "tile")
 
-    def set_card_size_preset(self, preset: str, *, save: bool = True) -> None:
-        preset = (preset or "").strip().lower()
-        if preset not in self._CARD_SIZE_PRESETS:
+    def _on_card_size_slider_changed(self, value: int) -> None:
+        scale = self._scale_from_slider(value)
+        self.set_card_scale(scale, save=True)
+
+    def set_card_scale(self, scale: float, *, save: bool = True) -> None:
+        scale = max(self._CARD_SCALE_MIN, min(float(scale), self._CARD_SCALE_MAX))
+        if abs(self._card_scale_value - scale) < 1e-6:
             return
-        if self._card_size_preset == preset:
-            return
-        self._card_size_preset = preset
+        self._card_scale_value = scale
         if save:
-            self._settings.setValue(self._settings_key_card_size(), preset)
+            self._settings.setValue(self._settings_key_card_size(), scale)
         self._update_card_size_button()
         self._schedule_grid_layout_sync()
 
     def _list_headers(self) -> list[str]:
         if self._browser_context == "project":
-            return ["#", "Name", "Status", "Shots", "Assets", "Last Updated", "Path"]
-        return ["#", "Name", "Status", "Version", "Assignee", "Last Updated"]
+            return ["", "", "Name", "Status", "Shots", "Assets", "Last Updated", "Path"]
+        return ["", "", "Name", "DCC", "Status", "Version", "Last Updated", "Assignee"]
+
+    def _list_col_dcc(self) -> int:
+        """Column index for DCC badges (asset/shot only); right after Name = 3."""
+        if self._browser_context != "project":
+            return 3
+        return -1
+
+    def _list_version_text(self, item: ViewItem) -> str:
+        """Version string for list: work or publish version for active department."""
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return "—"
+        ver = _card_version_for_display(
+            ref,
+            (self._active_department or "").strip() or None,
+            self._show_publish,
+            _item_active_dcc(item.path, (self._active_department or "").strip() or "") if item.path else None,
+        )
+        return ver if ver else "—"
+
+    @staticmethod
+    def _list_last_updated(item: ViewItem) -> str:
+        """Last updated string for list: mtime of asset/shot path or '—'."""
+        path = getattr(item, "path", None)
+        if not path or not isinstance(path, Path):
+            return "—"
+        try:
+            if path.is_dir():
+                mtime = path.stat().st_mtime
+            elif path.exists():
+                mtime = path.stat().st_mtime
+            else:
+                return "—"
+        except OSError:
+            return "—"
+        try:
+            from datetime import datetime
+            return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return "—"
+
+    @staticmethod
+    def _list_departments_text(item: ViewItem) -> str:
+        """Comma-separated department names that have work/publish for this item (asset/shot)."""
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)):
+            return "—"
+        labels: list[str] = []
+        for d in getattr(ref, "departments", ()) or ():
+            if getattr(d, "work_exists", False) or getattr(d, "publish_version_count", 0) > 0:
+                name = getattr(d, "name", "") or getattr(d, "label", "")
+                if name:
+                    labels.append(name)
+        return ", ".join(labels) if labels else "—"
+
+    @staticmethod
+    def _status_foreground(status: str) -> QColor:
+        """Return foreground color for status text (list and badges)."""
+        key = (status or "").strip().upper()
+        if key == "READY":
+            return QColor("#10b981")
+        if key == "PROGRESS":
+            return QColor("#3b82f6")
+        if key == "BLOCKED":
+            return QColor("#ef4444")
+        return QColor("#71717a")  # WAITING / default
 
     def _apply_list_column_defaults(self) -> None:
-        # Keep layout stable: path is hidden by default in dense views.
+        # Column 0 (#) and 1 (Thumb) fixed; others ResizeToContents so min width fits text; Path hidden.
+        h = self._list_view.horizontalHeader()
+        row_h = 56
+        if h:
+            h.setMinimumSectionSize(24)
+            if self._list_model.columnCount() > 0:
+                h.resizeSection(0, 36)  # # column compact
+                h.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+            if self._list_model.columnCount() > 1:
+                h.resizeSection(1, row_h)
+                h.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+            # Columns 2..N-2: min width to fit content; last column keeps stretch
+            n = self._list_model.columnCount()
+            for c in range(2, n - 1):
+                h.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+            if n > 1:
+                h.setSectionResizeMode(n - 1, QHeaderView.ResizeMode.Stretch)
         if self._browser_context == "project":
-            self._list_view.setColumnHidden(6, True)
+            self._list_view.setColumnHidden(7, True)  # Path
         else:
-            # Existing behavior: no hidden columns in the new dense list.
-            pass
+            dcc_col = self._list_col_dcc()
+            if dcc_col >= 0 and h:
+                h.setMinimumSectionSize(80)
 
     def _icon_for_item(self, item: ViewItem):
         # Placeholder by kind when no thumbnail: asset/shot/project get type icon; inbox_item = folder.
@@ -2897,6 +3325,14 @@ class MainView(QWidget):
         self._dispatch_item_context_action(chosen, item)
 
     def _on_list_context_menu(self, pos) -> None:
+        # DCC badge right-click takes priority (same as grid)
+        hit_item, hit_dcc, hit_dep = self._list_dcc_hit(pos)
+        if hit_item and hit_dcc and hit_dep:
+            menu = self._build_dcc_badge_context_menu(hit_item, hit_dcc, hit_dep)
+            if menu:
+                chosen = menu.exec(self._list_view.viewport().mapToGlobal(pos))
+                self._dispatch_dcc_badge_action(chosen, hit_item, hit_dcc, hit_dep)
+            return
         index = self._list_view.indexAt(pos)
         if not index.isValid():
             self.root_context_menu_requested.emit(self._list_view.viewport().mapToGlobal(pos))
@@ -3078,7 +3514,7 @@ class MainView(QWidget):
         if item.kind.value in ("asset", "shot"):
             refresh_action = menu.addAction(lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
             if item.kind.value == "asset":
-                rename_action = menu.addAction(lucide_icon("pencil", size=16, color_hex=MONOS_COLORS["text_label"]), "Rename…")
+                rename_action = menu.addAction(lucide_icon("pencil", size=16, color_hex=MONOS_COLORS["text_label"]), "Rename… (Beta)")
             delete_action = menu.addAction(lucide_icon("trash-2", size=16, color_hex="#ef4444"), "Delete…")
             if delete_action is not None:
                 delete_action.setProperty("class", "danger-action")
@@ -3246,22 +3682,33 @@ class MainView(QWidget):
     def _prefetch_visible_thumbnails(self) -> None:
         self._thumb_prefetch_scheduled = False
 
-        if self._view_mode != "tile":
-            return
         if self._tile_model.rowCount() == 0:
             return
-        if self._tile_page.currentIndex() != 1:
-            return
-
-        viewport = self._tile_view.viewport()
-        vp_rect = viewport.rect()
         active_dept = (self._active_department or "").strip() or None
+
+        # When in tile mode: only prefetch if tile content is shown; use tile viewport for visibility.
+        # When in list mode: prefetch so list thumb column gets thumbnails; use list viewport for visibility.
+        if self._view_mode == "tile":
+            if self._tile_page.currentIndex() != 1:
+                return
+            view = self._tile_view
+            vp_rect = view.viewport().rect()
+        else:
+            list_view = getattr(self, "_list_view", None)
+            if list_view is None or self._list_page.currentIndex() != 1:
+                return
+            view = list_view
+            vp_rect = view.viewport().rect()
+
+        def is_row_visible(row: int) -> bool:
+            idx = self._tile_model.index(row, 0) if view is self._tile_view else self._list_model.index(row, 0)
+            return view.visualRect(idx).intersects(vp_rect)
 
         for row in range(self._tile_model.rowCount()):
             index = self._tile_model.index(row, 0)
             if not index.isValid():
                 continue
-            if not self._tile_view.visualRect(index).intersects(vp_rect):
+            if not is_row_visible(row):
                 continue
 
             item = index.data(Qt.UserRole)
@@ -3276,6 +3723,10 @@ class MainView(QWidget):
 
             state = std_item.data(self._THUMB_STATE_ROLE)
             if state in ("loaded", "missing"):
+                # Still sync current icon to list (in case list was refreshed or never got it)
+                list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
+                if list_thumb is not None:
+                    list_thumb.setIcon(std_item.icon())
                 continue
 
             asset_id = str(item.path)
@@ -3283,8 +3734,12 @@ class MainView(QWidget):
             if mgr is not None and hasattr(mgr, "request_thumbnail"):
                 pix = mgr.request_thumbnail(asset_id, department=active_dept)
                 if pix is not None:
-                    std_item.setIcon(QIcon(pix))
+                    icon = QIcon(pix)
+                    std_item.setIcon(icon)
                     std_item.setData("loaded", self._THUMB_STATE_ROLE)
+                    list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
+                    if list_thumb is not None:
+                        list_thumb.setIcon(icon)
                     continue
                 thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path, department=active_dept)
                 if thumb_file is None:
@@ -3301,6 +3756,10 @@ class MainView(QWidget):
                 std_item.setData("missing", self._THUMB_STATE_ROLE)
                 continue
 
-            std_item.setIcon(QIcon(pix))
+            icon = QIcon(pix)
+            std_item.setIcon(icon)
             std_item.setData("loaded", self._THUMB_STATE_ROLE)
+            list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
+            if list_thumb is not None:
+                list_thumb.setIcon(icon)
 

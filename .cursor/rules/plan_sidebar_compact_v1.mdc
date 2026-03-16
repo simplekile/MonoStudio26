@@ -1,0 +1,107 @@
+# Plan — Sidebar Compact Mode (thay vì ẩn)
+
+Khi resize window nhỏ (dưới ngưỡng ẩn sidebar), **không ẩn** mà chuyển sang **sidebar compact**: dùng **widget riêng** `SidebarCompact`, chỉ gồm các nút (icon), không chứa filters/list.
+
+## 1. Ngưỡng & hành vi
+
+| Chiều rộng content | Hành vi |
+|--------------------|--------|
+| &lt; 720px | **SidebarCompact** (56px) + ẩn inspector |
+| &lt; 1000px | **Sidebar** full (256px) + ẩn inspector |
+| ≥ 1000px | Sidebar full + inspector |
+
+- Inspector: không đổi (ẩn khi &lt; 1000px).
+- Sidebar: khi &lt; 720px hiện **SidebarCompact**, khi ≥ 720px hiện **Sidebar** (full). Không ẩn hẳn.
+
+## 2. Kiến trúc: SidebarCompact riêng
+
+- **Tạo widget mới `SidebarCompact`** (file riêng hoặc trong `sidebar.py`): chỉ chứa **các nút (button)** tương ứng chức năng, không có filters, không có list inline.
+- **MainWindow** dùng **một container** bên trái splitter; trong container có **QStackedWidget**:
+  - Page 0: **Sidebar** (full, 256px) — widget hiện tại.
+  - Page 1: **SidebarCompact** (56px) — widget mới chỉ toàn nút.
+- Khi &lt; 720px: `sidebar_stack.setCurrentWidget(sidebar_compact)`, set splitter sizes `[56, w-56]`, container width 56.
+- Khi ≥ 720px: `sidebar_stack.setCurrentWidget(sidebar_full)`, set splitter sizes `_main_splitter_sizes_restore` (256, ...).
+
+### 2.1 SidebarCompact — chỉ các button, dàn hàng dọc + separator
+
+- **Chiều rộng cố định**: 56px (hoặc 64px).
+- **Layout**: **Hàng dọc** (vertical column) — các nút xếp theo cột, từ trên xuống. **Vẫn có separator** (QFrame HLine) giữa các nhóm logic, giống sidebar full.
+- **Nội dung (từ trên xuống)**:
+  1. **Project switcher**: 1 nút icon (chấm tròn). Click → menu project. Tooltip: tên project / "Select project".
+  2. **Separator** (ngang, 1px).
+  3. **Scope (Project | Shot | Asset)**: 3 nút icon xếp **dọc**, mỗi nút = 1 scope. Click → emit context. Tooltip: "Projects" / "Shots" / "Assets".
+  4. **Separator**.
+  5. **Inbox / Project Guide / Outbox**: 3 nút icon xếp **dọc**. Click → emit context (Inbox, Project Guide, Outbox). Tooltip giữ nguyên.
+  6. **Separator** (trên block Recent Tasks).
+  7. **Recent Tasks**: 1 nút icon (list/calendar). Click → **popup list**. Tooltip: "Recent Tasks".
+  8. **Stretch** (đẩy footer xuống sát đáy).
+  9. **Separator** (trên footer).
+  10. **Footer**: 1 nút/logo nhỏ (icon app). Tooltip có thể hiện version.
+
+- Separator: style giống sidebar full (SidebarNavSeparator — 1px, màu #3f3f46 / rgba), margin ngang nhỏ (8px hai bên hoặc full width).
+- **Không có**: filters, list inline, chữ "MONOS" + version (chỉ icon footer).
+
+- **Signals**: SidebarCompact emit **cùng tên signal** với Sidebar để MainWindow nối một lần (hoặc nối cả hai, chỉ widget visible mới nhận tương tác): `context_changed`, `context_clicked`, `project_switch_requested`, `settings_requested` (có thể bỏ trong compact), `recent_task_clicked`, `recent_task_double_clicked`, `clear_recent_tasks_requested`, v.v. MainWindow khi khởi tạo kết nối cả Sidebar và SidebarCompact tới cùng slot; hoặc dùng một “sidebar proxy” mà cả hai forward tới.
+
+### 2.2 Đồng bộ state
+
+- **Project list / current project**: MainWindow gọi `set_projects()` trên **cả** Sidebar và SidebarCompact (hoặc chỉ Sidebar + SidebarCompact đọc từ MainWindow). Cần API `set_projects()` trên SidebarCompact (chỉ cập nhật nút project + menu).
+- **Scope hiện tại**: Khi đổi context từ Sidebar hoặc SidebarCompact, MainWindow cập nhật state; khi chuyển sang compact (hoặc từ compact sang full) cần **set scope/context** cho widget đang hiện (ví dụ `sidebar_compact.set_current_context(scope)` khi switch sang compact để nút scope sáng đúng).
+- **Recent tasks list**: MainWindow gọi `set_recent_tasks(tasks)` trên cả hai; SidebarCompact dùng data này cho popup.
+
+## 3. Implementation outline
+
+### 3.1 MainWindow
+
+- Thêm **sidebar container** (QWidget), bên trong là **QStackedWidget**:
+  - `addWidget(self._sidebar)`  — page full
+  - `addWidget(self._sidebar_compact)` — page compact (widget mới).
+- **Splitter**: thay vì add trực tiếp `_sidebar`, add **sidebar_container**. Khi restore sizes vẫn dùng 256 cho vị trí sidebar.
+- **`_apply_responsive_panels()`**:
+  - &lt; 720px: `sidebar_stack.setCurrentWidget(_sidebar_compact)`, `sidebar_container.setFixedWidth(56)`, `_main_splitter.setSizes([56, w-56])`. Lưu sizes hiện tại vào `_main_splitter_sizes_restore` trước nếu đang full. Inspector ẩn.
+  - ≥ 720px: `sidebar_stack.setCurrentWidget(_sidebar)`, `sidebar_container.setFixedWidth(256)` (hoặc bỏ fixed, để sidebar 256), `_main_splitter.setSizes(_main_splitter_sizes_restore)`. Inspector vẫn ẩn nếu &lt; 1000px.
+  - ≥ 1000px: full sidebar + inspector hiện.
+- Kết nối signal: **SidebarCompact** emit cùng signal với Sidebar; MainWindow connect cả hai tới cùng handler (chỉ widget visible mới nhận click nên không conflict).
+
+### 3.2 SidebarCompact (widget mới)
+
+- **File**: `sidebar_compact.py` (mới) hoặc class `SidebarCompact(QWidget)` trong `sidebar.py`.
+- **Layout**: QVBoxLayout, **hàng dọc**, thứ tự: project btn → **separator** → scope 3 btn (dọc) → **separator** → Inbox/Guide/Outbox 3 btn (dọc) → **separator** → recent tasks btn → stretch → **separator** → footer logo. Mỗi nhóm cách nhau bằng QFrame HLine (objectName SidebarNavSeparator hoặc dùng chung style).
+- **Width**: `setFixedWidth(56)`, setMinimumWidth(56), setMaximumWidth(56).
+- **Project**: QToolButton icon-only (dot), menu giống Sidebar; `set_projects(projects, current_root, status_by_root)`.
+- **Scope**: 3 QToolButton icon-only; click → emit scope (Projects/Shots/Assets); `set_current_scope(scope)` để highlight.
+- **Inbox/Guide/Outbox**: 3 QToolButton, click → emit context.
+- **Recent Tasks**: 1 QToolButton icon; click → show popup (QFrame + QListWidget, delegate giống Sidebar); `set_recent_tasks(tasks)`; emit `recent_task_clicked`, `recent_task_double_clicked`, `clear_recent_tasks_requested`.
+- **Footer**: QLabel icon logo hoặc QToolButton, tooltip version.
+- **Style**: objectName `SidebarCompact`, nền #18181b, viền phải nhẹ (optional).
+
+### 3.3 Style (style.py)
+
+- `QWidget#SidebarCompact`: background #18181b, width 56 (hoặc để code setFixedWidth).
+- Nút: icon 20–24px, transparent nền, hover nhẹ.
+
+### 3.4 Persistence
+
+- Không lưu “compact” trong settings; khi restore geometry, width nhỏ → `_apply_responsive_panels()` chọn SidebarCompact.
+
+## 4. Thứ tự triển khai
+
+1. **Tạo SidebarCompact**: class + layout chỉ các button (project, scope, inbox/guide/outbox, recent tasks, footer). Signals trùng tên Sidebar. Implement `set_projects`, `set_current_scope`, `set_recent_tasks`; Recent Tasks click → popup list.
+2. **MainWindow**: Tạo sidebar_container + QStackedWidget; add Sidebar và SidebarCompact; splitter add container thay vì add Sidebar trực tiếp. Sửa `_apply_responsive_panels()`: &lt; 720px switch sang SidebarCompact + set sizes [56, ...], ≥ 720px switch sang Sidebar + restore sizes.
+3. **Kết nối signal**: MainWindow connect signals của SidebarCompact tới cùng slot đang dùng cho Sidebar (context_changed, project_switch_requested, recent_task_clicked, …). Gọi `set_projects` / `set_recent_tasks` cho cả hai khi có thay đổi.
+4. **Đồng bộ context khi đổi stack**: Khi chuyển từ full → compact, gọi `sidebar_compact.set_current_scope(current_scope)` (và context Inbox/Guide/Outbox nếu đang ở đó) để nút sáng đúng.
+5. **Style**: SidebarCompact QSS.
+
+## 5. File cần sửa/tạo
+
+| Khu vực | File |
+|---------|------|
+| Widget compact mới | **sidebar_compact.py** (mới) hoặc `sidebar.py` (class SidebarCompact) |
+| Main layout + responsive | `main_window.py`: container, QStackedWidget, _apply_responsive_panels(), connect signals SidebarCompact |
+| Style | `style.py`: SidebarCompact |
+
+## 6. Edge cases
+
+- Chuyển full ↔ compact: cập nhật scope/context lên widget đang hiện để highlight đúng.
+- Title bar: `left_w = sizes[0]` → 56 khi compact, 256 khi full.
+- Restore geometry hẹp: showEvent + resizeEvent → _apply_responsive_panels() → hiện SidebarCompact ngay từ đầu.

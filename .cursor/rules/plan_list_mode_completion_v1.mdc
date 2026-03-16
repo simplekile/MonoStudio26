@@ -1,0 +1,136 @@
+---
+description: Plan hoàn thiện List mode trong Main View — đồng bộ selection, dữ liệu cột, keyboard, UX.
+alwaysApply: false
+---
+
+# Plan — Hoàn thiện List mode (Main View) (v1)
+
+Main View có hai chế độ **Grid (Tile)** và **List**. List mode đã có: model theo context (project / asset / shot), header theo context, double-click mở, context menu giống grid, empty state. Plan này bổ sung các mục còn thiếu hoặc chưa nhất quán.
+
+---
+
+## 1. Hiện trạng (tóm tắt)
+
+- **Grid (Tile)**: mặc định, có thumbnail, card size, DCC badge, Work/Published.
+- **List**: `QTableView` + `QStandardItemModel`, cột theo context:
+  - **Project**: `#, Name, Status, Shots, Assets, Last Updated, Path` (Path ẩn mặc định).
+  - **Asset/Shot**: `#, Name, Status, Version, Assignee, Last Updated`.
+- **Chung**: cùng `_all_items` / `_order`, selection qua `selection_id_changed` (path), `selected_view_item()` đọc từ view đang hiện.
+
+**Điểm chưa hoàn thiện:**
+
+1. Header list khởi tạo sai trong `__init__` (Name, Type, Departments count, Path) — chỉ đúng sau khi `clear()`/`set_items()` gọi `_list_headers()`.
+2. Khi đổi view mode (Grid ↔ List), selection không sync: chọn dòng list, chuyển sang Grid có thể không có selection và ngược lại.
+3. Cột **Version** và **Assignee** (asset/shot) đang luôn "—", chưa gắn dữ liệu thật.
+4. List không có **Enter** để mở item (chỉ double-click).
+5. Chưa có **sort** theo cột (tùy chọn).
+6. **Column width** không lưu/khôi phục theo context.
+7. **Tooltip** trên hàng list (tùy chọn, giống grid).
+8. **Visual**: delegate list chỉ vẽ amber bar cho project active; có thể thêm vạch trái (selected) cho asset/shot theo table_deep_dark_monos.
+
+---
+
+## 2. Mục tiêu và phạm vi
+
+- Đồng bộ selection khi chuyển view mode.
+- Sửa header list lúc khởi tạo.
+- (Tùy chọn) Điền Version / Assignee nếu có nguồn dữ liệu.
+- Keyboard: Enter trên list = activate item (như grid).
+- (Tùy chọn) Sort theo cột, lưu độ rộng cột, tooltip hàng, vạch selected.
+
+---
+
+## 3. Chi tiết từng hạng mục
+
+### 3.1 Header list lúc khởi tạo
+
+- **Vấn đề**: `MainView.__init__` set `_list_model.setHorizontalHeaderLabels(["Name", "Type", "Departments count", "Path"])` — không khớp với `_list_headers()` (project: 7 cột, asset/shot: 6 cột).
+- **Cách làm**: Trong `__init__`, sau khi `_browser_context` đã được set (mặc định `"asset"`), gọi `self._list_model.setHorizontalHeaderLabels(self._list_headers())` thay cho mảng cố định.
+- **File**: `monostudio/ui_qt/main_view.py` (đoạn tạo `_list_model`).
+
+### 3.2 Đồng bộ selection khi chuyển view mode
+
+- **Hành vi mong muốn**: Khi user bấm Grid hoặc List, view đổi nhưng **cùng item vẫn được chọn** (theo path).
+- **Cách làm**: Trong `set_view_mode()`:
+  1. Trước khi đổi stack: `current_item = self.selected_view_item()` (lấy từ view đang hiện).
+  2. Đổi `_view_mode` và `_content.setCurrentIndex(...)` như hiện tại.
+  3. Nếu `current_item` không None: gọi `select_item_by_path(current_item.path)` để đặt selection trên view mới (cùng row index).
+- **File**: `monostudio/ui_qt/main_view.py` (`set_view_mode`).
+
+### 3.3 Cột Version (asset/shot)
+
+- **Hiện tại**: Luôn `"—"` trong `_insert_list_row_at` và `_populate_views` (asset/shot).
+- **Mục tiêu**: Hiển thị version có ý nghĩa cho department đang active (work hoặc publish).
+- **Cách làm** (gợi ý):
+  - Nếu `_show_publish` và có `_active_department`: lấy latest publish version (vd. `v003`) từ `item.ref` (Asset/Shot) cho department đó; không có thì `"—"`.
+  - Nếu Work: lấy work version cao nhất từ departments (vd. work version count hoặc version string từ scan); không có thì `"—"`.
+  - Helper: `_list_version_for_item(item: ViewItem) -> str` trả về chuỗi hiển thị (vd. `v001`, `—`).
+- **File**: `monostudio/ui_qt/main_view.py` (chỗ tạo `c_version` trong list row, cả insert và populate).
+- **Ghi chú**: Phụ thuộc dữ liệu từ pipeline (work/publish version); nếu chưa có API rõ thì có thể để "—" và ghi trong plan là bước sau.
+
+### 3.4 Cột Assignee (asset/shot)
+
+- **Hiện tại**: Luôn `"—"`.
+- **Mục tiêu**: Khi có nguồn assignee (task system, metadata), hiển thị tên; không có thì giữ `"—"`.
+- **Cách làm**: Nếu sau này có `item.ref.assignee` hoặc tương đương, set `c_assignee.setText(...)`; không thì bỏ qua (giữ "—").
+
+### 3.5 Keyboard: Enter để activate (list)
+
+- **Hành vi**: Khi focus ở list view, bấm Enter = tương đương double-click (gọi logic activate: open / open publish folder / notify select department).
+- **Cách làm**:
+  - Cách 1: `_list_view` override `keyPressEvent`: nếu `key in (Key_Return, Key_Enter)` và có selection, lấy `selected_view_item()` rồi gọi cùng logic với `_on_list_activated` (hoặc emit `item_activated` / mở publish tùy context). Cần truyền reference tới MainView để gọi logic (vd. qua signal hoặc parent).
+  - Cách 2: Trên `MainView` install `eventFilter` lên `_list_view`: khi `Key_Return`/`Key_Enter`, lấy index hiện tại, lấy item, gọi `_on_list_activated(index)` (hoặc tạo index từ row hiện tại). Tránh duplicate logic: tạo helper `_activate_item_if_allowed(item)` dùng chung cho double-click và Enter.
+- **File**: `monostudio/ui_qt/main_view.py`.
+
+### 3.6 Sort theo cột (tùy chọn)
+
+- **Hiện tại**: `setSortingEnabled(False)`.
+- **Nếu bật sort**: Dùng `QSortFilterProxyModel` (hoặc sort trực tiếp trên model). Lưu ý: sau khi sort, row index không còn trùng với `_order`/`_items` — `select_item_by_path` và `selected_view_item` cần map qua proxy. Hoặc giữ model không sort, chỉ sort khi hiển thị và map selection qua proxy. Plan có thể ghi "Phase 2" để tránh scope quá lớn.
+
+### 3.7 Lưu/khôi phục độ rộng cột (tùy chọn)
+
+- **Cách làm**: QSettings key theo context, vd. `main_view/list_column_sizes/asset` = list int (width từng cột). Trong `set_view_mode("list", ...)` hoặc khi set_items với list visible, `restoreState`/`restoreGeometry` hoặc `setSectionSizes`. Khi đổi column width (header resize), lưu lại. File: `main_view.py` + có thể key trong `_SETTINGS_KEY_*`.
+
+### 3.8 Tooltip hàng list (tùy chọn)
+
+- **Giống grid**: Tooltip = tên item + type (và có thể status). Cách làm: `_list_view.setMouseTracking(True)` (nếu chưa), trong `eventFilter` cho list viewport, với `QEvent.ToolTip` lấy `indexAt(pos)`, lấy item, `QToolTip.showText(globalPos, text)`.
+
+### 3.9 Delegate: vạch trái khi chọn (asset/shot)
+
+- **Tham chiếu**: `.cursor/rules/table_deep_dark_monos_v1.mdc` — "Tier 1 anchor", vạch xanh bên trái cho cột đầu khi selected.
+- **Cách làm**: Trong `_ListRowDelegate.paint`, nếu `index.column() == 0` và hàng đó đang selected (kiểm tra option.state & QStyle.State_Selected), vẽ `fillRect(option.rect.left(), ..., 2, height, blue)`. Cần option.state từ view.
+
+---
+
+## 4. Thứ tự triển khai đề xuất
+
+| Bước | Nội dung | Ưu tiên |
+|------|----------|--------|
+| 1 | Sửa header list trong `__init__` dùng `_list_headers()` | Cao |
+| 2 | Sync selection trong `set_view_mode` (current item → select_item_by_path) | Cao |
+| 3 | Enter key trên list → activate (helper + eventFilter hoặc keyPressEvent) | Cao |
+| 4 | Version column: điền từ pipeline nếu có (hoặc để "—" + doc) | Trung bình |
+| 5 | Assignee: chỉ khi có data source | Thấp |
+| 6 | Delegate: vạch trái 2px cho row selected (asset/shot) | Trung bình |
+| 7 | Tooltip hàng list | Thấp |
+| 8 | Sort cột / lưu column width | Phase 2 |
+
+---
+
+## 5. File liên quan
+
+| Khu vực | File |
+|---------|------|
+| List init, view mode, selection, keyboard, delegate | `monostudio/ui_qt/main_view.py` |
+| Table/List QSS (đã có MainViewList) | `monostudio/ui_qt/style.py` |
+| Rule table Deep Dark | `.cursor/rules/table_deep_dark_monos_v1.mdc` |
+
+---
+
+## 6. Kiểm tra nhanh sau khi làm
+
+- Chọn 1 item ở Grid → chuyển sang List → cùng item vẫn được chọn.
+- Chọn 1 item ở List → chuyển sang Grid → cùng item vẫn được chọn.
+- Ở List, chọn 1 dòng, bấm Enter → mở item (hoặc open publish / hint department) giống double-click.
+- Mở app, vào Assets, chuyển List ngay: header đúng `#, Name, Status, Version, Assignee, Last Updated` (không còn "Type", "Departments count").
+- (Nếu làm delegate) Hàng được chọn có vạch xanh 2px bên trái cột đầu.

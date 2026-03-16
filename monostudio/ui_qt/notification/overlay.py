@@ -54,6 +54,9 @@ class NotificationOverlayWidget(QWidget):
         self._general_anchor_widget: QWidget | None = None
         self._toasts: list[ToastWidget] = []
         self._sidebar_toasts: list[ToastWidget] = []
+        # Overlay itself stays transparent for mouse events so it never blocks
+        # interaction with the rest of the UI; individual toast widgets can still
+        # handle mouse if we ever host them elsewhere.
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setAutoFillBackground(False)

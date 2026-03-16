@@ -3,14 +3,16 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from datetime import datetime
+import os
 import shutil
 import sys
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QPoint, Qt, QRect, QSettings, Signal, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDropEvent
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMenu, QMessageBox, QSplitter, QStackedWidget, QToolTip, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QFrame, QMenu, QMessageBox, QSizePolicy, QSplitter, QStackedWidget, QToolTip, QVBoxLayout, QWidget
 from qframelesswindow import FramelessMainWindow
 
 from monostudio.core.app_paths import get_app_base_path
@@ -34,7 +36,7 @@ from monostudio.core.pipeline_types_and_presets import (
     seed_project_from_user_default,
 )
 from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
-from monostudio.core.asset_rename import rename_asset
+from monostudio.core.asset_rename import prepare_work_file_renames, rename_asset
 from monostudio.core.pending_create import remove_by_entity, remove_for_entities, clear_all as pending_clear_all
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
 from monostudio.core.inbox_reader import add_to_inbox, append_inbox_distributed
@@ -47,7 +49,7 @@ from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
 from monostudio.ui_qt.new_project_dialog import NewProjectDialog
 from monostudio.ui_qt.settings_dialog import SettingsDialog
-from monostudio.ui_qt.sidebar import Sidebar
+from monostudio.ui_qt.sidebar import Sidebar, SidebarCompact
 from monostudio.ui_qt.top_bar import TopBar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog, ask_delete_folder
@@ -79,10 +81,15 @@ class MainWindow(FramelessMainWindow):
     """
     Phase 0 shell:
     - 3 panels: Sidebar (~15%), Main View (~60%), Inspector (~25%, hidden by default)
+    - On narrow resize: hide inspector, then hide sidebar (responsive).
     - No filesystem logic
     - No publish logic
     - No database
     """
+
+    # Width thresholds: below these, hide inspector then sidebar (content area width).
+    _WIDTH_HIDE_INSPECTOR = 1000
+    _WIDTH_HIDE_SIDEBAR = 720
 
     departmentChanged = Signal(object)  # str | None
     typeChanged = Signal(object)  # str | None
@@ -124,6 +131,7 @@ class MainWindow(FramelessMainWindow):
             max_memory=200,
         )
         self._fs_watcher = QFileSystemWatcher(self)
+        self._watcher_manually_disabled = False  # user can toggle watcher off via top bar
         self._fs_event_collector = FsEventCollector(self, debounce_ms=300)
         self._fs_watcher.fileChanged.connect(self._fs_event_collector.add_path)
         self._fs_watcher.directoryChanged.connect(self._fs_event_collector.add_path)
@@ -152,11 +160,27 @@ class MainWindow(FramelessMainWindow):
                 self._type_aliases_by_id[self._norm(type_id)] = aliases
 
         self._sidebar = Sidebar()
+        self._sidebar_compact = SidebarCompact(self)
+        self._sidebar_compact.set_filter_source(self._sidebar.filters())
         # Persist sidebar filter selections per page (assets/shots).
         try:
             self._sidebar.filters().set_settings(self._settings)
         except Exception:
             pass
+        self._sidebar_container = QWidget(self)
+        self._sidebar_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self._sidebar_container.setMinimumWidth(256)
+        self._sidebar_container.setMaximumWidth(256)  # like old Sidebar: fixed 256, no gap
+        _sidebar_stack = QStackedWidget(self._sidebar_container)
+        _sidebar_stack.setContentsMargins(0, 0, 0, 0)
+        _sidebar_stack.addWidget(self._sidebar)
+        _sidebar_stack.addWidget(self._sidebar_compact)
+        _sidebar_stack.setCurrentIndex(0)
+        _sidebar_container_layout = QVBoxLayout(self._sidebar_container)
+        _sidebar_container_layout.setContentsMargins(0, 0, 0, 0)
+        _sidebar_container_layout.setSpacing(0)
+        _sidebar_container_layout.addWidget(_sidebar_stack)
+        self._sidebar_stack = _sidebar_stack
         self._main_view = MainView()
         self._main_view.set_thumbnail_manager(self._thumbnail_manager)
         self._content_stack = QStackedWidget()
@@ -207,7 +231,7 @@ class MainWindow(FramelessMainWindow):
         self._main_splitter = QSplitter(Qt.Horizontal)
         self._main_splitter.setObjectName("MainSplitter")
         self._main_splitter.setChildrenCollapsible(False)
-        self._main_splitter.addWidget(self._sidebar)
+        self._main_splitter.addWidget(self._sidebar_container)
         self._main_splitter.addWidget(right_container)
         self._main_splitter.setStretchFactor(0, 20)
         self._main_splitter.setStretchFactor(1, 80)
@@ -215,6 +239,12 @@ class MainWindow(FramelessMainWindow):
 
         self.setCentralWidget(self._main_splitter)
         self._restore_splitter_sizes()
+        # Store sizes to restore when showing panels again after narrow resize.
+        self._content_splitter_sizes_restore: list[int] = [800, 320]
+        self._main_splitter_sizes_restore: list[int] = [256, 1100]
+        self._compact_filter_popup: QFrame | None = None
+        self._compact_filter_popup_closed_at = 0.0
+        self._POPUP_REOPEN_GRACE = 0.25
         # Frameless window on Windows often receives drop at window level; forward to current page
         self.setAcceptDrops(True)
         # Title bar only over right pane (not over sidebar); update when splitter/window resizes.
@@ -226,9 +256,19 @@ class MainWindow(FramelessMainWindow):
         self._sidebar.context_clicked.connect(self._on_context_clicked)
         self._sidebar.context_menu_requested.connect(self._on_sidebar_context_menu_requested)
         self._sidebar.settings_requested.connect(self._open_settings)
+        self._sidebar.project_switch_requested.connect(self._switch_project)
+        self._top_bar.settings_clicked.connect(self._open_settings)
         self._sidebar.recent_task_clicked.connect(self._on_recent_task_clicked)
         self._sidebar.recent_task_double_clicked.connect(self._on_recent_task_double_clicked)
         self._sidebar.clear_recent_tasks_requested.connect(self._on_clear_recent_tasks)
+        # Compact sidebar: sync context to full sidebar then full sidebar emits; wire other signals to same handlers.
+        self._sidebar_compact.context_changed.connect(lambda ctx: self._sidebar.set_current_context(ctx))
+        self._sidebar_compact.context_clicked.connect(self._on_context_clicked)
+        self._sidebar_compact.project_switch_requested.connect(self._switch_project)
+        self._sidebar_compact.recent_task_clicked.connect(self._on_recent_task_clicked)
+        self._sidebar_compact.recent_task_double_clicked.connect(self._on_recent_task_double_clicked)
+        self._sidebar_compact.clear_recent_tasks_requested.connect(self._on_clear_recent_tasks)
+        self._sidebar_compact.filter_requested.connect(self._on_compact_filter_requested)
         # Metadata-driven filter sidebar (UI-only; wiring stub).
         self._sidebar.filters().departmentClicked.connect(self._controller.on_department_clicked)
         self._sidebar.filters().typeClicked.connect(self._controller.on_type_clicked)
@@ -241,7 +281,6 @@ class MainWindow(FramelessMainWindow):
         self._controller.departmentChanged.connect(self._set_main_view_department)
         self.departmentChanged.connect(self._on_filter_state_changed)
         self.typeChanged.connect(self._on_filter_state_changed)
-        self._top_bar.project_switch_requested.connect(self._switch_project)
         self._top_bar.minimize_clicked.connect(self.showMinimized)
         self._top_bar.maximize_clicked.connect(self._toggle_maximize)
         self._top_bar.close_clicked.connect(self.close)
@@ -298,8 +337,11 @@ class MainWindow(FramelessMainWindow):
 
         notification_service.set_main_window(self, self._main_view)
         notification_service.set_general_toast_anchor_widget(self._top_bar.get_noti_button())
+        # Anchor important banner under the update button so it appears as a callout.
+        notification_service.set_important_anchor_widget(self._top_bar.get_update_button())
 
         self._top_bar.update_button_clicked.connect(self._open_settings_to_updates)
+        self._top_bar.watcher_toggled.connect(self._on_watcher_toggled)
         self._startup_update_check_worker: _StartupUpdateCheckWorker | None = None
         QTimer.singleShot(800, self._start_startup_update_check)
 
@@ -311,19 +353,26 @@ class MainWindow(FramelessMainWindow):
         self._startup_update_check_worker.start()
 
     def _on_startup_update_check_finished(self, result, error_message: str) -> None:
+        # Debug: always pretend there is an update if env is set.
+        debug_fake_update = os.getenv("MONOS_DEBUG_FAKE_UPDATE")
+        if debug_fake_update:
+            class _FakeUpdateResult:
+                def __init__(self, version: str) -> None:
+                    self.update_available = True
+                    self.latest_version = version
+
+            fake_version = debug_fake_update.strip() or (getattr(result, "latest_version", None) or "9.9.9-debug")
+            result = _FakeUpdateResult(fake_version)
+            error_message = ""
+
         if error_message or result is None:
             return
         self._settings.setValue("updates/last_check_time", datetime.now().isoformat())
         self._top_bar.set_update_available(result.update_available, result.latest_version)
         if result.update_available:
-            btn = self._top_bar.get_update_button()
-            pos = btn.mapToGlobal(btn.rect().bottomRight())
-            QToolTip.showText(
-                pos,
-                f"Update available: {result.latest_version}. Check it out!",
-                btn,
-                btn.rect(),
-                5000,
+            # Important: show a sticky notification that only disappears when the user closes it.
+            notification_service.important(
+                f"Update available: {result.latest_version}. Check it out!"
             )
 
     def _open_settings_to_updates(self) -> None:
@@ -350,12 +399,90 @@ class MainWindow(FramelessMainWindow):
             self._workspace_projects = updated
             self._sync_top_bar()
 
+    def _on_watcher_toggled(self, enabled: bool) -> None:
+        """User toggled file watcher from top bar: on -> resume watching, off -> release all handles."""
+        self._watcher_manually_disabled = not enabled
+        if not enabled:
+            # On Windows, removePaths() often does not release directory handles. Cancel scan workers
+            # so no thread holds dirs, then replace the watcher with a new one so the old one is
+            # destroyed and the OS releases handles (rename/delete then work in Explorer too).
+            self._top_bar.set_watcher_busy(True)
+            try:
+                self._worker_manager.cancel_category("filesystem_scan")
+                self._worker_manager.cancel_category("incremental_scan")
+                for _ in range(20):
+                    QApplication.processEvents()
+                    time.sleep(0.1)
+                old_watcher = self._fs_watcher
+                old_watcher.fileChanged.disconnect()
+                old_watcher.directoryChanged.disconnect()
+                self._fs_watcher = QFileSystemWatcher(self)
+                self._fs_watcher.fileChanged.connect(self._fs_event_collector.add_path)
+                self._fs_watcher.directoryChanged.connect(self._fs_event_collector.add_path)
+                old_watcher.setParent(None)
+                old_watcher.deleteLater()
+                self._fs_event_collector.set_project_root(None)
+                self._fs_event_collector.set_registries(None, None)
+                for _ in range(15):
+                    QApplication.processEvents()
+                    time.sleep(0.05)
+            finally:
+                self._top_bar.set_watcher_busy(False)
+            notification_service.success("File watcher paused. Rename and delete are now allowed.")
+        else:
+            self._update_fs_watcher_paths()
+            notification_service.success("File watcher on. Changes will be detected automatically.")
+
     def _update_title_bar_geometry(self) -> None:
         """Place title bar over right pane only (x = sidebar width), not over sidebar."""
         sizes = self._main_splitter.sizes()
         left_w = sizes[0] if sizes else 0
         self._top_bar.setGeometry(left_w, 0, self.width() - left_w, self._top_bar.height())
         self._top_bar.raise_()
+
+    def _apply_responsive_panels(self) -> None:
+        """Narrow: hide inspector. Very narrow: switch to compact sidebar (56px)."""
+        w = self._main_splitter.width()
+        is_compact = self._sidebar_stack.currentIndex() == 1
+        if w < self._WIDTH_HIDE_SIDEBAR:
+            if not is_compact:
+                sizes = self._main_splitter.sizes()
+                if len(sizes) >= 2 and sizes[0] > 0:
+                    self._main_splitter_sizes_restore = list(sizes)
+                self._sidebar_compact.set_current_context(self._sidebar.current_context())
+                self._sidebar_stack.setCurrentIndex(1)
+                self._sidebar_container.setMinimumWidth(56)
+                self._sidebar_container.setMaximumWidth(56)
+            self._main_splitter.setSizes([56, max(0, w - 56)])
+            if self._inspector.isVisible():
+                sizes = self._content_splitter.sizes()
+                if len(sizes) >= 2 and sizes[1] > 0:
+                    self._content_splitter_sizes_restore = list(sizes)
+                self._inspector.setVisible(False)
+            self._content_splitter.setSizes([self._content_splitter.width(), 0])
+        elif w < self._WIDTH_HIDE_INSPECTOR:
+            if is_compact:
+                self._sidebar.set_current_context(self._sidebar_compact.current_context())
+                self._sidebar_stack.setCurrentIndex(0)
+                self._sidebar_container.setMinimumWidth(256)
+                self._sidebar_container.setMaximumWidth(256)
+                self._main_splitter.setSizes(self._main_splitter_sizes_restore)
+            if self._inspector.isVisible():
+                sizes = self._content_splitter.sizes()
+                if len(sizes) >= 2 and sizes[1] > 0:
+                    self._content_splitter_sizes_restore = list(sizes)
+                self._inspector.setVisible(False)
+            self._content_splitter.setSizes([self._content_splitter.width(), 0])
+        else:
+            if is_compact:
+                self._sidebar.set_current_context(self._sidebar_compact.current_context())
+                self._sidebar_stack.setCurrentIndex(0)
+                self._sidebar_container.setMinimumWidth(256)
+                self._sidebar_container.setMaximumWidth(256)
+                self._main_splitter.setSizes(self._main_splitter_sizes_restore)
+            if not self._inspector.isVisible():
+                self._inspector.setVisible(True)
+                self._content_splitter.setSizes(self._content_splitter_sizes_restore)
 
     def _apply_maximized_geometry_if_needed(self) -> None:
         """Ép geometry khít availableGeometry khi đang maximized (tránh khoảng hở do Qt/WM)."""
@@ -368,10 +495,16 @@ class MainWindow(FramelessMainWindow):
         if self.geometry() != desired:
             self.setGeometry(desired)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Apply responsive panels on first show (sidebar/inspector hide when window is narrow).
+        QTimer.singleShot(0, self._apply_responsive_panels)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self.isMaximized():
             self._apply_maximized_geometry_if_needed()
+        self._apply_responsive_panels()
         self._update_title_bar_geometry()
         notification_service.update_overlay_geometry()
 
@@ -673,7 +806,12 @@ class MainWindow(FramelessMainWindow):
         return
 
     def _sync_top_bar(self) -> None:
-        self._top_bar.set_projects(
+        self._sidebar.set_projects(
+            self._workspace_projects,
+            current_root=self._project_root,
+            status_by_root=self._workspace_project_status,
+        )
+        self._sidebar_compact.set_projects(
             self._workspace_projects,
             current_root=self._project_root,
             status_by_root=self._workspace_project_status,
@@ -874,6 +1012,7 @@ class MainWindow(FramelessMainWindow):
     def _on_delete_requested(self, item: ViewItem) -> None:
         """
         Guarded delete (asset/shot only):
+        - Requires file watcher to be paused (toggle in top bar)
         - Confirmation requires typing exact folder name
         - Deletes folder recursively from disk
         - On success: update in-memory index and app_state, clear inspector if needed, refresh UI (NO rescan)
@@ -882,6 +1021,11 @@ class MainWindow(FramelessMainWindow):
         if self._project_index is None:
             return
         if item.kind.value not in ("asset", "shot"):
+            return
+        if not self._watcher_manually_disabled:
+            notification_service.warning(
+                "Pause the file watcher (click the eye icon in the top bar) before deleting."
+            )
             return
 
         path = item.path
@@ -927,6 +1071,7 @@ class MainWindow(FramelessMainWindow):
     def _on_rename_asset_requested(self, item: ViewItem) -> None:
         """
         Rename (asset only):
+        - Requires file watcher to be paused (toggle in top bar)
         - Dialog validates target name
         - Renames asset folder on disk + renames work files to match pipeline prefix
         - On success: refresh in-memory index and app_state (same style as delete), keep selection on renamed asset
@@ -934,6 +1079,11 @@ class MainWindow(FramelessMainWindow):
         if self._project_index is None or self._project_root is None:
             return
         if item.kind.value != "asset":
+            return
+        if not self._watcher_manually_disabled:
+            notification_service.warning(
+                "Pause the file watcher (click the eye icon in the top bar) before renaming."
+            )
             return
 
         old_path = Path(item.path)
@@ -948,14 +1098,32 @@ class MainWindow(FramelessMainWindow):
             return
 
         try:
-            result = rename_asset(
+            work_file_renames = prepare_work_file_renames(
                 project_root=self._project_root,
                 asset_path=old_path,
                 new_name=dlg.final_name(),
             )
+        except (OSError, ValueError, FileNotFoundError) as e:
+            logging.warning("Prepare rename failed: %s", e)
+            notification_service.error(f"Rename failed: {e}")
+            return
+
+        try:
+            result = rename_asset(
+                project_root=self._project_root,
+                asset_path=old_path,
+                new_name=dlg.final_name(),
+                work_file_renames=work_file_renames,
+            )
         except (OSError, PermissionError, ValueError, FileExistsError) as e:
             logging.warning("Rename asset failed: %s", e)
-            notification_service.error(f"Rename failed: {e}")
+            if getattr(e, "winerror", None) == 5:
+                notification_service.error(
+                    "Rename failed: Access denied. The folder may be in use by Dropbox or another app. "
+                    "Try pausing sync for this folder, or rename it in Explorer and refresh the project."
+                )
+            else:
+                notification_service.error(f"Rename failed: {e}")
             return
         except Exception as e:
             logging.exception("Rename asset failed unexpectedly: %s", e)
@@ -980,6 +1148,7 @@ class MainWindow(FramelessMainWindow):
         self._sidebar.set_project_index(self._project_index)
         self._reload_main_view()
         self._sync_primary_action()
+        self._update_fs_watcher_paths()
 
         # Keep selection on renamed asset if it exists in the refreshed index.
         try:
@@ -1497,6 +1666,7 @@ class MainWindow(FramelessMainWindow):
     def _refresh_recent_tasks(self) -> None:
         tasks = self._recent_tasks_store.get_for_project(self._project_root) if self._project_root else []
         self._sidebar.set_recent_tasks(tasks)
+        self._sidebar_compact.set_recent_tasks(tasks)
 
     def _apply_workspace_root(self, folder: str | None, *, save: bool) -> None:
         # No validation. Read-only discovery.
@@ -1601,6 +1771,69 @@ class MainWindow(FramelessMainWindow):
             debounce_ms=0,
         )
 
+    def _watcher_paths_for_asset(self, root: Path, asset: Asset, *, max_paths: int = 2000) -> list[str]:
+        """Return the list of watcher paths for a single asset (dept dirs, work, publish). Used after rename to add only the new asset's paths."""
+        to_add: list[str] = []
+        _seen: set[str] = set()
+        base = Path(asset.path)
+        if not base.is_absolute():
+            base = (root / base).resolve()
+        use_dcc_folders = read_use_dcc_folders(root)
+        try:
+            _dcc_reg = get_default_dcc_registry()
+        except Exception:
+            _dcc_reg = None
+
+        def _add_dir_and_ancestors(dir_path: Path, entity_base: Path) -> None:
+            try:
+                resolved = dir_path.resolve()
+                base_resolved = entity_base.resolve()
+            except OSError:
+                return
+            if not resolved.is_dir() or len(to_add) >= max_paths:
+                return
+            s = str(resolved)
+            if s not in _seen:
+                _seen.add(s)
+                to_add.append(s)
+            parent = resolved.parent
+            while parent != base_resolved and len(parent.parts) > len(base_resolved.parts):
+                if parent.is_dir() and len(to_add) < max_paths:
+                    ps = str(parent)
+                    if ps not in _seen:
+                        _seen.add(ps)
+                        to_add.append(ps)
+                parent = parent.parent
+
+        for dept in asset.departments:
+            dept_dir = Path(dept.path) if Path(dept.path).is_absolute() else (root / dept.path).resolve()
+            _add_dir_and_ancestors(dept_dir, base)
+            if use_dcc_folders and _dcc_reg is not None:
+                for dcc_id in _dcc_reg.get_all_dccs():
+                    try:
+                        wp = resolve_work_path(dept_dir, dcc_id, True, _dcc_reg)
+                    except Exception:
+                        continue
+                    if wp.is_dir() and len(to_add) < max_paths:
+                        s = str(wp)
+                        if s not in _seen:
+                            _seen.add(s)
+                            to_add.append(s)
+            else:
+                wp = Path(dept.work_path) if Path(dept.work_path).is_absolute() else (root / dept.work_path).resolve()
+                if wp.is_dir() and len(to_add) < max_paths:
+                    s = str(wp)
+                    if s not in _seen:
+                        _seen.add(s)
+                        to_add.append(s)
+            pp = Path(dept.publish_path) if Path(dept.publish_path).is_absolute() else (root / dept.publish_path).resolve()
+            if pp.is_dir() and len(to_add) < max_paths:
+                s = str(pp)
+                if s not in _seen:
+                    _seen.add(s)
+                    to_add.append(s)
+        return to_add
+
     def _update_fs_watcher_paths(self) -> None:
         """Set or clear watched paths and collector state from current project root.
         Watches project root, assets/, shots/, and each asset/shot directory so changes
@@ -1616,6 +1849,9 @@ class MainWindow(FramelessMainWindow):
         self._fs_event_collector.set_registries(None, None)
         if self._project_root is None:
             _watcher_log.debug("fs_watcher paths cleared (no project)")
+            return
+        if self._watcher_manually_disabled:
+            _watcher_log.debug("fs_watcher paths not added (manually paused)")
             return
         try:
             root = self._project_root.resolve()
@@ -1664,16 +1900,13 @@ class MainWindow(FramelessMainWindow):
                         to_add.append(ps)
                 parent = parent.parent
 
+        # Do not watch the asset/shot folder itself — it would lock the folder on Windows and block rename.
+        # Watch only department, work, publish subdirs so we still get change events without holding the entity handle.
         if self._project_index is not None:
             for asset in self._project_index.assets:
                 base = Path(asset.path)
                 if not base.is_absolute():
                     base = (root / base).resolve()
-                if base.is_dir() and len(to_add) < _max_paths:
-                    s = str(base)
-                    if s not in _seen:
-                        _seen.add(s)
-                        to_add.append(s)
                 for dept in asset.departments:
                     dept_dir = dept.path if Path(dept.path).is_absolute() else (root / dept.path).resolve()
                     _add_dir_and_ancestors(dept_dir, base)
@@ -1705,11 +1938,6 @@ class MainWindow(FramelessMainWindow):
                 base = Path(shot.path)
                 if not base.is_absolute():
                     base = (root / base).resolve()
-                if base.is_dir() and len(to_add) < _max_paths:
-                    s = str(base)
-                    if s not in _seen:
-                        _seen.add(s)
-                        to_add.append(s)
                 for dept in shot.departments:
                     dept_dir = dept.path if Path(dept.path).is_absolute() else (root / dept.path).resolve()
                     _add_dir_and_ancestors(dept_dir, base)
@@ -2481,6 +2709,7 @@ class MainWindow(FramelessMainWindow):
         # Switch to Assets or Shots context.
         ctx = "Assets" if task.item_type == "asset" else "Shots"
         self._sidebar.set_current_context(ctx)
+        self._sidebar_compact.set_current_context(ctx)
         # Set department filter: sync controller first, then sidebar with emit=False so clicking
         # two tasks with the same department does not trigger controller's "same dept → toggle off".
         self._controller.sync_filter_state(department=task.department, type_id=self.current_type)
@@ -2541,6 +2770,57 @@ class MainWindow(FramelessMainWindow):
             return
         self._recent_tasks_store.clear_for_project(self._project_root)
         self._refresh_recent_tasks()
+
+    def _on_compact_filter_requested(self) -> None:
+        """Show full filter panel (Departments & Types) in a popup when sidebar is compact.
+        Same as noti button: if popup is open, close it; if just closed (grace), don't reopen."""
+        if self._sidebar_stack.currentIndex() != 1:
+            return
+        # Toggle: if popup is visible, close it and return
+        if self._compact_filter_popup is not None and self._compact_filter_popup.isVisible():
+            self._compact_filter_popup.close()
+            return
+        if (time.monotonic() - self._compact_filter_popup_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
+        filter_widget = self._sidebar.take_filters_center()
+        if filter_widget is None:
+            return
+
+        class _FilterPopupFrame(QFrame):
+            def __init__(self, parent, on_hide_cb):
+                super().__init__(parent)
+                self._on_hide_cb = on_hide_cb
+
+            def hideEvent(self, event):
+                self._on_hide_cb()
+                super().hideEvent(event)
+
+        def _on_filter_popup_hidden():
+            self._sidebar.restore_filters_center(filter_widget)
+            self._compact_filter_popup_closed_at = time.monotonic()
+            self._compact_filter_popup = None
+            btn = getattr(self._sidebar_compact, "_filter_btn", None)
+            if btn is not None:
+                QTimer.singleShot(0, lambda: self._sidebar_compact._clear_tool_button_hover(btn))
+
+        popup = _FilterPopupFrame(self, _on_filter_popup_hidden)
+        popup.setObjectName("SidebarCompactFilterPopup")
+        popup.setWindowFlags(Qt.WindowType.Popup | Qt.FramelessWindowHint)
+        popup.setAttribute(Qt.WA_TranslucentBackground, False)
+        lay = QVBoxLayout(popup)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.addWidget(filter_widget)
+        popup.setMinimumWidth(260)
+        popup.setMinimumHeight(280)
+        # Position below the filter icon (compact sidebar is on the left)
+        btn = getattr(self._sidebar_compact, "_filter_btn", None)
+        if btn is not None:
+            pos = btn.mapToGlobal(btn.rect().bottomLeft())
+            popup.move(pos.x(), pos.y() + 4)
+        else:
+            popup.move(self._sidebar_container.mapToGlobal(self._sidebar_container.rect().topRight()).x() + 4, 80)
+        self._compact_filter_popup = popup
+        popup.show()
 
     def _new_project(self) -> None:
         if self._workspace_root is None:
@@ -2743,11 +3023,14 @@ class MainWindow(FramelessMainWindow):
         except Exception:
             pass
         path = self._app_settings_path()
+        # Persist "full" layout (sizes when both panels visible) so restore doesn't get 0 for hidden panels.
+        main_sizes = self._main_splitter_sizes_restore if (self._sidebar_stack.currentIndex() == 1) else self._main_splitter.sizes()
+        content_sizes = self._content_splitter_sizes_restore if not self._inspector.isVisible() else self._content_splitter.sizes()
         payload = {
             "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "window_maximized": self.isMaximized(),
-            "main_splitter_sizes": self._main_splitter.sizes(),
-            "content_splitter_sizes": self._content_splitter.sizes(),
+            "main_splitter_sizes": main_sizes,
+            "content_splitter_sizes": content_sizes,
         }
         try:
             from monostudio.core.atomic_write import atomic_write_text
