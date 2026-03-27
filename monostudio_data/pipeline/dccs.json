@@ -94,6 +94,15 @@
       "brand_icon_slug": "rizomuv",
       "brand_color_hex": "#FF6600",
       "requires_import": true
+    },
+    "fusion": {
+      "label": "Fusion",
+      "executable": "Fusion",
+      "folder": "fusion",
+      "departments": ["comp"],
+      "workfile_extensions": [".comp"],
+      "brand_icon_slug": "fusion",
+      "brand_color_hex": "#FF6A00"
     }
   }
 }

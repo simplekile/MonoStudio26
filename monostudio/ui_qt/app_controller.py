@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
 
 from monostudio.core.dcc_blender import BlenderDccAdapter
+from monostudio.core.dcc_fusion import FusionDccAdapter
 from monostudio.core.dcc_houdini import HoudiniDccAdapter
 from monostudio.core.dcc_maya import MayaDccAdapter
 from monostudio.core.dcc_rizomuv import RizomUVDccAdapter
@@ -693,9 +694,30 @@ class AppController(QObject):
     def _rizomuv_adapter(self) -> RizomUVDccAdapter:
         return RizomUVDccAdapter(rizomuv_executable=self._rizomuv_executable(), repo_root=self._repo_root)
 
+    def _fusion_executable(self) -> str:
+        exe = self._settings.value("integrations/fusion_exe", "", str)
+        exe = (exe or "").strip()
+        if exe:
+            return exe
+        try:
+            return str(self._dcc_registry.get_dcc_info("fusion").get("executable") or "Fusion")
+        except Exception:
+            return "Fusion"
+
+    def _fusion_adapter(self) -> FusionDccAdapter:
+        return FusionDccAdapter(fusion_executable=self._fusion_executable(), repo_root=self._repo_root)
+
     def _dcc_adapter(
         self, dcc: str
-    ) -> BlenderDccAdapter | MayaDccAdapter | HoudiniDccAdapter | SubstancePainterDccAdapter | RizomUVDccAdapter | None:
+    ) -> (
+        BlenderDccAdapter
+        | MayaDccAdapter
+        | HoudiniDccAdapter
+        | SubstancePainterDccAdapter
+        | RizomUVDccAdapter
+        | FusionDccAdapter
+        | None
+    ):
         if dcc == "blender":
             return self._blender_adapter()
         if dcc == "maya":
@@ -706,6 +728,8 @@ class AppController(QObject):
             return self._substance_painter_adapter()
         if dcc == "rizomuv":
             return self._rizomuv_adapter()
+        if dcc == "fusion":
+            return self._fusion_adapter()
         return None
 
     def _on_maya_launch_requested(

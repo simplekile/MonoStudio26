@@ -19,6 +19,10 @@ def _brand_svg_path(slug: str) -> Path:
     return _brands_dir() / f"{slug}.svg"
 
 
+def _brand_png_path(slug: str) -> Path:
+    return _brands_dir() / f"{slug}.png"
+
+
 def _read_svg_text(slug: str) -> str | None:
     p = _brand_svg_path(slug)
     try:
@@ -27,6 +31,41 @@ def _read_svg_text(slug: str) -> str | None:
         return p.read_text(encoding="utf-8")
     except OSError:
         return None
+
+
+def _read_png(slug: str) -> QPixmap | None:
+    p = _brand_png_path(slug)
+    try:
+        if not p.is_file():
+            return None
+        pm = QPixmap(str(p))
+        if pm.isNull():
+            return None
+        return pm
+    except OSError:
+        return None
+
+
+def _brand_files_cache_token(slug: str) -> tuple[int, int]:
+    """
+    Token to bust brand_icon cache when icon files change on disk.
+    (mtime_ns for svg, mtime_ns for png; 0 when missing/unreadable)
+    """
+    svg_m = 0
+    png_m = 0
+    try:
+        p = _brand_svg_path(slug)
+        if p.is_file():
+            svg_m = p.stat().st_mtime_ns
+    except OSError:
+        svg_m = 0
+    try:
+        p = _brand_png_path(slug)
+        if p.is_file():
+            png_m = p.stat().st_mtime_ns
+    except OSError:
+        png_m = 0
+    return (svg_m, png_m)
 
 
 def _apply_fill(svg: str, color_hex: str) -> str:
@@ -68,7 +107,7 @@ def _render_brand_pixmap(renderer: QSvgRenderer, size_px: int) -> QPixmap:
 
 
 @lru_cache(maxsize=256)
-def brand_icon(slug: str, *, size: int = 16, color_hex: str | None = None) -> QIcon:
+def _brand_icon_cached(slug: str, size: int, color_hex: str | None, _token: tuple[int, int]) -> QIcon:
     """
     Render a brand SVG (from monostudio_data/icons/brands) into a QIcon at fixed size.
     Cached to avoid per-paint parsing.
@@ -76,7 +115,16 @@ def brand_icon(slug: str, *, size: int = 16, color_hex: str | None = None) -> QI
     """
     svg = _read_svg_text(slug)
     if not svg:
-        return QIcon()
+        # Fallback: allow raster brand icon (e.g. official product icon) when SVG is unavailable.
+        pm = _read_png(slug)
+        if pm is None:
+            return QIcon()
+        pm_1x = pm.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        out = QIcon(pm_1x)
+        pm_2x = pm.scaled(size * 2, size * 2, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pm_2x.setDevicePixelRatio(2.0)
+        out.addPixmap(pm_2x)
+        return out
     color = (color_hex or MONOS_COLORS["text_primary"]).strip()
     svg = _apply_fill(svg, color)
 
@@ -90,4 +138,9 @@ def brand_icon(slug: str, *, size: int = 16, color_hex: str | None = None) -> QI
     pix_2x.setDevicePixelRatio(2.0)
     out.addPixmap(pix_2x)
     return out
+
+
+def brand_icon(slug: str, *, size: int = 16, color_hex: str | None = None) -> QIcon:
+    # Include file mtimes in the cache key so changes are reflected without needing an app restart.
+    return _brand_icon_cached(slug, int(size), color_hex, _brand_files_cache_token(slug))
 

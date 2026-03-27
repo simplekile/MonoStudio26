@@ -2,7 +2,10 @@
 # Prereqs: pip install PySide6 pyinstaller; Inno Setup 6 (optional, for .exe installer)
 # Optional: -NoCommit to skip auto-commit (default: commit uncommitted changes before build)
 
-param([switch]$NoCommit)
+param(
+    [switch]$NoCommit,
+    [switch]$NoVersionBump
+)
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -48,10 +51,14 @@ Write-Host "Generating app.ico from logo..."
 python build_icon.py
 if ($LASTEXITCODE -ne 0) { Write-Warning "build_icon.py failed; EXE/installer will have no custom icon." }
 
-# 3) Write VERSION from git commit count (v26.<count> -> baked into build + installer)
-Write-Host "Writing VERSION from git..."
-python build_version.py
-if ($LASTEXITCODE -ne 0) { Write-Warning "build_version.py failed; version may be v26 only." }
+# 3) Write/bump VERSION from last commit message, unless explicitly disabled
+if (-not $NoVersionBump) {
+    Write-Host "Writing VERSION from git (bump from last commit message)..."
+    python build_version.py
+    if ($LASTEXITCODE -ne 0) { Write-Warning "build_version.py failed; version may be v26 only." }
+} else {
+    Write-Host "Skipping build_version.py (keeping existing monostudio_data\VERSION)."
+}
 
 # 4) PyInstaller onedir (--clean so EXE icon is embedded from current app.ico)
 Write-Host "Building PyInstaller onedir (dist/MonoStudio26/)..."

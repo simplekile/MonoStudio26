@@ -367,6 +367,16 @@ def _parse_workfile_version(filename: str, prefix: str, ext: str) -> int | None:
     mid = filename[start : start + 3]
     if not mid.isdigit():
         return None
+    # Validate the suffix between version digits and extension:
+    # - Allow: "{prefix}_v001{ext}"
+    # - Allow: "{prefix}_v001_{description}{ext}" (description must not contain dots)
+    # - Reject autosave-style names like "{prefix}_v001.26.03.16...{ext}"
+    tail = filename[start + 3 : -len(ext)] if len(ext) else filename[start + 3 :]
+    if tail:
+        if not tail.startswith("_"):
+            return None
+        if "." in tail:
+            return None
     return int(mid)
 
 
