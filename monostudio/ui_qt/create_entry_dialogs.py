@@ -21,7 +21,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWidgets import QLineEdit
 
-from monostudio.core.pipeline_types_and_presets import TypeDef, load_department_vocabulary, load_pipeline_types_and_presets
+from monostudio.core.pipeline_types_and_presets import (
+    TypeDef,
+    load_department_vocabulary,
+    load_pipeline_types_and_presets_for_project,
+)
 from monostudio.core.structure_registry import StructureRegistry
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.ui_qt.style import MonosDialog
@@ -183,7 +187,7 @@ class CreateAssetDialog(MonosDialog):
 
         self._project_root = project_root
         self._initial_type_id = (initial_type_id or "").strip() or None
-        self._types: dict[str, TypeDef] = load_pipeline_types_and_presets().types
+        self._types: dict[str, TypeDef] = load_pipeline_types_and_presets_for_project(project_root).types
         self._dept_vocab: set[str] = set(load_department_vocabulary())
 
         self._selected_type_id: str | None = None
@@ -417,7 +421,7 @@ class CreateShotDialog(MonosDialog):
 
         self._project_root = project_root
         self._initial_type_id = (initial_type_id or "").strip() or None
-        self._types: dict[str, TypeDef] = load_pipeline_types_and_presets().types
+        self._types: dict[str, TypeDef] = load_pipeline_types_and_presets_for_project(project_root).types
         self._dept_vocab: set[str] = set(load_department_vocabulary())
 
         self._selected_type_id: str | None = None

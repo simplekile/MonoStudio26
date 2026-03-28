@@ -51,6 +51,7 @@ from monostudio.ui_qt.thumbnails import ThumbnailCache, make_department_cache_ke
 from monostudio.ui_qt.style import MONOS_COLORS, THUMB_TAG_STYLE, monos_font
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.dcc_status import resolve_dcc_status
 from monostudio.core.fs_reader import (
@@ -468,7 +469,12 @@ def _overall_status_key_for_item(item: ViewItem, active_department: str | None) 
     return "waiting"
 
 
-def _dcc_ids_for_item(item: ViewItem, active_department: str | None) -> list[tuple[str, str]]:
+def _dcc_ids_for_item(
+    item: ViewItem,
+    active_department: str | None,
+    *,
+    dept_registry: DepartmentRegistry | None = None,
+) -> list[tuple[str, str]]:
     """Return [(dcc_id, status), ...] for the item's DCC badges (same logic as paint).
     status is "exists" or "creating". Only includes badges matching the active department."""
     ref = item.ref
@@ -505,7 +511,11 @@ def _dcc_ids_for_item(item: ViewItem, active_department: str | None) -> list[tup
         dept_name = getattr(d, "name", "") or ""
         if active_key and _norm(dept_name) != active_key:
             continue
-        for dcc_id in reg.get_available_dccs(dept_name) or []:
+        if dept_registry is not None:
+            dcc_ids = dept_registry.supported_dcc_ids(reg, dept_name)
+        else:
+            dcc_ids = reg.get_available_dccs(dept_name) or []
+        for dcc_id in dcc_ids:
             dcc_id = (dcc_id or "").strip()
             if not dcc_id:
                 continue
@@ -518,6 +528,8 @@ def _dcc_ids_for_item(item: ViewItem, active_department: str | None) -> list[tup
 def _list_dcc_badge_info(
     item: ViewItem,
     active_department: str | None,
+    *,
+    dept_registry: DepartmentRegistry | None = None,
 ) -> list[tuple[QIcon | None, str, str]]:
     """Return [(icon or None, dcc_id, status), ...] for list DCC column paint. status in ('exists', 'creating')."""
     out: list[tuple[QIcon | None, str, str]] = []
@@ -530,7 +542,7 @@ def _list_dcc_badge_info(
         return out
     _norm = lambda s: (s or "").strip().casefold()
     active_key = _norm(active_department)
-    ids_with_status = _dcc_ids_for_item(item, active_department)
+    ids_with_status = _dcc_ids_for_item(item, active_department, dept_registry=dept_registry)
     for dcc_id, status in ids_with_status:
         if status == "creating":
             out.append((None, dcc_id, "creating"))
@@ -729,7 +741,10 @@ class _ListRowDelegate(QStyledItemDelegate):
 
         # DCC column: paint badges (asset/shot, not publish mode)
         if col == list_col_dcc and list_col_dcc >= 0 and isinstance(item, ViewItem) and not show_publish:
-            badge_info = _list_dcc_badge_info(item, active_dep.strip() or None)
+            dept_reg = getattr(main, "_dept_registry", None)
+            badge_info = _list_dcc_badge_info(
+                item, active_dep.strip() or None, dept_registry=dept_reg
+            )
             if badge_info:
                 rects = _list_dcc_badge_rects(option.rect, [(dcc_id, st) for (_, dcc_id, st) in badge_info])
                 chip_h = self._DCC_BADGE_SIZE + self._DCC_BADGE_PAD * 2
@@ -825,6 +840,7 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._active_department: str | None = None
         self._active_department_icon_name: str | None = None  # from pipeline (subdepartment-safe)
         self._active_project_root: str | None = None  # current open project (Projects page)
+        self._dept_registry: DepartmentRegistry | None = None
         self._show_publish: bool = False
         self._active_dcc_cache: dict[str, str] = {}  # "item_path|department" -> dcc_id
 
@@ -891,6 +907,12 @@ class _GridCardDelegate(QStyledItemDelegate):
         if p == self._active_project_root:
             return
         self._active_project_root = p
+        self._view.viewport().update()
+
+    def set_dept_registry(self, registry: DepartmentRegistry | None) -> None:
+        if registry is self._dept_registry:
+            return
+        self._dept_registry = registry
         self._view.viewport().update()
 
     def set_show_publish(self, show_publish: bool) -> None:
@@ -1197,7 +1219,12 @@ class _GridCardDelegate(QStyledItemDelegate):
                     dept_name = getattr(d, "name", "") or ""
                     if active_key and self._norm(dept_name) != active_key:
                         continue
-                    for dcc_id in reg.get_available_dccs(dept_name) or []:
+                    dre = self._dept_registry
+                    if dre is not None:
+                        dcc_ids = dre.supported_dcc_ids(reg, dept_name)
+                    else:
+                        dcc_ids = reg.get_available_dccs(dept_name) or []
+                    for dcc_id in dcc_ids:
                         dcc_id = (dcc_id or "").strip()
                         if not dcc_id:
                             continue
@@ -1462,6 +1489,7 @@ class MainView(QWidget):
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
         self._project_root: str | None = None
+        self._dept_registry: DepartmentRegistry | None = None
         self._empty_override: str | None = None
         self._in_batch_set_items: bool = False  # skip stack switch to placeholder during set_items (avoids flicker)
         self._thumb_cache = ThumbnailCache(size_px=self._THUMBNAIL_SIZE_PX)
@@ -1883,7 +1911,11 @@ class MainView(QWidget):
         cell_rect = self._list_view.visualRect(index)
         if not cell_rect.contains(pos):
             return None, None, None
-        dcc_list = _dcc_ids_for_item(item, (self._active_department or "").strip() or None)
+        dcc_list = _dcc_ids_for_item(
+            item,
+            (self._active_department or "").strip() or None,
+            dept_registry=getattr(self, "_dept_registry", None),
+        )
         if not dcc_list:
             return None, None, None
         rects = _list_dcc_badge_rects(cell_rect, dcc_list)
@@ -1906,7 +1938,9 @@ class MainView(QWidget):
         if not active_dep:
             return None, None, None
         cell_rect = self._tile_view.visualRect(index)
-        dcc_ids = _dcc_ids_for_item(item, active_dep)
+        dcc_ids = _dcc_ids_for_item(
+            item, active_dep, dept_registry=getattr(self, "_dept_registry", None)
+        )
         if not dcc_ids:
             return None, None, None
         rects = _dcc_badge_rects(cell_rect, self._GRID_GAP_PX, dcc_ids)
@@ -2232,7 +2266,9 @@ class MainView(QWidget):
     def set_project_root(self, path: str | None) -> None:
         # Store only; no validation, no scanning (per requirements).
         self._project_root = path or None
+        self._dept_registry = DepartmentRegistry.for_project(Path(path)) if path else None
         self._grid_delegate.set_active_project_root(self._project_root)
+        self._grid_delegate.set_dept_registry(self._dept_registry)
         if getattr(self, "_list_row_delegate", None) is not None:
             self._list_row_delegate.set_active_project_root(self._project_root)
         self._update_empty_states()

@@ -29,6 +29,14 @@ def _load_user_default_json(filename: str) -> dict:
         return {}
 
 
+def get_resolved_user_default_pipeline_mappings() -> tuple[dict, dict, dict]:
+    """
+    Departments, types, and structure folder mappings as used for new projects:
+    user files in Documents/.monostudio/pipeline/ override mono2026 preset.
+    """
+    return _resolve_initial_configs()
+
+
 def _resolve_initial_configs() -> tuple[dict, dict, dict]:
     """
     Resolve initial departments, types, and folders configs for a new project.
@@ -86,7 +94,7 @@ def create_new_project(
     """
     Safe project creation (read/write):
     - Creates a new project folder under workspace_root using an auto-generated Project ID.
-    - Creates required structure: assets/, shots/, project_guide/ (with reference, script, storyboard, guideline, concept), .monostudio/project.json
+    - Creates required structure: assets/, shots/, inbox/, outbox/, project_guide/ (with reference, script, storyboard, guideline, concept), .monostudio/project.json
     - Writes metadata deterministically.
     - On failure: best-effort rollback inside the new project folder only.
     """
@@ -122,6 +130,13 @@ def create_new_project(
         shots_dir = project_root / struct_reg.get_folder("shots")
         shots_dir.mkdir(parents=True, exist_ok=False)
         created_paths.append(shots_dir)
+
+        inbox_dir = project_root / struct_reg.get_folder("inbox")
+        inbox_dir.mkdir(parents=True, exist_ok=False)
+        created_paths.append(inbox_dir)
+        outbox_dir = project_root / struct_reg.get_folder("outbox")
+        outbox_dir.mkdir(parents=True, exist_ok=False)
+        created_paths.append(outbox_dir)
 
         project_guide_root = project_root / struct_reg.get_folder("project_guide")
         project_guide_root.mkdir(parents=True, exist_ok=False)

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.dcc_registry import DccRegistry
 from monostudio.core.models import Asset, ProjectIndex, Shot
 
 
@@ -187,6 +188,20 @@ def _load_departments_json(path: Path) -> dict[str, dict] | None:
         parent_val = node.get("parent")
         if isinstance(parent_val, str) and parent_val.strip():
             node_out["parent"] = parent_val.strip()
+        raw_dccs = node.get("dccs")
+        if isinstance(raw_dccs, list):
+            dcc_list: list[str] = []
+            seen_d: set[str] = set()
+            for x in raw_dccs:
+                if not isinstance(x, str) or not x.strip():
+                    continue
+                d = x.strip().lower()
+                if d != x.strip():
+                    continue
+                if d not in seen_d:
+                    seen_d.add(d)
+                    dcc_list.append(d)
+            node_out["dccs"] = dcc_list
         out[dept_id.strip()] = node_out
     return out if out else None
 
@@ -398,6 +413,66 @@ class DepartmentRegistry:
             return "WARNING"
         return "FREE"
 
+    def supported_dcc_ids(self, dcc_registry: DccRegistry, dept_id: str) -> list[str]:
+        """
+        DCC ids allowed for this logical department.
+
+        If departments.json lists ``dccs`` for this dept, that list is the source of truth
+        (filtered to ids known in ``dcc_registry``). An empty list means no DCC is allowed.
+
+        If ``dccs`` is omitted, falls back to global rules in ``dccs.json``
+        (``DccRegistry.get_available_dccs``).
+        """
+        did = (dept_id or "").strip()
+        node = self._mapping.get(did) or {}
+        raw = node.get("dccs")
+        if isinstance(raw, list):
+            known = set(dcc_registry.get_all_dccs())
+            out: list[str] = []
+            seen: set[str] = set()
+            for x in raw:
+                if not isinstance(x, str) or not x.strip():
+                    continue
+                d = x.strip().lower()
+                if d != x.strip():
+                    continue
+                if d not in known or d in seen:
+                    continue
+                seen.add(d)
+                out.append(d)
+            return out
+        return dcc_registry.get_available_dccs(did)
+
+    def is_dcc_allowed_for(self, dcc_registry: DccRegistry, dept_id: str, dcc_id: str) -> bool:
+        did = (dcc_id or "").strip()
+        if not did:
+            return False
+        return did in set(self.supported_dcc_ids(dcc_registry, dept_id))
+
+    def pick_default_dcc(
+        self,
+        dcc_registry: DccRegistry,
+        *,
+        department: str | None,
+        last_used: str | None = None,
+    ) -> str | None:
+        """Same contract as ``DccRegistry.resolve_default_dcc`` but respects per-department ``dccs``."""
+        dep = (department or "").strip() or None
+        last = (last_used or "").strip() or None
+
+        if dep is None:
+            if last is not None and last in dcc_registry.get_all_dccs():
+                return last
+            return dcc_registry.get_default_dcc()
+
+        allowed = set(self.supported_dcc_ids(dcc_registry, dep))
+        if last is not None and last in allowed:
+            return last
+        d0 = dcc_registry.get_default_dcc()
+        if d0 is not None and d0 in allowed:
+            return d0
+        return None
+
     def get_raw_mapping(self) -> dict[str, dict]:
         """Return a copy of the raw mapping (for UI editing / save)."""
         return {k: dict(v) for k, v in self._mapping.items()}
@@ -510,6 +585,9 @@ def _build_departments_payload(mapping: dict[str, dict]) -> dict[str, dict]:
         }
         if isinstance(node.get("parent"), str) and (node.get("parent") or "").strip():
             row["parent"] = (node.get("parent") or "").strip()
+        dccs = node.get("dccs")
+        if isinstance(dccs, list):
+            row["dccs"] = [str(x).strip().lower() for x in dccs if isinstance(x, str) and x.strip()]
         payload[dept_id.strip()] = row
     return payload
 

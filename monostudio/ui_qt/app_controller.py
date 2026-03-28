@@ -203,8 +203,8 @@ class AppController(QObject):
             allowed_dcc_ids: list[str] | None = None
             disabled_dcc_ids: list[str] | None = None
             if use_create_new_dialog and resolved_department:
-                # Create New: only show DCCs that are available for this department (from dccs.json).
-                allowed_dcc_ids = self._dcc_registry.get_available_dccs(resolved_department)
+                dept_reg = DepartmentRegistry.for_project(self._project_root)
+                allowed_dcc_ids = dept_reg.supported_dcc_ids(self._dcc_registry, resolved_department)
             elif not use_create_new_dialog and item.departments and resolved_department:
                 # Open With: only show DCCs that have work files in this department.
                 for d in item.departments:
@@ -361,6 +361,20 @@ class AppController(QObject):
     def _norm(s: str | None) -> str:
         return (s or "").strip().casefold()
 
+    def _canonical_registry_department_id(self, dept_id: str | None) -> str | None:
+        """Return the registry key for dept_id (exact casing from pipeline), or None if not in project."""
+        if not dept_id or not isinstance(dept_id, str) or not dept_id.strip():
+            return None
+        pr = self._project_root
+        if pr is None:
+            return None
+        reg = DepartmentRegistry.for_project(pr)
+        nid = self._norm(dept_id)
+        for aid in reg.get_departments():
+            if self._norm(aid) == nid:
+                return aid
+        return None
+
     def _resolve_department(
         self,
         *,
@@ -369,11 +383,16 @@ class AppController(QObject):
         meta: dict[str, Any],
         project_defaults: dict[str, Any],
     ) -> str | None:
-        # 1) Sidebar Active Department
+        # 1) Sidebar Active Department — folder already exists on disk for this item
         if self.current_department and any(self._norm(d) == self._norm(self.current_department) for d in available_departments):
             for d in available_departments:
                 if self._norm(d) == self._norm(self.current_department):
                     return d
+
+        # 1b) Sidebar — id exists in pipeline registry but folder not created yet (e.g. new dept from Settings)
+        canon = self._canonical_registry_department_id(self.current_department)
+        if canon is not None:
+            return canon
 
         # 2) Asset/Shot last-used (or per-item default if present)
         defaults = meta.get("defaults") if isinstance(meta, dict) else None
@@ -412,8 +431,13 @@ class AppController(QObject):
         # 0) User-selected active DCC (single source: _item_active_dcc from open.json)
         active_val = _item_active_dcc(item_path, department)
         if isinstance(active_val, str) and active_val.strip():
-            if self._dcc_registry.is_dcc_allowed(active_val.strip(), department):
-                return active_val.strip()
+            av = active_val.strip()
+            if self._project_root is not None:
+                dre = DepartmentRegistry.for_project(self._project_root)
+                if dre.is_dcc_allowed_for(self._dcc_registry, department, av):
+                    return av
+            elif self._dcc_registry.is_dcc_allowed(av, department):
+                return av
 
         # 1) Asset/Department last-used DCC
         last_used: str | None = None
@@ -437,7 +461,10 @@ class AppController(QObject):
             if isinstance(dcc, str) and dcc.strip():
                 last_used = dcc.strip()
 
-        # Registry is the single source of truth for allowed + defaults.
+        if self._project_root is not None:
+            return DepartmentRegistry.for_project(self._project_root).pick_default_dcc(
+                self._dcc_registry, department=department, last_used=last_used
+            )
         return self._dcc_registry.resolve_default_dcc(department=department, last_used=last_used)
 
     @staticmethod

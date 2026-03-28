@@ -142,17 +142,8 @@ def ensure_pipeline_bootstrap() -> None:
         return
 
 
-def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
-    ensure_pipeline_bootstrap()
-    path = pipeline_types_and_presets_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return PipelineTypesAndPresets()
-
-    if not isinstance(data, dict):
-        return PipelineTypesAndPresets()
-
+def _parse_types_and_presets_data(data: dict) -> PipelineTypesAndPresets:
+    """Parse types_and_presets JSON object into PipelineTypesAndPresets."""
     depts_raw = data.get("departments")
     out_depts: dict[str, DepartmentDef] = {}
     if isinstance(depts_raw, dict):
@@ -189,7 +180,6 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
             continue
         if not isinstance(node, dict):
             continue
-        # Use node["id"] as type_id when present (e.g. _characters), else use object key.
         node_id = node.get("id")
         type_id = (node_id.strip() if isinstance(node_id, str) and node_id.strip() else key)
         name = node.get("name")
@@ -201,8 +191,6 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
             continue
         icon = icon_name.strip() if isinstance(icon_name, str) and icon_name.strip() else None
 
-        # New schema: departments: [ ... ]
-        # Back-compat: department_presets: { "Default": [ ... ], ... } -> pick "Default" if present, else first preset.
         departments: list[str] = []
         raw_depts = node.get("departments")
         if isinstance(raw_depts, list):
@@ -223,7 +211,6 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
             icon_name=icon,
         )
 
-    # Back-compat: if departments metadata is missing, synthesize minimal defs from observed department ids.
     if not out_depts:
         seen: set[str] = set()
         for t in out_types.values():
@@ -233,6 +220,47 @@ def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
                     out_depts[d] = DepartmentDef(dept_id=d, name=d, short_name=d, icon_name=None)
 
     return PipelineTypesAndPresets(types=out_types, departments=out_depts)
+
+
+def load_pipeline_types_and_presets() -> PipelineTypesAndPresets:
+    ensure_pipeline_bootstrap()
+    path = pipeline_types_and_presets_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return PipelineTypesAndPresets()
+
+    if not isinstance(data, dict):
+        return PipelineTypesAndPresets()
+    return _parse_types_and_presets_data(data)
+
+
+def load_pipeline_types_and_presets_for_project(project_root: Path | None) -> PipelineTypesAndPresets:
+    """
+    Load types_and_presets metadata for UI: project file first, then user default, then app shipped file.
+    """
+    paths: list[Path] = []
+    if project_root is not None:
+        paths.append(get_project_pipeline_dir(Path(project_root)) / _TYPES_AND_PRESETS_JSON)
+    ensure_user_default_config_dir()
+    paths.append(get_user_default_config_root() / "pipeline" / _TYPES_AND_PRESETS_JSON)
+    paths.append(pipeline_types_and_presets_path())
+
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        cfg = _parse_types_and_presets_data(data)
+        if cfg.types or cfg.departments:
+            return cfg
+
+    ensure_pipeline_bootstrap()
+    return PipelineTypesAndPresets()
 
 
 def save_pipeline_types_and_presets(config: PipelineTypesAndPresets) -> bool:
@@ -247,6 +275,8 @@ def save_pipeline_types_and_presets(config: PipelineTypesAndPresets) -> bool:
         }
         if d.icon_name:
             node["icon_name"] = d.icon_name
+        if d.parent:
+            node["parent"] = d.parent
         depts_out[dept_id] = node
     payload["departments"] = depts_out
 
@@ -325,6 +355,8 @@ def save_pipeline_types_and_presets_to_user_default(config: PipelineTypesAndPres
         }
         if d.icon_name:
             node["icon_name"] = d.icon_name
+        if d.parent:
+            node["parent"] = d.parent
         depts_out[dept_id] = node
     payload["departments"] = depts_out
 
@@ -366,6 +398,8 @@ def save_pipeline_types_and_presets_to_project(project_root: Path, config: Pipel
         }
         if d.icon_name:
             node["icon_name"] = d.icon_name
+        if d.parent:
+            node["parent"] = d.parent
         depts_out[dept_id] = node
     payload["departments"] = depts_out
 

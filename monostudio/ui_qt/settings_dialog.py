@@ -53,32 +53,16 @@ from monostudio.core.dcc_houdini import resolve_houdini_executable
 from monostudio.core.dcc_maya import resolve_maya_executable
 from monostudio.core.dcc_rizomuv import resolve_rizomuv_executable
 from monostudio.core.dcc_substance_painter import resolve_substance_painter_executable
-from monostudio.core.department_registry import (
-    DepartmentRegistry,
-    ensure_parent_from_preset,
-    get_default_department_mapping,
-    load_department_mapping_from_file,
-    save_project_departments,
-    write_departments_to_path,
-)
-from monostudio.core.fs_reader import (
-    build_project_index,
-    read_use_dcc_folders,
-    save_use_dcc_folders,
-)
-from monostudio.core.structure_registry import StructureRegistry, save_project_structure, write_structure_to_path
-from monostudio.core.type_registry import TypeRegistry, save_project_types, write_types_to_path
+from monostudio.core.fs_reader import read_use_dcc_folders, save_use_dcc_folders
 from monostudio.core.pipeline_types_and_presets import (
     PipelineTypesAndPresets,
-    TypeDef,
-    get_user_default_config_root,
     load_department_vocabulary,
     load_pipeline_types_and_presets,
-    pipeline_department_presets_dir,
+    load_pipeline_types_and_presets_for_project,
     save_pipeline_types_and_presets,
     save_pipeline_types_and_presets_to_project,
-    save_pipeline_types_and_presets_to_user_default,
 )
+from monostudio.ui_qt.pipeline_structure_editor import PipelineStructureEditorWidget
 from monostudio.core.update_checker import (
     CheckResult,
     ExtraRepoRelease,
@@ -257,7 +241,7 @@ class SettingsDialog(MonosDialog):
 
         self._vocab = load_department_vocabulary()
         self._vocab_set = set(self._vocab)
-        self._config: PipelineTypesAndPresets = load_pipeline_types_and_presets()
+        self._config: PipelineTypesAndPresets = load_pipeline_types_and_presets_for_project(project_root)
 
         # Optional integrations UI fields.
         self._blender_exe_field: QLineEdit | None = None
@@ -266,9 +250,7 @@ class SettingsDialog(MonosDialog):
         self._houdini_workfile_ext_combo: QComboBox | None = None
         self._substance_painter_exe_field: QLineEdit | None = None
         self._rizomuv_exe_field: QLineEdit | None = None
-        self._dept_mapping_table: QTableWidget | None = None
-        self._type_mapping_table: QTableWidget | None = None
-        self._structure_mapping_table: QTableWidget | None = None
+        self._pipeline_editor: PipelineStructureEditorWidget | None = None
         self._use_dcc_folders_cb: QCheckBox | None = None
         self._notification_max_visible_combo: QComboBox | None = None
         self._publish_ignore_ext_field: QLineEdit | None = None
@@ -325,15 +307,10 @@ class SettingsDialog(MonosDialog):
         btn_cancel.setObjectName("DialogSecondaryButton")
         btn_cancel.clicked.connect(self.reject)
 
-        btn_save_as_default = QPushButton("Save as default")
-        btn_save_as_default.setObjectName("SettingsCategoryActionButton")
-        btn_save_as_default.clicked.connect(self._on_save_as_default)
-
         button_row = QWidget()
         button_row_l = QHBoxLayout(button_row)
         button_row_l.setContentsMargins(0, 0, 0, 0)
         button_row_l.setSpacing(10)
-        button_row_l.addWidget(btn_save_as_default)
         button_row_l.addStretch(1)
         button_row_l.addWidget(btn_save)
         button_row_l.addWidget(btn_cancel)
@@ -348,9 +325,9 @@ class SettingsDialog(MonosDialog):
         self._nav.setCurrentRow(1)
         self._content_stack.setCurrentIndex(1)
         if getattr(self, "_pipeline_tier2_stack", None) is not None:
-            self._pipeline_tier2_stack.setCurrentIndex(1)
-        if getattr(self, "_pipeline_tier2_buttons", None) and len(self._pipeline_tier2_buttons) > 1:
-            self._pipeline_tier2_buttons[1].setChecked(True)
+            self._pipeline_tier2_stack.setCurrentIndex(0)
+        if getattr(self, "_pipeline_tier2_buttons", None) and len(self._pipeline_tier2_buttons) > 0:
+            self._pipeline_tier2_buttons[0].setChecked(True)
 
     def open_to_updates_tab(self) -> None:
         """Switch to General → Updates and apply cached check result if any (from startup)."""
@@ -1132,10 +1109,9 @@ class SettingsDialog(MonosDialog):
         self._update_download_product = ""
 
     def _build_pipeline_page(self) -> QWidget:
-        """Tier 2: Pipeline → Mapping Folders | Categories | Scan rules | Statuses."""
+        """Tier 2: Pipeline → Pipeline structure | Scan rules | Statuses."""
         return self._build_tier2_page_buttons([
-            ("Mapping Folders", self._build_mapping_folders_page()),
-            ("Categories", self._build_categories_page()),
+            ("Pipeline structure", self._build_pipeline_structure_page()),
             ("Scan rules", self._build_pipeline_scan_rules_tab()),
             ("Statuses", self._placeholder("Pipeline → Statuses (placeholder)")),
         ], store_stack="pipeline", store_buttons="pipeline")
@@ -1186,42 +1162,6 @@ class SettingsDialog(MonosDialog):
         grp_layout.addWidget(hint)
         layout.addWidget(grp)
         layout.addStretch(1)
-        return root
-
-    def _build_categories_page(self) -> QWidget:
-        """Pipeline → Categories: Tier 3 nút Asset Depts | Shot Depts (types & presets by kind)."""
-        root = QWidget()
-        outer = QVBoxLayout(root)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(12)
-
-        stack = QStackedWidget(root)
-        stack.setObjectName("SettingsPageStack")
-        stack.addWidget(self._build_types_and_presets_kind(kind="asset"))
-        stack.addWidget(self._build_types_and_presets_kind(kind="shot"))
-
-        btn_row = QWidget(root)
-        btn_row.setObjectName("Tier3Container")
-        btn_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        btn_l = QHBoxLayout(btn_row)
-        btn_l.setContentsMargins(6, 6, 6, 6)
-        btn_l.setSpacing(4)
-
-        group = QButtonGroup(root)
-        buttons: list[QPushButton] = []
-        for i, label in enumerate(("Asset Depts", "Shot Depts")):
-            btn = QPushButton(label, btn_row)
-            btn.setObjectName("Tier3Pill")
-            btn.setCheckable(True)
-            btn.setFlat(True)
-            btn.setChecked(i == 0)
-            btn.clicked.connect(lambda _c=False, idx=i: self._on_page_button_clicked(stack, buttons, idx))
-            group.addButton(btn)
-            btn_l.addWidget(btn, 0)
-            buttons.append(btn)
-
-        outer.addWidget(btn_row, 0, Qt.AlignLeft)
-        outer.addWidget(stack, 1)
         return root
 
     def _build_app_workspace_tab(self) -> QWidget:
@@ -1299,643 +1239,36 @@ class SettingsDialog(MonosDialog):
             self._use_dcc_folders_cb.setEnabled(True)
             self._use_dcc_folders_cb.setChecked(read_use_dcc_folders(self._project_root))
         self.project_root_selected.emit(folder)
+        self._reload_pipeline_editor_for_project()
 
-    def _build_mapping_folders_page(self) -> QWidget:
-        """
-        Mapping Folders — Tier 3 segmented: Departments | Types | Structure.
-        Shared preset system covers all three sections.
-        """
+    def _build_pipeline_structure_page(self) -> QWidget:
         root = QWidget()
         outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(12)
-
-        if self._project_root is None:
-            lab = QLabel("Select a project (Project Root) in General → Workspace to edit Mapping Folders.", root)
-            lab.setWordWrap(True)
-            lab.setObjectName("DialogHelper")
-            outer.addWidget(lab)
-            return root
-
-        stack = QStackedWidget(root)
-        stack.setObjectName("SettingsPageStack")
-        stack.addWidget(self._build_department_mapping_section(root))
-        stack.addWidget(self._build_type_mapping_section(root))
-        stack.addWidget(self._build_structure_mapping_section(root))
-
-        btn_row = QWidget(root)
-        btn_row.setObjectName("Tier3Container")
-        btn_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        btn_l = QHBoxLayout(btn_row)
-        btn_l.setContentsMargins(6, 6, 6, 6)
-        btn_l.setSpacing(4)
-
-        group = QButtonGroup(root)
-        buttons: list[QPushButton] = []
-        for i, label in enumerate(("Departments", "Types", "Structure")):
-            btn = QPushButton(label, btn_row)
-            btn.setObjectName("Tier3Pill")
-            btn.setCheckable(True)
-            btn.setFlat(True)
-            btn.setChecked(i == 0)
-            btn.clicked.connect(lambda _c=False, idx=i: self._on_page_button_clicked(stack, buttons, idx))
-            group.addButton(btn)
-            btn_l.addWidget(btn, 0)
-            buttons.append(btn)
-
-        outer.addWidget(btn_row, 0, Qt.AlignLeft)
-
-        # Preset row — shared across all three sections
-        preset_row = QWidget(root)
-        preset_row_l = QHBoxLayout(preset_row)
-        preset_row_l.setContentsMargins(0, 0, 0, 0)
-        preset_row_l.setSpacing(8)
-        preset_label = QLabel("Preset:", root)
-        preset_combo = QComboBox(root)
-        preset_combo.setMinimumWidth(200)
-        preset_combo.setMaximumWidth(320)
-
-        def _preset_list() -> list[tuple[str, Path]]:
-            out: list[tuple[str, Path]] = []
-            def _display_name(stem: str, suffix: str = "") -> str:
-                name = stem.replace("_", " ").title()
-                return f"{name}{suffix}" if suffix else name
-            try:
-                shipped = pipeline_department_presets_dir()
-                if shipped.is_dir():
-                    for p in sorted(shipped.glob("*.json")):
-                        out.append((_display_name(p.stem), p))
-            except Exception:
-                pass
-            try:
-                user_base = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
-                user_presets = user_base / "MonoStudio" / "department_presets"
-                if user_presets.is_dir():
-                    for p in sorted(user_presets.glob("*.json")):
-                        out.append((_display_name(p.stem, " (saved)"), p))
-            except Exception:
-                pass
-            return out
-
-        for name, path in _preset_list():
-            preset_combo.addItem(name, path)
-        apply_preset_btn = QPushButton("Apply", root)
-        apply_preset_btn.setToolTip("Load selected preset into all tables. Save to apply to project.")
-        preset_row_l.addWidget(preset_label)
-        preset_row_l.addWidget(preset_combo, 1)
-        preset_row_l.addWidget(apply_preset_btn)
-        preset_row_l.addStretch()
-        outer.addWidget(preset_row)
-
-        outer.addWidget(stack, 1)
-
-        # Preset helpers -------------------------------------------------
-
-        def _user_presets_dir() -> Path:
-            try:
-                base = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
-                d = base / "MonoStudio" / "department_presets"
-                d.mkdir(parents=True, exist_ok=True)
-                return d
-            except Exception:
-                return Path()
-
-        def _read_id_label_folder_table(table: QTableWidget) -> dict[str, dict]:
-            out: dict[str, dict] = {}
-            for row in range(table.rowCount()):
-                id_item = table.item(row, 0)
-                label_item = table.item(row, 1)
-                folder_item = table.item(row, 2)
-                if id_item is None or folder_item is None:
-                    continue
-                fid = (id_item.text() or "").strip()
-                folder = (folder_item.text() or "").strip()
-                if not fid or not folder:
-                    continue
-                label = (label_item.text() or "").strip() if label_item else fid
-                out[fid] = {"label": label or fid, "folder": folder}
-            return out
-
-        def _dept_mapping_from_table() -> dict[str, dict]:
-            table = self._dept_mapping_table
-            if table is None:
-                return {}
-            out: dict[str, dict] = {}
-            for row in range(table.rowCount()):
-                id_item = table.item(row, 0)
-                label_item = table.item(row, 1)
-                shot_folder_item = table.item(row, 2)
-                asset_folder_item = table.item(row, 3)
-                order_item = table.item(row, 4)
-                if id_item is None or shot_folder_item is None or asset_folder_item is None:
-                    continue
-                dept_id = (id_item.text() or "").strip()
-                shot_folder = (shot_folder_item.text() or "").strip() or dept_id
-                asset_folder = (asset_folder_item.text() or "").strip() or dept_id
-                if not dept_id:
-                    continue
-                label = (label_item.text() or "").strip() if label_item else dept_id
-                try:
-                    order = int((order_item.text() or "999").strip()) if order_item else 999
-                except ValueError:
-                    order = 999
-                out[dept_id] = {
-                    "label": label or dept_id,
-                    "folder": shot_folder,
-                    "shot_folder": shot_folder,
-                    "asset_folder": asset_folder,
-                    "order": order,
-                }
-            return out
-
-        def _build_full_preset() -> dict:
-            payload: dict = {}
-            dept = _dept_mapping_from_table()
-            if dept:
-                payload["departments"] = dept
-            if self._type_mapping_table is not None:
-                types = _read_id_label_folder_table(self._type_mapping_table)
-                if types:
-                    payload["types"] = types
-            if self._structure_mapping_table is not None:
-                struct = _read_id_label_folder_table(self._structure_mapping_table)
-                if struct:
-                    payload["folders"] = struct
-            return payload
-
-        def _load_preset_file(path: Path) -> dict | None:
-            try:
-                if not path.is_file():
-                    return None
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    return data
-            except (OSError, json.JSONDecodeError):
-                pass
-            return None
-
-        def _repopulate_dept_table(mapping: dict[str, dict]) -> None:
-            table = self._dept_mapping_table
-            if table is None or not mapping:
-                return
-            temp_reg = DepartmentRegistry(mapping, None)
-            try:
-                pi = build_project_index(self._project_root, temp_reg) if self._project_root else None
-            except Exception:
-                pi = None
-            dept_ids = sorted(mapping.keys(), key=lambda d: (mapping[d].get("order", 999), d))
-            table.setRowCount(len(dept_ids))
-            fp = monos_font("Inter", 11, QFont.Weight.Bold)
-            fs = monos_font("JetBrains Mono", 10)
-            cp = QColor("#EEEEEE")
-            cs = QColor("#888888")
-            for row, dept_id in enumerate(dept_ids):
-                raw = mapping[dept_id]
-                lv = raw.get("label", dept_id)
-                sfv = raw.get("shot_folder") or raw.get("folder") or dept_id
-                afv = raw.get("asset_folder") or raw.get("folder") or dept_id
-                ov = raw.get("order", 999)
-                el = temp_reg.get_mapping_edit_level(self._project_root, dept_id, pi) if self._project_root else "FREE"
-                id_item = QTableWidgetItem(dept_id)
-                id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
-                id_item.setFont(fp)
-                id_item.setForeground(cp)
-                table.setItem(row, 0, id_item)
-                li = QTableWidgetItem(lv)
-                li.setForeground(cs)
-                table.setItem(row, 1, li)
-                si = QTableWidgetItem(sfv)
-                si.setFont(fs)
-                si.setForeground(cs)
-                if el == "MIGRATION_REQUIRED":
-                    si.setFlags(si.flags() & ~Qt.ItemIsEditable)
-                table.setItem(row, 2, si)
-                ai = QTableWidgetItem(afv)
-                ai.setFont(fs)
-                ai.setForeground(cs)
-                if el == "MIGRATION_REQUIRED":
-                    ai.setFlags(ai.flags() & ~Qt.ItemIsEditable)
-                table.setItem(row, 3, ai)
-                oi = QTableWidgetItem(str(ov))
-                oi.setFont(fs)
-                oi.setForeground(cs)
-                oi.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                table.setItem(row, 4, oi)
-                badge = QLabel(el.replace("_", " "))
-                badge.setAlignment(Qt.AlignCenter)
-                if el == "MIGRATION_REQUIRED":
-                    badge.setStyleSheet(
-                        "background-color: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid #ef4444;"
-                        " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                    )
-                elif el == "WARNING":
-                    badge.setStyleSheet(
-                        "background-color: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid #f59e0b;"
-                        " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                    )
-                else:
-                    badge.setStyleSheet(
-                        "background-color: rgba(37, 99, 235, 0.15); color: #2563eb; border: 1px solid #2563eb;"
-                        " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                    )
-                table.setCellWidget(row, 5, badge)
-
-        def _apply_preset_data(data: dict) -> None:
-            dept_data = data.get("departments")
-            if isinstance(dept_data, dict) and dept_data:
-                _repopulate_dept_table(dept_data)
-            types_data = data.get("types")
-            if isinstance(types_data, dict) and types_data and self._type_mapping_table is not None:
-                _repopulate_id_label_folder_table(self._type_mapping_table, types_data)
-            folders_data = data.get("folders")
-            if isinstance(folders_data, dict) and folders_data and self._structure_mapping_table is not None:
-                _repopulate_id_label_folder_table(self._structure_mapping_table, folders_data)
-
-        def _repopulate_id_label_folder_table(table: QTableWidget, mapping: dict[str, dict]) -> None:
-            ids = sorted(mapping.keys())
-            table.setRowCount(len(ids))
-            for row, fid in enumerate(ids):
-                entry = mapping[fid] if isinstance(mapping.get(fid), dict) else {}
-                label_val = entry.get("label", fid)
-                folder_val = entry.get("folder", fid)
-                id_item = QTableWidgetItem(fid)
-                id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
-                table.setItem(row, 0, id_item)
-                table.setItem(row, 1, QTableWidgetItem(label_val if isinstance(label_val, str) else fid))
-                table.setItem(row, 2, QTableWidgetItem(folder_val if isinstance(folder_val, str) else fid))
-
-        def _on_save_preset() -> None:
-            payload = _build_full_preset()
-            if not payload:
-                QMessageBox.information(self, "Save preset", "No mapping data to save.")
-                return
-            initial_dir = str(_user_presets_dir()) if _user_presets_dir() else ""
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Save mapping preset", initial_dir, "Mapping preset (*.json);;All files (*)",
-            )
-            if not path or not path.strip():
-                return
-            try:
-                from monostudio.core.atomic_write import atomic_write_text
-                content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-                atomic_write_text(Path(path), content, encoding="utf-8")
-                QMessageBox.information(self, "Save preset", "Preset saved.")
-                preset_combo.blockSignals(True)
-                preset_combo.clear()
-                for name, p in _preset_list():
-                    preset_combo.addItem(name, p)
-                preset_combo.blockSignals(False)
-            except OSError as e:
-                QMessageBox.warning(self, "Save preset", f"Failed to save: {e}")
-
-        def _on_load_preset() -> None:
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Load mapping preset", "", "Mapping preset (*.json);;All files (*)",
-            )
-            if not path or not path.strip():
-                return
-            data = _load_preset_file(Path(path))
-            if not data:
-                QMessageBox.warning(self, "Load preset", "Invalid or empty preset file.")
-                return
-            _apply_preset_data(data)
-            QMessageBox.information(self, "Load preset", "Preset loaded. Click Save to apply to project.")
-
-        def _on_apply_preset() -> None:
-            preset_path = preset_combo.currentData()
-            if preset_path is None:
-                return
-            data = _load_preset_file(preset_path)
-            if data:
-                _apply_preset_data(data)
-
-        def _on_reset() -> None:
-            mono_path = pipeline_department_presets_dir() / "mono2026_preset.json"
-            data = _load_preset_file(mono_path)
-            if data:
-                _apply_preset_data(data)
-            else:
-                default_dept = get_default_department_mapping()
-                default_data: dict = {}
-                if default_dept:
-                    default_data["departments"] = default_dept
-                from monostudio.core.type_registry import _default_type_mapping
-                default_data["types"] = _default_type_mapping()
-                from monostudio.core.structure_registry import _DEFAULT_MAPPING as _DEFAULT_STRUCTURE
-                default_data["folders"] = dict(_DEFAULT_STRUCTURE)
-                _apply_preset_data(default_data)
-
-        apply_preset_btn.clicked.connect(_on_apply_preset)
-
-        btn_actions = QWidget(root)
-        btn_actions_l = QHBoxLayout(btn_actions)
-        btn_actions_l.setContentsMargins(0, 0, 0, 0)
-        btn_actions_l.setSpacing(8)
-
-        reset_btn = QPushButton("Reset to default", root)
-        reset_btn.setToolTip("Reset all mapping tables (Departments, Types, Structure) to built-in defaults.")
-        reset_btn.clicked.connect(_on_reset)
-        save_preset_btn = QPushButton("Save preset…", root)
-        save_preset_btn.setToolTip("Save all mapping tables as a single JSON preset file.")
-        save_preset_btn.clicked.connect(_on_save_preset)
-        load_preset_btn = QPushButton("Load preset…", root)
-        load_preset_btn.setToolTip("Load a preset file into all tables. Save to apply to project.")
-        load_preset_btn.clicked.connect(_on_load_preset)
-
-        btn_actions_l.addWidget(reset_btn)
-        btn_actions_l.addWidget(save_preset_btn)
-        btn_actions_l.addWidget(load_preset_btn)
-        btn_actions_l.addStretch()
-        outer.addWidget(btn_actions)
-
-        return root
-
-    def _build_department_mapping_section(self, parent: QWidget) -> QWidget:
-        """Department mapping table section (no preset controls — handled by parent)."""
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        registry = DepartmentRegistry.for_project(self._project_root)
-        try:
-            project_index = build_project_index(self._project_root, registry)
-        except Exception:
-            project_index = None
-
+        outer.setSpacing(8)
+        self._pipeline_editor = PipelineStructureEditorWidget(self)
+        self._pipeline_editor.set_project_root(self._project_root)
+        self._pipeline_editor.config_changed.connect(self._on_pipeline_editor_config_changed)
+        outer.addWidget(self._pipeline_editor, 1)
         hint = QLabel(
-            "Map logical department IDs to physical folder names per context. Same department (e.g. fx) can use different folders for shots (e.g. 02_fx) and assets (e.g. 06_fx).",
+            "Tree colors: root / structure / asset type / shot type / departments / subdepartments. "
+            "Under each type, open Workflow to assign leaf departments. "
+            "Use Save in this section for project pipeline JSON; bottom Save also saves all Settings tabs.",
             root,
         )
         hint.setWordWrap(True)
         hint.setObjectName("DialogHelper")
-        layout.addWidget(hint)
-
-        table = QTableWidget(root)
-        table.setColumnCount(6)
-        table.setHorizontalHeaderLabels(["ID", "Label", "Folder (Shot)", "Folder (Asset)", "Order", "Status"])
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SingleSelection)
-        table.setShowGrid(False)
-        table.setFocusPolicy(Qt.NoFocus)
-        table.setAlternatingRowColors(False)
-        header = table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
-        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(40)
-        table.setColumnWidth(0, 140)
-        dept_ids = registry.get_departments()
-        table.setRowCount(len(dept_ids))
-        font_primary = monos_font("Inter", 11, QFont.Weight.Bold)
-        font_secondary = monos_font("JetBrains Mono", 10)
-        color_primary = QColor("#EEEEEE")
-        color_secondary = QColor("#888888")
-        for row, dept_id in enumerate(dept_ids):
-            raw = registry.get_raw_mapping().get(dept_id, {})
-            label_val = raw.get("label", dept_id)
-            shot_folder_val = raw.get("shot_folder") or raw.get("folder") or dept_id
-            asset_folder_val = raw.get("asset_folder") or raw.get("folder") or dept_id
-            order_val = raw.get("order", 999)
-            edit_level = registry.get_mapping_edit_level(self._project_root, dept_id, project_index)
-
-            id_item = QTableWidgetItem(dept_id)
-            id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
-            id_item.setFont(font_primary)
-            id_item.setForeground(color_primary)
-            table.setItem(row, 0, id_item)
-
-            label_item = QTableWidgetItem(label_val)
-            label_item.setForeground(color_secondary)
-            table.setItem(row, 1, label_item)
-
-            shot_folder_item = QTableWidgetItem(shot_folder_val)
-            shot_folder_item.setFont(font_secondary)
-            shot_folder_item.setForeground(color_secondary)
-            if edit_level == "MIGRATION_REQUIRED":
-                shot_folder_item.setFlags(shot_folder_item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(row, 2, shot_folder_item)
-
-            asset_folder_item = QTableWidgetItem(asset_folder_val)
-            asset_folder_item.setFont(font_secondary)
-            asset_folder_item.setForeground(color_secondary)
-            if edit_level == "MIGRATION_REQUIRED":
-                asset_folder_item.setFlags(asset_folder_item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(row, 3, asset_folder_item)
-
-            order_item = QTableWidgetItem(str(order_val))
-            order_item.setFont(font_secondary)
-            order_item.setForeground(color_secondary)
-            order_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            table.setItem(row, 4, order_item)
-
-            status_badge = QLabel(edit_level.replace("_", " "))
-            status_badge.setAlignment(Qt.AlignCenter)
-            if edit_level == "MIGRATION_REQUIRED":
-                status_badge.setStyleSheet(
-                    "background-color: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid #ef4444;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-                status_badge.setToolTip("Files exist in this department folder. Inline edit blocked; use Run Migration.")
-            elif edit_level == "WARNING":
-                status_badge.setStyleSheet(
-                    "background-color: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid #f59e0b;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-                status_badge.setToolTip("Assets exist but no files in this folder yet. Edit with caution.")
-            else:
-                status_badge.setStyleSheet(
-                    "background-color: rgba(37, 99, 235, 0.15); color: #2563eb; border: 1px solid #2563eb;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-            table.setCellWidget(row, 5, status_badge)
-
-        self._dept_mapping_table = table
-        table.setMaximumWidth(960)
-        layout.addWidget(table)
-
-        run_mig_btn = QPushButton("Run Migration…", root)
-        run_mig_btn.setMaximumWidth(200)
-        run_mig_btn.setToolTip("Required when folder mapping is changed and files already exist in the department folder. Not implemented in this release.")
-        run_mig_btn.setEnabled(True)
-        def _on_run_migration() -> None:
-            QMessageBox.information(
-                self,
-                "Run Migration",
-                "Migration is out of scope in this release. Use an external tool to move files when changing department folder names.",
-            )
-        run_mig_btn.clicked.connect(_on_run_migration)
-        layout.addWidget(run_mig_btn)
-
-        mig_label = QLabel("Migration is out of scope: changing folder when files exist requires a separate migration tool.", root)
-        mig_label.setWordWrap(True)
-        mig_label.setObjectName("DialogHelper")
-        layout.addWidget(mig_label)
+        outer.addWidget(hint)
         return root
 
-    def _build_type_mapping_section(self, parent: QWidget) -> QWidget:
-        """Type mapping table section with edit-level status."""
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+    def _on_pipeline_editor_config_changed(self) -> None:
+        if self._pipeline_editor is not None:
+            self._config = self._pipeline_editor.build_pipeline_types_and_presets()
 
-        try:
-            registry = TypeRegistry.for_project(self._project_root)
-        except RuntimeError as e:
-            lab = QLabel(f"Invalid type config: {e}", root)
-            lab.setWordWrap(True)
-            lab.setObjectName("DialogHelper")
-            layout.addWidget(lab)
-            return root
-
-        hint = QLabel(
-            "Map logical asset type IDs to physical folder names. Logical IDs are immutable; only folder names and labels can be edited.",
-            root,
-        )
-        hint.setWordWrap(True)
-        hint.setObjectName("DialogHelper")
-        layout.addWidget(hint)
-
-        table = QTableWidget(root)
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["Logical ID", "Label", "Folder", "Status"])
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SingleSelection)
-        table.setShowGrid(False)
-        table.setFocusPolicy(Qt.NoFocus)
-        table.setAlternatingRowColors(False)
-        header = table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
-        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(40)
-        type_ids = registry.get_types()
-        table.setRowCount(len(type_ids))
-        for row, type_id in enumerate(type_ids):
-            raw = registry.get_raw_mapping().get(type_id, {})
-            label_val = raw.get("label", type_id)
-            folder_val = raw.get("folder", type_id)
-            edit_level = registry.get_mapping_edit_level(self._project_root, type_id)
-
-            id_item = QTableWidgetItem(type_id)
-            id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(row, 0, id_item)
-            table.setItem(row, 1, QTableWidgetItem(label_val))
-            folder_item = QTableWidgetItem(folder_val)
-            if edit_level == "MIGRATION_REQUIRED":
-                folder_item.setFlags(folder_item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(row, 2, folder_item)
-
-            status_badge = QLabel(edit_level.replace("_", " "))
-            status_badge.setAlignment(Qt.AlignCenter)
-            if edit_level == "MIGRATION_REQUIRED":
-                status_badge.setStyleSheet(
-                    "background-color: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid #ef4444;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-                status_badge.setToolTip("Assets with files exist under this type folder. Inline edit blocked.")
-            elif edit_level == "WARNING":
-                status_badge.setStyleSheet(
-                    "background-color: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid #f59e0b;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-                status_badge.setToolTip("Type folder exists but is empty. Edit with caution.")
-            else:
-                status_badge.setStyleSheet(
-                    "background-color: rgba(37, 99, 235, 0.15); color: #2563eb; border: 1px solid #2563eb;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-            table.setCellWidget(row, 3, status_badge)
-
-        self._type_mapping_table = table
-        table.setMaximumWidth(960)
-        layout.addWidget(table)
-        return root
-
-    def _build_structure_mapping_section(self, parent: QWidget) -> QWidget:
-        """Structure mapping table section with edit-level status."""
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        try:
-            registry = StructureRegistry.for_project(self._project_root)
-        except RuntimeError as e:
-            lab = QLabel(f"Invalid structure config: {e}", root)
-            lab.setWordWrap(True)
-            lab.setObjectName("DialogHelper")
-            layout.addWidget(lab)
-            return root
-
-        hint = QLabel(
-            "Map top-level project folder IDs to physical folder names. IDs are immutable; only folder names and labels can be edited.",
-            root,
-        )
-        hint.setWordWrap(True)
-        hint.setObjectName("DialogHelper")
-        layout.addWidget(hint)
-
-        table = QTableWidget(root)
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["Logical ID", "Label", "Folder", "Status"])
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SingleSelection)
-        table.setShowGrid(False)
-        table.setFocusPolicy(Qt.NoFocus)
-        table.setAlternatingRowColors(False)
-        header = table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
-        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(40)
-        folder_ids = registry.get_ids()
-        raw = registry.get_raw_mapping()
-        table.setRowCount(len(folder_ids))
-        for row, fid in enumerate(folder_ids):
-            entry = raw.get(fid, {})
-            label_val = entry.get("label", fid)
-            folder_val = entry.get("folder", fid)
-            edit_level = registry.get_mapping_edit_level(self._project_root, fid)
-
-            id_item = QTableWidgetItem(fid)
-            id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(row, 0, id_item)
-            table.setItem(row, 1, QTableWidgetItem(label_val))
-            folder_item = QTableWidgetItem(folder_val)
-            if edit_level == "MIGRATION_REQUIRED":
-                folder_item.setFlags(folder_item.flags() & ~Qt.ItemIsEditable)
-            table.setItem(row, 2, folder_item)
-
-            status_badge = QLabel(edit_level.replace("_", " "))
-            status_badge.setAlignment(Qt.AlignCenter)
-            if edit_level == "MIGRATION_REQUIRED":
-                status_badge.setStyleSheet(
-                    "background-color: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid #ef4444;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-                status_badge.setToolTip("This folder has content. Inline edit blocked; rename folder manually first.")
-            elif edit_level == "WARNING":
-                status_badge.setStyleSheet(
-                    "background-color: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid #f59e0b;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-                status_badge.setToolTip("Folder exists but is empty. Edit with caution.")
-            else:
-                status_badge.setStyleSheet(
-                    "background-color: rgba(37, 99, 235, 0.15); color: #2563eb; border: 1px solid #2563eb;"
-                    " border-radius: 4px; font-size: 10px; font-weight: 700; padding: 2px 6px;"
-                )
-            table.setCellWidget(row, 3, status_badge)
-
-        self._structure_mapping_table = table
-        table.setMaximumWidth(960)
-        layout.addWidget(table)
-        return root
+    def _reload_pipeline_editor_for_project(self) -> None:
+        self._config = load_pipeline_types_and_presets_for_project(self._project_root)
+        if self._pipeline_editor is not None:
+            self._pipeline_editor.set_project_root(self._project_root)
 
     def _build_project_integrations_tab(self) -> QWidget:
         root = QWidget()
@@ -2279,312 +1612,6 @@ class SettingsDialog(MonosDialog):
         l.addStretch(1)
         return w
 
-    def _build_types_and_presets_kind(self, *, kind: str) -> QWidget:
-        """
-        kind:
-          - "asset": type_id must NOT be shot/shot_*
-          - "shot":  type_id must be shot or shot_*
-        """
-        def is_shot_type_id(type_id: str) -> bool:
-            return type_id == "shot" or type_id.startswith("shot_")
-
-        def allow_type_id(type_id: str) -> bool:
-            if not _is_valid_type_id(type_id):
-                return False
-            if kind == "shot":
-                return is_shot_type_id(type_id)
-            return not is_shot_type_id(type_id)
-
-        root = QWidget()
-        layout = QHBoxLayout(root)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        kind_label = "Asset" if kind == "asset" else "Shot"
-        # Left: Types + Selected Type (dọc) — cùng cấu trúc và style cho Asset và Shot
-        types_box = QGroupBox(f"{kind_label} Types")
-        types_box.setObjectName("SettingsCategoryGroup")
-        types_l = QVBoxLayout(types_box)
-        types_l.setContentsMargins(12, 12, 12, 12)
-        types_l.setSpacing(10)
-
-        types_list = QListWidget()
-        types_list.setObjectName("SelectableList")
-        types_list.setSelectionMode(QListWidget.SingleSelection)
-        types_l.addWidget(types_list, 1)
-
-        btn_row = QWidget()
-        btn_l = QHBoxLayout(btn_row)
-        btn_l.setContentsMargins(0, 0, 0, 0)
-        btn_l.setSpacing(10)
-        btn_type_create = QPushButton("Add Type")
-        btn_type_create.setObjectName("SettingsCategoryActionButton")
-        btn_type_delete = QPushButton("Delete Type")
-        btn_type_delete.setObjectName("SettingsCategoryActionButton")
-        btn_type_delete.setEnabled(False)
-        btn_type_reset = QPushButton("Reset default")
-        btn_type_reset.setObjectName("SettingsCategoryActionButton")
-        btn_l.addWidget(btn_type_create)
-        btn_l.addWidget(btn_type_delete)
-        btn_l.addWidget(btn_type_reset)
-        btn_l.addStretch(1)
-        types_l.addWidget(btn_row)
-
-        details = QGroupBox(f"Selected {kind_label} Type")
-        details.setObjectName("SettingsCategoryGroup")
-        details_l = QVBoxLayout(details)
-        details_l.setContentsMargins(12, 12, 12, 12)
-        details_l.setSpacing(10)
-
-        type_id_field = QLineEdit()
-        type_id_field.setReadOnly(True)
-        type_name_field = QLineEdit()
-        type_short_field = QLineEdit()
-        type_short_field.setValidator(QRegularExpressionValidator(QRegularExpression(r"[a-z0-9_]+"), type_short_field))
-
-        details_l.addWidget(self._field("Type ID (immutable)", type_id_field))
-        details_l.addWidget(self._field("Name", type_name_field))
-        details_l.addWidget(self._field("Short Name", type_short_field))
-
-        left = QWidget()
-        left_l = QVBoxLayout(left)
-        left_l.setContentsMargins(0, 0, 0, 0)
-        left_l.setSpacing(12)
-        left_l.addWidget(types_box, 1)
-        left_l.addWidget(details, 1)
-        left.setMinimumWidth(280)
-
-        # Right: Department Presets — cùng cấu trúc và style cho Asset và Shot
-        presets = QGroupBox(f"Department Presets ({kind_label})")
-        presets.setObjectName("SettingsCategoryGroup")
-        presets_l = QVBoxLayout(presets)
-        presets_l.setContentsMargins(12, 12, 12, 12)
-        presets_l.setSpacing(10)
-
-        presets_btn_row = QWidget()
-        presets_btn_l = QHBoxLayout(presets_btn_row)
-        presets_btn_l.setContentsMargins(0, 0, 0, 0)
-        presets_btn_l.setSpacing(10)
-        btn_presets_reset = QPushButton("Reset default")
-        btn_presets_reset.setObjectName("SettingsCategoryActionButton")
-        presets_btn_l.addWidget(btn_presets_reset)
-        presets_btn_l.addStretch(1)
-        presets_l.addWidget(presets_btn_row)
-
-        dept_list = QListWidget()
-        dept_list.setObjectName("SelectableListMulti")
-        dept_list.setSelectionMode(QAbstractItemView.MultiSelection)
-        dept_list.setIconSize(QSize(16, 16))
-
-        def _dept_icon(dept_id: str):
-            defn = self._config.departments.get(dept_id)
-            icon_name = defn.icon_name if defn and defn.icon_name else "folder"
-            return lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS["text_label"])
-
-        def _dept_display_name(dept_id: str) -> str:
-            defn = self._config.departments.get(dept_id)
-            return defn.name if defn else dept_id
-
-        def _update_dept_list_icons() -> None:
-            for row in range(dept_list.count()):
-                it = dept_list.item(row)
-                if it:
-                    dept_id = it.data(Qt.UserRole)
-                    if dept_id:
-                        it.setIcon(_dept_icon(dept_id))
-
-        def refresh_dept_list() -> None:
-            for row in range(dept_list.count()):
-                it = dept_list.item(row)
-                if it:
-                    dept_id = it.data(Qt.UserRole)
-                    if dept_id:
-                        it.setIcon(_dept_icon(dept_id))
-                        it.setText(_dept_display_name(dept_id))
-
-        for d in self._vocab:
-            it = QListWidgetItem(_dept_icon(d), _dept_display_name(d))
-            it.setData(Qt.UserRole, d)
-            dept_list.addItem(it)
-        presets_l.addWidget(dept_list, 2)
-        presets.setMinimumWidth(260)
-
-        layout.addWidget(left, 1)
-        layout.addWidget(presets, 1)
-
-        def current_type_id() -> str | None:
-            it = types_list.currentItem()
-            return it.data(Qt.UserRole) if it else None
-
-        def current_preset() -> str | None:
-            return None
-
-        def refresh_types(select: str | None) -> None:
-            types_list.blockSignals(True)
-            types_list.clear()
-            items = [(tid, t) for tid, t in self._config.types.items() if (is_shot_type_id(tid) if kind == "shot" else not is_shot_type_id(tid))]
-            for tid, t in sorted(items, key=lambda kv: kv[1].name.lower()):
-                item = QListWidgetItem(f"{t.name} ({tid})")
-                item.setData(Qt.UserRole, tid)
-                types_list.addItem(item)
-                if select == tid:
-                    types_list.setCurrentItem(item)
-            if types_list.currentItem() is None and types_list.count() > 0:
-                types_list.setCurrentItem(types_list.item(0))
-            types_list.blockSignals(False)
-            on_type_selected()
-
-        def refresh_presets() -> None:
-            on_preset_selected()
-
-        def on_type_selected() -> None:
-            tid = current_type_id()
-            t = self._config.types.get(tid or "")
-            has = t is not None
-            btn_type_delete.setEnabled(has)
-
-            type_id_field.blockSignals(True)
-            type_name_field.blockSignals(True)
-            type_short_field.blockSignals(True)
-            type_id_field.setText(t.type_id if t else "")
-            type_name_field.setText(t.name if t else "")
-            type_short_field.setText(t.short_name if t else "")
-            type_id_field.blockSignals(False)
-            type_name_field.blockSignals(False)
-            type_short_field.blockSignals(False)
-
-            refresh_presets()
-
-        def on_type_fields_changed() -> None:
-            tid = current_type_id()
-            if not tid:
-                return
-            t = self._config.types.get(tid)
-            if t is None:
-                return
-            name = type_name_field.text().strip()
-            short = type_short_field.text().strip()
-            if not name or not short:
-                return
-            self._config.types[tid] = TypeDef(
-                type_id=tid,
-                name=name,
-                short_name=short,
-                departments=t.departments,
-                icon_name=t.icon_name,
-            )
-            refresh_types(select=tid)
-
-        def on_create_type() -> None:
-            from PySide6.QtWidgets import QInputDialog
-
-            type_id, ok = QInputDialog.getText(self, "Add Type", "Type ID (lowercase, immutable):")
-            if not ok:
-                return
-            type_id = (type_id or "").strip()
-            if not allow_type_id(type_id):
-                return
-            if type_id in self._config.types:
-                return
-            name, ok = QInputDialog.getText(self, "Add Type", "Name (display):")
-            if not ok:
-                return
-            name = (name or "").strip()
-            if not name:
-                return
-            short, ok = QInputDialog.getText(self, "     Type", "Short Name (prefix):")
-            if not ok:
-                return
-            short = (short or "").strip()
-            if not short:
-                return
-            self._config.types[type_id] = TypeDef(type_id=type_id, name=name, short_name=short, departments=[], icon_name=None)
-            refresh_types(select=type_id)
-
-        def on_delete_type() -> None:
-            tid = current_type_id()
-            if not tid or tid not in self._config.types:
-                return
-            res = QMessageBox.question(self, "Delete Type", f"Delete type '{tid}'?")
-            if res != QMessageBox.Yes:
-                return
-            self._config.types.pop(tid, None)
-            refresh_types(select=None)
-
-        def on_reset_types_default() -> None:
-            res = QMessageBox.question(
-                self,
-                "Reset Types",
-                "Reload all types from monostudio_data/pipeline/types_and_presets.json? Changes are applied in memory until you save.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if res != QMessageBox.StandardButton.Yes:
-                return
-            loaded = load_pipeline_types_and_presets()
-            self._config = PipelineTypesAndPresets(types=loaded.types, departments=self._config.departments)
-            refresh_types(select=None)
-
-        def on_reset_presets_default() -> None:
-            res = QMessageBox.question(
-                self,
-                "Reset Department Presets",
-                "Reload all department definitions from monostudio_data/pipeline/types_and_presets.json? Changes are applied in memory until you save.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if res != QMessageBox.StandardButton.Yes:
-                return
-            loaded = load_pipeline_types_and_presets()
-            self._config = PipelineTypesAndPresets(types=self._config.types, departments=loaded.departments)
-            refresh_dept_list()
-            on_preset_selected()
-
-        def on_preset_selected() -> None:
-            tid = current_type_id()
-            t = self._config.types.get(tid or "")
-            has = bool(t)
-            dept_list.setEnabled(has)
-            dept_list.blockSignals(True)
-            for row in range(dept_list.count()):
-                it = dept_list.item(row)
-                dept = it.data(Qt.UserRole) if it else None
-                it.setSelected(bool(has and t and dept in (t.departments or [])))
-            _update_dept_list_icons()
-            dept_list.blockSignals(False)
-
-        def on_dept_selection_changed() -> None:
-            tid = current_type_id()
-            t = self._config.types.get(tid or "")
-            if t is None:
-                return
-            selected = []
-            for it in dept_list.selectedItems():
-                d = it.data(Qt.UserRole) if it else None
-                if isinstance(d, str) and d in self._vocab_set:
-                    selected.append(d)
-            self._config.types[tid] = TypeDef(
-                type_id=tid,
-                name=t.name,
-                short_name=t.short_name,
-                departments=selected,
-                icon_name=t.icon_name,
-            )
-
-        # wiring
-        types_list.currentItemChanged.connect(lambda _c, _p: on_type_selected())
-        type_name_field.textChanged.connect(lambda _t: on_type_fields_changed())
-        type_short_field.textChanged.connect(lambda _t: on_type_fields_changed())
-        btn_type_create.clicked.connect(on_create_type)
-        btn_type_delete.clicked.connect(on_delete_type)
-        btn_type_reset.clicked.connect(on_reset_types_default)
-        btn_presets_reset.clicked.connect(on_reset_presets_default)
-        dept_list.itemSelectionChanged.connect(on_dept_selection_changed)
-        dept_list.itemSelectionChanged.connect(lambda: _update_dept_list_icons())
-
-        refresh_types(select=None)
-        return root
-
     @staticmethod
     def _field(label: str, widget: QWidget) -> QWidget:
         block = QWidget()
@@ -2597,101 +1624,13 @@ class SettingsDialog(MonosDialog):
         l.addWidget(widget)
         return block
 
-    def _on_save_as_default(self) -> None:
-        """Save current Pipeline Types & Presets and folder mappings to Documents/.monostudio/ as user default."""
-        if not save_pipeline_types_and_presets_to_user_default(self._config):
-            QMessageBox.critical(
-                self,
-                "Save as default",
-                "Failed to save to Documents/.monostudio/pipeline/",
-            )
-            return
-        root = get_user_default_config_root()
-        pipeline_dir = root / "pipeline"
-        pipeline_dir.mkdir(parents=True, exist_ok=True)
-
-        saved_parts: list[str] = ["types_and_presets"]
-
-        # Read department mapping from UI table (not disk).
-        if self._dept_mapping_table is not None:
-            dept_mapping: dict[str, dict] = {}
-            for row in range(self._dept_mapping_table.rowCount()):
-                id_item = self._dept_mapping_table.item(row, 0)
-                label_item = self._dept_mapping_table.item(row, 1)
-                shot_folder_item = self._dept_mapping_table.item(row, 2)
-                asset_folder_item = self._dept_mapping_table.item(row, 3)
-                order_item = self._dept_mapping_table.item(row, 4)
-                if id_item is None or shot_folder_item is None or asset_folder_item is None:
-                    continue
-                dept_id = (id_item.text() or "").strip()
-                if not dept_id:
-                    continue
-                shot_folder = (shot_folder_item.text() or "").strip() or dept_id
-                asset_folder = (asset_folder_item.text() or "").strip() or dept_id
-                label = (label_item.text() or "").strip() if label_item else dept_id
-                try:
-                    order = int((order_item.text() or "999").strip()) if order_item else 999
-                except ValueError:
-                    order = 999
-                dept_mapping[dept_id] = {
-                    "label": label or dept_id,
-                    "folder": shot_folder,
-                    "shot_folder": shot_folder,
-                    "asset_folder": asset_folder,
-                    "order": order,
-                }
-            if dept_mapping:
-                # User default should have "parent" so new projects get nested folder layout.
-                dept_mapping = ensure_parent_from_preset(dept_mapping)
-                write_departments_to_path(pipeline_dir / "departments.json", dept_mapping)
-                saved_parts.append("departments")
-
-        # Read type mapping from UI table (not disk).
-        if self._type_mapping_table is not None:
-            type_mapping: dict[str, dict] = {}
-            for row in range(self._type_mapping_table.rowCount()):
-                id_item = self._type_mapping_table.item(row, 0)
-                label_item = self._type_mapping_table.item(row, 1)
-                folder_item = self._type_mapping_table.item(row, 2)
-                if id_item is None or folder_item is None:
-                    continue
-                type_id = (id_item.text() or "").strip()
-                folder = (folder_item.text() or "").strip()
-                if not type_id or not folder:
-                    continue
-                label = (label_item.text() or "").strip() if label_item else type_id
-                type_mapping[type_id] = {"label": label or type_id, "folder": folder}
-            if type_mapping:
-                write_types_to_path(pipeline_dir / "types.json", type_mapping)
-                saved_parts.append("types")
-
-        # Read structure mapping from UI table (not disk).
-        if self._structure_mapping_table is not None:
-            struct_mapping: dict[str, dict[str, str]] = {}
-            for row in range(self._structure_mapping_table.rowCount()):
-                id_item = self._structure_mapping_table.item(row, 0)
-                label_item = self._structure_mapping_table.item(row, 1)
-                folder_item = self._structure_mapping_table.item(row, 2)
-                if id_item is None or folder_item is None:
-                    continue
-                fid = (id_item.text() or "").strip()
-                folder = (folder_item.text() or "").strip()
-                if not fid or not folder:
-                    continue
-                label = (label_item.text() or "").strip() if label_item else fid
-                struct_mapping[fid] = {"label": label or fid, "folder": folder}
-            if struct_mapping:
-                write_structure_to_path(pipeline_dir / "structure.json", struct_mapping)
-                saved_parts.append("structure")
-
-        QMessageBox.information(
-            self,
-            "Save as default",
-            f"Pipeline config saved to:\n{pipeline_dir}\n({', '.join(saved_parts)})",
-        )
-
     def _on_save(self) -> None:
-        if self._project_root is not None:
+        if self._project_root is not None and self._pipeline_editor is not None:
+            self._config = self._pipeline_editor.build_pipeline_types_and_presets()
+            if not self._pipeline_editor.save_all_to_project(self._project_root):
+                QMessageBox.critical(self, "Settings", "Failed to save pipeline configuration to project.")
+                return
+        elif self._project_root is not None:
             if not save_pipeline_types_and_presets_to_project(self._project_root, self._config):
                 QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets to project.")
                 return
@@ -2699,76 +1638,6 @@ class SettingsDialog(MonosDialog):
             if not save_pipeline_types_and_presets(self._config):
                 QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets.")
                 return
-
-        # Persist project-level department mapping when project is set and table was built.
-        if self._project_root is not None and self._dept_mapping_table is not None:
-            mapping: dict[str, dict] = {}
-            for row in range(self._dept_mapping_table.rowCount()):
-                id_item = self._dept_mapping_table.item(row, 0)
-                label_item = self._dept_mapping_table.item(row, 1)
-                shot_folder_item = self._dept_mapping_table.item(row, 2)
-                asset_folder_item = self._dept_mapping_table.item(row, 3)
-                order_item = self._dept_mapping_table.item(row, 4)
-                if id_item is None or shot_folder_item is None or asset_folder_item is None:
-                    continue
-                dept_id = (id_item.text() or "").strip()
-                shot_folder = (shot_folder_item.text() or "").strip() or dept_id
-                asset_folder = (asset_folder_item.text() or "").strip() or dept_id
-                if not dept_id:
-                    continue
-                label = (label_item.text() or "").strip() if label_item else dept_id
-                try:
-                    order = int((order_item.text() or "999").strip()) if order_item else 999
-                except ValueError:
-                    order = 999
-                mapping[dept_id] = {
-                    "label": label or dept_id,
-                    "folder": shot_folder,
-                    "shot_folder": shot_folder,
-                    "asset_folder": asset_folder,
-                    "order": order,
-                }
-            if mapping:
-                # Table has no parent column; ensure nested layout (subdepartments under parent folder) from preset.
-                mapping = ensure_parent_from_preset(mapping)
-                if not save_project_departments(self._project_root, mapping):
-                    QMessageBox.warning(self, "Settings", "Failed to save Department Mapping to project.")
-
-        # Persist project-level type mapping when project is set and table was built.
-        if self._project_root is not None and self._type_mapping_table is not None:
-            type_mapping: dict[str, dict] = {}
-            for row in range(self._type_mapping_table.rowCount()):
-                id_item = self._type_mapping_table.item(row, 0)
-                label_item = self._type_mapping_table.item(row, 1)
-                folder_item = self._type_mapping_table.item(row, 2)
-                if id_item is None or folder_item is None:
-                    continue
-                type_id = (id_item.text() or "").strip()
-                folder = (folder_item.text() or "").strip()
-                if not type_id or not folder:
-                    continue
-                label = (label_item.text() or "").strip() if label_item else type_id
-                type_mapping[type_id] = {"label": label or type_id, "folder": folder}
-            if type_mapping and not save_project_types(self._project_root, type_mapping):
-                QMessageBox.warning(self, "Settings", "Failed to save Type Mapping to project.")
-
-        # Persist project-level structure mapping when project is set and table was built.
-        if self._project_root is not None and self._structure_mapping_table is not None:
-            struct_mapping: dict[str, dict[str, str]] = {}
-            for row in range(self._structure_mapping_table.rowCount()):
-                id_item = self._structure_mapping_table.item(row, 0)
-                label_item = self._structure_mapping_table.item(row, 1)
-                folder_item = self._structure_mapping_table.item(row, 2)
-                if id_item is None or folder_item is None:
-                    continue
-                fid = (id_item.text() or "").strip()
-                folder = (folder_item.text() or "").strip()
-                if not fid or not folder:
-                    continue
-                label = (label_item.text() or "").strip() if label_item else fid
-                struct_mapping[fid] = {"label": label or fid, "folder": folder}
-            if struct_mapping and not save_project_structure(self._project_root, struct_mapping):
-                QMessageBox.warning(self, "Settings", "Failed to save Structure Mapping to project.")
 
         # Persist project-level use_dcc_folders when project is set.
         if self._project_root is not None and self._use_dcc_folders_cb is not None:

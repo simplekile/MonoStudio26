@@ -63,7 +63,7 @@ from monostudio.core.project_guide_tags import (
     rename_tag_definition,
 )
 from monostudio.core.models import Asset, ProjectIndex, Shot
-from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets
+from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets_for_project
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.brand_icons import brand_icon
@@ -894,7 +894,7 @@ class SidebarWidget(QWidget):
             self._sync_tag_selection()
             return
 
-        meta = load_pipeline_types_and_presets()
+        meta = load_pipeline_types_and_presets_for_project(self._project_root)
 
         # Types: stable ids + display names.
         types_out: list[tuple[str, str]] = []

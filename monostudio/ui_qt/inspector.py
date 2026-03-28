@@ -51,6 +51,92 @@ def _inspector_get_active_dcc(item_path: Path | None, department: str | None) ->
     return _item_active_dcc(item_path, department)
 
 
+def _inspector_department_registry_from_widget(w: QWidget | None) -> DepartmentRegistry | None:
+    p: QWidget | None = w
+    while p is not None:
+        r = getattr(p, "_department_registry", None)
+        if isinstance(r, DepartmentRegistry):
+            return r
+        p = p.parentWidget()
+    return None
+
+
+def _inspector_canonical_dept_id(hint: str | None, ref: Asset | Shot, registry: DepartmentRegistry | None) -> str | None:
+    if not hint or not str(hint).strip():
+        return None
+    h = str(hint).strip().casefold()
+    for d in ref.departments:
+        dn = (getattr(d, "name", None) or "").strip()
+        if dn and dn.casefold() == h:
+            return dn
+    if registry is not None:
+        for did in registry.get_departments():
+            if (did or "").strip().casefold() == h:
+                return (did or "").strip()
+    return None
+
+
+def _inspector_synthetic_department(ref: Asset | Shot, dept_id: str, registry: DepartmentRegistry) -> Department:
+    ctx = "asset" if isinstance(ref, Asset) else "shot"
+    rel = registry.get_department_relative_path(dept_id, ctx)
+    base = ref.path / rel if rel else ref.path
+    work = base / "work"
+    pub = base / "publish"
+    work_exists = work.is_dir()
+    pub_exists = pub.is_dir()
+    return Department(
+        name=dept_id,
+        path=base,
+        work_path=work,
+        publish_path=pub,
+        work_exists=work_exists,
+        work_file_exists=False,
+        work_file_dcc=None,
+        work_file_dccs=(),
+        publish_exists=pub_exists,
+        latest_publish_version=None,
+        publish_version_count=0,
+    )
+
+
+def _inspector_merge_departments_with_registry(ref: Asset | Shot, registry: DepartmentRegistry) -> tuple[Department, ...]:
+    scanned_by_cf: dict[str, Department] = {}
+    for d in ref.departments:
+        cf = (d.name or "").strip().casefold()
+        if cf and cf not in scanned_by_cf:
+            scanned_by_cf[cf] = d
+    out: list[Department] = []
+    for did in registry.get_departments():
+        cf = (did or "").strip().casefold()
+        if cf in scanned_by_cf:
+            out.append(scanned_by_cf[cf])
+        else:
+            out.append(_inspector_synthetic_department(ref, did, registry))
+    return tuple(out)
+
+
+def _inspector_work_and_publish_paths(
+    ref: Asset | Shot,
+    dept_id: str,
+    registry: DepartmentRegistry | None,
+) -> tuple[Path, Path] | None:
+    dep_cf = (dept_id or "").strip().casefold()
+    for d in ref.departments:
+        if (d.name or "").strip().casefold() == dep_cf:
+            return (d.work_path, d.publish_path)
+    if registry is not None:
+        ctx = "asset" if isinstance(ref, Asset) else "shot"
+        try:
+            rel = registry.get_department_relative_path(dept_id.strip(), ctx)
+        except Exception:
+            return None
+        if not rel:
+            return None
+        base = ref.path / rel
+        return (base / "work", base / "publish")
+    return None
+
+
 def _work_file_version_from_path_for_inspector(path: Path | None) -> int | None:
     """Cùng logic main view: parse version từ path stem (hỗ trợ suffix như _fixNecklace)."""
     from monostudio.ui_qt.main_view import _work_file_version_from_path
@@ -380,17 +466,17 @@ class InspectorPanel(QWidget):
             return
 
         # Đồng bộ department từ sidebar (active_department_hint):
-        # - sidebar_focus (vàng) luôn bám theo hint hợp lệ
+        # - sidebar_focus (vàng) luôn bám theo hint hợp lệ (kể cả department mới chỉ có trong registry)
         # - _last_focused_department dùng cho logic (Tech row, preview, status, DCC)
         ref = getattr(item, "ref", None)
-        if isinstance(ref, (Asset, Shot)) and getattr(ref, "departments", None):
+        if isinstance(ref, (Asset, Shot)):
             hint = (active_department_hint or "").strip() or None
-            hint_ok = hint and any((d.name or "").strip().casefold() == (hint or "").casefold() for d in ref.departments)
-            if hint_ok:
-                self._last_focused_department = hint
-                self._dept_pipeline.set_sidebar_focus(hint)
+            reg = self._department_registry if isinstance(self._department_registry, DepartmentRegistry) else None
+            canon = _inspector_canonical_dept_id(hint, ref, reg) if hint else None
+            if canon:
+                self._last_focused_department = canon
+                self._dept_pipeline.set_sidebar_focus(canon)
             else:
-                # Sidebar không chọn department hoặc hint không khớp
                 self._last_focused_department = None
                 self._dept_pipeline.set_sidebar_focus(None)
 
@@ -473,26 +559,24 @@ class InspectorPanel(QWidget):
         if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
             return
         ref = getattr(item, "ref", None)
-        if isinstance(ref, (Asset, Shot)) and ref.departments and self._last_focused_department:
-            dep = (self._last_focused_department or "").strip().casefold()
-            for d in ref.departments:
-                if (d.name or "").strip().casefold() == dep:
-                    path = Path(d.work_path)
-                    self.open_folder_requested.emit(path)
-                    return
+        if isinstance(ref, (Asset, Shot)) and self._last_focused_department:
+            dep = (self._last_focused_department or "").strip()
+            reg = self._department_registry if isinstance(self._department_registry, DepartmentRegistry) else None
+            paths = _inspector_work_and_publish_paths(ref, dep, reg)
+            if paths:
+                self.open_folder_requested.emit(Path(paths[0]))
 
     def _on_open_publish_folder_requested(self) -> None:
         item = self._current_item
         if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
             return
         ref = getattr(item, "ref", None)
-        if isinstance(ref, (Asset, Shot)) and ref.departments and self._last_focused_department:
-            dep = (self._last_focused_department or "").strip().casefold()
-            for d in ref.departments:
-                if (d.name or "").strip().casefold() == dep:
-                    path = Path(d.publish_path)
-                    self.open_folder_requested.emit(path)
-                    return
+        if isinstance(ref, (Asset, Shot)) and self._last_focused_department:
+            dep = (self._last_focused_department or "").strip()
+            reg = self._department_registry if isinstance(self._department_registry, DepartmentRegistry) else None
+            paths = _inspector_work_and_publish_paths(ref, dep, reg)
+            if paths:
+                self.open_folder_requested.emit(Path(paths[1]))
 
     def _on_paste_requested(self) -> None:
         item = self._current_item
@@ -541,12 +625,11 @@ class InspectorPanel(QWidget):
             self._tech.set_resolved_path(None)
             return
         ref = getattr(item, "ref", None)
-        if isinstance(ref, (Asset, Shot)) and ref.departments:
-            for d in ref.departments:
-                if (d.name or "").strip().casefold() == dep.casefold():
-                    path = d.publish_path if self._show_publish else d.work_path
-                    self._tech.set_resolved_path(path)
-                    break
+        if isinstance(ref, (Asset, Shot)):
+            reg = self._department_registry if isinstance(self._department_registry, DepartmentRegistry) else None
+            paths = _inspector_work_and_publish_paths(ref, dep.strip(), reg)
+            if paths:
+                self._tech.set_resolved_path(paths[1] if self._show_publish else paths[0])
             else:
                 self._tech.set_resolved_path(None)
         else:
@@ -1737,18 +1820,22 @@ class _IdentityBlock(QWidget):
             raw = ref.name or "—"
             dept_str = (_department_display_name(raw, label_resolver) if raw != "—" else "—")
             show_dept_badge = True
-        elif isinstance(ref, (Asset, Shot)) and ref.departments:
+        elif isinstance(ref, (Asset, Shot)):
             active_key = (active_department or "").strip().casefold()
             if active_key:
-                dept_to_show = None
+                matched_id = None
                 for d in ref.departments:
                     dn = (getattr(d, "name", None) or "").strip()
                     if dn and dn.casefold() == active_key:
-                        dept_to_show = d
+                        matched_id = dn
                         break
-                if dept_to_show is not None:
-                    raw = dept_to_show.name or "—"
-                    dept_str = _department_display_name(raw, label_resolver) if raw else "—"
+                if matched_id is None and registry is not None and hasattr(registry, "get_departments"):
+                    for did in registry.get_departments():
+                        if (did or "").strip().casefold() == active_key:
+                            matched_id = (did or "").strip()
+                            break
+                if matched_id:
+                    dept_str = _department_display_name(matched_id, label_resolver)
                     show_dept_badge = True
 
         self._meta_dept_badge.setVisible(show_dept_badge)
@@ -1834,11 +1921,27 @@ class _IdentityBlock(QWidget):
             if status in ("exists", "creating"):
                 badges.append((dcc_id, status, dept_id))
 
+        dre = None
+        p = self.parent()
+        while p:
+            for attr in ("_department_registry", "_dept_reg"):
+                r = getattr(p, attr, None)
+                if r is not None and hasattr(r, "supported_dcc_ids"):
+                    dre = r
+                    break
+            if dre is not None:
+                break
+            p = p.parent()
+
         for d in getattr(ref, "departments", ()) or ():
             dn = (getattr(d, "name", None) or "").strip()
             if active_key and (dn or "").casefold() != active_key:
                 continue
-            for dcc_id in (reg.get_available_dccs(dn) or []):
+            if dre is not None:
+                dcc_loop = dre.supported_dcc_ids(reg, dn)
+            else:
+                dcc_loop = reg.get_available_dccs(dn) or []
+            for dcc_id in dcc_loop:
                 dcc_id = (dcc_id or "").strip()
                 if not dcc_id or (dn, dcc_id) in seen:
                     continue
@@ -2139,16 +2242,15 @@ class _InspectorAssetStatusBlock(QWidget):
         if not item or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
             return
         ref = getattr(item, "ref", None)
-        if not isinstance(ref, (Asset, Shot)) or not getattr(ref, "departments", None):
+        if not isinstance(ref, (Asset, Shot)):
             return
         dep = (self._last_active_department or "").strip()
         if not dep:
             return
-        dep_norm = dep.casefold()
-        for d in ref.departments:
-            if (d.name or "").strip().casefold() == dep_norm:
-                _TechnicalSpecs._copy_text(str(Path(d.publish_path)))
-                return
+        reg = _inspector_department_registry_from_widget(self)
+        paths = _inspector_work_and_publish_paths(ref, dep, reg)
+        if paths:
+            _TechnicalSpecs._copy_text(str(Path(paths[1])))
 
     def set_focused_department(self, dept_name: str | None) -> None:
         self._health.set_focused_department(dept_name)
@@ -2240,9 +2342,10 @@ class _ProductionHealth(QWidget):
             status = _status_from_department(ref)
         elif isinstance(ref, (Asset, Shot)):
             dep = (self._focused_department or "").strip()
-            if dep:
+            dep_cf = dep.casefold() if dep else ""
+            if dep_cf:
                 for d in ref.departments:
-                    if (d.name or "").strip() == dep:
+                    if (d.name or "").strip().casefold() == dep_cf:
                         status = _status_from_department(d)
                         break
             else:
@@ -2336,6 +2439,18 @@ class _DeptCard(QFrame):
         self._pill.setStyleSheet(
             f"padding: 1px 6px; border-radius: 8px; border: none; background: rgba(255,255,255,0.06); color: {_status_color(status)};"
         )
+        dept_root_ok = False
+        try:
+            dept_root_ok = bool(dept.path.exists() and dept.path.is_dir())
+        except OSError:
+            dept_root_ok = False
+        self._btn_open.setEnabled(dept_root_ok)
+        if dept_root_ok:
+            self._btn_open.setToolTip("Open department folder")
+        else:
+            self._btn_open.setToolTip(
+                "Department folder is not on disk yet. Use Create New in the main view or create the folder manually."
+            )
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         # Clicking the card updates Tech row with this department's work path.
@@ -2600,12 +2715,6 @@ class _DepartmentPipeline(QWidget):
     def set_item(self, item: ViewItem) -> None:
         self._current_item = item
         ref = item.ref
-        if isinstance(ref, Department):
-            depts = (ref,)
-        elif isinstance(ref, (Asset, Shot)):
-            depts = ref.departments
-        else:
-            depts = ()
 
         registry = None
         label_resolver = None
@@ -2622,6 +2731,16 @@ class _DepartmentPipeline(QWidget):
             if registry is not None and label_resolver is not None:
                 break
             p = p.parent()
+
+        if isinstance(ref, Department):
+            depts = (ref,)
+        elif isinstance(ref, (Asset, Shot)):
+            if isinstance(registry, DepartmentRegistry):
+                depts = _inspector_merge_departments_with_registry(ref, registry)
+            else:
+                depts = ref.departments
+        else:
+            depts = ()
 
         if not depts:
             self._current_all_dept_ids = []

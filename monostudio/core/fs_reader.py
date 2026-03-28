@@ -155,7 +155,7 @@ def _build_asset_departments(
         prefix = work_file_prefix(name=asset_dir.name, department=dept_id)
 
         if use_dcc_folders and reg is not None:
-            available_dccs = reg.get_available_dccs(dept_id)
+            available_dccs = dept_registry.supported_dcc_ids(reg, dept_id)
             work_file_dccs_list: list[str] = []
             work_exists = False
             flat_work = dept_dir / "work"
@@ -257,7 +257,7 @@ def _build_shot_departments(
         prefix = work_file_prefix(name=shot_dir.name, department=dept_id)
 
         if use_dcc_folders and reg is not None:
-            available_dccs = reg.get_available_dccs(dept_id)
+            available_dccs = dept_registry.supported_dcc_ids(reg, dept_id)
             work_file_dccs_list: list[str] = []
             work_exists = False
             flat_work = dept_dir / "work"

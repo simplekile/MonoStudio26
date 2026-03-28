@@ -1559,6 +1559,13 @@ def apply_dark_theme(app: QApplication) -> None:
             font-weight: 700;
             color: #fafafa;
         }
+        /* Pipeline Settings → Workflow panel: department group (title for subdept checkboxes) */
+        QLabel#PipelineWorkflowGroupTitle {
+            color: #71717a;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+        }
         QLabel#DialogPrefixChip {
             padding: 6px 10px;
             border: 1px solid rgba(39, 39, 42, 0.70);

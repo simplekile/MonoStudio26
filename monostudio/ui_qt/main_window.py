@@ -31,8 +31,9 @@ from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.workspace_reader import DiscoveredProject, ProjectQuickStats, discover_projects, read_project_quick_stats
 from monostudio.core.project_create import create_new_project
 from monostudio.core.pipeline_types_and_presets import (
+    PipelineTypesAndPresets,
     ensure_pipeline_bootstrap,
-    load_pipeline_types_and_presets,
+    load_pipeline_types_and_presets_for_project,
     seed_project_from_user_default,
 )
 from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
@@ -142,22 +143,7 @@ class MainWindow(FramelessMainWindow):
         self.current_department: str | None = None
         self.current_type: str | None = None
         self.current_search_query: str = ""
-        meta = load_pipeline_types_and_presets()
-        self._dept_icon_map: dict[str, str] = {
-            k: v.icon_name for k, v in meta.departments.items() if v.icon_name
-        }
-        self._type_short_name_map: dict[str, str] = {
-            k: v.short_name for k, v in meta.types.items() if v.short_name
-        }
-        self._type_name_by_id: dict[str, str] = {k: v.name for k, v in meta.types.items()}
-        # Type aliases allow robust matching against filesystem folder names:
-        # e.g. "environment" may appear as "env" or "Environment" in legacy projects.
-        self._type_aliases_by_id: dict[str, set[str]] = {}
-        for type_id, t in meta.types.items():
-            aliases_raw = [type_id, t.name, t.short_name]
-            aliases = {self._norm(a) for a in aliases_raw if isinstance(a, str) and a.strip()}
-            if aliases:
-                self._type_aliases_by_id[self._norm(type_id)] = aliases
+        self._apply_pipeline_types_and_presets_metadata(load_pipeline_types_and_presets_for_project(self._project_root))
 
         self._sidebar = Sidebar()
         self._sidebar_compact = SidebarCompact(self)
@@ -394,6 +380,17 @@ class MainWindow(FramelessMainWindow):
         dialog.project_root_selected.connect(lambda p: self._apply_project_root(p, save=True))
         dialog.open_to_updates_tab()
         dialog.exec()
+        self._sync_pipeline_preset_metadata_ui()
+        if self._project_root is not None:
+            try:
+                dept_reg = DepartmentRegistry.for_project(self._project_root)
+                self._inspector.set_department_registry(dept_reg)
+                self._inspector.set_department_icon_map(self._dept_icon_map)
+                self._inspector.set_type_short_name_map(self._type_short_name_map)
+            except Exception:
+                self._inspector.set_department_registry(None)
+                self._inspector.set_department_icon_map({})
+                self._inspector.set_type_short_name_map({})
         renamed_to = dialog.project_root_renamed_to()
         if renamed_to is None:
             return
@@ -572,6 +569,30 @@ class MainWindow(FramelessMainWindow):
             self._on_outbox_drop_requested(paths)
         else:
             # Other pages: no drop handling
+            pass
+
+    def _apply_pipeline_types_and_presets_metadata(self, meta: PipelineTypesAndPresets) -> None:
+        self._dept_icon_map = {
+            k: v.icon_name for k, v in meta.departments.items() if v.icon_name
+        }
+        self._type_short_name_map = {
+            k: v.short_name for k, v in meta.types.items() if v.short_name
+        }
+        self._type_name_by_id = {k: v.name for k, v in meta.types.items()}
+        self._type_aliases_by_id = {}
+        for type_id, t in meta.types.items():
+            aliases_raw = [type_id, t.name, t.short_name]
+            aliases = {self._norm(a) for a in aliases_raw if isinstance(a, str) and a.strip()}
+            if aliases:
+                self._type_aliases_by_id[self._norm(type_id)] = aliases
+
+    def _sync_pipeline_preset_metadata_ui(self) -> None:
+        self._apply_pipeline_types_and_presets_metadata(
+            load_pipeline_types_and_presets_for_project(self._project_root)
+        )
+        try:
+            self._sidebar.filters().reload_from_pipeline_metadata()
+        except Exception:
             pass
 
     @staticmethod
@@ -1605,6 +1626,7 @@ class MainWindow(FramelessMainWindow):
         self._project_root = Path(folder) if folder else None
         self._controller.set_project_root(self._project_root)
         self._sidebar.filters().set_project_root(self._project_root)
+        self._sync_pipeline_preset_metadata_ui()
         self._main_view.set_project_root(folder)
         self._main_view.set_empty_override(None)
 
@@ -1646,8 +1668,12 @@ class MainWindow(FramelessMainWindow):
                 self._app_state.clear_project_data()
                 self._entered_parent = None
                 self._main_view.clear()
+                self._sidebar.filters().set_project_root(None)
+                self._sync_pipeline_preset_metadata_ui()
                 self._sidebar.set_project_index(None)
                 self._inspector.set_department_registry(None)
+                self._inspector.set_department_icon_map({})
+                self._inspector.set_type_short_name_map({})
                 self._update_fs_watcher_paths()
                 self._inspector.set_item(None)
                 self._sync_primary_action()
@@ -2888,6 +2914,17 @@ class MainWindow(FramelessMainWindow):
         dialog.workspace_root_selected.connect(lambda p: self._apply_workspace_root(p, save=True))
         dialog.project_root_selected.connect(lambda p: self._apply_project_root(p, save=True))
         dialog.exec()
+        self._sync_pipeline_preset_metadata_ui()
+        if self._project_root is not None:
+            try:
+                dept_reg = DepartmentRegistry.for_project(self._project_root)
+                self._inspector.set_department_registry(dept_reg)
+                self._inspector.set_department_icon_map(self._dept_icon_map)
+                self._inspector.set_type_short_name_map(self._type_short_name_map)
+            except Exception:
+                self._inspector.set_department_registry(None)
+                self._inspector.set_department_icon_map({})
+                self._inspector.set_type_short_name_map({})
 
         renamed_to = dialog.project_root_renamed_to()
         if renamed_to is None:

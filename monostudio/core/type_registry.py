@@ -22,6 +22,11 @@ def get_project_types_path(project_root: Path) -> Path:
     return get_project_pipeline_dir(project_root) / _TYPES_JSON
 
 
+def get_default_type_mapping() -> dict[str, dict]:
+    """Shallow copy of built-in / shipped-derived type mapping (no project). For UI reset-to-factory."""
+    return dict(_default_type_mapping())
+
+
 def _default_type_mapping() -> dict[str, dict]:
     """
     Default mapping when no project types.json exists.
