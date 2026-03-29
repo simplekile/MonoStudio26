@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -8,8 +10,23 @@ import re
 
 from collections import OrderedDict
 
-from PySide6.QtCore import Qt, Signal, QSize, QPoint, QTimer, QSettings, QEvent
-from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal, QSize, QPoint, QRect, QTimer, QSettings, QEvent, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QDrag,
+    QFont,
+    QIcon,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
+from PySide6.QtCore import QMimeData
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -38,7 +55,19 @@ from monostudio.core.dcc_status import resolve_dcc_status
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.style import MONOS_COLORS, file_icon_spec_for_path, monos_font
-from monostudio.ui_qt.thumbnails import ThumbnailCache
+from monostudio.ui_qt.inspector_preview_settings import (
+    THUMB_SOURCE_RENDER_SEQUENCE,
+    default_qsettings,
+    read_inspector_thumbnail_open_exe,
+    read_inspector_thumbnail_source,
+    read_sequence_preview_fps,
+)
+from monostudio.ui_qt.thumbnails import ThumbnailCache, resolve_thumbnail_path
+from monostudio.ui_qt.thumbnail_source_resolve import (
+    dept_work_path_for_ref,
+    primary_work_file_for_department,
+    resolve_entity_thumbnail_source_path,
+)
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 from monostudio.ui_qt.shell_thumbnail import get_windows_shell_thumbnail
 from monostudio.ui_qt.worker_manager import WorkerTask
@@ -135,6 +164,63 @@ def _inspector_work_and_publish_paths(
         base = ref.path / rel
         return (base / "work", base / "publish")
     return None
+
+
+def _inspector_preview_resolve_sequence(
+    work_path: Path | None,
+    work_file_path: Path | None,
+) -> tuple[Path | None, list[Path]]:
+    from monostudio.core.sequence_preview import list_sequence_frames, resolve_sequence_folder
+
+    if work_path is None or not work_path.is_dir():
+        return (None, [])
+    sq = resolve_sequence_folder(work_path, work_file_path)
+    if sq is None or not sq.is_dir():
+        return (None, [])
+    return (sq, list_sequence_frames(sq))
+
+
+def _inspector_preview_worker_run(
+    path_str: str,
+    *,
+    is_inbox: bool,
+    dept: str | None,
+    mode: str,
+    work_path_str: str | None,
+    work_file_str: str | None,
+    decode_max_side: int = 1024,
+) -> tuple[str, QImage | None, bool]:
+    """Background: load inspector thumb (sequence folder resolved on main thread after apply)."""
+    px = max(256, min(1024, int(decode_max_side)))
+    p = Path(path_str)
+    if is_inbox and p.is_file():
+        pix = get_windows_shell_thumbnail(p, px)
+        if pix is not None and not pix.isNull():
+            return (path_str, pix.toImage(), True)
+        return (path_str, None, True)
+
+    wp: Path | None = Path(work_path_str) if work_path_str else None
+    wf: Path | None = Path(work_file_str) if work_file_str else None
+    if wp is not None and not wp.is_dir():
+        wp = None
+    if wf is not None and not wf.is_file():
+        wf = None
+
+    thumb = resolve_entity_thumbnail_source_path(p, dept, mode, wp, wf)
+    if thumb is None:
+        return (path_str, None, False)
+    use_fit = ".user." in str(thumb)
+    cache = ThumbnailCache(size_px=px)
+    pm = cache.load_thumbnail_pixmap(thumb)
+    if (pm is None or pm.isNull()) and thumb.suffix.lower() in (".exr", ".hdr"):
+        from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+        img = load_preview_frame_qimage(thumb, max_side=px)
+        if img is not None and not img.isNull():
+            pm = QPixmap.fromImage(img)
+    if pm is None or pm.isNull():
+        return (path_str, None, use_fit)
+    return (path_str, pm.toImage(), use_fit)
 
 
 def _work_file_version_from_path_for_inspector(path: Path | None) -> int | None:
@@ -337,6 +423,8 @@ class InspectorPanel(QWidget):
         self._department_registry: object | None = None  # DepartmentRegistry | None (để biết subdepartment, display name)
         self._department_icon_map: dict[str, str] = {}  # dept_id -> lucide icon name
         self._type_short_name_map: dict[str, str] = {}  # type_id -> short_name
+        self._inspector_settings: QSettings = default_qsettings()
+        self._preview.set_qsettings(self._inspector_settings)
         self.set_item(None)
 
         # Clear department focus when clicking anywhere in the Inspector content
@@ -371,9 +459,20 @@ class InspectorPanel(QWidget):
         self._worker_manager = manager
         self._preview.set_worker_manager(manager)
 
+    def set_app_settings(self, settings: QSettings) -> None:
+        """Share MainWindow QSettings so Inspector reads the same keys as Settings dialog."""
+        self._inspector_settings = settings
+        self._preview.set_qsettings(settings)
+
     def apply_preview_thumb(self, path_str: str, image_or_none: QImage | None, use_fit: bool) -> None:
         """Main thread: áp dụng thumb đã load từ worker (chỉ khi path khớp item hiện tại)."""
         self._preview.apply_preview_thumb(path_str, image_or_none, use_fit)
+
+    def invalidate_inspector_preview_settings_cache(self) -> None:
+        """After Settings save: drop preview RAM cache so thumbnail source / FPS apply."""
+        self._preview.invalidate_settings_dependent_cache()
+        if self._current_item is not None:
+            self._preview.update_thumbnail_only()
 
     def clear_preview_loading(self) -> None:
         """Tắt loading spinner (khi worker lỗi hoặc hủy)."""
@@ -1112,15 +1211,18 @@ class _PreviewContainer(QWidget):
     """Container for thumbnail with Fill/Fit, Paste and Remove buttons at top-left."""
     paste_requested = Signal()
     remove_requested = Signal()
+    sequence_play_clicked = Signal()
 
     _THUMB_BTN_MARGIN = 8
     _THUMB_BTN_GAP = 4
     _THUMB_BTN_SIZE = 44
+    _INFO_BTN_SIZE = 32
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._hovered = False
         self._pending_action: str | None = None  # "paste" | "remove" | None
+        self._preview_help_text: str = ""
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._container_layout = QVBoxLayout(self)
@@ -1132,6 +1234,7 @@ class _PreviewContainer(QWidget):
         self._inbox_mode = False
         self._show_fill_fit = False
         self._show_remove = False
+        self._render_sequence_hide_controls = False
 
         self._btn_fill_fit = QToolButton(self)
         self._btn_fill_fit.setMouseTracking(True)
@@ -1197,6 +1300,31 @@ class _PreviewContainer(QWidget):
         self._btn_cancel.setVisible(False)
         self._btn_cancel.installEventFilter(self)
 
+        self._btn_seq_play = QToolButton(self)
+        self._btn_seq_play.setMouseTracking(True)
+        self._btn_seq_play.setCursor(Qt.PointingHandCursor)
+        self._btn_seq_play.setIconSize(QSize(24, 24))
+        self._btn_seq_play.setFixedSize(self._THUMB_BTN_SIZE, self._THUMB_BTN_SIZE)
+        self._btn_seq_play.setStyleSheet(_thumb_button_style())
+        self._btn_seq_play.setIcon(lucide_icon("play", size=24, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_seq_play.setToolTip("Play sequence")
+        self._btn_seq_play.clicked.connect(self.sequence_play_clicked.emit)
+        self._btn_seq_play.setVisible(False)
+        self._btn_seq_play.installEventFilter(self)
+        self._sequence_play_available = False
+
+        self._btn_info = QToolButton(self)
+        self._btn_info.setMouseTracking(True)
+        self._btn_info.setCursor(Qt.PointingHandCursor)
+        self._btn_info.setIcon(lucide_icon("circle-help", size=18, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_info.setIconSize(QSize(20, 20))
+        self._btn_info.setFixedSize(self._INFO_BTN_SIZE, self._INFO_BTN_SIZE)
+        self._btn_info.setStyleSheet(_thumb_button_style())
+        self._btn_info.setToolTip("")
+        self._btn_info.setVisible(False)
+        self._btn_info.clicked.connect(self._on_preview_info_clicked)
+        self._btn_info.installEventFilter(self)
+
         self._w.image_changed.connect(self._on_preview_image_changed)
 
         # Mouse-move fallback scoped to Inspector scroll viewport (not whole app).
@@ -1259,13 +1387,26 @@ class _PreviewContainer(QWidget):
         self._btn_confirm.setVisible(False)
         self._btn_cancel.setVisible(False)
 
+    def set_preview_help_text(self, text: str) -> None:
+        """Multi-line hints shown when the user clicks the corner info button (not on hover over the thumb)."""
+        t = (text or "").strip()
+        self._preview_help_text = t
+        self._btn_info.setVisible(bool(t))
+        self._layout_thumb_overlay_buttons()
+
+    def _on_preview_info_clicked(self) -> None:
+        t = (self._preview_help_text or "").strip()
+        if not t:
+            return
+        gp = self._btn_info.mapToGlobal(self._btn_info.rect().bottomLeft() + QPoint(0, 4))
+        QToolTip.showText(gp, t, self._btn_info, QRect(), 20000)
+
     def _on_preview_image_changed(self, has_image: bool) -> None:
         show = not self._inbox_mode and has_image
         self.set_show_fill_fit(show)
         self.set_show_remove(show)
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
+    def _layout_thumb_overlay_buttons(self) -> None:
         r = self._w.geometry()
         margin = self._THUMB_BTN_MARGIN
         gap = self._THUMB_BTN_GAP
@@ -1278,12 +1419,43 @@ class _PreviewContainer(QWidget):
         self._btn_paste.raise_()
         self._btn_remove.move(x0 + (size + gap) * 2, y0)
         self._btn_remove.raise_()
-        # Confirm / cancel at top-right
         x_right = r.x() + r.width() - margin - size
         self._btn_confirm.move(x_right, y0)
         self._btn_confirm.raise_()
         self._btn_cancel.move(x_right - (size + gap), y0)
         self._btn_cancel.raise_()
+        bx = r.x() + (r.width() - size) // 2
+        by = r.y() + (r.height() - size) // 2
+        self._btn_seq_play.move(bx, by)
+        self._btn_seq_play.raise_()
+        isz = self._INFO_BTN_SIZE
+        self._btn_info.move(r.x() + r.width() - margin - isz, r.y() + r.height() - margin - isz)
+        if self._btn_info.isVisible():
+            self._btn_info.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._layout_thumb_overlay_buttons()
+
+    def _apply_sequence_play_visibility(self) -> None:
+        if not self._sequence_play_available:
+            self._btn_seq_play.setVisible(False)
+            return
+        self._btn_seq_play.setVisible(bool(self._hovered))
+
+    def update_sequence_play_control(self, *, available: bool, playing: bool) -> None:
+        """Có sequence thì bật nút play/pause (hiện khi hover); icon theo trạng thái phát."""
+        self._sequence_play_available = bool(available)
+        if not available:
+            self._btn_seq_play.setVisible(False)
+            return
+        if playing:
+            self._btn_seq_play.setIcon(lucide_icon("pause", size=24, color_hex=MONOS_COLORS["text_label"]))
+            self._btn_seq_play.setToolTip("Pause sequence")
+        else:
+            self._btn_seq_play.setIcon(lucide_icon("play", size=24, color_hex=MONOS_COLORS["text_label"]))
+            self._btn_seq_play.setToolTip("Play sequence")
+        self._apply_sequence_play_visibility()
 
     def set_paste_enabled(self, enabled: bool) -> None:
         on = bool(enabled)
@@ -1292,13 +1464,25 @@ class _PreviewContainer(QWidget):
 
     def set_show_fill_fit(self, show: bool) -> None:
         self._show_fill_fit = bool(show)
-        self._btn_fill_fit.setVisible(self._hovered and self._show_fill_fit)
+        self._btn_fill_fit.setVisible(self._hovered and self._show_fill_fit and not self._render_sequence_hide_controls)
         if self._show_fill_fit:
             self._update_fill_fit_icon()
 
     def set_show_remove(self, show: bool) -> None:
         self._show_remove = bool(show)
-        self._btn_remove.setVisible(self._hovered and self._show_remove)
+        self._btn_remove.setVisible(self._hovered and self._show_remove and not self._render_sequence_hide_controls)
+
+    def set_render_sequence_hide_controls(self, hide: bool) -> None:
+        """When True (Settings: render sequence only), hide paste/fill/remove; play vẫn theo hover."""
+        self._render_sequence_hide_controls = bool(hide)
+        if hide:
+            self._pending_action = None
+            self._btn_fill_fit.setVisible(False)
+            self._btn_paste.setVisible(False)
+            self._btn_remove.setVisible(False)
+            self._btn_confirm.setVisible(False)
+            self._btn_cancel.setVisible(False)
+        self._set_hovered(self._hovered)
 
     def set_inbox_mode(self, on: bool) -> None:
         """Inbox: preview widget tự quyết height theo heightForWidth (tỉ lệ ảnh)."""
@@ -1338,6 +1522,8 @@ class _PreviewContainer(QWidget):
             or self._btn_remove.underMouse()
             or self._btn_confirm.underMouse()
             or self._btn_cancel.underMouse()
+            or self._btn_seq_play.underMouse()
+            or self._btn_info.underMouse()
         )
 
     def _cursor_in_hover_region(self) -> bool:
@@ -1349,6 +1535,8 @@ class _PreviewContainer(QWidget):
             self._btn_remove,
             self._btn_confirm,
             self._btn_cancel,
+            self._btn_seq_play,
+            self._btn_info,
         ):
             if not w.isVisible():
                 continue
@@ -1362,22 +1550,29 @@ class _PreviewContainer(QWidget):
 
     def _set_hovered(self, on: bool) -> None:
         self._hovered = bool(on)
-        if not self._hovered:
+        if self._render_sequence_hide_controls:
             self._btn_fill_fit.setVisible(False)
             self._btn_paste.setVisible(False)
             self._btn_remove.setVisible(False)
             self._btn_confirm.setVisible(False)
             self._btn_cancel.setVisible(False)
-            return
-        if self._show_fill_fit:
-            self._btn_fill_fit.setVisible(True)
-        if self._btn_paste.isEnabled():
-            self._btn_paste.setVisible(True)
-        if self._show_remove:
-            self._btn_remove.setVisible(True)
-        if self._pending_action is not None:
-            self._btn_confirm.setVisible(True)
-            self._btn_cancel.setVisible(True)
+        elif not self._hovered:
+            self._btn_fill_fit.setVisible(False)
+            self._btn_paste.setVisible(False)
+            self._btn_remove.setVisible(False)
+            self._btn_confirm.setVisible(False)
+            self._btn_cancel.setVisible(False)
+        else:
+            if self._show_fill_fit:
+                self._btn_fill_fit.setVisible(True)
+            if self._btn_paste.isEnabled():
+                self._btn_paste.setVisible(True)
+            if self._show_remove:
+                self._btn_remove.setVisible(True)
+            if self._pending_action is not None:
+                self._btn_confirm.setVisible(True)
+                self._btn_cancel.setVisible(True)
+        self._apply_sequence_play_visibility()
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         # Hover có thể di chuyển giữa preview widget, các nút overlay và khoảng trống trong Inspector viewport.
@@ -1403,6 +1598,8 @@ class _PreviewContainer(QWidget):
             self._btn_remove,
             self._btn_confirm,
             self._btn_cancel,
+            self._btn_seq_play,
+            self._btn_info,
         ):
             if et in (QEvent.Type.Enter, QEvent.Type.HoverEnter):
                 self._set_hovered(True)
@@ -1415,6 +1612,26 @@ class _PreviewContainer(QWidget):
                     self._set_hovered(False)
 
         return super().eventFilter(watched, event)
+
+
+class _InspectorSeqDecodeSignaler(QObject):
+    frame_ready = Signal(int, object)
+
+
+class _InspectorSeqDecodeRunnable(QRunnable):
+    def __init__(self, idx: int, path: Path, max_side: int, signaler: _InspectorSeqDecodeSignaler) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._idx = idx
+        self._path = path
+        self._max_side = max_side
+        self._signaler = signaler
+
+    def run(self) -> None:
+        from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+        img = load_preview_frame_qimage(self._path, self._max_side)
+        self._signaler.frame_ready.emit(self._idx, img)
 
 
 class _InspectorPreview(QWidget):
@@ -1431,6 +1648,10 @@ class _InspectorPreview(QWidget):
         self._active_department: str | None = None
         self._item: ViewItem | None = None
         self._preview_thumb_cache: OrderedDict[str, tuple[QPixmap, bool]] = OrderedDict()
+        self._qsettings: QSettings | None = None
+        self._sequence_folder: Path | None = None
+        self._sequence_frames: list[Path] = []
+        self._drag_start_pos: QPoint | None = None
         self._preview_layout = QVBoxLayout(self)
         self._preview_layout.setContentsMargins(0, 0, 0, 0)
         self._preview_layout.setSpacing(0)
@@ -1438,8 +1659,39 @@ class _InspectorPreview(QWidget):
         self._preview_layout.addWidget(self._container, 0)
         self._container.paste_requested.connect(self.paste_requested.emit)
         self._container.remove_requested.connect(self._on_remove_requested)
+        self._container.sequence_play_clicked.connect(self._toggle_inspector_inline_seq_play)
         self._container._w.context_menu_requested.connect(self._open_context_menu)
+        self._container._w.installEventFilter(self)
         self._set_paste_enabled(False)
+        self._seq_pool: QThreadPool | None = None
+        self._seq_sig = _InspectorSeqDecodeSignaler(self)
+        self._seq_sig.frame_ready.connect(self._on_inspector_seq_frame_ready, Qt.ConnectionType.QueuedConnection)
+        self._seq_tick = QTimer(self)
+        self._seq_tick.setSingleShot(True)
+        self._seq_tick.timeout.connect(self._on_inspector_seq_tick)
+        self._seq_poll = QTimer(self)
+        self._seq_poll.setSingleShot(True)
+        self._seq_poll.timeout.connect(self._on_inspector_seq_tick)
+        self._seq_buffer: dict[int, QPixmap] = {}
+        self._seq_in_flight: set[int] = set()
+        self._seq_playing = False
+        self._seq_index = 0
+        self._seq_scrubbing = False
+        self._last_thumb_use_fit = False
+        self._seq_decode_bucket: int | None = None
+        self._seq_live_display = False
+
+    def _inspector_preview_decode_max_side(self) -> int:
+        """Decode / scale thumbs to match preview cell (DPR), capped for memory."""
+        wgt = self._container._w
+        w = wgt.width()
+        if w < 1:
+            w = max(280, wgt.sizeHint().width())
+        h = wgt.heightForWidth(w) if wgt.hasHeightForWidth() else max(1, wgt.height())
+        h = max(1, h)
+        dpr = max(1.0, float(wgt.devicePixelRatioF()))
+        side = int(max(w, h) * dpr * 1.08)
+        return max(256, min(1024, side))
 
     def _on_remove_requested(self) -> None:
         if self._item is not None:
@@ -1456,8 +1708,392 @@ class _InspectorPreview(QWidget):
         """Optional: load preview thumb in background, show loading spinner."""
         self._worker_manager = manager
 
+    def set_qsettings(self, settings: QSettings | None) -> None:
+        self._qsettings = settings
+
+    def invalidate_settings_dependent_cache(self) -> None:
+        self._preview_thumb_cache.clear()
+        self._seq_decode_bucket = None
+
+    def _work_paths_for_preview_item(self, item: ViewItem) -> tuple[Path | None, Path | None]:
+        ref = getattr(item, "ref", None)
+        dept = self._active_department
+        if not isinstance(ref, (Asset, Shot)) or not (dept or "").strip():
+            return (None, None)
+        ds = dept.strip()
+        wp = dept_work_path_for_ref(ref, dept)
+        wf = primary_work_file_for_department(ref, ds, _inspector_get_active_dcc(item.path, dept))
+        return (wp, wf)
+
+    def _sync_sequence_context_for_inspector_preview(self) -> None:
+        self._sequence_folder = None
+        self._sequence_frames = []
+        item = self._item
+        if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            self._update_sequence_play_button()
+            self._sync_inspector_thumb_tooltip()
+            return
+        wp, wf = self._work_paths_for_preview_item(item)
+        sq, frames = _inspector_preview_resolve_sequence(wp, wf)
+        self._sequence_folder = sq
+        self._sequence_frames = frames
+        self._update_sequence_play_button()
+        self._sync_inspector_thumb_tooltip()
+
+    def _sync_inspector_thumb_tooltip(self) -> None:
+        """Help text for the corner info button; preview widget has no hover tooltip."""
+        w = self._container._w
+        w.setToolTip("")
+        item = self._item
+        if item is None:
+            self._container.set_preview_help_text("")
+            return
+        if item.kind == ViewItemKind.INBOX_ITEM:
+            self._container.set_preview_help_text(
+                "Double-click: open file.\n"
+                "Right-click: menu."
+            )
+            return
+        if item.kind in (ViewItemKind.PROJECT, ViewItemKind.DEPARTMENT):
+            self._container.set_preview_help_text("Right-click: menu.")
+            return
+        lines: list[str] = [
+            "Double-click: open the thumbnail image (default app in Settings).",
+        ]
+        if self._sequence_frames:
+            lines.append("Hold left button and drag: drag the sequence folder (to Explorer / a DCC).")
+            lines.append("Middle mouse + drag horizontally: scrub frames.")
+        src = read_inspector_thumbnail_source(self._qsettings)
+        if src != THUMB_SOURCE_RENDER_SEQUENCE:
+            lines.append("Hover: Fill / Fit, Paste, Remove (top).")
+        lines.append("Right-click: menu (paste, remove, open file…).")
+        self._container.set_preview_help_text("\n".join(lines))
+
+    def _update_sequence_play_button(self) -> None:
+        self._container.update_sequence_play_control(
+            available=bool(self._sequence_frames),
+            playing=self._seq_playing,
+        )
+
+    def _perform_sequence_folder_drag(self) -> None:
+        if self._sequence_folder is None or not self._sequence_folder.is_dir():
+            return
+        md = QMimeData()
+        md.setUrls([QUrl.fromLocalFile(str(self._sequence_folder.resolve()))])
+        drag = QDrag(self._container._w)
+        drag.setMimeData(md)
+        drag.exec(Qt.DropAction.CopyAction)
+
+    def _resolve_inspector_thumbnail_disk_path(self) -> Path | None:
+        """On-disk image file shown in preview (sequence frame when scrubbing/playing, else resolved thumb)."""
+        item = self._item
+        if item is None:
+            return None
+        if item.kind == ViewItemKind.INBOX_ITEM:
+            p = item.path
+            return p if isinstance(p, Path) and p.is_file() else None
+        if self._seq_live_display and self._sequence_frames:
+            i = self._seq_index
+            if 0 <= i < len(self._sequence_frames):
+                f = self._sequence_frames[i]
+                try:
+                    if f.is_file():
+                        return f
+                except OSError:
+                    pass
+        mode = read_inspector_thumbnail_source(self._qsettings)
+        ref = getattr(item, "ref", None)
+        if isinstance(ref, (Asset, Shot)):
+            wp, wf = self._work_paths_for_preview_item(item)
+            p = resolve_entity_thumbnail_source_path(
+                Path(item.path),
+                self._active_department,
+                mode,
+                wp,
+                wf,
+            )
+            if p is not None:
+                try:
+                    if p.is_file():
+                        return p
+                except OSError:
+                    pass
+        p2 = resolve_thumbnail_path(Path(item.path), department=self._active_department)
+        if p2 is not None:
+            try:
+                if p2.is_file():
+                    return p2
+            except OSError:
+                pass
+        return None
+
+    def _open_inspector_thumbnail_externally(self) -> None:
+        path = self._resolve_inspector_thumbnail_disk_path()
+        if path is None:
+            return
+        try:
+            path = path.resolve()
+        except OSError:
+            return
+        if not path.is_file():
+            return
+        exe = read_inspector_thumbnail_open_exe(self._qsettings)
+        if exe:
+            exep = Path(exe)
+            if exep.is_file():
+                try:
+                    subprocess.Popen([str(exep), str(path)], cwd=str(path.parent))
+                    return
+                except OSError as e:
+                    logging.getLogger(__name__).warning("Open thumbnail with configured app failed: %s", e)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _sync_thumbnail_overlay_mode(self) -> None:
+        mode = read_inspector_thumbnail_source(self._qsettings)
+        self._container.set_render_sequence_hide_controls(mode == THUMB_SOURCE_RENDER_SEQUENCE)
+        self._sync_inspector_thumb_tooltip()
+
+    def _halt_inline_sequence_ui(self) -> None:
+        self._seq_playing = False
+        self._seq_scrubbing = False
+        self._seq_live_display = False
+        self._seq_tick.stop()
+        self._seq_poll.stop()
+        self._seq_buffer.clear()
+        self._seq_in_flight.clear()
+        if self._seq_pool is not None:
+            self._seq_pool.clear()
+        self._update_sequence_play_button()
+
+    def _restore_static_thumb_from_cache(self) -> None:
+        item = self._item
+        w = self._container._w
+        if item is None:
+            return
+        ck = self._preview_cache_key(item.path)
+        t = self._preview_thumb_cache.get(ck)
+        if t is not None:
+            pix, uf = t
+            if pix is not None and not pix.isNull():
+                w.set_pixmap(pix, use_fit=uf)
+                self._seq_live_display = False
+                return
+
+    def _ensure_inspector_seq_pool(self) -> None:
+        if self._seq_pool is None:
+            self._seq_pool = QThreadPool(self)
+            self._seq_pool.setMaxThreadCount(4)
+
+    def _inspector_seq_is_heavy(self) -> bool:
+        heavy = {".exr", ".hdr"}
+        return bool(self._sequence_frames) and all(p.suffix.lower() in heavy for p in self._sequence_frames)
+
+    def _inspector_seq_prefetch_n(self) -> int:
+        return 1 if self._inspector_seq_is_heavy() else 3
+
+    def _trim_inspector_seq_buffer(self) -> None:
+        cap = 6
+        while len(self._seq_buffer) > cap:
+            best_k = None
+            best_d = -1
+            for k in self._seq_buffer:
+                d = abs(k - self._seq_index)
+                if d > best_d:
+                    best_d = d
+                    best_k = k
+            if best_k is not None:
+                del self._seq_buffer[best_k]
+            else:
+                break
+
+    def _request_inspector_seq_decode(self, idx: int) -> None:
+        n = len(self._sequence_frames)
+        if idx < 0 or idx >= n:
+            return
+        if idx in self._seq_buffer or idx in self._seq_in_flight:
+            return
+        self._ensure_inspector_seq_pool()
+        self._seq_in_flight.add(idx)
+        mx = self._inspector_preview_decode_max_side()
+        self._seq_pool.start(
+            _InspectorSeqDecodeRunnable(idx, self._sequence_frames[idx], mx, self._seq_sig)
+        )
+
+    def _show_inspector_seq_frame(self, idx: int) -> None:
+        n = len(self._sequence_frames)
+        if n <= 0:
+            return
+        idx = max(0, min(n - 1, idx))
+        self._seq_index = idx
+        w = self._container._w
+        if idx in self._seq_buffer:
+            w.set_pixmap(self._seq_buffer[idx], use_fit=self._last_thumb_use_fit)
+            self._seq_live_display = True
+            return
+        self._request_inspector_seq_decode(idx)
+
+    def _scrub_inspector_seq_to_x(self, lx: int, width: int) -> None:
+        n = len(self._sequence_frames)
+        if n <= 0:
+            return
+        self._seq_playing = False
+        self._seq_tick.stop()
+        self._seq_poll.stop()
+        ww = max(1, width)
+        frac = max(0.0, min(1.0, lx / float(ww)))
+        idx = int(round(frac * (n - 1)))
+        self._show_inspector_seq_frame(idx)
+
+    def _scrub_inspector_seq_from_event(self, event: QMouseEvent) -> None:
+        w = self._container._w
+        lx = int(event.position().x()) if hasattr(event, "position") else int(event.pos().x())
+        self._scrub_inspector_seq_to_x(lx, max(1, w.width()))
+
+    def _toggle_inspector_inline_seq_play(self) -> None:
+        if not self._sequence_frames:
+            return
+        if self._seq_playing:
+            # Pause: giữ frame + index; lần play sau tiếp từ đây.
+            self._seq_playing = False
+            self._seq_tick.stop()
+            self._seq_poll.stop()
+            self._update_sequence_play_button()
+            return
+        self._seq_playing = False
+        self._seq_tick.stop()
+        self._seq_poll.stop()
+        self._seq_in_flight.clear()
+        if self._seq_pool is not None:
+            self._seq_pool.clear()
+        self._seq_playing = True
+        self._request_inspector_seq_decode(self._seq_index)
+        pn = self._inspector_seq_prefetch_n()
+        n = len(self._sequence_frames)
+        for k in range(1, min(pn + 1, n)):
+            j = (self._seq_index + k) % n
+            self._request_inspector_seq_decode(j)
+        self._schedule_inspector_seq_tick()
+        self._update_sequence_play_button()
+
+    def _schedule_inspector_seq_tick(self) -> None:
+        if not self._seq_playing or not self._sequence_frames:
+            return
+        fps = read_sequence_preview_fps(self._qsettings)
+        ms = max(1, round(1000 / max(1, min(60, int(fps)))))
+        self._seq_tick.start(ms)
+
+    def _on_inspector_seq_tick(self) -> None:
+        if not self._seq_playing or not self._sequence_frames or self._seq_scrubbing:
+            return
+        n = len(self._sequence_frames)
+        nxt = (self._seq_index + 1) % n
+        pn = self._inspector_seq_prefetch_n()
+        if nxt in self._seq_buffer:
+            self._show_inspector_seq_frame(nxt)
+            for k in range(1, pn + 1):
+                j = (self._seq_index + k) % n
+                self._request_inspector_seq_decode(j)
+            self._schedule_inspector_seq_tick()
+        else:
+            self._request_inspector_seq_decode(nxt)
+            self._seq_poll.start(16)
+
+    def _on_inspector_seq_frame_ready(self, idx: int, image: object) -> None:
+        self._seq_in_flight.discard(idx)
+        n = len(self._sequence_frames)
+        if idx < 0 or idx >= n:
+            return
+        if isinstance(image, QImage) and not image.isNull():
+            pix = QPixmap.fromImage(image)
+            if not pix.isNull():
+                self._seq_buffer[idx] = pix
+                self._trim_inspector_seq_buffer()
+        if idx == self._seq_index and idx in self._seq_buffer:
+            self._container._w.set_pixmap(self._seq_buffer[idx], use_fit=self._last_thumb_use_fit)
+            self._seq_live_display = True
+
+    def _on_inspector_preview_resize(self) -> None:
+        if not self._sequence_frames:
+            self._seq_decode_bucket = None
+            return
+        mx = self._inspector_preview_decode_max_side()
+        b = max(64, (mx // 64) * 64)
+        if b == self._seq_decode_bucket:
+            return
+        self._seq_decode_bucket = b
+        if not self._seq_live_display:
+            return
+        self._seq_buffer.clear()
+        self._seq_in_flight.clear()
+        if self._seq_pool is not None:
+            self._seq_pool.clear()
+        self._show_inspector_seq_frame(self._seq_index)
+        if self._seq_playing:
+            pn = self._inspector_seq_prefetch_n()
+            n = len(self._sequence_frames)
+            for k in range(1, min(pn + 1, n)):
+                j = (self._seq_index + k) % n
+                self._request_inspector_seq_decode(j)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if watched is not self._container._w:
+            return super().eventFilter(watched, event)
+        try:
+            et = event.type()
+        except Exception:
+            return False
+        if et == QEvent.Type.Resize:
+            self._on_inspector_preview_resize()
+            return False
+        if et == QEvent.Type.MouseButtonDblClick and isinstance(event, QMouseEvent):
+            if event.button() == Qt.MouseButton.LeftButton:
+                if self._resolve_inspector_thumbnail_disk_path() is None:
+                    return False
+                if self._seq_playing:
+                    self._seq_playing = False
+                    self._seq_tick.stop()
+                    self._seq_poll.stop()
+                    self._restore_static_thumb_from_cache()
+                self._open_inspector_thumbnail_externally()
+                self._update_sequence_play_button()
+                return True
+        if et == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+            if event.button() == Qt.MouseButton.LeftButton:
+                if hasattr(event, "position"):
+                    self._drag_start_pos = QPoint(int(event.position().x()), int(event.position().y()))
+                else:
+                    self._drag_start_pos = event.pos()
+            elif event.button() == Qt.MouseButton.MiddleButton and self._sequence_frames:
+                self._seq_scrubbing = True
+                self._scrub_inspector_seq_from_event(event)
+                return True
+        elif et == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+            if self._seq_scrubbing and bool(event.buttons() & Qt.MouseButton.MiddleButton):
+                self._scrub_inspector_seq_from_event(event)
+                return True
+            if self._drag_start_pos is not None and bool(event.buttons() & Qt.MouseButton.LeftButton):
+                if hasattr(event, "position"):
+                    pos = QPoint(int(event.position().x()), int(event.position().y()))
+                else:
+                    pos = event.pos()
+                d = pos - self._drag_start_pos
+                if (abs(d.x()) + abs(d.y())) >= QApplication.startDragDistance():
+                    self._perform_sequence_folder_drag()
+                    self._drag_start_pos = None
+        elif et == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._seq_scrubbing = False
+                return True
+            if event.button() == Qt.MouseButton.LeftButton:
+                # Play/pause chỉ qua nút overlay — tránh xung đột với drag folder + double-click mở file.
+                self._drag_start_pos = None
+        return False
+
     def apply_preview_thumb(self, path_str: str, image_or_none: QImage | None, use_fit: bool) -> None:
         """Main thread only: apply thumb from worker. path_str must match current item."""
+        self._halt_inline_sequence_ui()
+        self._seq_index = 0
+        self._last_thumb_use_fit = use_fit
         w = self._container._w
         w.set_loading(False)
         item = self._item
@@ -1469,6 +2105,7 @@ class _InspectorPreview(QWidget):
             pix = QPixmap.fromImage(image_or_none)
             if not pix.isNull():
                 w.set_pixmap(pix, use_fit=use_fit)
+                self._seq_live_display = False
         if pix is None:
             if item.kind == ViewItemKind.INBOX_ITEM and item.path:
                 try:
@@ -1477,10 +2114,13 @@ class _InspectorPreview(QWidget):
                 except Exception:
                     pass
             w.set_pixmap(None)
+            self._seq_live_display = False
         while len(self._preview_thumb_cache) >= self._PREVIEW_CACHE_MAX:
             self._preview_thumb_cache.popitem(last=False)
         self._preview_thumb_cache[cache_key] = (pix, use_fit)
         self._preview_thumb_cache.move_to_end(cache_key)
+        self._sync_sequence_context_for_inspector_preview()
+        self._sync_thumbnail_overlay_mode()
 
     def clear_preview_loading(self) -> None:
         """Tắt loading spinner (khi worker lỗi)."""
@@ -1495,18 +2135,27 @@ class _InspectorPreview(QWidget):
         except Exception:
             base = str(path)
         dep = (self._active_department or "").strip()
+        mode = read_inspector_thumbnail_source(self._qsettings)
         if dep:
-            return f"{base}::dept::{dep}"
-        return base
+            return f"{base}::dept::{dep}::ts::{mode}"
+        return f"{base}::ts::{mode}"
 
     def set_item(self, item: ViewItem) -> None:
+        self._halt_inline_sequence_ui()
+        self._seq_index = 0
+        self._seq_decode_bucket = None
+        self._seq_live_display = False
         self._item = item
+        self._sequence_folder = None
+        self._sequence_frames = []
+        self._update_sequence_play_button()
         can_paste = item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
         self._set_paste_enabled(can_paste)
         is_inbox = item.kind == ViewItemKind.INBOX_ITEM
         w = self._container._w
         w.set_inbox_mode(is_inbox)
         self._container.set_inbox_mode(is_inbox)
+        self._sync_thumbnail_overlay_mode()
         self._preview_layout.setStretchFactor(self._container, 0)
         w.set_placeholder_kind(item.kind.value, letter=(display_name_for_item(item) or "").strip()[:1])
         w.set_user_fit(False)  # default fill when switching item
@@ -1523,6 +2172,8 @@ class _InspectorPreview(QWidget):
             self._preview_thumb_cache.move_to_end(cache_key)
             if cached_pix is not None and not cached_pix.isNull():
                 w.set_pixmap(cached_pix, use_fit=cached_fit)
+                self._seq_live_display = False
+                self._sync_sequence_context_for_inspector_preview()
                 return
             # cache lưu (None, fit) khi không có thumb → hiện placeholder
             if is_inbox and path:
@@ -1532,24 +2183,14 @@ class _InspectorPreview(QWidget):
                 except Exception:
                     pass
             w.set_pixmap(None)
+            self._seq_live_display = False
+            self._sync_sequence_context_for_inspector_preview()
             return
 
-        def run_load() -> tuple[str, QImage | None, bool]:
-            """Chạy trong worker: trả (path_str, QImage|None, use_fit)."""
-            p = Path(path_str)
-            if is_inbox and p.is_file():
-                pix = get_windows_shell_thumbnail(p, 1024)
-                if pix is not None and not pix.isNull():
-                    return (path_str, pix.toImage(), True)
-            cache = ThumbnailCache(size_px=1024)
-            thumb = cache.resolve_thumbnail_file(p, department=dept)
-            if thumb is None:
-                return (path_str, None, False)
-            use_fit = ".user." in str(thumb)
-            pix = cache.load_thumbnail_pixmap(thumb)
-            if pix is None or pix.isNull():
-                return (path_str, None, use_fit)
-            return (path_str, pix.toImage(), use_fit)
+        mode = read_inspector_thumbnail_source(self._qsettings)
+        wp, wf = self._work_paths_for_preview_item(item)
+        wps = str(wp) if wp is not None else None
+        wfs = str(wf) if wf is not None else None
 
         if mgr is not None and hasattr(mgr, "submit_task"):
             w.set_loading(True)
@@ -1560,6 +2201,19 @@ class _InspectorPreview(QWidget):
                 if getattr(self, "_item", None) is not item or str(self._item.path) != path_str:
                     w.set_loading(False)
                     return
+                ms = self._inspector_preview_decode_max_side()
+
+                def run_load() -> tuple[str, QImage | None, bool]:
+                    return _inspector_preview_worker_run(
+                        path_str,
+                        is_inbox=is_inbox,
+                        dept=dept,
+                        mode=mode,
+                        work_path_str=wps,
+                        work_file_str=wfs,
+                        decode_max_side=ms,
+                    )
+
                 task = WorkerTask("inspector_preview_thumb", run_load, manager=mgr)
                 mgr.submit_task(task, category="inspector_preview_thumb", replace_existing=True)
 
@@ -1567,27 +2221,19 @@ class _InspectorPreview(QWidget):
             return
 
         def load() -> None:
-            is_inbox_check = getattr(self, "_item", None) and getattr(self._item, "kind", None) == ViewItemKind.INBOX_ITEM
-            if getattr(self, "_item", None) and self._item.path == path and is_inbox_check and path and path.is_file():
-                shell_pix = get_windows_shell_thumbnail(path, size_px=1024)
-                if shell_pix is not None and not shell_pix.isNull():
-                    self._container._w.set_pixmap(shell_pix, use_fit=True)
-                    return
-            thumb = self._thumbs.resolve_thumbnail_file(path, department=dept)
-            use_fit = thumb is not None and ".user." in str(thumb)
-            if thumb is None:
-                if getattr(self, "_item", None) and self._item.path == path:
-                    if is_inbox_check and path:
-                        try:
-                            icon_name, color_hex = file_icon_spec_for_path(path)
-                            self._container._w.set_placeholder_file_icon(icon_name, color_hex)
-                        except Exception:
-                            pass
-                    self._container._w.set_pixmap(None)
+            if getattr(self, "_item", None) is not item or str(self._item.path) != path_str:
                 return
-            pix = self._thumbs.load_thumbnail_pixmap(thumb)
-            if getattr(self, "_item", None) and self._item.path == path:
-                self._container._w.set_pixmap(pix, use_fit=use_fit)
+            ms = self._inspector_preview_decode_max_side()
+            ps, img, uf = _inspector_preview_worker_run(
+                path_str,
+                is_inbox=is_inbox,
+                dept=dept,
+                mode=mode,
+                work_path_str=wps,
+                work_file_str=wfs,
+                decode_max_side=ms,
+            )
+            self.apply_preview_thumb(ps, img, uf)
 
         QTimer.singleShot(0, load)
 
@@ -1596,12 +2242,17 @@ class _InspectorPreview(QWidget):
         item = self._item
         if item is None:
             return
+        self._halt_inline_sequence_ui()
         path = item.path
         path_str = str(path)
         cache_key = self._preview_cache_key(path)
         dept = self._active_department
         is_inbox = item.kind == ViewItemKind.INBOX_ITEM
         mgr = self._worker_manager
+        mode = read_inspector_thumbnail_source(self._qsettings)
+        wp, wf = self._work_paths_for_preview_item(item)
+        wps = str(wp) if wp is not None else None
+        wfs = str(wf) if wf is not None else None
 
         if cache_key in self._preview_thumb_cache:
             cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
@@ -1609,6 +2260,9 @@ class _InspectorPreview(QWidget):
             w = self._container._w
             if cached_pix is not None and not cached_pix.isNull():
                 w.set_pixmap(cached_pix, use_fit=cached_fit)
+                self._seq_live_display = False
+                self._sync_sequence_context_for_inspector_preview()
+                self._sync_thumbnail_overlay_mode()
                 return
             if is_inbox and path:
                 try:
@@ -1617,34 +2271,35 @@ class _InspectorPreview(QWidget):
                 except Exception:
                     pass
             w.set_pixmap(None)
+            self._seq_live_display = False
+            self._sync_sequence_context_for_inspector_preview()
+            self._sync_thumbnail_overlay_mode()
             return
-
-        def run_load() -> tuple[str, QImage | None, bool]:
-            p = Path(path_str)
-            if is_inbox and p.is_file():
-                pix = get_windows_shell_thumbnail(p, 1024)
-                if pix is not None and not pix.isNull():
-                    return (path_str, pix.toImage(), True)
-            cache = ThumbnailCache(size_px=1024)
-            thumb = cache.resolve_thumbnail_file(p, department=dept)
-            if thumb is None:
-                return (path_str, None, False)
-            use_fit = ".user." in str(thumb)
-            pix = cache.load_thumbnail_pixmap(thumb)
-            if pix is None or pix.isNull():
-                return (path_str, None, use_fit)
-            return (path_str, pix.toImage(), use_fit)
 
         if mgr is not None and hasattr(mgr, "submit_task"):
             w = self._container._w
             w.set_loading(True)
             w.update()
             QApplication.processEvents()
+            self._sync_thumbnail_overlay_mode()
 
             def submit() -> None:
                 if self._item is not item or str(self._item.path) != path_str:
                     w.set_loading(False)
                     return
+                ms = self._inspector_preview_decode_max_side()
+
+                def run_load() -> tuple[str, QImage | None, bool]:
+                    return _inspector_preview_worker_run(
+                        path_str,
+                        is_inbox=is_inbox,
+                        dept=dept,
+                        mode=mode,
+                        work_path_str=wps,
+                        work_file_str=wfs,
+                        decode_max_side=ms,
+                    )
+
                 task = WorkerTask("inspector_preview_thumb", run_load, manager=mgr)
                 mgr.submit_task(task, category="inspector_preview_thumb", replace_existing=True)
 
@@ -1652,24 +2307,19 @@ class _InspectorPreview(QWidget):
             return
 
         def load() -> None:
-            if is_inbox and path and path.is_file():
-                shell_pix = get_windows_shell_thumbnail(path, size_px=1024)
-                if shell_pix is not None and not shell_pix.isNull():
-                    self._container._w.set_pixmap(shell_pix, use_fit=True)
-                    return
-            thumb = self._thumbs.resolve_thumbnail_file(path, department=dept)
-            use_fit = thumb is not None and ".user." in str(thumb)
-            if thumb is None:
-                if is_inbox and path:
-                    try:
-                        icon_name, color_hex = file_icon_spec_for_path(path)
-                        self._container._w.set_placeholder_file_icon(icon_name, color_hex)
-                    except Exception:
-                        pass
-                self._container._w.set_pixmap(None)
+            if self._item is not item or str(self._item.path) != path_str:
                 return
-            pix = self._thumbs.load_thumbnail_pixmap(thumb)
-            self._container._w.set_pixmap(pix, use_fit=use_fit)
+            ms = self._inspector_preview_decode_max_side()
+            ps, img, uf = _inspector_preview_worker_run(
+                path_str,
+                is_inbox=is_inbox,
+                dept=dept,
+                mode=mode,
+                work_path_str=wps,
+                work_file_str=wfs,
+                decode_max_side=ms,
+            )
+            self.apply_preview_thumb(ps, img, uf)
 
         QTimer.singleShot(0, load)
 
@@ -1699,6 +2349,11 @@ class _InspectorPreview(QWidget):
         act_remove.setEnabled(can_paste)
         act_remove.triggered.connect(lambda: self.remove_requested.emit(self._item) if self._item else None)
         menu.addAction(act_remove)
+        open_path = self._resolve_inspector_thumbnail_disk_path()
+        act_open = QAction(lucide_icon("file-image", size=16, color_hex=MONOS_COLORS["text_label"]), "Open thumbnail file…", menu)
+        act_open.setEnabled(open_path is not None)
+        act_open.triggered.connect(self._open_inspector_thumbnail_externally)
+        menu.addAction(act_open)
         menu.exec(gp)
 
 

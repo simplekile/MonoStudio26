@@ -130,6 +130,7 @@ class MainWindow(FramelessMainWindow):
             worker_manager=self._worker_manager,
             size_px=512,
             max_memory=200,
+            settings=self._settings,
         )
         self._fs_watcher = QFileSystemWatcher(self)
         self._watcher_manually_disabled = False  # user can toggle watcher off via top bar
@@ -175,6 +176,7 @@ class MainWindow(FramelessMainWindow):
         self._outbox_page_widget: OutboxPageWidget | None = None
         self._reference_page_widget: ReferencePageWidget | None = None
         self._inspector = InspectorPanel()
+        self._inspector.set_app_settings(self._settings)
         self._inspector.set_thumbnail_manager(self._thumbnail_manager)
         self._inspector.set_worker_manager(self._worker_manager)
         self._inspector.setMinimumWidth(240)
@@ -2913,7 +2915,11 @@ class MainWindow(FramelessMainWindow):
         )
         dialog.workspace_root_selected.connect(lambda p: self._apply_workspace_root(p, save=True))
         dialog.project_root_selected.connect(lambda p: self._apply_project_root(p, save=True))
-        dialog.exec()
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            self._thumbnail_manager.clear_memory_cache()
+            self._main_view.invalidate_all_thumbnails_for_source_change()
+            self._inspector.invalidate_inspector_preview_settings_cache()
         self._sync_pipeline_preset_metadata_ui()
         if self._project_root is not None:
             try:

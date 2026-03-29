@@ -13,6 +13,7 @@ from PySide6.QtGui import (
     QPainter,
     QPixmap,
     QRegularExpressionValidator,
+    QShowEvent,
     QTextBlockFormat,
     QTextCursor,
 )
@@ -36,8 +37,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -62,6 +65,17 @@ from monostudio.core.pipeline_types_and_presets import (
     save_pipeline_types_and_presets,
     save_pipeline_types_and_presets_to_project,
 )
+from monostudio.ui_qt.inspector_preview_settings import (
+    THUMB_SOURCE_RENDER_SEQUENCE,
+    THUMB_SOURCE_USER,
+    THUMB_SOURCE_USER_THEN_RENDER,
+    read_inspector_thumbnail_open_exe,
+    read_inspector_thumbnail_source,
+    read_sequence_preview_fps,
+    write_inspector_thumbnail_open_exe,
+    write_inspector_thumbnail_source,
+    write_sequence_preview_fps,
+)
 from monostudio.ui_qt.pipeline_structure_editor import PipelineStructureEditorWidget
 from monostudio.core.update_checker import (
     CheckResult,
@@ -77,6 +91,22 @@ from monostudio.core.update_checker import (
     is_newer_than,
     launch_installer,
     run_installer_and_exit,
+)
+from monostudio.core.access_control import (
+    AccessRole,
+    admin_key_configured,
+    bundled_access_keys_module_path,
+    clear_session,
+    dev_key_configured,
+    has_access_restrictions,
+    is_admin_capable,
+    is_dev_session,
+    read_splash_display_ms,
+    read_verbose_debug_enabled,
+    session_role,
+    try_unlock,
+    write_splash_display_ms,
+    write_verbose_debug_enabled,
 )
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.version import get_app_version
@@ -254,6 +284,19 @@ class SettingsDialog(MonosDialog):
         self._use_dcc_folders_cb: QCheckBox | None = None
         self._notification_max_visible_combo: QComboBox | None = None
         self._publish_ignore_ext_field: QLineEdit | None = None
+        self._inspector_thumb_source_group: QButtonGroup | None = None
+        self._inspector_thumb_radio_user: QRadioButton | None = None
+        self._inspector_thumb_radio_render: QRadioButton | None = None
+        self._inspector_thumb_radio_both: QRadioButton | None = None
+        self._inspector_sequence_fps_spin: QSpinBox | None = None
+        self._inspector_thumb_open_exe_field: QLineEdit | None = None
+
+        self._pipeline_access_banner: QLabel | None = None
+        self._access_status_label: QLabel | None = None
+        self._access_unlock_field: QLineEdit | None = None
+        self._access_keys_info_label: QLabel | None = None
+        self._access_debug_cb: QCheckBox | None = None
+        self._access_splash_spin: QSpinBox | None = None
 
         # Tier 1: left nav — General | Pipeline | DCCs | Project
         self._content_stack = QStackedWidget(self)
@@ -284,7 +327,7 @@ class SettingsDialog(MonosDialog):
                 it.setIcon(ic)
             self._nav.addItem(it)
         self._nav.setCurrentRow(0)
-        self._nav.currentRowChanged.connect(self._content_stack.setCurrentIndex)
+        self._nav.currentRowChanged.connect(self._on_settings_nav_row_changed)
 
         nav_frame = QFrame(self)
         nav_frame.setObjectName("SettingsNavFrame")
@@ -454,13 +497,14 @@ class SettingsDialog(MonosDialog):
             b.setChecked(i == index)
 
     def _build_general_page(self) -> QWidget:
-        """Tier 2: General → Workspace | UI | Behavior | Updates (nút page ngang)."""
+        """Tier 2: General → Workspace | UI | Behavior | Updates | Access (nút page ngang)."""
         return self._build_tier2_page_buttons(
             [
                 ("Workspace", self._build_app_workspace_tab()),
                 ("UI", self._build_ui_tab()),
                 ("Behavior", self._build_behavior_tab()),
                 ("Updates", self._build_updates_tab()),
+                ("Access", self._build_access_tab()),
             ],
             store_stack="general",
             store_buttons="general",
@@ -493,8 +537,98 @@ class SettingsDialog(MonosDialog):
         grp_layout.addLayout(form)
         grp_layout.addWidget(hint)
         layout.addWidget(grp)
+
+        grp_insp = QGroupBox("Inspector preview", root)
+        insp_l = QVBoxLayout(grp_insp)
+        self._inspector_thumb_source_group = QButtonGroup(grp_insp)
+        r_user = QRadioButton("User thumbnail only (pasted / .user.)", grp_insp)
+        r_render = QRadioButton("Render sequence (work/render, preview, playblast, flipbook/…)", grp_insp)
+        r_both = QRadioButton("User first, then render sequence", grp_insp)
+        self._inspector_thumb_radio_user = r_user
+        self._inspector_thumb_radio_render = r_render
+        self._inspector_thumb_radio_both = r_both
+        self._inspector_thumb_source_group.addButton(r_user)
+        self._inspector_thumb_source_group.addButton(r_render)
+        self._inspector_thumb_source_group.addButton(r_both)
+        try:
+            mode = read_inspector_thumbnail_source(self._settings)
+            if mode == THUMB_SOURCE_USER:
+                r_user.setChecked(True)
+            elif mode == THUMB_SOURCE_RENDER_SEQUENCE:
+                r_render.setChecked(True)
+            else:
+                r_both.setChecked(True)
+        except Exception:
+            r_both.setChecked(True)
+        insp_l.addWidget(r_user)
+        insp_l.addWidget(r_render)
+        insp_l.addWidget(r_both)
+        hint_insp = QLabel(
+            "Applies to the large Inspector thumbnail only; main grid thumbnails are unchanged. "
+            "Sequences live under work/render, preview, playblast, or flipbook/<work file name>/ (priority: render → preview → playblast → flipbook).",
+            grp_insp,
+        )
+        hint_insp.setWordWrap(True)
+        hint_insp.setObjectName("DialogHelper")
+        insp_l.addWidget(hint_insp)
+        fps_form = QFormLayout()
+        self._inspector_sequence_fps_spin = QSpinBox(grp_insp)
+        self._inspector_sequence_fps_spin.setRange(1, 60)
+        try:
+            self._inspector_sequence_fps_spin.setValue(read_sequence_preview_fps(self._settings))
+        except Exception:
+            self._inspector_sequence_fps_spin.setValue(30)
+        fps_form.addRow("Sequence playback FPS:", self._inspector_sequence_fps_spin)
+        insp_l.addLayout(fps_form)
+        insp_l.addWidget(QLabel("Default app for thumbnail file:", grp_insp))
+        thumb_app_row = QHBoxLayout()
+        self._inspector_thumb_open_exe_field = QLineEdit(grp_insp)
+        self._inspector_thumb_open_exe_field.setPlaceholderText("Use default app for file type (Windows “Open with”)")
+        try:
+            self._inspector_thumb_open_exe_field.setText(read_inspector_thumbnail_open_exe(self._settings))
+        except Exception:
+            self._inspector_thumb_open_exe_field.setText("")
+        btn_thumb_browse = QPushButton("Browse…", grp_insp)
+        btn_thumb_browse.clicked.connect(self._browse_inspector_thumbnail_open_exe)
+        btn_thumb_clear = QPushButton("Clear", grp_insp)
+        btn_thumb_clear.clicked.connect(lambda: self._inspector_thumb_open_exe_field.setText(""))
+        thumb_app_row.addWidget(self._inspector_thumb_open_exe_field, 1)
+        thumb_app_row.addWidget(btn_thumb_browse, 0)
+        thumb_app_row.addWidget(btn_thumb_clear, 0)
+        insp_l.addLayout(thumb_app_row)
+        hint_thumb_app = QLabel(
+            "Double-click the Inspector thumbnail (or context menu → Open thumbnail file) launches this executable "
+            "with the image path. Sequence play/pause appears at the center when you hover the preview (like other overlay buttons). "
+            "Leave empty to use the system default.",
+            grp_insp,
+        )
+        hint_thumb_app.setWordWrap(True)
+        hint_thumb_app.setObjectName("DialogHelper")
+        insp_l.addWidget(hint_thumb_app)
+        layout.addWidget(grp_insp)
+
         layout.addStretch(1)
         return root
+
+    def _browse_inspector_thumbnail_open_exe(self) -> None:
+        start = ""
+        try:
+            if self._inspector_thumb_open_exe_field is not None:
+                t = (self._inspector_thumb_open_exe_field.text() or "").strip()
+                if t:
+                    p = Path(t)
+                    if p.parent.is_dir():
+                        start = str(p.parent)
+        except Exception:
+            start = ""
+        path, _flt = QFileDialog.getOpenFileName(
+            self,
+            "Select application for thumbnails",
+            start,
+            "Executable (*.exe);;All files (*.*)",
+        )
+        if path and self._inspector_thumb_open_exe_field is not None:
+            self._inspector_thumb_open_exe_field.setText(path.strip())
 
     def _build_behavior_tab(self) -> QWidget:
         """General → Behavior: global pipeline options (create asset/shot)."""
@@ -528,6 +662,172 @@ class SettingsDialog(MonosDialog):
         layout.addWidget(grp)
         layout.addStretch(1)
         return root
+
+    def _build_access_tab(self) -> QWidget:
+        """General → Access: shared key source info, unlock session, developer-only diagnostics."""
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        grp_src = QGroupBox("Bundled keys (repository / build only)", root)
+        gk = QVBoxLayout(grp_src)
+        self._access_keys_info_label = QLabel("", grp_src)
+        self._access_keys_info_label.setWordWrap(True)
+        self._access_keys_info_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self._access_keys_info_label.setProperty("mono", True)
+        gk.addWidget(self._access_keys_info_label)
+        hint_k = QLabel(
+            "Keys are defined only in monostudio/core/access_keys_bundled.py in source control. "
+            "They ship inside the app; users cannot change them from Settings.",
+            grp_src,
+        )
+        hint_k.setWordWrap(True)
+        hint_k.setObjectName("DialogHelper")
+        gk.addWidget(hint_k)
+        layout.addWidget(grp_src)
+
+        grp_unlock = QGroupBox("Session unlock", root)
+        gl = QVBoxLayout(grp_unlock)
+        self._access_status_label = QLabel("Locked — enter a key to unlock.", grp_unlock)
+        self._access_status_label.setObjectName("DialogHelper")
+        gl.addWidget(self._access_status_label)
+        row = QHBoxLayout()
+        self._access_unlock_field = QLineEdit(grp_unlock)
+        self._access_unlock_field.setPlaceholderText("Administrator or developer key")
+        self._access_unlock_field.setEchoMode(QLineEdit.EchoMode.Password)
+        btn_apply = QPushButton("Unlock", grp_unlock)
+        btn_apply.setObjectName("DialogPrimaryButton")
+        btn_apply.clicked.connect(self._on_access_unlock_clicked)
+        btn_lock = QPushButton("Lock session", grp_unlock)
+        btn_lock.setObjectName("DialogSecondaryButton")
+        btn_lock.clicked.connect(self._on_access_lock_clicked)
+        row.addWidget(self._access_unlock_field, 1)
+        row.addWidget(btn_apply, 0)
+        row.addWidget(btn_lock, 0)
+        gl.addLayout(row)
+        hint_u = QLabel(
+            "Administrator: pipeline structure and scan rules. Developer: same, plus debug logging and splash timing. "
+            "Unlock lasts until you close the app or click Lock session.",
+            grp_unlock,
+        )
+        hint_u.setWordWrap(True)
+        hint_u.setObjectName("DialogHelper")
+        gl.addWidget(hint_u)
+        layout.addWidget(grp_unlock)
+
+        grp_dev = QGroupBox("Developer", root)
+        gd = QVBoxLayout(grp_dev)
+        self._access_debug_cb = QCheckBox("Verbose debug logging (extra loggers → stderr)", grp_dev)
+        try:
+            if self._settings is not None:
+                self._access_debug_cb.setChecked(read_verbose_debug_enabled(self._settings))
+        except Exception:
+            pass
+        splash_row = QHBoxLayout()
+        self._access_splash_spin = QSpinBox(grp_dev)
+        self._access_splash_spin.setRange(500, 60_000)
+        self._access_splash_spin.setSingleStep(100)
+        try:
+            if self._settings is not None:
+                self._access_splash_spin.setValue(read_splash_display_ms(self._settings))
+            else:
+                self._access_splash_spin.setValue(2000)
+        except Exception:
+            self._access_splash_spin.setValue(2000)
+        splash_row.addWidget(QLabel("Splash minimum display (ms):", grp_dev))
+        splash_row.addWidget(self._access_splash_spin, 1)
+        gd.addWidget(self._access_debug_cb)
+        gd.addLayout(splash_row)
+        hint_d = QLabel(
+            "Applies after you save Settings and restart the app.",
+            grp_dev,
+        )
+        hint_d.setWordWrap(True)
+        hint_d.setObjectName("DialogHelper")
+        gd.addWidget(hint_d)
+        layout.addWidget(grp_dev)
+
+        layout.addStretch(1)
+        return root
+
+    def _on_settings_nav_row_changed(self, row: int) -> None:
+        self._content_stack.setCurrentIndex(row)
+        if row == 1:
+            self._refresh_pipeline_access_lock()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._refresh_access_tab_state()
+        self._refresh_pipeline_access_lock()
+
+    def _refresh_access_tab_state(self) -> None:
+        if self._access_status_label is None:
+            return
+        s = self._settings
+        a_cfg = admin_key_configured()
+        d_cfg = dev_key_configured()
+        if self._access_keys_info_label is not None:
+            try:
+                mod_path = bundled_access_keys_module_path()
+            except Exception:
+                mod_path = None
+            lines = [
+                f"Module: {mod_path}" if mod_path else "Module: monostudio.core.access_keys_bundled",
+                f"Administrator key: {'configured' if a_cfg else 'not configured'}",
+                f"Developer key: {'configured' if d_cfg else 'not configured'}",
+            ]
+            self._access_keys_info_label.setText("\n".join(lines))
+        role = session_role()
+        if not has_access_restrictions():
+            self._access_status_label.setText("No keys configured — pipeline and scan rules are not restricted.")
+        elif role == AccessRole.DEV:
+            self._access_status_label.setText("Session: Developer (full access).")
+        elif role == AccessRole.ADMIN:
+            self._access_status_label.setText("Session: Administrator (pipeline & scan rules).")
+        else:
+            self._access_status_label.setText("Restricted — unlock with an administrator or developer key.")
+        if self._access_unlock_field:
+            self._access_unlock_field.setEnabled(True)
+        dev_on = is_dev_session()
+        if self._access_debug_cb:
+            self._access_debug_cb.setEnabled(dev_on and s is not None)
+        if self._access_splash_spin:
+            self._access_splash_spin.setEnabled(dev_on and s is not None)
+
+    def _refresh_pipeline_access_lock(self) -> None:
+        admin_ok = is_admin_capable()
+        if self._pipeline_editor is not None:
+            self._pipeline_editor.setEnabled(admin_ok)
+        if self._publish_ignore_ext_field is not None:
+            self._publish_ignore_ext_field.setEnabled(admin_ok)
+        if self._pipeline_access_banner is not None:
+            if has_access_restrictions() and not admin_ok:
+                self._pipeline_access_banner.setText(
+                    "Pipeline structure and scan rules are locked. Unlock in General → Access with an administrator or developer key."
+                )
+                self._pipeline_access_banner.setVisible(True)
+            else:
+                self._pipeline_access_banner.setVisible(False)
+
+    def _on_access_unlock_clicked(self) -> None:
+        if self._access_unlock_field is None:
+            return
+        entered = (self._access_unlock_field.text() or "").strip()
+        role = try_unlock(entered)
+        if role is None:
+            QMessageBox.warning(self, "Access", "Key does not match any configured administrator or developer key.")
+        else:
+            self._access_unlock_field.clear()
+        self._refresh_access_tab_state()
+        self._refresh_pipeline_access_lock()
+
+    def _on_access_lock_clicked(self) -> None:
+        clear_session()
+        self._refresh_access_tab_state()
+        self._refresh_pipeline_access_lock()
 
     def _build_updates_tab(self) -> QWidget:
         """General → Updates: one list (MonoStudio + other products), each row: icon, name, version, View release notes, action button."""
@@ -1110,11 +1410,26 @@ class SettingsDialog(MonosDialog):
 
     def _build_pipeline_page(self) -> QWidget:
         """Tier 2: Pipeline → Pipeline structure | Scan rules | Statuses."""
-        return self._build_tier2_page_buttons([
-            ("Pipeline structure", self._build_pipeline_structure_page()),
-            ("Scan rules", self._build_pipeline_scan_rules_tab()),
-            ("Statuses", self._placeholder("Pipeline → Statuses (placeholder)")),
-        ], store_stack="pipeline", store_buttons="pipeline")
+        outer = QWidget(self)
+        ol = QVBoxLayout(outer)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.setSpacing(8)
+        self._pipeline_access_banner = QLabel(outer)
+        self._pipeline_access_banner.setWordWrap(True)
+        self._pipeline_access_banner.setObjectName("DialogHelper")
+        self._pipeline_access_banner.setVisible(False)
+        ol.addWidget(self._pipeline_access_banner, 0)
+        inner = self._build_tier2_page_buttons(
+            [
+                ("Pipeline structure", self._build_pipeline_structure_page()),
+                ("Scan rules", self._build_pipeline_scan_rules_tab()),
+                ("Statuses", self._placeholder("Pipeline → Statuses (placeholder)")),
+            ],
+            store_stack="pipeline",
+            store_buttons="pipeline",
+        )
+        ol.addWidget(inner, 1)
+        return outer
 
     def _build_dccs_page(self) -> QWidget:
         """DCCs: single page (Blender / integrations)."""
@@ -1625,19 +1940,21 @@ class SettingsDialog(MonosDialog):
         return block
 
     def _on_save(self) -> None:
-        if self._project_root is not None and self._pipeline_editor is not None:
-            self._config = self._pipeline_editor.build_pipeline_types_and_presets()
-            if not self._pipeline_editor.save_all_to_project(self._project_root):
-                QMessageBox.critical(self, "Settings", "Failed to save pipeline configuration to project.")
-                return
-        elif self._project_root is not None:
-            if not save_pipeline_types_and_presets_to_project(self._project_root, self._config):
-                QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets to project.")
-                return
-        else:
-            if not save_pipeline_types_and_presets(self._config):
-                QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets.")
-                return
+        _admin_save = is_admin_capable()
+        if _admin_save:
+            if self._project_root is not None and self._pipeline_editor is not None:
+                self._config = self._pipeline_editor.build_pipeline_types_and_presets()
+                if not self._pipeline_editor.save_all_to_project(self._project_root):
+                    QMessageBox.critical(self, "Settings", "Failed to save pipeline configuration to project.")
+                    return
+            elif self._project_root is not None:
+                if not save_pipeline_types_and_presets_to_project(self._project_root, self._config):
+                    QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets to project.")
+                    return
+            else:
+                if not save_pipeline_types_and_presets(self._config):
+                    QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets.")
+                    return
 
         # Persist project-level use_dcc_folders when project is set.
         if self._project_root is not None and self._use_dcc_folders_cb is not None:
@@ -1656,6 +1973,25 @@ class SettingsDialog(MonosDialog):
         except Exception:
             pass
 
+        # Inspector preview: thumbnail source + sequence playback FPS.
+        try:
+            if self._settings is not None and self._inspector_thumb_radio_user is not None:
+                if self._inspector_thumb_radio_user.isChecked():
+                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER)
+                elif self._inspector_thumb_radio_render is not None and self._inspector_thumb_radio_render.isChecked():
+                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_RENDER_SEQUENCE)
+                else:
+                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER_THEN_RENDER)
+            if self._settings is not None and self._inspector_sequence_fps_spin is not None:
+                write_sequence_preview_fps(self._settings, self._inspector_sequence_fps_spin.value())
+            if self._settings is not None and self._inspector_thumb_open_exe_field is not None:
+                write_inspector_thumbnail_open_exe(
+                    self._settings,
+                    (self._inspector_thumb_open_exe_field.text() or "").strip(),
+                )
+        except Exception:
+            pass
+
         # Persist global pipeline behavior (create work/publish subfolders).
         try:
             if self._settings is not None and self._create_work_publish_subfolders_cb is not None:
@@ -1666,13 +2002,27 @@ class SettingsDialog(MonosDialog):
         except Exception:
             pass
 
-        # Persist publish ignore extensions.
+        # Persist publish ignore extensions (same access tier as pipeline / scan rules).
         try:
-            if self._settings is not None and self._publish_ignore_ext_field is not None:
+            if (
+                _admin_save
+                and self._settings is not None
+                and self._publish_ignore_ext_field is not None
+            ):
                 self._settings.setValue(
                     "pipeline/publish_ignore_extensions",
                     (self._publish_ignore_ext_field.text() or "").strip(),
                 )
+        except Exception:
+            pass
+
+        # Developer-only persisted diagnostics.
+        try:
+            if self._settings is not None and is_dev_session():
+                if self._access_debug_cb is not None:
+                    write_verbose_debug_enabled(self._settings, self._access_debug_cb.isChecked())
+                if self._access_splash_spin is not None:
+                    write_splash_display_ms(self._settings, self._access_splash_spin.value())
         except Exception:
             pass
 

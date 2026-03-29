@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
-from monostudio.ui_qt.thumbnails import ThumbnailCache, make_department_cache_key
+from monostudio.ui_qt.thumbnails import ThumbnailCache
 from monostudio.ui_qt.style import MONOS_COLORS, THUMB_TAG_STYLE, monos_font
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -2352,6 +2352,35 @@ class MainView(QWidget):
                 return True
         return False
 
+    def _thumbnail_request_extras(self, item: ViewItem) -> dict:
+        """Pipeline ref + active DCC for ThumbnailManager (render-sequence / user_then rules)."""
+        active_dept = (self._active_department or "").strip() or None
+        ref = getattr(item, "ref", None)
+        pipeline_ref = ref if isinstance(ref, (Asset, Shot)) else None
+        active_dcc: str | None = None
+        if pipeline_ref is not None and active_dept and getattr(item, "path", None):
+            active_dcc = self.get_active_dcc(item.path, active_dept)
+        return {"pipeline_ref": pipeline_ref, "active_dcc_id": active_dcc}
+
+    def invalidate_all_thumbnails_for_source_change(self) -> None:
+        """After global thumbnail-source setting change: reset row state so grid reloads with new resolver."""
+        for row in range(self._tile_model.rowCount()):
+            idx = self._tile_model.index(row, 0)
+            if not idx.isValid():
+                continue
+            item = idx.data(Qt.UserRole)
+            if not isinstance(item, ViewItem):
+                continue
+            std_item = self._tile_model.itemFromIndex(idx)
+            if std_item is None:
+                continue
+            std_item.setData(None, self._THUMB_STATE_ROLE)
+            std_item.setIcon(self._icon_for_item(item))
+            list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
+            if list_thumb is not None:
+                list_thumb.setIcon(std_item.icon())
+        self._schedule_thumbnail_prefetch()
+
     def invalidate_thumbnail(self, item_root: Path, department: str | None = None) -> None:
         """
         Force a thumbnail refresh for a specific item (and optionally a department).
@@ -2387,7 +2416,11 @@ class MainView(QWidget):
             std_item.setData(None, self._THUMB_STATE_ROLE)
             icon = None
             if mgr is not None and hasattr(mgr, "request_thumbnail"):
-                pix = mgr.request_thumbnail(asset_id, department=active_dept)
+                pix = mgr.request_thumbnail(
+                    asset_id,
+                    department=active_dept,
+                    **self._thumbnail_request_extras(item),
+                )
                 if pix is not None:
                     icon = QIcon(pix)
                     std_item.setIcon(icon)
@@ -2452,7 +2485,11 @@ class MainView(QWidget):
             std_item = self._tile_model.itemFromIndex(idx)
             if std_item is None:
                 continue
-            pix = mgr.request_thumbnail(entity_path, department=active_dept)
+            pix = mgr.request_thumbnail(
+                entity_path,
+                department=active_dept,
+                **self._thumbnail_request_extras(item),
+            )
             if pix is not None:
                 icon = QIcon(pix)
                 std_item.setIcon(icon)
@@ -3801,7 +3838,11 @@ class MainView(QWidget):
             asset_id = str(item.path)
             mgr = getattr(self, "_thumbnail_manager", None)
             if mgr is not None and hasattr(mgr, "request_thumbnail"):
-                pix = mgr.request_thumbnail(asset_id, department=active_dept)
+                pix = mgr.request_thumbnail(
+                    asset_id,
+                    department=active_dept,
+                    **self._thumbnail_request_extras(item),
+                )
                 if pix is not None:
                     icon = QIcon(pix)
                     std_item.setIcon(icon)

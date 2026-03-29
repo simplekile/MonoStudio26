@@ -10,10 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QObject, QTimer
+from PySide6.QtCore import Qt, QObject, QTimer, QSettings
 from PySide6.QtGui import QPixmap, QImage
 
 if TYPE_CHECKING:
+    from monostudio.core.models import Asset, Shot
     from monostudio.ui_qt.app_state import AppState
     from monostudio.ui_qt.worker_manager import WorkerManager
 
@@ -112,6 +113,7 @@ def _load_video_frame_via_ffmpeg(video_path: Path, size_px: int) -> QPixmap | No
 
 
 _DEPT_THUMB_CACHE_SEP = "::dept::"
+_THUMB_SOURCE_MODE_MARKER = "::tsm::"
 
 
 def _thumbnail_disk_cache_dir() -> Path:
@@ -144,6 +146,22 @@ def resolve_department_thumbnail_path(item_root: Path, department: str) -> Path 
     return None
 
 
+def resolve_user_only_thumbnail_path(item_root: Path, department: str | None) -> Path | None:
+    """Only user-provided thumbnails (paste / explicit .user. files), not auto thumb_{dept}.png."""
+    dep = (department or "").strip()
+    if dep:
+        meta = item_root / ".meta"
+        for name in (f"thumb_{dep}.user.png", f"thumb_{dep}.user.jpg"):
+            p = meta / name
+            if p.is_file():
+                return p
+    for name in ("thumbnail.user.png", "thumbnail.user.jpg"):
+        p = item_root / name
+        if p.is_file():
+            return p
+    return None
+
+
 def resolve_thumbnail_path(item_root: Path, department: str | None = None) -> Path | None:
     """
     Resolve thumbnail path with department fallback:
@@ -168,20 +186,32 @@ def resolve_thumbnail_path(item_root: Path, department: str | None = None) -> Pa
     return None
 
 
-def make_department_cache_key(entity_path: str, department: str | None) -> str:
-    """Build cache key: entity path alone, or entity::dept::department when filtered."""
+def make_department_cache_key(
+    entity_path: str,
+    department: str | None,
+    *,
+    thumb_source_mode: str | None = None,
+) -> str:
+    """Build cache key: entity path alone, or entity::dept::department when filtered; optional ::tsm::mode."""
     dep = (department or "").strip()
     if dep:
-        return f"{entity_path}{_DEPT_THUMB_CACHE_SEP}{dep}"
-    return entity_path
+        base = f"{entity_path}{_DEPT_THUMB_CACHE_SEP}{dep}"
+    else:
+        base = entity_path
+    if thumb_source_mode:
+        return f"{base}{_THUMB_SOURCE_MODE_MARKER}{thumb_source_mode}"
+    return base
 
 
 def parse_department_cache_key(cache_key: str) -> tuple[str, str | None]:
-    """Split cache key back into (entity_path, department_or_None)."""
-    if _DEPT_THUMB_CACHE_SEP in cache_key:
-        parts = cache_key.split(_DEPT_THUMB_CACHE_SEP, 1)
+    """Split cache key back into (entity_path, department_or_None). Strips ::tsm:: suffix if present."""
+    s = cache_key
+    if _THUMB_SOURCE_MODE_MARKER in s:
+        s = s.split(_THUMB_SOURCE_MODE_MARKER, 1)[0]
+    if _DEPT_THUMB_CACHE_SEP in s:
+        parts = s.split(_DEPT_THUMB_CACHE_SEP, 1)
         return (parts[0], parts[1] if len(parts) > 1 else None)
-    return (cache_key, None)
+    return (s, None)
 
 
 @dataclass
@@ -274,7 +304,14 @@ def _load_thumbnail_image_worker(file_path: str, size_px: int, cache_key: str | 
     if not p.is_file():
         return None
     try:
-        img = QImage(file_path)
+        ext = (p.suffix or "").strip().lower()
+        img: QImage | None = None
+        if ext in (".exr", ".hdr"):
+            from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+            img = load_preview_frame_qimage(p, max_side=size_px)
+        if img is None or img.isNull():
+            img = QImage(str(p))
         if img.isNull():
             return None
         scaled = img.scaled(
@@ -305,12 +342,14 @@ class ThumbnailManager(QObject):
         worker_manager: "WorkerManager",
         size_px: int = DEFAULT_THUMB_SIZE_PX,
         max_memory: int = DEFAULT_MEMORY_CACHE_MAX,
+        settings: QSettings | None = None,
     ) -> None:
         super().__init__(parent)
         self._app_state = app_state
         self._worker_manager = worker_manager
         self._size_px = size_px
         self._max_memory = max(1, max_memory)
+        self._settings = settings
         self._cache: OrderedDict[str, QPixmap] = OrderedDict()
         self._pending: set[str] = set()
         self._connect_worker()
@@ -320,15 +359,30 @@ class ThumbnailManager(QObject):
         if isinstance(self._worker_manager, WorkerManager):
             self._worker_manager.taskFinished.connect(self._on_task_finished)
 
-    def request_thumbnail(self, asset_id: str, department: str | None = None) -> QPixmap | None:
+    def request_thumbnail(
+        self,
+        asset_id: str,
+        department: str | None = None,
+        *,
+        pipeline_ref: "Asset | Shot | None" = None,
+        active_dcc_id: str | None = None,
+    ) -> QPixmap | None:
         """
         Return pixmap from memory cache if present; else return None (caller shows placeholder)
         and schedule async load if not already pending. Duplicate requests coalesced.
         When department is given, looks for department-specific thumb first (fallback to entity).
+        With settings + pipeline_ref, thumbnail source mode (user / render sequence / …) applies.
         """
         if not asset_id or not str(asset_id).strip():
             return None
-        cache_key = make_department_cache_key(str(asset_id).strip(), department)
+        from monostudio.ui_qt.inspector_preview_settings import read_inspector_thumbnail_source
+
+        mode = read_inspector_thumbnail_source(self._settings)
+        cache_key = make_department_cache_key(
+            str(asset_id).strip(),
+            department,
+            thumb_source_mode=mode,
+        )
         if cache_key in self._cache:
             self._cache.move_to_end(cache_key)
             try:
@@ -346,12 +400,36 @@ class ThumbnailManager(QObject):
             pass
         if cache_key not in self._pending:
             self._pending.add(cache_key)
-            self._schedule_load(str(asset_id).strip(), department, cache_key)
+            self._schedule_load(
+                str(asset_id).strip(),
+                department,
+                cache_key,
+                pipeline_ref=pipeline_ref,
+                active_dcc_id=active_dcc_id,
+            )
         return None
 
-    def _schedule_load(self, entity_path: str, department: str | None, cache_key: str) -> None:
+    def _schedule_load(
+        self,
+        entity_path: str,
+        department: str | None,
+        cache_key: str,
+        *,
+        pipeline_ref: "Asset | Shot | None" = None,
+        active_dcc_id: str | None = None,
+    ) -> None:
         dep = (department or "").strip() or None
-        path = resolve_thumbnail_path(Path(entity_path), department=dep)
+        from monostudio.ui_qt.inspector_preview_settings import read_inspector_thumbnail_source
+        from monostudio.ui_qt.thumbnail_source_resolve import resolve_grid_thumbnail_file
+
+        mode = read_inspector_thumbnail_source(self._settings)
+        path = resolve_grid_thumbnail_file(
+            Path(entity_path),
+            dep,
+            mode=mode,
+            pipeline_ref=pipeline_ref,
+            active_dcc_id=active_dcc_id,
+        )
         if path is None:
             self._pending.discard(cache_key)
             return
@@ -396,17 +474,37 @@ class ThumbnailManager(QObject):
         entity_path, _ = parse_department_cache_key(cache_key)
         self._app_state.notify_thumbnail_ready([cache_key, entity_path])
 
+    def _keys_for_entity_dep(self, entity_path: str, department: str | None) -> list[str]:
+        dep_norm = (department or "").strip() or None
+        seen: set[str] = set()
+        out: list[str] = []
+        for k in set(self._cache.keys()) | self._pending:
+            ep, d = parse_department_cache_key(k)
+            if ep != entity_path:
+                continue
+            if dep_norm is None:
+                if d is not None:
+                    continue
+            elif d != dep_norm:
+                continue
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
+
     def invalidate(self, asset_id: str, department: str | None = None) -> None:
         """Remove from memory cache; allow reload on next request. Emit so UI refreshes."""
         aid = (asset_id or "").strip()
         if not aid:
             return
-        cache_key = make_department_cache_key(aid, department)
-        self._cache.pop(cache_key, None)
-        self._pending.discard(cache_key)
-        # Also invalidate entity-level key if department was given (ensures fallback refreshes).
-        if department:
-            self._cache.pop(aid, None)
-            self._pending.discard(aid)
-        self._app_state.invalidate_thumbnails([cache_key, aid])
+        keys = self._keys_for_entity_dep(aid, department)
+        for cache_key in keys:
+            self._cache.pop(cache_key, None)
+            self._pending.discard(cache_key)
+        self._app_state.invalidate_thumbnails(keys + [aid] if keys else [aid])
+
+    def clear_memory_cache(self) -> None:
+        """Drop all in-memory thumbnails and pending loads (e.g. thumbnail source mode changed)."""
+        self._cache.clear()
+        self._pending.clear()
 

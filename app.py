@@ -7,10 +7,11 @@ import sys
 from pathlib import Path
 
 import time
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
+from monostudio.core.access_control import read_splash_display_ms, read_verbose_debug_enabled
 from monostudio.core.app_paths import get_app_base_path, write_install_path_for_tools
 from monostudio.core.crash_recovery import install_crash_logging
 from monostudio.core.pipeline_types_and_presets import ensure_user_default_config_dir
@@ -18,7 +19,6 @@ from monostudio.ui_qt.main_window import MainWindow
 from monostudio.core.version import get_app_version
 from monostudio.ui_qt.style import apply_dark_theme
 
-SPLASH_DISPLAY_MS = 2000
 SPLASH_LOADING_UPDATE_MS = 50
 SPLASH_SIZE = (460, 280)
 SPLASH_BG = "#121214"
@@ -135,35 +135,45 @@ def _ensure_comtypes_on_windows() -> None:
 
 def main() -> int:
     install_crash_logging()
-    # DCC status / pending_create / assets diff debugging (Blender/subprocess spam stdout)
+    # DCC / pending_create / assets-diff tracing: quiet by default (no DEBUG to console or log file).
     _dcc_log = logging.getLogger("monostudio.dcc_debug")
-    _dcc_log.setLevel(logging.DEBUG)
+    _dcc_log.setLevel(logging.WARNING)
+    _dcc_log.propagate = False
     try:
         _log_path = Path.cwd() / "monostudio_dcc_debug.log"
         _fh = logging.FileHandler(_log_path, mode="a", encoding="utf-8")
         _fh.setLevel(logging.DEBUG)
         _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        _dcc_log.addHandler(_fh)
-        # Same file for fs watcher debug (to verify watcher is receiving events)
+        # Fs watcher diagnostics still append here when that logger emits DEBUG.
         _watcher_log = logging.getLogger("monostudio.fs_watcher")
         _watcher_log.setLevel(logging.DEBUG)
         _watcher_log.addHandler(_fh)
     except Exception:
         pass
-    # Project Guide drag-drop debug (set MONOS_DEBUG_PROJECT_GUIDE_DROP=1)
-    if os.environ.get("MONOS_DEBUG_PROJECT_GUIDE_DROP"):
-        _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        _sh = logging.StreamHandler(sys.stderr)
-        _sh.setLevel(logging.DEBUG)
-        _sh.setFormatter(_fmt)
-        for _name in ("monostudio.ui_qt.reference_page_widget", "monostudio.ui_qt.inbox_split_view", "monostudio.ui_qt.main_window"):
-            _log = logging.getLogger(_name)
-            _log.setLevel(logging.DEBUG)
-            _log.addHandler(_sh)
     # Qt6 (PySide6) enables high-DPI scaling/pixmaps by default.
     # These application attributes are deprecated and emit warnings in Qt6.
 
     app = QApplication(sys.argv)
+
+    _boot_settings = QSettings("MonoStudio26", "MonoStudio26")
+    _splash_display_ms = read_splash_display_ms(_boot_settings)
+
+    # Verbose UI debug: env override or General → Access (developer) + Save Settings.
+    if os.environ.get("MONOS_DEBUG_PROJECT_GUIDE_DROP") or read_verbose_debug_enabled(_boot_settings):
+        _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        _sh = logging.StreamHandler(sys.stderr)
+        _sh.setLevel(logging.DEBUG)
+        _sh.setFormatter(_fmt)
+        for _name in (
+            "monostudio.ui_qt.reference_page_widget",
+            "monostudio.ui_qt.inbox_split_view",
+            "monostudio.ui_qt.main_window",
+            "monostudio.dcc_debug",
+            "monostudio.ui_qt.app_state",
+        ):
+            _log = logging.getLogger(_name)
+            _log.setLevel(logging.DEBUG)
+            _log.addHandler(_sh)
 
     # Resolve version once (git commit count)
     _version = get_app_version()
@@ -212,10 +222,10 @@ def main() -> int:
 
     _splash_step("Almost ready…", 0.90)
 
-    # Keep splash visible until at least SPLASH_DISPLAY_MS has passed
+    # Keep splash visible until at least configured minimum has passed
     def _tick_splash() -> None:
         elapsed = (time.monotonic() - splash_start) * 1000
-        progress = min(1.0, elapsed / SPLASH_DISPLAY_MS)
+        progress = min(1.0, elapsed / max(1, _splash_display_ms))
         status = "Ready" if progress >= 1.0 else _splash_status
         splash.setPixmap(_make_splash_pixmap(_icon, progress, status, _version))
         if progress >= 1.0:
