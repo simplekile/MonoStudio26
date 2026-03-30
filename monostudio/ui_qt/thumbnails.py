@@ -375,9 +375,15 @@ class ThumbnailManager(QObject):
         """
         if not asset_id or not str(asset_id).strip():
             return None
+        from monostudio.core.models import Asset, Shot
         from monostudio.ui_qt.inspector_preview_settings import read_inspector_thumbnail_source
 
-        mode = read_inspector_thumbnail_source(self._settings)
+        if isinstance(pipeline_ref, Asset):
+            mode = read_inspector_thumbnail_source(self._settings, entity="asset")
+        elif isinstance(pipeline_ref, Shot):
+            mode = read_inspector_thumbnail_source(self._settings, entity="shot")
+        else:
+            mode = None
         cache_key = make_department_cache_key(
             str(asset_id).strip(),
             department,
@@ -419,10 +425,19 @@ class ThumbnailManager(QObject):
         active_dcc_id: str | None = None,
     ) -> None:
         dep = (department or "").strip() or None
-        from monostudio.ui_qt.inspector_preview_settings import read_inspector_thumbnail_source
+        from monostudio.core.models import Asset, Shot
+        from monostudio.ui_qt.inspector_preview_settings import (
+            THUMB_SOURCE_USER_THEN_RENDER,
+            read_inspector_thumbnail_source,
+        )
         from monostudio.ui_qt.thumbnail_source_resolve import resolve_grid_thumbnail_file
 
-        mode = read_inspector_thumbnail_source(self._settings)
+        if isinstance(pipeline_ref, Asset):
+            mode = read_inspector_thumbnail_source(self._settings, entity="asset")
+        elif isinstance(pipeline_ref, Shot):
+            mode = read_inspector_thumbnail_source(self._settings, entity="shot")
+        else:
+            mode = THUMB_SOURCE_USER_THEN_RENDER
         path = resolve_grid_thumbnail_file(
             Path(entity_path),
             dep,

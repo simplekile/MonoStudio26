@@ -1077,17 +1077,32 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(255, 255, 255, 0.08);
             border-radius: 6px;
         }
-        QFrame#MainViewCardSizePopup {
+        QFrame#MainViewOptionsPopup {
             background-color: #1c1c1f;
             border: 1px solid #2a2a2d;
             border-radius: 8px;
         }
-        QToolButton#MainViewCardSizeButton {
+        QFrame#MainViewOptionsPopup QSlider {
+            margin: 0px;
+            padding: 0px;
+        }
+        QFrame#MainViewOptionsPopup QRadioButton {
+            padding: 0px 0px;
+            margin: 0px;
+            min-height: 20px;
+            max-height: 22px;
+            spacing: 6px;
+        }
+        QFrame#MainViewOptionsPopup QRadioButton::indicator {
+            width: 14px;
+            height: 14px;
+        }
+        QToolButton#MainViewOptionsButton {
             padding: 6px;
             border: none;
             background: transparent;
         }
-        QToolButton#MainViewCardSizeButton:hover {
+        QToolButton#MainViewOptionsButton:hover {
             background: rgba(255, 255, 255, 0.08);
             border-radius: 6px;
         }

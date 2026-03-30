@@ -311,6 +311,7 @@ class MainWindow(FramelessMainWindow):
         self._inspector.inbox_distribute_finished.connect(self._on_inbox_distribute_finished)
         self._inspector.active_dcc_changed.connect(self._on_inspector_active_dcc_changed)
         self._main_view.active_dcc_changed.connect(self._on_main_view_active_dcc_changed)
+        self._main_view.thumbnail_source_changed.connect(self._on_main_view_thumbnail_source_changed)
 
         # Restore last nav page (Assets/Shots/Inbox/...) after connections so Inbox switch builds split view.
         self._restore_sidebar_context()
@@ -2905,6 +2906,12 @@ class MainWindow(FramelessMainWindow):
             parent=self,
         )
         dialog.show()
+
+    def _on_main_view_thumbnail_source_changed(self) -> None:
+        """Header popup: user vs render sequence — same refresh path as saving Settings."""
+        self._thumbnail_manager.clear_memory_cache()
+        self._main_view.invalidate_all_thumbnails_for_source_change()
+        self._inspector.invalidate_inspector_preview_settings_cache()
 
     def _open_settings(self) -> None:
         dialog = SettingsDialog(

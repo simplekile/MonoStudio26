@@ -284,10 +284,14 @@ class SettingsDialog(MonosDialog):
         self._use_dcc_folders_cb: QCheckBox | None = None
         self._notification_max_visible_combo: QComboBox | None = None
         self._publish_ignore_ext_field: QLineEdit | None = None
-        self._inspector_thumb_source_group: QButtonGroup | None = None
-        self._inspector_thumb_radio_user: QRadioButton | None = None
-        self._inspector_thumb_radio_render: QRadioButton | None = None
-        self._inspector_thumb_radio_both: QRadioButton | None = None
+        self._inspector_thumb_source_group_asset: QButtonGroup | None = None
+        self._inspector_thumb_source_group_shot: QButtonGroup | None = None
+        self._inspector_thumb_radio_asset_user: QRadioButton | None = None
+        self._inspector_thumb_radio_asset_render: QRadioButton | None = None
+        self._inspector_thumb_radio_asset_both: QRadioButton | None = None
+        self._inspector_thumb_radio_shot_user: QRadioButton | None = None
+        self._inspector_thumb_radio_shot_render: QRadioButton | None = None
+        self._inspector_thumb_radio_shot_both: QRadioButton | None = None
         self._inspector_sequence_fps_spin: QSpinBox | None = None
         self._inspector_thumb_open_exe_field: QLineEdit | None = None
 
@@ -540,32 +544,74 @@ class SettingsDialog(MonosDialog):
 
         grp_insp = QGroupBox("Inspector preview", root)
         insp_l = QVBoxLayout(grp_insp)
-        self._inspector_thumb_source_group = QButtonGroup(grp_insp)
-        r_user = QRadioButton("User thumbnail only (pasted / .user.)", grp_insp)
-        r_render = QRadioButton("Render sequence (work/render, preview, playblast, flipbook/…)", grp_insp)
-        r_both = QRadioButton("User first, then render sequence", grp_insp)
-        self._inspector_thumb_radio_user = r_user
-        self._inspector_thumb_radio_render = r_render
-        self._inspector_thumb_radio_both = r_both
-        self._inspector_thumb_source_group.addButton(r_user)
-        self._inspector_thumb_source_group.addButton(r_render)
-        self._inspector_thumb_source_group.addButton(r_both)
+        _tip_u = (
+            "Only user thumbnails (pasted or .user.* files).\nWork render/preview sequences are ignored."
+        )
+        _tip_r = (
+            "Image sequence under the active work file folder:\n"
+            "work/render → preview → playblast → flipbook, then <work name>/."
+        )
+        _tip_s = "Prefer a user thumbnail when it exists;\notherwise use the same sequence path as Render."
+
+        insp_l.addWidget(QLabel("Thumbnail source — Assets", grp_insp))
+        self._inspector_thumb_source_group_asset = QButtonGroup(grp_insp)
+        r_au = QRadioButton("User", grp_insp)
+        r_au.setToolTip(_tip_u)
+        r_ar = QRadioButton("Render", grp_insp)
+        r_ar.setToolTip(_tip_r)
+        r_ab = QRadioButton("Smart", grp_insp)
+        r_ab.setToolTip(_tip_s)
+        self._inspector_thumb_radio_asset_user = r_au
+        self._inspector_thumb_radio_asset_render = r_ar
+        self._inspector_thumb_radio_asset_both = r_ab
+        self._inspector_thumb_source_group_asset.addButton(r_au)
+        self._inspector_thumb_source_group_asset.addButton(r_ar)
+        self._inspector_thumb_source_group_asset.addButton(r_ab)
         try:
-            mode = read_inspector_thumbnail_source(self._settings)
-            if mode == THUMB_SOURCE_USER:
-                r_user.setChecked(True)
-            elif mode == THUMB_SOURCE_RENDER_SEQUENCE:
-                r_render.setChecked(True)
+            ma = read_inspector_thumbnail_source(self._settings, entity="asset")
+            if ma == THUMB_SOURCE_USER:
+                r_au.setChecked(True)
+            elif ma == THUMB_SOURCE_RENDER_SEQUENCE:
+                r_ar.setChecked(True)
             else:
-                r_both.setChecked(True)
+                r_ab.setChecked(True)
         except Exception:
-            r_both.setChecked(True)
-        insp_l.addWidget(r_user)
-        insp_l.addWidget(r_render)
-        insp_l.addWidget(r_both)
+            r_ab.setChecked(True)
+        insp_l.addWidget(r_au)
+        insp_l.addWidget(r_ar)
+        insp_l.addWidget(r_ab)
+
+        insp_l.addWidget(QLabel("Thumbnail source — Shots", grp_insp))
+        self._inspector_thumb_source_group_shot = QButtonGroup(grp_insp)
+        r_su = QRadioButton("User", grp_insp)
+        r_su.setToolTip(_tip_u)
+        r_sr = QRadioButton("Render", grp_insp)
+        r_sr.setToolTip(_tip_r)
+        r_sb = QRadioButton("Smart", grp_insp)
+        r_sb.setToolTip(_tip_s)
+        self._inspector_thumb_radio_shot_user = r_su
+        self._inspector_thumb_radio_shot_render = r_sr
+        self._inspector_thumb_radio_shot_both = r_sb
+        self._inspector_thumb_source_group_shot.addButton(r_su)
+        self._inspector_thumb_source_group_shot.addButton(r_sr)
+        self._inspector_thumb_source_group_shot.addButton(r_sb)
+        try:
+            ms = read_inspector_thumbnail_source(self._settings, entity="shot")
+            if ms == THUMB_SOURCE_USER:
+                r_su.setChecked(True)
+            elif ms == THUMB_SOURCE_RENDER_SEQUENCE:
+                r_sr.setChecked(True)
+            else:
+                r_sb.setChecked(True)
+        except Exception:
+            r_sb.setChecked(True)
+        insp_l.addWidget(r_su)
+        insp_l.addWidget(r_sr)
+        insp_l.addWidget(r_sb)
+
         hint_insp = QLabel(
-            "Applies to the large Inspector thumbnail only; main grid thumbnails are unchanged. "
-            "Sequences live under work/render, preview, playblast, or flipbook/<work file name>/ (priority: render → preview → playblast → flipbook).",
+            "Grid, list, and Inspector. Assets and Shots can use different modes. "
+            "Render uses work/render → preview → playblast → flipbook/<work name>/.",
             grp_insp,
         )
         hint_insp.setWordWrap(True)
@@ -1973,15 +2019,36 @@ class SettingsDialog(MonosDialog):
         except Exception:
             pass
 
-        # Inspector preview: thumbnail source + sequence playback FPS.
+        # Inspector preview: thumbnail source (asset vs shot) + sequence playback FPS.
         try:
-            if self._settings is not None and self._inspector_thumb_radio_user is not None:
-                if self._inspector_thumb_radio_user.isChecked():
-                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER)
-                elif self._inspector_thumb_radio_render is not None and self._inspector_thumb_radio_render.isChecked():
-                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_RENDER_SEQUENCE)
+            if self._settings is not None and self._inspector_thumb_radio_asset_user is not None:
+                if self._inspector_thumb_radio_asset_user.isChecked():
+                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER, entity="asset")
+                elif (
+                    self._inspector_thumb_radio_asset_render is not None
+                    and self._inspector_thumb_radio_asset_render.isChecked()
+                ):
+                    write_inspector_thumbnail_source(
+                        self._settings, THUMB_SOURCE_RENDER_SEQUENCE, entity="asset"
+                    )
                 else:
-                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER_THEN_RENDER)
+                    write_inspector_thumbnail_source(
+                        self._settings, THUMB_SOURCE_USER_THEN_RENDER, entity="asset"
+                    )
+            if self._settings is not None and self._inspector_thumb_radio_shot_user is not None:
+                if self._inspector_thumb_radio_shot_user.isChecked():
+                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER, entity="shot")
+                elif (
+                    self._inspector_thumb_radio_shot_render is not None
+                    and self._inspector_thumb_radio_shot_render.isChecked()
+                ):
+                    write_inspector_thumbnail_source(
+                        self._settings, THUMB_SOURCE_RENDER_SEQUENCE, entity="shot"
+                    )
+                else:
+                    write_inspector_thumbnail_source(
+                        self._settings, THUMB_SOURCE_USER_THEN_RENDER, entity="shot"
+                    )
             if self._settings is not None and self._inspector_sequence_fps_spin is not None:
                 write_sequence_preview_fps(self._settings, self._inspector_sequence_fps_spin.value())
             if self._settings is not None and self._inspector_thumb_open_exe_field is not None:

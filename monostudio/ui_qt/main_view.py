@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from PySide6.QtCore import QElapsedTimer, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import (
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QApplication,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QStyle,
     QStyledItemDelegate,
@@ -48,6 +49,13 @@ from PySide6.QtWidgets import (
 
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 from monostudio.ui_qt.thumbnails import ThumbnailCache
+from monostudio.ui_qt.inspector_preview_settings import (
+    THUMB_SOURCE_RENDER_SEQUENCE,
+    THUMB_SOURCE_USER,
+    THUMB_SOURCE_USER_THEN_RENDER,
+    read_inspector_thumbnail_source,
+    write_inspector_thumbnail_source,
+)
 from monostudio.ui_qt.style import MONOS_COLORS, THUMB_TAG_STYLE, monos_font
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -1464,6 +1472,7 @@ class MainView(QWidget):
     view_mode_changed = Signal(str)  # "tile" | "list"
     search_query_changed = Signal(str)  # debounced search text; empty string = clear
     show_publish_changed = Signal(bool)  # Work/Published toggle (Assets/Shots only)
+    thumbnail_source_changed = Signal()  # user / render sequence / user-then-render (grid + Inspector)
     open_publish_folder_requested = Signal(object)  # emits Path (latest publish version folder)
     dcc_open_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
     dcc_folder_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
@@ -1650,10 +1659,10 @@ class MainView(QWidget):
         toggle_layout.addWidget(self._btn_grid, 0)
         toggle_layout.addWidget(self._btn_list, 0)
 
-        # Right: Thumbnail size — button opens popup with slider (5 notches), like search
-        self._card_size_popup_closed_at = 0.0
+        # Right: Main view options — popup for card size, thumbnail source; room for filter/sort later
+        self._main_view_options_popup_closed_at = 0.0
 
-        class _CardSizePopupFrame(QFrame):
+        class _MainViewOptionsPopupFrame(QFrame):
             def __init__(self, parent, on_hide_cb):
                 super().__init__(parent)
                 self._on_hide_cb = on_hide_cb
@@ -1662,37 +1671,138 @@ class MainView(QWidget):
                 self._on_hide_cb()
                 super().hideEvent(event)
 
-        self._card_size_popup = _CardSizePopupFrame(self, self._on_card_size_popup_hidden)
-        self._card_size_popup.setObjectName("MainViewCardSizePopup")
-        self._card_size_popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-        self._card_size_popup.setAttribute(Qt.WA_StyledBackground, True)
-        popup_card_layout = QHBoxLayout(self._card_size_popup)
-        popup_card_layout.setContentsMargins(12, 10, 12, 10)
-        popup_card_layout.setSpacing(10)
-        _popup_label = QLabel("Size", self._card_size_popup)
-        _popup_label.setObjectName("MainViewCardSizePopupLabel")
+        self._main_view_options_popup = _MainViewOptionsPopupFrame(self, self._on_main_view_options_popup_hidden)
+        self._main_view_options_popup.setObjectName("MainViewOptionsPopup")
+        self._main_view_options_popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._main_view_options_popup.setAttribute(Qt.WA_StyledBackground, True)
+        self._main_view_options_popup.setMinimumWidth(260)
+        popup_outer = QVBoxLayout(self._main_view_options_popup)
+        popup_outer.setContentsMargins(8, 6, 8, 6)
+        popup_outer.setSpacing(4)
+        self._main_view_options_size_block = QWidget(self._main_view_options_popup)
+        sz_block_l = QVBoxLayout(self._main_view_options_size_block)
+        sz_block_l.setContentsMargins(0, 0, 0, 0)
+        sz_block_l.setSpacing(0)
+        popup_card_row = QHBoxLayout()
+        popup_card_row.setSpacing(10)
+        _popup_label = QLabel("Card size", self._main_view_options_size_block)
+        _popup_label.setObjectName("MainViewOptionsSizeLabel")
         _popup_label.setStyleSheet("color: #a1a1aa; font-size: 11px; font-weight: 600;")
-        self._card_size_slider = QSlider(Qt.Horizontal, self._card_size_popup)
-        self._card_size_slider.setObjectName("MainViewCardSizeSlider")
+        self._card_size_slider = QSlider(Qt.Horizontal, self._main_view_options_size_block)
+        self._card_size_slider.setObjectName("MainViewOptionsSizeSlider")
         self._card_size_slider.setMinimum(0)
         self._card_size_slider.setMaximum(self._CARD_SLIDER_RANGE)
         self._card_size_slider.setSingleStep(1)
         self._card_size_slider.setPageStep(10)
-        self._card_size_slider.setTickPosition(QSlider.TicksBelow)
-        self._card_size_slider.setTickInterval(25)
+        self._card_size_slider.setTickPosition(QSlider.TickPosition.NoTicks)
         self._card_size_slider.setFixedWidth(120)
         self._card_size_slider.valueChanged.connect(self._on_card_size_slider_changed)
-        popup_card_layout.addWidget(_popup_label, 0, Qt.AlignVCenter)
-        popup_card_layout.addWidget(self._card_size_slider, 0, Qt.AlignVCenter)
-        self._card_size_popup.adjustSize()
-        self._btn_card_size = QToolButton(header)
-        self._btn_card_size.setObjectName("MainViewCardSizeButton")
-        self._btn_card_size.setToolTip("Thumbnail size")
-        self._btn_card_size.setAutoRaise(True)
-        self._btn_card_size.setCursor(Qt.PointingHandCursor)
-        self._btn_card_size.setIcon(lucide_icon("sliders-horizontal", size=16, color_hex=MONOS_COLORS["text_label"]))
-        self._btn_card_size.clicked.connect(self._show_card_size_popup)
-        self._update_card_size_button()
+        popup_card_row.addWidget(_popup_label, 0, Qt.AlignVCenter)
+        popup_card_row.addWidget(self._card_size_slider, 0, Qt.AlignVCenter)
+        sz_block_l.addLayout(popup_card_row)
+        popup_outer.addWidget(self._main_view_options_size_block)
+
+        self._main_view_options_sep = QFrame(self._main_view_options_popup)
+        self._main_view_options_sep.setFrameShape(QFrame.Shape.HLine)
+        self._main_view_options_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._main_view_options_sep.setFixedHeight(1)
+        self._main_view_options_sep.setStyleSheet(
+            f"background: {MONOS_COLORS['border']}; border: none; max-height: 1px; min-height: 1px;"
+        )
+        popup_outer.addWidget(self._main_view_options_sep)
+
+        _hdr_style = "color: #a1a1aa; font-size: 11px; font-weight: 600; margin: 0; padding: 0;"
+        _tip_user = (
+            "Only user thumbnails (pasted or .user.* files).\nWork render/preview sequences are ignored."
+        )
+        _tip_render = (
+            "Image sequence under the active work file folder:\n"
+            "work/render → preview → playblast → flipbook, then <work name>/."
+        )
+        _tip_smart = "Prefer a user thumbnail when it exists;\notherwise use the same sequence path as Render."
+
+        self._thumb_source_asset_block = QWidget(self._main_view_options_popup)
+        _abl = QVBoxLayout(self._thumb_source_asset_block)
+        _abl.setContentsMargins(0, 0, 0, 0)
+        _abl.setSpacing(2)
+        _la = QLabel("Assets", self._thumb_source_asset_block)
+        _la.setStyleSheet(_hdr_style)
+        _la.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        _abl.addWidget(_la)
+        self._thumb_source_group_asset = QButtonGroup(self._thumb_source_asset_block)
+        self._thumb_source_asset_user = QRadioButton("User", self._thumb_source_asset_block)
+        self._thumb_source_asset_user.setToolTip(_tip_user)
+        self._thumb_source_asset_render = QRadioButton("Render", self._thumb_source_asset_block)
+        self._thumb_source_asset_render.setToolTip(_tip_render)
+        self._thumb_source_asset_both = QRadioButton("Smart", self._thumb_source_asset_block)
+        self._thumb_source_asset_both.setToolTip(_tip_smart)
+        for rb in (self._thumb_source_asset_user, self._thumb_source_asset_render, self._thumb_source_asset_both):
+            rb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._thumb_source_group_asset.setExclusive(True)
+        self._thumb_source_group_asset.addButton(self._thumb_source_asset_user, 0)
+        self._thumb_source_group_asset.addButton(self._thumb_source_asset_render, 1)
+        self._thumb_source_group_asset.addButton(self._thumb_source_asset_both, 2)
+        self._thumb_source_group_asset.idClicked.connect(self._on_main_view_thumb_source_asset_clicked)
+        _ar = QVBoxLayout()
+        _ar.setContentsMargins(0, 0, 0, 0)
+        _ar.setSpacing(0)
+        _ar.addWidget(self._thumb_source_asset_user)
+        _ar.addWidget(self._thumb_source_asset_render)
+        _ar.addWidget(self._thumb_source_asset_both)
+        _abl.addLayout(_ar)
+        popup_outer.addWidget(self._thumb_source_asset_block)
+
+        self._thumb_source_mid_sep = QFrame(self._main_view_options_popup)
+        self._thumb_source_mid_sep.setFrameShape(QFrame.Shape.HLine)
+        self._thumb_source_mid_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._thumb_source_mid_sep.setFixedHeight(1)
+        self._thumb_source_mid_sep.setStyleSheet(
+            f"background: {MONOS_COLORS['border']}; border: none; max-height: 1px; min-height: 1px;"
+        )
+        popup_outer.addWidget(self._thumb_source_mid_sep)
+
+        self._thumb_source_shot_block = QWidget(self._main_view_options_popup)
+        _sbl = QVBoxLayout(self._thumb_source_shot_block)
+        _sbl.setContentsMargins(0, 0, 0, 0)
+        _sbl.setSpacing(2)
+        _ls = QLabel("Shots", self._thumb_source_shot_block)
+        _ls.setStyleSheet(_hdr_style)
+        _ls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        _sbl.addWidget(_ls)
+        self._thumb_source_group_shot = QButtonGroup(self._thumb_source_shot_block)
+        self._thumb_source_shot_user = QRadioButton("User", self._thumb_source_shot_block)
+        self._thumb_source_shot_user.setToolTip(_tip_user)
+        self._thumb_source_shot_render = QRadioButton("Render", self._thumb_source_shot_block)
+        self._thumb_source_shot_render.setToolTip(_tip_render)
+        self._thumb_source_shot_both = QRadioButton("Smart", self._thumb_source_shot_block)
+        self._thumb_source_shot_both.setToolTip(_tip_smart)
+        for rb in (self._thumb_source_shot_user, self._thumb_source_shot_render, self._thumb_source_shot_both):
+            rb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._thumb_source_group_shot.setExclusive(True)
+        self._thumb_source_group_shot.addButton(self._thumb_source_shot_user, 0)
+        self._thumb_source_group_shot.addButton(self._thumb_source_shot_render, 1)
+        self._thumb_source_group_shot.addButton(self._thumb_source_shot_both, 2)
+        self._thumb_source_group_shot.idClicked.connect(self._on_main_view_thumb_source_shot_clicked)
+        _sr = QVBoxLayout()
+        _sr.setContentsMargins(0, 0, 0, 0)
+        _sr.setSpacing(0)
+        _sr.addWidget(self._thumb_source_shot_user)
+        _sr.addWidget(self._thumb_source_shot_render)
+        _sr.addWidget(self._thumb_source_shot_both)
+        _sbl.addLayout(_sr)
+        popup_outer.addWidget(self._thumb_source_shot_block)
+        self._main_view_options_popup.adjustSize()
+        self._btn_main_view_options = QToolButton(header)
+        self._btn_main_view_options.setObjectName("MainViewOptionsButton")
+        self._btn_main_view_options.setAccessibleName("View options")
+        self._btn_main_view_options.setToolTip(
+            "View options — card size, thumbnail source for Assets/Shots (filter & sort later)"
+        )
+        self._btn_main_view_options.setAutoRaise(True)
+        self._btn_main_view_options.setCursor(Qt.PointingHandCursor)
+        self._btn_main_view_options.setIcon(lucide_icon("sliders-horizontal", size=16, color_hex=MONOS_COLORS["text_label"]))
+        self._btn_main_view_options.clicked.connect(self._show_main_view_options_popup)
+        self._update_main_view_options_button()
 
         # (Primary action button removed — replaced by Work/Published pill)
 
@@ -1811,7 +1921,7 @@ class MainView(QWidget):
         header_layout.addStretch(1)
         header_layout.addWidget(toggle, 0, Qt.AlignVCenter)
         header_layout.addStretch(1)
-        header_layout.addWidget(self._btn_card_size, 0, Qt.AlignVCenter)
+        header_layout.addWidget(self._btn_main_view_options, 0, Qt.AlignVCenter)
         header_layout.addWidget(self._btn_search_icon, 0, Qt.AlignVCenter)
         header_layout.addWidget(self._work_publish_switch, 0, Qt.AlignVCenter)
 
@@ -2243,7 +2353,7 @@ class MainView(QWidget):
             return
         self._browser_context = context
         self._card_scale_value = self._load_card_scale()
-        self._update_card_size_button()
+        self._update_main_view_options_button()
         if getattr(self, "_work_publish_switch", None) is not None:
             self._work_publish_switch.setVisible(context in ("asset", "shot"))
 
@@ -2983,29 +3093,94 @@ class MainView(QWidget):
     def _card_scale(self) -> float:
         return self._card_scale_value
 
-    def _show_card_size_popup(self) -> None:
-        """Show thumbnail size slider popup below the button. Same as noti: toggle if open, grace to avoid reopen."""
-        if self._card_size_popup.isVisible():
-            self._card_size_popup.close()
+    def _show_main_view_options_popup(self) -> None:
+        """Show main view options below the header button (size, source; filter/sort later). Toggle if open; reopen grace."""
+        if self._main_view_options_popup.isVisible():
+            self._main_view_options_popup.close()
             return
-        if (time.monotonic() - self._card_size_popup_closed_at) < self._POPUP_REOPEN_GRACE:
+        if (time.monotonic() - self._main_view_options_popup_closed_at) < self._POPUP_REOPEN_GRACE:
             return
         self._card_size_slider.blockSignals(True)
         self._card_size_slider.setValue(self._slider_from_scale(self._card_scale_value))
         self._card_size_slider.blockSignals(False)
-        pos = self._btn_card_size.mapToGlobal(self._btn_card_size.rect().bottomLeft())
-        self._card_size_popup.move(pos.x(), pos.y() + 2)
-        self._card_size_popup.show()
+        self._sync_thumb_source_radios_from_settings()
+        tile = self._view_mode == "tile"
+        self._main_view_options_size_block.setVisible(tile)
+        self._main_view_options_sep.setVisible(tile)
+        ctx = self._browser_context
+        self._thumb_source_asset_block.setVisible(ctx in ("asset", "project"))
+        self._thumb_source_shot_block.setVisible(ctx in ("shot", "project"))
+        self._thumb_source_mid_sep.setVisible(ctx == "project")
+        pos = self._btn_main_view_options.mapToGlobal(self._btn_main_view_options.rect().bottomLeft())
+        self._main_view_options_popup.move(pos.x(), pos.y() + 2)
+        self._main_view_options_popup.show()
 
-    def _on_card_size_popup_hidden(self) -> None:
-        self._card_size_popup_closed_at = time.monotonic()
-        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._btn_card_size))
+    def _sync_thumb_source_radios_from_settings(self) -> None:
+        ma = read_inspector_thumbnail_source(self._settings, entity="asset")
+        ms = read_inspector_thumbnail_source(self._settings, entity="shot")
+        for w in (
+            self._thumb_source_asset_user,
+            self._thumb_source_asset_render,
+            self._thumb_source_asset_both,
+            self._thumb_source_shot_user,
+            self._thumb_source_shot_render,
+            self._thumb_source_shot_both,
+        ):
+            w.blockSignals(True)
+        self._thumb_source_asset_user.setChecked(ma == THUMB_SOURCE_USER)
+        self._thumb_source_asset_render.setChecked(ma == THUMB_SOURCE_RENDER_SEQUENCE)
+        self._thumb_source_asset_both.setChecked(ma == THUMB_SOURCE_USER_THEN_RENDER)
+        self._thumb_source_shot_user.setChecked(ms == THUMB_SOURCE_USER)
+        self._thumb_source_shot_render.setChecked(ms == THUMB_SOURCE_RENDER_SEQUENCE)
+        self._thumb_source_shot_both.setChecked(ms == THUMB_SOURCE_USER_THEN_RENDER)
+        for w in (
+            self._thumb_source_asset_user,
+            self._thumb_source_asset_render,
+            self._thumb_source_asset_both,
+            self._thumb_source_shot_user,
+            self._thumb_source_shot_render,
+            self._thumb_source_shot_both,
+        ):
+            w.blockSignals(False)
 
-    def _update_card_size_button(self) -> None:
-        if hasattr(self, "_btn_card_size") and self._btn_card_size is not None:
+    def _on_main_view_thumb_source_asset_clicked(self, button_id: int) -> None:
+        self._apply_main_view_thumb_source_for_entity("asset", int(button_id))
+
+    def _on_main_view_thumb_source_shot_clicked(self, button_id: int) -> None:
+        self._apply_main_view_thumb_source_for_entity("shot", int(button_id))
+
+    def _apply_main_view_thumb_source_for_entity(
+        self, entity: Literal["asset", "shot"], button_id: int
+    ) -> None:
+        by_id = {
+            0: THUMB_SOURCE_USER,
+            1: THUMB_SOURCE_RENDER_SEQUENCE,
+            2: THUMB_SOURCE_USER_THEN_RENDER,
+        }
+        mode = by_id.get(button_id)
+        if mode is None:
+            return
+        if read_inspector_thumbnail_source(self._settings, entity=entity) == mode:
+            return
+        write_inspector_thumbnail_source(self._settings, mode, entity=entity)
+        self.thumbnail_source_changed.emit()
+
+    def _on_main_view_options_popup_hidden(self) -> None:
+        self._main_view_options_popup_closed_at = time.monotonic()
+        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._btn_main_view_options))
+
+    def _update_main_view_options_button(self) -> None:
+        if hasattr(self, "_btn_main_view_options") and self._btn_main_view_options is not None:
             pct = int(round(self._card_scale_value * 100))
-            self._btn_card_size.setToolTip(f"Thumbnail size: {pct}%")
-            self._btn_card_size.setEnabled(self._view_mode == "tile")
+            if self._view_mode == "tile":
+                self._btn_main_view_options.setToolTip(
+                    f"View options — card size {pct}%; Assets & Shots: User / Render / Smart (filter & sort later)"
+                )
+            else:
+                self._btn_main_view_options.setToolTip(
+                    "View options — Assets & Shots: User / Render / Smart (filter & sort later)"
+                )
+            self._btn_main_view_options.setEnabled(True)
 
     def _on_card_size_slider_changed(self, value: int) -> None:
         scale = self._scale_from_slider(value)
@@ -3018,7 +3193,7 @@ class MainView(QWidget):
         self._card_scale_value = scale
         if save:
             self._settings.setValue(self._settings_key_card_size(), scale)
-        self._update_card_size_button()
+        self._update_main_view_options_button()
         self._schedule_grid_layout_sync()
 
     def _list_headers(self) -> list[str]:
@@ -3166,7 +3341,7 @@ class MainView(QWidget):
         self._btn_grid.setChecked(mode == "tile")
         self._btn_list.setChecked(mode == "list")
         self.view_mode_changed.emit(mode)
-        self._update_card_size_button()
+        self._update_main_view_options_button()
 
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())

@@ -1711,6 +1711,13 @@ class _InspectorPreview(QWidget):
     def set_qsettings(self, settings: QSettings | None) -> None:
         self._qsettings = settings
 
+    def _inspector_thumb_source_mode(self) -> str:
+        """Thumbnail source mode from settings (separate keys for Asset vs Shot)."""
+        item = self._item
+        if item is not None and item.kind == ViewItemKind.SHOT:
+            return read_inspector_thumbnail_source(self._qsettings, entity="shot")
+        return read_inspector_thumbnail_source(self._qsettings, entity="asset")
+
     def invalidate_settings_dependent_cache(self) -> None:
         self._preview_thumb_cache.clear()
         self._seq_decode_bucket = None
@@ -1763,7 +1770,7 @@ class _InspectorPreview(QWidget):
         if self._sequence_frames:
             lines.append("Hold left button and drag: drag the sequence folder (to Explorer / a DCC).")
             lines.append("Middle mouse + drag horizontally: scrub frames.")
-        src = read_inspector_thumbnail_source(self._qsettings)
+        src = self._inspector_thumb_source_mode()
         if src != THUMB_SOURCE_RENDER_SEQUENCE:
             lines.append("Hover: Fill / Fit, Paste, Remove (top).")
         lines.append("Right-click: menu (paste, remove, open file…).")
@@ -1801,7 +1808,7 @@ class _InspectorPreview(QWidget):
                         return f
                 except OSError:
                     pass
-        mode = read_inspector_thumbnail_source(self._qsettings)
+        mode = self._inspector_thumb_source_mode()
         ref = getattr(item, "ref", None)
         if isinstance(ref, (Asset, Shot)):
             wp, wf = self._work_paths_for_preview_item(item)
@@ -1849,7 +1856,7 @@ class _InspectorPreview(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _sync_thumbnail_overlay_mode(self) -> None:
-        mode = read_inspector_thumbnail_source(self._qsettings)
+        mode = self._inspector_thumb_source_mode()
         self._container.set_render_sequence_hide_controls(mode == THUMB_SOURCE_RENDER_SEQUENCE)
         self._sync_inspector_thumb_tooltip()
 
@@ -2135,7 +2142,7 @@ class _InspectorPreview(QWidget):
         except Exception:
             base = str(path)
         dep = (self._active_department or "").strip()
-        mode = read_inspector_thumbnail_source(self._qsettings)
+        mode = self._inspector_thumb_source_mode()
         if dep:
             return f"{base}::dept::{dep}::ts::{mode}"
         return f"{base}::ts::{mode}"
@@ -2187,7 +2194,7 @@ class _InspectorPreview(QWidget):
             self._sync_sequence_context_for_inspector_preview()
             return
 
-        mode = read_inspector_thumbnail_source(self._qsettings)
+        mode = self._inspector_thumb_source_mode()
         wp, wf = self._work_paths_for_preview_item(item)
         wps = str(wp) if wp is not None else None
         wfs = str(wf) if wf is not None else None
@@ -2249,7 +2256,7 @@ class _InspectorPreview(QWidget):
         dept = self._active_department
         is_inbox = item.kind == ViewItemKind.INBOX_ITEM
         mgr = self._worker_manager
-        mode = read_inspector_thumbnail_source(self._qsettings)
+        mode = self._inspector_thumb_source_mode()
         wp, wf = self._work_paths_for_preview_item(item)
         wps = str(wp) if wp is not None else None
         wfs = str(wf) if wf is not None else None
