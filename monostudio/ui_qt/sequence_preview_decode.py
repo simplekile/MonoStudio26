@@ -70,10 +70,8 @@ def load_preview_frame_qimage(path: Path, max_side: int = PREVIEW_MAX_SIDE_DEFAU
     """Load and downscale one frame for flipbook / preview."""
     ext = path.suffix.lower()
     if ext in (".exr", ".hdr"):
-        return _load_via_ffmpeg(path, max_side)
+        return None
     img = QImage(str(path))
     if img.isNull():
-        if ext in (".exr", ".hdr"):
-            return _load_via_ffmpeg(path, max_side)
         return None
     return _scale_qimage(img, max_side)

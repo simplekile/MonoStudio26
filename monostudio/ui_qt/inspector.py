@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QDrag,
     QFont,
+    QFontMetrics,
     QIcon,
     QImage,
     QMouseEvent,
@@ -212,12 +213,6 @@ def _inspector_preview_worker_run(
     use_fit = ".user." in str(thumb)
     cache = ThumbnailCache(size_px=px)
     pm = cache.load_thumbnail_pixmap(thumb)
-    if (pm is None or pm.isNull()) and thumb.suffix.lower() in (".exr", ".hdr"):
-        from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
-
-        img = load_preview_frame_qimage(thumb, max_side=px)
-        if img is not None and not img.isNull():
-            pm = QPixmap.fromImage(img)
     if pm is None or pm.isNull():
         return (path_str, None, use_fit)
     return (path_str, pm.toImage(), use_fit)
@@ -950,6 +945,8 @@ class _PreviewWidget(QWidget):
         self._loading = False  # True = đang load thumb (hiện spinner như Explorer)
         self._loading_angle = 0.0  # độ (0–360) để vẽ icon quay
         self._loading_timer: QTimer | None = None
+        self._unreadable_ext: str = ""  # e.g. ".EXR" (JetBrains Mono, green)
+        self._unreadable_hint: str = ""  # Inter, muted (word wrap)
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
         # Global production status indicator (small dot top-right, color + tooltip text).
         self._status_color_hex: str | None = None
@@ -969,10 +966,23 @@ class _PreviewWidget(QWidget):
         self._has_image = bool(pix and not pix.isNull())
         self._display_fit = bool(use_fit)
         if self._has_image:
+            self._unreadable_ext = ""
+            self._unreadable_hint = ""
             self._placeholder_file_icon = ()
         if self._inbox_mode:
             self.updateGeometry()
         self.image_changed.emit(self._has_image)
+        self.update()
+
+    def set_unreadable_preview(self, ext_display: str, hint: str) -> None:
+        ext = (ext_display or "").strip()
+        h = (hint or "").strip()
+        if ext:
+            self._placeholder_file_icon = ()
+        if self._unreadable_ext == ext and self._unreadable_hint == h:
+            return
+        self._unreadable_ext = ext
+        self._unreadable_hint = h
         self.update()
 
     def set_placeholder_kind(self, kind: str, *, letter: str = "") -> None:
@@ -1147,6 +1157,42 @@ class _PreviewWidget(QWidget):
             p.setPen(QPen(QColor(MONOS_COLORS["border"]), 1))
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(r.adjusted(0, 0, -1, -1), radius, radius)
+
+            if self._unreadable_ext:
+                p.fillRect(r, QColor(167, 243, 208, 20))
+                margin = 22
+                inner = r.adjusted(margin, margin, -margin, -margin)
+                f_ext = monos_font("JetBrains Mono", 22, QFont.Weight.DemiBold)
+                f_hint = monos_font("Inter", 11, QFont.Weight.Medium)
+                fm_ext = QFontMetrics(f_ext)
+                gap = 8
+                hint_h = 0
+                if self._unreadable_hint:
+                    fm_hint = QFontMetrics(f_hint)
+                    hint_rect_probe = QRect(inner.left(), inner.top(), inner.width(), inner.height())
+                    hint_h = fm_hint.boundingRect(
+                        hint_rect_probe,
+                        Qt.AlignHCenter | Qt.TextWordWrap,
+                        self._unreadable_hint,
+                    ).height()
+                total_h = fm_ext.height() + (gap + hint_h if self._unreadable_hint else 0)
+                y0 = inner.top() + max(0, (inner.height() - total_h) // 2)
+                p.setFont(f_ext)
+                p.setPen(QColor("#a7f3d0"))
+                ext_rect = QRect(inner.left(), y0, inner.width(), fm_ext.height())
+                p.drawText(ext_rect, Qt.AlignHCenter | Qt.AlignTop, self._unreadable_ext)
+                if self._unreadable_hint:
+                    p.setFont(f_hint)
+                    p.setPen(QColor(MONOS_COLORS["text_meta"]))
+                    top_hint = y0 + fm_ext.height() + gap
+                    hint_draw = QRect(inner.left(), top_hint, inner.width(), max(1, inner.bottom() - top_hint))
+                    p.drawText(
+                        hint_draw,
+                        Qt.AlignHCenter | Qt.TextWordWrap | Qt.AlignTop,
+                        self._unreadable_hint,
+                    )
+                self._draw_status_dot(p, r)
+                return
 
             if self._placeholder_kind in ("asset", "shot", "project"):
                 icon_name = "box" if self._placeholder_kind == "asset" else "clapperboard" if self._placeholder_kind == "shot" else "layout-dashboard"
@@ -1732,6 +1778,52 @@ class _InspectorPreview(QWidget):
         wf = primary_work_file_for_department(ref, ds, _inspector_get_active_dcc(item.path, dept))
         return (wp, wf)
 
+    def _unreadable_thumb_hint(self) -> str:
+        """Short hint for EXR/HDR (and similar) when in-app preview is unavailable."""
+        open_path: Path | None = None
+        try:
+            open_path = self._resolve_inspector_thumbnail_disk_path()
+        except Exception:
+            open_path = None
+        has_file = False
+        if open_path is not None:
+            try:
+                has_file = open_path.is_file()
+            except OSError:
+                has_file = False
+        seq_dir = self._sequence_folder
+        has_seq = seq_dir is not None and seq_dir.is_dir()
+        if has_file and has_seq:
+            return "Right-click: Open thumbnail file… or Open render folder…"
+        if has_seq:
+            return "Right-click: Open render folder…"
+        if has_file:
+            return "Right-click: Open thumbnail file…"
+        return "Right-click for options…"
+
+    def _apply_inspector_thumb_decode_failure(self, w: _PreviewWidget, *, is_inbox: bool, path: Path | None) -> None:
+        """No pixmap: show unreadable extension state for EXR/HDR, else Inbox file icon / clear."""
+        heavy_ext: str | None = None
+        try:
+            p = self._resolve_inspector_thumbnail_disk_path()
+            if p is not None:
+                sl = p.suffix.lower()
+                if sl in (".exr", ".hdr"):
+                    heavy_ext = p.suffix.upper()
+        except Exception:
+            heavy_ext = None
+        w.set_pixmap(None)
+        if heavy_ext:
+            w.set_unreadable_preview(heavy_ext, self._unreadable_thumb_hint())
+            return
+        w.set_unreadable_preview("", "")
+        if is_inbox and path:
+            try:
+                icon_name, color_hex = file_icon_spec_for_path(path)
+                w.set_placeholder_file_icon(icon_name, color_hex)
+            except Exception:
+                pass
+
     def _sync_sequence_context_for_inspector_preview(self) -> None:
         self._sequence_folder = None
         self._sequence_frames = []
@@ -2106,27 +2198,26 @@ class _InspectorPreview(QWidget):
         item = self._item
         if item is None or str(item.path) != path_str:
             return
+        self._sync_sequence_context_for_inspector_preview()
         cache_key = self._preview_cache_key(Path(path_str))
         pix: QPixmap | None = None
         if image_or_none is not None and not image_or_none.isNull():
             pix = QPixmap.fromImage(image_or_none)
             if not pix.isNull():
                 w.set_pixmap(pix, use_fit=use_fit)
+                w.set_unreadable_preview("", "")
                 self._seq_live_display = False
         if pix is None:
-            if item.kind == ViewItemKind.INBOX_ITEM and item.path:
-                try:
-                    icon_name, color_hex = file_icon_spec_for_path(item.path)
-                    w.set_placeholder_file_icon(icon_name, color_hex)
-                except Exception:
-                    pass
-            w.set_pixmap(None)
+            self._apply_inspector_thumb_decode_failure(
+                w,
+                is_inbox=item.kind == ViewItemKind.INBOX_ITEM,
+                path=item.path,
+            )
             self._seq_live_display = False
         while len(self._preview_thumb_cache) >= self._PREVIEW_CACHE_MAX:
             self._preview_thumb_cache.popitem(last=False)
         self._preview_thumb_cache[cache_key] = (pix, use_fit)
         self._preview_thumb_cache.move_to_end(cache_key)
-        self._sync_sequence_context_for_inspector_preview()
         self._sync_thumbnail_overlay_mode()
 
     def clear_preview_loading(self) -> None:
@@ -2167,6 +2258,7 @@ class _InspectorPreview(QWidget):
         w.set_placeholder_kind(item.kind.value, letter=(display_name_for_item(item) or "").strip()[:1])
         w.set_user_fit(False)  # default fill when switching item
         w.set_pixmap(None)
+        w.set_unreadable_preview("", "")
         path = item.path
         path_str = str(path)
         cache_key = self._preview_cache_key(path)
@@ -2182,16 +2274,10 @@ class _InspectorPreview(QWidget):
                 self._seq_live_display = False
                 self._sync_sequence_context_for_inspector_preview()
                 return
-            # cache lưu (None, fit) khi không có thumb → hiện placeholder
-            if is_inbox and path:
-                try:
-                    icon_name, color_hex = file_icon_spec_for_path(path)
-                    w.set_placeholder_file_icon(icon_name, color_hex)
-                except Exception:
-                    pass
-            w.set_pixmap(None)
-            self._seq_live_display = False
+            # cache lưu (None, fit) khi không có thumb → placeholder hoặc EXR/HDR unreadable
             self._sync_sequence_context_for_inspector_preview()
+            self._apply_inspector_thumb_decode_failure(w, is_inbox=is_inbox, path=path)
+            self._seq_live_display = False
             return
 
         mode = self._inspector_thumb_source_mode()
@@ -2271,15 +2357,9 @@ class _InspectorPreview(QWidget):
                 self._sync_sequence_context_for_inspector_preview()
                 self._sync_thumbnail_overlay_mode()
                 return
-            if is_inbox and path:
-                try:
-                    icon_name, color_hex = file_icon_spec_for_path(path)
-                    w.set_placeholder_file_icon(icon_name, color_hex)
-                except Exception:
-                    pass
-            w.set_pixmap(None)
-            self._seq_live_display = False
             self._sync_sequence_context_for_inspector_preview()
+            self._apply_inspector_thumb_decode_failure(w, is_inbox=is_inbox, path=path)
+            self._seq_live_display = False
             self._sync_thumbnail_overlay_mode()
             return
 
@@ -2361,6 +2441,19 @@ class _InspectorPreview(QWidget):
         act_open.setEnabled(open_path is not None)
         act_open.triggered.connect(self._open_inspector_thumbnail_externally)
         menu.addAction(act_open)
+
+        seq_dir = self._sequence_folder if (self._sequence_folder is not None and self._sequence_folder.is_dir()) else None
+        act_open_render = QAction(
+            lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Open render folder…",
+            menu,
+        )
+        act_open_render.setEnabled(bool(seq_dir))
+        if seq_dir is not None:
+            act_open_render.triggered.connect(
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(seq_dir)))
+            )
+        menu.addAction(act_open_render)
         menu.exec(gp)
 
 

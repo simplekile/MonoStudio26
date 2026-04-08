@@ -125,6 +125,12 @@ def list_sequence_frames(sequence_folder: Path) -> list[Path]:
         for p in sequence_folder.iterdir():
             if not p.is_file():
                 continue
+            # Skip cryptomatte outputs (not meaningful as thumbnails / flipbook).
+            try:
+                if "cryptomatte" in p.name.casefold():
+                    continue
+            except Exception:
+                pass
             suf = p.suffix.lower()
             if suf in _SEQUENCE_SUFFIXES:
                 out.append(p)

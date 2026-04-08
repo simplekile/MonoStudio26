@@ -714,6 +714,41 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #18181b; /* Zinc-900 */
             border-bottom: 1px solid rgba(39, 39, 42, 0.50);
         }
+        QWidget#TopBarPanelGroup {
+            background-color: rgba(39, 39, 42, 0.85);
+            border-radius: 8px;
+        }
+        QToolButton#TopBarPanelAutoBtn {
+            border: none;
+            border-radius: 6px;
+            padding: 0 6px;
+            margin: 0;
+            background: transparent;
+            color: #a1a1aa;
+            font-family: "Inter", "Inter UI", "Segoe UI", "San Francisco", sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        QToolButton#TopBarPanelAutoBtn:hover {
+            background: rgba(255, 255, 255, 0.06);
+            color: #e4e4e7;
+        }
+        QToolButton#TopBarPanelAutoBtn[active="true"] {
+            background: rgba(37, 99, 235, 0.18);
+            color: #fafafa;
+        }
+        QToolButton#TopBarPanelGlyphBtn {
+            border: none;
+            border-radius: 6px;
+            margin: 0;
+            background: transparent;
+        }
+        QToolButton#TopBarPanelGlyphBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QToolButton#TopBarPanelGlyphBtn:checked {
+            background: rgba(37, 99, 235, 0.12);
+        }
         QToolButton#ProjectSwitch {
             padding: 6px 12px;
             border: none;
@@ -801,7 +836,8 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowCloseBtn,
         QToolButton#TopBarNotiBtn,
         QToolButton#TopBarUpdateBtn,
-        QToolButton#TopBarWatcherBtn {
+        QToolButton#TopBarWatcherBtn,
+        QToolButton#TopBarSettingsBtn {
             border: none;
             border-radius: 0;
             background: transparent;
@@ -811,7 +847,8 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowMaxBtn:hover,
         QToolButton#TopBarNotiBtn:hover,
         QToolButton#TopBarUpdateBtn:hover,
-        QToolButton#TopBarWatcherBtn:hover {
+        QToolButton#TopBarWatcherBtn:hover,
+        QToolButton#TopBarSettingsBtn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: #e4e4e7;
             border-radius: 8px;

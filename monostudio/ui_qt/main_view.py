@@ -3796,9 +3796,13 @@ class MainView(QWidget):
             refresh_action = menu.addAction(lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
             if item.kind.value == "asset":
                 rename_action = menu.addAction(lucide_icon("pencil", size=16, color_hex=MONOS_COLORS["text_label"]), "Rename… (Beta)")
-            delete_action = menu.addAction(lucide_icon("trash-2", size=16, color_hex="#ef4444"), "Delete…")
+            kind_word = "Asset" if item.kind.value == "asset" else "Shot"
+            ent_name = (item.name or "").strip() or (item.path.name if item.path else "")
+            delete_label = f"Delete {kind_word} {ent_name}…" if ent_name else f"Delete {kind_word}…"
+            delete_action = menu.addAction(lucide_icon("trash-2", size=16, color_hex="#ef4444"), delete_label)
             if delete_action is not None:
                 delete_action.setProperty("class", "danger-action")
+                delete_action.setData("delete_asset_or_shot")
         elif item.kind.value == "department":
             open_work = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Work Folder")
             open_publish = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Publish Folder")
@@ -3873,7 +3877,7 @@ class MainView(QWidget):
             if item.kind.value == "asset":
                 self.rename_requested.emit(item)
             return
-        if text == "Delete…":
+        if getattr(chosen, "data", lambda: None)() == "delete_asset_or_shot":
             self.delete_requested.emit(item)
             return
         if text == "Open Work Folder":

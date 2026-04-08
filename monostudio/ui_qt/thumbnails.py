@@ -307,9 +307,7 @@ def _load_thumbnail_image_worker(file_path: str, size_px: int, cache_key: str | 
         ext = (p.suffix or "").strip().lower()
         img: QImage | None = None
         if ext in (".exr", ".hdr"):
-            from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
-
-            img = load_preview_frame_qimage(p, max_side=size_px)
+            return None
         if img is None or img.isNull():
             img = QImage(str(p))
         if img.isNull():

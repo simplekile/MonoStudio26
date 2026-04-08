@@ -82,7 +82,7 @@ class MainWindow(FramelessMainWindow):
     """
     Phase 0 shell:
     - 3 panels: Sidebar (~15%), Main View (~60%), Inspector (~25%, hidden by default)
-    - On narrow resize: hide inspector, then hide sidebar (responsive).
+    - On narrow resize: hide inspector, then hide sidebar (responsive), unless user chose manual layout via TopBar toggles.
     - No filesystem logic
     - No publish logic
     - No database
@@ -230,6 +230,11 @@ class MainWindow(FramelessMainWindow):
         # Store sizes to restore when showing panels again after narrow resize.
         self._content_splitter_sizes_restore: list[int] = [800, 320]
         self._main_splitter_sizes_restore: list[int] = [256, 1100]
+        self._panel_layout_auto: bool = True
+        # Manual sidebar: full (256px) vs compact rail (56px) — không ẩn hẳn cột sidebar.
+        self._manual_sidebar_full: bool = True
+        self._manual_inspector_visible: bool = True
+        self._load_panel_layout_prefs()
         self._compact_filter_popup: QFrame | None = None
         self._compact_filter_popup_closed_at = 0.0
         self._POPUP_REOPEN_GRACE = 0.25
@@ -246,6 +251,9 @@ class MainWindow(FramelessMainWindow):
         self._sidebar.settings_requested.connect(self._open_settings)
         self._sidebar.project_switch_requested.connect(self._switch_project)
         self._top_bar.settings_clicked.connect(self._open_settings)
+        self._top_bar.layout_auto_clicked.connect(self._on_top_bar_layout_auto_clicked)
+        self._top_bar.layout_sidebar_clicked.connect(self._on_top_bar_layout_sidebar_clicked)
+        self._top_bar.layout_inspector_clicked.connect(self._on_top_bar_layout_inspector_clicked)
         self._sidebar.recent_task_clicked.connect(self._on_recent_task_clicked)
         self._sidebar.recent_task_double_clicked.connect(self._on_recent_task_double_clicked)
         self._sidebar.clear_recent_tasks_requested.connect(self._on_clear_recent_tasks)
@@ -447,9 +455,155 @@ class MainWindow(FramelessMainWindow):
         self._top_bar.setGeometry(left_w, 0, self.width() - left_w, self._top_bar.height())
         self._top_bar.raise_()
 
-    def _apply_responsive_panels(self) -> None:
+    def _load_panel_layout_prefs(self) -> None:
+        def _bool_pref(key: str, default: bool) -> bool:
+            v = self._settings.value(key, default)
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on")
+            return default
+
+        self._panel_layout_auto = _bool_pref("ui/panel_layout_auto", True)
+        if self._settings.contains("ui/panel_manual_sidebar_full"):
+            self._manual_sidebar_full = _bool_pref("ui/panel_manual_sidebar_full", True)
+        else:
+            self._manual_sidebar_full = _bool_pref("ui/panel_manual_sidebar", True)
+        self._manual_inspector_visible = _bool_pref("ui/panel_manual_inspector", True)
+
+    def _persist_panel_layout_prefs(self) -> None:
+        try:
+            self._settings.setValue("ui/panel_layout_auto", self._panel_layout_auto)
+            self._settings.setValue("ui/panel_manual_sidebar_full", self._manual_sidebar_full)
+            self._settings.setValue("ui/panel_manual_inspector", self._manual_inspector_visible)
+        except Exception:
+            pass
+
+    def _apply_panel_layout(self, *, full_manual: bool = False) -> None:
+        """Auto: width-based sidebar/inspector. Manual: refresh geometry on resize; full apply after toggles."""
+        if self._panel_layout_auto:
+            self._apply_responsive_panels_impl()
+        elif full_manual:
+            self._apply_manual_panel_layout_full()
+        else:
+            self._refresh_manual_panel_geometry()
+        self._sync_panel_layout_top_bar()
+
+    def _sync_panel_layout_top_bar(self) -> None:
+        sw = self._main_splitter.sizes()
+        sw0 = sw[0] if sw else 0
+        # Glyph: checked = full-width rail; unchecked = compact 56px (vẫn còn sidebar).
+        sidebar_expanded = sw0 > 80
+        self._top_bar.set_panel_layout_controls(
+            auto=self._panel_layout_auto,
+            sidebar_on=sidebar_expanded,
+            inspector_on=self._inspector.isVisible(),
+        )
+
+    def _apply_main_splitter_sidebar_metric(self, mode: str) -> None:
+        """
+        Set main splitter so the first pane width exactly matches the sidebar column (no dead gap).
+        Sidebar uses Fixed policy + hard min/max; if splitter[0] > maxWidth, Qt leaves empty space.
+        mode: 'compact' | 'full'
+        """
+        w = max(0, self._main_splitter.width())
+        if mode == "compact":
+            self._sidebar_container.setMinimumWidth(56)
+            self._sidebar_container.setMaximumWidth(56)
+            sw = min(56, w)
+            self._main_splitter.setSizes([sw, max(0, w - sw)])
+        else:
+            self._sidebar_container.setMinimumWidth(256)
+            self._sidebar_container.setMaximumWidth(256)
+            sw = min(256, w)
+            self._main_splitter.setSizes([sw, max(0, w - sw)])
+
+    def _apply_manual_panel_layout_full(self) -> None:
+        """Apply user-chosen sidebar / Inspector visibility (after TopBar toggles or first show in manual mode)."""
+        if self._manual_sidebar_full:
+            if self._sidebar_stack.currentIndex() != 0:
+                self._sidebar.set_current_context(self._sidebar_compact.current_context())
+                self._sidebar_stack.setCurrentIndex(0)
+            self._apply_main_splitter_sidebar_metric("full")
+        else:
+            if self._sidebar_stack.currentIndex() != 1:
+                sizes_now = self._main_splitter.sizes()
+                if len(sizes_now) >= 2 and sizes_now[0] > 56:
+                    self._main_splitter_sizes_restore = list(sizes_now)
+                self._sidebar_compact.set_current_context(self._sidebar.current_context())
+                self._sidebar_stack.setCurrentIndex(1)
+            self._apply_main_splitter_sidebar_metric("compact")
+
+        cw = max(0, self._content_splitter.width())
+        if self._manual_inspector_visible:
+            self._inspector.setVisible(True)
+            cs = list(self._content_splitter_sizes_restore)
+            default_iw = max(240, min(360, max(0, cw // 4)))
+            iw = int(cs[1]) if cs and len(cs) >= 2 and cs[1] > 0 else default_iw
+            if cw > 200:
+                iw = max(180, min(iw, cw - 100))
+            else:
+                iw = max(80, min(iw, max(0, cw - 40)))
+            self._content_splitter.setSizes([max(0, cw - iw), iw])
+        else:
+            if self._inspector.isVisible():
+                sizes_c = self._content_splitter.sizes()
+                if len(sizes_c) >= 2 and sizes_c[1] > 0:
+                    self._content_splitter_sizes_restore = list(sizes_c)
+            self._inspector.setVisible(False)
+            self._content_splitter.setSizes([cw, 0])
+
+        self._update_title_bar_geometry()
+
+    def _refresh_manual_panel_geometry(self) -> None:
+        """Keep manual layout consistent on window resize without resetting user splitter drags."""
+        if self._manual_sidebar_full:
+            self._apply_main_splitter_sidebar_metric("full")
+        else:
+            self._apply_main_splitter_sidebar_metric("compact")
+
+        cw = max(0, self._content_splitter.width())
+        if not self._manual_inspector_visible:
+            self._content_splitter.setSizes([cw, 0])
+        elif self._inspector.isVisible():
+            s = self._content_splitter.sizes()
+            if len(s) >= 2 and s[1] > 0:
+                right = min(s[1], max(1, cw - 120))
+                self._content_splitter.setSizes([max(0, cw - right), right])
+
+        self._update_title_bar_geometry()
+
+    def _on_top_bar_layout_auto_clicked(self) -> None:
+        self._panel_layout_auto = True
+        self._persist_panel_layout_prefs()
+        self._apply_panel_layout()
+
+    def _on_top_bar_layout_sidebar_clicked(self) -> None:
+        was_auto = self._panel_layout_auto
+        self._panel_layout_auto = False
+        if was_auto:
+            sw = self._main_splitter.sizes()
+            sw0 = sw[0] if sw else 0
+            # Đang full → thu compact; đang compact (hoặc auto hẹp) → mở full.
+            self._manual_sidebar_full = sw0 <= 56
+        else:
+            self._manual_sidebar_full = not self._manual_sidebar_full
+        self._persist_panel_layout_prefs()
+        self._apply_panel_layout(full_manual=True)
+
+    def _on_top_bar_layout_inspector_clicked(self) -> None:
+        was_auto = self._panel_layout_auto
+        self._panel_layout_auto = False
+        if was_auto:
+            self._manual_inspector_visible = not self._inspector.isVisible()
+        else:
+            self._manual_inspector_visible = not self._manual_inspector_visible
+        self._persist_panel_layout_prefs()
+        self._apply_panel_layout(full_manual=True)
+
+    def _apply_responsive_panels_impl(self) -> None:
         """Narrow: hide inspector. Very narrow: switch to compact sidebar (56px)."""
-        w = self._main_splitter.width()
+        w = max(0, self._main_splitter.width())
         is_compact = self._sidebar_stack.currentIndex() == 1
         if w < self._WIDTH_HIDE_SIDEBAR:
             if not is_compact:
@@ -458,9 +612,7 @@ class MainWindow(FramelessMainWindow):
                     self._main_splitter_sizes_restore = list(sizes)
                 self._sidebar_compact.set_current_context(self._sidebar.current_context())
                 self._sidebar_stack.setCurrentIndex(1)
-                self._sidebar_container.setMinimumWidth(56)
-                self._sidebar_container.setMaximumWidth(56)
-            self._main_splitter.setSizes([56, max(0, w - 56)])
+            self._apply_main_splitter_sidebar_metric("compact")
             if self._inspector.isVisible():
                 sizes = self._content_splitter.sizes()
                 if len(sizes) >= 2 and sizes[1] > 0:
@@ -471,9 +623,7 @@ class MainWindow(FramelessMainWindow):
             if is_compact:
                 self._sidebar.set_current_context(self._sidebar_compact.current_context())
                 self._sidebar_stack.setCurrentIndex(0)
-                self._sidebar_container.setMinimumWidth(256)
-                self._sidebar_container.setMaximumWidth(256)
-                self._main_splitter.setSizes(self._main_splitter_sizes_restore)
+            self._apply_main_splitter_sidebar_metric("full")
             if self._inspector.isVisible():
                 sizes = self._content_splitter.sizes()
                 if len(sizes) >= 2 and sizes[1] > 0:
@@ -484,9 +634,7 @@ class MainWindow(FramelessMainWindow):
             if is_compact:
                 self._sidebar.set_current_context(self._sidebar_compact.current_context())
                 self._sidebar_stack.setCurrentIndex(0)
-                self._sidebar_container.setMinimumWidth(256)
-                self._sidebar_container.setMaximumWidth(256)
-                self._main_splitter.setSizes(self._main_splitter_sizes_restore)
+            self._apply_main_splitter_sidebar_metric("full")
             if not self._inspector.isVisible():
                 self._inspector.setVisible(True)
                 self._content_splitter.setSizes(self._content_splitter_sizes_restore)
@@ -504,14 +652,14 @@ class MainWindow(FramelessMainWindow):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        # Apply responsive panels on first show (sidebar/inspector hide when window is narrow).
-        QTimer.singleShot(0, self._apply_responsive_panels)
+        # First layout pass: auto → responsive; manual → apply saved visibility.
+        QTimer.singleShot(0, lambda: self._apply_panel_layout(full_manual=not self._panel_layout_auto))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self.isMaximized():
             self._apply_maximized_geometry_if_needed()
-        self._apply_responsive_panels()
+        self._apply_panel_layout()
         self._update_title_bar_geometry()
         notification_service.update_overlay_geometry()
 
@@ -1506,6 +1654,11 @@ class MainWindow(FramelessMainWindow):
             self._app_state.update_shots(list(result.shots))
             self._app_state.commit_immediate()
             self._sidebar.set_project_index(result)
+            # Full rescan: drop in-memory thumbs so grid/inspector reload from disk (mtime / new sources).
+            try:
+                self._thumbnail_manager.clear_memory_cache()
+            except Exception:
+                pass
             self._reload_main_view()
             self._sync_primary_action()
             self._sync_top_bar()
@@ -3077,11 +3230,18 @@ class MainWindow(FramelessMainWindow):
         """
         try:
             self._settings.setValue("ui/sidebar_context", self._sidebar.current_context())
+            self._persist_panel_layout_prefs()
         except Exception:
             pass
         path = self._app_settings_path()
         # Persist "full" layout (sizes when both panels visible) so restore doesn't get 0 for hidden panels.
-        main_sizes = self._main_splitter_sizes_restore if (self._sidebar_stack.currentIndex() == 1) else self._main_splitter.sizes()
+        ms_cur = self._main_splitter.sizes()
+        if len(ms_cur) >= 1 and ms_cur[0] == 0:
+            main_sizes = self._main_splitter_sizes_restore
+        elif self._sidebar_stack.currentIndex() == 1:
+            main_sizes = self._main_splitter_sizes_restore
+        else:
+            main_sizes = ms_cur
         content_sizes = self._content_splitter_sizes_restore if not self._inspector.isVisible() else self._content_splitter.sizes()
         payload = {
             "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
@@ -3118,11 +3278,20 @@ class MainWindow(FramelessMainWindow):
             if self._workspace_root is None:
                 return
             menu = QMenu(self)
+            act_refresh = menu.addAction(
+                lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Refresh",
+            )
+            menu.addSeparator()
             new_proj = menu.addAction(
                 lucide_icon("folder-plus", size=16, color_hex=MONOS_COLORS["text_label"]),
                 "New Project…",
             )
             chosen = menu.exec(global_pos)
+            if chosen == act_refresh:
+                self._apply_workspace_root(str(self._workspace_root), save=False)
+                self._reload_main_view()
+                return
             if chosen is not None and chosen == new_proj:
                 self._new_project()
             return
@@ -3135,6 +3304,11 @@ class MainWindow(FramelessMainWindow):
         if context not in ("Assets", "Shots"):
             return
         menu = QMenu(self)
+        act_refresh = menu.addAction(
+            lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Refresh",
+        )
+        menu.addSeparator()
         create_asset = None
         create_shot = None
 
@@ -3145,6 +3319,9 @@ class MainWindow(FramelessMainWindow):
 
         chosen = menu.exec(global_pos)
         if chosen is None:
+            return
+        if chosen == act_refresh:
+            self._on_refresh_requested()
             return
         if create_asset is not None and chosen == create_asset:
             self._create_asset()

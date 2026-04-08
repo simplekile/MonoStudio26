@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPainter, QPaintEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
+    QSizePolicy,
     QToolButton,
     QWidget,
 )
@@ -15,6 +16,48 @@ from PySide6.QtWidgets import (
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.notification.notification_dropdown import NotificationDropdown
 from monostudio.ui_qt.notification.notification_list_dialog import NotificationListDialog
+
+
+class _PanelLayoutGlyphButton(QToolButton):
+    """Cursor-style outline frame with sidebar strip (left) or inspector strip (bottom)."""
+
+    def __init__(self, kind: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._kind = kind  # "sidebar" | "inspector"
+        self.setCheckable(True)
+        self.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.setFixedSize(32, 32)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setObjectName("TopBarPanelGlyphBtn")
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        checked = self.isChecked()
+        stroke = QColor("#e4e4e7" if checked else "#71717a")
+        fill = QColor("#60a5fa" if checked else "#52525b")
+        r = self.rect().adjusted(7, 7, -7, -7)
+        radius = 3.0
+        p.setPen(stroke)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(r).adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        inner = r.adjusted(3, 3, -3, -3)
+        if self._kind == "sidebar":
+            bar_w = max(4, min(5, inner.width() - 2))
+            bar = QRectF(inner.left(), inner.top(), float(bar_w), float(inner.height()))
+            p.drawRoundedRect(bar, 1.5, 1.5)
+        else:
+            bar_h = max(4.0, float(inner.height()) * 0.28)
+            bar = QRectF(
+                float(inner.left()),
+                float(inner.bottom()) - bar_h + 0.5,
+                float(inner.width()),
+                bar_h - 0.5,
+            )
+            p.drawRoundedRect(bar, 1.5, 1.5)
 
 
 class _UpdateBadge(QWidget):
@@ -43,6 +86,9 @@ class TopBar(QWidget):
     title_double_clicked = Signal()
     update_button_clicked = Signal()
     watcher_toggled = Signal(bool)  # True = watcher on, False = watcher off
+    layout_auto_clicked = Signal()
+    layout_sidebar_clicked = Signal()
+    layout_inspector_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -73,15 +119,16 @@ class TopBar(QWidget):
         self._btn_close.clicked.connect(self.close_clicked.emit)
 
         # Update button (right side, before noti) — icon: download for "update"
+        _action_icon_w, _action_icon_h = 32, 36
         self._btn_update = QToolButton(self)
         self._btn_update.setObjectName("TopBarUpdateBtn")
         self._btn_update.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._btn_update.setIcon(lucide_icon("download", size=20, color_hex=_win_icon_color))
-        self._btn_update.setFixedSize(40, 36)
+        self._btn_update.setFixedSize(_action_icon_w, _action_icon_h)
         self._btn_update.setToolTip("Check for updates")
         self._btn_update.clicked.connect(self.update_button_clicked.emit)
         self._update_badge = _UpdateBadge(self._btn_update)
-        self._update_badge.move(26, 4)
+        self._update_badge.move(_action_icon_w - 12, 4)
         self._update_badge.hide()
         self._update_badge.raise_()
 
@@ -92,7 +139,7 @@ class TopBar(QWidget):
         self._btn_watcher.setCheckable(True)
         self._btn_watcher.setChecked(True)
         self._btn_watcher.setIcon(lucide_icon("eye", size=20, color_hex="#22c55e"))
-        self._btn_watcher.setFixedSize(40, 36)
+        self._btn_watcher.setFixedSize(_action_icon_w, _action_icon_h)
         self._btn_watcher.setToolTip("File watcher: on — pause (click) before rename/delete")
         self._btn_watcher.toggled.connect(self._on_watcher_toggled)
         self._watcher_busy = False
@@ -106,7 +153,7 @@ class TopBar(QWidget):
         self._btn_settings.setObjectName("TopBarSettingsBtn")
         self._btn_settings.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._btn_settings.setIcon(lucide_icon("settings", size=20, color_hex=_win_icon_color))
-        self._btn_settings.setFixedSize(40, 36)
+        self._btn_settings.setFixedSize(_action_icon_w, _action_icon_h)
         self._btn_settings.setToolTip("Settings")
         self._btn_settings.clicked.connect(self.settings_clicked.emit)
 
@@ -115,7 +162,7 @@ class TopBar(QWidget):
         self._btn_noti.setObjectName("TopBarNotiBtn")
         self._btn_noti.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._btn_noti.setIcon(lucide_icon("bell", size=20, color_hex=_win_icon_color))
-        self._btn_noti.setFixedSize(40, 36)
+        self._btn_noti.setFixedSize(_action_icon_w, _action_icon_h)
         self._btn_noti.setToolTip("Notifications")
         self._noti_dropdown_closed_at = 0.0  # monotonic time when dropdown last closed (avoid reopen on same click)
         self._noti_dropdown = NotificationDropdown(self)
@@ -123,17 +170,69 @@ class TopBar(QWidget):
         self._noti_dropdown.closed.connect(self._on_noti_dropdown_closed)
         self._btn_noti.clicked.connect(self._show_noti_dropdown)
 
+        # Panel layout: Auto (responsive) + sidebar + inspector toggles (Cursor-style)
+        self._panel_group = QWidget(self)
+        self._panel_group.setObjectName("TopBarPanelGroup")
+        panel_l = QHBoxLayout(self._panel_group)
+        panel_l.setContentsMargins(2, 2, 2, 2)
+        panel_l.setSpacing(0)
+        self._btn_layout_auto = QToolButton(self._panel_group)
+        self._btn_layout_auto.setObjectName("TopBarPanelAutoBtn")
+        self._btn_layout_auto.setText("Auto")
+        self._btn_layout_auto.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._btn_layout_auto.setFixedHeight(28)
+        self._btn_layout_auto.setMinimumWidth(38)
+        self._btn_layout_auto.setToolTip("Auto layout — hide sidebar and Inspector when the window is narrow")
+        self._btn_layout_auto.clicked.connect(self._on_layout_auto_clicked)
+        self._btn_layout_sidebar = _PanelLayoutGlyphButton("sidebar", self._panel_group)
+        self._btn_layout_sidebar.setToolTip("Full sidebar or compact rail (56px)")
+        self._btn_layout_sidebar.clicked.connect(self.layout_sidebar_clicked.emit)
+        self._btn_layout_inspector = _PanelLayoutGlyphButton("inspector", self._panel_group)
+        self._btn_layout_inspector.setToolTip("Show or hide Inspector")
+        self._btn_layout_inspector.clicked.connect(self.layout_inspector_clicked.emit)
+        panel_l.addWidget(self._btn_layout_auto, 0, Qt.AlignVCenter)
+        panel_l.addWidget(self._btn_layout_sidebar, 0, Qt.AlignVCenter)
+        panel_l.addWidget(self._btn_layout_inspector, 0, Qt.AlignVCenter)
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 10, 8, 10)
         layout.setSpacing(0)
+        layout.addWidget(self._panel_group, 0, Qt.AlignLeft | Qt.AlignVCenter)
         layout.addStretch(1)
-        layout.addWidget(self._btn_update, 0, Qt.AlignRight | Qt.AlignVCenter)
-        layout.addWidget(self._btn_watcher, 0, Qt.AlignRight | Qt.AlignVCenter)
-        layout.addWidget(self._btn_settings, 0, Qt.AlignRight | Qt.AlignVCenter)
-        layout.addWidget(self._btn_noti, 0, Qt.AlignRight | Qt.AlignVCenter)
+        self._action_strip = QWidget(self)
+        self._action_strip.setObjectName("TopBarActionStrip")
+        action_l = QHBoxLayout(self._action_strip)
+        action_l.setContentsMargins(0, 0, 0, 0)
+        action_l.setSpacing(0)
+        action_l.addWidget(self._btn_update, 0, Qt.AlignVCenter)
+        action_l.addWidget(self._btn_watcher, 0, Qt.AlignVCenter)
+        action_l.addWidget(self._btn_settings, 0, Qt.AlignVCenter)
+        action_l.addWidget(self._btn_noti, 0, Qt.AlignVCenter)
+        layout.addWidget(self._action_strip, 0, Qt.AlignRight | Qt.AlignVCenter)
+        # Keep window chrome (min / max / close) at original spacing — gap before them only
+        layout.addSpacing(10)
         layout.addWidget(self._btn_min, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_max, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_close, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+    def _on_layout_auto_clicked(self) -> None:
+        """Always re-enter auto layout (segment stays active until user uses sidebar/inspector toggles)."""
+        self.layout_auto_clicked.emit()
+
+    def set_panel_layout_controls(self, *, auto: bool, sidebar_on: bool, inspector_on: bool) -> None:
+        """Sync TopBar panel controls from MainWindow (block signals while updating)."""
+        self._btn_layout_auto.setProperty("active", auto)
+        self._btn_layout_auto.style().unpolish(self._btn_layout_auto)
+        self._btn_layout_auto.style().polish(self._btn_layout_auto)
+        self._btn_layout_auto.update()
+        self._btn_layout_sidebar.blockSignals(True)
+        self._btn_layout_sidebar.setChecked(sidebar_on)
+        self._btn_layout_sidebar.blockSignals(False)
+        self._btn_layout_sidebar.update()
+        self._btn_layout_inspector.blockSignals(True)
+        self._btn_layout_inspector.setChecked(inspector_on)
+        self._btn_layout_inspector.blockSignals(False)
+        self._btn_layout_inspector.update()
 
     # Grace period (seconds): if popup was closed less than this ago, next button click is treated as "close" not "open"
     _POPUP_REOPEN_GRACE = 0.25
@@ -265,13 +364,11 @@ class TopBar(QWidget):
 
     def _is_on_window_buttons(self, pos: QPoint) -> bool:
         return (
-            self._btn_min.geometry().contains(pos)
+            self._panel_group.geometry().contains(pos)
+            or self._action_strip.geometry().contains(pos)
+            or self._btn_min.geometry().contains(pos)
             or self._btn_max.geometry().contains(pos)
             or self._btn_close.geometry().contains(pos)
-            or self._btn_update.geometry().contains(pos)
-            or self._btn_watcher.geometry().contains(pos)
-            or self._btn_settings.geometry().contains(pos)
-            or self._btn_noti.geometry().contains(pos)
         )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:

@@ -6,7 +6,14 @@
 #define MyAppVersion "26.0.0"
 #endif
 
+#ifndef MyAppName
 #define MyAppName "MonoStudio 26"
+#endif
+
+#ifndef MyOutputBaseFilename
+#define MyOutputBaseFilename "MonoStudio26_Setup"
+#endif
+
 #define MyAppExe "MonoStudio26.exe"
 ; Source = PyInstaller onedir output (relative to this script's parent = repo root)
 #define SourceDir "..\dist\MonoStudio26"
@@ -18,7 +25,7 @@ AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\MonoStudio26
 DefaultGroupName={#MyAppName}
 OutputDir=..\dist
-OutputBaseFilename=MonoStudio26_Setup
+OutputBaseFilename={#MyOutputBaseFilename}
 SetupIconFile=..\monostudio_data\icons\app.ico
 Compression=lzma2
 SolidCompression=yes

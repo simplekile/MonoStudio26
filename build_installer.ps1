@@ -4,7 +4,8 @@
 
 param(
     [switch]$NoCommit,
-    [switch]$NoVersionBump
+    [switch]$NoVersionBump,
+    [switch]$Beta
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,8 +80,14 @@ if ($isccExe) {
         if ($verText -match "^26\.(\d+)\.(\d+)$") { $appVer = "26.$($Matches[1]).$($Matches[2])" }
         elseif ($verText -match "^26\.(\d+)$") { $appVer = "26.0.$($Matches[1])" }
     }
+    $isccArgs = @("/DMyAppVersion=$appVer")
+    if ($Beta) {
+        Write-Host "Beta build: Output MonoStudio26_Beta_Setup.exe, AppName includes Beta (same install dir as stable)."
+        $isccArgs += "/DMyAppName=MonoStudio 26 (Beta)"
+        $isccArgs += "/DMyOutputBaseFilename=MonoStudio26_Beta_Setup"
+    }
     Write-Host "Building installer with Inno Setup (version $appVer)..."
-    & $isccExe "/DMyAppVersion=$appVer" "installer\MonoStudio26.iss"
+    & $isccExe @isccArgs "installer\MonoStudio26.iss"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } else {
     Write-Host "Inno Setup not found. Install from https://jrsoftware.org/isinfo.php then re-run, or open installer\MonoStudio26.iss in Inno Setup Compiler."
