@@ -710,6 +710,56 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #ef4444;
         }
 
+        /* Production status picker: category section headers + tooltips */
+        QMenu#ProductionStatusMenu::item {
+            padding: 6px 28px 6px 20px;
+        }
+        QLabel#ProductionStatusMenuSectionLabel {
+            font-family: "Inter", "Inter UI", "Segoe UI", "San Francisco", sans-serif;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.14em;
+            color: #71717a;
+            background: transparent;
+        }
+        QWidget#ProductionStatusMenuSection_default {
+            background-color: rgba(113, 113, 122, 0.14);
+            border-top: none;
+            border-bottom: none;
+        }
+        QWidget#ProductionStatusMenuSection_blocked {
+            background-color: rgba(239, 68, 68, 0.14);
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        QWidget#ProductionStatusMenuSection_hold {
+            background-color: rgba(251, 191, 36, 0.12);
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        QWidget#ProductionStatusMenuSection_review {
+            background-color: rgba(96, 165, 250, 0.12);
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        QWidget#ProductionStatusMenuSection_in_progress {
+            background-color: rgba(245, 158, 11, 0.12);
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        QWidget#ProductionStatusMenuSection_not_started {
+            background-color: rgba(113, 113, 122, 0.16);
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        QWidget#ProductionStatusMenuSection_done {
+            background-color: rgba(16, 185, 129, 0.12);
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        QWidget#ProductionStatusMenuSection_na {
+            background-color: rgba(82, 82, 91, 0.22);
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+        QWidget#ProductionStatusMenuSection_other {
+            background-color: rgba(161, 161, 170, 0.12);
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+
         QWidget#TopBar {
             background-color: #18181b; /* Zinc-900 */
             border-bottom: 1px solid rgba(39, 39, 42, 0.50);
@@ -1211,7 +1261,8 @@ def apply_dark_theme(app: QApplication) -> None:
             color: rgba(161, 161, 170, 0.45);
         }
         /* Folder icon on each department row (lighter hover) */
-        QToolButton#InspectorDeptOpenButton {
+        QToolButton#InspectorDeptOpenButton,
+        QToolButton#InspectorDeptStatusMenuButton {
             border: none;
             padding: 0 6px;
             background: transparent;
@@ -1225,7 +1276,8 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #e4e4e7;
         }
         /* But for the dept folder button, use pill-style hover and no border */
-        QWidget#InspectorPanel QToolButton#InspectorDeptOpenButton:hover {
+        QWidget#InspectorPanel QToolButton#InspectorDeptOpenButton:hover,
+        QWidget#InspectorPanel QToolButton#InspectorDeptStatusMenuButton:hover {
             background: rgba(255, 255, 255, 0.08);
             border: none;
             border-radius: 999px;

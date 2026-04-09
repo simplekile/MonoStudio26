@@ -6,11 +6,17 @@ from typing import TYPE_CHECKING
 
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.models import Asset, DccWorkState, Department, ProjectIndex, Shot
+from monostudio.core.production_status import load_status_overrides_for_scan
 
 if TYPE_CHECKING:
     from monostudio.core.department_registry import DepartmentRegistry
     from monostudio.core.dcc_registry import DccRegistry
     from monostudio.core.type_registry import TypeRegistry
+
+
+def _status_overrides_for_item(item_dir: Path, departments: tuple[Department, ...]) -> tuple[tuple[str, str], ...]:
+    names = tuple((d.name or "").strip() for d in departments if (d.name or "").strip())
+    return load_status_overrides_for_scan(item_dir, names)
 
 
 def _iter_dirs(path: Path) -> list[Path]:
@@ -711,13 +717,15 @@ def build_project_index(
             departments, dcc_states = _build_asset_departments(
                 asset_dir, dept_registry, open_meta, use_dcc_folders, dcc_reg
             )
+            dept_tup = tuple(departments)
             assets.append(
                 Asset(
                     asset_type=type_id,
                     name=asset_dir.name,
                     path=asset_dir,
-                    departments=tuple(departments),
+                    departments=dept_tup,
                     dcc_work_states=tuple(dcc_states),
+                    status_overrides=_status_overrides_for_item(asset_dir, dept_tup),
                 )
             )
 
@@ -727,12 +735,14 @@ def build_project_index(
         departments, dcc_states = _build_shot_departments(
             shot_dir, dept_registry, open_meta, use_dcc_folders, dcc_reg
         )
+        dept_tup = tuple(departments)
         shots.append(
             Shot(
                 name=shot_dir.name,
                 path=shot_dir,
-                departments=tuple(departments),
+                departments=dept_tup,
                 dcc_work_states=tuple(dcc_states),
+                status_overrides=_status_overrides_for_item(shot_dir, dept_tup),
             )
         )
 
@@ -784,12 +794,14 @@ def scan_single_asset(
     departments, dcc_states = _build_asset_departments(
         asset_dir, dept_reg, open_meta, use_dcc_folders, dcc_reg
     )
+    dept_tup = tuple(departments)
     return Asset(
         asset_type=type_id,
         name=asset_dir.name,
         path=asset_dir,
-        departments=tuple(departments),
+        departments=dept_tup,
         dcc_work_states=tuple(dcc_states),
+        status_overrides=_status_overrides_for_item(asset_dir, dept_tup),
     )
 
 
@@ -827,11 +839,13 @@ def scan_single_shot(
     departments, dcc_states = _build_shot_departments(
         shot_dir, dept_reg, open_meta, use_dcc_folders, dcc_reg
     )
+    dept_tup = tuple(departments)
     return Shot(
         name=shot_dir.name,
         path=shot_dir,
-        departments=tuple(departments),
+        departments=dept_tup,
         dcc_work_states=tuple(dcc_states),
+        status_overrides=_status_overrides_for_item(shot_dir, dept_tup),
     )
 
 
@@ -867,13 +881,15 @@ def scan_assets_in_type(
         departments, dcc_states = _build_asset_departments(
             asset_dir, dept_reg, open_meta, use_dcc_folders, dcc_reg
         )
+        dept_tup = tuple(departments)
         assets.append(
             Asset(
                 asset_type=type_id,
                 name=asset_dir.name,
                 path=asset_dir,
-                departments=tuple(departments),
+                departments=dept_tup,
                 dcc_work_states=tuple(dcc_states),
+                status_overrides=_status_overrides_for_item(asset_dir, dept_tup),
             )
         )
     return sorted(assets, key=lambda a: (a.asset_type, a.name))

@@ -48,6 +48,14 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.core.models import Asset, Department, Shot, ProjectIndex
+from monostudio.core.production_status import (
+    aggregate_status_id_for_item,
+    color_hex_for_status_id,
+    department_has_status_override,
+    effective_status_id_for_department,
+    load_production_status_registry,
+    override_status_id_for_department,
+)
 from monostudio.core.inbox_reader import load_inbox_destinations, resolve_destination_path
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.department_registry import DepartmentRegistry
@@ -70,6 +78,7 @@ from monostudio.ui_qt.thumbnail_source_resolve import (
     resolve_entity_thumbnail_source_path,
 )
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
+from monostudio.ui_qt.production_status_menu import pick_production_status_at
 from monostudio.ui_qt.shell_thumbnail import get_windows_shell_thumbnail
 from monostudio.ui_qt.worker_manager import WorkerTask
 
@@ -325,6 +334,8 @@ class InspectorPanel(QWidget):
     open_folder_requested = Signal(object)  # emits ViewItem — mở folder trong explorer
     inbox_distribute_finished = Signal(list)  # list of dicts: {path, destination_id, destination_label, scope, entity_name, target_path}
     active_dcc_changed = Signal(object, str, str)  # path, department, dcc_id — đồng bộ với main view
+    production_status_override_requested = Signal(object, str, object)  # Path, department, status_id | None
+    inspector_hidden_departments_changed = Signal(set)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -363,6 +374,7 @@ class InspectorPanel(QWidget):
         self._dept_pipeline.manage_clicked.connect(self.manage_departments_requested.emit)
         self._dept_pipeline.department_focused.connect(self._on_department_focused)
         self._dept_pipeline.hidden_departments_changed.connect(self._on_hidden_departments_changed)
+        self._dept_pipeline.production_status_override_requested.connect(self.production_status_override_requested.emit)
         self._preview.paste_requested.connect(self._on_paste_requested)
         self._preview.remove_requested.connect(self._on_remove_requested)
         self._show_publish: bool = False
@@ -412,6 +424,7 @@ class InspectorPanel(QWidget):
 
         self._current_item: ViewItem | None = None
         self._previous_item: ViewItem | None = None
+        self._project_root: Path | None = None
         self._thumbnail_manager: object | None = None
         self._worker_manager: object | None = None
         self._department_label_resolver: object | None = None  # callable[[str], str] | None
@@ -453,6 +466,10 @@ class InspectorPanel(QWidget):
         """Optional WorkerManager: load preview thumb in background + loading spinner (như Explorer)."""
         self._worker_manager = manager
         self._preview.set_worker_manager(manager)
+
+    def set_project_root(self, path: Path | str | None) -> None:
+        """Open project root for production status presets + overrides."""
+        self._project_root = Path(path) if path else None
 
     def set_app_settings(self, settings: QSettings) -> None:
         """Share MainWindow QSettings so Inspector reads the same keys as Settings dialog."""
@@ -557,6 +574,7 @@ class InspectorPanel(QWidget):
 
         if item is None:
             self._empty.set_message("Select an item to view details")
+            self.inspector_hidden_departments_changed.emit(set())
             return
 
         # Đồng bộ department từ sidebar (active_department_hint):
@@ -610,6 +628,11 @@ class InspectorPanel(QWidget):
                 self._preview.update_thumbnail_only()
             if diff.get("name") or diff.get("type"):
                 self._tech.set_item(item)
+
+        if isinstance(ref, (Asset, Shot)):
+            self.inspector_hidden_departments_changed.emit(set(self._dept_pipeline._hidden_departments))
+        else:
+            self.inspector_hidden_departments_changed.emit(set())
 
         if scroll_bar and scroll_bar.value() != scroll_pos:
             scroll_bar.setValue(scroll_pos)
@@ -687,6 +710,7 @@ class InspectorPanel(QWidget):
 
     def _on_hidden_departments_changed(self, hidden: set) -> None:
         self._asset_status.set_hidden_departments(hidden)
+        self.inspector_hidden_departments_changed.emit(set(hidden))
 
     def _on_identity_active_dcc_changed(self, path, department: str, dcc_id: str) -> None:
         """Sync active DCC với main view: emit signal và refresh identity để version đúng DCC."""
@@ -3072,6 +3096,16 @@ class _ProductionHealth(QWidget):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         l.addWidget(spacer)
 
+    @staticmethod
+    def _project_root_from_parent(widget: QWidget | None) -> Path | None:
+        p = widget.parent() if widget is not None else None
+        while p is not None:
+            r = getattr(p, "_project_root", None)
+            if r is not None:
+                return Path(r) if r else None
+            p = p.parent()
+        return None
+
     def set_focused_department(self, dept_name: str | None) -> None:
         self._focused_department = (dept_name or "").strip() or None
         if self._current_item is not None:
@@ -3091,40 +3125,46 @@ class _ProductionHealth(QWidget):
         if item is None:
             self.status_changed.emit("", "")
             return
-        status = "WAITING"
         ref = item.ref
         if isinstance(ref, Department):
             status = _status_from_department(ref)
-        elif isinstance(ref, (Asset, Shot)):
-            dep = (self._focused_department or "").strip()
-            dep_cf = dep.casefold() if dep else ""
-            if dep_cf:
-                for d in ref.departments:
-                    if (d.name or "").strip().casefold() == dep_cf:
-                        status = _status_from_department(d)
-                        break
-            else:
-                visible = [d for d in ref.departments if (d.name or "") not in self._hidden_departments]
-                if not visible:
-                    visible = list(ref.departments)
-                if visible and all(d.publish_version_count > 0 for d in visible):
-                    status = "READY"
-                elif any(d.work_exists for d in visible):
-                    status = "PROGRESS"
-                else:
-                    status = "WAITING"
-        else:
-            self.status_changed.emit("", "")
+            color = _status_color(status)
+            display = _status_display_label(status)
+            self.status_changed.emit(color, display)
+            return
+        if isinstance(ref, (Asset, Shot)):
+            try:
+                pr = self._project_root_from_parent(self)
+                reg = load_production_status_registry(pr)
+                sid = aggregate_status_id_for_item(
+                    ref,
+                    active_department=self._focused_department,
+                    hidden_departments=self._hidden_departments,
+                    registry=reg,
+                )
+                color = color_hex_for_status_id(sid, reg)
+                display = reg.label_for(sid)
+                self.status_changed.emit(color, display)
+            except Exception:
+                self.status_changed.emit("", "")
             return
 
-        color = _status_color(status)
-        display = _status_display_label(status)
-        # Emit for Inspector preview to render as a dot inside thumbnail.
-        self.status_changed.emit(color, display)
+        self.status_changed.emit("", "")
+
+
+def _dept_status_pill_qss(text_color: str) -> str:
+    """QLabel#InspectorStatusPill base + hover (requires WA_Hover on the label)."""
+    return (
+        f"QLabel#InspectorStatusPill {{ padding: 1px 8px; border-radius: 12px; "
+        f"border: 1px solid transparent; background-color: rgba(255,255,255,0.06); color: {text_color}; }}"
+        f"QLabel#InspectorStatusPill:hover {{ background-color: rgba(255,255,255,0.12); "
+        f"border: 1px solid rgba(255,255,255,0.14); }}"
+    )
 
 
 class _DeptCard(QFrame):
     clicked = Signal()
+    production_status_override_requested = Signal(str, object)  # dept_name, status_id | None
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3159,9 +3199,9 @@ class _DeptCard(QFrame):
         self._pill.setObjectName("InspectorStatusPill")
         pill_font = monos_font("Inter", 9, QFont.Weight.DemiBold)
         self._pill.setFont(pill_font)
-        self._pill.setStyleSheet(
-            f"padding: 1px 6px; border-radius: 8px; border: none; background: rgba(255,255,255,0.06); color: {MONOS_COLORS['text_label']};"
-        )
+        self._pill.setAttribute(Qt.WA_Hover, True)
+        self._pill.setStyleSheet(_dept_status_pill_qss(MONOS_COLORS["text_label"]))
+        self._pill.installEventFilter(self)
 
         self._btn_open = QToolButton(self)
         self._btn_open.setObjectName("InspectorDeptOpenButton")
@@ -3180,20 +3220,53 @@ class _DeptCard(QFrame):
         l.addWidget(row, 0)
 
         self._dept: Department | None = None
+        self._dept_name_key: str = ""
+        self._asset_shot_ref: Asset | Shot | None = None
+        self._project_root: Path | None = None
         self._btn_open.clicked.connect(self._open_folder)
 
-    def set_department(self, dept: Department, display_name: str | None = None, icon_name: str | None = None) -> None:
+    def set_department(
+        self,
+        dept: Department,
+        display_name: str | None = None,
+        icon_name: str | None = None,
+        *,
+        ref: Asset | Shot | None = None,
+        project_root: Path | None = None,
+    ) -> None:
         self._dept = dept
+        self._dept_name_key = (dept.name or "").strip()
+        self._asset_shot_ref = ref
+        self._project_root = project_root
         raw = (display_name or dept.name or "").strip()
         text = raw.replace("_", " ").title() if raw else ""
         self._name.setText(text)
         ico = lucide_icon((icon_name or "").strip() or "layers", size=14, color_hex=MONOS_COLORS["text_label"])
         self._icon_label.setPixmap(ico.pixmap(14, 14))
-        status = _status_from_department(dept)
-        self._pill.setText(_status_display_label(status))
-        self._pill.setStyleSheet(
-            f"padding: 1px 6px; border-radius: 8px; border: none; background: rgba(255,255,255,0.06); color: {_status_color(status)};"
-        )
+
+        show_menu = ref is not None
+        self._pill.setCursor(Qt.PointingHandCursor if show_menu else Qt.ArrowCursor)
+
+        try:
+            reg = load_production_status_registry(project_root)
+            oid = (
+                override_status_id_for_department(ref, self._dept_name_key)
+                if ref is not None and self._dept_name_key
+                else None
+            )
+            eff = effective_status_id_for_department(dept, oid, reg)
+            self._pill.setText(reg.label_for(eff))
+            col = color_hex_for_status_id(eff, reg)
+            self._pill.setStyleSheet(_dept_status_pill_qss(col))
+            manual = bool(ref is not None and department_has_status_override(ref, self._dept_name_key))
+            src = "Manual" if manual else "From files"
+            self._pill.setToolTip(f"{src}: {reg.label_for(eff)}")
+        except Exception:
+            status = _status_from_department(dept)
+            self._pill.setText(_status_display_label(status))
+            self._pill.setStyleSheet(_dept_status_pill_qss(_status_color(status)))
+            self._pill.setToolTip("")
+
         dept_root_ok = False
         try:
             dept_root_ok = bool(dept.path.exists() and dept.path.is_dir())
@@ -3206,6 +3279,23 @@ class _DeptCard(QFrame):
             self._btn_open.setToolTip(
                 "Department folder is not on disk yet. Use Create New in the main view or create the folder manually."
             )
+
+    def _show_status_menu(self) -> None:
+        if self._asset_shot_ref is None or not self._dept_name_key:
+            return
+        res = pick_production_status_at(self, self._project_root, QCursor.pos())
+        if res is False:
+            return
+        self.production_status_override_requested.emit(self._dept_name_key, res)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if obj is self._pill and event.type() == QEvent.Type.MouseButtonPress:
+            me = event
+            if isinstance(me, QMouseEvent) and me.button() == Qt.MouseButton.LeftButton:
+                if self._asset_shot_ref is not None and self._dept_name_key:
+                    self._show_status_menu()
+                    return True
+        return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         # Clicking the card updates Tech row with this department's work path.
@@ -3284,6 +3374,7 @@ class _DepartmentPipeline(QWidget):
     manage_clicked = Signal()
     department_focused = Signal(str)
     hidden_departments_changed = Signal(set)
+    production_status_override_requested = Signal(object, str, object)  # Path, department, status_id | None
 
     _SETTINGS_KEY_HIDDEN = "inspector/hidden_departments"
 
@@ -3342,11 +3433,13 @@ class _DepartmentPipeline(QWidget):
 
         self._dept_cards: list[_DeptCard] = []
         self._dept_card_slots: list[object] = []
+        self._dept_card_production_status_connected: list[bool] = []
         for _ in range(_MAX_DEPT_CARDS):
             card = _DeptCard(self._list)
             card.setVisible(False)
             self._dept_cards.append(card)
             self._dept_card_slots.append(None)
+            self._dept_card_production_status_connected.append(False)
 
         self._empty = QLabel("—", self)
         self._empty.setStyleSheet(f"color: {MONOS_COLORS['text_meta']};")
@@ -3457,6 +3550,21 @@ class _DepartmentPipeline(QWidget):
                         out[parent] = label
         return out
 
+    def _inspector_project_root(self) -> Path | None:
+        p = self.parent()
+        while p is not None:
+            r = getattr(p, "_project_root", None)
+            if r is not None:
+                return Path(r) if r else None
+            p = p.parent()
+        return None
+
+    def _emit_production_status_override_for_card(self, dept_name: str, status_id: object) -> None:
+        item = self._current_item
+        if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        self.production_status_override_requested.emit(item.path, dept_name, status_id)
+
     def set_sidebar_focus(self, dept_name: str | None) -> None:
         """Highlight the department that is focused from the sidebar (persistent, yellow border)."""
         self._sidebar_focused_dept_id = (dept_name or "").strip() or None
@@ -3496,6 +3604,9 @@ class _DepartmentPipeline(QWidget):
                 depts = ref.departments
         else:
             depts = ()
+
+        pr_root = self._inspector_project_root()
+        ref_as = ref if isinstance(ref, (Asset, Shot)) else None
 
         if not depts:
             self._current_all_dept_ids = []
@@ -3573,6 +3684,12 @@ class _DepartmentPipeline(QWidget):
                 except (TypeError, RuntimeError):
                     pass
                 self._dept_card_slots[i] = None
+            if i < len(self._dept_card_production_status_connected) and self._dept_card_production_status_connected[i]:
+                try:
+                    card.production_status_override_requested.disconnect(self._emit_production_status_override_for_card)
+                except (TypeError, RuntimeError):
+                    pass
+                self._dept_card_production_status_connected[i] = False
 
         while self._list_l.count():
             self._list_l.takeAt(0)
@@ -3595,7 +3712,7 @@ class _DepartmentPipeline(QWidget):
                 card = self._dept_cards[card_idx]
                 display_name = _department_display_name(d.name or "", label_resolver)
                 dept_icon_name = icon_map.get(d.name or "", "layers")
-                card.set_department(d, display_name, dept_icon_name)
+                card.set_department(d, display_name, dept_icon_name, ref=ref_as, project_root=pr_root)
                 card.set_sidebar_focused(bool(self._sidebar_focused_dept_id and (d.name or "") == self._sidebar_focused_dept_id))
                 card.set_focused(bool(self._focused_dept_id and (d.name or "") == self._focused_dept_id))
                 card.setVisible(True)
@@ -3608,6 +3725,9 @@ class _DepartmentPipeline(QWidget):
                 card.clicked.connect(slot)
                 if card_idx < len(self._dept_card_slots):
                     self._dept_card_slots[card_idx] = slot
+                card.production_status_override_requested.connect(self._emit_production_status_override_for_card)
+                if card_idx < len(self._dept_card_production_status_connected):
+                    self._dept_card_production_status_connected[card_idx] = True
                 self._list_l.addWidget(card, 0)
                 card_idx += 1
 

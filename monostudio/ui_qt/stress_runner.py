@@ -58,6 +58,7 @@ def _make_fake_assets(count: int, base_path: Path) -> list:
                 path=asset_path,
                 departments=(dept,),
                 dcc_work_states=(),
+                status_overrides=(),
             )
         )
     return assets

@@ -24,7 +24,10 @@ from monostudio.core.fs_reader import (
     read_use_dcc_folders,
     resolve_work_path,
     run_incremental_scan,
+    scan_single_asset,
+    scan_single_shot,
 )
+from monostudio.core.item_status import set_department_status_override
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.structure_registry import StructureRegistry
 from monostudio.core.type_registry import TypeRegistry
@@ -318,6 +321,9 @@ class MainWindow(FramelessMainWindow):
         self._inspector.open_folder_requested.connect(self._on_inspector_open_folder_requested)
         self._inspector.inbox_distribute_finished.connect(self._on_inbox_distribute_finished)
         self._inspector.active_dcc_changed.connect(self._on_inspector_active_dcc_changed)
+        self._inspector.inspector_hidden_departments_changed.connect(self._main_view.set_inspector_hidden_departments)
+        self._inspector.production_status_override_requested.connect(self._on_production_status_override)
+        self._main_view.production_status_override_chosen.connect(self._on_production_status_override)
         self._main_view.active_dcc_changed.connect(self._on_main_view_active_dcc_changed)
         self._main_view.thumbnail_source_changed.connect(self._on_main_view_thumbnail_source_changed)
 
@@ -1785,6 +1791,7 @@ class MainWindow(FramelessMainWindow):
         self._sync_pipeline_preset_metadata_ui()
         self._main_view.set_project_root(folder)
         self._main_view.set_empty_override(None)
+        self._inspector.set_project_root(self._project_root)
 
         if self._project_root is not None:
             try:
@@ -2863,6 +2870,142 @@ class MainWindow(FramelessMainWindow):
         if p is None or not department or not dcc_id:
             return
         self._main_view.set_active_dcc(p, department, dcc_id)
+
+    def _on_production_status_override(self, entity_path: object, department: str, status_id: object) -> None:
+        if self._project_root is None:
+            return
+        dep = (department or "").strip()
+        if not dep:
+            return
+
+        raw_paths: list[Path]
+        if isinstance(entity_path, (list, tuple)):
+            raw_paths = []
+            for p in entity_path:
+                try:
+                    raw_paths.append(Path(p))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            try:
+                raw_paths = [Path(entity_path)]
+            except (TypeError, ValueError):
+                return
+        raw_paths = [p for p in raw_paths if str(p)]
+        if not raw_paths:
+            return
+
+        sid: str | None
+        if status_id is None:
+            sid = None
+        else:
+            s = str(status_id).strip()
+            sid = s if s else None
+
+        failed: list[tuple[Path, str]] = []
+        ok_paths: list[Path] = []
+        for ep in raw_paths:
+            try:
+                set_department_status_override(ep, dep, sid)
+                ok_paths.append(ep)
+            except OSError as e:
+                failed.append((ep, str(e)))
+            except ValueError:
+                pass
+
+        if not ok_paths:
+            if failed:
+                msg = "\n".join(f"{fp}: {err}" for fp, err in failed[:5])
+                if len(failed) > 5:
+                    msg += f"\n… (+{len(failed) - 5} more)"
+                QMessageBox.warning(self, "Production status", f"Could not save status:\n{msg}")
+            return
+
+        if failed:
+            msg = "\n".join(f"{fp}: {err}" for fp, err in failed[:5])
+            if len(failed) > 5:
+                msg += f"\n… (+{len(failed) - 5} more)"
+            QMessageBox.warning(
+                self,
+                "Production status",
+                f"Saved {len(ok_paths)} item(s); {len(failed)} failed:\n{msg}",
+            )
+
+        dept_reg = DepartmentRegistry.for_project(self._project_root)
+        type_reg = TypeRegistry.for_project(self._project_root)
+        struct_reg = StructureRegistry.for_project(self._project_root)
+        assets_dir = self._project_root / struct_reg.get_folder("assets")
+        shots_dir = self._project_root / struct_reg.get_folder("shots")
+
+        current_assets = dict(self._app_state.assets())
+        current_shots = dict(self._app_state.shots())
+
+        def same_path(key: str, path_value: Path) -> bool:
+            try:
+                return Path(key).resolve() == Path(path_value).resolve()
+            except OSError:
+                return False
+
+        ok_resolved: set[str] = set()
+        for ep in ok_paths:
+            try:
+                ep_r = ep.resolve()
+            except OSError:
+                ep_r = ep
+            ok_resolved.add(str(ep_r))
+
+            try:
+                ep_r.relative_to(assets_dir.resolve())
+                updated_asset = scan_single_asset(self._project_root, ep_r, dept_reg, type_reg)
+            except ValueError:
+                updated_asset = None
+            updated_shot: Shot | None = None
+            if updated_asset is None:
+                try:
+                    ep_r.relative_to(shots_dir.resolve())
+                    updated_shot = scan_single_shot(self._project_root, ep_r, dept_reg)
+                except ValueError:
+                    pass
+
+            if updated_asset is not None:
+                key = next((k for k in current_assets if same_path(k, updated_asset.path)), str(updated_asset.path))
+                for k in list(current_assets):
+                    if k != key and same_path(k, updated_asset.path):
+                        current_assets.pop(k, None)
+                current_assets[key] = updated_asset
+            if updated_shot is not None:
+                key = next((k for k in current_shots if same_path(k, updated_shot.path)), str(updated_shot.path))
+                for k in list(current_shots):
+                    if k != key and same_path(k, updated_shot.path):
+                        current_shots.pop(k, None)
+                current_shots[key] = updated_shot
+
+        self._app_state.update_assets(current_assets)
+        self._app_state.update_shots(current_shots)
+        self._app_state.commit_immediate()
+        if self._project_index is not None:
+            ca = dict(self._app_state.assets())
+            cs = dict(self._app_state.shots())
+            self._project_index = ProjectIndex(
+                root=self._project_index.root,
+                assets=tuple(sorted(ca.values(), key=lambda x: (x.asset_type, x.name))),
+                shots=tuple(sorted(cs.values(), key=lambda x: x.name)),
+            )
+            self._sidebar.set_project_index(self._project_index)
+
+        def _refresh_inspector() -> None:
+            sel = self._main_view.selected_view_item()
+            if sel is None or not sel.path:
+                return
+            try:
+                sp = Path(sel.path).resolve()
+            except OSError:
+                sp = Path(sel.path)
+            if str(sp) in ok_resolved:
+                self._inspector.set_item(sel, active_department_hint=self.current_department)
+
+        QTimer.singleShot(0, _refresh_inspector)
+        QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
 
     def _on_main_view_active_dcc_changed(self, path: object, department: str, dcc_id: str) -> None:
         """Đồng bộ active DCC từ Main View sang Inspector (refresh identity)."""

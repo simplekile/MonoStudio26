@@ -40,6 +40,8 @@ class Asset:
     departments: tuple[Department, ...]
     # Per (department_id, dcc_id): resolved work file path + folder existence. Source of truth from scan.
     dcc_work_states: tuple[tuple[tuple[str, str], DccWorkState], ...] = ()
+    # Manual production status overrides: (department_name, status_id) from .monostudio/status.json
+    status_overrides: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,7 @@ class Shot:
     path: Path
     departments: tuple[Department, ...]
     dcc_work_states: tuple[tuple[tuple[str, str], DccWorkState], ...] = ()
+    status_overrides: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)

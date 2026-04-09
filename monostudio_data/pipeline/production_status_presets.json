@@ -1,0 +1,100 @@
+{
+  "schema": 1,
+  "category_order": [
+    "blocked",
+    "hold",
+    "review",
+    "in_progress",
+    "not_started",
+    "done",
+    "na"
+  ],
+  "menu_category_order": [
+    "not_started",
+    "in_progress",
+    "review",
+    "done",
+    "hold",
+    "blocked",
+    "na"
+  ],
+  "statuses": [
+    {
+      "id": "published",
+      "label": "Published",
+      "category": "done",
+      "rank": 0,
+      "tooltip": "Shipped or published build."
+    },
+    {
+      "id": "approved",
+      "label": "Approved",
+      "category": "done",
+      "rank": 1,
+      "tooltip": "Signed off internally."
+    },
+    {
+      "id": "working",
+      "label": "Working",
+      "category": "in_progress",
+      "rank": 0,
+      "tooltip": "Active work in progress."
+    },
+    {
+      "id": "rework",
+      "label": "Rework",
+      "category": "in_progress",
+      "rank": 2,
+      "tooltip": "Needs changes after feedback or review."
+    },
+    {
+      "id": "waiting",
+      "label": "Waiting",
+      "category": "not_started",
+      "rank": 0,
+      "tooltip": "Not started or waiting for handoff."
+    },
+    {
+      "id": "internal_review",
+      "label": "Internal review",
+      "category": "review",
+      "rank": 0,
+      "tooltip": "Waiting for internal review."
+    },
+    {
+      "id": "client_review",
+      "label": "Client review",
+      "category": "review",
+      "rank": 1,
+      "tooltip": "Waiting for client approval."
+    },
+    {
+      "id": "ready_for_delivery",
+      "label": "Ready for delivery",
+      "category": "review",
+      "rank": 2,
+      "tooltip": "Content complete; ready to hand off."
+    },
+    {
+      "id": "on_hold",
+      "label": "On hold",
+      "category": "hold",
+      "rank": 0,
+      "tooltip": "Paused on purpose (brief, schedule, etc.)."
+    },
+    {
+      "id": "blocked",
+      "label": "Blocked",
+      "category": "blocked",
+      "rank": 0,
+      "tooltip": "Cannot proceed: tech issue, dependency, etc."
+    },
+    {
+      "id": "omitted",
+      "label": "Skipped",
+      "category": "na",
+      "rank": 0,
+      "tooltip": "Not applicable for this department or shot."
+    }
+  ]
+}
