@@ -1,3 +1,32 @@
+# MonoStudio 26 — Release v26.11.0
+
+## Highlights
+
+- **Production status — preset & pipeline**: Hệ thống trạng thái sản xuất theo preset JSON (`production_status_presets.json`), merge theo project, registry có category/rank/tooltip; UI chọn status qua menu thống nhất; đồng bộ grid, Inspector và aggregate status.
+- **Sequence / media preview**: Cải tiến luồng xem preview chuỗi (core + decode UI), gắn với Inspector và main view để review nhanh hơn.
+- **DCC — Fusion**: Thêm Fusion vào registry pipeline, adapter launch, và brand icon (hỗ trợ PNG khi không có SVG).
+- **Build & phân phối**: Cờ `-Beta` cho installer tên `MonoStudio26_Beta_Setup.exe` và tên hiển thị “MonoStudio 26 (Beta)”; `-NoVersionBump` để build đúng VERSION đã ghi tay (patch/hotfix không bị `build_version.py` tự tăng).
+- **Nền tảng đã có từ các bản 26 trước**: Banner update bền, List mode Assets/Shots, sidebar compact, watcher toggle + rename asset an toàn hơn trên Windows — vẫn là phần cốt lõi của trải nghiệm trong cùng major 26.
+
+## Changes in this release
+
+- feat: **Production status** — module `production_status` (registry, category màu, thứ tự menu), preset mặc định + override theo project; tích hợp `item_status` / `models` / `fs_reader`.
+- feat: **UI production status** — `production_status_menu`, cập nhật Inspector, main view, main window, style; stress runner nếu có điểm chạm status.
+- feat: **Sequence preview** — chỉnh `sequence_preview`, `sequence_preview_decode`, UI liên quan (inspector, thumbnails, top bar, style).
+- feat: **Fusion DCC** — `dcc_fusion`, wiring trong `app_controller`, `dccs.json`, icon thương hiệu.
+- feat: **Brand icons** — fallback PNG + cache theo mtime file để đổi icon không cần restart.
+- build: **Inno** — `MyAppName` / `MyOutputBaseFilename` có thể override (beta); **PowerShell** — `-Beta`, `-NoVersionBump` trên `build_installer.ps1`.
+
+## Lưu ý migration (pipeline)
+
+- Nếu project dùng production status, cần có (hoặc merge) `production_status_presets.json` trong pipeline; status id cũ có thể cần map sang preset mới — kiểm tra override từng item sau khi mở project.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.10.3
 
 ## Highlights

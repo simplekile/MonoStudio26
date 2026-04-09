@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Callable, Literal
@@ -8,7 +9,9 @@ from typing import Callable, Literal
 from PySide6.QtCore import (
     QElapsedTimer,
     QEvent,
+    QItemSelection,
     QItemSelectionModel,
+    QPersistentModelIndex,
     QMimeData,
     QPoint,
     QRect,
@@ -26,6 +29,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QFont,
     QFontMetrics,
+    QDrag,
     QIcon,
     QKeySequence,
     QPainter,
@@ -307,6 +311,60 @@ def _resolved_work_path_for_copy(
             return wp
     # No file from scan: return work folder so user still gets a usable path
     return Path(dept_obj.work_path)
+
+
+def _resolve_work_root_folder_any(ref: Asset | Shot, active_department: str | None) -> Path | None:
+    """
+    Path to work root folder (e.g. <dept>/work/).
+    Uses active department if set, otherwise falls back to the first department.
+    """
+    dep = (active_department or "").strip()
+    departments = getattr(ref, "departments", ()) or ()
+    if dep:
+        for d in departments:
+            if (d.name or "").strip().casefold() == dep.casefold():
+                return Path(d.work_path)
+        return None
+    if departments:
+        return Path(departments[0].work_path)
+    return None
+
+
+def _resolve_work_file_for_department_dcc(ref: Asset | Shot, department: str, dcc_id: str) -> Path | None:
+    """Resolve actual work file path from scan states (preferred source of truth)."""
+    dep = (department or "").strip().casefold()
+    dcc = (dcc_id or "").strip().casefold()
+    if not dep or not dcc:
+        return None
+    states = getattr(ref, "dcc_work_states", ()) or ()
+    for (dept_id, state_dcc_id), state in states:
+        if (dept_id or "").strip().casefold() != dep:
+            continue
+        if (state_dcc_id or "").strip().casefold() != dcc:
+            continue
+        wp = getattr(state, "work_file_path", None)
+        if isinstance(wp, Path) and wp.is_file():
+            return wp
+    return None
+
+
+def _next_workfile_version_path(work_path: Path, prefix: str, dcc_id: str, ext: str) -> Path:
+    """
+    Compute next version path under work_path using existing versions for dcc_id.
+    Uses ext from source path (e.g. '.blend').
+    """
+    ext = (ext or "").strip()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    try:
+        reg = get_default_dcc_registry()
+        versions = list_work_file_versions(work_path, prefix, dcc_id, reg)
+        max_ver = max((v for v, _p in versions if isinstance(v, int)), default=0)
+    except Exception:
+        max_ver = 0
+    next_ver = max_ver + 1 if max_ver >= 1 else 1
+    safe_prefix = prefix or "unnamed"
+    return work_path / f"{safe_prefix}_v{next_ver:03d}{ext}"
 
 
 def _resolve_latest_publish_folder(ref: Asset | Shot, active_department: str | None) -> Path | None:
@@ -870,15 +928,275 @@ def _write_active_dcc(item_path: Path, active_department: str, dcc_id: str) -> N
 
 
 class _ClearOnEmptyClickListView(QListView):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._middle_drag_start_pos: QPoint | None = None
+        self._shift_anchor_index: QPersistentModelIndex | None = None
+
+    def _select_shift_range_rows(
+        self,
+        *,
+        anchor,
+        target,
+        add: bool,
+    ) -> None:
+        """
+        Reliable shift-range selection for QListView IconMode.
+        Selecting with QItemSelection(topLeft,bottomRight) can behave inconsistently for icon layouts,
+        so we select rows explicitly.
+        """
+        sm = self.selectionModel()
+        m = self.model()
+        if sm is None or m is None or not (anchor.isValid() and target.isValid()):
+            return
+        a = anchor.row()
+        b = target.row()
+        lo = min(a, b)
+        hi = max(a, b)
+        flags = (
+            QItemSelectionModel.SelectionFlag.Select
+            if add
+            else QItemSelectionModel.SelectionFlag.ClearAndSelect
+        )
+        if not add:
+            sm.clearSelection()
+        for r in range(lo, hi + 1):
+            idx = m.index(r, 0)
+            if idx.isValid():
+                sm.select(idx, QItemSelectionModel.SelectionFlag.Select)
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if not self.indexAt(event.pos()).isValid():
+        if event.button() == Qt.MouseButton.MiddleButton:
+            # Middle button: drag gesture only (do not alter selection).
+            idx = self.indexAt(event.pos())
+            if idx.isValid():
+                sm = self.selectionModel()
+                if sm is not None:
+                    sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+            self._middle_drag_start_pos = event.pos()
+            event.accept()
+            return
+        # Fix: shift-click should select a range in both directions (up or down).
+        if event.button() == Qt.MouseButton.LeftButton and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            idx = self.indexAt(event.pos())
+            sm = self.selectionModel()
+            if idx.isValid() and sm is not None:
+                # Use a stable anchor like Explorer: last non-modified click becomes anchor.
+                anchor = self._shift_anchor_index
+                if anchor is None or not anchor.isValid():
+                    anchor = sm.currentIndex()
+                if not anchor.isValid():
+                    anchor = idx
+
+                sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+                add = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                self._select_shift_range_rows(anchor=anchor, target=idx, add=add)
+                event.accept()
+                return
+        # Clear selection only on primary click on empty area.
+        if event.button() == Qt.MouseButton.LeftButton and not self.indexAt(event.pos()).isValid():
             self.clearSelection()
+            self._shift_anchor_index = None
         super().mousePressEvent(event)
+        # Update anchor on plain left-clicks (no modifiers), after default selection logic runs.
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and self.indexAt(event.pos()).isValid()
+        ):
+            sm = self.selectionModel()
+            if sm is not None and sm.currentIndex().isValid():
+                self._shift_anchor_index = QPersistentModelIndex(sm.currentIndex())
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if bool(event.buttons() & Qt.MouseButton.MiddleButton) and self._middle_drag_start_pos is not None:
+            # Start drag once the user moved past the platform threshold.
+            if (event.pos() - self._middle_drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
+                self.startDrag(Qt.CopyAction)
+                self._middle_drag_start_pos = None
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._middle_drag_start_pos = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def startDrag(self, supportedActions) -> None:  # type: ignore[override]
+        buttons = QApplication.mouseButtons()
+        # Only allow dragging with middle button (disable left-drag).
+        if not (buttons & Qt.MouseButton.MiddleButton) or (buttons & Qt.MouseButton.LeftButton):
+            return
+        model = self.model()
+        if model is None:
+            return
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+        mime = model.mimeData(indexes)
+        if mime is None:
+            return
+
+        dpr = float(getattr(self, "devicePixelRatioF", lambda: 1.0)())
+        if dpr <= 0:
+            dpr = 1.0
+
+        def render_card(index, *, logical_size: QSize) -> QPixmap | None:
+            if not index.isValid():
+                return None
+            w = max(1, int(logical_size.width() * dpr))
+            h = max(1, int(logical_size.height() * dpr))
+            pm = QPixmap(w, h)
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(QColor(0, 0, 0, 0))
+            p2 = QPainter(pm)
+            try:
+                p2.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                p2.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                # Lightweight drag preview: thumbnail + name only (no status/id/ver overlays).
+                r = QRect(0, 0, logical_size.width(), logical_size.height())
+                # Background card
+                bg = QColor("#18181b")
+                border = QColor("#3f3f46")
+                p2.setPen(QPen(border, 1))
+                p2.setBrush(bg)
+                p2.drawRoundedRect(r.adjusted(0, 0, -1, -1), 12, 12)
+
+                inner = r.adjusted(8, 8, -8, -8)
+                if inner.width() > 0 and inner.height() > 0:
+                    # 16:9 thumb region
+                    thumb_w = inner.width()
+                    thumb_h = max(1, int(thumb_w * 9 / 16))
+                    thumb = QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
+                    icon = index.data(Qt.DecorationRole)
+                    if isinstance(icon, QIcon):
+                        src = icon.pixmap(256, 256)
+                        if not src.isNull():
+                            scaled = src.scaled(
+                                thumb.size(),
+                                Qt.KeepAspectRatioByExpanding,
+                                Qt.SmoothTransformation,
+                            )
+                            sx = max(0, (scaled.width() - thumb.width()) // 2)
+                            sy = max(0, (scaled.height() - thumb.height()) // 2)
+                            crop = scaled.copy(QRect(QPoint(sx, sy), thumb.size()))
+                            p2.drawPixmap(thumb, crop)
+
+                    # Name (single line)
+                    item = index.data(Qt.UserRole)
+                    name = display_name_for_item(item) if isinstance(item, ViewItem) else None
+                    name = (name or "").strip() or "—"
+                    text_rect = QRect(inner.left(), thumb.bottom() + 8, inner.width(), max(1, inner.bottom() - (thumb.bottom() + 8)))
+                    f = QFont("Inter")
+                    f.setPointSize(11)
+                    f.setWeight(QFont.Weight.DemiBold)
+                    p2.setFont(f)
+                    p2.setPen(QColor("#e4e4e7"))
+                    p2.drawText(text_rect, Qt.AlignLeft | Qt.AlignTop, name)
+            finally:
+                p2.end()
+            return pm if not pm.isNull() else None
+
+        # Base card size from the live view cell (logical px).
+        try:
+            base_rect = self.visualRect(indexes[0])
+        except Exception:
+            return
+        if not base_rect.isValid() or base_rect.isEmpty():
+            return
+
+        max_w = 220
+        base_logical_w = int(base_rect.width())
+        target_w = min(max_w, max(120, int(base_logical_w * 0.62)))
+        # Compute a compact height for drag preview (thumb 16:9 + single-line name).
+        inner_pad = 8
+        gap_thumb_text = 8
+        name_font = QFont("Inter")
+        name_font.setPointSize(11)
+        name_font.setWeight(QFont.Weight.DemiBold)
+        name_fm = QFontMetrics(name_font)
+        name_h = max(14, name_fm.height())
+        inner_w = max(1, target_w - inner_pad * 2)
+        thumb_h = max(1, int(inner_w * 9 / 16))
+        content_h = inner_pad + thumb_h + gap_thumb_text + name_h + inner_pad
+        # Ensure we don't exceed the original cell height too much.
+        max_h = max(1, int(base_rect.height() * (target_w / max(1, base_logical_w))))
+        target_h = min(max_h, content_h)
+        target_size = QSize(target_w, max(1, target_h))
+
+        scaled_cards: list[QPixmap] = []
+        for idx in indexes[:3]:  # Keep stack shallow for readability/perf.
+            pm = render_card(idx, logical_size=target_size)
+            if pm is not None:
+                scaled_cards.append(pm)
+        if not scaled_cards:
+            return
+
+        # Composite as a small stack + count badge.
+        offset = 10
+        layers = len(scaled_cards)
+        w = int(scaled_cards[0].width() / dpr) + offset * (layers - 1)
+        h = int(scaled_cards[0].height() / dpr) + offset * (layers - 1)
+        out = QPixmap(max(1, int(w * dpr)), max(1, int(h * dpr)))
+        out.setDevicePixelRatio(dpr)
+        out.fill(QColor(0, 0, 0, 0))
+        p = QPainter(out)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            # Back-to-front
+            for i in range(layers - 1, -1, -1):
+                pm = scaled_cards[i]
+                dx = offset * i
+                dy = offset * i
+                if i > 0:
+                    p.setOpacity(0.78)
+                else:
+                    p.setOpacity(1.0)
+                p.drawPixmap(dx, dy, pm)
+            p.setOpacity(1.0)
+
+            total = len(indexes)
+            if total > 1:
+                badge = f"{total}"
+                f = QFont("Inter")
+                f.setPointSize(10)
+                f.setWeight(QFont.Weight.DemiBold)
+                p.setFont(f)
+                fm = QFontMetrics(f)
+                tw = fm.horizontalAdvance(badge)
+                pad_x = 8
+                pad_y = 4
+                bw = tw + pad_x * 2
+                bh = fm.height() + pad_y * 2
+                # HiDPI: painter uses logical coords when pixmap has devicePixelRatio.
+                out_w = int(out.width() / max(dpr, 1.0))
+                bx = out_w - bw - 6
+                by = 6
+                br = 9
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(37, 99, 235, 220))  # blue-600-ish
+                p.drawRoundedRect(QRect(bx, by, bw, bh), br, br)
+                p.setPen(QColor("#fafafa"))
+                p.drawText(QRect(bx, by, bw, bh), Qt.AlignmentFlag.AlignCenter, badge)
+        finally:
+            p.end()
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(out)
+        drag.setHotSpot(QPoint(24, 24))
+        drag.exec(supportedActions)
 
 
 class _ClearOnEmptyClickTableView(QTableView):
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if not self.indexAt(event.pos()).isValid():
+        if event.button() == Qt.MouseButton.MiddleButton:
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and not self.indexAt(event.pos()).isValid():
             self.clearSelection()
         super().mousePressEvent(event)
 
@@ -1076,14 +1394,19 @@ class _ListRowDelegate(QStyledItemDelegate):
                     dot_r = 3
                     painter.setFont(chip_font)
                     painter.setPen(Qt.NoPen)
-                    painter.setBrush(QColor(255, 255, 255, 40) if pill_hover else QColor(255, 255, 255, 18))
+                    qc = QColor(color_hex_for_status_id(sid, reg))
+                    bg = QColor(qc)
+                    bg.setAlpha(72 if pill_hover else 42)
+                    painter.setBrush(bg)
                     painter.drawRoundedRect(pill_rect, 8, 8)
                     if pill_hover:
-                        painter.setPen(QPen(QColor(255, 255, 255, 64), 1))
+                        bc = QColor(qc)
+                        bc.setAlpha(140)
+                        painter.setPen(QPen(bc, 1))
                         painter.setBrush(Qt.NoBrush)
                         painter.drawRoundedRect(pill_rect, 8, 8)
                     painter.setPen(Qt.NoPen)
-                    painter.setBrush(QColor(color_hex_for_status_id(sid, reg)))
+                    painter.setBrush(qc)
                     painter.drawEllipse(
                         QPoint(pill_rect.left() + chip_pad_x + dot_r, pill_rect.center().y()),
                         dot_r,
@@ -1706,14 +2029,19 @@ class _GridCardDelegate(QStyledItemDelegate):
                     chip_rect = QRect(x, y_pills, tw, chip_h)
                     pill_hover = self._hovered_pill_row is not None and self._hovered_pill_row == index.row()
                     p.setPen(Qt.NoPen)
-                    p.setBrush(QColor(255, 255, 255, 40) if pill_hover else QColor(255, 255, 255, 18))
+                    qc = QColor(color_hex_for_status_id(sid, reg))
+                    bg = QColor(qc)
+                    bg.setAlpha(72 if pill_hover else 42)
+                    p.setBrush(bg)
                     p.drawRoundedRect(chip_rect, 8, 8)
                     if pill_hover:
-                        p.setPen(QPen(QColor(255, 255, 255, 64), 1))
+                        bc = QColor(qc)
+                        bc.setAlpha(140)
+                        p.setPen(QPen(bc, 1))
                         p.setBrush(Qt.NoBrush)
                         p.drawRoundedRect(chip_rect, 8, 8)
                     p.setPen(Qt.NoPen)
-                    p.setBrush(QColor(color_hex_for_status_id(sid, reg)))
+                    p.setBrush(qc)
                     p.drawEllipse(QPoint(chip_rect.left() + chip_pad_x + dot_r, chip_rect.center().y()), dot_r, dot_r)
                     p.setPen(QColor(MONOS_COLORS["text_primary"] if pill_hover else MONOS_COLORS["text_label"]))
                     text_rect = chip_rect.adjusted(chip_pad_x + dot_r * 2 + 6, 0, -4, 0)
@@ -4209,12 +4537,12 @@ class MainView(QWidget):
                 return
         self.item_activated.emit(item)
 
-    def _notify_select_department(self) -> None:
+    def _notify_transient_hint(self, message: str) -> None:
         from PySide6.QtGui import QCursor
         if getattr(self, "_hint_popup", None) is not None:
             self._hint_popup.deleteLater()
             self._hint_popup = None
-        lbl = QLabel("Select a department filter first", self)
+        lbl = QLabel(message, self)
         lbl.setStyleSheet(
             "QLabel { background: #18181b; color: #fafafa; border: 1px solid #3f3f46; "
             "border-radius: 8px; padding: 8px 14px; font-family: 'Inter'; font-size: 12px; font-weight: 500; }"
@@ -4225,7 +4553,80 @@ class MainView(QWidget):
         lbl.move(pos.x() + 12, pos.y() + 12)
         lbl.show()
         self._hint_popup = lbl
-        QTimer.singleShot(2500, lambda: self._dismiss_hint_popup(lbl))
+        QTimer.singleShot(3200, lambda: self._dismiss_hint_popup(lbl))
+
+    def _notify_select_department(self) -> None:
+        self._notify_transient_hint("Select a department filter first")
+
+    def _resolve_paste_dcc_for_tile(self, item: ViewItem, dep: str, clip: dict | None) -> str | None:
+        """
+        DCC to use when pasting from tile context: prefer clipboard (from Copy Work File),
+        else active DCC / detected work DCC on the destination item.
+        """
+        if isinstance(clip, dict):
+            c = clip.get("dcc_id")
+            if isinstance(c, str) and c.strip():
+                return c.strip()
+        if not isinstance(item.ref, (Asset, Shot)):
+            return None
+        dep_cf = (dep or "").strip().casefold()
+        p = getattr(item.ref, "path", None)
+        ad = self.get_active_dcc(p, dep) if p else None
+        if isinstance(ad, str) and ad.strip():
+            return ad.strip()
+        for d in getattr(item.ref, "departments", ()) or ():
+            if (d.name or "").strip().casefold() != dep_cf:
+                continue
+            wfd = getattr(d, "work_file_dcc", None)
+            if isinstance(wfd, str) and wfd.strip():
+                return wfd.strip()
+            dccs = getattr(d, "work_file_dccs", ()) or ()
+            for x in dccs:
+                if isinstance(x, str) and x.strip():
+                    return x.strip()
+            break
+        return None
+
+    def _perform_paste_work_file(
+        self,
+        item: ViewItem,
+        *,
+        department: str,
+        dcc_id: str,
+        src: Path,
+    ) -> bool:
+        """Copy src into the resolved work folder as the next version. Returns False on failure."""
+        if not isinstance(item.ref, (Asset, Shot)) or not getattr(self, "_project_root", None):
+            return False
+        dep_norm = (department or "").strip().casefold()
+        dept_obj = None
+        for d in getattr(item.ref, "departments", ()) or ():
+            if (d.name or "").strip().casefold() == dep_norm:
+                dept_obj = d
+                break
+        if dept_obj is None:
+            _dcc_debug_log.warning("paste work file: no department %r on item %r", department, getattr(item.ref, "path", None))
+            return False
+        did = (dcc_id or "").strip()
+        if not did:
+            return False
+        dept_key = (dept_obj.name or "").strip() or (department or "").strip()
+        try:
+            reg = get_default_dcc_registry()
+            use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
+            dst_work = resolve_work_path(dept_obj.path, did, use_dcc_folders, reg)
+            dst_work.mkdir(parents=True, exist_ok=True)
+            prefix = work_file_prefix(
+                name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
+                department=dept_key,
+            )
+            dst_path = _next_workfile_version_path(dst_work, prefix, did, src.suffix)
+            shutil.copy2(src, dst_path)
+            self.refresh_requested.emit()
+            return True
+        except Exception:
+            _dcc_debug_log.exception("paste work file failed (dst_work would be under department %r, dcc %r)", department, did)
+            return False
 
     def _dismiss_hint_popup(self, lbl: QLabel) -> None:
         try:
@@ -4290,9 +4691,19 @@ class MainView(QWidget):
             f"Open {dcc_label} Folder",
         )
         copy_act = menu.addAction(
-            lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
+            dcc_icon,
             f"Copy {dcc_label} Work Path",
         )
+        copy_file_act = menu.addAction(dcc_icon, f"Copy {dcc_label} Work File")
+        paste_file_act = menu.addAction(dcc_icon, f"Paste {dcc_label} Work File")
+        if not getattr(self, "_work_file_clipboard", None):
+            paste_file_act.setEnabled(False)
+            paste_file_act.setToolTip("No copied work file yet.")
+        else:
+            paste_file_act.setToolTip(
+                "Paste as next version. Creates missing DCC subfolder and work folder if needed "
+                "(or only work/ when project uses flat work paths)."
+            )
         menu.addSeparator()
         delete_act = menu.addAction(
             lucide_icon("trash-2", size=16, color_hex="#ef4444"),
@@ -4303,6 +4714,8 @@ class MainView(QWidget):
         menu.setProperty("_dcc_open", open_act)
         menu.setProperty("_dcc_folder", folder_act)
         menu.setProperty("_dcc_copy", copy_act)
+        menu.setProperty("_dcc_copy_file", copy_file_act)
+        menu.setProperty("_dcc_paste_file", paste_file_act)
         menu.setProperty("_dcc_delete", delete_act)
         menu.setProperty("_dcc_id", dcc_id)
         menu.setProperty("_department", department)
@@ -4323,6 +4736,23 @@ class MainView(QWidget):
             self.dcc_folder_requested.emit(item, dcc_id, department)
         elif text.startswith("Copy ") and "Work Path" in text:
             self.dcc_copy_path_requested.emit(item, dcc_id, department)
+        elif text.startswith("Copy ") and "Work File" in text:
+            if isinstance(item.ref, (Asset, Shot)):
+                wp = _resolve_work_file_for_department_dcc(item.ref, department, dcc_id)
+                if wp is not None:
+                    self._work_file_clipboard = {"path": wp, "dcc_id": dcc_id, "department": department}
+                    self._copy_full_path(str(wp))
+        elif text.startswith("Paste ") and "Work File" in text:
+            clip = getattr(self, "_work_file_clipboard", None)
+            if isinstance(clip, dict):
+                src = clip.get("path")
+                if isinstance(src, Path) and src.is_file():
+                    if not self._perform_paste_work_file(item, department=department, dcc_id=dcc_id, src=src):
+                        self._notify_transient_hint("Could not paste work file (check department path and permissions).")
+                else:
+                    self._notify_transient_hint("Copied work file is no longer on disk. Copy again.")
+            else:
+                self._notify_transient_hint("No copied work file. Use Copy Work File first.")
         elif text.startswith("Delete ") and " folder" in text:
             self.dcc_delete_requested.emit(item, dcc_id, department)
 
@@ -4423,6 +4853,7 @@ class MainView(QWidget):
                 copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Path")
             menu.addSeparator()
             open_folder = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Folder")
+            open_work = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Work Folder")
             menu.setProperty("_act_open_latest_publish", open_latest)
             menu.setProperty("_act_open_publish_root", open_pub_root)
             menu.setProperty("_act_copy_context_path", copy_ctx)
@@ -4432,7 +4863,7 @@ class MainView(QWidget):
             menu.setProperty("_act_create_new", None)
             menu.setProperty("_act_refresh", None)
             menu.setProperty("_act_delete", None)
-            menu.setProperty("_act_open_work", None)
+            menu.setProperty("_act_open_work", open_work)
             menu.setProperty("_act_open_publish", None)
             return menu
 
@@ -4516,6 +4947,19 @@ class MainView(QWidget):
                 if not _has_work:
                     copy_ctx.setEnabled(False)
                     copy_ctx.setToolTip("No work file in this department.")
+                copy_work_file = menu.addAction(open_icon, "Copy Work File")
+                paste_work_file = menu.addAction(open_icon, "Paste Work File")
+                if not _has_work:
+                    copy_work_file.setEnabled(False)
+                    copy_work_file.setToolTip("No work file in this department.")
+                if not getattr(self, "_work_file_clipboard", None):
+                    paste_work_file.setEnabled(False)
+                    paste_work_file.setToolTip("No copied work file yet.")
+                else:
+                    paste_work_file.setToolTip(
+                        "Paste as next version. Creates missing DCC subfolder and work folder if needed "
+                        "(or only work/ when project uses flat work paths)."
+                    )
             else:
                 copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Path")
             menu.addSeparator()
@@ -4526,6 +4970,10 @@ class MainView(QWidget):
             open_publish_folder = menu.addAction(
                 lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
                 "Open Publish Folder",
+            )
+            open_work = menu.addAction(
+                lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Open Work Folder",
             )
 
         menu.addSeparator()
@@ -4610,6 +5058,45 @@ class MainView(QWidget):
                     return
             self._copy_full_path(str(item.path))
             return
+        if text == "Copy Work File":
+            if isinstance(item.ref, (Asset, Shot)):
+                dep = (self._active_department or "").strip()
+                if dep:
+                    active_dcc = self.get_active_dcc(getattr(item.ref, "path", None), dep)
+                    if not active_dcc:
+                        for d in getattr(item.ref, "departments", ()) or ():
+                            if (d.name or "").strip().casefold() == dep.casefold():
+                                active_dcc = getattr(d, "work_file_dcc", None) or (d.work_file_dccs[0].strip() if d.work_file_dccs else None)
+                                break
+                    if active_dcc:
+                        wp = _resolve_work_file_for_department_dcc(item.ref, dep, active_dcc)
+                        if wp is not None:
+                            self._work_file_clipboard = {"path": wp, "dcc_id": active_dcc, "department": dep}
+                            self._copy_full_path(str(wp))
+            return
+        if text == "Paste Work File":
+            if not isinstance(item.ref, (Asset, Shot)) or not getattr(self, "_project_root", None):
+                return
+            dep = (self._active_department or "").strip()
+            if not dep:
+                return
+            clip = getattr(self, "_work_file_clipboard", None)
+            if not isinstance(clip, dict):
+                self._notify_transient_hint("No copied work file. Use Copy Work File first.")
+                return
+            src = clip.get("path")
+            if not (isinstance(src, Path) and src.is_file()):
+                self._notify_transient_hint("Copied work file is no longer on disk. Copy again.")
+                return
+            paste_dcc = self._resolve_paste_dcc_for_tile(item, dep, clip)
+            if not paste_dcc:
+                self._notify_transient_hint(
+                    "Could not determine DCC for paste. Copy a work file first, or use Open With on this asset."
+                )
+                return
+            if not self._perform_paste_work_file(item, department=dep, dcc_id=paste_dcc, src=src):
+                self._notify_transient_hint("Could not paste work file (check department path and permissions).")
+            return
         if text == "Open Folder":
             _, folder = self._resolved_path_and_folder_for_item(item)
             self._open_folder(folder)
@@ -4625,8 +5112,13 @@ class MainView(QWidget):
             self.delete_requested.emit(item)
             return
         if text == "Open Work Folder":
-            if hasattr(item, "ref") and item.ref is not None and hasattr(item.ref, "work_path"):
-                self._open_folder(Path(item.ref.work_path))
+            if hasattr(item, "ref") and item.ref is not None:
+                if isinstance(item.ref, (Asset, Shot)):
+                    folder = _resolve_work_root_folder_any(item.ref, self._active_department)
+                    if folder is not None:
+                        self._open_folder(folder)
+                elif hasattr(item.ref, "work_path"):
+                    self._open_folder(Path(item.ref.work_path))
             return
         if text == "Open Publish Folder":
             if isinstance(item.ref, (Asset, Shot)):

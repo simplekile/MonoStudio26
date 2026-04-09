@@ -106,6 +106,8 @@ class MainWindow(FramelessMainWindow):
         # Minimum window size (usability floor).
         self.setMinimumSize(640, 480)
         self.setObjectName("MonosMainWindow")
+        # Always-on-top (persisted); on Windows we drive z-order via Win32 to avoid setWindowFlags flicker.
+        self._window_always_on_top: bool = False
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
         repo_root = get_app_base_path()
@@ -345,6 +347,7 @@ class MainWindow(FramelessMainWindow):
 
         self._top_bar.update_button_clicked.connect(self._open_settings_to_updates)
         self._top_bar.watcher_toggled.connect(self._on_watcher_toggled)
+        self._top_bar.always_on_top_toggled.connect(self._on_always_on_top_toggled)
         self._startup_update_check_worker: _StartupUpdateCheckWorker | None = None
         QTimer.singleShot(800, self._start_startup_update_check)
 
@@ -453,6 +456,34 @@ class MainWindow(FramelessMainWindow):
         else:
             self._update_fs_watcher_paths()
             notification_service.success("File watcher on. Changes will be detected automatically.")
+
+    def _apply_win32_always_on_top(self, on: bool) -> bool:
+        """Windows: HWND_TOPMOST without Qt setWindowFlags — avoids full window recreate / flicker."""
+        if sys.platform != "win32":
+            return False
+        try:
+            import win32con
+            import win32gui
+        except ImportError:
+            return False
+        try:
+            wid = self.winId()
+            if not wid:
+                return False
+            hwnd = int(wid)
+            flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+            after = win32con.HWND_TOPMOST if on else win32con.HWND_NOTOPMOST
+            win32gui.SetWindowPos(hwnd, after, 0, 0, 0, 0, flags)
+            return True
+        except Exception:
+            return False
+
+    def _on_always_on_top_toggled(self, on: bool) -> None:
+        self._window_always_on_top = on
+        if sys.platform == "win32" and self._apply_win32_always_on_top(on):
+            return
+        # Linux/macOS (or Win32 fallback): qframelesswindow path — must refresh frameless after flag change.
+        self.setStayOnTop(on)
 
     def _update_title_bar_geometry(self) -> None:
         """Place title bar over right pane only (x = sidebar width), not over sidebar."""
@@ -658,8 +689,13 @@ class MainWindow(FramelessMainWindow):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        # First layout pass: auto → responsive; manual → apply saved visibility.
-        QTimer.singleShot(0, lambda: self._apply_panel_layout(full_manual=not self._panel_layout_auto))
+        # Defer: Win32 topmost needs a valid HWND; panel layout matches previous first-paint behavior.
+        QTimer.singleShot(0, self._deferred_after_show)
+
+    def _deferred_after_show(self) -> None:
+        if sys.platform == "win32" and self._window_always_on_top:
+            self._apply_win32_always_on_top(True)
+        self._apply_panel_layout(full_manual=not self._panel_layout_auto)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -1472,8 +1508,10 @@ class MainWindow(FramelessMainWindow):
 
             if context_name in ("Assets", "Shots", "Projects"):
                 if context_name in ("Assets", "Shots"):
+                    # Clicking an already-selected page should NOT wipe the list/grid.
+                    # If a background scan hasn't produced a ProjectIndex yet, clearing here
+                    # can leave the view empty until another event forces a reload.
                     self._sync_filter_state_from_sidebar()
-                    self._main_view.clear()
                 self._reload_main_view()
             elif context_name == "Inbox":
                 self._sync_filter_state_from_sidebar()
@@ -2239,8 +2277,12 @@ class MainWindow(FramelessMainWindow):
             return
 
         if self._project_index is None:
-            self._main_view.clear()
+            # Keep whatever is currently shown (avoid "click -> empty list") while scan/index is pending.
+            self._main_view.set_empty_override("Scanning project…")
             return
+        else:
+            # Clear any loading override once we have an index.
+            self._main_view.set_empty_override(None)
 
         if context == "Assets":
             # Sync type from sidebar so filter matches visible selection (fixes desync after Assets→Shots→Assets then type change).
@@ -3340,6 +3382,13 @@ class MainWindow(FramelessMainWindow):
             # Restore maximized state (6b B: gọi set_maximized sau showMaximized)
             if data.get("window_maximized") is True and restored:
                 QTimer.singleShot(0, self._apply_restore_maximized)
+            always_top = data.get("window_always_on_top") is True
+            self._window_always_on_top = always_top
+            if always_top and sys.platform != "win32":
+                # Same as FramelessMainWindow.setStayOnTop but without show() — window is still hidden (splash).
+                self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+                self.updateFrameless()
+            self._top_bar.set_always_on_top(always_top)
 
         if not restored:
             # First launch / no saved geometry: default size.
@@ -3389,6 +3438,7 @@ class MainWindow(FramelessMainWindow):
         payload = {
             "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "window_maximized": self.isMaximized(),
+            "window_always_on_top": self._window_always_on_top,
             "main_splitter_sizes": main_sizes,
             "content_splitter_sizes": content_sizes,
         }

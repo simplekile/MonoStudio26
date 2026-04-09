@@ -127,6 +127,8 @@ def pick_production_status_at(
     reg = load_production_status_registry(project_root)
     menu = MonosMenu(parent)
     menu.setObjectName("ProductionStatusMenu")
+    # Qt menus often ignore QAction.toolTip unless explicitly enabled.
+    menu.setToolTipsVisible(True)
 
     _add_section_header(menu, "", is_default=True)
     act_auto = menu.addAction("Automatic (from files)")

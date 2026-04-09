@@ -766,17 +766,21 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QWidget#TopBarPanelGroup {
             background-color: rgba(39, 39, 42, 0.85);
-            border-radius: 8px;
+            border-radius: 6px;
+        }
+        QWidget#TopBarPanelGroup[autoMode="true"] {
+            background-color: rgba(39, 39, 42, 0.45);
+            border-radius: 4px;
         }
         QToolButton#TopBarPanelAutoBtn {
             border: none;
-            border-radius: 6px;
-            padding: 0 6px;
+            border-radius: 4px;
+            padding: 0 4px;
             margin: 0;
             background: transparent;
             color: #a1a1aa;
             font-family: "Inter", "Inter UI", "Segoe UI", "San Francisco", sans-serif;
-            font-size: 11px;
+            font-size: 8px;
             font-weight: 600;
         }
         QToolButton#TopBarPanelAutoBtn:hover {
@@ -787,9 +791,21 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(37, 99, 235, 0.18);
             color: #fafafa;
         }
+        QWidget#TopBarPanelGroup[autoMode="true"] QToolButton#TopBarPanelAutoBtn {
+            color: rgba(161, 161, 170, 0.65);
+            font-size: 7px;
+            padding: 0 3px;
+        }
+        QWidget#TopBarPanelGroup[autoMode="true"] QToolButton#TopBarPanelGlyphBtn {
+            background: transparent;
+        }
+        QWidget#TopBarPanelGroup[autoMode="true"] QToolButton#TopBarPanelAutoBtn[active="true"] {
+            background: rgba(37, 99, 235, 0.12);
+            color: rgba(250, 250, 250, 0.85);
+        }
         QToolButton#TopBarPanelGlyphBtn {
             border: none;
-            border-radius: 6px;
+            border-radius: 4px;
             margin: 0;
             background: transparent;
         }
@@ -798,6 +814,9 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QToolButton#TopBarPanelGlyphBtn:checked {
             background: rgba(37, 99, 235, 0.12);
+        }
+        QToolButton#TopBarPanelGlyphBtn:disabled {
+            background: transparent;
         }
         QToolButton#ProjectSwitch {
             padding: 6px 12px;
@@ -887,6 +906,7 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#TopBarNotiBtn,
         QToolButton#TopBarUpdateBtn,
         QToolButton#TopBarWatcherBtn,
+        QToolButton#TopBarAlwaysOnTopBtn,
         QToolButton#TopBarSettingsBtn {
             border: none;
             border-radius: 0;
@@ -898,6 +918,7 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#TopBarNotiBtn:hover,
         QToolButton#TopBarUpdateBtn:hover,
         QToolButton#TopBarWatcherBtn:hover,
+        QToolButton#TopBarAlwaysOnTopBtn:hover,
         QToolButton#TopBarSettingsBtn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: #e4e4e7;

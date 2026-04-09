@@ -1788,6 +1788,18 @@ class _InspectorPreview(QWidget):
             return read_inspector_thumbnail_source(self._qsettings, entity="shot")
         return read_inspector_thumbnail_source(self._qsettings, entity="asset")
 
+    def _thumbnail_player_label(self) -> str:
+        """User-facing app label for opening a thumbnail externally (Settings or OS default)."""
+        exe = read_inspector_thumbnail_open_exe(self._qsettings)
+        if exe:
+            try:
+                p = Path(exe)
+                n = p.name if p.name else str(exe)
+                return n
+            except Exception:
+                return str(exe)
+        return "default app"
+
     def invalidate_settings_dependent_cache(self) -> None:
         self._preview_thumb_cache.clear()
         self._seq_decode_bucket = None
@@ -1817,13 +1829,14 @@ class _InspectorPreview(QWidget):
                 has_file = False
         seq_dir = self._sequence_folder
         has_seq = seq_dir is not None and seq_dir.is_dir()
+        player = self._thumbnail_player_label()
         if has_file and has_seq:
-            return "Right-click: Open thumbnail file… or Open render folder…"
+            return f"Double-click: open with {player}.\nRight-click: Open thumbnail file… or Open render folder…"
         if has_seq:
-            return "Right-click: Open render folder…"
+            return f"Double-click: open with {player}.\nRight-click: Open render folder…"
         if has_file:
-            return "Right-click: Open thumbnail file…"
-        return "Right-click for options…"
+            return f"Double-click: open with {player}.\nRight-click: Open thumbnail file…"
+        return f"Double-click: open with {player}.\nRight-click: menu."
 
     def _apply_inspector_thumb_decode_failure(self, w: _PreviewWidget, *, is_inbox: bool, path: Path | None) -> None:
         """No pixmap: show unreadable extension state for EXR/HDR, else Inbox file icon / clear."""
@@ -1880,8 +1893,9 @@ class _InspectorPreview(QWidget):
         if item.kind in (ViewItemKind.PROJECT, ViewItemKind.DEPARTMENT):
             self._container.set_preview_help_text("Right-click: menu.")
             return
+        player = self._thumbnail_player_label()
         lines: list[str] = [
-            "Double-click: open the thumbnail image (default app in Settings).",
+            f"Double-click: open with {player}.",
         ]
         if self._sequence_frames:
             lines.append("Hold left button and drag: drag the sequence folder (to Explorer / a DCC).")
