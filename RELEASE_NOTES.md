@@ -1,3 +1,19 @@
+# MonoStudio 26 — Release v26.11.4
+
+## Highlights
+
+- **Sidebar**: Sửa và tinh chỉnh layout/hành vi sidebar (filter, compact, navigation) cho ổn định hơn trên nhiều kích thước cửa sổ.
+
+## Changes in this release
+
+- fix: `sidebar.py` — cập nhật sidebar.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.11.3
 
 ## Highlights

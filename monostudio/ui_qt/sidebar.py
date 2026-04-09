@@ -2595,7 +2595,7 @@ class Sidebar(QWidget):
         self._apply_recent_tasks_visibility()
 
         # Default context: Assets (keeps existing workflow stable)
-        self.set_current_context(SidebarContext.ASSETS.value)
+        self.set_current_context(SidebarContext.ASSETS.value, force=True)
 
         # Start with empty hierarchy until MainWindow provides an index.
         self.set_project_index(None)
@@ -2798,7 +2798,9 @@ class Sidebar(QWidget):
             return self._footer_context
         return self._scope_context
 
-    def set_current_context(self, context_name: str) -> None:
+    def set_current_context(self, context_name: str, *, force: bool = False) -> None:
+        if not force and context_name == self.current_context():
+            return
         if context_name in (SidebarContext.PROJECTS.value, SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
             self._footer_context = None
             self._scope_context = context_name
@@ -3285,7 +3287,9 @@ class SidebarCompact(QWidget):
             return self._footer_context
         return self._scope_context
 
-    def set_current_context(self, context_name: str) -> None:
+    def set_current_context(self, context_name: str, *, force: bool = False) -> None:
+        if not force and context_name == self.current_context():
+            return
         if context_name in (SidebarContext.PROJECTS.value, SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
             self._footer_context = None
             self._scope_context = context_name
