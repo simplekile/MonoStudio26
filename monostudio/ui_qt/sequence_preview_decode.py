@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
 from PySide6.QtGui import QImage
 
 PREVIEW_MAX_SIDE_DEFAULT = 1920
@@ -55,6 +56,7 @@ def _load_via_ffmpeg(path: Path, max_side: int) -> QImage | None:
             capture_output=True,
             timeout=120,
             check=False,
+            **hide_console_subprocess_kwargs(),
         )
         if proc.returncode != 0 or not proc.stdout:
             return None

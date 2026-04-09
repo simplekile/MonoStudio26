@@ -1,3 +1,22 @@
+# MonoStudio 26 — Release v26.11.2
+
+## Highlights
+
+- **Windows subprocess — ẩn cửa sổ console**: Module `subprocess_win` với `hide_console_subprocess_kwargs` để spawn process (decode preview, thumbnail) không bật cửa sổ console trên Windows.
+- **Preview & thumbnail**: Tiếp tục chỉnh `sequence_preview_decode` và `thumbnails` đồng bộ luồng decode/spawn.
+
+## Changes in this release
+
+- feat: `subprocess_win.py` — kwargs chuẩn cho subprocess ẩn console trên Windows.
+- fix: `sequence_preview_decode.py` — dùng helper subprocess Windows + tinh chỉnh decode.
+- fix: `thumbnails.py` — spawn subprocess nhất quán với preview.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.11.1
 
 ## Highlights

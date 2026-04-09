@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt, QObject, QTimer, QSettings
 from PySide6.QtGui import QPixmap, QImage
 
+from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
+
 if TYPE_CHECKING:
     from monostudio.core.models import Asset, Shot
     from monostudio.ui_qt.app_state import AppState
@@ -54,6 +56,7 @@ def _get_video_duration_seconds(video_path: Path) -> float | None:
             timeout=5,
             text=True,
             check=False,
+            **hide_console_subprocess_kwargs(),
         )
         if proc.returncode != 0 or not proc.stdout or not proc.stdout.strip():
             return None
@@ -92,6 +95,7 @@ def _load_video_frame_via_ffmpeg(video_path: Path, size_px: int) -> QPixmap | No
             capture_output=True,
             timeout=10,
             check=False,
+            **hide_console_subprocess_kwargs(),
         )
         if proc.returncode != 0 or not proc.stdout:
             return None
