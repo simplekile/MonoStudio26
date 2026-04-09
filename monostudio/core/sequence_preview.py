@@ -10,6 +10,8 @@ subfolder is missing under the first root, the next root is tried (e.g. only
 ``flipbook/<name>/`` exists while ``render/`` is present but empty).
 
 Within one canonical root name, newer mtime wins if duplicate directories exist.
+
+Supported frame extensions include common plate formats (e.g. ``.dpx``) plus png/jpg/tif/tga/exr/webp.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ _SEQUENCE_SUFFIXES = frozenset({
     ".tga",
     ".exr",
     ".webp",
+    ".dpx",
 })
 
 

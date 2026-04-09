@@ -276,6 +276,12 @@ class ThumbnailCache:
             return pix
 
         pix = QPixmap(key)
+        if pix.isNull() and ext == ".dpx":
+            from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+            img = load_preview_frame_qimage(file_path, self._size_px)
+            if img is not None and not img.isNull():
+                pix = QPixmap.fromImage(img)
         if pix.isNull():
             return None
 
@@ -305,11 +311,13 @@ def _load_thumbnail_image_worker(file_path: str, size_px: int, cache_key: str | 
         return None
     try:
         ext = (p.suffix or "").strip().lower()
-        img: QImage | None = None
         if ext in (".exr", ".hdr"):
             return None
-        if img is None or img.isNull():
-            img = QImage(str(p))
+        img = QImage(str(p))
+        if img.isNull() and ext == ".dpx":
+            from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+            img = load_preview_frame_qimage(p, size_px) or QImage()
         if img.isNull():
             return None
         scaled = img.scaled(

@@ -72,6 +72,9 @@ def load_preview_frame_qimage(path: Path, max_side: int = PREVIEW_MAX_SIDE_DEFAU
     if ext in (".exr", ".hdr"):
         return None
     img = QImage(str(path))
-    if img.isNull():
-        return None
-    return _scale_qimage(img, max_side)
+    if not img.isNull():
+        return _scale_qimage(img, max_side)
+    # Qt often has no DPX reader on Windows; ffmpeg handles common DPX flavors.
+    if ext == ".dpx":
+        return _load_via_ffmpeg(path, max_side)
+    return None
