@@ -1,3 +1,21 @@
+# MonoStudio 26 — Release v26.11.3
+
+## Highlights
+
+- **Sequence preview — decode**: Cập nhật `sequence_preview_decode` cho luồng decode/hiển thị preview chuỗi ổn định hơn.
+- **Thumbnails**: Tinh chỉnh `thumbnails` đồng bộ với pipeline preview đã đổi.
+
+## Changes in this release
+
+- fix: `sequence_preview_decode.py` — decode và wiring preview chuỗi.
+- fix: `thumbnails.py` — đồng bộ thumbnail với decode.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.11.2
 
 ## Highlights
