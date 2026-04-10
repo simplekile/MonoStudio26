@@ -16,10 +16,15 @@ SETTINGS_ORG = "MonoStudio26"
 SETTINGS_APP = "MonoStudio26"
 SETTINGS_KEY_FFMPEG_EXE = "tools/ffmpeg_executable"
 
-# Windows-oriented landing page with static builds; also works as entry point for other platforms.
-FFMPEG_OFFICIAL_BUILDS_URL = "https://www.gyan.dev/ffmpeg/builds/"
-# Alternative: GitHub Actions builds (latest release redirect).
-FFMPEG_BTBN_RELEASES_LATEST = "https://github.com/BtbN/FFmpeg-Builds/releases/latest"
+# gyan.dev CODEX FFMPEG — stable URLs (aliases track “latest” for that package type).
+# Page: https://www.gyan.dev/ffmpeg/builds/
+FFMPEG_GYAN_BUILDS_PAGE = "https://www.gyan.dev/ffmpeg/builds/"
+FFMPEG_GYAN_RELEASE_ESSENTIALS_ZIP = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+FFMPEG_GYAN_RELEASE_FULL_7Z = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z"
+FFMPEG_GYAN_GIT_FULL_7Z = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-full.7z"
+
+# Backwards compat for imports expecting the old name.
+FFMPEG_OFFICIAL_BUILDS_URL = FFMPEG_GYAN_BUILDS_PAGE
 
 
 def app_qsettings() -> QSettings:

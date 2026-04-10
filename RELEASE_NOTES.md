@@ -1,3 +1,24 @@
+# MonoStudio 26 — Release v26.11.6
+
+## Highlights
+
+- **FFmpeg — cài trong app**: Tải bundle Gyan (`ffmpeg-release-essentials.zip`), giải nén vào `%LOCALAPPDATA%\MonoStudio\tools\ffmpeg`, ghi nhận `ffmpeg.exe` trong Settings (không cần tự tải tay nếu dùng flow có sẵn).
+- **Settings**: Mở rộng hàng FFmpeg (tiến trình tải/cài, kiểm tra zip, refresh phiên bản).
+- **Core**: `update_checker.download_to_file` — tải file/generic zip (dùng cho cài FFmpeg); tinh chỉnh `ffmpeg_resolve`.
+
+## Changes in this release
+
+- feat: `ffmpeg_install.py` — validate zip, extract Gyan layout, tìm `ffmpeg.exe`, root cài đặt chuẩn.
+- feat: `update_checker.py` — `download_to_file()` (không validate PE installer).
+- feat: `settings_dialog.py` — UI tải/cài FFmpeg + tích hợp `ffmpeg_install`.
+- fix: `ffmpeg_resolve.py` — chỉnh nhẹ resolve/ghi path.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.11.5
 
 ## Highlights

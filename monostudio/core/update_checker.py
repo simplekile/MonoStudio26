@@ -585,6 +585,17 @@ def _do_download(url: str, dest_path: Path, timeout: int, progress_callback: Any
     raise RuntimeError(str(last_error) if last_error else "Download failed")
 
 
+def download_to_file(
+    url: str,
+    dest_path: Path,
+    timeout: int = 900,
+    progress_callback: Any = None,
+) -> None:
+    """Download a generic file (e.g. zip). No PE / installer validation."""
+    print(f"[MonoStudio] Download URL: {url}", flush=True)
+    _do_download(url, dest_path, timeout, progress_callback)
+
+
 def download_installer(
     url: str,
     dest_path: Path,

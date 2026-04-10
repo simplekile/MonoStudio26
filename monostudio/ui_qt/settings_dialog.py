@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -110,8 +111,8 @@ from monostudio.core.access_control import (
 )
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.ffmpeg_resolve import (
-    FFMPEG_BTBN_RELEASES_LATEST,
-    FFMPEG_OFFICIAL_BUILDS_URL,
+    FFMPEG_GYAN_BUILDS_PAGE,
+    FFMPEG_GYAN_RELEASE_ESSENTIALS_ZIP,
     get_ffmpeg_version_short,
     resolve_ffmpeg_executable,
     validate_ffmpeg_executable,
@@ -227,6 +228,72 @@ class _DownloadWorker(QThread):
             self.download_finished.emit(False, str(self._dest_path), str(e))
 
 
+class _FfmpegZipDownloadWorker(QThread):
+    """Download ffmpeg-release-essentials.zip to temp; validate zip signature."""
+
+    download_finished = Signal(bool, str, str)
+    progress = Signal(int, int)
+
+    def __init__(self, url: str, dest_path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self._url = url
+        self._dest_path = dest_path
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _progress_callback(self, read: int, total: int | None) -> None:
+        if self._cancelled:
+            raise RuntimeError("Cancelled")
+        self.progress.emit(read, total or 0)
+
+    def run(self) -> None:
+        from monostudio.core.ffmpeg_install import is_plausible_zip
+        from monostudio.core.update_checker import download_to_file
+
+        try:
+            download_to_file(self._url, self._dest_path, timeout=900, progress_callback=self._progress_callback)
+            if self._cancelled:
+                self.download_finished.emit(False, str(self._dest_path), "Cancelled")
+                return
+            if not is_plausible_zip(self._dest_path):
+                self.download_finished.emit(
+                    False,
+                    str(self._dest_path),
+                    "Downloaded file is not a valid zip (try again or use Official builds).",
+                )
+                return
+            self.download_finished.emit(True, str(self._dest_path), "")
+        except RuntimeError as e:
+            if "Cancelled" in str(e):
+                self.download_finished.emit(False, str(self._dest_path), "Cancelled")
+            else:
+                self.download_finished.emit(False, str(self._dest_path), str(e))
+        except Exception as e:
+            self.download_finished.emit(False, str(self._dest_path), str(e))
+
+
+class _FfmpegInstallWorker(QThread):
+    """Extract Gyan zip on a background thread (no QSettings here — main thread registers path)."""
+
+    ok = Signal(str)
+    err = Signal(str)
+
+    def __init__(self, zip_path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self._zip_path = zip_path
+
+    def run(self) -> None:
+        try:
+            from monostudio.core.ffmpeg_install import extract_gyan_ffmpeg_essentials_zip
+
+            p = extract_gyan_ffmpeg_essentials_zip(self._zip_path)
+            self.ok.emit(str(p.resolve()))
+        except Exception as e:
+            self.err.emit(str(e).replace("\n", " ")[:400])
+
+
 def _is_valid_type_id(type_id: str) -> bool:
     if not type_id:
         return False
@@ -302,6 +369,10 @@ class SettingsDialog(MonosDialog):
         self._inspector_thumb_radio_shot_both: QRadioButton | None = None
         self._inspector_sequence_fps_spin: QSpinBox | None = None
         self._inspector_thumb_open_exe_field: QLineEdit | None = None
+
+        self._ffmpeg_pending_zip: Path | None = None
+        self._ffmpeg_download_worker: _FfmpegZipDownloadWorker | None = None
+        self._ffmpeg_install_worker: _FfmpegInstallWorker | None = None
 
         self._pipeline_access_banner: QLabel | None = None
         self._access_status_label: QLabel | None = None
@@ -1102,7 +1173,7 @@ class SettingsDialog(MonosDialog):
 
         hint = QLabel(
             "Updates are delivered via GitHub Releases. Download runs the installer and closes the app. "
-            "FFmpeg is used for DPX / EXR / video thumbnails — use Official builds or Get FFmpeg, or locate ffmpeg.exe.",
+            "FFmpeg is used for DPX / EXR / video thumbnails — Get FFmpeg (download to temp) then Install, or locate ffmpeg.exe.",
             root,
         )
         hint.setWordWrap(True)
@@ -1116,7 +1187,7 @@ class SettingsDialog(MonosDialog):
         return root
 
     def _build_ffmpeg_update_row(self, list_container: QWidget, list_layout: QVBoxLayout) -> None:
-        """FFmpeg row: same list style as MonoFX — version, official link, locate + download actions."""
+        """FFmpeg row: Get → download to temp → Install (extract to LocalAppData) + locate + official link."""
         row = QWidget(list_container)
         row.setObjectName("UpdateProductListRow")
         row.setProperty("last", "true")
@@ -1150,35 +1221,82 @@ class SettingsDialog(MonosDialog):
         link_btn.setObjectName("UpdateProductListLink")
         link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         link_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(FFMPEG_OFFICIAL_BUILDS_URL))
+            lambda: QDesktopServices.openUrl(QUrl(FFMPEG_GYAN_BUILDS_PAGE))
         )
         row_l.addWidget(link_btn)
 
-        action_container = QWidget(row)
-        action_container.setFixedSize(28 + 6 + _UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
-        action_l = QHBoxLayout(action_container)
-        action_l.setContentsMargins(0, 0, 0, 0)
-        action_l.setSpacing(6)
+        _aw = _UPDATE_ACTION_WIDTH + 6 + 24
+        outer = QWidget(row)
+        outer.setFixedSize(28 + 6 + _aw, _UPDATE_ACTION_HEIGHT)
+        outer_l = QHBoxLayout(outer)
+        outer_l.setContentsMargins(0, 0, 0, 0)
+        outer_l.setSpacing(6)
 
-        locate_tb = QToolButton(action_container)
+        locate_tb = QToolButton(outer)
         locate_tb.setObjectName("UpdateDownloadCancelBtn")
         locate_tb.setIcon(lucide_icon("search", size=16, color_hex="#a1a1aa"))
         locate_tb.setFixedSize(28, _UPDATE_ACTION_HEIGHT)
         locate_tb.setToolTip("Locate ffmpeg.exe on this PC (saved in settings)")
         locate_tb.clicked.connect(self._on_ffmpeg_locate_clicked)
-        action_l.addWidget(locate_tb)
+        outer_l.addWidget(locate_tb)
 
-        get_btn = QPushButton("Get FFmpeg", action_container)
+        stack = QStackedWidget(outer)
+        stack.setFixedSize(_aw, _UPDATE_ACTION_HEIGHT)
+
+        page_get = QWidget(stack)
+        pg_l = QHBoxLayout(page_get)
+        pg_l.setContentsMargins(0, 0, 0, 0)
+        get_btn = QPushButton("Get FFmpeg", page_get)
         get_btn.setObjectName("SettingsCategoryActionButton")
         get_btn.setIcon(lucide_icon("download", size=16, color_hex="#a1a1aa"))
         get_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
-        get_btn.setToolTip("Open latest FFmpeg release builds (download zip, then add to PATH or use Locate)")
-        get_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(FFMPEG_BTBN_RELEASES_LATEST))
+        get_btn.setToolTip(
+            "Download ffmpeg-release-essentials.zip to temp, then click Install. "
+            "Other packages: Official builds."
         )
-        action_l.addWidget(get_btn)
+        get_btn.clicked.connect(self._on_ffmpeg_download_clicked)
+        pg_l.addWidget(get_btn)
+        stack.addWidget(page_get)
 
-        row_l.addWidget(action_container)
+        page_load = QWidget(stack)
+        pl_l = QHBoxLayout(page_load)
+        pl_l.setContentsMargins(0, 0, 0, 0)
+        pl_l.setSpacing(6)
+        prog = QProgressBar(page_load)
+        prog.setObjectName("UpdateDownloadProgress")
+        prog.setMinimum(0)
+        prog.setMaximum(0)
+        prog.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
+        cancel_tb = QToolButton(page_load)
+        cancel_tb.setObjectName("UpdateDownloadCancelBtn")
+        cancel_tb.setIcon(lucide_icon("x", size=14, color_hex="#a1a1aa"))
+        cancel_tb.setFixedSize(24, _UPDATE_ACTION_HEIGHT)
+        cancel_tb.setToolTip("Cancel download")
+        pl_l.addWidget(prog)
+        pl_l.addWidget(cancel_tb)
+        stack.addWidget(page_load)
+
+        page_inst = QWidget(stack)
+        pi_l = QHBoxLayout(page_inst)
+        pi_l.setContentsMargins(0, 0, 0, 0)
+        install_btn = QPushButton("Install", page_inst)
+        install_btn.setObjectName("UpdateProductListBtnDownload")
+        install_btn.setIcon(lucide_icon("package", size=16, color_hex="#fafafa"))
+        install_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
+        install_btn.setToolTip("Extract to %LOCALAPPDATA%\\MonoStudio\\tools\\ffmpeg and register ffmpeg.exe")
+        install_btn.clicked.connect(self._on_ffmpeg_install_clicked)
+        pi_l.addWidget(install_btn)
+        stack.addWidget(page_inst)
+
+        outer_l.addWidget(stack)
+        row_l.addWidget(outer)
+
+        self._ffmpeg_action_stack = stack
+        self._ffmpeg_get_btn = get_btn
+        self._ffmpeg_progress_bar = prog
+        self._ffmpeg_cancel_btn = cancel_tb
+        self._ffmpeg_install_btn = install_btn
+        stack.setCurrentIndex(0)
         list_layout.addWidget(row)
 
     def _refresh_ffmpeg_update_row(self) -> None:
@@ -1214,6 +1332,125 @@ class SettingsDialog(MonosDialog):
         write_ffmpeg_executable_path(s, str(p.resolve()))
         s.sync()
         self._refresh_ffmpeg_update_row()
+
+    def _on_ffmpeg_download_clicked(self) -> None:
+        stack = getattr(self, "_ffmpeg_action_stack", None)
+        if stack is None:
+            return
+        dest = Path(tempfile.gettempdir()) / "MonoStudio26" / "ffmpeg-release-essentials.zip"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        stack.setCurrentIndex(1)
+        bar = getattr(self, "_ffmpeg_progress_bar", None)
+        if bar is not None:
+            bar.setMinimum(0)
+            bar.setMaximum(0)
+            bar.setValue(0)
+        cancel = getattr(self, "_ffmpeg_cancel_btn", None)
+        if cancel is not None:
+            try:
+                cancel.clicked.disconnect(self._on_ffmpeg_download_cancel_clicked)
+            except (TypeError, RuntimeError):
+                pass
+            cancel.clicked.connect(self._on_ffmpeg_download_cancel_clicked)
+        self._ffmpeg_download_worker = _FfmpegZipDownloadWorker(
+            FFMPEG_GYAN_RELEASE_ESSENTIALS_ZIP,
+            dest,
+            self,
+        )
+        self._ffmpeg_download_worker.progress.connect(self._on_ffmpeg_zip_download_progress)
+        self._ffmpeg_download_worker.download_finished.connect(self._on_ffmpeg_zip_download_finished)
+        self._ffmpeg_download_worker.start()
+
+    def _on_ffmpeg_download_cancel_clicked(self) -> None:
+        if self._ffmpeg_download_worker is not None:
+            self._ffmpeg_download_worker.cancel()
+
+    def _on_ffmpeg_zip_download_progress(self, read: int, total: int) -> None:
+        bar = getattr(self, "_ffmpeg_progress_bar", None)
+        if bar is None:
+            return
+        if total > 0:
+            bar.setMaximum(total)
+            bar.setValue(read)
+        else:
+            bar.setMaximum(0)
+            bar.setMinimum(0)
+
+    def _on_ffmpeg_zip_download_finished(self, success: bool, path_str: str, error_message: str = "") -> None:
+        self._ffmpeg_download_worker = None
+        stack = getattr(self, "_ffmpeg_action_stack", None)
+        cancel = getattr(self, "_ffmpeg_cancel_btn", None)
+        if cancel is not None:
+            try:
+                cancel.clicked.disconnect(self._on_ffmpeg_download_cancel_clicked)
+            except (TypeError, RuntimeError):
+                pass
+        bar = getattr(self, "_ffmpeg_progress_bar", None)
+        if bar is not None:
+            bar.setMinimum(0)
+            bar.setMaximum(0)
+        if stack is None:
+            return
+        p = Path(path_str)
+        if success:
+            self._ffmpeg_pending_zip = p
+            stack.setCurrentIndex(2)
+            return
+        stack.setCurrentIndex(0)
+        self._ffmpeg_pending_zip = None
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        err = (error_message or "").strip()
+        if err != "Cancelled":
+            QMessageBox.warning(
+                self,
+                "FFmpeg download",
+                err[:400] if err else "Download failed.",
+            )
+
+    def _on_ffmpeg_install_clicked(self) -> None:
+        z = self._ffmpeg_pending_zip
+        stack = getattr(self, "_ffmpeg_action_stack", None)
+        if z is None or not z.is_file():
+            if stack is not None:
+                stack.setCurrentIndex(0)
+            QMessageBox.warning(self, "FFmpeg", "No downloaded package. Click Get FFmpeg first.")
+            return
+        btn = getattr(self, "_ffmpeg_install_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+        self._ffmpeg_install_worker = _FfmpegInstallWorker(z, self)
+        self._ffmpeg_install_worker.ok.connect(self._on_ffmpeg_install_ok)
+        self._ffmpeg_install_worker.err.connect(self._on_ffmpeg_install_err)
+        self._ffmpeg_install_worker.finished.connect(self._on_ffmpeg_install_thread_finished)
+        self._ffmpeg_install_worker.start()
+
+    def _on_ffmpeg_install_ok(self, exe: str) -> None:
+        s = self._settings or QSettings("MonoStudio26", "MonoStudio26")
+        write_ffmpeg_executable_path(s, exe)
+        s.sync()
+        try:
+            if self._ffmpeg_pending_zip is not None:
+                self._ffmpeg_pending_zip.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._ffmpeg_pending_zip = None
+        stack = getattr(self, "_ffmpeg_action_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(0)
+        self._refresh_ffmpeg_update_row()
+        QMessageBox.information(self, "FFmpeg", f"Installed to Local AppData tools folder.\n{exe}")
+
+    def _on_ffmpeg_install_err(self, msg: str) -> None:
+        QMessageBox.warning(self, "FFmpeg install", msg)
+
+    def _on_ffmpeg_install_thread_finished(self) -> None:
+        self._ffmpeg_install_worker = None
+        btn = getattr(self, "_ffmpeg_install_btn", None)
+        if btn is not None:
+            btn.setEnabled(True)
 
     def _format_last_checked(self, dt: datetime) -> str:
         """Format last check time like 'Today, 8:25 AM' or 'Yesterday, 3:00 PM'."""
