@@ -109,6 +109,14 @@ from monostudio.core.access_control import (
     write_verbose_debug_enabled,
 )
 from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.ffmpeg_resolve import (
+    FFMPEG_BTBN_RELEASES_LATEST,
+    FFMPEG_OFFICIAL_BUILDS_URL,
+    get_ffmpeg_version_short,
+    resolve_ffmpeg_executable,
+    validate_ffmpeg_executable,
+    write_ffmpeg_executable_path,
+)
 from monostudio.core.version import get_app_version
 from monostudio.ui_qt.force_rename_project_id_dialog import ForceRenameProjectIdDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -387,6 +395,7 @@ class SettingsDialog(MonosDialog):
             for i, b in enumerate(buttons):
                 b.setChecked(i == 3)
         self._apply_cached_update_result(get_cached_check_result())
+        self._refresh_ffmpeg_update_row()
 
     def _load_persisted_last_check_time(self) -> None:
         """Load last check time from settings so 'Last checked' is visible across sessions."""
@@ -479,6 +488,7 @@ class SettingsDialog(MonosDialog):
         """When General → Updates tab is shown, apply cached result; if no extra repos yet, fetch in background."""
         if index == 3:
             self._apply_cached_update_result(get_cached_check_result())
+            self._refresh_ffmpeg_update_row()
             if not get_cached_extra_repos() and not getattr(self, "_extra_repos_fetch_worker", None):
                 w = _ExtraReposFetchWorker(self)
                 self._extra_repos_fetch_worker = w
@@ -951,12 +961,10 @@ class SettingsDialog(MonosDialog):
         self._update_extra_download_url: dict[str, str] = {}
         self._update_download_product: str = ""  # "monostudio" or extra display_name
 
-        for idx, (product_id, display_name, repo) in enumerate(products):
+        for product_id, display_name, repo in products:
             row = QWidget(list_container)
             row.setObjectName("UpdateProductListRow")
             row.setFixedHeight(44)
-            if idx == len(products) - 1:
-                row.setProperty("last", "true")
             row_l = QHBoxLayout(row)
             row_l.setContentsMargins(12, 0, 12, 0)
             row_l.setSpacing(12)
@@ -1076,6 +1084,9 @@ class SettingsDialog(MonosDialog):
 
             list_layout.addWidget(row)
 
+        self._build_ffmpeg_update_row(list_container, list_layout)
+        self._refresh_ffmpeg_update_row()
+
         layout.addWidget(list_container)
 
         # Release notes
@@ -1090,7 +1101,8 @@ class SettingsDialog(MonosDialog):
         layout.addWidget(self._update_changelog, 1)
 
         hint = QLabel(
-            "Updates are delivered via GitHub Releases. Download runs the installer and closes the app.",
+            "Updates are delivered via GitHub Releases. Download runs the installer and closes the app. "
+            "FFmpeg is used for DPX / EXR / video thumbnails — use Official builds or Get FFmpeg, or locate ffmpeg.exe.",
             root,
         )
         hint.setWordWrap(True)
@@ -1102,6 +1114,106 @@ class SettingsDialog(MonosDialog):
         self._update_check_worker: _UpdateCheckWorker | None = None
         self._update_download_worker: _DownloadWorker | None = None
         return root
+
+    def _build_ffmpeg_update_row(self, list_container: QWidget, list_layout: QVBoxLayout) -> None:
+        """FFmpeg row: same list style as MonoFX — version, official link, locate + download actions."""
+        row = QWidget(list_container)
+        row.setObjectName("UpdateProductListRow")
+        row.setProperty("last", "true")
+        row.setFixedHeight(44)
+        row_l = QHBoxLayout(row)
+        row_l.setContentsMargins(12, 0, 12, 0)
+        row_l.setSpacing(12)
+
+        icon_l = QLabel(row)
+        icon_l.setFixedSize(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
+        icon_l.setScaledContents(True)
+        ic = lucide_icon("clapperboard", size=_UPDATE_ROW_ICON_SIZE, color_hex="#a1a1aa")
+        pm = ic.pixmap(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
+        if not pm.isNull():
+            icon_l.setPixmap(pm)
+        row_l.addWidget(icon_l)
+
+        name_l = QLabel("FFmpeg", row)
+        name_l.setObjectName("UpdateProductListName")
+        row_l.addWidget(name_l)
+
+        ver_l = QLabel("—", row)
+        ver_l.setObjectName("UpdateProductListVersion")
+        ver_l.setProperty("mono", True)
+        row_l.addWidget(ver_l)
+        self._ffmpeg_version_label = ver_l
+
+        row_l.addStretch(1)
+
+        link_btn = QPushButton("Official builds", row)
+        link_btn.setObjectName("UpdateProductListLink")
+        link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        link_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(FFMPEG_OFFICIAL_BUILDS_URL))
+        )
+        row_l.addWidget(link_btn)
+
+        action_container = QWidget(row)
+        action_container.setFixedSize(28 + 6 + _UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
+        action_l = QHBoxLayout(action_container)
+        action_l.setContentsMargins(0, 0, 0, 0)
+        action_l.setSpacing(6)
+
+        locate_tb = QToolButton(action_container)
+        locate_tb.setObjectName("UpdateDownloadCancelBtn")
+        locate_tb.setIcon(lucide_icon("search", size=16, color_hex="#a1a1aa"))
+        locate_tb.setFixedSize(28, _UPDATE_ACTION_HEIGHT)
+        locate_tb.setToolTip("Locate ffmpeg.exe on this PC (saved in settings)")
+        locate_tb.clicked.connect(self._on_ffmpeg_locate_clicked)
+        action_l.addWidget(locate_tb)
+
+        get_btn = QPushButton("Get FFmpeg", action_container)
+        get_btn.setObjectName("SettingsCategoryActionButton")
+        get_btn.setIcon(lucide_icon("download", size=16, color_hex="#a1a1aa"))
+        get_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
+        get_btn.setToolTip("Open latest FFmpeg release builds (download zip, then add to PATH or use Locate)")
+        get_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(FFMPEG_BTBN_RELEASES_LATEST))
+        )
+        action_l.addWidget(get_btn)
+
+        row_l.addWidget(action_container)
+        list_layout.addWidget(row)
+
+    def _refresh_ffmpeg_update_row(self) -> None:
+        lab = getattr(self, "_ffmpeg_version_label", None)
+        if lab is None:
+            return
+        s = self._settings
+        exe = resolve_ffmpeg_executable(s)
+        if exe:
+            short = get_ffmpeg_version_short(exe)
+            lab.setText(short or "OK")
+        else:
+            lab.setText("Not found")
+
+    def _on_ffmpeg_locate_clicked(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ffmpeg.exe",
+            "",
+            "ffmpeg (ffmpeg.exe);;All files (*.*)",
+        )
+        if not path_str:
+            return
+        p = Path(path_str)
+        if not validate_ffmpeg_executable(p):
+            QMessageBox.warning(
+                self,
+                "FFmpeg",
+                "The selected file does not run as ffmpeg (ffmpeg -version failed).",
+            )
+            return
+        s = self._settings or QSettings("MonoStudio26", "MonoStudio26")
+        write_ffmpeg_executable_path(s, str(p.resolve()))
+        s.sync()
+        self._refresh_ffmpeg_update_row()
 
     def _format_last_checked(self, dt: datetime) -> str:
         """Format last check time like 'Today, 8:25 AM' or 'Yesterday, 3:00 PM'."""

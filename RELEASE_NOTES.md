@@ -1,3 +1,24 @@
+# MonoStudio 26 — Release v26.11.5
+
+## Highlights
+
+- **FFmpeg / ffprobe**: Module `ffmpeg_resolve` — tìm `ffmpeg` và `ffprobe` theo đường dẫn tùy chọn trong Settings (QSettings) hoặc `PATH`; subprocess ẩn console trên Windows.
+- **Settings**: Cấu hình đường dẫn FFmpeg trong Settings (tab công cụ / tích hợp tùy UI).
+- **Preview & thumbnail**: `sequence_preview_decode` và `thumbnails` dùng binary đã resolve, ổn định hơn khi máy không có ffmpeg trên PATH mặc định.
+
+## Changes in this release
+
+- feat: `ffmpeg_resolve.py` — resolve ffmpeg/ffprobe, đọc/ghi `tools/ffmpeg_executable`.
+- feat: `settings_dialog.py` — UI chọn / xóa đường dẫn FFmpeg.
+- fix: `sequence_preview_decode.py` — dùng `resolve_ffmpeg_executable`.
+- fix: `thumbnails.py` — dùng `resolve_ffmpeg_executable` / `resolve_ffprobe_executable`.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.11.4
 
 ## Highlights

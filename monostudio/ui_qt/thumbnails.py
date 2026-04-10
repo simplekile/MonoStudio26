@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import shutil
 import subprocess
 import tempfile
 from collections import OrderedDict
@@ -13,6 +12,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt, QObject, QTimer, QSettings
 from PySide6.QtGui import QPixmap, QImage
 
+from monostudio.core.ffmpeg_resolve import resolve_ffprobe_executable, resolve_ffmpeg_executable
 from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
 
 if TYPE_CHECKING:
@@ -39,7 +39,7 @@ DEFAULT_MEMORY_CACHE_MAX = 200
 
 def _get_video_duration_seconds(video_path: Path) -> float | None:
     """Get video duration in seconds via ffprobe; None if unavailable or invalid."""
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = resolve_ffprobe_executable()
     if not ffprobe:
         return None
     path_str = str(video_path.resolve())
@@ -71,7 +71,7 @@ def _load_video_frame_via_ffmpeg(video_path: Path, size_px: int) -> QPixmap | No
     Extract one frame from video at 1/4 duration using ffmpeg (fast: -ss before -i).
     Falls back to frame at 0s if duration unknown. Returns scaled QPixmap or None.
     """
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = resolve_ffmpeg_executable()
     if not ffmpeg:
         return None
     path_str = str(video_path.resolve())

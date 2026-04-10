@@ -6,7 +6,6 @@ FFmpeg must support the format (OpenEXR for .exr). Decoded frames are LRU-cached
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import threading
 from collections import OrderedDict
@@ -15,6 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
 
+from monostudio.core.ffmpeg_resolve import resolve_ffmpeg_executable
 from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
 
 PREVIEW_MAX_SIDE_DEFAULT = 1920
@@ -79,7 +79,7 @@ def _scale_qimage(img: QImage, max_side: int) -> QImage:
 
 
 def _load_via_ffmpeg(path: Path, max_side: int) -> QImage | None:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = resolve_ffmpeg_executable()
     if not ffmpeg:
         return None
     vf = f"scale='min({max_side},iw)':-1"
