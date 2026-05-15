@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Iterable
 
 # Direct children of work_path only (case-insensitive); search order.
 _SEQUENCE_ROOT_PRIORITY = ("render", "preview", "playblast", "flipbook")
@@ -106,6 +107,68 @@ def resolve_sequence_folder(work_path: Path, work_file_path: Path | None) -> Pat
     return None
 
 
+_WORKFILE_VERSION_RE = re.compile(r"(?:^|_)v(\d{3,})(?:_|$)", re.IGNORECASE)
+
+
+def _parse_workfile_version_from_folder_name(folder_name: str) -> int | None:
+    """
+    Best-effort: parse a version number from a work-named sequence folder.
+    Expected patterns include "..._v001" or "..._v001_fixNecklace".
+    """
+    s = (folder_name or "").strip()
+    if not s:
+        return None
+    m = _WORKFILE_VERSION_RE.search(s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def resolve_best_available_sequence_folder(work_path: Path) -> Path | None:
+    """
+    Fallback: when the latest work file has no render/preview sequence yet, pick the best available
+    work-named folder under ``work/<render|preview|playblast|flipbook>/``.
+
+    Selection rules (v1):
+    - Root priority: render → preview → playblast → flipbook
+    - Within the first root that contains any usable sequence folder:
+      - Prefer the highest parsed version (if any folders have a parseable v###)
+      - Otherwise prefer newest folder mtime
+    - Requires the candidate folder to contain at least one frame file.
+    """
+    if not work_path.is_dir():
+        return None
+    for root in _sequence_roots_by_priority(work_path):
+        try:
+            children = [c for c in root.iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        candidates: list[Path] = []
+        for c in children:
+            try:
+                if list_sequence_frames(c):
+                    candidates.append(c)
+            except Exception:
+                continue
+        if not candidates:
+            continue
+        # Prefer highest v### when available; otherwise newest mtime.
+        with_ver: list[tuple[int, Path]] = []
+        for c in candidates:
+            v = _parse_workfile_version_from_folder_name(c.name)
+            if v is not None:
+                with_ver.append((v, c))
+        if with_ver:
+            with_ver.sort(key=lambda t: (t[0], _mtime_key_ns(t[1])), reverse=True)
+            return with_ver[0][1]
+        candidates.sort(key=_mtime_key_ns, reverse=True)
+        return candidates[0]
+    return None
+
+
 def _natural_frame_sort_key(path: Path) -> tuple[str, int, str]:
     stem = path.stem
     m = re.search(r"(\d+)$", stem)
@@ -119,23 +182,30 @@ def _natural_frame_sort_key(path: Path) -> tuple[str, int, str]:
     return (stem.lower(), 0, path.suffix.lower())
 
 
-def list_sequence_frames(sequence_folder: Path) -> list[Path]:
+def list_sequence_frames(
+    sequence_folder: Path,
+    *,
+    ignore_extensions: Iterable[str] | None = None,
+    ignore_name_tokens: Iterable[str] | None = None,
+) -> list[Path]:
     """Sorted list of image files directly under ``sequence_folder`` (non-recursive, v1)."""
     if not sequence_folder.is_dir():
         return []
+    ign_ext = {str(s).strip().lower() for s in (ignore_extensions or ()) if str(s).strip()}
+    ign_tok = {str(s).strip().casefold() for s in (ignore_name_tokens or ()) if str(s).strip()}
     out: list[Path] = []
     try:
         for p in sequence_folder.iterdir():
             if not p.is_file():
                 continue
-            # Skip cryptomatte outputs (not meaningful as thumbnails / flipbook).
-            try:
-                if "cryptomatte" in p.name.casefold():
-                    continue
-            except Exception:
-                pass
             suf = p.suffix.lower()
             if suf in _SEQUENCE_SUFFIXES:
+                if ign_ext and suf in ign_ext:
+                    continue
+                if ign_tok:
+                    name_cf = p.name.casefold()
+                    if any(t in name_cf for t in ign_tok):
+                        continue
                 out.append(p)
     except OSError:
         return []

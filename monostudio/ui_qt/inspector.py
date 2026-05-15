@@ -66,15 +66,22 @@ from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.style import MONOS_COLORS, file_icon_spec_for_path, monos_font
 from monostudio.ui_qt.inspector_preview_settings import (
     THUMB_SOURCE_RENDER_SEQUENCE,
+    THUMB_SOURCE_USER_THEN_RENDER,
     default_qsettings,
     read_inspector_thumbnail_open_exe,
     read_inspector_thumbnail_source,
     read_sequence_preview_fps,
 )
-from monostudio.ui_qt.thumbnails import ThumbnailCache, resolve_thumbnail_path
+from monostudio.ui_qt.thumbnails import (
+    ThumbnailCache,
+    active_dcc_segment_for_thumbnail_cache,
+    get_thumbnail_sequence_ignore_extensions,
+    get_thumbnail_sequence_ignore_tokens,
+    resolve_thumbnail_path,
+)
 from monostudio.ui_qt.thumbnail_source_resolve import (
-    dept_work_path_for_ref,
     primary_work_file_for_department,
+    resolve_department_work_path_for_preview,
     resolve_entity_thumbnail_source_path,
 )
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
@@ -179,15 +186,32 @@ def _inspector_work_and_publish_paths(
 def _inspector_preview_resolve_sequence(
     work_path: Path | None,
     work_file_path: Path | None,
+    *,
+    ignore_extensions: frozenset[str] | None = None,
+    ignore_name_tokens: frozenset[str] | None = None,
 ) -> tuple[Path | None, list[Path]]:
-    from monostudio.core.sequence_preview import list_sequence_frames, resolve_sequence_folder
+    from monostudio.core.sequence_preview import (
+        list_sequence_frames,
+        resolve_best_available_sequence_folder,
+        resolve_sequence_folder,
+    )
 
     if work_path is None or not work_path.is_dir():
         return (None, [])
     sq = resolve_sequence_folder(work_path, work_file_path)
     if sq is None or not sq.is_dir():
-        return (None, [])
-    return (sq, list_sequence_frames(sq))
+        # Fallback: latest work may have no sequence yet; use best available older sequence folder.
+        sq = resolve_best_available_sequence_folder(work_path)
+        if sq is None or not sq.is_dir():
+            return (None, [])
+    return (
+        sq,
+        list_sequence_frames(
+            sq,
+            ignore_extensions=ignore_extensions,
+            ignore_name_tokens=ignore_name_tokens,
+        ),
+    )
 
 
 def _inspector_preview_worker_run(
@@ -199,6 +223,8 @@ def _inspector_preview_worker_run(
     work_path_str: str | None,
     work_file_str: str | None,
     decode_max_side: int = 1024,
+    sequence_ignore_extensions: frozenset[str] | None = None,
+    sequence_ignore_name_tokens: frozenset[str] | None = None,
 ) -> tuple[str, QImage | None, bool]:
     """Background: load inspector thumb (sequence folder resolved on main thread after apply)."""
     px = max(256, min(1024, int(decode_max_side)))
@@ -216,7 +242,15 @@ def _inspector_preview_worker_run(
     if wf is not None and not wf.is_file():
         wf = None
 
-    thumb = resolve_entity_thumbnail_source_path(p, dept, mode, wp, wf)
+    thumb = resolve_entity_thumbnail_source_path(
+        p,
+        dept,
+        mode,
+        wp,
+        wf,
+        sequence_ignore_extensions=sequence_ignore_extensions,
+        sequence_ignore_name_tokens=sequence_ignore_name_tokens,
+    )
     if thumb is None:
         return (path_str, None, False)
     use_fit = ".user." in str(thumb)
@@ -722,6 +756,8 @@ class InspectorPanel(QWidget):
                 active_department=department,
                 active_dcc_id=dcc_id,
             )
+            # Preview resolve uses primary work file for (dept, active DCC); refresh sequence + thumb.
+            self._preview.update_thumbnail_only(active_dcc_hint=dcc_id)
 
     def _on_department_focused(self, department_name: str) -> None:
         """Update Tech row, status pill, and preview thumbnail with the clicked department."""
@@ -975,6 +1011,26 @@ class _PreviewWidget(QWidget):
         # Global production status indicator (small dot top-right, color + tooltip text).
         self._status_color_hex: str | None = None
         self._status_label: str | None = None
+        # Version badge (always visible when a work version is known).
+        self._version_badge_text: str = ""
+        self._version_badge_bg: QColor | None = None
+        self._version_badge_tooltip: str = ""
+        self._version_badge_rect: QRect | None = None
+
+    def set_version_badge(self, *, text: str, bg: QColor | None, tooltip: str = "") -> None:
+        t = (text or "").strip()
+        tip = (tooltip or "").strip()
+        same_bg = (self._version_badge_bg == bg) if (self._version_badge_bg is not None or bg is not None) else True
+        if self._version_badge_text == t and same_bg and self._version_badge_tooltip == tip:
+            return
+        self._version_badge_text = t
+        self._version_badge_bg = bg
+        self._version_badge_tooltip = tip
+        self._version_badge_rect = None
+        # Clear tooltip unless we are actively hovering the badge.
+        if not t:
+            self.setToolTip("")
+        self.update()
 
     def get_user_fit(self) -> bool:
         return self._user_fit
@@ -1174,6 +1230,46 @@ class _PreviewWidget(QWidget):
                     p.drawPixmap(r, crop)
                 # Overlay global status dot on top of image.
                 self._draw_status_dot(p, r)
+                # Version badge (color encodes fresh vs old).
+                if self._version_badge_text and self._version_badge_bg is not None:
+                    pad = 10
+                    f = monos_font("Inter", 10, QFont.Weight.Bold)
+                    p.save()
+                    p.setFont(f)
+                    fm = p.fontMetrics()
+                    text = self._version_badge_text.strip().upper()
+                    # Add a small "film" icon to clarify this is preview version.
+                    icon_size = 12
+                    icon_gap = 6
+                    play_icon = lucide_icon("film", size=icon_size, color_hex="#ffffff")
+                    play_pix = play_icon.pixmap(icon_size, icon_size)
+                    tw = fm.horizontalAdvance(text) + (icon_size + icon_gap if not play_pix.isNull() else 0)
+                    th = fm.height()
+                    pill_pad_x = 10
+                    pill_pad_y = 4
+                    pill_w = tw + pill_pad_x * 2
+                    pill_h = th + pill_pad_y * 2
+                    x = r.left() + pad
+                    y = r.bottom() - pad - pill_h
+                    rect = QRect(x, y, pill_w, pill_h)
+                    self._version_badge_rect = rect
+                    bg = QColor(self._version_badge_bg)
+                    bg.setAlpha(190)
+                    border = QColor(255, 255, 255, 64)
+                    p.setPen(QPen(border, 1))
+                    p.setBrush(bg)
+                    p.drawRoundedRect(rect, 8, 8)
+                    p.setPen(QColor("#ffffff"))
+                    # Draw icon + text centered as a group.
+                    content_w = fm.horizontalAdvance(text) + (icon_size + icon_gap if not play_pix.isNull() else 0)
+                    start_x = rect.center().x() - (content_w // 2)
+                    if not play_pix.isNull():
+                        iy = rect.center().y() - (icon_size // 2)
+                        p.drawPixmap(start_x, iy, play_pix)
+                        start_x += icon_size + icon_gap
+                    text_rect = QRect(start_x, rect.top(), rect.right() - start_x, rect.height())
+                    p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+                    p.restore()
                 return
 
             # Placeholder: icon by kind (asset/shot/project) or letter/em-dash
@@ -1260,6 +1356,25 @@ class _PreviewWidget(QWidget):
             p.drawText(r, Qt.AlignCenter, "—")
         finally:
             p.end()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        except Exception:
+            pos = None
+        rect = self._version_badge_rect
+        if (
+            pos is not None
+            and rect is not None
+            and self._version_badge_tooltip
+            and rect.contains(pos)
+        ):
+            self.setToolTip(self._version_badge_tooltip)
+        else:
+            # Keep widget tooltip empty to avoid global hover tooltips.
+            if self.toolTip():
+                self.setToolTip("")
+        return super().mouseMoveEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         try:
@@ -1804,14 +1919,29 @@ class _InspectorPreview(QWidget):
         self._preview_thumb_cache.clear()
         self._seq_decode_bucket = None
 
-    def _work_paths_for_preview_item(self, item: ViewItem) -> tuple[Path | None, Path | None]:
+    def _work_paths_for_preview_item(
+        self,
+        item: ViewItem,
+        *,
+        active_dcc_hint: str | None = None,
+    ) -> tuple[Path | None, Path | None]:
         ref = getattr(item, "ref", None)
         dept = self._active_department
         if not isinstance(ref, (Asset, Shot)) or not (dept or "").strip():
             return (None, None)
         ds = dept.strip()
-        wp = dept_work_path_for_ref(ref, dept)
-        wf = primary_work_file_for_department(ref, ds, _inspector_get_active_dcc(item.path, dept))
+        if active_dcc_hint is not None:
+            adc = (active_dcc_hint or "").strip() or None
+        else:
+            adc = _inspector_get_active_dcc(item.path, dept)
+        wf = primary_work_file_for_department(ref, ds, adc)
+        wp = resolve_department_work_path_for_preview(
+            ref,
+            dept,
+            work_file_path=wf,
+            item_root=Path(item.path),
+            active_dcc_id=adc,
+        )
         return (wp, wf)
 
     def _unreadable_thumb_hint(self) -> str:
@@ -1864,15 +1994,80 @@ class _InspectorPreview(QWidget):
     def _sync_sequence_context_for_inspector_preview(self) -> None:
         self._sequence_folder = None
         self._sequence_frames = []
+        try:
+            self._container._w.set_version_badge(text="", bg=None, tooltip="")
+        except Exception:
+            pass
         item = self._item
         if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            self._seq_index = 0
             self._update_sequence_play_button()
             self._sync_inspector_thumb_tooltip()
             return
         wp, wf = self._work_paths_for_preview_item(item)
-        sq, frames = _inspector_preview_resolve_sequence(wp, wf)
+        ign_ext = get_thumbnail_sequence_ignore_extensions(self._qsettings)
+        ign_tok = get_thumbnail_sequence_ignore_tokens(self._qsettings)
+        sq, frames = _inspector_preview_resolve_sequence(
+            wp, wf, ignore_extensions=ign_ext, ignore_name_tokens=ign_tok
+        )
         self._sequence_folder = sq
         self._sequence_frames = frames
+        self._seq_index = (len(frames) // 2) if frames else 0
+
+        # Version badge: always show when latest work version is known.
+        # Color encodes whether we're showing a sequence folder for the latest work (green) or an older fallback (red).
+        try:
+            mode = self._inspector_thumb_source_mode()
+            latest_v = _work_file_version_from_path_for_inspector(wf)
+            if latest_v is not None:
+                label_latest = f"v{int(latest_v):03d}"
+            else:
+                label_latest = ""
+
+            badge_text = label_latest
+            badge_bg: QColor | None = None
+            tooltip = ""
+
+            if badge_text:
+                # Default: latest known work version.
+                badge_bg = QColor(MONOS_COLORS["emerald_500"])
+                tooltip = f"Preview version: {badge_text} (matches latest work)."
+
+            # When in Render / Smart, and latest has no matching sequence folder, badge becomes red and shows fallback version.
+            if mode in (THUMB_SOURCE_RENDER_SEQUENCE, THUMB_SOURCE_USER_THEN_RENDER) and wp is not None and wp.is_dir():
+                from monostudio.core.sequence_preview import (
+                    resolve_best_available_sequence_folder,
+                    resolve_sequence_folder,
+                )
+                cur = resolve_sequence_folder(wp, wf)
+                if cur is None:
+                    best = resolve_best_available_sequence_folder(wp)
+                    if best is not None:
+                        import re
+
+                        m = re.search(r"(?:^|_)v(\d{3,})(?:_|$)", best.name, flags=re.IGNORECASE)
+                        fallback_v = int(m.group(1)) if m else None
+                        if fallback_v is not None:
+                            badge_text = f"v{fallback_v:03d}"
+                        # Mark as old only when we actually have to fall back.
+                        badge_bg = QColor(MONOS_COLORS["red_500"])
+                        if badge_text and label_latest and badge_text != label_latest:
+                            tooltip = (
+                                f"Preview version: {badge_text} (older preview).\n"
+                                f"Latest work: {label_latest} (no preview yet)."
+                            )
+                        elif label_latest:
+                            tooltip = (
+                                "Preview version: older preview.\n"
+                                f"Latest work: {label_latest} (no preview yet)."
+                            )
+                        else:
+                            tooltip = "Preview version: older preview (latest work has no preview yet)."
+
+            if badge_text:
+                self._container._w.set_version_badge(text=badge_text, bg=badge_bg, tooltip=tooltip)
+        except Exception:
+            pass
         self._update_sequence_play_button()
         self._sync_inspector_thumb_tooltip()
 
@@ -1942,12 +2137,16 @@ class _InspectorPreview(QWidget):
         ref = getattr(item, "ref", None)
         if isinstance(ref, (Asset, Shot)):
             wp, wf = self._work_paths_for_preview_item(item)
+            ign_ext = get_thumbnail_sequence_ignore_extensions(self._qsettings)
+            ign_tok = get_thumbnail_sequence_ignore_tokens(self._qsettings)
             p = resolve_entity_thumbnail_source_path(
                 Path(item.path),
                 self._active_department,
                 mode,
                 wp,
                 wf,
+                sequence_ignore_extensions=ign_ext,
+                sequence_ignore_name_tokens=ign_tok,
             )
             if p is not None:
                 try:
@@ -2229,7 +2428,6 @@ class _InspectorPreview(QWidget):
     def apply_preview_thumb(self, path_str: str, image_or_none: QImage | None, use_fit: bool) -> None:
         """Main thread only: apply thumb from worker. path_str must match current item."""
         self._halt_inline_sequence_ui()
-        self._seq_index = 0
         self._last_thumb_use_fit = use_fit
         w = self._container._w
         w.set_loading(False)
@@ -2265,13 +2463,26 @@ class _InspectorPreview(QWidget):
     def set_active_department(self, department: str | None) -> None:
         self._active_department = (department or "").strip() or None
 
-    def _preview_cache_key(self, path: Path) -> str:
+    def _preview_cache_key(self, path: Path, *, active_dcc_hint: str | None = None) -> str:
         try:
             base = str(path.resolve())
         except Exception:
             base = str(path)
         dep = (self._active_department or "").strip()
         mode = self._inspector_thumb_source_mode()
+        item = self._item
+        if (
+            dep
+            and item is not None
+            and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
+            and str(getattr(item, "path", "")) == str(path)
+        ):
+            if active_dcc_hint is not None:
+                ac = active_dcc_hint
+            else:
+                ac = _inspector_get_active_dcc(path, dep)
+            adc_seg = active_dcc_segment_for_thumbnail_cache(ac)
+            return f"{base}::dept::{dep}::adc::{adc_seg}::ts::{mode}"
         if dep:
             return f"{base}::dept::{dep}::ts::{mode}"
         return f"{base}::ts::{mode}"
@@ -2322,6 +2533,8 @@ class _InspectorPreview(QWidget):
         wp, wf = self._work_paths_for_preview_item(item)
         wps = str(wp) if wp is not None else None
         wfs = str(wf) if wf is not None else None
+        ign_ext = get_thumbnail_sequence_ignore_extensions(self._qsettings)
+        ign_tok = get_thumbnail_sequence_ignore_tokens(self._qsettings)
 
         if mgr is not None and hasattr(mgr, "submit_task"):
             w.set_loading(True)
@@ -2343,6 +2556,8 @@ class _InspectorPreview(QWidget):
                         work_path_str=wps,
                         work_file_str=wfs,
                         decode_max_side=ms,
+                        sequence_ignore_extensions=ign_ext,
+                        sequence_ignore_name_tokens=ign_tok,
                     )
 
                 task = WorkerTask("inspector_preview_thumb", run_load, manager=mgr)
@@ -2363,12 +2578,14 @@ class _InspectorPreview(QWidget):
                 work_path_str=wps,
                 work_file_str=wfs,
                 decode_max_side=ms,
+                sequence_ignore_extensions=ign_ext,
+                sequence_ignore_name_tokens=ign_tok,
             )
             self.apply_preview_thumb(ps, img, uf)
 
         QTimer.singleShot(0, load)
 
-    def update_thumbnail_only(self) -> None:
+    def update_thumbnail_only(self, *, active_dcc_hint: str | None = None) -> None:
         """Update thumbnail image only (e.g. after thumbnailsChanged or department change)."""
         item = self._item
         if item is None:
@@ -2376,14 +2593,16 @@ class _InspectorPreview(QWidget):
         self._halt_inline_sequence_ui()
         path = item.path
         path_str = str(path)
-        cache_key = self._preview_cache_key(path)
+        cache_key = self._preview_cache_key(path, active_dcc_hint=active_dcc_hint)
         dept = self._active_department
         is_inbox = item.kind == ViewItemKind.INBOX_ITEM
         mgr = self._worker_manager
         mode = self._inspector_thumb_source_mode()
-        wp, wf = self._work_paths_for_preview_item(item)
+        wp, wf = self._work_paths_for_preview_item(item, active_dcc_hint=active_dcc_hint)
         wps = str(wp) if wp is not None else None
         wfs = str(wf) if wf is not None else None
+        ign_ext = get_thumbnail_sequence_ignore_extensions(self._qsettings)
+        ign_tok = get_thumbnail_sequence_ignore_tokens(self._qsettings)
 
         if cache_key in self._preview_thumb_cache:
             cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
@@ -2423,6 +2642,8 @@ class _InspectorPreview(QWidget):
                         work_path_str=wps,
                         work_file_str=wfs,
                         decode_max_side=ms,
+                        sequence_ignore_extensions=ign_ext,
+                        sequence_ignore_name_tokens=ign_tok,
                     )
 
                 task = WorkerTask("inspector_preview_thumb", run_load, manager=mgr)
@@ -2443,6 +2664,8 @@ class _InspectorPreview(QWidget):
                 work_path_str=wps,
                 work_file_str=wfs,
                 decode_max_side=ms,
+                sequence_ignore_extensions=ign_ext,
+                sequence_ignore_name_tokens=ign_tok,
             )
             self.apply_preview_thumb(ps, img, uf)
 

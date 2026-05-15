@@ -632,7 +632,7 @@ class SettingsDialog(MonosDialog):
             "Image sequence under the active work file folder:\n"
             "work/render → preview → playblast → flipbook, then <work name>/."
         )
-        _tip_s = "Prefer a user thumbnail when it exists;\notherwise use the same sequence path as Render."
+        _tip_s = "Prefer the Render sequence when it exists;\notherwise use the User thumbnail."
 
         insp_l.addWidget(QLabel("Thumbnail source — Assets", grp_insp))
         self._inspector_thumb_source_group_asset = QButtonGroup(grp_insp)
@@ -1871,6 +1871,50 @@ class SettingsDialog(MonosDialog):
         grp_layout.addLayout(form)
         grp_layout.addWidget(hint)
         layout.addWidget(grp)
+
+        # Thumbnail / render-sequence scan rules.
+        default_thumb_tokens = "cryptomatte,z"
+        grp_t = QGroupBox("Thumbnails (Render/Preview sequences)", root)
+        grp_t_layout = QVBoxLayout(grp_t)
+        form_t = QFormLayout()
+
+        self._thumb_seq_ignore_ext_field = QLineEdit(grp_t)
+        self._thumb_seq_ignore_ext_field.setPlaceholderText("")
+        self._thumb_seq_ignore_ext_field.setProperty("mono", True)
+        try:
+            if self._settings is not None:
+                v = self._settings.value("pipeline/thumbnail_sequence_ignore_extensions", "", str)
+                self._thumb_seq_ignore_ext_field.setText((v or "").strip())
+            else:
+                self._thumb_seq_ignore_ext_field.setText("")
+        except Exception:
+            self._thumb_seq_ignore_ext_field.setText("")
+        form_t.addRow("Ignore extensions (comma-separated):", self._thumb_seq_ignore_ext_field)
+
+        self._thumb_seq_ignore_tokens_field = QLineEdit(grp_t)
+        self._thumb_seq_ignore_tokens_field.setPlaceholderText(default_thumb_tokens)
+        self._thumb_seq_ignore_tokens_field.setProperty("mono", True)
+        try:
+            if self._settings is not None:
+                v = self._settings.value("pipeline/thumbnail_sequence_ignore_tokens", default_thumb_tokens, str)
+                self._thumb_seq_ignore_tokens_field.setText((v or default_thumb_tokens).strip())
+            else:
+                self._thumb_seq_ignore_tokens_field.setText(default_thumb_tokens)
+        except Exception:
+            self._thumb_seq_ignore_tokens_field.setText(default_thumb_tokens)
+        form_t.addRow("Ignore filename tokens (comma-separated):", self._thumb_seq_ignore_tokens_field)
+
+        hint_t = QLabel(
+            "Applies when picking a representative frame from work/<render|preview|playblast|flipbook>/<work_name>/. "
+            "Extensions are compared as lowercase with leading dot. Tokens are substring-matched case-insensitively. "
+            "Default token: cryptomatte (from legacy behavior).",
+            grp_t,
+        )
+        hint_t.setWordWrap(True)
+        hint_t.setObjectName("DialogHelper")
+        grp_t_layout.addLayout(form_t)
+        grp_t_layout.addWidget(hint_t)
+        layout.addWidget(grp_t)
         layout.addStretch(1)
         return root
 
@@ -2429,6 +2473,22 @@ class SettingsDialog(MonosDialog):
                     "pipeline/publish_ignore_extensions",
                     (self._publish_ignore_ext_field.text() or "").strip(),
                 )
+        except Exception:
+            pass
+
+        # Persist thumbnail sequence scan rules (same access tier as pipeline / scan rules).
+        try:
+            if _admin_save and self._settings is not None:
+                if getattr(self, "_thumb_seq_ignore_ext_field", None) is not None:
+                    self._settings.setValue(
+                        "pipeline/thumbnail_sequence_ignore_extensions",
+                        (self._thumb_seq_ignore_ext_field.text() or "").strip(),
+                    )
+                if getattr(self, "_thumb_seq_ignore_tokens_field", None) is not None:
+                    self._settings.setValue(
+                        "pipeline/thumbnail_sequence_ignore_tokens",
+                        (self._thumb_seq_ignore_tokens_field.text() or "").strip(),
+                    )
         except Exception:
             pass
 

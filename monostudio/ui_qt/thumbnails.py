@@ -36,6 +36,52 @@ _VIDEO_EXTENSIONS = frozenset({
 })
 DEFAULT_MEMORY_CACHE_MAX = 200
 
+# Settings: rules for scanning frames under work/<render|preview|playblast|flipbook>/...
+SETTINGS_KEY_THUMB_SEQ_IGNORE_EXT = "pipeline/thumbnail_sequence_ignore_extensions"
+SETTINGS_KEY_THUMB_SEQ_IGNORE_TOKENS = "pipeline/thumbnail_sequence_ignore_tokens"
+DEFAULT_THUMB_SEQ_IGNORE_TOKENS = "cryptomatte,z"
+
+
+def _parse_ignore_extensions(raw: str) -> frozenset[str]:
+    result: set[str] = set()
+    for part in (raw or "").split(","):
+        ext = (part or "").strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = "." + ext
+        result.add(ext)
+    return frozenset(result)
+
+
+def _parse_ignore_tokens(raw: str) -> frozenset[str]:
+    result: set[str] = set()
+    for part in (raw or "").split(","):
+        tok = (part or "").strip()
+        if not tok:
+            continue
+        result.add(tok)
+    return frozenset(result)
+
+
+def get_thumbnail_sequence_ignore_extensions(settings: QSettings | None) -> frozenset[str]:
+    """Parse pipeline/thumbnail_sequence_ignore_extensions (comma-separated). Normalized to lowercase with leading dot."""
+    if settings is None:
+        return frozenset()
+    raw = settings.value(SETTINGS_KEY_THUMB_SEQ_IGNORE_EXT, "", str) or ""
+    return _parse_ignore_extensions(raw)
+
+
+def get_thumbnail_sequence_ignore_tokens(settings: QSettings | None) -> frozenset[str]:
+    """
+    Parse pipeline/thumbnail_sequence_ignore_tokens (comma-separated).
+    Tokens are substring-matched against filename (case-insensitive).
+    """
+    if settings is None:
+        return _parse_ignore_tokens(DEFAULT_THUMB_SEQ_IGNORE_TOKENS)
+    raw = settings.value(SETTINGS_KEY_THUMB_SEQ_IGNORE_TOKENS, DEFAULT_THUMB_SEQ_IGNORE_TOKENS, str) or DEFAULT_THUMB_SEQ_IGNORE_TOKENS
+    return _parse_ignore_tokens(raw)
+
 
 def _get_video_duration_seconds(video_path: Path) -> float | None:
     """Get video duration in seconds via ffprobe; None if unavailable or invalid."""
@@ -117,7 +163,15 @@ def _load_video_frame_via_ffmpeg(video_path: Path, size_px: int) -> QPixmap | No
 
 
 _DEPT_THUMB_CACHE_SEP = "::dept::"
+_THUMB_ACTIVE_DCC_MARKER = "::adc::"
 _THUMB_SOURCE_MODE_MARKER = "::tsm::"
+_THUMB_SCAN_RULES_MARKER = "::sr::"
+
+
+def active_dcc_segment_for_thumbnail_cache(active_dcc_id: str | None) -> str:
+    """Normalized active DCC for grid/list thumbnail cache key; __none__ when no selection in open.json."""
+    s = (active_dcc_id or "").strip().casefold()
+    return s if s else "__none__"
 
 
 def _thumbnail_disk_cache_dir() -> Path:
@@ -194,24 +248,34 @@ def make_department_cache_key(
     entity_path: str,
     department: str | None,
     *,
+    thumb_active_dcc_sig: str | None = None,
     thumb_source_mode: str | None = None,
+    thumb_scan_rules_sig: str | None = None,
 ) -> str:
-    """Build cache key: entity path alone, or entity::dept::department when filtered; optional ::tsm::mode."""
+    """Build cache key: entity or entity::dept::dep; optional ::adc::, ::tsm::, ::sr:: (in that order)."""
     dep = (department or "").strip()
     if dep:
         base = f"{entity_path}{_DEPT_THUMB_CACHE_SEP}{dep}"
     else:
         base = entity_path
+    if thumb_active_dcc_sig is not None:
+        base = f"{base}{_THUMB_ACTIVE_DCC_MARKER}{thumb_active_dcc_sig}"
     if thumb_source_mode:
-        return f"{base}{_THUMB_SOURCE_MODE_MARKER}{thumb_source_mode}"
+        base = f"{base}{_THUMB_SOURCE_MODE_MARKER}{thumb_source_mode}"
+    if thumb_scan_rules_sig:
+        base = f"{base}{_THUMB_SCAN_RULES_MARKER}{thumb_scan_rules_sig}"
     return base
 
 
 def parse_department_cache_key(cache_key: str) -> tuple[str, str | None]:
-    """Split cache key back into (entity_path, department_or_None). Strips ::tsm:: suffix if present."""
+    """Split cache key into (entity_path, department_or_None). Strips ::sr::, ::tsm::, ::adc:: suffixes."""
     s = cache_key
+    if _THUMB_SCAN_RULES_MARKER in s:
+        s = s.split(_THUMB_SCAN_RULES_MARKER, 1)[0]
     if _THUMB_SOURCE_MODE_MARKER in s:
         s = s.split(_THUMB_SOURCE_MODE_MARKER, 1)[0]
+    if _THUMB_ACTIVE_DCC_MARKER in s:
+        s = s.split(_THUMB_ACTIVE_DCC_MARKER, 1)[0]
     if _DEPT_THUMB_CACHE_SEP in s:
         parts = s.split(_DEPT_THUMB_CACHE_SEP, 1)
         return (parts[0], parts[1] if len(parts) > 1 else None)
@@ -360,6 +424,8 @@ class ThumbnailManager(QObject):
         self._settings = settings
         self._cache: OrderedDict[str, QPixmap] = OrderedDict()
         self._pending: set[str] = set()
+        # Cache keys where resolve_grid_thumbnail_file returned no path, or worker decode failed — avoid prefetch spam.
+        self._no_path_keys: set[str] = set()
         self._connect_worker()
 
     def _connect_worker(self) -> None:
@@ -392,10 +458,15 @@ class ThumbnailManager(QObject):
             mode = read_inspector_thumbnail_source(self._settings, entity="shot")
         else:
             mode = None
+        adc_sig: str | None = None
+        if isinstance(pipeline_ref, (Asset, Shot)):
+            adc_sig = active_dcc_segment_for_thumbnail_cache(active_dcc_id)
         cache_key = make_department_cache_key(
             str(asset_id).strip(),
             department,
+            thumb_active_dcc_sig=adc_sig,
             thumb_source_mode=mode,
+            thumb_scan_rules_sig=self._thumbnail_scan_rules_signature(),
         )
         if cache_key in self._cache:
             self._cache.move_to_end(cache_key)
@@ -406,6 +477,8 @@ class ThumbnailManager(QObject):
             except Exception:
                 pass
             return self._cache[cache_key]
+        if cache_key in self._no_path_keys:
+            return None
         try:
             from monostudio.ui_qt.stress_profiler import enabled, record_thumbnail_miss
             if enabled():
@@ -440,6 +513,9 @@ class ThumbnailManager(QObject):
         )
         from monostudio.ui_qt.thumbnail_source_resolve import resolve_grid_thumbnail_file
 
+        seq_ign_ext = get_thumbnail_sequence_ignore_extensions(self._settings)
+        seq_ign_tok = get_thumbnail_sequence_ignore_tokens(self._settings)
+
         if isinstance(pipeline_ref, Asset):
             mode = read_inspector_thumbnail_source(self._settings, entity="asset")
         elif isinstance(pipeline_ref, Shot):
@@ -452,9 +528,12 @@ class ThumbnailManager(QObject):
             mode=mode,
             pipeline_ref=pipeline_ref,
             active_dcc_id=active_dcc_id,
+            sequence_ignore_extensions=seq_ign_ext,
+            sequence_ignore_name_tokens=seq_ign_tok,
         )
         if path is None:
             self._pending.discard(cache_key)
+            self._no_path_keys.add(cache_key)
             return
         file_path = str(path)
         size_px = self._size_px
@@ -473,23 +552,37 @@ class ThumbnailManager(QObject):
         )
 
     def _on_task_finished(self, category: str, result: object, error: str | None) -> None:
-        if not category.startswith("thumbnail_load:") or error is not None:
+        if not category.startswith("thumbnail_load:"):
+            return
+        cache_key = category.replace("thumbnail_load:", "", 1) if ":" in category else ""
+        if error is not None:
+            self._pending.discard(cache_key)
             return
         if result is None:
-            cache_key = category.replace("thumbnail_load:", "", 1) if ":" in category else ""
             self._pending.discard(cache_key)
+            if cache_key:
+                self._no_path_keys.add(cache_key)
             return
         pair = result if isinstance(result, tuple) and len(result) == 2 else None
         if pair is None:
+            self._pending.discard(cache_key)
+            if cache_key:
+                self._no_path_keys.add(cache_key)
             return
         cache_key, qimg = pair
         if not isinstance(cache_key, str) or not isinstance(qimg, QImage) or qimg.isNull():
-            self._pending.discard(cache_key if isinstance(cache_key, str) else "")
+            ck = cache_key if isinstance(cache_key, str) else ""
+            self._pending.discard(ck)
+            if ck:
+                self._no_path_keys.add(ck)
             return
         self._pending.discard(cache_key)
         pix = QPixmap.fromImage(qimg)
         if pix.isNull():
+            self._pending.discard(cache_key)
+            self._no_path_keys.add(cache_key)
             return
+        self._no_path_keys.discard(cache_key)
         self._cache[cache_key] = pix
         self._cache.move_to_end(cache_key)
         while len(self._cache) > self._max_memory:
@@ -501,7 +594,7 @@ class ThumbnailManager(QObject):
         dep_norm = (department or "").strip() or None
         seen: set[str] = set()
         out: list[str] = []
-        for k in set(self._cache.keys()) | self._pending:
+        for k in set(self._cache.keys()) | self._pending | self._no_path_keys:
             ep, d = parse_department_cache_key(k)
             if ep != entity_path:
                 continue
@@ -524,10 +617,26 @@ class ThumbnailManager(QObject):
         for cache_key in keys:
             self._cache.pop(cache_key, None)
             self._pending.discard(cache_key)
+            self._no_path_keys.discard(cache_key)
         self._app_state.invalidate_thumbnails(keys + [aid] if keys else [aid])
 
     def clear_memory_cache(self) -> None:
         """Drop all in-memory thumbnails and pending loads (e.g. thumbnail source mode changed)."""
         self._cache.clear()
         self._pending.clear()
+        self._no_path_keys.clear()
+
+    def _thumbnail_scan_rules_signature(self) -> str | None:
+        """
+        Compact signature for settings-driven scan rules affecting sequence thumbnails.
+        Used in cache key so changing rules triggers reload without manual invalidate.
+        """
+        if self._settings is None:
+            return None
+        ext = sorted(get_thumbnail_sequence_ignore_extensions(self._settings))
+        tok = sorted(t.casefold() for t in get_thumbnail_sequence_ignore_tokens(self._settings))
+        if not ext and not tok:
+            return None
+        # Keep stable + short; human-readable is fine (not security-sensitive).
+        return f"e={';'.join(ext)}|t={';'.join(tok)}"
 

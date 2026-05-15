@@ -2411,7 +2411,7 @@ class MainView(QWidget):
             "Image sequence under the active work file folder:\n"
             "work/render → preview → playblast → flipbook, then <work name>/."
         )
-        _tip_smart = "Prefer a user thumbnail when it exists;\notherwise use the same sequence path as Render."
+        _tip_smart = "Prefer the Render sequence when it exists;\notherwise use the User thumbnail."
 
         self._thumb_source_asset_block = QWidget(self._main_view_options_popup)
         _abl = QVBoxLayout(self._thumb_source_asset_block)
@@ -2971,6 +2971,10 @@ class MainView(QWidget):
                 if hit_item and hit_dcc and hit_dep:
                     self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
                     self.active_dcc_changed.emit(hit_item.path, hit_dep, hit_dcc)
+                    try:
+                        self.invalidate_thumbnail(hit_item.path, hit_dep)
+                    except Exception:
+                        pass
                     event.accept()
                     return True
 
@@ -3057,6 +3061,10 @@ class MainView(QWidget):
                     if hit_item and hit_dcc and hit_dep:
                         self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
                         self.active_dcc_changed.emit(hit_item.path, hit_dep, hit_dcc)
+                        try:
+                            self.invalidate_thumbnail(hit_item.path, hit_dep)
+                        except Exception:
+                            pass
                         list_view.viewport().update()
                         event.accept()
                         return True
@@ -3139,6 +3147,9 @@ class MainView(QWidget):
 
         self._tile_view.setGridSize(QSize(cell_w, card_h + gap))
         self._grid_delegate.set_card_size(QSize(card_w, card_h))
+        # Thumbnail prefetch uses visualRect; it often runs in the same singleShot(0) tick before IconMode
+        # lays out wrapped cells, so only the first row intersects the viewport. Prefetch again after grid size.
+        self._schedule_thumbnail_prefetch(force=True)
 
     def set_context_title(self, title: str) -> None:
         self.update_title(base_title=title, department=self._active_department)
@@ -3183,6 +3194,12 @@ class MainView(QWidget):
             return
         self._grid_delegate.set_active_dcc(item_path, department, dcc_id)
         self._tile_view.viewport().update()
+        # Thumbnail cache is keyed by active DCC; refresh this row so render-sequence / smart thumb updates.
+        try:
+            self.invalidate_thumbnail(item_path, (department or "").strip() or None)
+        except Exception:
+            pass
+        self._list_view.viewport().update()
 
     def update_title(self, *, base_title: str, department: str | None) -> None:
         """
@@ -5194,7 +5211,9 @@ class MainView(QWidget):
                 std_item.setData(None, self._THUMB_STATE_ROLE)
         self._schedule_thumbnail_prefetch()
 
-    def _schedule_thumbnail_prefetch(self) -> None:
+    def _schedule_thumbnail_prefetch(self, *, force: bool = False) -> None:
+        if force:
+            self._thumb_prefetch_scheduled = False
         if self._thumb_prefetch_scheduled:
             return
         self._thumb_prefetch_scheduled = True
@@ -5207,29 +5226,20 @@ class MainView(QWidget):
             return
         active_dept = (self._active_department or "").strip() or None
 
-        # When in tile mode: only prefetch if tile content is shown; use tile viewport for visibility.
-        # When in list mode: prefetch so list thumb column gets thumbnails; use list viewport for visibility.
+        # Prefetch all rows (asset/shot/project). QListView IconMode lays out lazily, so visualRect-based
+        # visibility checks miss most rows on first tick after set_items. ThumbnailManager dedupes pending /
+        # no-path keys, and WorkerManager queues via QThreadPool, so this stays cheap and idempotent.
         if self._view_mode == "tile":
             if self._tile_page.currentIndex() != 1:
                 return
-            view = self._tile_view
-            vp_rect = view.viewport().rect()
         else:
             list_view = getattr(self, "_list_view", None)
             if list_view is None or self._list_page.currentIndex() != 1:
                 return
-            view = list_view
-            vp_rect = view.viewport().rect()
-
-        def is_row_visible(row: int) -> bool:
-            idx = self._tile_model.index(row, 0) if view is self._tile_view else self._list_model.index(row, 0)
-            return view.visualRect(idx).intersects(vp_rect)
 
         for row in range(self._tile_model.rowCount()):
             index = self._tile_model.index(row, 0)
             if not index.isValid():
-                continue
-            if not is_row_visible(row):
                 continue
 
             item = index.data(Qt.UserRole)
@@ -5266,9 +5276,8 @@ class MainView(QWidget):
                     if list_thumb is not None:
                         list_thumb.setIcon(icon)
                     continue
-                thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path, department=active_dept)
-                if thumb_file is None:
-                    std_item.setData("missing", self._THUMB_STATE_ROLE)
+                # ThumbnailManager resolves render/sequence paths that legacy ThumbnailCache does not; never infer
+                # "missing" from resolve_thumbnail_file here or visible rows stay stuck until invalidate (e.g. DCC click).
                 continue
 
             thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path, department=active_dept)
