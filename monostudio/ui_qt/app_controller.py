@@ -28,6 +28,7 @@ from monostudio.core.fs_reader import (
 )
 from monostudio.core.models import Asset, Shot
 from monostudio.core.pending_create import add as pending_create_add
+from monostudio.core.project_create_defaults import read_create_default_dcc
 from monostudio.ui_qt.import_source_dialog import ImportSourceDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.main_view import _item_active_dcc, _open_metadata_path
@@ -111,7 +112,7 @@ class AppController(QObject):
         force_open_with: bool = False,
         force_create_new: bool = False,
         parent=None,
-    ) -> None:
+    ) -> bool:
         """
         Smart Open Resolver (primary interaction for double-click).
         - Resolve Department (priority order)
@@ -122,6 +123,8 @@ class AppController(QObject):
         Dialog is fallback only (unless force_dialog=True).
         force_open_with=True: show "Open With…" dialog (choose DCC to open existing work file).
         force_create_new=True: show "Create New…" dialog and always create a new work file (never open existing).
+
+        Returns True if open/create completed; False if the user cancelled a dialog or import flow.
         """
         if self._project_root is None:
             raise RuntimeError("No project is selected; cannot open DCC.")
@@ -177,7 +180,6 @@ class AppController(QObject):
                     project_defaults=project_defaults,
                 )
 
-        remember_for_item = False
         choice = None
         show_dialog = force_dialog or force_open_with or force_create_new or not resolved_department or not resolved_dcc or not resolved_dept_has_work_file
         # When no work file exists (e.g. double-click on new item), show Create New dialog instead of Open With.
@@ -247,16 +249,16 @@ class AppController(QObject):
                 item_name=item_name,
                 type_folder=type_folder,
                 department_label=department_label,
+                project_root=self._project_root if use_create_new_dialog else None,
                 parent=parent,
             )
             if dlg.exec() != OpenResolverDialog.Accepted:
-                return
+                return False
             choice = dlg.choice()
             if choice is None:
-                return
+                return False
             resolved_department = choice.department
             resolved_dcc = choice.dcc
-            remember_for_item = bool(choice.remember_for_item)
 
         if not resolved_department or not resolved_dcc:
             raise RuntimeError("Failed to resolve Department or DCC.")
@@ -271,7 +273,7 @@ class AppController(QObject):
                 parent=parent,
             )
             if action is None:
-                return
+                return False
         else:
             action = self._open_or_create_work_file(
                 item=item,
@@ -285,7 +287,6 @@ class AppController(QObject):
             item.path,
             department=resolved_department,
             dcc=resolved_dcc,
-            remember_for_item=remember_for_item,
             action=action,
         )
         # Push to recent tasks for sidebar.
@@ -300,6 +301,8 @@ class AppController(QObject):
                 dcc=resolved_dcc,
             )
 
+        return True
+
     def open_with_dcc(
         self,
         *,
@@ -312,7 +315,7 @@ class AppController(QObject):
         if self._project_root is None:
             raise RuntimeError("No project is selected; cannot open DCC.")
         action = self._open_or_create_work_file(item=item, department=department, dcc=dcc)
-        self._write_item_open_metadata(item.path, department=department, dcc=dcc, remember_for_item=False, action=action)
+        self._write_item_open_metadata(item.path, department=department, dcc=dcc, action=action)
         if self._recent_tasks_store is not None and self._project_root is not None:
             self._recent_tasks_store.push(
                 project_root=self._project_root,
@@ -394,15 +397,7 @@ class AppController(QObject):
         if canon is not None:
             return canon
 
-        # 2) Asset/Shot last-used (or per-item default if present)
-        defaults = meta.get("defaults") if isinstance(meta, dict) else None
-        if isinstance(defaults, dict):
-            dep = defaults.get("department")
-            if isinstance(dep, str) and dep.strip():
-                for d in available_departments:
-                    if self._norm(d) == self._norm(dep):
-                        return d
-
+        # 2) Asset/Shot last-used
         last_open = meta.get("last_open") if isinstance(meta, dict) else None
         if isinstance(last_open, dict):
             dep = last_open.get("department")
@@ -455,11 +450,12 @@ class AppController(QObject):
             if isinstance(dcc, str) and dcc.strip():
                 last_used = dcc.strip()
 
-        defaults = meta.get("defaults") if isinstance(meta, dict) else None
-        if isinstance(defaults, dict):
-            dcc = defaults.get("dcc")
-            if isinstance(dcc, str) and dcc.strip():
-                last_used = dcc.strip()
+        if last_used is None and self._project_root is not None:
+            cd = read_create_default_dcc(self._project_root, department)
+            if isinstance(cd, str) and cd.strip():
+                dre = DepartmentRegistry.for_project(self._project_root)
+                if dre.is_dcc_allowed_for(self._dcc_registry, department, cd.strip()):
+                    last_used = cd.strip()
 
         if self._project_root is not None:
             return DepartmentRegistry.for_project(self._project_root).pick_default_dcc(
@@ -802,7 +798,6 @@ class AppController(QObject):
         *,
         department: str,
         dcc: str,
-        remember_for_item: bool,
         action: Literal["open", "create"] | None = None,
     ) -> None:
         root = Path(item_root)
@@ -826,8 +821,8 @@ class AppController(QObject):
         by_dep[department] = {"dcc": dcc, "opened_at": now}
         data["last_open_by_department"] = by_dep
 
-        if remember_for_item:
-            data["defaults"] = {"department": department, "dcc": dcc}
+        # Removed per-item "remember as default"; strip legacy key if present.
+        data.pop("defaults", None)
 
         try:
             from monostudio.core.atomic_write import atomic_write_text

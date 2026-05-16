@@ -164,7 +164,7 @@ class TopBar(QWidget):
         self._btn_watcher.setChecked(True)
         self._btn_watcher.setIcon(lucide_icon("eye", size=20, color_hex="#22c55e"))
         self._btn_watcher.setFixedSize(_action_icon_w, _action_icon_h)
-        self._btn_watcher.setToolTip("File watcher: on — pause (click) before rename/delete")
+        self._btn_watcher.setToolTip("File watcher: on — pause (click) before rename or Move to Trash")
         self._btn_watcher.toggled.connect(self._on_watcher_toggled)
         self._watcher_busy = False
         self._watcher_blink_on = True
@@ -376,14 +376,14 @@ class TopBar(QWidget):
     def _update_watcher_button_appearance(self, enabled: bool) -> None:
         if self._watcher_busy:
             return
-        # On = green (safe to browse); Off = red (required for rename/delete)
+        # On = green (safe to browse); Off = red (required for rename / Move to Trash)
         color = "#22c55e" if enabled else "#ef4444"
         self._btn_watcher.setIcon(
             lucide_icon("eye" if enabled else "eye-off", size=20, color_hex=color)
         )
         self._btn_watcher.setToolTip(
-            "File watcher: on — pause (click) before rename/delete" if enabled
-            else "File watcher: paused — rename/delete allowed (click to resume)"
+            "File watcher: on — pause (click) before rename or Move to Trash" if enabled
+            else "File watcher: paused — rename and Move to Trash allowed (click to resume)"
         )
 
     def _on_watcher_busy_blink(self) -> None:

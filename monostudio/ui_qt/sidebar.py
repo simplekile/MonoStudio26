@@ -86,6 +86,7 @@ class SidebarContext(str, Enum):
     INBOX = "Inbox"
     PROJECT_GUIDE = "Project Guide"
     OUTBOX = "Outbox"
+    TRASH = "Trash"
 
 
 # Single nav item that holds the scope pill (Project | Shot | Asset).
@@ -2440,6 +2441,7 @@ class Sidebar(QWidget):
             (SidebarContext.INBOX.value, "inbox", "Inbox"),
             (SidebarContext.PROJECT_GUIDE.value, "folder-open", "Project Guide"),
             (SidebarContext.OUTBOX.value, "send", "Outbox"),
+            (SidebarContext.TRASH.value, "trash-2", "Trash"),
         )
         for context_name, icon_name, tooltip_text in _footer_items:
             btn = QToolButton(nav_pages_row)
@@ -2818,7 +2820,12 @@ class Sidebar(QWidget):
                     self._filters.set_mode("assets")
             self.context_changed.emit(context_name)
             return
-        if context_name in (SidebarContext.INBOX.value, SidebarContext.PROJECT_GUIDE.value, SidebarContext.OUTBOX.value):
+        if context_name in (
+            SidebarContext.INBOX.value,
+            SidebarContext.PROJECT_GUIDE.value,
+            SidebarContext.OUTBOX.value,
+            SidebarContext.TRASH.value,
+        ):
             self._footer_context = context_name
             self._nav.setCurrentRow(-1)
             self._previous_context_text = getattr(self, "_last_context_text", None)
@@ -2833,6 +2840,8 @@ class Sidebar(QWidget):
             elif context_name == SidebarContext.OUTBOX.value:
                 self._filters.setVisible(True)
                 self._filters.set_mode("inbox")  # Source filter (Client/Freelancer) like Inbox
+            elif context_name == SidebarContext.TRASH.value:
+                self._filters.setVisible(False)
             self.context_changed.emit(context_name)
             return
 
@@ -3016,11 +3025,17 @@ class Sidebar(QWidget):
 
     def _sync_footer_active_states(self) -> None:
         ctx = self.current_context()
+        _icons = {
+            SidebarContext.INBOX.value: "inbox",
+            SidebarContext.PROJECT_GUIDE.value: "folder-open",
+            SidebarContext.OUTBOX.value: "send",
+            SidebarContext.TRASH.value: "trash-2",
+        }
         for name, btn in self._footer_buttons.items():
             active = name == ctx
             btn.setProperty("active", "true" if active else "false")
             color = MONOS_COLORS["blue_400"] if active else MONOS_COLORS["text_label"]
-            icon_name = "inbox" if name == SidebarContext.INBOX.value else ("folder-open" if name == SidebarContext.PROJECT_GUIDE.value else "send")
+            icon_name = _icons.get(name, "inbox")
             ic = lucide_icon(icon_name, size=16, color_hex=color)
             if not ic.isNull():
                 btn.setIcon(ic)
@@ -3155,11 +3170,13 @@ class SidebarCompact(QWidget):
             SidebarContext.INBOX.value: "Inbox",
             SidebarContext.PROJECT_GUIDE.value: "Project Guide",
             SidebarContext.OUTBOX.value: "Outbox",
+            SidebarContext.TRASH.value: "Trash",
         }
         for ctx_name, icon_name in [
             (SidebarContext.INBOX.value, "inbox"),
             (SidebarContext.PROJECT_GUIDE.value, "folder-open"),
             (SidebarContext.OUTBOX.value, "send"),
+            (SidebarContext.TRASH.value, "trash-2"),
         ]:
             btn = QToolButton(self)
             btn.setObjectName("SidebarCompactFooterNavButton")
@@ -3297,7 +3314,12 @@ class SidebarCompact(QWidget):
             self._sync_active_states()
             self.context_changed.emit(context_name)
             return
-        if context_name in (SidebarContext.INBOX.value, SidebarContext.PROJECT_GUIDE.value, SidebarContext.OUTBOX.value):
+        if context_name in (
+            SidebarContext.INBOX.value,
+            SidebarContext.PROJECT_GUIDE.value,
+            SidebarContext.OUTBOX.value,
+            SidebarContext.TRASH.value,
+        ):
             self._footer_context = context_name
             self._last_context_text = context_name
             self._sync_active_states()
@@ -3321,7 +3343,13 @@ class SidebarCompact(QWidget):
             active = name == ctx
             btn.setProperty("active", "true" if active else "false")
             color = MONOS_COLORS["blue_400"] if active else MONOS_COLORS["text_label"]
-            icon_name = "inbox" if name == SidebarContext.INBOX.value else ("folder-open" if name == SidebarContext.PROJECT_GUIDE.value else "send")
+            _fi = {
+                SidebarContext.INBOX.value: "inbox",
+                SidebarContext.PROJECT_GUIDE.value: "folder-open",
+                SidebarContext.OUTBOX.value: "send",
+                SidebarContext.TRASH.value: "trash-2",
+            }
+            icon_name = _fi.get(name, "inbox")
             ic = lucide_icon(icon_name, size=20, color_hex=color)
             if not ic.isNull():
                 btn.setIcon(ic)

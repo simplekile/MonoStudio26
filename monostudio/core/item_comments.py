@@ -1,0 +1,269 @@
+"""
+Per-item notes / feedback for assets and shots.
+
+Stored at <item_root>/.monostudio/item_comments.json
+Schema v2: { "schema": 2, "entries": [ { id, at, author, text, done, done_at? }, ... ] }
+"""
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from getpass import getuser
+from pathlib import Path
+from typing import Callable
+
+from monostudio.core.atomic_write import atomic_write_text
+
+COMMENTS_FILENAME = "item_comments.json"
+COMMENTS_SCHEMA = 2
+_MAX_ENTRIES = 200
+_MAX_TEXT_LEN = 4000
+_WRITE_RETRIES = 5
+
+
+@dataclass(frozen=True)
+class ItemCommentEntry:
+    id: str
+    at: str
+    author: str
+    text: str
+    done: bool = False
+    done_at: str | None = None
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "id": self.id,
+            "at": self.at,
+            "author": self.author,
+            "text": self.text,
+            "done": bool(self.done),
+        }
+        if self.done_at:
+            d["done_at"] = self.done_at
+        return d
+
+
+def _comments_path(item_root: Path) -> Path:
+    return Path(item_root) / ".monostudio" / COMMENTS_FILENAME
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_entry(raw: object) -> ItemCommentEntry | None:
+    if not isinstance(raw, dict):
+        return None
+    eid = str(raw.get("id") or "").strip()
+    at = str(raw.get("at") or "").strip()
+    text = str(raw.get("text") or "").strip()
+    if not eid or not at:
+        return None
+    text = text[:_MAX_TEXT_LEN]
+    author = str(raw.get("author") or "").strip()[:200]
+    done = bool(raw.get("done"))
+    done_at = raw.get("done_at")
+    done_at_s = str(done_at).strip()[:64] if done_at else None
+    if done and not done_at_s:
+        done_at_s = at
+    if not done:
+        done_at_s = None
+    return ItemCommentEntry(id=eid, at=at, author=author, text=text, done=done, done_at=done_at_s)
+
+
+def _read_raw(item_root: Path) -> dict | None:
+    path = _comments_path(item_root)
+    try:
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _newer(a: ItemCommentEntry, b: ItemCommentEntry) -> ItemCommentEntry:
+    return b if b.at >= a.at else a
+
+
+def _normalize_entries(entries: list[ItemCommentEntry]) -> list[ItemCommentEntry]:
+    by_id: dict[str, ItemCommentEntry] = {}
+    for e in entries:
+        prev = by_id.get(e.id)
+        by_id[e.id] = e if prev is None else _newer(prev, e)
+    out = sorted(by_id.values(), key=lambda x: x.at)
+    if len(out) > _MAX_ENTRIES:
+        out = out[-_MAX_ENTRIES:]
+    return out
+
+
+def read_item_comments(item_root: Path) -> list[ItemCommentEntry]:
+    data = _read_raw(item_root)
+    if not data:
+        return []
+    raw_list = data.get("entries")
+    if not isinstance(raw_list, list):
+        return []
+    out: list[ItemCommentEntry] = []
+    for raw in raw_list:
+        p = _parse_entry(raw)
+        if p:
+            out.append(p)
+    return _normalize_entries(out)
+
+
+def count_open_notes(item_root: Path) -> int:
+    return sum(1 for e in read_item_comments(item_root) if not e.done)
+
+
+def notes_badge_visual_mode(item_root: Path) -> tuple[int, str]:
+    """
+    Return (open_count, mode) for thumbnail badge painting.
+    mode: "empty" — no entries; "open" — at least one not done; "all_done" — entries exist and all done.
+    """
+    entries = read_item_comments(item_root)
+    if not entries:
+        return (0, "empty")
+    open_n = sum(1 for e in entries if not e.done)
+    if open_n > 0:
+        return (open_n, "open")
+    return (0, "all_done")
+
+
+def latest_note_preview_line(item_root: Path, *, max_chars: int = 96) -> tuple[str, bool]:
+    """
+    Most recent note by `at`; single line for tile metadata.
+    Returns (preview, done) — preview empty if no notes or empty text; done is the entry's flag.
+    """
+    entries = read_item_comments(Path(item_root))
+    if not entries:
+        return ("", False)
+    last = entries[-1]
+    done = bool(last.done)
+    text = (last.text or "").replace("\n", " ").strip()
+    if not text:
+        return ("", done)
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return (text, done)
+
+
+def new_comment_entry(text: str, *, author: str | None = None) -> ItemCommentEntry:
+    """In-memory entry for new note (before save batch)."""
+    t = (text or "").strip()
+    if not t:
+        raise ValueError("comment text must be non-empty")
+    t = t[:_MAX_TEXT_LEN]
+    auth = (author or "").strip() or (getuser() or "").strip()
+    return ItemCommentEntry(
+        id=uuid.uuid4().hex[:16],
+        at=_utc_now_iso(),
+        author=auth,
+        text=t,
+        done=False,
+        done_at=None,
+    )
+
+
+def write_item_comments(item_root: Path, entries: list[ItemCommentEntry]) -> None:
+    """Replace on-disk comment file with the given list (normalized, capped)."""
+    _write_payload(Path(item_root), entries)
+
+
+def _write_payload(item_root: Path, entries: list[ItemCommentEntry]) -> None:
+    payload = {
+        "schema": COMMENTS_SCHEMA,
+        "entries": [e.to_dict() for e in _normalize_entries(entries)],
+    }
+    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(_comments_path(item_root), content, encoding="utf-8")
+
+
+def _atomic_update(
+    item_root: Path,
+    updater: Callable[[list[ItemCommentEntry]], list[ItemCommentEntry]],
+) -> None:
+    """Read latest disk → updater → write if changed; retry on OSError."""
+    root = Path(item_root)
+    last_exc: OSError | None = None
+    for attempt in range(_WRITE_RETRIES):
+        fresh = read_item_comments(root)
+        proposed = _normalize_entries(updater(list(fresh)))
+        if proposed == fresh:
+            return
+        try:
+            _write_payload(root, proposed)
+            return
+        except OSError as ex:
+            last_exc = ex
+            time.sleep(0.05 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+
+
+def append_item_comment(item_root: Path, text: str, *, author: str | None = None) -> None:
+    t = (text or "").strip()
+    if not t:
+        raise ValueError("comment text must be non-empty")
+    t = t[:_MAX_TEXT_LEN]
+    auth = (author or "").strip() or (getuser() or "").strip()
+    new_id = uuid.uuid4().hex[:16]
+    new_entry = ItemCommentEntry(
+        id=new_id,
+        at=_utc_now_iso(),
+        author=auth,
+        text=t,
+        done=False,
+        done_at=None,
+    )
+
+    def updater(cur: list[ItemCommentEntry]) -> list[ItemCommentEntry]:
+        if any(e.id == new_entry.id for e in cur):
+            return cur
+        return cur + [new_entry]
+
+    _atomic_update(Path(item_root), updater)
+
+
+def delete_item_comment(item_root: Path, comment_id: str) -> None:
+    cid = (comment_id or "").strip()
+    if not cid:
+        raise ValueError("comment_id required")
+    root = Path(item_root)
+    if not any(e.id == cid for e in read_item_comments(root)):
+        raise ValueError("comment not found")
+
+    def updater(cur: list[ItemCommentEntry]) -> list[ItemCommentEntry]:
+        return [e for e in cur if e.id != cid]
+
+    _atomic_update(root, updater)
+
+
+def set_item_comment_done(item_root: Path, comment_id: str, done: bool) -> None:
+    cid = (comment_id or "").strip()
+    if not cid:
+        raise ValueError("comment_id required")
+    done_flag = bool(done)
+    root = Path(item_root)
+    if not any(e.id == cid for e in read_item_comments(root)):
+        raise ValueError("comment not found")
+
+    def updater(cur: list[ItemCommentEntry]) -> list[ItemCommentEntry]:
+        now = _utc_now_iso()
+        out: list[ItemCommentEntry] = []
+        for e in cur:
+            if e.id != cid:
+                out.append(e)
+                continue
+            if bool(e.done) == done_flag:
+                return cur
+            if done_flag:
+                out.append(ItemCommentEntry(id=e.id, at=e.at, author=e.author, text=e.text, done=True, done_at=now))
+            else:
+                out.append(ItemCommentEntry(id=e.id, at=e.at, author=e.author, text=e.text, done=False, done_at=None))
+        return out
+
+    _atomic_update(root, updater)

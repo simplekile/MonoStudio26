@@ -4,6 +4,7 @@ import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.department_registry import get_project_pipeline_dir
@@ -31,6 +32,56 @@ class TypeDef:
 class PipelineTypesAndPresets:
     types: dict[str, TypeDef] = field(default_factory=dict)
     departments: dict[str, DepartmentDef] = field(default_factory=dict)
+
+
+EntityScope = Literal["asset", "shot"]
+
+
+def is_shot_type_id(type_id: str) -> bool:
+    """Pipeline convention: shot types are ``shot`` or prefixed ``shot_``."""
+    tid = (type_id or "").strip()
+    return bool(tid == "shot" or tid.startswith("shot_"))
+
+
+def ordered_department_ids_for_scope(
+    meta: PipelineTypesAndPresets,
+    scope: EntityScope,
+    *,
+    type_id: str | None = None,
+) -> list[str]:
+    """
+    Department IDs for asset or shot scope, ordered like sidebar filters.
+
+    When ``type_id`` is set and matches ``scope``, only that type's departments are returned.
+    Otherwise returns the union across all types in the scope.
+    """
+    assets = scope == "asset"
+    seen: set[str] = set()
+    tid = (type_id or "").strip()
+
+    if tid and tid in meta.types:
+        if (assets and not is_shot_type_id(tid)) or (not assets and is_shot_type_id(tid)):
+            for d in meta.types[tid].departments:
+                if isinstance(d, str) and d.strip() and d not in seen:
+                    seen.add(d)
+    else:
+        for type_key, tdef in meta.types.items():
+            if assets and is_shot_type_id(type_key):
+                continue
+            if not assets and not is_shot_type_id(type_key):
+                continue
+            for d in tdef.departments:
+                if isinstance(d, str) and d.strip() and d not in seen:
+                    seen.add(d)
+
+    depts: list[str] = []
+    for dept_id in meta.departments.keys():
+        if dept_id in seen:
+            depts.append(dept_id)
+    missing = [d for d in seen if d not in meta.departments]
+    missing.sort(key=lambda s: s.lower())
+    depts.extend(missing)
+    return depts
 
 
 def pipeline_root() -> Path:

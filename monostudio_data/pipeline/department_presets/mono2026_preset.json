@@ -18,6 +18,25 @@
     "lighting": {"label": "Lighting", "folder": "lighting", "shot_folder": "03_lighting", "asset_folder": "08_lighting", "order": 16},
     "comp": {"label": "Comp", "folder": "comp", "shot_folder": "04_comp", "asset_folder": "comp", "order": 17}
   },
+  "create_default_dcc_by_department": {
+    "layout": "blender",
+    "modelling": "blender",
+    "sculpt": "blender",
+    "retopo": "blender",
+    "uv": "rizomuv",
+    "rigging": "blender",
+    "geoclean": "blender",
+    "rig": "blender",
+    "surfacing": "blender",
+    "baking": "substance_painter",
+    "texturing": "substance_painter",
+    "grooming": "houdini",
+    "lookdev": "houdini",
+    "anim": "blender",
+    "fx": "houdini",
+    "lighting": "houdini",
+    "comp": "fusion"
+  },
   "types": {
     "_characters": {"label": "Character", "folder": "_characters"},
     "_props": {"label": "Prop", "folder": "_props"},

@@ -57,7 +57,10 @@ from monostudio.core.dcc_houdini import resolve_houdini_executable
 from monostudio.core.dcc_maya import resolve_maya_executable
 from monostudio.core.dcc_rizomuv import resolve_rizomuv_executable
 from monostudio.core.dcc_substance_painter import resolve_substance_painter_executable
+from monostudio.core.department_registry import DepartmentRegistry
+from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.fs_reader import read_use_dcc_folders, save_use_dcc_folders
+from monostudio.core.project_create_defaults import read_create_default_dcc_map, write_create_default_dcc_map
 from monostudio.core.pipeline_types_and_presets import (
     PipelineTypesAndPresets,
     load_department_vocabulary,
@@ -356,6 +359,8 @@ class SettingsDialog(MonosDialog):
         self._substance_painter_exe_field: QLineEdit | None = None
         self._rizomuv_exe_field: QLineEdit | None = None
         self._pipeline_editor: PipelineStructureEditorWidget | None = None
+        self._create_default_combos: dict[str, QComboBox] = {}
+        self._create_default_form_layout: QFormLayout | None = None
         self._use_dcc_folders_cb: QCheckBox | None = None
         self._notification_max_visible_combo: QComboBox | None = None
         self._publish_ignore_ext_field: QLineEdit | None = None
@@ -1817,6 +1822,7 @@ class SettingsDialog(MonosDialog):
         inner = self._build_tier2_page_buttons(
             [
                 ("Pipeline structure", self._build_pipeline_structure_page()),
+                ("Create defaults", self._build_pipeline_create_defaults_tab()),
                 ("Scan rules", self._build_pipeline_scan_rules_tab()),
                 ("Statuses", self._placeholder("Pipeline → Statuses (placeholder)")),
             ],
@@ -2023,6 +2029,91 @@ class SettingsDialog(MonosDialog):
         self._config = load_pipeline_types_and_presets_for_project(self._project_root)
         if self._pipeline_editor is not None:
             self._pipeline_editor.set_project_root(self._project_root)
+        self._reload_pipeline_create_defaults_form()
+
+    def _build_pipeline_create_defaults_tab(self) -> QWidget:
+        """Default DCC for Create New, per department (project.json)."""
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        hint = QLabel(
+            "Choose which DCC is pre-selected in Create New for each department. "
+            "Saved in the open project (.monostudio/project.json).",
+            root,
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("DialogHelper")
+        layout.addWidget(hint, 0)
+        scroll = QScrollArea(root)
+        scroll.setObjectName("OpenResolverScroll")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.viewport().setAutoFillBackground(False)
+        inner = QWidget(scroll)
+        form = QFormLayout(inner)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(10)
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, 1)
+        self._create_default_form_layout = form
+        self._create_default_combos = {}
+        self._reload_pipeline_create_defaults_form()
+        return root
+
+    def _reload_pipeline_create_defaults_form(self) -> None:
+        form = self._create_default_form_layout
+        if form is None:
+            return
+        while form.rowCount() > 0:
+            form.removeRow(0)
+        self._create_default_combos.clear()
+        if self._project_root is None:
+            lab = QLabel("Open a project to set create defaults per department.")
+            lab.setObjectName("DialogHelper")
+            lab.setWordWrap(True)
+            form.addRow(lab)
+            return
+        try:
+            dre = DepartmentRegistry.for_project(self._project_root)
+            reg = get_default_dcc_registry()
+        except Exception:
+            lab = QLabel("Could not load department or DCC registry for this project.")
+            lab.setObjectName("DialogWarning")
+            lab.setWordWrap(True)
+            form.addRow(lab)
+            return
+        saved = read_create_default_dcc_map(self._project_root)
+        for dep_id in dre.get_departments():
+            dep_label = dre.get_department_label(dep_id) or dep_id
+            cb = QComboBox()
+            cb.addItem("(none)", "")
+            for dcc_id in dre.supported_dcc_ids(reg, dep_id):
+                try:
+                    info = reg.get_dcc_info(dcc_id)
+                    dn = info.get("label") if isinstance(info, dict) else None
+                    dlab = dn.strip() if isinstance(dn, str) and dn.strip() else dcc_id
+                except Exception:
+                    dlab = dcc_id
+                cb.addItem(dlab, dcc_id)
+            cur = saved.get(dep_id) or ""
+            if not cur:
+                for k, v in saved.items():
+                    if k.strip().casefold() == dep_id.strip().casefold():
+                        cur = v
+                        break
+            idx = 0
+            if cur:
+                for i in range(cb.count()):
+                    data = cb.itemData(i)
+                    if isinstance(data, str) and data.strip().casefold() == cur.strip().casefold():
+                        idx = i
+                        break
+            cb.setCurrentIndex(idx)
+            self._create_default_combos[dep_id] = cb
+            row_label = QLabel(dep_label)
+            row_label.setObjectName("DialogLabelPrimary")
+            form.addRow(row_label, cb)
 
     def _build_project_integrations_tab(self) -> QWidget:
         root = QWidget()
@@ -2394,6 +2485,20 @@ class SettingsDialog(MonosDialog):
                 if not save_pipeline_types_and_presets(self._config):
                     QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets.")
                     return
+
+        if self._project_root is not None and self._create_default_combos:
+            mapping: dict[str, str] = {}
+            for dep_id, cb in self._create_default_combos.items():
+                raw = cb.currentData()
+                dcc = (raw or "").strip() if isinstance(raw, str) else ""
+                if dcc:
+                    mapping[dep_id] = dcc
+            if not write_create_default_dcc_map(self._project_root, mapping):
+                QMessageBox.warning(
+                    self,
+                    "Settings",
+                    "Failed to save Create defaults (default DCC per department).",
+                )
 
         # Persist project-level use_dcc_folders when project is set.
         if self._project_root is not None and self._use_dcc_folders_cb is not None:

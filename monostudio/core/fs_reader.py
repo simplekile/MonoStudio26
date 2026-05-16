@@ -652,7 +652,7 @@ def _detect_workfile(
 def _resolve_dcc_for_department(*, dept_name: str, meta: dict, fallback_from_file: str | None) -> str | None:
     """
     Prefer DCC detected from actual work file on disk (source of truth for icon/display).
-    When no work file is detected, use metadata (last_open_by_department / last_open / defaults).
+    When no work file is detected, use metadata (last_open_by_department / last_open).
     """
     if fallback_from_file and str(fallback_from_file).strip():
         return fallback_from_file.strip()
@@ -670,12 +670,6 @@ def _resolve_dcc_for_department(*, dept_name: str, meta: dict, fallback_from_fil
         last_open = meta.get("last_open")
         if isinstance(last_open, dict) and _norm(last_open.get("department")) == _norm(dept_name):
             dcc = last_open.get("dcc")
-            if isinstance(dcc, str) and dcc.strip():
-                return dcc.strip()
-
-        defaults = meta.get("defaults")
-        if isinstance(defaults, dict) and _norm(defaults.get("department")) == _norm(dept_name):
-            dcc = defaults.get("dcc")
             if isinstance(dcc, str) and dcc.strip():
                 return dcc.strip()
 
@@ -895,6 +889,28 @@ def scan_assets_in_type(
     return sorted(assets, key=lambda a: (a.asset_type, a.name))
 
 
+def scan_all_shots_in_root(
+    project_root: Path,
+    department_registry: "DepartmentRegistry | None" = None,
+) -> list[Shot]:
+    """Rescan every direct shot folder under ``<project>/<shots_folder>/`` (same rules as full index)."""
+    from monostudio.core.department_registry import DepartmentRegistry
+    from monostudio.core.structure_registry import StructureRegistry
+
+    dept_reg = department_registry or DepartmentRegistry.for_project(project_root)
+    struct_reg = StructureRegistry.for_project(project_root)
+    root = Path(project_root).resolve()
+    shots_dir = root / struct_reg.get_folder("shots")
+    if not shots_dir.is_dir():
+        return []
+    out: list[Shot] = []
+    for shot_dir in _iter_dirs(shots_dir):
+        s = scan_single_shot(root, shot_dir, dept_reg)
+        if s is not None:
+            out.append(s)
+    return out
+
+
 def run_incremental_scan(
     project_root: Path,
     asset_ids: list[str],
@@ -902,11 +918,20 @@ def run_incremental_scan(
     type_folders: list[str],
     department_registry: "DepartmentRegistry | None" = None,
     type_registry: "TypeRegistry | None" = None,
+    *,
+    rescan_assets_listing: bool = False,
+    rescan_shots_listing: bool = False,
+    listing_snapshot_asset_ids: list[str] | None = None,
+    listing_snapshot_shot_ids: list[str] | None = None,
 ) -> tuple[list[Asset], list[Shot], list[str], list[str]]:
     """
-    Incremental scan: rescan only the given asset paths, shot paths, and type folders.
+    Incremental scan: rescan the given asset paths, shot paths, and/or type folders.
+
+    When ``rescan_assets_listing`` / ``rescan_shots_listing`` are True, rescan all known
+    asset type folders / all shot folders (for watcher events on ``assets/`` or ``shots/``).
+    Pass listing snapshots so entities removed on disk are dropped from AppState.
+
     Returns (new_assets, new_shots, requested_asset_ids, requested_shot_ids).
-    Caller can remove from state any requested id not present in new_* (e.g. deleted on disk).
     """
     from monostudio.core.department_registry import DepartmentRegistry
     from monostudio.core.type_registry import TypeRegistry
@@ -916,35 +941,69 @@ def run_incremental_scan(
     root = Path(project_root).resolve()
     assets_out: list[Asset] = []
     shots_out: list[Shot] = []
-    seen_asset_ids: set[str] = set()
-    for aid in asset_ids:
-        if not aid or aid in seen_asset_ids:
-            continue
-        try:
-            p = Path(aid).resolve()
-        except OSError:
-            continue
-        a = scan_single_asset(root, p, dept_reg, type_reg)
-        if a is not None:
-            seen_asset_ids.add(aid)
+    seen_asset_paths: set[str] = set()
+
+    if rescan_assets_listing:
+        for tid in type_reg.get_types():
+            tf = type_reg.get_type_folder(tid)
+            if not tf:
+                continue
+            for a in scan_assets_in_type(root, tf, dept_reg, type_reg):
+                try:
+                    key = str(a.path.resolve())
+                except OSError:
+                    key = str(a.path)
+                if key not in seen_asset_paths:
+                    seen_asset_paths.add(key)
+                    assets_out.append(a)
+        requested_asset_ids = list(listing_snapshot_asset_ids or [])
+    else:
+        for aid in asset_ids:
+            if not aid:
+                continue
+            try:
+                p = Path(aid).resolve()
+            except OSError:
+                continue
+            a = scan_single_asset(root, p, dept_reg, type_reg)
+            if a is None:
+                continue
+            try:
+                key = str(a.path.resolve())
+            except OSError:
+                key = str(a.path)
+            if key in seen_asset_paths:
+                continue
+            seen_asset_paths.add(key)
             assets_out.append(a)
-    for sid in shot_ids:
-        if not sid:
-            continue
-        try:
-            p = Path(sid).resolve()
-        except OSError:
-            continue
-        s = scan_single_shot(root, p, dept_reg)
-        if s is not None:
-            shots_out.append(s)
-    for type_folder in type_folders:
-        if not type_folder:
-            continue
-        for a in scan_assets_in_type(root, type_folder, dept_reg, type_reg):
-            aid = str(a.path)
-            if aid not in seen_asset_ids:
-                seen_asset_ids.add(aid)
-                assets_out.append(a)
-    return (assets_out, shots_out, list(asset_ids), list(shot_ids))
+        for type_folder in type_folders:
+            if not type_folder:
+                continue
+            for a in scan_assets_in_type(root, type_folder, dept_reg, type_reg):
+                try:
+                    key = str(a.path.resolve())
+                except OSError:
+                    key = str(a.path)
+                if key not in seen_asset_paths:
+                    seen_asset_paths.add(key)
+                    assets_out.append(a)
+        requested_asset_ids = list(asset_ids)
+
+    if rescan_shots_listing:
+        shots_out = scan_all_shots_in_root(root, dept_reg)
+        requested_shot_ids = list(listing_snapshot_shot_ids or [])
+    else:
+        for sid in shot_ids:
+            if not sid:
+                continue
+            try:
+                p = Path(sid).resolve()
+            except OSError:
+                continue
+            s = scan_single_shot(root, p, dept_reg)
+            if s is not None:
+                shots_out.append(s)
+        requested_shot_ids = list(shot_ids)
+
+    return (assets_out, shots_out, requested_asset_ids, requested_shot_ids)
 

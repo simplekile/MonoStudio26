@@ -9,6 +9,10 @@ from pathlib import Path
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.pipeline_types_and_presets import get_user_default_config_root
 from monostudio.core.project_id import generate_project_id
+from monostudio.core.project_create_defaults import (
+    CREATE_DEFAULT_DCC_BY_DEPARTMENT_KEY,
+    resolved_create_default_dcc_map_for_new_project,
+)
 from monostudio.core.structure_registry import StructureRegistry
 
 PROJECT_GUIDE_DEPARTMENTS = ("reference", "script", "storyboard", "guideline", "concept")
@@ -151,18 +155,17 @@ def create_new_project(
         created_paths.append(monostudio_dir)
 
         manifest = monostudio_dir / "project.json"
+        manifest_payload: dict = {
+            "id": project_id,
+            "name": name,
+            "start_date": start_date,
+            "schema": 1,
+        }
+        create_defaults = resolved_create_default_dcc_map_for_new_project()
+        if create_defaults:
+            manifest_payload[CREATE_DEFAULT_DCC_BY_DEPARTMENT_KEY] = create_defaults
         manifest.write_text(
-            json.dumps(
-                {
-                    "id": project_id,
-                    "name": name,
-                    "start_date": start_date,
-                    "schema": 1,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
+            json.dumps(manifest_payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 

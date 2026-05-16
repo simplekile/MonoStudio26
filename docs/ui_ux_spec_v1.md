@@ -276,7 +276,7 @@ User / permission
 
 Task / assignee
 
-Notes / comments
+~~Notes / comments~~ — Per-asset/shot notes live in `<item>/.monostudio/item_comments.json` (badge + dialog); not a separate cloud layer.
 
 Status workflow
 

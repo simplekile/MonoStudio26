@@ -1,0 +1,62 @@
+---
+description: MONOS — Quy tắc xóa dữ liệu, thùng rác project, không xóa vĩnh viễn trên main view, tự dọn trash
+alwaysApply: true
+---
+
+# MONOS — Delete & Project Trash (v1)
+
+## Mục đích
+
+Chuẩn hóa hành vi **xóa** trong app: an toàn, có thể hoàn tác qua thùng rác project, tránh xóa hẳn nhầm từ luồng làm việc chính.
+
+---
+
+## 1. Main View (Assets / Shots) — không xóa vĩnh viễn
+
+- **Không** thêm nút hay mục menu **“Xóa vĩnh viễn” / “Delete permanently”** trên main view, context menu grid/list, hay Inspector khi đang ở luồng asset/shot bình thường.
+- Hành vi mặc định khi user “xóa” entity pipeline: **Move to Trash** (chuyển thư mục vào khu vực trash của project + ghi manifest), **không** `shutil.rmtree` trực tiếp từ path asset/shot gốc trong handler đó.
+- **Xóa vĩnh viễn** (`shutil.rmtree` / xóa file hết hồi phục) chỉ được phép từ **UI quản lý Trash** (danh sách thùng rác: từng mục hoặc “Empty trash”), kèm xác nhận rõ ràng.
+
+---
+
+## 2. Thùng rác project — vị trí & schema
+
+- Trash **không** là một mục trong `structure.json` / `StructureRegistry` (không thêm logical id `trash` cạnh assets, shots, inbox, …).
+- Lưu cố định dưới project: **`project_root/.monostudio/trash/`** (thư mục con unique mỗi lần đưa vào) + **manifest** (vd `.monostudio/trash_manifest.json`) để restore đúng `original_relative` (asset/shot).
+- `build_project_index` chỉ quét `assets` / `shots` theo `StructureRegistry`; nội dung dưới `.monostudio/trash` **không** được tính là asset/shot.
+
+---
+
+## 3. Tự động dọn trash (retention)
+
+- **Có** cơ chế **tự xóa vĩnh viễn** các mục trong trash đã quá **N ngày** (N lấy từ cấu hình app hoặc project — mặc định hợp lý vd 30 nếu chưa có setting).
+- Chạy retention khi: mở project, định kỳ nhẹ trong session, hoặc cả hai — ưu tiên không block UI (worker/timer).
+- Mỗi lần purge: ghi log ngắn (id, `trashed_at`, lý do `expired_retention`).
+
+---
+
+## 4. Khi thêm hoặc sửa **bất kỳ** luồng xóa nào trong codebase
+
+| Kiểm tra | Yêu cầu |
+|-----------|---------|
+| **Phạm vi dữ liệu** | Nếu là **entity pipeline** (asset, shot, hoặc sau này tương đương): ưu tiên **soft delete → trash**; không mở đường xóa hẳn từ main view. |
+| **Inbox / Outbox / Project Guide tree** | Xóa file/folder thật trên đĩa có thể vẫn cần thiết; nếu có meta (vd `inbox_meta.json`), **đồng bộ xóa/ghi meta** cùng một transaction tương đối; ghi rõ trong PR là “destructive immediate” hay sau này gắn trash. |
+| **Thumbnail / cache / override file** | Được phép xóa ngay (không trash); vẫn cần **xác nhận** nếu user-facing hoặc undo khó. |
+| **File watcher** | Giữ đồng bộ policy hiện tại: pause watcher trước rename/delete nặng trên Windows nếu code path đó đã yêu cầu. |
+| **UI** | Action nguy hiểm: `danger-action` trong menu (QSS global); dialog xác nhận theo `dialog_ui_v1` / `delete_confirm_dialog`. |
+| **Sau khi xóa / di chuyển** | Invalidate thumbnail đúng path; rebuild index / refresh view theo pattern `MainWindow` sau delete hiện tại. |
+
+---
+
+## 5. Không làm
+
+- Không thêm **Permanent delete** cho asset/shot trên main view (kể cả shortcut ẩn) — chỉ trong Trash UI.
+- Không map **trash** trong `structure.json` để user đổi tên folder trash qua structure editor.
+
+---
+
+## 6. Tham chiếu triển khai (khi có code trash)
+
+- Handler tương đương: `MainWindow._on_delete_requested` → chuyển sang move-to-trash + manifest.
+- Scan index: `monostudio/core/fs_reader.py` — `build_project_index`.
+- Cấu trúc top-level: `monostudio/core/structure_registry.py` — `_ALL_FOLDER_IDS` không mở rộng cho trash.

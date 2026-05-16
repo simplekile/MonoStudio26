@@ -54,6 +54,11 @@ from monostudio.core.pipeline_types_and_presets import (
     save_pipeline_types_and_presets_to_user_default,
 )
 from monostudio.core.project_create import get_resolved_user_default_pipeline_mappings
+from monostudio.core.project_create_defaults import (
+    clear_create_default_dcc,
+    read_create_default_dcc,
+    write_create_default_dcc,
+)
 from monostudio.core.structure_registry import StructureRegistry, save_project_structure
 from monostudio.core.type_registry import TypeRegistry, get_default_type_mapping, save_project_types
 from monostudio.ui_qt.inbox_split_view import _InboxTreeDelegate
@@ -927,6 +932,16 @@ class PipelineStructureEditorWidget(QWidget):
         dcc_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         root_l.addWidget(dcc_scroll, 1)
 
+        create_def_title = QLabel("Create New — default DCC", w)
+        create_def_title.setObjectName("DialogSectionTitle")
+        root_l.addWidget(create_def_title)
+        cb_create_default = QComboBox(w)
+        cb_create_default.setToolTip(
+            "Pre-selected in Create New for this department. Saved in project.json."
+        )
+        cb_create_default.currentIndexChanged.connect(self._on_department_create_default_changed)
+        root_l.addWidget(cb_create_default)
+
         return {
             "widget": w,
             "id_lab": id_lab,
@@ -943,6 +958,7 @@ class PipelineStructureEditorWidget(QWidget):
             "dcc_inner": dcc_inner,
             "dcc_inner_l": dcc_inner_l,
             "dcc_scroll": dcc_scroll,
+            "create_default_dcc": cb_create_default,
         }
 
     def _build_form_type_workflow(self) -> dict:
@@ -1014,6 +1030,49 @@ class PipelineStructureEditorWidget(QWidget):
         cb.setCurrentIndex(max(0, idx))
         cb.blockSignals(False)
         self._refresh_department_dcc_ui(did)
+        self._refresh_department_create_default_combo(did)
+
+    def _refresh_department_create_default_combo(self, did: str) -> None:
+        f = self._form_department
+        cb = f["create_default_dcc"]
+        reg = self._pipeline_dcc_reg
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem("(none)", "")
+        if reg:
+            dre = DepartmentRegistry(self._depts_map, None)
+            for dcc_id in dre.supported_dcc_ids(reg, did):
+                try:
+                    info = reg.get_dcc_info(dcc_id)
+                    label = (info.get("label") if isinstance(info, dict) else None) or dcc_id
+                except Exception:
+                    label = dcc_id
+                cb.addItem(f"{dcc_id} — {label}", dcc_id)
+        saved: str | None = None
+        if self._project_root is not None:
+            saved = read_create_default_dcc(self._project_root, did)
+        idx = 0
+        if saved:
+            for i in range(cb.count()):
+                data = cb.itemData(i)
+                if isinstance(data, str) and data.strip().casefold() == saved.strip().casefold():
+                    idx = i
+                    break
+        cb.setCurrentIndex(idx)
+        cb.setEnabled(self._project_root is not None and reg is not None)
+        cb.blockSignals(False)
+
+    def _on_department_create_default_changed(self, _index: int) -> None:
+        f = self._form_department
+        did = (f.get("did") or "").strip()
+        if not did or self._project_root is None:
+            return
+        raw = f["create_default_dcc"].currentData()
+        dcc = (raw or "").strip() if isinstance(raw, str) else ""
+        if dcc:
+            write_create_default_dcc(self._project_root, did, dcc)
+        else:
+            clear_create_default_dcc(self._project_root, did)
 
     def _refresh_department_dcc_ui(self, did: str) -> None:
         f = self._form_department
@@ -1028,6 +1087,7 @@ class PipelineStructureEditorWidget(QWidget):
         f["dcc_custom"].blockSignals(False)
         self._update_dept_dcc_hint(did)
         self._rebuild_dept_dcc_checkboxes(did)
+        self._refresh_department_create_default_combo(did)
 
     def _update_dept_dcc_hint(self, did: str) -> None:
         f = self._form_department
@@ -1121,6 +1181,7 @@ class PipelineStructureEditorWidget(QWidget):
                 self._depts_map[did]["dccs"] = list(eff)
         self._update_dept_dcc_hint(did)
         self._rebuild_dept_dcc_checkboxes(did)
+        self._refresh_department_create_default_combo(did)
         self._rebuild_model()
         self.config_changed.emit()
 
@@ -1141,6 +1202,7 @@ class PipelineStructureEditorWidget(QWidget):
                 picked.append(x.strip().lower())
         self._depts_map[did]["dccs"] = picked
         self._update_dept_dcc_hint(did)
+        self._refresh_department_create_default_combo(did)
         self._rebuild_model()
         self.config_changed.emit()
 

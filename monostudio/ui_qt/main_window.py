@@ -42,12 +42,19 @@ from monostudio.core.pipeline_types_and_presets import (
 from monostudio.core.clipboard_thumbnail_handler import ClipboardThumbnailHandler
 from monostudio.core.asset_rename import prepare_work_file_renames, rename_asset
 from monostudio.core.pending_create import remove_by_entity, remove_for_entities, clear_all as pending_clear_all
+from monostudio.core.project_trash import (
+    TrashError,
+    move_asset_or_shot_to_trash,
+    purge_expired,
+    retention_days_from_settings,
+)
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
 from monostudio.core.inbox_reader import add_to_inbox, append_inbox_distributed
 from monostudio.core.outbox_reader import add_to_outbox
 from monostudio.ui_qt.inbox_drop_dialog import InboxDropDialog
 from monostudio.ui_qt.inbox_page_widget import InboxPageWidget
 from monostudio.ui_qt.outbox_page_widget import OutboxPageWidget
+from monostudio.ui_qt.trash_page_widget import TrashPageWidget
 from monostudio.ui_qt.reference_page_widget import ReferencePageWidget
 from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
@@ -55,7 +62,7 @@ from monostudio.ui_qt.new_project_dialog import NewProjectDialog
 from monostudio.ui_qt.settings_dialog import SettingsDialog
 from monostudio.ui_qt.sidebar import Sidebar, SidebarCompact
 from monostudio.ui_qt.top_bar import TopBar
-from monostudio.ui_qt.view_items import ViewItem, ViewItemKind
+from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog, ask_delete_folder
 from monostudio.ui_qt.rename_asset_dialog import RenameAssetDialog
 from monostudio.ui_qt.app_controller import AppController
@@ -63,7 +70,11 @@ from monostudio.ui_qt.app_state import AppState
 from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
 from monostudio.ui_qt.worker_manager import WorkerManager, WorkerTask
 from monostudio.ui_qt.thumbnails import ThumbnailManager
-from monostudio.ui_qt.fs_watcher import FsEventCollector
+from monostudio.ui_qt.fs_watcher import (
+    FsEventCollector,
+    append_entity_meta_watch_paths,
+    append_entity_monostudio_watch_paths,
+)
 from monostudio.ui_qt.stress_diagnostics_dialog import StressDiagnosticsDialog
 from monostudio.ui_qt.stress_profiler import enabled as stress_profiler_enabled
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -145,6 +156,8 @@ class MainWindow(FramelessMainWindow):
         self._fs_watcher.fileChanged.connect(self._fs_event_collector.add_path)
         self._fs_watcher.directoryChanged.connect(self._fs_event_collector.add_path)
         self._fs_event_collector.batchReady.connect(self._on_fs_batch_ready)
+        self._fs_event_collector.metaThumbnailsStale.connect(self._on_fs_meta_thumbnails_stale)
+        self._fs_event_collector.itemNotesStale.connect(self._on_fs_item_notes_stale)
         self._entered_parent: Asset | Shot | None = None
 
         # Centralized filter state (UI-only; no filtering engine yet)
@@ -181,6 +194,7 @@ class MainWindow(FramelessMainWindow):
         self._content_stack.addWidget(self._main_view)
         self._inbox_page_widget: InboxPageWidget | None = None
         self._outbox_page_widget: OutboxPageWidget | None = None
+        self._trash_page_widget: TrashPageWidget | None = None
         self._reference_page_widget: ReferencePageWidget | None = None
         self._inspector = InspectorPanel()
         self._inspector.set_app_settings(self._settings)
@@ -310,6 +324,7 @@ class MainWindow(FramelessMainWindow):
         self._clipboard_thumbs.thumbnailUpdated.connect(self._on_thumbnail_updated)
         self._main_view.delete_requested.connect(self._on_delete_requested)
         self._main_view.rename_requested.connect(self._on_rename_asset_requested)
+        self._main_view.item_notes_requested.connect(self._on_item_notes_dialog_requested)
         self._main_view.switch_project_requested.connect(self._on_switch_project_requested)
         self._main_view.primary_action_requested.connect(self._on_primary_action_requested)
         self._main_view.search_query_changed.connect(self._on_search_query_changed)
@@ -327,6 +342,7 @@ class MainWindow(FramelessMainWindow):
         self._inspector.active_dcc_changed.connect(self._on_inspector_active_dcc_changed)
         self._inspector.inspector_hidden_departments_changed.connect(self._main_view.set_inspector_hidden_departments)
         self._inspector.production_status_override_requested.connect(self._on_production_status_override)
+        self._inspector.item_notes_dialog_requested.connect(self._on_item_notes_dialog_requested)
         self._main_view.production_status_override_chosen.connect(self._on_production_status_override)
         self._main_view.active_dcc_changed.connect(self._on_main_view_active_dcc_changed)
         self._main_view.thumbnail_source_changed.connect(self._on_main_view_thumbnail_source_changed)
@@ -454,7 +470,7 @@ class MainWindow(FramelessMainWindow):
                     time.sleep(0.05)
             finally:
                 self._top_bar.set_watcher_busy(False)
-            notification_service.success("File watcher paused. Rename and delete are now allowed.")
+            notification_service.success("File watcher paused. Rename and Move to Trash are now allowed.")
         else:
             self._update_fs_watcher_paths()
             notification_service.success("File watcher on. Changes will be detected automatically.")
@@ -1175,6 +1191,7 @@ class MainWindow(FramelessMainWindow):
             QMessageBox.critical(self, "Paste Thumbnail", str(e))
             return
 
+        self._ensure_entity_meta_watched(Path(item.path))
         self._inspector.refresh_thumbnail()
         self._main_view.invalidate_thumbnail(item.path, department=active_dept)
 
@@ -1234,20 +1251,18 @@ class MainWindow(FramelessMainWindow):
 
     def _on_delete_requested(self, item: ViewItem) -> None:
         """
-        Guarded delete (asset/shot only):
+        Move asset/shot to project trash (recoverable):
         - Requires file watcher to be paused (toggle in top bar)
         - Confirmation requires typing exact folder name
-        - Deletes folder recursively from disk
-        - On success: update in-memory index and app_state, clear inspector if needed, refresh UI (NO rescan)
-        - On failure: show notification (e.g. file in use on Windows)
+        - On success: update in-memory index and app_state, clear inspector if needed, refresh UI
         """
-        if self._project_index is None:
+        if self._project_index is None or self._project_root is None:
             return
         if item.kind.value not in ("asset", "shot"):
             return
         if not self._watcher_manually_disabled:
             notification_service.warning(
-                "Pause the file watcher (click the eye icon in the top bar) before deleting."
+                "Pause the file watcher (click the eye icon in the top bar) before moving items to Trash."
             )
             return
 
@@ -1255,7 +1270,13 @@ class MainWindow(FramelessMainWindow):
         name = path.name
         kind_label = "Asset" if item.kind.value == "asset" else "Shot"
 
-        dialog = DeleteConfirmDialog(kind_label=kind_label, folder_name=name, absolute_path=path, parent=self)
+        dialog = DeleteConfirmDialog(
+            kind_label=kind_label,
+            folder_name=name,
+            absolute_path=path,
+            parent=self,
+            move_to_trash=True,
+        )
         if dialog.exec() != QDialog.Accepted:
             return
 
@@ -1266,17 +1287,21 @@ class MainWindow(FramelessMainWindow):
             return
 
         try:
-            shutil.rmtree(path)
+            move_asset_or_shot_to_trash(self._project_root, path, item.kind.value)
+        except TrashError as e:
+            notification_service.error(f"Could not move to Trash: {e}")
+            return
         except (OSError, PermissionError) as e:
-            logging.warning("Delete failed: %s", e)
-            notification_service.error(f"Delete failed: {e}. Close any app using files in this folder and try again.")
+            logging.warning("Move to trash failed: %s", e)
+            notification_service.error(
+                f"Move to Trash failed: {e}. Close any app using files in this folder and try again."
+            )
             return
         except Exception as e:
-            logging.exception("Delete failed unexpectedly: %s", e)
-            notification_service.error(f"Delete failed: {e}")
+            logging.exception("Move to trash failed unexpectedly: %s", e)
+            notification_service.error(f"Move to Trash failed: {e}")
             return
 
-        # Clear inspector and thumbnails for deleted path before reload so nothing accesses the removed folder.
         cur = self._main_view.selected_view_item()
         if cur is not None and getattr(cur, "path", None) == path:
             self._inspector.set_item(None)
@@ -1289,7 +1314,40 @@ class MainWindow(FramelessMainWindow):
         self._sidebar.set_project_index(self._project_index)
         self._reload_main_view()
         self._sync_primary_action()
-        notification_service.success(f"Deleted {kind_label} '{name}'.")
+        notification_service.success(f"Moved {kind_label} '{name}' to Trash.")
+
+    def _on_trash_changed_from_trash_page(self) -> None:
+        """After restore or permanent delete from Trash page: rescan pipeline index."""
+        if self._project_root is None:
+            return
+        self._rescan_project()
+        self._reload_main_view()
+
+    def _on_item_notes_dialog_requested(self, item: object) -> None:
+        if not isinstance(item, ViewItem):
+            return
+        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        try:
+            p = Path(item.path)
+        except (TypeError, ValueError):
+            return
+        try:
+            if not p.is_dir():
+                return
+        except OSError:
+            return
+        from monostudio.ui_qt.item_notes_dialog import ItemNotesDialog
+
+        dlg = ItemNotesDialog(
+            parent=self,
+            item_path=p,
+            item_display_name=display_name_for_item(item),
+        )
+        dlg.notes_changed.connect(lambda: self._main_view.invalidate_notes_open_count_cache(p))
+        dlg.notes_changed.connect(self._inspector.refresh_notes_badge)
+        dlg.notes_changed.connect(lambda: self._ensure_entity_monostudio_watched(p))
+        dlg.exec()
 
     def _on_rename_asset_requested(self, item: ViewItem) -> None:
         """
@@ -1392,7 +1450,7 @@ class MainWindow(FramelessMainWindow):
 
     def _restore_sidebar_context(self) -> None:
         """Restore last selected nav page (Assets/Shots/Inbox/Projects/Outbox) from QSettings."""
-        _valid = ("Assets", "Shots", "Inbox", "Project Guide", "Projects", "Outbox")
+        _valid = ("Assets", "Shots", "Inbox", "Project Guide", "Projects", "Outbox", "Trash")
         ctx = (self._settings.value("ui/sidebar_context", "Assets", str) or "Assets").strip()
         if ctx in _valid:
             self._sidebar.set_current_context(ctx)
@@ -1411,7 +1469,7 @@ class MainWindow(FramelessMainWindow):
 
             self._main_view.set_context_title(context_name)
             self._entered_parent = None
-            if context_name not in ("Inbox", "Project Guide", "Outbox"):
+            if context_name not in ("Inbox", "Project Guide", "Outbox", "Trash"):
                 self._content_stack.setCurrentWidget(self._main_view)
                 self._main_view.clear()
                 self._inspector.set_inbox_distribute_paths([], None, None)
@@ -1482,6 +1540,16 @@ class MainWindow(FramelessMainWindow):
                 self._content_stack.setCurrentWidget(self._outbox_page_widget)
                 self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
+            elif context_name == "Trash":
+                self._sync_filter_state_from_sidebar()
+                if self._trash_page_widget is None:
+                    self._trash_page_widget = TrashPageWidget(self)
+                    self._trash_page_widget.trash_changed.connect(self._on_trash_changed_from_trash_page)
+                    self._content_stack.addWidget(self._trash_page_widget)
+                self._trash_page_widget.set_project_root(self._project_root)
+                self._content_stack.setCurrentWidget(self._trash_page_widget)
+                self._inspector.set_inbox_distribute_paths([], None, None)
+                self._inspector.set_inbox_tree_preview(None)
             elif context_name == "Projects":
                 self._reload_main_view()
             else:
@@ -1526,6 +1594,10 @@ class MainWindow(FramelessMainWindow):
                 if self._reference_page_widget is not None:
                     self._reference_page_widget.set_project_root(self._project_root)
                     self._reference_page_widget.set_department(self._sidebar.filters().current_department() or "reference")
+            elif context_name == "Trash":
+                self._sync_filter_state_from_sidebar()
+                if self._trash_page_widget is not None:
+                    self._trash_page_widget.set_project_root(self._project_root)
             else:
                 self._main_view.clear()
                 self._main_view.set_empty_override(self._empty_message_for_context(context_name))
@@ -1671,8 +1743,15 @@ class MainWindow(FramelessMainWindow):
         except Exception:
             pass
         try:
+            from monostudio.ui_qt.thumbnails import parse_department_cache_key
+
+            entity_ids: set[str] = set()
+            for raw in ids_set:
+                ep, _ = parse_department_cache_key(str(raw).strip())
+                if ep:
+                    entity_ids.add(ep)
             cur = self._main_view.selected_view_item()
-            if cur is not None and str(cur.path) in ids_set:
+            if cur is not None and str(cur.path) in entity_ids:
                 self._inspector.update_thumbnail_for_current()
         except Exception:
             pass
@@ -1707,7 +1786,7 @@ class MainWindow(FramelessMainWindow):
             soft = bool(getattr(self, "_filesystem_scan_soft", False))
             self._filesystem_scan_soft = False
             if soft:
-                # Already reloaded on tab switch; a second full reload clears tile icons -> visible grid flicker.
+                # Already reloaded on tab switch; a second full reload clears tile icons → visible grid flicker.
                 # AppState diffs update rows; keep thumbnail memory cache warm.
                 QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
             else:
@@ -1820,7 +1899,7 @@ class MainWindow(FramelessMainWindow):
                 self._update_fs_watcher_paths()
             # Grid already updated via assetsChanged/shotsChanged from commit_immediate(); full reload would clear+repopulate and cause flicker.
             ctx = self._sidebar.current_context()
-            if ctx not in ("Assets", "Shots"):
+            if ctx not in ("Assets", "Shots", "Trash"):
                 self._reload_main_view()
             QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
             self._sync_primary_action()
@@ -1873,6 +1952,11 @@ class MainWindow(FramelessMainWindow):
                 self._app_state.update_assets(list(self._project_index.assets))
                 self._app_state.update_shots(list(self._project_index.shots))
                 self._app_state.commit_immediate()
+                try:
+                    nd = retention_days_from_settings(self._settings)
+                    purge_expired(self._project_root, nd)
+                except Exception:
+                    logging.getLogger(__name__).debug("trash retention purge skipped", exc_info=True)
                 self._reload_main_view()
             except Exception as e:
                 failed_path = str(self._project_root)
@@ -1971,7 +2055,60 @@ class MainWindow(FramelessMainWindow):
         task = WorkerTask("filesystem_scan", run, manager=self._worker_manager)
         self._worker_manager.submit_task(task, category="filesystem_scan", replace_existing=True)
 
-    def _on_fs_batch_ready(self, asset_ids: list, shot_ids: list, type_folders: list) -> None:
+    def _on_fs_meta_thumbnails_stale(self, stale: object) -> None:
+        """Invalidate in-memory thumbnails when ``.meta`` files change (watcher does not rescan thumbs)."""
+        if not isinstance(stale, list):
+            return
+        mgr = self._thumbnail_manager
+        active_dept = (self._controller.current_department or "").strip() or None
+        for entry in stale:
+            if not isinstance(entry, (tuple, list)) or len(entry) < 2:
+                continue
+            entity_path, dept = entry[0], entry[1]
+            if not isinstance(entity_path, str) or not entity_path.strip():
+                continue
+            ep = entity_path.strip()
+            if dept is None:
+                mgr.invalidate_entity(ep)
+            elif isinstance(dept, str) and dept.strip():
+                mgr.invalidate(ep, department=dept.strip())
+            else:
+                mgr.invalidate_entity(ep)
+            try:
+                self._main_view.invalidate_thumbnail(Path(ep), department=active_dept)
+            except Exception:
+                pass
+            try:
+                cur = self._main_view.selected_view_item()
+                if cur is not None and str(cur.path) == ep:
+                    self._inspector.update_thumbnail_for_current()
+            except Exception:
+                pass
+
+    def _on_fs_item_notes_stale(self, entities: object) -> None:
+        """External edits to ``.monostudio/item_comments.json``: refresh note badges."""
+        if not isinstance(entities, list):
+            return
+        for ep in entities:
+            if not isinstance(ep, str) or not ep.strip():
+                continue
+            try:
+                self._main_view.invalidate_notes_open_count_cache(Path(ep.strip()))
+            except Exception:
+                pass
+        try:
+            self._inspector.refresh_notes_badge()
+        except Exception:
+            pass
+
+    def _on_fs_batch_ready(
+        self,
+        asset_ids: list,
+        shot_ids: list,
+        type_folders: list,
+        rescan_assets_listing: bool = False,
+        rescan_shots_listing: bool = False,
+    ) -> None:
         """Submit incremental scan for fs watcher batch; never full rescan."""
         _watcher_log = logging.getLogger("monostudio.fs_watcher")
         if self._project_root is None:
@@ -1980,12 +2117,35 @@ class MainWindow(FramelessMainWindow):
         a_ids = [x for x in (asset_ids or []) if isinstance(x, str) and x.strip()]
         s_ids = [x for x in (shot_ids or []) if isinstance(x, str) and x.strip()]
         t_folders = [x for x in (type_folders or []) if isinstance(x, str) and x.strip()]
-        if not a_ids and not s_ids and not t_folders:
+        ra = bool(rescan_assets_listing)
+        rs = bool(rescan_shots_listing)
+        if not a_ids and not s_ids and not t_folders and not ra and not rs:
             return
-        _watcher_log.debug("fs_watcher batch_ready -> incremental_scan asset_ids=%s shot_ids=%s type_folders=%s", len(a_ids), len(s_ids), len(t_folders))
+        _watcher_log.debug(
+            "fs_watcher batch_ready -> incremental_scan asset_ids=%s shot_ids=%s type_folders=%s rescan_assets=%s rescan_shots=%s",
+            len(a_ids),
+            len(s_ids),
+            len(t_folders),
+            ra,
+            rs,
+        )
+
+        current_assets = dict(self._app_state.assets())
+        current_shots = dict(self._app_state.shots())
+        snap_a = list(current_assets.keys()) if ra else None
+        snap_s = list(current_shots.keys()) if rs else None
 
         def run() -> tuple[list[Asset], list[Shot], list[str], list[str]]:
-            return run_incremental_scan(root, a_ids, s_ids, t_folders)
+            return run_incremental_scan(
+                root,
+                a_ids,
+                s_ids,
+                t_folders,
+                rescan_assets_listing=ra,
+                rescan_shots_listing=rs,
+                listing_snapshot_asset_ids=snap_a,
+                listing_snapshot_shot_ids=snap_s,
+            )
 
         task = WorkerTask("incremental_scan", run, manager=self._worker_manager)
         self._worker_manager.submit_task(
@@ -2022,8 +2182,52 @@ class MainWindow(FramelessMainWindow):
             debounce_ms=0,
         )
 
+    def _append_entity_meta_watch_path(
+        self,
+        entity_base: Path,
+        to_add: list[str],
+        seen: set[str],
+        *,
+        max_paths: int,
+    ) -> None:
+        append_entity_meta_watch_paths(entity_base, to_add, seen, max_paths=max_paths)
+
+    def _ensure_entity_meta_watched(self, entity_base: Path) -> None:
+        """Register ``.meta`` and its contents after first write (e.g. paste thumbnail)."""
+        if self._watcher_manually_disabled or self._project_root is None:
+            return
+        existing = set(self._fs_watcher.directories()) | set(self._fs_watcher.files())
+        to_add: list[str] = []
+        seen = set(existing)
+        append_entity_meta_watch_paths(entity_base, to_add, seen, max_paths=2000)
+        new_paths = [p for p in to_add if p not in existing]
+        if new_paths:
+            self._fs_watcher.addPaths(new_paths)
+
+    def _append_entity_monostudio_watch_path(
+        self,
+        entity_base: Path,
+        to_add: list[str],
+        seen: set[str],
+        *,
+        max_paths: int,
+    ) -> None:
+        append_entity_monostudio_watch_paths(entity_base, to_add, seen, max_paths=max_paths)
+
+    def _ensure_entity_monostudio_watched(self, entity_base: Path) -> None:
+        """Register ``.monostudio`` after first notes write (folder may not exist at initial watcher setup)."""
+        if self._watcher_manually_disabled or self._project_root is None:
+            return
+        existing = set(self._fs_watcher.directories()) | set(self._fs_watcher.files())
+        to_add: list[str] = []
+        seen = set(existing)
+        append_entity_monostudio_watch_paths(entity_base, to_add, seen, max_paths=2000)
+        new_paths = [p for p in to_add if p not in existing]
+        if new_paths:
+            self._fs_watcher.addPaths(new_paths)
+
     def _watcher_paths_for_asset(self, root: Path, asset: Asset, *, max_paths: int = 2000) -> list[str]:
-        """Return the list of watcher paths for a single asset (dept dirs, work, publish). Used after rename to add only the new asset's paths."""
+        """Return watcher paths for one asset (dept/work/publish, ``.meta``, ``.monostudio``). Used after rename."""
         to_add: list[str] = []
         _seen: set[str] = set()
         base = Path(asset.path)
@@ -2083,12 +2287,17 @@ class MainWindow(FramelessMainWindow):
                 if s not in _seen:
                     _seen.add(s)
                     to_add.append(s)
+        self._append_entity_meta_watch_path(base, to_add, _seen, max_paths=max_paths)
+        self._append_entity_monostudio_watch_path(base, to_add, _seen, max_paths=max_paths)
         return to_add
 
     def _update_fs_watcher_paths(self) -> None:
         """Set or clear watched paths and collector state from current project root.
-        Watches project root, assets/, shots/, and each asset/shot directory so changes
-        inside entity folders (e.g. work/) are detected on Windows (no recursive watch).
+        Watches project root, assets/, shots/, each registered ``assets/<type>/`` (new asset folders),
+        each entity ``.meta/`` (files + subdirs inside),
+        each entity ``.monostudio/`` (notes JSON and peers),
+        and dept/work/publish so changes are detected on Windows
+        (no recursive watch).
         For nested (subdepartment) layout, also watches parent dirs of each department
         so that new subdepartment folders (e.g. surfacing/lookdev) trigger a scan.
         """
@@ -2126,6 +2335,24 @@ class MainWindow(FramelessMainWindow):
             _dcc_reg = get_default_dcc_registry()
         except Exception:
             _dcc_reg = None
+
+        try:
+            _watch_type_reg = TypeRegistry.for_project(root)
+            for _tid in _watch_type_reg.get_types():
+                _tf = (_watch_type_reg.get_type_folder(_tid) or "").strip()
+                if not _tf:
+                    continue
+                _td = assets_dir / _tf
+                if _td.is_dir() and len(to_add) < _max_paths:
+                    try:
+                        _s = str(_td.resolve())
+                    except OSError:
+                        _s = str(_td)
+                    if _s not in _seen:
+                        _seen.add(_s)
+                        to_add.append(_s)
+        except Exception:
+            pass
 
         def _add_dir_and_ancestors(dir_path: Path, entity_base: Path) -> None:
             """Add dir_path and its parent chain up to (not including) entity_base so nested subdepartments are watched."""
@@ -2185,6 +2412,8 @@ class MainWindow(FramelessMainWindow):
                         if s not in _seen:
                             _seen.add(s)
                             to_add.append(s)
+                self._append_entity_meta_watch_path(base, to_add, _seen, max_paths=_max_paths)
+                self._append_entity_monostudio_watch_path(base, to_add, _seen, max_paths=_max_paths)
             for shot in self._project_index.shots:
                 base = Path(shot.path)
                 if not base.is_absolute():
@@ -2216,6 +2445,8 @@ class MainWindow(FramelessMainWindow):
                         if s not in _seen:
                             _seen.add(s)
                             to_add.append(s)
+                self._append_entity_meta_watch_path(base, to_add, _seen, max_paths=_max_paths)
+                self._append_entity_monostudio_watch_path(base, to_add, _seen, max_paths=_max_paths)
         if to_add:
             added = self._fs_watcher.addPaths(to_add)
             failed = len(to_add) - len(added)
@@ -2247,6 +2478,9 @@ class MainWindow(FramelessMainWindow):
 
     def _reload_main_view(self) -> None:
         context = self._sidebar.current_context()
+        if context == "Trash" and self._trash_page_widget is not None:
+            self._trash_page_widget.set_project_root(self._project_root)
+            return
         if context == "Inbox" and self._inbox_page_widget is not None:
             self._inbox_page_widget.set_project_root(self._project_root)
             self._inbox_page_widget.set_type_filter(self._sidebar.filters().current_type() or "")
@@ -2381,18 +2615,18 @@ class MainWindow(FramelessMainWindow):
             return
         if item.kind == ViewItemKind.ASSET and isinstance(item.ref, Asset):
             try:
-                self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
-                self._refresh_recent_tasks()
-                notification_service.success(f"Opened Asset '{item.ref.name}'.")
+                if self._controller.smart_open(item=item.ref, force_dialog=False, parent=self):
+                    self._refresh_recent_tasks()
+                    notification_service.success(f"Opened Asset '{item.ref.name}'.")
             except Exception as e:
                 logging.warning("DCC launch failed (asset): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
             return
         if item.kind == ViewItemKind.SHOT and isinstance(item.ref, Shot):
             try:
-                self._controller.smart_open(item=item.ref, force_dialog=False, parent=self)
-                self._refresh_recent_tasks()
-                notification_service.success(f"Opened Shot '{item.ref.name}'.")
+                if self._controller.smart_open(item=item.ref, force_dialog=False, parent=self):
+                    self._refresh_recent_tasks()
+                    notification_service.success(f"Opened Shot '{item.ref.name}'.")
             except Exception as e:
                 logging.warning("DCC launch failed (shot): %s", e, exc_info=True)
                 QMessageBox.critical(self, "Open DCC", str(e))
@@ -2726,10 +2960,10 @@ class MainWindow(FramelessMainWindow):
         if not isinstance(ref, (Asset, Shot)):
             return
         try:
-            self._controller.smart_open(item=ref, force_dialog=False, parent=self)
-            self._refresh_recent_tasks()
-            kind_label = "Asset" if isinstance(ref, Asset) else "Shot"
-            notification_service.success(f"Opened {kind_label} '{ref.name}'.")
+            if self._controller.smart_open(item=ref, force_dialog=False, parent=self):
+                self._refresh_recent_tasks()
+                kind_label = "Asset" if isinstance(ref, Asset) else "Shot"
+                notification_service.success(f"Opened {kind_label} '{ref.name}'.")
         except Exception as e:
             logging.warning("DCC launch failed: %s", e, exc_info=True)
             QMessageBox.critical(self, "Open DCC", str(e))
@@ -2743,8 +2977,8 @@ class MainWindow(FramelessMainWindow):
         if not isinstance(ref, (Asset, Shot)):
             return
         try:
-            self._controller.smart_open(item=ref, force_dialog=True, force_open_with=True, parent=self)
-            self._refresh_recent_tasks()
+            if self._controller.smart_open(item=ref, force_dialog=True, force_open_with=True, parent=self):
+                self._refresh_recent_tasks()
         except Exception as e:
             logging.warning("DCC launch failed (open with): %s", e, exc_info=True)
             QMessageBox.critical(self, "Open With…", str(e))
@@ -2758,12 +2992,12 @@ class MainWindow(FramelessMainWindow):
         if not isinstance(ref, (Asset, Shot)):
             return
         try:
-            self._controller.smart_open(item=ref, force_dialog=True, force_create_new=True, parent=self)
-            # Repaint tile so delegate shows "Creating…" from resolve_dcc_status (pending already recorded).
-            self._main_view.repaint_tiles_for_entity(str(ref.path))
-            self._refresh_recent_tasks()
-            kind_label = "Asset" if isinstance(ref, Asset) else "Shot"
-            notification_service.success(f"Creating new work file for {kind_label} '{ref.name}'.")
+            if self._controller.smart_open(item=ref, force_dialog=True, force_create_new=True, parent=self):
+                # Repaint tile so delegate shows "Creating…" from resolve_dcc_status (pending already recorded).
+                self._main_view.repaint_tiles_for_entity(str(ref.path))
+                self._refresh_recent_tasks()
+                kind_label = "Asset" if isinstance(ref, Asset) else "Shot"
+                notification_service.success(f"Creating new work file for {kind_label} '{ref.name}'.")
             # Pending cleared when watcher triggers incremental_scan and scan finds work_file_path (or via assetsChanged).
         except Exception as e:
             logging.warning("DCC launch failed (create new): %s", e, exc_info=True)

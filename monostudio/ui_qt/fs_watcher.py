@@ -27,6 +27,102 @@ _watcher_log = logging.getLogger("monostudio.fs_watcher")
 DEFAULT_DEBOUNCE_MS = 300
 
 
+_META_WATCH_CAP_PER_ENTITY = 64
+_MONO_WATCH_CAP_PER_ENTITY = 48
+
+
+def append_entity_meta_watch_paths(
+    entity_base: Path,
+    to_add: list[str],
+    seen: set[str],
+    *,
+    max_paths: int,
+    per_entity_cap: int = _META_WATCH_CAP_PER_ENTITY,
+) -> None:
+    """Add ``<entity>/.meta`` plus every file and subdir inside (QFileSystemWatcher is not recursive)."""
+    try:
+        meta = (Path(entity_base) / ".meta").resolve()
+    except OSError:
+        return
+    if not meta.is_dir():
+        return
+
+    budget = per_entity_cap
+
+    def try_add(path: Path) -> None:
+        nonlocal budget
+        if budget <= 0 or len(to_add) >= max_paths:
+            return
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return
+        if not resolved.exists():
+            return
+        s = str(resolved)
+        if s in seen:
+            return
+        seen.add(s)
+        to_add.append(s)
+        budget -= 1
+
+    try_add(meta)
+    try:
+        for child in sorted(meta.rglob("*")):
+            if budget <= 0 or len(to_add) >= max_paths:
+                break
+            try_add(child)
+    except OSError:
+        pass
+
+
+def append_entity_monostudio_watch_paths(
+    entity_base: Path,
+    to_add: list[str],
+    seen: set[str],
+    *,
+    max_paths: int,
+    per_entity_cap: int = _MONO_WATCH_CAP_PER_ENTITY,
+) -> None:
+    """Add ``<entity>/.monostudio`` plus files/subdirs (for ``item_comments.json`` and peers)."""
+    try:
+        mono = (Path(entity_base) / ".monostudio").resolve()
+    except OSError:
+        return
+    if not mono.exists():
+        return
+    budget = per_entity_cap
+
+    def try_add(path: Path) -> None:
+        nonlocal budget
+        if budget <= 0 or len(to_add) >= max_paths:
+            return
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return
+        if not resolved.exists():
+            return
+        s = str(resolved)
+        if s in seen:
+            return
+        seen.add(s)
+        to_add.append(s)
+        budget -= 1
+
+    if mono.is_dir():
+        try_add(mono)
+        try:
+            for child in sorted(mono.rglob("*")):
+                if budget <= 0 or len(to_add) >= max_paths:
+                    break
+                try_add(child)
+        except OSError:
+            pass
+    elif mono.is_file():
+        try_add(mono)
+
+
 def _normalize_path(path: str | Path) -> Path | None:
     """Resolve to absolute path; resolve symlinks. Return None on error."""
     try:
@@ -87,15 +183,45 @@ def _classify_path(
     return (None, None, None)
 
 
+def _path_under_entity_meta(path: Path) -> bool:
+    return ".meta" in path.parts
+
+
+def _path_triggers_item_notes_refresh(path: Path) -> bool:
+    if ".monostudio" not in path.parts:
+        return False
+    n = path.name
+    return n == "item_comments.json" or n == ".monostudio"
+
+
+def _department_from_meta_thumb_filename(name: str) -> str | None:
+    if not name.startswith("thumb_"):
+        return None
+    rest = name[6:]
+    if ".user." in rest:
+        dep = rest.split(".user.", 1)[0].strip()
+        return dep or None
+    for ext in (".png", ".jpg", ".jpeg"):
+        if rest.lower().endswith(ext):
+            dep = rest[: -len(ext)].strip()
+            return dep or None
+    return None
+
+
 class FsEventCollector(QObject):
     """
     Collects raw filesystem paths, debounces, normalizes, and classifies
-    affected scope (single asset, shot, type, unknown). Emits batchReady
+    affected scope (single asset, shot, type, unknown). Emits batchReady with optional
+    ``rescan_assets_listing`` / ``rescan_shots_listing`` when ``assets/`` or ``shots/`` root fires.
     for incremental scan submission. Never performs heavy work in callbacks.
     """
 
-    # Emits (asset_ids: list[str], shot_ids: list[str], type_folders: list[str])
-    batchReady = Signal(object, object, object)
+    # Emits (asset_ids, shot_ids, type_folders, rescan_assets_listing, rescan_shots_listing)
+    batchReady = Signal(object, object, object, bool, bool)
+    # Emits list[tuple[entity_path, department_or_None]] — department None => all dept thumbs for entity
+    metaThumbnailsStale = Signal(object)
+    # Emits list[str] — absolute entity root paths (asset/shot) whose ``.monostudio`` data changed
+    itemNotesStale = Signal(object)
 
     def __init__(
         self,
@@ -159,6 +285,9 @@ class FsEventCollector(QObject):
         asset_ids: set[str] = set()
         shot_ids: set[str] = set()
         type_folders: set[str] = set()
+        # entity_path -> department (None = invalidate every dept thumb for that entity)
+        meta_thumb_stale: dict[str, str | None] = {}
+        notes_entities: set[str] = set()
         project_root = self._project_root
         type_reg = self._type_registry
         if project_root is None or type_reg is None:
@@ -168,10 +297,24 @@ class FsEventCollector(QObject):
         struct_reg = StructureRegistry.for_project(project_root)
         _assets_f = struct_reg.get_folder("assets")
         _shots_f = struct_reg.get_folder("shots")
+        try:
+            assets_root = (project_root / _assets_f).resolve()
+        except OSError:
+            assets_root = project_root / _assets_f
+        try:
+            shots_root = (project_root / _shots_f).resolve()
+        except OSError:
+            shots_root = project_root / _shots_f
+        rescan_assets_listing = False
+        rescan_shots_listing = False
         for raw in paths:
             p = _normalize_path(raw)
             if p is None:
                 continue
+            if p == assets_root:
+                rescan_assets_listing = True
+            if p == shots_root:
+                rescan_shots_listing = True
             aid, sid, tf = _classify_path(project_root, p, type_reg, _assets_f, _shots_f)
             if aid:
                 asset_ids.add(aid)
@@ -179,7 +322,41 @@ class FsEventCollector(QObject):
                 shot_ids.add(sid)
             if tf:
                 type_folders.add(tf)
-        if asset_ids or shot_ids or type_folders:
+            if _path_triggers_item_notes_refresh(p):
+                ent = aid or sid
+                if ent:
+                    notes_entities.add(ent)
+            if not _path_under_entity_meta(p):
+                continue
+            entity = aid or sid
+            if not entity:
+                continue
+            dept: str | None = _department_from_meta_thumb_filename(p.name) if p.is_file() else None
+            if entity in meta_thumb_stale and meta_thumb_stale[entity] is None:
+                continue
+            if dept is None:
+                meta_thumb_stale[entity] = None
+            elif entity not in meta_thumb_stale:
+                meta_thumb_stale[entity] = dept
+            elif meta_thumb_stale[entity] != dept:
+                meta_thumb_stale[entity] = None
+        if asset_ids or shot_ids or type_folders or rescan_assets_listing or rescan_shots_listing:
             a_list, s_list, t_list = list(asset_ids), list(shot_ids), list(type_folders)
-            _watcher_log.debug("watcher batch ready paths=%d -> asset_ids=%d shot_ids=%d type_folders=%d", len(paths), len(a_list), len(s_list), len(t_list))
-            self.batchReady.emit(a_list, s_list, t_list)
+            _watcher_log.debug(
+                "watcher batch ready paths=%d -> asset_ids=%d shot_ids=%d type_folders=%d rescan_assets=%s rescan_shots=%s",
+                len(paths),
+                len(a_list),
+                len(s_list),
+                len(t_list),
+                rescan_assets_listing,
+                rescan_shots_listing,
+            )
+            self.batchReady.emit(a_list, s_list, t_list, rescan_assets_listing, rescan_shots_listing)
+        if meta_thumb_stale:
+            stale = [(ep, meta_thumb_stale[ep]) for ep in meta_thumb_stale]
+            _watcher_log.debug("watcher meta thumbnails stale count=%d", len(stale))
+            self.metaThumbnailsStale.emit(stale)
+        if notes_entities:
+            n_list = list(notes_entities)
+            _watcher_log.debug("watcher item notes stale entities=%d", len(n_list))
+            self.itemNotesStale.emit(n_list)

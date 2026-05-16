@@ -10,7 +10,7 @@ import re
 
 from collections import OrderedDict
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal, QSize, QPoint, QRect, QTimer, QSettings, QEvent, QUrl
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal, QSize, QPoint, QRect, QRectF, QTimer, QSettings, QEvent, QUrl
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -59,6 +59,10 @@ from monostudio.core.production_status import (
 from monostudio.core.inbox_reader import load_inbox_destinations, resolve_destination_path
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.department_registry import DepartmentRegistry
+from monostudio.core.pipeline_types_and_presets import (
+    load_pipeline_types_and_presets_for_project,
+    ordered_department_ids_for_scope,
+)
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.dcc_status import resolve_dcc_status
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -85,6 +89,18 @@ from monostudio.ui_qt.thumbnail_source_resolve import (
     resolve_entity_thumbnail_source_path,
 )
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
+from monostudio.core.fs_reader import work_file_prefix
+from monostudio.ui_qt.main_view import (
+    ItemHealth,
+    _THUMB_HEALTH_CHIP_PAD_PX,
+    _THUMB_HEALTH_ICON_PX,
+    _department_for_item,
+    _item_health_tooltip_text,
+    _notes_badge_tooltip_text,
+    _paint_note_icon_chip,
+    _thumb_note_chip_rect,
+    assess_view_item_health,
+)
 from monostudio.ui_qt.production_status_menu import pick_production_status_at
 from monostudio.ui_qt.shell_thumbnail import get_windows_shell_thumbnail
 from monostudio.ui_qt.worker_manager import WorkerTask
@@ -145,14 +161,33 @@ def _inspector_synthetic_department(ref: Asset | Shot, dept_id: str, registry: D
     )
 
 
-def _inspector_merge_departments_with_registry(ref: Asset | Shot, registry: DepartmentRegistry) -> tuple[Department, ...]:
+def _inspector_allowed_department_ids(ref: Asset | Shot, project_root: Path | None) -> list[str] | None:
+    """Department IDs for this asset/shot (pipeline types metadata); None → use full registry."""
+    if project_root is None:
+        return None
+    meta = load_pipeline_types_and_presets_for_project(project_root)
+    if not meta.types:
+        return None
+    scope = "asset" if isinstance(ref, Asset) else "shot"
+    type_id = (ref.asset_type or "").strip() if isinstance(ref, Asset) else None
+    ids = ordered_department_ids_for_scope(meta, scope, type_id=type_id or None)
+    return ids if ids else None
+
+
+def _inspector_merge_departments_with_registry(
+    ref: Asset | Shot,
+    registry: DepartmentRegistry,
+    *,
+    allowed_dept_ids: list[str] | None = None,
+) -> tuple[Department, ...]:
     scanned_by_cf: dict[str, Department] = {}
     for d in ref.departments:
         cf = (d.name or "").strip().casefold()
         if cf and cf not in scanned_by_cf:
             scanned_by_cf[cf] = d
     out: list[Department] = []
-    for did in registry.get_departments():
+    dept_ids = allowed_dept_ids if allowed_dept_ids is not None else registry.get_departments()
+    for did in dept_ids:
         cf = (did or "").strip().casefold()
         if cf in scanned_by_cf:
             out.append(scanned_by_cf[cf])
@@ -370,6 +405,7 @@ class InspectorPanel(QWidget):
     active_dcc_changed = Signal(object, str, str)  # path, department, dcc_id — đồng bộ với main view
     production_status_override_requested = Signal(object, str, object)  # Path, department, status_id | None
     inspector_hidden_departments_changed = Signal(set)
+    item_notes_dialog_requested = Signal(object)  # ViewItem (asset / shot)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -409,6 +445,7 @@ class InspectorPanel(QWidget):
         self._dept_pipeline.department_focused.connect(self._on_department_focused)
         self._dept_pipeline.hidden_departments_changed.connect(self._on_hidden_departments_changed)
         self._dept_pipeline.production_status_override_requested.connect(self.production_status_override_requested.emit)
+        self._asset_status.item_notes_clicked.connect(self.item_notes_dialog_requested.emit)
         self._preview.paste_requested.connect(self._on_paste_requested)
         self._preview.remove_requested.connect(self._on_remove_requested)
         self._show_publish: bool = False
@@ -417,10 +454,9 @@ class InspectorPanel(QWidget):
         self._asset_status.open_work_folder_clicked.connect(self._on_open_work_folder_requested)
         self._asset_status.open_publish_folder_clicked.connect(self._on_open_publish_folder_requested)
         self._asset_status._identity.active_dcc_changed.connect(self._on_identity_active_dcc_changed)
-        # Sync global production status (READY / PROGRESS / WAITING / BLOCKED) to preview thumbnail dot.
-        self._asset_status._health.status_changed.connect(
-            lambda color, label: self._preview._container._w.set_global_status_indicator(color, label)
-        )
+        self._asset_status._health.health_changed.connect(self._preview._container._w.set_item_health)
+        self._preview._container._w.health_chip_clicked.connect(self._on_preview_health_chip_clicked)
+        self._preview._container._w.notes_chip_clicked.connect(self._on_preview_notes_chip_clicked)
 
         self._inbox_destination = _InboxDestinationBlock()
         self._inbox_destination.distribute_finished.connect(self.inbox_distribute_finished.emit)
@@ -609,6 +645,7 @@ class InspectorPanel(QWidget):
         if item is None:
             self._empty.set_message("Select an item to view details")
             self.inspector_hidden_departments_changed.emit(set())
+            self._preview.set_inspector_notes_chip(False, 0)
             return
 
         # Đồng bộ department từ sidebar (active_department_hint):
@@ -676,6 +713,33 @@ class InspectorPanel(QWidget):
         if self._last_focused_department:
             self._on_department_focused(self._last_focused_department)
 
+        if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            self._sync_preview_notes_chip()
+        else:
+            self._preview.set_inspector_notes_chip(False, 0)
+
+    def _sync_preview_notes_chip(self) -> None:
+        item = self._current_item
+        if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            try:
+                from monostudio.core.item_comments import notes_badge_visual_mode
+
+                n, mode = notes_badge_visual_mode(Path(item.path))
+            except Exception:
+                n, mode = 0, "empty"
+            self._preview.set_inspector_notes_chip(True, int(n), str(mode))
+        else:
+            self._preview.set_inspector_notes_chip(False, 0, "empty")
+
+    def refresh_notes_badge(self) -> None:
+        """Re-read open note count from disk (e.g. after Notes dialog edits)."""
+        item = self._current_item
+        if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            self._asset_status.refresh_notes_display(item)
+        else:
+            self._asset_status.refresh_notes_display(None)
+        self._sync_preview_notes_chip()
+
     def refresh_thumbnail(self) -> None:
         # Best-effort; safe no-op if nothing selected.
         try:
@@ -687,6 +751,10 @@ class InspectorPanel(QWidget):
         """Update thumbnail only for current item (e.g. after thumbnailsChanged). No layout change."""
         if self._current_item is None:
             return
+        try:
+            self._preview.drop_preview_thumb_cache_for_item(self._current_item.path)
+        except Exception:
+            pass
         try:
             from monostudio.ui_qt.stress_profiler import enabled, record_inspector_update
             if enabled():
@@ -745,6 +813,49 @@ class InspectorPanel(QWidget):
     def _on_hidden_departments_changed(self, hidden: set) -> None:
         self._asset_status.set_hidden_departments(hidden)
         self.inspector_hidden_departments_changed.emit(set(hidden))
+
+    def _on_preview_health_chip_clicked(self) -> None:
+        item = self._current_item
+        dep = (self._last_focused_department or "").strip()
+        if item is None or not dep or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        ref = getattr(item, "ref", None)
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        active_dcc = _inspector_get_active_dcc(getattr(item, "path", None), dep)
+        health = assess_view_item_health(ref, dep, active_dcc_id=active_dcc)
+        if health is None:
+            return
+        from monostudio.ui_qt.item_health_dialog import ItemHealthDialog
+
+        dept_obj = _department_for_item(ref, dep)
+        naming_prefix = (
+            work_file_prefix(name=getattr(ref, "name", "") or "", department=dept_obj.name)
+            if dept_obj
+            else ""
+        )
+
+        def _trigger_main_refresh() -> None:
+            win = self.window()
+            mv = getattr(win, "_main_view", None)
+            if mv is not None:
+                mv.refresh_requested.emit()
+
+        dlg = ItemHealthDialog(
+            parent=self,
+            item_name=display_name_for_item(item),
+            department=dep,
+            health=health,
+            naming_prefix=naming_prefix or None,
+            on_repaired=_trigger_main_refresh,
+            health_refresh=(ref, dep, active_dcc),
+        )
+        dlg.exec()
+
+    def _on_preview_notes_chip_clicked(self) -> None:
+        item = self._current_item
+        if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            self.item_notes_dialog_requested.emit(item)
 
     def _on_identity_active_dcc_changed(self, path, department: str, dcc_id: str) -> None:
         """Sync active DCC với main view: emit signal và refresh identity để version đúng DCC."""
@@ -982,6 +1093,8 @@ class _InspectorEmptyState(QWidget):
 class _PreviewWidget(QWidget):
     context_menu_requested = Signal(object)  # emits QPoint (global)
     image_changed = Signal(bool)  # has_image
+    health_chip_clicked = Signal()
+    notes_chip_clicked = Signal()
 
     # Inbox: tỉ lệ theo ảnh input; Asset/Shot: 16:9
     INBOX_PREVIEW_MIN_HEIGHT = 120
@@ -1008,9 +1121,12 @@ class _PreviewWidget(QWidget):
         self._unreadable_ext: str = ""  # e.g. ".EXR" (JetBrains Mono, green)
         self._unreadable_hint: str = ""  # Inter, muted (word wrap)
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
-        # Global production status indicator (small dot top-right, color + tooltip text).
-        self._status_color_hex: str | None = None
-        self._status_label: str | None = None
+        self._item_health: ItemHealth | None = None
+        self._health_hovered = False
+        self._notes_chip_visible = False
+        self._notes_open_count = 0
+        self._notes_visual_mode = "empty"
+        self._notes_hovered = False
         # Version badge (always visible when a work version is known).
         self._version_badge_text: str = ""
         self._version_badge_bg: QColor | None = None
@@ -1120,36 +1236,91 @@ class _PreviewWidget(QWidget):
             self.setMinimumHeight(0)
         self.updateGeometry()
 
-    def set_global_status_indicator(self, color_hex: str | None, label: str | None) -> None:
-        """Set global status indicator (dot) color and tooltip label."""
-        color_hex = (color_hex or "").strip() or None
-        label = (label or "").strip() or None
-        if self._status_color_hex == color_hex and self._status_label == label:
+    def set_item_health(self, health: ItemHealth | None) -> None:
+        if self._item_health == health:
             return
-        self._status_color_hex = color_hex
-        self._status_label = label
+        self._item_health = health
+        if health is None:
+            self._health_hovered = False
+            if not self._notes_hovered:
+                self.unsetCursor()
         self.update()
 
-    def _draw_status_dot(self, p: QPainter, r: QRect) -> None:
-        """Draw small status dot at top-right inside thumbnail, similar to main view."""
-        if not self._status_color_hex:
+    def _health_chip_rect(self, r: QRect) -> QRect:
+        chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+        return QRect(r.right() - 12 - chip, r.top() + 12, chip, chip)
+
+    def _health_hit(self, pos: QPoint) -> bool:
+        if self._item_health is None:
+            return False
+        return self._health_chip_rect(self.rect()).contains(pos)
+
+    def _draw_health_chip(self, p: QPainter, r: QRect) -> None:
+        """Item health icon top-right (same as main view grid cards)."""
+        health = self._item_health
+        if health is None:
             return
-        try:
-            color = QColor(self._status_color_hex)
-        except Exception:
-            return
-        # Slightly transparent to match main view accent (≈80% opacity).
-        if color.isValid():
-            color.setAlpha(204)
-        pad = 10
-        radius = 6
-        cx = r.right() - pad - radius
-        cy = r.top() + pad + radius
+        chip_rect = self._health_chip_rect(r)
+        health_hover = self._health_hovered
+        chip_bg = QColor(0, 0, 0, 220 if health_hover else 168)
         p.save()
-        p.setPen(Qt.NoPen)
-        p.setBrush(color)
-        p.drawEllipse(QPoint(cx, cy), radius, radius)
+        if health_hover:
+            ring = QColor(health.color_hex)
+            ring.setAlpha(230)
+            p.setPen(QPen(ring, 2))
+        else:
+            p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(chip_bg)
+        p.drawEllipse(chip_rect)
+        icon_px = _THUMB_HEALTH_ICON_PX + (2 if health_hover else 0)
+        icon = lucide_icon(health.icon_name, size=icon_px, color_hex=health.color_hex)
+        pix = icon.pixmap(icon_px, icon_px)
+        if not pix.isNull():
+            pad = max(2, _THUMB_HEALTH_CHIP_PAD_PX - (1 if health_hover else 0))
+            dest = chip_rect.adjusted(pad, pad, -pad, -pad)
+            p.drawPixmap(dest, pix)
         p.restore()
+
+    def set_notes_chip(self, visible: bool, open_count: int = 0, visual_mode: str = "empty") -> None:
+        vis = bool(visible)
+        oc = max(0, int(open_count))
+        vm = visual_mode if visual_mode in ("empty", "open", "all_done") else "empty"
+        if vis == self._notes_chip_visible and oc == self._notes_open_count and vm == self._notes_visual_mode:
+            return
+        self._notes_chip_visible = vis
+        self._notes_open_count = oc
+        self._notes_visual_mode = vm
+        if not vis:
+            self._notes_hovered = False
+            if not self._health_hovered:
+                self.unsetCursor()
+        self.update()
+
+    def _note_chip_rect(self, r: QRect) -> QRect:
+        hr = self._health_chip_rect(r) if self._item_health is not None else None
+        return _thumb_note_chip_rect(r, hr)
+
+    def _note_hit(self, pos: QPoint) -> bool:
+        if not self._notes_chip_visible:
+            return False
+        return self._note_chip_rect(self.rect()).contains(pos)
+
+    def _draw_thumb_overlay_chips(self, p: QPainter, r: QRect) -> None:
+        if self._notes_chip_visible:
+            p.save()
+            try:
+                p.setRenderHint(QPainter.Antialiasing, True)
+                note_r = self._note_chip_rect(r)
+                _paint_note_icon_chip(
+                    p,
+                    note_r,
+                    self._notes_open_count,
+                    visual_mode=self._notes_visual_mode,
+                    hovered=self._notes_hovered,
+                )
+            finally:
+                p.restore()
+        self._draw_health_chip(p, r)
 
     def heightForWidth(self, w: int) -> int:  # type: ignore[override]
         if self._inbox_mode:
@@ -1228,8 +1399,7 @@ class _PreviewWidget(QWidget):
                     crop = scaled.copy(sx, sy, pw, ph)
                     crop.setDevicePixelRatio(dpr)
                     p.drawPixmap(r, crop)
-                # Overlay global status dot on top of image.
-                self._draw_status_dot(p, r)
+                self._draw_thumb_overlay_chips(p, r)
                 # Version badge (color encodes fresh vs old).
                 if self._version_badge_text and self._version_badge_bg is not None:
                     pad = 10
@@ -1311,7 +1481,7 @@ class _PreviewWidget(QWidget):
                         Qt.AlignHCenter | Qt.TextWordWrap | Qt.AlignTop,
                         self._unreadable_hint,
                     )
-                self._draw_status_dot(p, r)
+                self._draw_thumb_overlay_chips(p, r)
                 return
 
             if self._placeholder_kind in ("asset", "shot", "project"):
@@ -1322,7 +1492,7 @@ class _PreviewWidget(QWidget):
                     x = r.x() + (r.width() - 64) // 2
                     y = r.y() + (r.height() - 64) // 2
                     p.drawPixmap(x, y, src)
-                self._draw_status_dot(p, r)
+                self._draw_thumb_overlay_chips(p, r)
                 return
 
             if self._placeholder_file_icon:
@@ -1339,7 +1509,7 @@ class _PreviewWidget(QWidget):
                     x = r.x() + (r.width() - 64) // 2
                     y = r.y() + (r.height() - 64) // 2
                     p.drawPixmap(x, y, src)
-                self._draw_status_dot(p, r)
+                self._draw_thumb_overlay_chips(p, r)
                 return
 
             if self._placeholder_letter:
@@ -1347,7 +1517,7 @@ class _PreviewWidget(QWidget):
                 f = monos_font("Inter", 28, QFont.Weight.DemiBold)
                 p.setFont(f)
                 p.drawText(r, Qt.AlignCenter, self._placeholder_letter)
-                self._draw_status_dot(p, r)
+                self._draw_thumb_overlay_chips(p, r)
                 return
 
             p.setPen(QColor(MONOS_COLORS["text_meta"]))
@@ -1362,6 +1532,25 @@ class _PreviewWidget(QWidget):
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
         except Exception:
             pos = None
+        if pos is not None:
+            note_hover = self._note_hit(pos)
+            health_hover = self._health_hit(pos)
+            if note_hover != self._notes_hovered or health_hover != self._health_hovered:
+                self._notes_hovered = note_hover
+                self._health_hovered = health_hover
+                if note_hover or health_hover:
+                    self.setCursor(Qt.CursorShape.PointingHandCursor)
+                else:
+                    self.unsetCursor()
+                self.update()
+            gpt = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+            if note_hover:
+                QToolTip.showText(
+                    gpt,
+                    _notes_badge_tooltip_text(self._notes_open_count, self._notes_visual_mode),
+                )
+            elif health_hover and self._item_health is not None:
+                QToolTip.showText(gpt, _item_health_tooltip_text(self._item_health))
         rect = self._version_badge_rect
         if (
             pos is not None
@@ -1370,11 +1559,34 @@ class _PreviewWidget(QWidget):
             and rect.contains(pos)
         ):
             self.setToolTip(self._version_badge_tooltip)
-        else:
-            # Keep widget tooltip empty to avoid global hover tooltips.
+        elif pos is None or (not self._health_hit(pos) and not self._note_hit(pos)):
             if self.toolTip():
                 self.setToolTip("")
         return super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        if self._health_hovered or self._notes_hovered:
+            self._health_hovered = False
+            self._notes_hovered = False
+            self.unsetCursor()
+            self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            try:
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            except Exception:
+                pos = None
+            if pos is not None and self._note_hit(pos):
+                self.notes_chip_clicked.emit()
+                event.accept()
+                return
+            if pos is not None and self._health_hit(pos):
+                self.health_chip_clicked.emit()
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         try:
@@ -1836,7 +2048,7 @@ class _InspectorPreview(QWidget):
         self._qsettings: QSettings | None = None
         self._sequence_folder: Path | None = None
         self._sequence_frames: list[Path] = []
-        self._drag_start_pos: QPoint | None = None
+        self._mmb_folder_drag_start: QPoint | None = None
         self._preview_layout = QVBoxLayout(self)
         self._preview_layout.setContentsMargins(0, 0, 0, 0)
         self._preview_layout.setSpacing(0)
@@ -1896,6 +2108,9 @@ class _InspectorPreview(QWidget):
     def set_qsettings(self, settings: QSettings | None) -> None:
         self._qsettings = settings
 
+    def set_inspector_notes_chip(self, visible: bool, open_count: int = 0, visual_mode: str = "empty") -> None:
+        self._container._w.set_notes_chip(visible, open_count, visual_mode)
+
     def _inspector_thumb_source_mode(self) -> str:
         """Thumbnail source mode from settings (separate keys for Asset vs Shot)."""
         item = self._item
@@ -1918,6 +2133,20 @@ class _InspectorPreview(QWidget):
     def invalidate_settings_dependent_cache(self) -> None:
         self._preview_thumb_cache.clear()
         self._seq_decode_bucket = None
+
+    def drop_preview_thumb_cache_for_item(self, item_path: Path) -> None:
+        """Drop cached inspector preview pixmaps for one entity (e.g. after ``.meta`` thumb change)."""
+        try:
+            prefix = str(item_path.resolve())
+        except OSError:
+            prefix = str(item_path)
+        dead = [
+            k
+            for k in self._preview_thumb_cache
+            if k == prefix or k.startswith(f"{prefix}::")
+        ]
+        for k in dead:
+            self._preview_thumb_cache.pop(k, None)
 
     def _work_paths_for_preview_item(
         self,
@@ -2093,8 +2322,8 @@ class _InspectorPreview(QWidget):
             f"Double-click: open with {player}.",
         ]
         if self._sequence_frames:
-            lines.append("Hold left button and drag: drag the sequence folder (to Explorer / a DCC).")
-            lines.append("Middle mouse + drag horizontally: scrub frames.")
+            lines.append("Middle mouse + drag: drag sequence folder into Explorer / a DCC.")
+            lines.append("Left-click / drag horizontally on preview: scrub frames.")
         src = self._inspector_thumb_source_mode()
         if src != THUMB_SOURCE_RENDER_SEQUENCE:
             lines.append("Hover: Fill / Fit, Paste, Remove (top).")
@@ -2107,6 +2336,98 @@ class _InspectorPreview(QWidget):
             playing=self._seq_playing,
         )
 
+    def _inspector_thumb_hit_test_blocks_scrub(self, pos: QPoint) -> bool:
+        """Notes / health chips: keep LMB for chip clicks, not scrub."""
+        wgt = self._container._w
+        if isinstance(wgt, _PreviewWidget):
+            return bool(wgt._note_hit(pos) or wgt._health_hit(pos))
+        return False
+
+    def _inspector_sequence_folder_drag_pixmap(self) -> tuple[QPixmap | None, QPoint]:
+        """Card-style pixmap under cursor (aligned with grid middle-drag previews)."""
+        wgt = self._container._w
+        item = self._item
+        dpr = float(wgt.devicePixelRatioF())
+        if dpr <= 0:
+            dpr = 1.0
+        target_w = 200
+        inner_pad = 8
+        gap_thumb_text = 8
+        name_font = QFont("Inter")
+        name_font.setPointSize(11)
+        name_font.setWeight(QFont.Weight.DemiBold)
+        name_fm = QFontMetrics(name_font)
+        name_h = max(14, name_fm.height())
+        inner_w = max(1, target_w - inner_pad * 2)
+        thumb_region_h = max(1, int(inner_w * 9 / 16))
+        logical_h = inner_pad + thumb_region_h + gap_thumb_text + name_h + inner_pad
+        logical_size = QSize(target_w, logical_h)
+
+        ww = max(1, int(logical_size.width() * dpr))
+        hh = max(1, int(logical_size.height() * dpr))
+        pm = QPixmap(ww, hh)
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(pm)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            r = QRect(0, 0, logical_size.width(), logical_size.height())
+            bg = QColor("#18181b")
+            border = QColor("#3f3f46")
+            painter.setPen(QPen(border, 1))
+            painter.setBrush(bg)
+            painter.drawRoundedRect(r.adjusted(0, 0, -1, -1), 12, 12)
+
+            inner = r.adjusted(inner_pad, inner_pad, -inner_pad, -inner_pad)
+            thumb = QRect(inner.left(), inner.top(), inner.width(), thumb_region_h)
+            src_pix: QPixmap | None = getattr(wgt, "_pix", None)
+            has_img = bool(getattr(wgt, "_has_image", False) and src_pix is not None and not src_pix.isNull())
+            clip_path = QPainterPath()
+            clip_path.addRoundedRect(QRectF(thumb), 6, 6)
+            painter.save()
+            painter.setClipPath(clip_path)
+            if has_img and src_pix is not None:
+                scaled = src_pix.scaled(thumb.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                sx = max(0, (scaled.width() - thumb.width()) // 2)
+                sy = max(0, (scaled.height() - thumb.height()) // 2)
+                crop = scaled.copy(QRect(QPoint(sx, sy), thumb.size()))
+                painter.drawPixmap(thumb, crop)
+            else:
+                painter.fillRect(thumb, QColor(MONOS_COLORS["content_bg"]))
+                fc = lucide_icon("folder", size=44, color_hex=MONOS_COLORS["text_meta"])
+                fp = fc.pixmap(44, 44)
+                if not fp.isNull():
+                    painter.drawPixmap(
+                        thumb.center().x() - 22,
+                        thumb.center().y() - 22,
+                        fp,
+                    )
+            painter.restore()
+
+            name = ""
+            if item is not None:
+                try:
+                    name = (display_name_for_item(item) or "").strip()
+                except Exception:
+                    name = ""
+            folder_fallback = self._sequence_folder.name if self._sequence_folder else "—"
+            name = name or folder_fallback
+            text_rect = QRect(
+                inner.left(),
+                thumb.bottom() + gap_thumb_text,
+                inner.width(),
+                max(1, inner.bottom() - (thumb.bottom() + gap_thumb_text)),
+            )
+            painter.setFont(name_font)
+            painter.setPen(QColor("#e4e4e7"))
+            elided = name_fm.elidedText(name, Qt.TextElideMode.ElideRight, max(1, text_rect.width()))
+            painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignTop, elided)
+        finally:
+            painter.end()
+        hotspot = QPoint(24, 24)
+        return (pm if not pm.isNull() else None), hotspot
+
     def _perform_sequence_folder_drag(self) -> None:
         if self._sequence_folder is None or not self._sequence_folder.is_dir():
             return
@@ -2114,6 +2435,10 @@ class _InspectorPreview(QWidget):
         md.setUrls([QUrl.fromLocalFile(str(self._sequence_folder.resolve()))])
         drag = QDrag(self._container._w)
         drag.setMimeData(md)
+        dp, hs = self._inspector_sequence_folder_drag_pixmap()
+        if dp is not None and not dp.isNull():
+            drag.setPixmap(dp)
+            drag.setHotSpot(hs)
         drag.exec(Qt.DropAction.CopyAction)
 
     def _resolve_inspector_thumbnail_disk_path(self) -> Path | None:
@@ -2192,6 +2517,7 @@ class _InspectorPreview(QWidget):
     def _halt_inline_sequence_ui(self) -> None:
         self._seq_playing = False
         self._seq_scrubbing = False
+        self._mmb_folder_drag_start = None
         self._seq_live_display = False
         self._seq_tick.stop()
         self._seq_poll.stop()
@@ -2394,35 +2720,39 @@ class _InspectorPreview(QWidget):
                 self._update_sequence_play_button()
                 return True
         if et == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
-            if event.button() == Qt.MouseButton.LeftButton:
+            try:
+                mpos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            except Exception:
+                mpos = QPoint(0, 0)
+            if event.button() == Qt.MouseButton.LeftButton and self._sequence_frames:
+                if not self._inspector_thumb_hit_test_blocks_scrub(mpos):
+                    self._seq_scrubbing = True
+                    self._scrub_inspector_seq_from_event(event)
+                    return True
+            if event.button() == Qt.MouseButton.MiddleButton and self._sequence_folder and self._sequence_folder.is_dir():
                 if hasattr(event, "position"):
-                    self._drag_start_pos = QPoint(int(event.position().x()), int(event.position().y()))
+                    self._mmb_folder_drag_start = QPoint(int(event.position().x()), int(event.position().y()))
                 else:
-                    self._drag_start_pos = event.pos()
-            elif event.button() == Qt.MouseButton.MiddleButton and self._sequence_frames:
-                self._seq_scrubbing = True
-                self._scrub_inspector_seq_from_event(event)
-                return True
+                    self._mmb_folder_drag_start = event.pos()
         elif et == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
-            if self._seq_scrubbing and bool(event.buttons() & Qt.MouseButton.MiddleButton):
+            if self._seq_scrubbing and bool(event.buttons() & Qt.MouseButton.LeftButton):
                 self._scrub_inspector_seq_from_event(event)
                 return True
-            if self._drag_start_pos is not None and bool(event.buttons() & Qt.MouseButton.LeftButton):
+            if self._mmb_folder_drag_start is not None and bool(event.buttons() & Qt.MouseButton.MiddleButton):
                 if hasattr(event, "position"):
                     pos = QPoint(int(event.position().x()), int(event.position().y()))
                 else:
                     pos = event.pos()
-                d = pos - self._drag_start_pos
-                if (abs(d.x()) + abs(d.y())) >= QApplication.startDragDistance():
+                d = pos - self._mmb_folder_drag_start
+                if d.manhattanLength() >= QApplication.startDragDistance():
                     self._perform_sequence_folder_drag()
-                    self._drag_start_pos = None
+                    self._mmb_folder_drag_start = None
         elif et == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
-            if event.button() == Qt.MouseButton.MiddleButton:
+            if event.button() == Qt.MouseButton.LeftButton and self._seq_scrubbing:
                 self._seq_scrubbing = False
                 return True
-            if event.button() == Qt.MouseButton.LeftButton:
-                # Play/pause chỉ qua nút overlay — tránh xung đột với drag folder + double-click mở file.
-                self._drag_start_pos = None
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._mmb_folder_drag_start = None
         return False
 
     def apply_preview_thumb(self, path_str: str, image_or_none: QImage | None, use_fit: bool) -> None:
@@ -2675,7 +3005,7 @@ class _InspectorPreview(QWidget):
         item = self._item
         if item is None:
             return
-        self._preview_thumb_cache.pop(self._preview_cache_key(item.path), None)
+        self.drop_preview_thumb_cache_for_item(item.path)
         mgr = getattr(self, "_thumbnail_manager", None)
         if mgr is not None and hasattr(mgr, "invalidate"):
             mgr.invalidate(str(item.path), department=self._active_department)
@@ -3121,11 +3451,49 @@ class _IdentityBlock(QWidget):
             return
 
 
+class _InspectorItemNotesBadge(QWidget):
+    """Notes entry point: icon + optional open-count chip (left of health)."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("InspectorItemNotesBadge")
+        self.setFixedSize(40, 36)
+        self._btn = QToolButton(self)
+        self._btn.setObjectName("InspectorItemNotesBadgeButton")
+        self._btn.setAutoRaise(True)
+        self._btn.setCursor(Qt.PointingHandCursor)
+        self._btn.setIcon(lucide_icon("message-circle", size=18, color_hex=MONOS_COLORS["text_label"]))
+        self._btn.setIconSize(QSize(18, 18))
+        self._btn.setToolTip("Notes")
+        self._btn.clicked.connect(self.clicked.emit)
+        self._badge = QLabel(self)
+        self._badge.setObjectName("InspectorItemNotesBadgeCount")
+        self._badge.hide()
+        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._btn.setGeometry(6, 4, 28, 28)
+        self._badge.setGeometry(self.width() - 16, 0, 16, 16)
+
+    def set_open_count(self, n: int) -> None:
+        if n <= 0:
+            self._badge.hide()
+            self._btn.setToolTip("Notes")
+            return
+        self._badge.setText("9+" if n > 9 else str(n))
+        self._badge.show()
+        self._btn.setToolTip(f"Notes ({n} open)")
+
+
 class _InspectorAssetStatusBlock(QWidget):
     """One container: row1 = Asset info (name+meta) | Status pill; row2 = folder shortcuts."""
     open_asset_folder_clicked = Signal()
     open_work_folder_clicked = Signal()
     open_publish_folder_clicked = Signal()
+    item_notes_clicked = Signal(ViewItem)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3143,8 +3511,11 @@ class _InspectorAssetStatusBlock(QWidget):
         row1_l.setContentsMargins(0, 0, 0, 0)
         row1_l.setSpacing(12)
         self._identity = _IdentityBlock(self)
+        self._notes_badge = _InspectorItemNotesBadge(self)
+        self._notes_badge.clicked.connect(self._on_notes_badge_clicked)
         self._health = _ProductionHealth(self)
         row1_l.addWidget(self._identity, 1)
+        row1_l.addWidget(self._notes_badge, 0, Qt.AlignVCenter)
         row1_l.addWidget(self._health, 0, Qt.AlignVCenter)
 
         row2 = QWidget(self)
@@ -3220,6 +3591,15 @@ class _InspectorAssetStatusBlock(QWidget):
     def _on_open_publish_folder_clicked(self) -> None:
         self.open_publish_folder_clicked.emit()
 
+    def _on_notes_badge_clicked(self) -> None:
+        item = self._current_item
+        if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            self.item_notes_clicked.emit(item)
+
+    def refresh_notes_display(self, item: ViewItem | None = None) -> None:
+        """Notes entry is on the preview thumbnail; keep row badge hidden."""
+        self._notes_badge.setVisible(False)
+
     def set_item(
         self,
         item: ViewItem,
@@ -3232,6 +3612,8 @@ class _InspectorAssetStatusBlock(QWidget):
         self._last_active_department = active_department
         self._last_active_dcc_id = active_dcc_id
         self._identity.set_item(item, show_publish, active_department=active_department, active_dcc_id=active_dcc_id)
+        self._health.set_focused_department(active_department)
+        self._health.set_active_dcc(active_dcc_id)
         self._health.set_item(item)
         is_asset_or_shot = bool(item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT))
         self._quick_actions_btn.setEnabled(is_asset_or_shot)
@@ -3240,6 +3622,7 @@ class _InspectorAssetStatusBlock(QWidget):
         self._act_open_publish_folder.setEnabled(is_asset_or_shot)
         self._act_copy_dcc_work_path.setEnabled(is_asset_or_shot)
         self._act_copy_publish_path.setEnabled(is_asset_or_shot)
+        self.refresh_notes_display(item if is_asset_or_shot else None)
 
     def _on_copy_dcc_work_path_clicked(self) -> None:
         item = self._current_item
@@ -3269,6 +3652,7 @@ class _InspectorAssetStatusBlock(QWidget):
             _TechnicalSpecs._copy_text(str(Path(paths[1])))
 
     def set_focused_department(self, dept_name: str | None) -> None:
+        self._last_active_department = dept_name
         self._health.set_focused_department(dept_name)
 
     def set_hidden_departments(self, hidden: set[str]) -> None:
@@ -3313,16 +3697,16 @@ class _MiniInfoCard(QFrame):
 
 
 class _ProductionHealth(QWidget):
-    """Read-only global status indicator; computes overall status and exposes it as a colored dot with tooltip."""
+    """Computes item health for the focused department; drives the preview thumbnail health icon."""
 
-    # color_hex, label
-    status_changed = Signal(str, str)
+    health_changed = Signal(object)  # ItemHealth | None
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorProductionHealth")
         self._current_item: ViewItem | None = None
         self._focused_department: str | None = None
+        self._active_dcc_id: str | None = None
         self._hidden_departments: set[str] = set()
 
         l = QHBoxLayout(self)
@@ -3348,6 +3732,11 @@ class _ProductionHealth(QWidget):
         if self._current_item is not None:
             self._refresh()
 
+    def set_active_dcc(self, dcc_id: str | None) -> None:
+        self._active_dcc_id = (dcc_id or "").strip() or None
+        if self._current_item is not None:
+            self._refresh()
+
     def set_hidden_departments(self, hidden: set[str]) -> None:
         self._hidden_departments = set(hidden)
         if self._current_item is not None:
@@ -3359,34 +3748,16 @@ class _ProductionHealth(QWidget):
 
     def _refresh(self) -> None:
         item = self._current_item
-        if item is None:
-            self.status_changed.emit("", "")
+        dep = self._focused_department
+        if item is None or not dep:
+            self.health_changed.emit(None)
             return
         ref = item.ref
-        if isinstance(ref, Department):
-            status = _status_from_department(ref)
-            color = _status_color(status)
-            display = _status_display_label(status)
-            self.status_changed.emit(color, display)
+        if not isinstance(ref, (Asset, Shot)):
+            self.health_changed.emit(None)
             return
-        if isinstance(ref, (Asset, Shot)):
-            try:
-                pr = self._project_root_from_parent(self)
-                reg = load_production_status_registry(pr)
-                sid = aggregate_status_id_for_item(
-                    ref,
-                    active_department=self._focused_department,
-                    hidden_departments=self._hidden_departments,
-                    registry=reg,
-                )
-                color = color_hex_for_status_id(sid, reg)
-                display = reg.label_for(sid)
-                self.status_changed.emit(color, display)
-            except Exception:
-                self.status_changed.emit("", "")
-            return
-
-        self.status_changed.emit("", "")
+        health = assess_view_item_health(ref, dep, active_dcc_id=self._active_dcc_id)
+        self.health_changed.emit(health)
 
 
 def _dept_status_pill_qss(text_color: str) -> str:
@@ -3832,18 +4203,23 @@ class _DepartmentPipeline(QWidget):
                 break
             p = p.parent()
 
+        pr_root = self._inspector_project_root()
+        ref_as = ref if isinstance(ref, (Asset, Shot)) else None
+        allowed_ids: list[str] | None = None
+        if ref_as is not None:
+            allowed_ids = _inspector_allowed_department_ids(ref_as, pr_root)
+
         if isinstance(ref, Department):
             depts = (ref,)
         elif isinstance(ref, (Asset, Shot)):
             if isinstance(registry, DepartmentRegistry):
-                depts = _inspector_merge_departments_with_registry(ref, registry)
+                depts = _inspector_merge_departments_with_registry(
+                    ref, registry, allowed_dept_ids=allowed_ids
+                )
             else:
                 depts = ref.departments
         else:
             depts = ()
-
-        pr_root = self._inspector_project_root()
-        ref_as = ref if isinstance(ref, (Asset, Shot)) else None
 
         if not depts:
             self._current_all_dept_ids = []
@@ -3858,8 +4234,13 @@ class _DepartmentPipeline(QWidget):
 
         self._empty.setVisible(False)
 
-        if registry and hasattr(registry, "get_departments"):
+        if allowed_ids is not None:
+            ordered_ids = list(allowed_ids)
+        elif registry and hasattr(registry, "get_departments"):
             ordered_ids = list(registry.get_departments())
+        else:
+            ordered_ids = []
+        if ordered_ids:
             dept_by_id = {d.name: d for d in depts}
             ordered_depts = [dept_by_id[dept_id] for dept_id in ordered_ids if dept_id in dept_by_id]
         else:

@@ -710,6 +710,42 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #ef4444;
         }
 
+        /* View options — status filter dropdown (multi-select, stays open) */
+        QMenu#FilterStatusMenu::item {
+            padding: 6px 28px 6px 20px;
+            border-radius: 6px;
+            margin: 1px 6px;
+            color: #c4c4c8;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        QMenu#FilterStatusMenu::item:selected {
+            background-color: rgba(255, 255, 255, 0.06);
+            color: #d4d4d8;
+        }
+        QMenu#FilterStatusMenu::item:checked {
+            background-color: rgba(37, 99, 235, 0.22);
+            color: #d4d4d8;
+        }
+        QMenu#FilterStatusMenu::item:checked:selected {
+            background-color: rgba(37, 99, 235, 0.36);
+            color: #e4e4e7;
+        }
+        QMenu#FilterStatusMenu::indicator:checked {
+            image: none;
+            background-color: #3b82f6;
+            border: 1px solid #60a5fa;
+            border-radius: 3px;
+        }
+        QMenu#FilterStatusMenu::indicator:unchecked {
+            background-color: transparent;
+            border: 1px solid #52525b;
+            border-radius: 3px;
+        }
+        QMenu#FilterStatusMenu::indicator:unchecked:selected {
+            border-color: #71717a;
+        }
+
         /* Production status picker: category section headers + tooltips */
         QMenu#ProductionStatusMenu::item {
             padding: 6px 28px 6px 20px;
@@ -1194,16 +1230,91 @@ def apply_dark_theme(app: QApplication) -> None:
             margin: 0px;
             padding: 0px;
         }
+        QFrame#MainViewOptionsPopup QCheckBox,
         QFrame#MainViewOptionsPopup QRadioButton {
-            padding: 0px 0px;
+            padding: 0px;
             margin: 0px;
-            min-height: 20px;
-            max-height: 22px;
+            min-height: 18px;
+            max-height: 18px;
             spacing: 6px;
+            color: #c4c4c8;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 12px;
+            font-weight: 500;
         }
+        QFrame#MainViewOptionsPopup QCheckBox:hover,
+        QFrame#MainViewOptionsPopup QRadioButton:hover {
+            color: #d4d4d8;
+        }
+        QFrame#MainViewOptionsPopup QCheckBox::indicator,
         QFrame#MainViewOptionsPopup QRadioButton::indicator {
             width: 14px;
             height: 14px;
+        }
+        QFrame#MainViewOptionsPopup QLabel#ViewOptionsSectionLabel,
+        QFrame#MainViewOptionsPopup QLabel#ViewOptionsGroupLabel,
+        QFrame#MainViewOptionsPopup QLabel#MainViewOptionsSizeLabel {
+            margin: 0px;
+            padding: 0px;
+            min-height: 18px;
+            max-height: 18px;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+        }
+        /* Block headers: Assets, Shots, Card size */
+        QFrame#MainViewOptionsPopup QLabel#ViewOptionsSectionLabel,
+        QFrame#MainViewOptionsPopup QLabel#MainViewOptionsSizeLabel {
+            color: #71717a;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+        }
+        /* In-submenu field labels: Work folder, Sort by, Production status */
+        QFrame#MainViewOptionsPopup QLabel#ViewOptionsGroupLabel {
+            color: #52525b;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+        }
+        /* Collapsible rows: Filter, Sort, Metadata */
+        QToolButton#ViewOptionsSubmenuHeader {
+            color: #8b9cb3;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            border: none;
+            background: transparent;
+            min-height: 18px;
+            max-height: 18px;
+            padding: 0px;
+            margin: 0px;
+        }
+        QToolButton#ViewOptionsSubmenuHeader:hover {
+            color: #a8b8cc;
+        }
+        QToolButton#ViewOptionsFilterStatusButton {
+            color: #c4c4c8;
+            background-color: #27272a;
+            border: 1px solid #3f3f46;
+            border-radius: 6px;
+            padding: 4px 8px;
+            min-height: 18px;
+            max-height: 18px;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 12px;
+            font-weight: 500;
+            text-align: left;
+        }
+        QToolButton#ViewOptionsFilterStatusButton:hover {
+            color: #d4d4d8;
+            background-color: #3f3f46;
+            border-color: #52525b;
+        }
+        QToolButton#ViewOptionsFilterStatusButton::menu-indicator {
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
+            width: 12px;
+            height: 12px;
+            right: 6px;
         }
         QToolButton#MainViewOptionsButton {
             padding: 6px;
@@ -1249,6 +1360,27 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(255, 255, 255, 0.12);
             border: 1px solid rgba(63, 63, 70, 0.80);
             color: #e4e4e7;
+        }
+        QToolButton#InspectorItemNotesBadgeButton {
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            padding: 4px;
+        }
+        QWidget#InspectorPanel QToolButton#InspectorItemNotesBadgeButton:hover {
+            background: rgba(255, 255, 255, 0.10);
+            border: none;
+        }
+        QLabel#InspectorItemNotesBadgeCount {
+            font-family: "Inter";
+            font-size: 9px;
+            font-weight: 800;
+            color: #fafafa;
+            background-color: #2563eb;
+            border-radius: 8px;
+            min-width: 14px;
+            min-height: 14px;
+            padding: 0 3px;
         }
         QFrame#InspectorMiniCard,
         QFrame#InspectorDeptCard {
@@ -1371,6 +1503,117 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QDialog#SidebarFilterPickDialog {
             background-color: transparent;
+        }
+        QScrollArea#ItemHealthScroll {
+            background-color: #121214;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 8px;
+            margin-left: 4px;
+            margin-right: 4px;
+        }
+        QScrollArea#ItemHealthScroll::viewport {
+            background-color: #121214;
+            border-radius: 8px;
+        }
+        QScrollArea#ItemHealthScroll QWidget#ItemHealthScrollBody {
+            background: transparent;
+        }
+        QWidget#ItemHealthDialogTitleBar {
+            background-color: #121214;
+            border-bottom: 1px solid rgba(39, 39, 42, 0.50);
+            border-top-left-radius: 12px;
+            border-top-right-radius: 12px;
+        }
+        QToolButton#ItemHealthDialogMoveGrip {
+            border: none;
+            border-radius: 6px;
+            padding: 4px;
+            background: transparent;
+        }
+        QToolButton#ItemHealthDialogMoveGrip:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QToolButton#ItemHealthDialogSizeGrip {
+            border: none;
+            border-radius: 6px;
+            padding: 4px;
+            background: transparent;
+        }
+        QToolButton#ItemHealthDialogSizeGrip:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QScrollArea#ItemNotesScroll {
+            background-color: #121214;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 8px;
+        }
+        QScrollArea#ItemNotesScroll::viewport {
+            background-color: #121214;
+            border-radius: 8px;
+        }
+        QWidget#ItemNotesListHost {
+            background: transparent;
+        }
+        QFrame#ItemNotesCard {
+            background: #18181b;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 10px;
+        }
+        QFrame#ItemNotesCardDone {
+            background: rgba(16, 185, 129, 0.16);
+            border: 1px solid rgba(52, 211, 153, 0.42);
+            border-radius: 10px;
+        }
+        QFrame#ItemNotesHRule {
+            background-color: rgba(39, 39, 42, 0.80);
+            border: none;
+            max-height: 1px;
+        }
+        QLineEdit#ItemNotesLineInput {
+            background-color: #121214;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 10px;
+            padding: 10px 14px;
+            color: #e4e4e7;
+            font-family: "Inter";
+            font-size: 13px;
+            min-height: 20px;
+        }
+        QLineEdit#ItemNotesLineInput:focus {
+            border: 1px solid #2563eb;
+        }
+        QLineEdit#ItemNotesLineInput::placeholder {
+            color: #71717a;
+        }
+        QToolButton#ItemNotesAddPlusButton {
+            background-color: #27272a;
+            border: 1px solid rgba(63, 63, 70, 0.80);
+            border-radius: 10px;
+        }
+        QToolButton#ItemNotesAddPlusButton:hover {
+            background-color: #3f3f46;
+            border: 1px solid rgba(82, 82, 91, 0.90);
+        }
+        QToolButton#ItemNotesDeleteButton {
+            border: none;
+            background: transparent;
+            padding: 4px;
+            border-radius: 8px;
+        }
+        QToolButton#ItemNotesDeleteButton:hover {
+            background: rgba(239, 68, 68, 0.15);
+        }
+        QPlainTextEdit#ItemNotesAddEditor {
+            background-color: #121214;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 8px;
+            padding: 8px 10px;
+            color: #e4e4e7;
+            font-family: "Inter";
+            font-size: 13px;
+        }
+        QPlainTextEdit#ItemNotesAddEditor:focus {
+            border: 1px solid #2563eb;
         }
         /* MONOS calendar (Inbox drop: date picker) — Deep Dark, 8px radius embed */
         QCalendarWidget#MonosCalendar {
@@ -1633,6 +1876,13 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid #2a2a2d;
             border-radius: 50%;
         }
+        QFrame#DccCard[dept_default="true"] {
+            border: 2px solid rgba(161, 161, 170, 0.75);
+        }
+        QFrame#DccCard[dept_default="true"][selected="true"] {
+            border: 2px solid #2563eb;
+            background-color: rgba(37, 99, 235, 0.12);
+        }
         QFrame#DccCard[last_used="true"] {
             border: 2px solid rgba(37, 99, 235, 0.5);
         }
@@ -1658,12 +1908,20 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QLabel#DccCardLabel {
             color: #e4e4e7;
-            font-size: 13px;
             font-weight: 500;
+        }
+        QLabel#DccCardLabel[labelScale="primary"] {
+            font-size: 11px;
+        }
+        QLabel#DccCardLabel[labelScale="compact"] {
+            font-size: 9px;
         }
         QScrollArea#OpenResolverScroll {
             background: transparent;
             border: none;
+        }
+        QScrollArea#OpenResolverScroll > QWidget > QWidget {
+            background: transparent;
         }
         QLabel#DialogHelper {
             color: #a1a1aa;

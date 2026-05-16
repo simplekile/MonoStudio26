@@ -172,42 +172,57 @@ class SimpleDeleteConfirmDialog(MonosDialog):
 
 class DeleteConfirmDialog(MonosDialog):
     """
-    Guarded delete confirmation (explicit, boring):
-    - User must type exact folder name to enable Delete
-    - No warnings/toasts on success/failure (handled by caller)
+    Confirmation before removing an asset/shot folder from the pipeline view.
+    - ``require_typed_confirmation=True`` (default): user must type the exact folder name to enable OK.
+    - ``require_typed_confirmation=False``: message + OK only (e.g. Move to Trash).
+    - ``move_to_trash=True``: copy explains project trash; OK label is "Move to Trash".
     """
 
-    def __init__(self, *, kind_label: str, folder_name: str, absolute_path: Path, parent=None) -> None:
+    def __init__(
+        self,
+        *,
+        kind_label: str,
+        folder_name: str,
+        absolute_path: Path,
+        parent=None,
+        move_to_trash: bool = False,
+        require_typed_confirmation: bool = True,
+    ) -> None:
         super().__init__(parent)
         self.setModal(True)
-        self.setWindowTitle(f"Delete {kind_label}")
+        self._move_to_trash = bool(move_to_trash)
+        self._require_typed = bool(require_typed_confirmation)
+        self.setWindowTitle(f"Move to Trash — {kind_label}" if self._move_to_trash else f"Delete {kind_label}")
 
         self._expected = folder_name
 
-        body = QLabel(
-            "This will permanently delete the following folder from disk:\n\n"
-            f"{str(absolute_path)}\n\n"
-            "This action cannot be undone."
-        )
+        if self._move_to_trash:
+            body_text = (
+                "The following folder will be moved to this project's Trash "
+                "(under .monostudio/trash). You can restore it from the Trash page.\n\n"
+                f"{str(absolute_path)}\n\n"
+                "It will no longer appear in Assets or Shots until restored."
+            )
+        else:
+            body_text = (
+                "This will permanently delete the following folder from disk:\n\n"
+                f"{str(absolute_path)}\n\n"
+                "This action cannot be undone."
+            )
+        body = QLabel(body_text)
         body.setWordWrap(True)
         body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         body.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        prompt = QLabel("Type the name to confirm:")
-        prompt.setObjectName("DialogHint")
-        prompt.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-
-        self._input = QLineEdit()
-        self._input.setPlaceholderText(self._expected)
-        self._input.textChanged.connect(self._update_ok_enabled)
+        self._input: QLineEdit | None = None
 
         button_row = QWidget()
         button_row_l = QHBoxLayout(button_row)
         button_row_l.setContentsMargins(0, 0, 0, 0)
         button_row_l.setSpacing(10)
-        self._ok_btn = QPushButton("Delete")
+        self._ok_btn = QPushButton("Move to Trash" if self._move_to_trash else "Delete")
         self._ok_btn.setObjectName("DialogPrimaryButton")
-        self._ok_btn.setEnabled(False)
+        self._ok_btn.setEnabled(not self._require_typed)
         self._ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("DialogSecondaryButton")
@@ -221,14 +236,24 @@ class DeleteConfirmDialog(MonosDialog):
         layout.setSpacing(10)
         layout.addWidget(body)
         layout.addSpacing(6)
-        layout.addWidget(prompt)
-        layout.addWidget(self._input)
-        layout.addSpacing(10)
+        if self._require_typed:
+            prompt = QLabel("Type the name to confirm:")
+            prompt.setObjectName("DialogHint")
+            prompt.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            self._input = QLineEdit()
+            self._input.setPlaceholderText(self._expected)
+            self._input.textChanged.connect(self._update_ok_enabled)
+            layout.addWidget(prompt)
+            layout.addWidget(self._input)
+            layout.addSpacing(10)
         layout.addWidget(button_row)
 
         self._update_ok_enabled()
 
     def _update_ok_enabled(self) -> None:
+        if not self._require_typed or self._input is None:
+            self._ok_btn.setEnabled(True)
+            return
         typed = self._input.text().strip()  # trim whitespace
         self._ok_btn.setEnabled(typed == self._expected)
 

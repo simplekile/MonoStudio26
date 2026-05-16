@@ -4,7 +4,7 @@ import json
 import shutil
 import time
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, NamedTuple
 
 from PySide6.QtCore import (
     QElapsedTimer,
@@ -32,13 +32,12 @@ from PySide6.QtGui import (
     QDrag,
     QIcon,
     QKeySequence,
+    QMouseEvent,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
     QShortcut,
-    QStandardItem,
-    QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -68,6 +67,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.ui_qt.pipeline_view_models import (
+    PIPELINE_VIEW_THUMB_STATE_ROLE,
+    PipelineTableModel,
+    PipelineTileModel,
+)
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 from monostudio.ui_qt.thumbnails import ThumbnailCache
 from monostudio.ui_qt.inspector_preview_settings import (
@@ -77,7 +81,8 @@ from monostudio.ui_qt.inspector_preview_settings import (
     read_inspector_thumbnail_source,
     write_inspector_thumbnail_source,
 )
-from monostudio.ui_qt.style import MONOS_COLORS, THUMB_TAG_STYLE, monos_font
+from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, THUMB_TAG_STYLE, monos_font
+from monostudio.ui_qt.production_status_menu import _menu_status_dot_icon
 from monostudio.ui_qt.production_status_menu import pick_production_status_at
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -85,14 +90,16 @@ from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.dcc_status import resolve_dcc_status
 from monostudio.core.fs_reader import (
+    _parse_workfile_version,
     list_work_file_versions,
     read_use_dcc_folders,
     resolve_work_path,
     work_file_prefix,
 )
 from monostudio.core.workspace_reader import ProjectQuickStats
-from monostudio.core.models import Asset, Shot
+from monostudio.core.models import Asset, Department, Shot
 from monostudio.core.production_status import (
+    ProductionStatusRegistry,
     aggregate_status_id_for_item,
     color_hex_for_status_id,
     load_production_status_registry,
@@ -101,6 +108,93 @@ from monostudio.core.production_status import (
 
 import logging
 _dcc_debug_log = logging.getLogger("monostudio.dcc_debug")
+
+# --- Grid card: meta block under 16:9 thumb (one template, same height for every card) ---
+_GRID_META_PAD_TOP = 16
+_GRID_NAME_LINE_H = 20
+_GRID_GAP_NAME_TO_META = 4
+_GRID_META_LINE_H = 16
+_GRID_GAP_BETWEEN_META_LINES = 4
+_GRID_META_PAD_BOTTOM = 16  # breathing below last meta line when no department status pill
+_GRID_GAP_META_TO_PILL = 4
+_GRID_META_PAD_BOTTOM_WITH_PILL = 20  # breathing below status pill row
+
+
+def _grid_status_pill_line_height(fm: QFontMetrics) -> int:
+    return max(16, fm.height() + 4)
+
+
+def _grid_asset_shot_meta_text_block_height(n_lines: int) -> int:
+    """Combined height of n mono meta lines (0..4) under the title, including gaps between lines."""
+    if n_lines <= 0:
+        return 0
+    return n_lines * _GRID_META_LINE_H + (n_lines - 1) * _GRID_GAP_BETWEEN_META_LINES
+
+
+def _grid_asset_shot_meta_head_to_first_line() -> int:
+    """Distance from thumb.bottom() to top of first optional meta line."""
+    return _GRID_META_PAD_TOP + _GRID_NAME_LINE_H + _GRID_GAP_NAME_TO_META
+
+
+def _grid_asset_shot_y_pills_offset_from_thumb_bottom(*, n_meta_lines: int) -> int:
+    """Distance from thumb.bottom() to top of production-status pill row."""
+    return _grid_asset_shot_meta_head_to_first_line() + _grid_asset_shot_meta_text_block_height(n_meta_lines) + _GRID_GAP_META_TO_PILL
+
+
+def grid_card_meta_block_height_project() -> int:
+    """Meta block under thumb for project cards (name + stats line + padding)."""
+    return (
+        _GRID_META_PAD_TOP
+        + _GRID_NAME_LINE_H
+        + _GRID_GAP_NAME_TO_META
+        + _GRID_META_LINE_H
+        + _GRID_META_PAD_BOTTOM
+    )
+
+
+def grid_card_meta_block_height_asset_shot(
+    *,
+    n_meta_lines: int,
+    show_department_status_pill: bool,
+    pill_font_metrics: QFontMetrics | None = None,
+) -> int:
+    """
+    Meta block under thumb for asset/shot tiles: optional mono lines (ID/version, last updated,
+    current department) + optional production-status pill. All cards share one height.
+    """
+    head = _grid_asset_shot_meta_head_to_first_line()
+    text_h = _grid_asset_shot_meta_text_block_height(n_meta_lines)
+    if not show_department_status_pill:
+        return head + text_h + _GRID_META_PAD_BOTTOM
+    pill_h = (
+        _grid_status_pill_line_height(pill_font_metrics)
+        if pill_font_metrics is not None
+        else 22
+    )
+    return head + text_h + _GRID_GAP_META_TO_PILL + pill_h + _GRID_META_PAD_BOTTOM_WITH_PILL
+
+
+def tile_grid_meta_line_count(
+    *,
+    show_id: bool,
+    show_version: bool,
+    show_last_updated: bool,
+    show_latest_note: bool,
+    show_current_department: bool,
+    active_department: str | None,
+) -> int:
+    """How many mono meta lines to reserve under the title on asset/shot tiles (0..4)."""
+    n = 0
+    if show_id or show_version:
+        n += 1
+    if show_last_updated:
+        n += 1
+    if show_latest_note:
+        n += 1
+    if show_current_department and (active_department or "").strip():
+        n += 1
+    return n
+
 
 # Lucide icon names for type/department thumb badges (icon-only, no text).
 _TYPE_ICON_MAP: dict[str, str] = {
@@ -249,6 +343,470 @@ def _item_has_work_for_department(ref: Asset | Shot, active_department: str | No
     return False
 
 
+def _item_has_work_folder_for_department(ref: Asset | Shot, active_department: str | None) -> bool:
+    """True if the department work folder exists on disk (Department.work_exists from scan)."""
+    dep_cf = (active_department or "").strip().casefold()
+    if not dep_cf:
+        return False
+    for d in getattr(ref, "departments", ()) or ():
+        if (d.name or "").strip().casefold() != dep_cf:
+            continue
+        if getattr(d, "work_exists", False):
+            return True
+    return False
+
+
+_THUMB_HEALTH_ICON_PX = 14
+_THUMB_HEALTH_CHIP_PAD_PX = 4
+_ITEM_HEALTH_COLORS: dict[str, str] = {
+    "ok": MONOS_COLORS["emerald_500"],
+    "warn": MONOS_COLORS["amber_500"],
+    "error": MONOS_COLORS["red_500"],
+}
+
+
+class HealthIssue(NamedTuple):
+    level: Literal["ok", "warn", "error"]
+    title: str
+    detail: str
+    bad_files: tuple[str, ...] = ()
+    bad_files_wrong_name: tuple[str, ...] = ()
+    bad_files_wrong_ext: tuple[str, ...] = ()
+    issue_id: str = ""
+
+
+class ItemHealth(NamedTuple):
+    level: Literal["ok", "warn", "error"]
+    icon_name: str
+    color_hex: str
+    issues: tuple[HealthIssue, ...]
+
+
+def _department_for_item(ref: Asset | Shot, active_department: str) -> Department | None:
+    dep_cf = (active_department or "").strip().casefold()
+    if not dep_cf:
+        return None
+    for d in getattr(ref, "departments", ()) or ():
+        if (d.name or "").strip().casefold() == dep_cf:
+            return d
+    return None
+
+
+def _workfile_extensions_set() -> frozenset[str]:
+    exts: set[str] = set()
+    try:
+        reg = get_default_dcc_registry()
+        for dcc_id in reg.get_all_dccs():
+            try:
+                info = reg.get_dcc_info(dcc_id)
+            except Exception:
+                continue
+            raw = info.get("workfile_extensions") if isinstance(info, dict) else None
+            if not isinstance(raw, list):
+                continue
+            for ext in raw:
+                if isinstance(ext, str) and ext.strip().startswith("."):
+                    exts.add(ext.strip().lower())
+    except Exception:
+        pass
+    return frozenset(exts)
+
+
+def _work_paths_for_department(ref: Asset | Shot, dept: Department) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    dep_cf = (dept.name or "").strip().casefold()
+
+    def add(p: Path | None) -> None:
+        if p is None:
+            return
+        try:
+            key = str(p.resolve()).casefold()
+        except OSError:
+            key = str(p).casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        if p.is_dir():
+            paths.append(p)
+
+    add(Path(dept.work_path))
+    for (dept_id, _dcc_id), state in getattr(ref, "dcc_work_states", ()) or ():
+        if (dept_id or "").strip().casefold() != dep_cf:
+            continue
+        wfp = getattr(state, "work_file_path", None)
+        if isinstance(wfp, Path):
+            add(wfp.parent)
+    return paths
+
+
+def _invalid_work_files_split_in_folder(
+    work_path: Path,
+    prefix: str,
+    work_exts: frozenset[str],
+) -> tuple[list[Path], list[Path]]:
+    """
+    Files in work folder that look like work files but fail convention.
+    Returns (wrong_name, wrong_ext): wrong_ext = starts with prefix but extension not a work DCC ext.
+    """
+    name_bad: list[Path] = []
+    ext_bad: list[Path] = []
+    if not prefix or not work_path.is_dir():
+        return name_bad, ext_bad
+    try:
+        entries = list(work_path.iterdir())
+    except OSError:
+        return name_bad, ext_bad
+    for p in entries:
+        if not p.is_file():
+            continue
+        ext_lower = (p.suffix or "").lower()
+        starts = p.name.startswith(prefix)
+        if not (starts or ext_lower in work_exts):
+            continue
+        matched = False
+        if ext_lower in work_exts:
+            if _parse_workfile_version(p.name, prefix, ext_lower) is not None:
+                matched = True
+            elif p.name == prefix + ext_lower:
+                matched = True
+        if matched:
+            continue
+        if starts and ext_lower not in work_exts:
+            ext_bad.append(p)
+        else:
+            name_bad.append(p)
+    return name_bad, ext_bad
+
+
+def _invalid_work_files_in_folder(
+    work_path: Path,
+    prefix: str,
+    work_exts: frozenset[str],
+) -> list[Path]:
+    a, b = _invalid_work_files_split_in_folder(work_path, prefix, work_exts)
+    merged = a + b
+    merged.sort(key=lambda path: path.name.casefold())
+    return merged
+
+
+def _split_invalid_work_files_for_department(
+    ref: Asset | Shot,
+    dept: Department,
+    prefix: str,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Returns (all paths, wrong_name paths, wrong_ext paths) as strings, deduped."""
+    work_exts = _workfile_extensions_set()
+    seen: set[str] = set()
+    name_paths: list[str] = []
+    ext_paths: list[str] = []
+
+    def add_unique(lst: list[str], p: Path) -> None:
+        try:
+            key = str(p.resolve()).casefold()
+        except OSError:
+            key = str(p).casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        lst.append(str(p))
+
+    for wp in _work_paths_for_department(ref, dept):
+        n_bad, e_bad = _invalid_work_files_split_in_folder(wp, prefix, work_exts)
+        for p in n_bad:
+            add_unique(name_paths, p)
+        for p in e_bad:
+            add_unique(ext_paths, p)
+    name_paths.sort(key=lambda s: Path(s).name.casefold())
+    ext_paths.sort(key=lambda s: Path(s).name.casefold())
+    all_paths = sorted(set(name_paths) | set(ext_paths), key=lambda s: Path(s).name.casefold())
+    return tuple(all_paths), tuple(name_paths), tuple(ext_paths)
+
+
+def _assess_work_naming_in_folder(
+    work_path: Path,
+    prefix: str,
+    work_exts: frozenset[str],
+) -> Literal["ok", "warn", "error"]:
+    if not prefix or not work_path.is_dir():
+        return "ok"
+    valid = 0
+    suspect = 0
+    try:
+        entries = list(work_path.iterdir())
+    except OSError:
+        return "ok"
+    for p in entries:
+        if not p.is_file():
+            continue
+        ext_lower = (p.suffix or "").lower()
+        is_candidate = p.name.startswith(prefix) or ext_lower in work_exts
+        if not is_candidate:
+            continue
+        matched = False
+        if ext_lower in work_exts:
+            if _parse_workfile_version(p.name, prefix, ext_lower) is not None:
+                matched = True
+            elif p.name == prefix + ext_lower:
+                matched = True
+        if matched:
+            valid += 1
+        else:
+            suspect += 1
+    if suspect > 0 and valid == 0:
+        return "error"
+    if suspect > 0:
+        return "warn"
+    return "ok"
+
+
+def _assess_work_naming_for_department(
+    ref: Asset | Shot,
+    dept: Department,
+    prefix: str,
+) -> Literal["ok", "warn", "error"]:
+    work_exts = _workfile_extensions_set()
+    worst: Literal["ok", "warn", "error"] = "ok"
+    for wp in _work_paths_for_department(ref, dept):
+        level = _assess_work_naming_in_folder(wp, prefix, work_exts)
+        if level == "error":
+            return "error"
+        if level == "warn":
+            worst = "warn"
+    return worst
+
+
+def _latest_work_mtime_for_department(
+    ref: Asset | Shot,
+    active_department: str,
+    *,
+    active_dcc_id: str | None = None,
+) -> float | None:
+    dep_cf = (active_department or "").strip().casefold()
+    if not dep_cf:
+        return None
+    best: float | None = None
+    dcc_cf = (active_dcc_id or "").strip().casefold() if active_dcc_id else None
+    for (dept_id, dcc_id), state in getattr(ref, "dcc_work_states", ()) or ():
+        if (dept_id or "").strip().casefold() != dep_cf:
+            continue
+        if dcc_cf and (dcc_id or "").strip().casefold() != dcc_cf:
+            continue
+        wp = getattr(state, "work_file_path", None)
+        if not isinstance(wp, Path) or not wp.is_file():
+            continue
+        try:
+            ts = wp.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or ts > best:
+            best = ts
+    return best
+
+
+def _latest_publish_mtime_for_department(ref: Asset | Shot, active_department: str) -> float | None:
+    pub = _resolve_latest_publish_folder(ref, active_department)
+    if pub is None or not pub.exists():
+        return None
+    try:
+        best = pub.stat().st_mtime
+    except OSError:
+        return None
+    try:
+        for ch in pub.iterdir():
+            try:
+                best = max(best, ch.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return best
+
+
+def _latest_work_file_path_for_department(
+    ref: Asset | Shot,
+    active_department: str,
+    *,
+    active_dcc_id: str | None = None,
+) -> Path | None:
+    dep_cf = (active_department or "").strip().casefold()
+    if not dep_cf:
+        return None
+    best_path: Path | None = None
+    best_ts: float | None = None
+    dcc_cf = (active_dcc_id or "").strip().casefold() if active_dcc_id else None
+    for (dept_id, dcc_id), state in getattr(ref, "dcc_work_states", ()) or ():
+        if (dept_id or "").strip().casefold() != dep_cf:
+            continue
+        if dcc_cf and (dcc_id or "").strip().casefold() != dcc_cf:
+            continue
+        wp = getattr(state, "work_file_path", None)
+        if not isinstance(wp, Path) or not wp.is_file():
+            continue
+        try:
+            ts = wp.stat().st_mtime
+        except OSError:
+            continue
+        if best_ts is None or ts >= best_ts:
+            best_ts = ts
+            best_path = wp
+    return best_path
+
+
+def assess_view_item_health(
+    ref: Asset | Shot,
+    active_department: str | None,
+    *,
+    active_dcc_id: str | None = None,
+) -> ItemHealth | None:
+    """
+    Item health for the focused department: work file, publish, naming, work vs publish mtime.
+    ok = green heart; warn/error = triangle-alert (amber/red).
+    """
+    dep = (active_department or "").strip()
+    if not dep:
+        return None
+    dept = _department_for_item(ref, dep)
+    if dept is None:
+        return None
+
+    issues: list[HealthIssue] = []
+    prefix = work_file_prefix(name=ref.name, department=dept.name)
+    has_work = _item_has_work_for_department(ref, dep)
+    has_publish = _item_has_publish_for_department(ref, dep)
+    work_path = _latest_work_file_path_for_department(ref, dep, active_dcc_id=active_dcc_id)
+    work_ts = _latest_work_mtime_for_department(ref, dep, active_dcc_id=active_dcc_id)
+    pub_ts = _latest_publish_mtime_for_department(ref, dep)
+    pub_folder = _resolve_latest_publish_folder(ref, dep)
+
+    if has_work:
+        work_detail = str(work_path) if work_path else "Work file present"
+        if work_ts is not None:
+            work_detail = f"{work_detail}\nModified: {_format_mtime(work_ts)}"
+        issues.append(HealthIssue("ok", "Work file", work_detail))
+    else:
+        issues.append(HealthIssue("warn", "Work file", "No work file found for this department."))
+
+    if has_publish:
+        pub_detail = str(pub_folder) if pub_folder else "Publish version present"
+        if pub_ts is not None:
+            pub_detail = f"{pub_detail}\nModified: {_format_mtime(pub_ts)}"
+        issues.append(HealthIssue("ok", "Publish", pub_detail))
+    elif has_work:
+        issues.append(HealthIssue("warn", "Publish", "No publish version yet."))
+    else:
+        issues.append(HealthIssue("ok", "Publish", "No publish required until work exists."))
+
+    if getattr(dept, "work_exists", False) or _work_paths_for_department(ref, dept):
+        naming = _assess_work_naming_for_department(ref, dept, prefix)
+        bad_all, bad_name, bad_ext = _split_invalid_work_files_for_department(ref, dept, prefix)
+        expected = f"{prefix}_v###"
+        work_exts = _workfile_extensions_set()
+        ext_hint = ", ".join(sorted(work_exts)[:6])
+        if len(work_exts) > 6:
+            ext_hint += ", …"
+        if naming == "error":
+            detail = f"Files in work folder must match {expected} (plus a registered work extension).\n"
+            if bad_name and bad_ext:
+                detail += "Some entries have invalid names; others use a non-work extension."
+            elif bad_ext:
+                detail += f"Non-work extensions (not in DCC registry: {ext_hint}) can be removed with Clean."
+            else:
+                detail += "Use Fix name to rename files that use a work extension but the wrong stem or version."
+            issues.append(
+                HealthIssue(
+                    "error",
+                    "Work file naming",
+                    detail,
+                    bad_all,
+                    bad_name,
+                    bad_ext,
+                    "work_file_naming",
+                )
+            )
+        elif naming == "warn":
+            detail = (
+                f"Some files do not match {expected}; check for typos or autosaves.\n"
+                f"Registered work extensions include {ext_hint}."
+            )
+            issues.append(
+                HealthIssue(
+                    "warn",
+                    "Work file naming",
+                    detail,
+                    bad_all,
+                    bad_name,
+                    bad_ext,
+                    "work_file_naming",
+                )
+            )
+        else:
+            issues.append(
+                HealthIssue(
+                    "ok",
+                    "Work file naming",
+                    f"Work files follow {expected}.",
+                    issue_id="work_file_naming",
+                )
+            )
+
+    if has_work and has_publish and work_ts is not None and pub_ts is not None:
+        if work_ts > pub_ts:
+            issues.append(
+                HealthIssue(
+                    "warn",
+                    "Modified dates",
+                    (
+                        f"Work is newer than the latest publish.\n"
+                        f"Work: {_format_mtime(work_ts)}\n"
+                        f"Publish: {_format_mtime(pub_ts)}"
+                    ),
+                )
+            )
+        else:
+            issues.append(
+                HealthIssue(
+                    "ok",
+                    "Modified dates",
+                    (
+                        f"Publish is up to date with work.\n"
+                        f"Work: {_format_mtime(work_ts)}\n"
+                        f"Publish: {_format_mtime(pub_ts)}"
+                    ),
+                )
+            )
+
+    if any(i.level == "error" for i in issues):
+        level: Literal["ok", "warn", "error"] = "error"
+    elif any(i.level == "warn" for i in issues):
+        level = "warn"
+    else:
+        level = "ok"
+
+    if level == "ok":
+        return ItemHealth(
+            level="ok",
+            icon_name="heart",
+            color_hex=_ITEM_HEALTH_COLORS["ok"],
+            issues=tuple(issues),
+        )
+    return ItemHealth(
+        level=level,
+        icon_name="triangle-alert",
+        color_hex=_ITEM_HEALTH_COLORS[level],
+        issues=tuple(issues),
+    )
+
+
+def _item_health_tooltip_text(health: ItemHealth) -> str:
+    if health.level == "ok":
+        return "Healthy — click for details"
+    lines = [i.title for i in health.issues if i.level != "ok"]
+    if not lines:
+        return "Issues detected — click for details"
+    return "\n".join(f"• {t}" for t in lines)
+
+
 def _resolve_work_files_for_drag(ref: Asset | Shot, active_department: str | None) -> list[Path]:
     """Work file path(s) for drag in work mode; only actual files from dcc_work_states."""
     dep = (active_department or "").strip().casefold()
@@ -376,6 +934,98 @@ def _resolve_latest_publish_folder(ref: Asset | Shot, active_department: str | N
     if not ver:
         return None
     return Path(dept.publish_path) / ver
+
+
+def _format_mtime(ts: float) -> str:
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "—"
+
+
+def _mtime_display_for_path(path: Path) -> str:
+    try:
+        if path.is_dir() or path.is_file():
+            mtime = path.stat().st_mtime
+        else:
+            return "—"
+    except OSError:
+        return "—"
+    return _format_mtime(mtime)
+
+
+def _mtime_display_for_publish_version_folder(folder: Path) -> str:
+    """Use folder and immediate children mtimes so updates inside the publish drop show."""
+    try:
+        best = folder.stat().st_mtime
+    except OSError:
+        return "—"
+    try:
+        for ch in folder.iterdir():
+            try:
+                t = ch.stat().st_mtime
+                if t > best:
+                    best = t
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return _format_mtime(best)
+
+
+def _view_item_mtime_sort_ts(
+    item: ViewItem,
+    *,
+    show_publish: bool,
+    active_department: str | None,
+) -> float:
+    """Numeric mtime for sort-by-date (same sources as last-updated display)."""
+    ref = item.ref
+    if show_publish and isinstance(ref, (Asset, Shot)):
+        pub = _resolve_latest_publish_folder(ref, active_department)
+        if pub is None or not pub.exists():
+            return 0.0
+        try:
+            best = pub.stat().st_mtime
+        except OSError:
+            return 0.0
+        try:
+            for ch in pub.iterdir():
+                try:
+                    best = max(best, ch.stat().st_mtime)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return best
+    path = getattr(item, "path", None)
+    if not path or not isinstance(path, Path):
+        return 0.0
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _view_item_last_updated_display(
+    item: ViewItem,
+    *,
+    show_publish: bool,
+    active_department: str | None,
+) -> str:
+    """Last updated for list/tile meta: asset/shot root in Work mode, latest publish version folder in Published."""
+    ref = item.ref
+    if show_publish and isinstance(ref, (Asset, Shot)):
+        pub = _resolve_latest_publish_folder(ref, active_department)
+        if pub is None or not pub.exists():
+            return "—"
+        return _mtime_display_for_publish_version_folder(pub)
+    path = getattr(item, "path", None)
+    if not path or not isinstance(path, Path):
+        return "—"
+    return _mtime_display_for_path(path)
 
 
 def _resolve_publish_root_folder(ref: Asset | Shot, active_department: str | None) -> Path | None:
@@ -518,18 +1168,176 @@ def _thumb_badge_rects(cell_rect: QRect, gap_px: int, has_dept: bool) -> tuple[Q
     return type_rect, dept_rect
 
 
-def _thumb_status_dot_rect(cell_rect: QRect, gap_px: int) -> QRect:
-    """Compute status dot rect (matches grid delegate layout). Used for tooltip hit-test."""
-    r = cell_rect.adjusted(0, 0, -gap_px, -gap_px)
+def _thumb_rect_from_cell(cell_rect: QRect, gap_px: int) -> QRect:
+    """16:9 thumb rect inside a grid cell (1px card border; matches health hit-test geometry)."""
+    g = max(0, int(gap_px))
+    r = cell_rect.adjusted(0, 0, -g, -g)
     border_px = 1
     inner = r.adjusted(border_px, border_px, -border_px, -border_px)
     thumb_w = inner.width()
     thumb_h = max(1, int(thumb_w * 9 / 16))
-    thumb = QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
-    dot_radius = 5
-    dot_x = thumb.right() - 12 - dot_radius
-    dot_y = thumb.top() + 12 + dot_radius
-    return QRect(dot_x - dot_radius, dot_y - dot_radius, dot_radius * 2, dot_radius * 2)
+    return QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
+
+
+def _thumb_health_chip_rect(cell_rect: QRect, gap_px: int) -> QRect:
+    """Top-right health icon chip on thumb (matches grid delegate layout). Used for tooltip hit-test."""
+    thumb = _thumb_rect_from_cell(cell_rect, gap_px)
+    chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+    return QRect(thumb.right() - 12 - chip, thumb.top() + 12, chip, chip)
+
+
+def _thumb_note_chip_rect(thumb: QRect, health_chip_rect: QRect | None) -> QRect:
+    """Notes chip to the left of the health chip when present; else same slot as health (top-right)."""
+    chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+    gap = 4
+    if health_chip_rect is not None:
+        return QRect(health_chip_rect.left() - gap - chip, health_chip_rect.top(), chip, chip)
+    return QRect(thumb.right() - 12 - chip, thumb.top() + 12, chip, chip)
+
+
+def _list_thumb_dest_rect(cell_rect: QRect, icon: QIcon) -> QRect | None:
+    """Thumbnail pixmap rect inside list thumb column (matches _ListRowDelegate.paint)."""
+    if icon.isNull():
+        return None
+    cell_h = max(24, cell_rect.height() - 8)
+    cell_w = max(24, cell_rect.width() - 8)
+    actual = icon.actualSize(QSize(cell_w, cell_h))
+    pw = actual.width() or cell_h * 2
+    ph = actual.height() or cell_h * 2
+    pix = icon.pixmap(pw, ph)
+    if pix.isNull() or pix.width() <= 0 or pix.height() <= 0:
+        return None
+    scale = cell_h / pix.height()
+    scaled_w = int(pix.width() * scale)
+    dest_h = cell_h
+    dest_w = min(scaled_w, cell_w)
+    x = cell_rect.x() + (cell_rect.width() - dest_w) // 2
+    y = cell_rect.y() + (cell_rect.height() - dest_h) // 2
+    return QRect(x, y, dest_w, dest_h)
+
+
+def _list_health_chip_rect(cell_rect: QRect) -> QRect:
+    """Centered health icon chip in list Health column."""
+    chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+    return QRect(
+        cell_rect.left() + max(0, (cell_rect.width() - chip) // 2),
+        cell_rect.top() + max(0, (cell_rect.height() - chip) // 2),
+        chip,
+        chip,
+    )
+
+
+def _paint_health_icon_chip(
+    painter: QPainter,
+    chip_rect: QRect,
+    health: ItemHealth,
+    *,
+    hovered: bool,
+) -> None:
+    chip_bg = QColor(0, 0, 0, 220 if hovered else 168)
+    if hovered:
+        ring = QColor(health.color_hex)
+        ring.setAlpha(230)
+        painter.setPen(QPen(ring, 2))
+    else:
+        painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(chip_bg)
+    painter.drawEllipse(chip_rect)
+    icon_px = _THUMB_HEALTH_ICON_PX + (2 if hovered else 0)
+    icon = lucide_icon(health.icon_name, size=icon_px, color_hex=health.color_hex)
+    pix = icon.pixmap(icon_px, icon_px)
+    if not pix.isNull():
+        pad = max(2, _THUMB_HEALTH_CHIP_PAD_PX - (1 if hovered else 0))
+        dest = chip_rect.adjusted(pad, pad, -pad, -pad)
+        painter.drawPixmap(dest, pix)
+
+
+def _notes_badge_tooltip_text(open_n: int, visual_mode: str) -> str:
+    if visual_mode == "open" or open_n > 0:
+        return f"Notes ({open_n} open)"
+    if visual_mode == "all_done":
+        return "Notes (all completed)"
+    return "Notes"
+
+
+def _paint_note_icon_chip(
+    painter: QPainter,
+    chip_rect: QRect,
+    open_count: int,
+    *,
+    visual_mode: str = "empty",
+    hovered: bool,
+) -> None:
+    """Notes on thumb: empty=muted; open=yellow+red count; all_done=green (history, none open)."""
+    icon_name = "message-circle"
+    if open_count > 0 or visual_mode == "open":
+        chip_bg = QColor(234, 179, 8, 235 if hovered else 215)
+        if hovered:
+            ring = QColor(255, 255, 255, 140)
+            painter.setPen(QPen(ring, 2))
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(chip_bg)
+        painter.drawEllipse(chip_rect)
+        icon_px = _THUMB_HEALTH_ICON_PX + (2 if hovered else 0)
+        icon = lucide_icon(icon_name, size=icon_px, color_hex="#18181b")
+        pix = icon.pixmap(icon_px, icon_px)
+        if not pix.isNull():
+            pad = max(2, _THUMB_HEALTH_CHIP_PAD_PX - (1 if hovered else 0))
+            dest = chip_rect.adjusted(pad, pad, -pad, -pad)
+            painter.drawPixmap(dest, pix)
+        label = "9+" if open_count > 9 else str(open_count)
+        bf = monos_font("Inter", 9, QFont.Weight.Bold)
+        painter.setFont(bf)
+        fm = QFontMetrics(bf)
+        pill_w = max(15, fm.horizontalAdvance(label) + 6)
+        pill_h = max(15, fm.height())
+        bx = chip_rect.right() - pill_w + 5
+        by = chip_rect.top() - max(2, pill_h // 2 - 2)
+        badge = QRect(bx, by, pill_w, pill_h)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#dc2626"))
+        painter.drawRoundedRect(badge, 999, 999)
+        painter.setPen(QColor("#fafafa"))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
+        return
+
+    if visual_mode == "all_done":
+        em = QColor(MONOS_COLORS.get("emerald_500", "#10b981"))
+        chip_bg = QColor(em)
+        chip_bg.setAlpha(230 if hovered else 200)
+        if hovered:
+            ring = QColor(255, 255, 255, 130)
+            painter.setPen(QPen(ring, 2))
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(chip_bg)
+        painter.drawEllipse(chip_rect)
+        icon_px = _THUMB_HEALTH_ICON_PX + (2 if hovered else 0)
+        icon = lucide_icon(icon_name, size=icon_px, color_hex="#fafafa")
+        pix = icon.pixmap(icon_px, icon_px)
+        if not pix.isNull():
+            pad = max(2, _THUMB_HEALTH_CHIP_PAD_PX - (1 if hovered else 0))
+            dest = chip_rect.adjusted(pad, pad, -pad, -pad)
+            painter.drawPixmap(dest, pix)
+        return
+
+    chip_bg = QColor(0, 0, 0, 220 if hovered else 168)
+    if hovered:
+        ring = QColor(MONOS_COLORS.get("text_meta", "#a1a1aa"))
+        ring.setAlpha(200)
+        painter.setPen(QPen(ring, 2))
+    else:
+        painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(chip_bg)
+    painter.drawEllipse(chip_rect)
+    icon_px = _THUMB_HEALTH_ICON_PX + (2 if hovered else 0)
+    icon = lucide_icon(icon_name, size=icon_px, color_hex=MONOS_COLORS.get("text_meta", "#a1a1aa"))
+    pix = icon.pixmap(icon_px, icon_px)
+    if not pix.isNull():
+        pad = max(2, _THUMB_HEALTH_CHIP_PAD_PX - (1 if hovered else 0))
+        dest = chip_rect.adjusted(pad, pad, -pad, -pad)
+        painter.drawPixmap(dest, pix)
 
 
 def _overall_status_paint_key_for_item(
@@ -802,6 +1610,7 @@ def _grid_status_pill_department_at(
     active_department: str | None,
     project_root: str | None,
     hidden_departments: set[str],
+    n_meta_lines: int,
 ) -> str | None:
     """Hit-test production status pill on grid card (only when a sidebar department is focused)."""
     if not project_root:
@@ -820,11 +1629,9 @@ def _grid_status_pill_department_at(
     thumb_w = inner.width()
     thumb_h = max(1, int(thumb_w * 9 / 16))
     thumb = QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
-    y = thumb.bottom() + 16
+    y_pills = thumb.bottom() + _grid_asset_shot_y_pills_offset_from_thumb_bottom(n_meta_lines=n_meta_lines)
     x = inner.left() + 16
     w = inner.width() - 32
-    y_meta = y + 24
-    y_pills = y_meta + 16 + 4
     if pos.y() < y_pills:
         return None
 
@@ -1216,11 +2023,25 @@ class _ListRowDelegate(QStyledItemDelegate):
         self._main_view = main_view  # MainView: for _active_department, _show_publish, _list_col_dcc
         self._active_project_root: str | None = None
         self._hovered_status_row: int | None = None
+        self._hovered_health_row: int | None = None
+        self._hovered_notes_row: int | None = None
 
     def set_hovered_status_row(self, row: int | None) -> None:
         if self._hovered_status_row == row:
             return
         self._hovered_status_row = row
+        self._view.viewport().update()
+
+    def set_hovered_health_row(self, row: int | None) -> None:
+        if self._hovered_health_row == row:
+            return
+        self._hovered_health_row = row
+        self._view.viewport().update()
+
+    def set_hovered_notes_row(self, row: int | None) -> None:
+        if self._hovered_notes_row == row:
+            return
+        self._hovered_notes_row = row
         self._view.viewport().update()
 
     def set_active_project_root(self, path: str | None) -> None:
@@ -1252,6 +2073,16 @@ class _ListRowDelegate(QStyledItemDelegate):
                 if lw > 0:
                     return QSize(max(base.width(), lw), max(base.height(), chip_h))
                 return QSize(max(base.width(), 120), max(base.height(), chip_h))
+        list_col_notes = main._list_col_notes() if hasattr(main, "_list_col_notes") else -1
+        if col == list_col_notes and list_col_notes >= 0:
+            chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+            base = super().sizeHint(option, index)
+            return QSize(max(base.width(), chip + 12), max(base.height(), chip + 8))
+        list_col_health = main._list_col_health() if hasattr(main, "_list_col_health") else -1
+        if col == list_col_health and list_col_health >= 0:
+            chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+            base = super().sizeHint(option, index)
+            return QSize(max(base.width(), chip + 12), max(base.height(), chip + 8))
         return super().sizeHint(option, index)
 
     def paint(self, painter: QPainter, option, index) -> None:
@@ -1327,34 +2158,117 @@ class _ListRowDelegate(QStyledItemDelegate):
         # Thumbnail column (col 1): draw icon crop-fit to row height (fill height, center-crop width)
         if col == 1:
             icon = index.data(Qt.DecorationRole)
+            dest: QRect | None = None
+            painted_pix = False
             if isinstance(icon, QIcon) and not icon.isNull():
-                cell_h = max(24, option.rect.height() - 8)
-                cell_w = max(24, option.rect.width() - 8)
-                # Request pixmap large enough for scaling; use actualSize if available
-                actual = icon.actualSize(QSize(cell_w, cell_h))
-                pw = actual.width() or cell_h * 2
-                ph = actual.height() or cell_h * 2
-                pix = icon.pixmap(pw, ph)
-                if not pix.isNull() and pix.width() > 0 and pix.height() > 0:
-                    # Scale to fill height; crop width to cell if needed (center crop)
-                    scale = cell_h / pix.height()
-                    scaled_w = int(pix.width() * scale)
-                    dest_h = cell_h
-                    dest_w = min(scaled_w, cell_w)
-                    src_h = pix.height()
-                    src_w = int(pix.width() * dest_w / scaled_w) if scaled_w > 0 else pix.width()
-                    src_x = (pix.width() - src_w) // 2
-                    src_y = 0
-                    x = option.rect.x() + (option.rect.width() - dest_w) // 2
-                    y = option.rect.y() + (option.rect.height() - dest_h) // 2
-                    painter.drawPixmap(
-                        QRect(x, y, dest_w, dest_h),
-                        pix,
-                        QRect(src_x, src_y, src_w, src_h),
+                dest = _list_thumb_dest_rect(option.rect, icon)
+                if dest is not None:
+                    cell_h = max(24, option.rect.height() - 8)
+                    cell_w = max(24, option.rect.width() - 8)
+                    actual = icon.actualSize(QSize(cell_w, cell_h))
+                    pw = actual.width() or cell_h * 2
+                    ph = actual.height() or cell_h * 2
+                    pix = icon.pixmap(pw, ph)
+                    if not pix.isNull() and pix.width() > 0 and pix.height() > 0:
+                        scale = cell_h / pix.height()
+                        scaled_w = int(pix.width() * scale)
+                        dest_h = cell_h
+                        dest_w = min(scaled_w, cell_w)
+                        src_h = pix.height()
+                        src_w = int(pix.width() * dest_w / scaled_w) if scaled_w > 0 else pix.width()
+                        src_x = (pix.width() - src_w) // 2
+                        src_y = 0
+                        x = option.rect.x() + (option.rect.width() - dest_w) // 2
+                        y = option.rect.y() + (option.rect.height() - dest_h) // 2
+                        painter.drawPixmap(
+                            QRect(x, y, dest_w, dest_h),
+                            pix,
+                            QRect(src_x, src_y, src_w, src_h),
+                        )
+                        painted_pix = True
+
+            item = index.data(Qt.UserRole)
+            if painted_pix:
+                return
+            super().paint(painter, option, index)
+            return
+
+        list_col_notes = main._list_col_notes() if hasattr(main, "_list_col_notes") else -1
+        if (
+            col == list_col_notes
+            and list_col_notes >= 0
+            and getattr(main, "_browser_context", "") in ("asset", "shot")
+        ):
+            item = index.data(Qt.UserRole)
+            if (
+                isinstance(item, ViewItem)
+                and isinstance(item.ref, (Asset, Shot))
+                and getattr(item, "path", None)
+            ):
+                n, nmode = (0, "empty")
+                if hasattr(main, "notes_badge_state"):
+                    try:
+                        n, nmode = main.notes_badge_state(item.path)  # type: ignore[attr-defined]
+                    except Exception:
+                        n, nmode = 0, "empty"
+                painter.save()
+                try:
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                    opt = QStyleOptionViewItem(option)
+                    self.initStyleOption(opt, index)
+                    opt.text = ""
+                    opt.icon = QIcon()
+                    self._view.style().drawControl(
+                        QStyle.ControlElement.CE_ItemViewItem, opt, painter, self._view
                     )
+                    chip_rect = _list_health_chip_rect(option.rect)
+                    _paint_note_icon_chip(
+                        painter,
+                        chip_rect,
+                        n,
+                        visual_mode=nmode,
+                        hovered=self._hovered_notes_row == index.row(),
+                    )
+                finally:
+                    painter.restore()
                 return
 
-        # Status column (asset/shot): production pill like grid when sidebar department is focused.
+        list_col_health = main._list_col_health() if hasattr(main, "_list_col_health") else -1
+        if (
+            col == list_col_health
+            and list_col_health >= 0
+            and getattr(main, "_browser_context", "") in ("asset", "shot")
+        ):
+            dep = (active_dep or "").strip()
+            if dep and isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
+                active_dcc = (
+                    _item_active_dcc(getattr(item, "path", None), dep)
+                    if getattr(item, "path", None)
+                    else None
+                )
+                health = assess_view_item_health(
+                    item.ref, dep, active_dcc_id=active_dcc
+                )
+                if health is not None:
+                    painter.save()
+                    try:
+                        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                        opt = QStyleOptionViewItem(option)
+                        self.initStyleOption(opt, index)
+                        opt.text = ""
+                        opt.icon = QIcon()
+                        self._view.style().drawControl(
+                            QStyle.ControlElement.CE_ItemViewItem, opt, painter, self._view
+                        )
+                        chip_rect = _list_health_chip_rect(option.rect)
+                        health_hover = self._hovered_health_row == index.row()
+                        _paint_health_icon_chip(
+                            painter, chip_rect, health, hovered=health_hover
+                        )
+                    finally:
+                        painter.restore()
+                    return
+
         list_col_status = main._list_col_status() if hasattr(main, "_list_col_status") else -1
         if (
             col == list_col_status
@@ -1437,11 +2351,14 @@ class _GridCardDelegate(QStyledItemDelegate):
     - Version + ID (JetBrains Mono)
     """
 
-    def __init__(self, *, view: QListView) -> None:
+    def __init__(self, *, view: QListView, main_view: QWidget | None = None) -> None:
         super().__init__(view)
         self._view = view
+        self._main_view = main_view
         self._hovered_row: int | None = None
         self._hovered_pill_row: int | None = None
+        self._hovered_health_row: int | None = None
+        self._hovered_notes_row: int | None = None
         self._card_size = QSize(320, 260)
         self._gap_px = 24
         self._active_department: str | None = None
@@ -1452,6 +2369,13 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._active_dcc_cache: dict[str, str] = {}  # "item_path|department" -> dcc_id
         self._inspector_hidden_departments: frozenset[str] = frozenset()
         self._show_dept_chips: bool = False
+        self._tile_meta_show_id: bool = True
+        self._tile_meta_show_version: bool = True
+        self._tile_meta_show_last_updated: bool = False
+        self._tile_meta_show_latest_note: bool = False
+        self._tile_meta_show_current_department: bool = False
+        self._tile_meta_show_status_pill: bool = True
+        self._active_department_label: str | None = None  # pipeline label for tile meta + header
 
         # Theme cache (no per-paint parsing / allocations)
         self._c_card_bg = QColor(MONOS_COLORS["card_bg"])
@@ -1482,6 +2406,9 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._icon_eye = lucide_icon("eye", size=16, color_hex=MONOS_COLORS["text_primary"])
         self._icon_download = lucide_icon("download", size=16, color_hex=MONOS_COLORS["text_primary"])
         self._icon_more = lucide_icon("ellipsis", size=16, color_hex=MONOS_COLORS["text_primary"])
+        self._icon_note_meta = lucide_icon("message-circle", size=12, color_hex=MONOS_COLORS["text_meta"])
+        self._icon_calendar_meta = lucide_icon("calendar", size=12, color_hex=MONOS_COLORS["text_meta"])
+        self._icon_hash_meta = lucide_icon("hash", size=12, color_hex=MONOS_COLORS["text_meta"])
 
     @staticmethod
     def _norm(s: str | None) -> str:
@@ -1500,6 +2427,18 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._hovered_pill_row = row
         self._view.viewport().update()
 
+    def set_hovered_health_row(self, row: int | None) -> None:
+        if self._hovered_health_row == row:
+            return
+        self._hovered_health_row = row
+        self._view.viewport().update()
+
+    def set_hovered_notes_row(self, row: int | None) -> None:
+        if self._hovered_notes_row == row:
+            return
+        self._hovered_notes_row = row
+        self._view.viewport().update()
+
     def set_card_size(self, size: QSize) -> None:
         if size.isValid() and size != self._card_size:
             self._card_size = size
@@ -1510,12 +2449,15 @@ class _GridCardDelegate(QStyledItemDelegate):
             self._gap_px = gap_px
             self._view.viewport().update()
 
-    def set_active_department(self, department: str | None, *, icon_name: str | None = None) -> None:
+    def set_active_department(self, department: str | None, *, icon_name: str | None = None, label: str | None = None) -> None:
         dep = (department or "").strip() or None
-        if dep == self._active_department and icon_name == self._active_department_icon_name:
+        lab = (label or "").strip() or None
+        ic = (icon_name or "").strip() or None
+        if dep == self._active_department and ic == self._active_department_icon_name and lab == self._active_department_label:
             return
         self._active_department = dep
-        self._active_department_icon_name = (icon_name or "").strip() or None
+        self._active_department_icon_name = ic
+        self._active_department_label = lab
         self._view.viewport().update()
 
     def set_active_project_root(self, path: str | None) -> None:
@@ -1548,6 +2490,33 @@ class _GridCardDelegate(QStyledItemDelegate):
         if show == self._show_dept_chips:
             return
         self._show_dept_chips = bool(show)
+        self._view.viewport().update()
+
+    def set_tile_meta_display(
+        self,
+        *,
+        show_id: bool,
+        show_version: bool,
+        show_last_updated: bool,
+        show_latest_note: bool,
+        show_current_department: bool,
+        show_status_pill: bool,
+    ) -> None:
+        if (
+            self._tile_meta_show_id == show_id
+            and self._tile_meta_show_version == show_version
+            and self._tile_meta_show_last_updated == show_last_updated
+            and self._tile_meta_show_latest_note == show_latest_note
+            and self._tile_meta_show_current_department == show_current_department
+            and self._tile_meta_show_status_pill == show_status_pill
+        ):
+            return
+        self._tile_meta_show_id = bool(show_id)
+        self._tile_meta_show_version = bool(show_version)
+        self._tile_meta_show_last_updated = bool(show_last_updated)
+        self._tile_meta_show_latest_note = bool(show_latest_note)
+        self._tile_meta_show_current_department = bool(show_current_department)
+        self._tile_meta_show_status_pill = bool(show_status_pill)
         self._view.viewport().update()
 
     def get_active_dcc(self, item_path: Path | None, department: str | None) -> str | None:
@@ -1755,19 +2724,48 @@ class _GridCardDelegate(QStyledItemDelegate):
                 p.drawText(r2, Qt.AlignCenter, t)
                 return r2
 
-            # Status dot on thumb — only when a department is focused in the sidebar (same scope as status pill).
+            # Item health (top-right) + notes chip to its left — only asset/shot on disk path.
             dept_focus = (self._active_department or "").strip()
-            if dept_focus:
-                k = status_key()
-                _text_c, _bg_c, border_c = status_style(k)
-                dot_radius = 5
-                dot_x = thumb.right() - 12 - dot_radius
-                dot_y = thumb.top() + 12 + dot_radius
-                if border_c.isValid():
-                    border_c.setAlpha(204)
-                p.setPen(QPen(border_c, 1))
-                p.setBrush(border_c)
-                p.drawEllipse(QPoint(dot_x, dot_y), dot_radius, dot_radius)
+            chip_sz = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+            health_rect: QRect | None = None
+            health_obj: ItemHealth | None = None
+            if dept_focus and isinstance(item.ref, (Asset, Shot)):
+                active_dcc = (
+                    self.get_active_dcc(getattr(item, "path", None), self._active_department)
+                    if getattr(item, "path", None)
+                    else None
+                )
+                health_obj = assess_view_item_health(
+                    item.ref,
+                    dept_focus,
+                    active_dcc_id=active_dcc,
+                )
+                if health_obj is not None:
+                    health_rect = QRect(
+                        thumb.right() - 12 - chip_sz,
+                        thumb.top() + 12,
+                        chip_sz,
+                        chip_sz,
+                    )
+
+            if isinstance(item.ref, (Asset, Shot)) and getattr(item, "path", None):
+                mw = self._main_view
+                n, nmode = (0, "empty")
+                if mw is not None and hasattr(mw, "notes_badge_state"):
+                    try:
+                        n, nmode = mw.notes_badge_state(item.path)  # type: ignore[attr-defined]
+                    except Exception:
+                        n, nmode = 0, "empty"
+                note_rect = _thumb_note_chip_rect(thumb, health_rect)
+                note_hover = self._hovered_notes_row is not None and self._hovered_notes_row == index.row()
+                _paint_note_icon_chip(p, note_rect, n, visual_mode=nmode, hovered=note_hover)
+
+            if health_obj is not None and health_rect is not None:
+                health_hover = (
+                    self._hovered_health_row is not None
+                    and self._hovered_health_row == index.row()
+                )
+                _paint_health_icon_chip(p, health_rect, health_obj, hovered=health_hover)
 
             # Type + Department icons (top-left, side by side, fully round, distinct colors)
             icon_size = 16
@@ -1963,9 +2961,8 @@ class _GridCardDelegate(QStyledItemDelegate):
             # Stop clipping before text to avoid rounded-corner cropping issues
             p.setClipping(False)
 
-            # Text blocks under thumbnail
-            # Spec: p-4 (16px) padding for info block
-            y = thumb.bottom() + 16
+            # Text blocks under thumbnail (geometry: tile_grid_meta_line_count, grid_card_meta_block_height_asset_shot).
+            y = thumb.bottom() + _GRID_META_PAD_TOP
             x = inner.left() + 16
             w = inner.width() - 32
 
@@ -1977,11 +2974,10 @@ class _GridCardDelegate(QStyledItemDelegate):
                 p.setPen(self._c_text_primary_highlight)
             else:
                 p.setPen(self._c_text_primary)
-            name_rect = QRect(x, y, w, 20)
+            name_rect = QRect(x, y, w, _GRID_NAME_LINE_H)
             p.drawText(name_rect, Qt.AlignLeft | Qt.AlignVCenter, display_name_for_item(item))
 
-            # ID / version (or project stats) always directly under title; pills render below when applicable.
-            y_meta = y + 24
+            y_meta = thumb.bottom() + _grid_asset_shot_meta_head_to_first_line()
             if item.kind.value == "project":
                 stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
                 shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
@@ -1989,26 +2985,161 @@ class _GridCardDelegate(QStyledItemDelegate):
                 meta = f"SHOTS {shots}   ASSETS {assets}"
                 p.setFont(self._font_meta_mono)
                 p.setPen(self._c_text_meta)
-                meta_rect = QRect(x, y_meta, w, 16)
+                meta_rect = QRect(x, y_meta, w, _GRID_META_LINE_H)
                 p.drawText(meta_rect, Qt.AlignLeft | Qt.AlignVCenter, meta)
             else:
+                cy = y_meta
                 p.setFont(self._font_meta_mono)
                 p.setPen(self._c_text_meta)
                 active_dep = (self._active_department or "").strip()
-                show_version = bool(active_dep)
                 active_dcc = self.get_active_dcc(getattr(item, "path", None), self._active_department) if getattr(item, "path", None) else None
-                ver_str = _card_version_for_display(item.ref, self._active_department, self._show_publish, active_dcc_id=active_dcc) if isinstance(item.ref, (Asset, Shot)) else None
-                if show_version and ver_str is not None:
-                    meta = f"ID {item.name}   {ver_str}" if ver_str != "—" else f"ID {item.name}   v —"
-                else:
-                    meta = f"ID {item.name}"
-                meta_rect = QRect(x, y_meta, w, 16)
-                p.drawText(meta_rect, Qt.AlignLeft | Qt.AlignVCenter, meta)
+                ver_str = (
+                    _card_version_for_display(item.ref, self._active_department, self._show_publish, active_dcc_id=active_dcc)
+                    if isinstance(item.ref, (Asset, Shot))
+                    else None
+                )
+                if self._tile_meta_show_id or self._tile_meta_show_version:
+                    line_top = cy
+                    ico_px = 12
+                    ico_gap = 4
+                    fm = p.fontMetrics()
+                    if (
+                        self._tile_meta_show_id
+                        and self._tile_meta_show_version
+                        and active_dep
+                        and ver_str is not None
+                    ):
+                        prefix = f"ID {item.name}   "
+                        ver_text = ver_str if ver_str != "—" else "v —"
+                        min_tail = ico_px + ico_gap + min(fm.horizontalAdvance(ver_text), 28)
+                        prefix_max = max(0, w - min_tail)
+                        prefix_draw = fm.elidedText(prefix, Qt.TextElideMode.ElideRight, prefix_max)
+                        pw = fm.horizontalAdvance(prefix_draw)
+                        p.drawText(
+                            QRect(x, line_top, max(1, prefix_max), _GRID_META_LINE_H),
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            prefix_draw,
+                        )
+                        x_h = x + pw + 4
+                        pix_hash = self._icon_hash_meta.pixmap(ico_px, ico_px)
+                        if not pix_hash.isNull():
+                            iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
+                            p.drawPixmap(x_h, iy, pix_hash)
+                        x_t = x_h + ico_px + ico_gap
+                        tw = max(0, x + w - x_t)
+                        elided = fm.elidedText(ver_text, Qt.TextElideMode.ElideRight, tw)
+                        p.drawText(
+                            QRect(x_t, line_top, tw, _GRID_META_LINE_H),
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            elided,
+                        )
+                    elif self._tile_meta_show_version and not self._tile_meta_show_id:
+                        ver_text = (ver_str or "—") if isinstance(item.ref, (Asset, Shot)) else "—"
+                        pix_hash = self._icon_hash_meta.pixmap(ico_px, ico_px)
+                        if not pix_hash.isNull():
+                            iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
+                            p.drawPixmap(x, iy, pix_hash)
+                        tx = x + ico_px + ico_gap
+                        tw_line = max(0, w - ico_px - ico_gap)
+                        elided = fm.elidedText(ver_text, Qt.TextElideMode.ElideRight, tw_line)
+                        p.drawText(
+                            QRect(tx, line_top, tw_line, _GRID_META_LINE_H),
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            elided,
+                        )
+                    else:
+                        p.drawText(
+                            QRect(x, line_top, w, _GRID_META_LINE_H),
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            f"ID {item.name}",
+                        )
+                    cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+                if self._tile_meta_show_last_updated:
+                    lu = (
+                        _view_item_last_updated_display(
+                            item,
+                            show_publish=self._show_publish,
+                            active_department=self._active_department,
+                        )
+                        if isinstance(item, ViewItem)
+                        else "—"
+                    )
+                    line_top = cy
+                    ico_px = 12
+                    ico_gap = 4
+                    pix_cal = self._icon_calendar_meta.pixmap(ico_px, ico_px)
+                    if not pix_cal.isNull():
+                        iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
+                        p.drawPixmap(x, iy, pix_cal)
+                    tx = x + ico_px + ico_gap
+                    tw_line = max(0, w - ico_px - ico_gap)
+                    elided = p.fontMetrics().elidedText(lu, Qt.TextElideMode.ElideRight, tw_line)
+                    p.drawText(
+                        QRect(tx, line_top, tw_line, _GRID_META_LINE_H),
+                        Qt.AlignLeft | Qt.AlignVCenter,
+                        elided,
+                    )
+                    cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+                if self._tile_meta_show_latest_note and isinstance(item.ref, (Asset, Shot)) and getattr(item, "path", None):
+                    from monostudio.core.item_comments import latest_note_preview_line
+
+                    snip, last_done = latest_note_preview_line(Path(item.path))
+                    note_line = snip if snip else "—"
+                    strike = bool(snip and last_done)
+                    ico_px = 12
+                    ico_gap = 4
+                    line_top = cy
+                    pix_note = self._icon_note_meta.pixmap(ico_px, ico_px)
+                    if not pix_note.isNull():
+                        iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
+                        p.drawPixmap(x, iy, pix_note)
+                    tx = x + ico_px + ico_gap
+                    tw_line = max(0, w - ico_px - ico_gap)
+                    p.save()
+                    try:
+                        f_note = QFont(self._font_meta_mono)
+                        if strike:
+                            f_note.setStrikeOut(True)
+                        p.setFont(f_note)
+                        p.setPen(
+                            QColor(MONOS_COLORS.get("text_muted", "#71717a"))
+                            if strike
+                            else self._c_text_meta
+                        )
+                        elided = QFontMetrics(f_note).elidedText(
+                            note_line, Qt.TextElideMode.ElideRight, tw_line
+                        )
+                        p.drawText(
+                            QRect(tx, line_top, tw_line, _GRID_META_LINE_H),
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            elided,
+                        )
+                    finally:
+                        p.restore()
+                    cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+                if self._tile_meta_show_current_department and active_dep:
+                    dep_disp = (self._active_department_label or active_dep).strip()
+                    dept_line = f"DEPT  {dep_disp.replace('_', ' ').upper()}"
+                    p.drawText(QRect(x, cy, w, _GRID_META_LINE_H), Qt.AlignLeft | Qt.AlignVCenter, dept_line)
+                    cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
 
             # Dept status pill — only when sidebar department is focused (no multi-dept chips without focus).
             ad_focus = (self._active_department or "").strip()
-            y_pills = y_meta + 16 + 4
-            if ad_focus and isinstance(item.ref, (Asset, Shot)) and self._active_project_root:
+            if (
+                self._tile_meta_show_status_pill
+                and ad_focus
+                and isinstance(item.ref, (Asset, Shot))
+                and self._active_project_root
+            ):
+                n_lines = tile_grid_meta_line_count(
+                    show_id=self._tile_meta_show_id,
+                    show_version=self._tile_meta_show_version,
+                    show_last_updated=self._tile_meta_show_last_updated,
+                    show_latest_note=self._tile_meta_show_latest_note,
+                    show_current_department=self._tile_meta_show_current_department,
+                    active_department=self._active_department,
+                )
+                y_pills = thumb.bottom() + _grid_asset_shot_y_pills_offset_from_thumb_bottom(n_meta_lines=n_lines)
                 try:
                     pr = Path(self._active_project_root)
                     reg = load_production_status_registry(pr)
@@ -2020,7 +3151,7 @@ class _GridCardDelegate(QStyledItemDelegate):
                     )
                     p.setFont(self._font_dept_chip)
                     fm = p.fontMetrics()
-                    chip_h = max(16, fm.height() + 4)
+                    chip_h = _grid_status_pill_line_height(fm)
                     chip_pad_x = 8
                     dot_r = 3
                     line = reg.label_for(sid)
@@ -2072,11 +3203,11 @@ class _GridCardDelegate(QStyledItemDelegate):
         return self._card_size
 
 
-class _PublishDragModel(QStandardItemModel):
-    """QStandardItemModel that provides file URI mime data for drag when in Published mode."""
+class _PublishDragPipelineModel(PipelineTileModel):
+    """PipelineTileModel plus Published/Work middle-drag MIME (URI list)."""
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, thumb_state_role=PIPELINE_VIEW_THUMB_STATE_ROLE)
         self._show_publish = False
         self._active_department: str | None = None
         self._ignore_extensions: frozenset[str] = frozenset()
@@ -2088,7 +3219,7 @@ class _PublishDragModel(QStandardItemModel):
     def set_publish_ignore_extensions(self, ignore_extensions: frozenset[str]) -> None:
         self._ignore_extensions = ignore_extensions or frozenset()
 
-    def flags(self, index):
+    def flags(self, index):  # type: ignore[override]
         default = super().flags(index)
         if not index.isValid():
             return default
@@ -2103,13 +3234,13 @@ class _PublishDragModel(QStandardItemModel):
                 return default | Qt.ItemIsDragEnabled
         return default
 
-    def supportedDragActions(self):
+    def supportedDragActions(self):  # type: ignore[override]
         return Qt.CopyAction
 
-    def mimeTypes(self):
+    def mimeTypes(self):  # type: ignore[override]
         return ["text/uri-list"]
 
-    def mimeData(self, indexes):
+    def mimeData(self, indexes):  # type: ignore[override]
         md = QMimeData()
         urls: list[QUrl] = []
         for idx in indexes:
@@ -2131,6 +3262,81 @@ class _PublishDragModel(QStandardItemModel):
         return md
 
 
+class _FilterStatusMenu(MonosMenu):
+    """Multi-select status filter menu; stays open until the user clicks outside."""
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        act = self.actionAt(event.pos())
+        if act is not None and act.isEnabled() and not act.isSeparator():
+            if act.isCheckable():
+                act.setChecked(not act.isChecked())
+                act.toggled.emit(act.isChecked())
+            else:
+                act.trigger()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class _ViewOptionsSubmenuSection(QWidget):
+    """Collapsible section in the view-options popup (Filter, Metadata, …)."""
+
+    def __init__(
+        self,
+        title: str,
+        parent: QWidget | None = None,
+        *,
+        expanded: bool = False,
+        on_layout_changed: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._on_layout_changed = on_layout_changed
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._header_btn = QToolButton(self)
+        self._header_btn.setText(title)
+        self._header_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._header_btn.setAutoRaise(True)
+        self._header_btn.setCheckable(True)
+        self._header_btn.setChecked(expanded)
+        self._header_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._header_btn.setObjectName("ViewOptionsSubmenuHeader")
+        self._header_btn.clicked.connect(self._on_header_clicked)
+        self._body = QWidget(self)
+        body_l = QVBoxLayout(self._body)
+        body_l.setContentsMargins(12, 0, 0, 0)
+        body_l.setSpacing(0)
+        self._body.setVisible(expanded)
+        outer.addWidget(self._header_btn)
+        outer.addWidget(self._body)
+        self._sync_chevron()
+
+    def body_layout(self) -> QVBoxLayout:
+        lay = self._body.layout()
+        assert isinstance(lay, QVBoxLayout)
+        return lay
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._header_btn.setChecked(bool(expanded))
+        self._body.setVisible(bool(expanded))
+        self._sync_chevron()
+
+    def _sync_chevron(self) -> None:
+        icon = "chevron-down" if self._header_btn.isChecked() else "chevron-right"
+        self._header_btn.setIcon(lucide_icon(icon, size=14, color_hex=MONOS_COLORS["text_label"]))
+
+    def _on_header_clicked(self) -> None:
+        self._body.setVisible(self._header_btn.isChecked())
+        self._sync_chevron()
+        if self._on_layout_changed is not None:
+            self._on_layout_changed()
+            QTimer.singleShot(0, self._on_layout_changed)
+
+
 class MainView(QWidget):
     """
     Spec: Main View has Tile (default) and List mode; has Search + Filters.
@@ -2144,6 +3350,7 @@ class MainView(QWidget):
     root_context_menu_requested = Signal(object)  # emits global QPoint
     copy_inventory_requested = Signal(object)  # emits ViewItem (asset/shot only)
     rename_requested = Signal(object)  # emits ViewItem (asset only)
+    item_notes_requested = Signal(object)  # emits ViewItem (asset / shot)
     delete_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_requested = Signal(object)  # emits ViewItem (asset/shot only)
     open_with_requested = Signal(object)  # emits ViewItem (asset/shot only)
@@ -2167,14 +3374,34 @@ class MainView(QWidget):
     _SETTINGS_KEY_CARD_SIZE_PREFIX = "main_view/card_size"
     _SETTINGS_KEY_SHOW_PUBLISH = "main_view/show_publish"
     _SETTINGS_KEY_SHOW_DEPT_STATUS_CHIPS = "main_view/show_dept_status_chips"
+    _SETTINGS_KEY_TILE_META_SHOW_ID = "main_view/tile_meta_show_id"
+    _SETTINGS_KEY_TILE_META_SHOW_VERSION = "main_view/tile_meta_show_version"
+    _SETTINGS_KEY_TILE_META_SHOW_LAST_UPDATED = "main_view/tile_meta_show_last_updated"
+    _SETTINGS_KEY_TILE_META_SHOW_LATEST_NOTE = "main_view/tile_meta_show_latest_note"
+    _SETTINGS_KEY_TILE_META_SHOW_CURRENT_DEPT = "main_view/tile_meta_show_current_department"
+    _SETTINGS_KEY_TILE_META_SHOW_STATUS_PILL = "main_view/tile_meta_show_status_pill"
+    _SETTINGS_KEY_HIDE_SKIPPED_CARDS = "main_view/hide_skipped_cards"
+    _SETTINGS_KEY_FILTER_WORK_FOLDER = "main_view/filter_work_folder"
+    _SETTINGS_KEY_FILTER_STATUS_IDS = "main_view/filter_status_ids"
+    _FILTER_WORK_ALL = "all"
+    _FILTER_WORK_HAS = "has"
+    _FILTER_WORK_NO = "no"
+    _SETTINGS_KEY_SORT_FIELD = "main_view/sort_field"
+    _SETTINGS_KEY_SORT_ASCENDING = "main_view/sort_ascending"
+    _SORT_FIELD_NAME = "name"
+    _SORT_FIELD_DATE = "date"
+    _SORT_FIELD_STATUS = "status"
     _THUMBNAIL_SIZE_PX = 512  # backing cache size (square); painted as 16:9 in grid
-    _THUMB_STATE_ROLE = Qt.UserRole + 1  # per-item state in tile model ("loaded"|"missing")
+    _THUMB_STATE_ROLE = PIPELINE_VIEW_THUMB_STATE_ROLE  # per-item state in tile model ("loaded"|"missing")
     _GRID_GAP_PX = 12
     _CARD_SCALE_MIN = 0.2
     _CARD_SCALE_MAX = 1.0
     _CARD_SLIDER_RANGE = 100  # slider 0..100 → scale 0.2..1.0
     # Reference width at 100% scale; card size = ref * scale (resize only changes column count).
     _CARD_REFERENCE_WIDTH = 320
+
+    # Thumbnail warm-up: avoid blocking one event-loop tick with hundreds of sync requests.
+    _THUMB_PREFETCH_CHUNK_ROWS = 48
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -2187,6 +3414,7 @@ class MainView(QWidget):
         self._thumb_cache = ThumbnailCache(size_px=self._THUMBNAIL_SIZE_PX)
         self._thumbnail_manager: object | None = None
         self._thumb_prefetch_scheduled = False
+        self._thumb_prefetch_gen = 0
 
         self._view_mode: str = "tile"
         self._browser_context: str = "asset"  # "project" | "asset" | "shot"
@@ -2201,9 +3429,42 @@ class MainView(QWidget):
         self._show_dept_status_chips: bool = bool(
             self._settings.value(self._SETTINGS_KEY_SHOW_DEPT_STATUS_CHIPS, False, type=bool)
         )
+        self._tile_meta_show_id: bool = bool(self._settings.value(self._SETTINGS_KEY_TILE_META_SHOW_ID, True, type=bool))
+        self._tile_meta_show_version: bool = bool(
+            self._settings.value(self._SETTINGS_KEY_TILE_META_SHOW_VERSION, True, type=bool)
+        )
+        self._tile_meta_show_last_updated: bool = bool(
+            self._settings.value(self._SETTINGS_KEY_TILE_META_SHOW_LAST_UPDATED, False, type=bool)
+        )
+        self._tile_meta_show_latest_note: bool = bool(
+            self._settings.value(self._SETTINGS_KEY_TILE_META_SHOW_LATEST_NOTE, False, type=bool)
+        )
+        self._tile_meta_show_current_department: bool = bool(
+            self._settings.value(self._SETTINGS_KEY_TILE_META_SHOW_CURRENT_DEPT, False, type=bool)
+        )
+        self._tile_meta_show_status_pill: bool = bool(
+            self._settings.value(self._SETTINGS_KEY_TILE_META_SHOW_STATUS_PILL, True, type=bool)
+        )
+        self._hide_skipped_cards: bool = bool(
+            self._settings.value(self._SETTINGS_KEY_HIDE_SKIPPED_CARDS, False, type=bool)
+        )
+        _wf_raw = str(self._settings.value(self._SETTINGS_KEY_FILTER_WORK_FOLDER, self._FILTER_WORK_ALL) or "").strip().lower()
+        self._filter_work_folder: str = (
+            _wf_raw if _wf_raw in (self._FILTER_WORK_HAS, self._FILTER_WORK_NO) else self._FILTER_WORK_ALL
+        )
+        _sf_raw = str(self._settings.value(self._SETTINGS_KEY_SORT_FIELD, self._SORT_FIELD_NAME) or "").strip().lower()
+        self._sort_field: str = (
+            _sf_raw
+            if _sf_raw in (self._SORT_FIELD_DATE, self._SORT_FIELD_STATUS)
+            else self._SORT_FIELD_NAME
+        )
+        self._sort_ascending: bool = bool(self._settings.value(self._SETTINGS_KEY_SORT_ASCENDING, True, type=bool))
+        self._filter_status_ids: set[str] = self._load_filter_status_ids_from_settings()
+        self._filter_status_actions: dict[str, QAction] = {}
         # Perf: avoid re-reading presets JSON on every list row / sizeHint / paint.
         self._cached_prod_reg_root: str | None = None
         self._cached_prod_reg: object | None = None
+        self._notes_badge_cache: dict[str, tuple[int, str]] = {}
         # Precomputed list Status column width (pill); avoids resizeColumnToContents × N rows.
         self._list_status_pill_layout_width: int = 0
 
@@ -2368,9 +3629,11 @@ class MainView(QWidget):
         self._main_view_options_popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self._main_view_options_popup.setAttribute(Qt.WA_StyledBackground, True)
         self._main_view_options_popup.setMinimumWidth(260)
+        self._main_view_options_popup.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         popup_outer = QVBoxLayout(self._main_view_options_popup)
         popup_outer.setContentsMargins(8, 6, 8, 6)
-        popup_outer.setSpacing(4)
+        popup_outer.setSpacing(2)
+        popup_outer.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinAndMaxSize)
         self._main_view_options_size_block = QWidget(self._main_view_options_popup)
         sz_block_l = QVBoxLayout(self._main_view_options_size_block)
         sz_block_l.setContentsMargins(0, 0, 0, 0)
@@ -2379,7 +3642,7 @@ class MainView(QWidget):
         popup_card_row.setSpacing(10)
         _popup_label = QLabel("Card size", self._main_view_options_size_block)
         _popup_label.setObjectName("MainViewOptionsSizeLabel")
-        _popup_label.setStyleSheet("color: #a1a1aa; font-size: 11px; font-weight: 600;")
+        _popup_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._card_size_slider = QSlider(Qt.Horizontal, self._main_view_options_size_block)
         self._card_size_slider.setObjectName("MainViewOptionsSizeSlider")
         self._card_size_slider.setMinimum(0)
@@ -2403,7 +3666,6 @@ class MainView(QWidget):
         )
         popup_outer.addWidget(self._main_view_options_sep)
 
-        _hdr_style = "color: #a1a1aa; font-size: 11px; font-weight: 600; margin: 0; padding: 0;"
         _tip_user = (
             "Only user thumbnails (pasted or .user.* files).\nWork render/preview sequences are ignored."
         )
@@ -2416,10 +3678,10 @@ class MainView(QWidget):
         self._thumb_source_asset_block = QWidget(self._main_view_options_popup)
         _abl = QVBoxLayout(self._thumb_source_asset_block)
         _abl.setContentsMargins(0, 0, 0, 0)
-        _abl.setSpacing(2)
+        _abl.setSpacing(0)
         _la = QLabel("Assets", self._thumb_source_asset_block)
-        _la.setStyleSheet(_hdr_style)
-        _la.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        _la.setObjectName("ViewOptionsSectionLabel")
+        _la.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         _abl.addWidget(_la)
         self._thumb_source_group_asset = QButtonGroup(self._thumb_source_asset_block)
         self._thumb_source_asset_user = QRadioButton("User", self._thumb_source_asset_block)
@@ -2456,10 +3718,10 @@ class MainView(QWidget):
         self._thumb_source_shot_block = QWidget(self._main_view_options_popup)
         _sbl = QVBoxLayout(self._thumb_source_shot_block)
         _sbl.setContentsMargins(0, 0, 0, 0)
-        _sbl.setSpacing(2)
+        _sbl.setSpacing(0)
         _ls = QLabel("Shots", self._thumb_source_shot_block)
-        _ls.setStyleSheet(_hdr_style)
-        _ls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        _ls.setObjectName("ViewOptionsSectionLabel")
+        _ls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         _sbl.addWidget(_ls)
         self._thumb_source_group_shot = QButtonGroup(self._thumb_source_shot_block)
         self._thumb_source_shot_user = QRadioButton("User", self._thumb_source_shot_block)
@@ -2504,7 +3766,190 @@ class MainView(QWidget):
         _dcl.addWidget(self._chk_dept_status_chips)
         popup_outer.addWidget(self._dept_chips_block)
 
-        self._main_view_options_popup.adjustSize()
+        self._filter_sep = QFrame(self._main_view_options_popup)
+        self._filter_sep.setFrameShape(QFrame.Shape.HLine)
+        self._filter_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._filter_sep.setFixedHeight(1)
+        self._filter_sep.setStyleSheet(
+            f"background: {MONOS_COLORS['border']}; border: none; max-height: 1px; min-height: 1px;"
+        )
+        popup_outer.addWidget(self._filter_sep)
+        self._filter_submenu = _ViewOptionsSubmenuSection(
+            "Filter",
+            self._main_view_options_popup,
+            expanded=False,
+            on_layout_changed=self._sync_main_view_options_popup_geometry,
+        )
+        self._filter_submenu.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        _fl = self._filter_submenu.body_layout()
+        self._chk_hide_skipped_cards = QCheckBox("Hide skipped", self._filter_submenu)
+        self._chk_hide_skipped_cards.setToolTip(
+            "Hide assets/shots whose production status pill is Skipped for the focused department "
+            "(status id omitted). No effect when no department is focused."
+        )
+        self._chk_hide_skipped_cards.toggled.connect(self._on_hide_skipped_cards_toggled)
+        self._chk_hide_skipped_cards.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        _fl.addWidget(self._chk_hide_skipped_cards)
+        _fl.addSpacing(2)
+        _wf_lbl = QLabel("Work folder", self._filter_submenu)
+        _wf_lbl.setObjectName("ViewOptionsGroupLabel")
+        _fl.addWidget(_wf_lbl)
+        self._filter_work_group = QButtonGroup(self._filter_submenu)
+        self._filter_work_all = QRadioButton("All", self._filter_submenu)
+        self._filter_work_all.setToolTip("Show every item (default).")
+        self._filter_work_has = QRadioButton("With work folder", self._filter_submenu)
+        self._filter_work_has.setToolTip(
+            "Only items whose focused department already has a work folder on disk."
+        )
+        self._filter_work_no = QRadioButton("Without work folder", self._filter_submenu)
+        self._filter_work_no.setToolTip(
+            "Only items whose focused department has no work folder yet."
+        )
+        for rb in (self._filter_work_all, self._filter_work_has, self._filter_work_no):
+            rb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._filter_work_group.setExclusive(True)
+        self._filter_work_group.addButton(self._filter_work_all, 0)
+        self._filter_work_group.addButton(self._filter_work_has, 1)
+        self._filter_work_group.addButton(self._filter_work_no, 2)
+        self._filter_work_group.idClicked.connect(self._on_filter_work_folder_clicked)
+        _fl.addWidget(self._filter_work_all)
+        _fl.addWidget(self._filter_work_has)
+        _fl.addWidget(self._filter_work_no)
+        self._sync_filter_work_radios_from_settings()
+        _fl.addSpacing(2)
+        _st_lbl = QLabel("Production status", self._filter_submenu)
+        _st_lbl.setObjectName("ViewOptionsGroupLabel")
+        _fl.addWidget(_st_lbl)
+        self._filter_status_btn = QToolButton(self._filter_submenu)
+        self._filter_status_btn.setObjectName("ViewOptionsFilterStatusButton")
+        self._filter_status_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._filter_status_btn.setPopupMode(QToolButton.ToolButtonPopupMode.DelayedPopup)
+        self._filter_status_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._filter_status_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._filter_status_btn.setToolTip(
+            "Filter by production status for the focused department. Empty selection shows all."
+        )
+        self._filter_status_menu = _FilterStatusMenu(self._filter_status_btn)
+        self._filter_status_menu.setObjectName("FilterStatusMenu")
+        self._filter_status_menu.setToolTipsVisible(True)
+        self._filter_status_menu.aboutToHide.connect(self._sync_main_view_options_popup_geometry)
+        self._filter_status_btn.clicked.connect(self._show_filter_status_menu)
+        _fl.addWidget(self._filter_status_btn)
+        self._update_filter_status_button_label()
+        popup_outer.addWidget(self._filter_submenu)
+
+        self._sort_sep = QFrame(self._main_view_options_popup)
+        self._sort_sep.setFrameShape(QFrame.Shape.HLine)
+        self._sort_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._sort_sep.setFixedHeight(1)
+        self._sort_sep.setStyleSheet(
+            f"background: {MONOS_COLORS['border']}; border: none; max-height: 1px; min-height: 1px;"
+        )
+        popup_outer.addWidget(self._sort_sep)
+        self._sort_submenu = _ViewOptionsSubmenuSection(
+            "Sort",
+            self._main_view_options_popup,
+            expanded=False,
+            on_layout_changed=self._sync_main_view_options_popup_geometry,
+        )
+        self._sort_submenu.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        _sl = self._sort_submenu.body_layout()
+        _sort_by_lbl = QLabel("Sort by", self._sort_submenu)
+        _sort_by_lbl.setObjectName("ViewOptionsGroupLabel")
+        _sl.addWidget(_sort_by_lbl)
+        self._sort_field_group = QButtonGroup(self._sort_submenu)
+        self._sort_by_name = QRadioButton("Name", self._sort_submenu)
+        self._sort_by_name.setToolTip("Asset type + name (assets) or shot name.")
+        self._sort_by_date = QRadioButton("Date", self._sort_submenu)
+        self._sort_by_date.setToolTip(
+            "Last updated: entity folder in Work mode, latest publish version in Published mode."
+        )
+        self._sort_by_status = QRadioButton("Status", self._sort_submenu)
+        self._sort_by_status.setToolTip(
+            "Production status for the focused department (pipeline category order)."
+        )
+        for rb in (self._sort_by_name, self._sort_by_date, self._sort_by_status):
+            rb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._sort_field_group.setExclusive(True)
+        self._sort_field_group.addButton(self._sort_by_name, 0)
+        self._sort_field_group.addButton(self._sort_by_date, 1)
+        self._sort_field_group.addButton(self._sort_by_status, 2)
+        self._sort_field_group.idClicked.connect(self._on_sort_field_clicked)
+        _sl.addWidget(self._sort_by_name)
+        _sl.addWidget(self._sort_by_date)
+        _sl.addWidget(self._sort_by_status)
+        _sl.addSpacing(2)
+        _sort_order_lbl = QLabel("Order", self._sort_submenu)
+        _sort_order_lbl.setObjectName("ViewOptionsGroupLabel")
+        _sl.addWidget(_sort_order_lbl)
+        self._sort_order_group = QButtonGroup(self._sort_submenu)
+        self._sort_ascending_rb = QRadioButton("Ascending", self._sort_submenu)
+        self._sort_ascending_rb.setToolTip("A→Z, oldest first, lowest status rank first.")
+        self._sort_descending_rb = QRadioButton("Descending", self._sort_submenu)
+        self._sort_descending_rb.setToolTip("Z→A, newest first, highest status rank first.")
+        for rb in (self._sort_ascending_rb, self._sort_descending_rb):
+            rb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._sort_order_group.setExclusive(True)
+        self._sort_order_group.addButton(self._sort_ascending_rb, 0)
+        self._sort_order_group.addButton(self._sort_descending_rb, 1)
+        self._sort_order_group.idClicked.connect(self._on_sort_order_clicked)
+        _sl.addWidget(self._sort_ascending_rb)
+        _sl.addWidget(self._sort_descending_rb)
+        self._sync_sort_radios_from_settings()
+        popup_outer.addWidget(self._sort_submenu)
+
+        self._metadata_sep = QFrame(self._main_view_options_popup)
+        self._metadata_sep.setFrameShape(QFrame.Shape.HLine)
+        self._metadata_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._metadata_sep.setFixedHeight(1)
+        self._metadata_sep.setStyleSheet(
+            f"background: {MONOS_COLORS['border']}; border: none; max-height: 1px; min-height: 1px;"
+        )
+        popup_outer.addWidget(self._metadata_sep)
+        self._metadata_submenu = _ViewOptionsSubmenuSection(
+            "Metadata",
+            self._main_view_options_popup,
+            expanded=False,
+            on_layout_changed=self._sync_main_view_options_popup_geometry,
+        )
+        self._metadata_submenu.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        _ml = self._metadata_submenu.body_layout()
+        self._chk_tile_meta_id = QCheckBox("ID", self._metadata_submenu)
+        self._chk_tile_meta_id.setToolTip("Show folder / entity ID under the title.")
+        self._chk_tile_meta_id.toggled.connect(self._on_tile_meta_id_toggled)
+        self._chk_tile_meta_version = QCheckBox("Version", self._metadata_submenu)
+        self._chk_tile_meta_version.setToolTip("Work or published version for the focused department.")
+        self._chk_tile_meta_version.toggled.connect(self._on_tile_meta_version_toggled)
+        self._chk_tile_meta_last_updated = QCheckBox("Last updated", self._metadata_submenu)
+        self._chk_tile_meta_last_updated.setToolTip(
+            "Work mode: asset/shot folder mtime. Published mode: latest publish version folder (and contents)."
+        )
+        self._chk_tile_meta_last_updated.toggled.connect(self._on_tile_meta_last_updated_toggled)
+        self._chk_tile_meta_latest_note = QCheckBox("Latest note", self._metadata_submenu)
+        self._chk_tile_meta_latest_note.setToolTip(
+            "Show the most recent item note as a line under the title on grid cards."
+        )
+        self._chk_tile_meta_latest_note.toggled.connect(self._on_tile_meta_latest_note_toggled)
+        self._chk_tile_meta_current_dept = QCheckBox("Current department", self._metadata_submenu)
+        self._chk_tile_meta_current_dept.setToolTip("Text line for the sidebar department filter (when set).")
+        self._chk_tile_meta_current_dept.toggled.connect(self._on_tile_meta_current_dept_toggled)
+        self._chk_tile_meta_status_pill = QCheckBox("Production status pill", self._metadata_submenu)
+        self._chk_tile_meta_status_pill.setToolTip(
+            "Pill under meta lines for the focused department (click to change status)."
+        )
+        self._chk_tile_meta_status_pill.toggled.connect(self._on_tile_meta_status_pill_toggled)
+        for w in (
+            self._chk_tile_meta_id,
+            self._chk_tile_meta_version,
+            self._chk_tile_meta_last_updated,
+            self._chk_tile_meta_latest_note,
+            self._chk_tile_meta_current_dept,
+            self._chk_tile_meta_status_pill,
+        ):
+            w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            _ml.addWidget(w)
+        popup_outer.addWidget(self._metadata_submenu)
+
         self._btn_main_view_options = QToolButton(header)
         self._btn_main_view_options.setObjectName("MainViewOptionsButton")
         self._btn_main_view_options.setAccessibleName("View options")
@@ -2520,7 +3965,7 @@ class MainView(QWidget):
         # (Primary action button removed — replaced by Work/Published pill)
 
         # Tile view (IconMode) skeleton
-        self._tile_model = _PublishDragModel(self)
+        self._tile_model = _PublishDragPipelineModel(self)
         self._tile_model.set_publish_state(self._show_publish, self._active_department)
         self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
         self._tile_view = _ClearOnEmptyClickListView()
@@ -2550,10 +3995,11 @@ class MainView(QWidget):
         # Left/top padding = 24px (right/bottom provided by per-cell gap).
         self._tile_view.setViewportMargins(24, 24, 0, 0)
 
-        self._grid_delegate = _GridCardDelegate(view=self._tile_view)
+        self._grid_delegate = _GridCardDelegate(view=self._tile_view, main_view=self)
         self._grid_delegate.set_gap_px(self._GRID_GAP_PX)
         self._grid_delegate.set_show_publish(self._show_publish)
         self._grid_delegate.set_show_dept_chips(self._show_dept_status_chips)
+        self._apply_tile_meta_to_delegate()
         self._tile_view.setItemDelegate(self._grid_delegate)
         self._tile_view.entered.connect(self._grid_delegate.set_hovered_index)
         self._tile_view.viewportEntered.connect(lambda: self._grid_delegate.set_hovered_index(None))
@@ -2578,8 +4024,7 @@ class MainView(QWidget):
         self._tile_page = tile_page
 
         # List view skeleton (headers set from _list_headers() per context)
-        self._list_model = QStandardItemModel(self)
-        self._list_model.setHorizontalHeaderLabels(self._list_headers())
+        self._list_model = PipelineTableModel(self, self._tile_model)
 
         self._list_view = _ClearOnEmptyClickTableView()
         self._list_view.setObjectName("MainViewList")
@@ -2658,6 +4103,8 @@ class MainView(QWidget):
         self.valid_selection_changed.emit(self.has_valid_selection())
 
         self._all_items: list[ViewItem] = []
+        # Full list from last set_items / diffs; visible rows may be a subset when "Hide skipped" is on.
+        self._items_unfiltered: list[ViewItem] = []
         # AssetGrid: asset_id -> row index for O(1) lookup; _order = display order of asset_ids.
         self._items: dict[str, int] = {}
         self._order: list[str] = []
@@ -2779,6 +4226,8 @@ class MainView(QWidget):
             return None, None
         if self._browser_context not in ("asset", "shot"):
             return None, None
+        if not self._tile_meta_show_status_pill:
+            return None, None
         index = self._tile_view.indexAt(pos)
         if not index.isValid():
             return None, None
@@ -2797,6 +4246,7 @@ class MainView(QWidget):
             active_department=self._active_department,
             project_root=self._project_root,
             hidden_departments=set(self._inspector_hidden_departments),
+            n_meta_lines=self._tile_meta_line_count(),
         )
         if dep and item.path:
             return item, dep
@@ -2877,17 +4327,102 @@ class MainView(QWidget):
         targets = self._production_status_target_paths(entity_path)
         self.production_status_override_chosen.emit(targets, department, res)
 
-    def _update_grid_pill_hover(self, pos) -> None:
-        """Track mouse over production status pill for hover paint (grid)."""
+    def _grid_health_hit_row(self, pos) -> int | None:
+        """Row index if pos is over the thumb health icon; else None."""
+        if self._view_mode != "tile":
+            return None
+        dep = (self._active_department or "").strip()
+        if not dep:
+            return None
+        index = self._tile_view.indexAt(pos)
+        if not index.isValid():
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
+            return None
+        cell_rect = self._tile_view.visualRect(index)
+        if not _thumb_health_chip_rect(cell_rect, self._GRID_GAP_PX).contains(pos):
+            return None
+        return index.row()
+
+    def _grid_note_hit_row(self, pos) -> int | None:
+        """Row index if pos is over the thumb notes chip; else None."""
+        if self._view_mode != "tile" or self._browser_context not in ("asset", "shot"):
+            return None
+        index = self._tile_view.indexAt(pos)
+        if not index.isValid():
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
+            return None
+        if not getattr(item, "path", None):
+            return None
+        cell_rect = self._tile_view.visualRect(index)
+        thumb = _thumb_rect_from_cell(cell_rect, self._GRID_GAP_PX)
+        dep = (self._active_department or "").strip()
+        health_rect: QRect | None = None
+        if dep:
+            active_dcc = self.get_active_dcc(item.path, dep)
+            if (
+                assess_view_item_health(
+                    item.ref,
+                    dep,
+                    active_dcc_id=active_dcc,
+                )
+                is not None
+            ):
+                health_rect = _thumb_health_chip_rect(cell_rect, self._GRID_GAP_PX)
+        note_rect = _thumb_note_chip_rect(thumb, health_rect)
+        return index.row() if note_rect.contains(pos) else None
+
+    def _show_item_health_dialog(self, item: ViewItem, department: str) -> None:
+        from monostudio.ui_qt.item_health_dialog import ItemHealthDialog
+
+        active_dcc = self.get_active_dcc(getattr(item, "path", None), department)
+        health = assess_view_item_health(
+            item.ref,
+            department,
+            active_dcc_id=active_dcc,
+        )
+        if health is None:
+            return
+        dept_obj = _department_for_item(item.ref, department)
+        naming_prefix = (
+            work_file_prefix(name=item.ref.name, department=dept_obj.name) if dept_obj else ""
+        )
+        dlg = ItemHealthDialog(
+            parent=self,
+            item_name=display_name_for_item(item),
+            department=department,
+            health=health,
+            naming_prefix=naming_prefix or None,
+            on_repaired=lambda: self.refresh_requested.emit(),
+            health_refresh=(item.ref, department, active_dcc),
+        )
+        dlg.exec()
+
+    def _update_grid_thumb_interactive_hover(self, pos) -> None:
+        """Track hover for production status pill, health icon, and notes chip (grid)."""
         if self._view_mode != "tile":
             return
-        row: int | None = None
+        pill_row: int | None = None
         hit_item, hit_dep = self._grid_status_pill_hit(pos)
         if hit_item and hit_dep:
             idx = self._tile_view.indexAt(pos)
             if idx.isValid():
-                row = idx.row()
-        self._grid_delegate.set_hovered_pill_row(row)
+                pill_row = idx.row()
+        self._grid_delegate.set_hovered_pill_row(pill_row)
+        health_row = self._grid_health_hit_row(pos)
+        self._grid_delegate.set_hovered_health_row(health_row)
+        notes_row = self._grid_note_hit_row(pos)
+        self._grid_delegate.set_hovered_notes_row(notes_row)
+        vp = self._tile_view.viewport()
+        if health_row is not None or notes_row is not None:
+            vp.setCursor(Qt.CursorShape.PointingHandCursor)
+        elif pill_row is not None:
+            vp.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            vp.unsetCursor()
 
     def _list_status_pill_hit_row(self, pos: QPoint) -> int | None:
         """Row index if pos is over list production status pill; else None."""
@@ -2921,10 +4456,87 @@ class MainView(QWidget):
         pill_rect = _list_status_pill_rect_for_cell(cell_rect, line, fm)
         return index.row() if pill_rect.contains(pos) else None
 
+    def _list_health_hit_row(self, pos: QPoint) -> int | None:
+        if self._view_mode != "list" or self._browser_context not in ("asset", "shot"):
+            return None
+        dep = (self._active_department or "").strip()
+        if not dep:
+            return None
+        hc = self._list_col_health()
+        if hc < 0:
+            return None
+        index = self._list_view.indexAt(pos)
+        if not index.isValid() or index.column() != hc:
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
+            return None
+        health = assess_view_item_health(
+            item.ref,
+            dep,
+            active_dcc_id=_item_active_dcc(item.path, dep) if item.path else None,
+        )
+        if health is None:
+            return None
+        cell_rect = self._list_view.visualRect(index)
+        return index.row() if _list_health_chip_rect(cell_rect).contains(pos) else None
+
+    def _list_thumb_note_hit_row(self, pos: QPoint) -> int | None:
+        if self._view_mode != "list" or self._browser_context not in ("asset", "shot"):
+            return None
+        nc = self._list_col_notes()
+        if nc < 0:
+            return None
+        index = self._list_view.indexAt(pos)
+        if not index.isValid() or index.column() != nc:
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)) or not item.path:
+            return None
+        cell_rect = self._list_view.visualRect(index)
+        note_rect = _list_health_chip_rect(cell_rect)
+        return index.row() if note_rect.contains(pos) else None
+
+    def _list_thumb_note_hit(self, pos: QPoint) -> ViewItem | None:
+        row = self._list_thumb_note_hit_row(pos)
+        if row is None:
+            return None
+        nc = self._list_col_notes()
+        if nc < 0:
+            return None
+        index = self._list_view.model().index(row, nc)
+        item = index.data(Qt.UserRole)
+        return item if isinstance(item, ViewItem) else None
+
+    def _list_health_hit(self, pos: QPoint) -> ViewItem | None:
+        row = self._list_health_hit_row(pos)
+        if row is None:
+            return None
+        index = self._list_view.model().index(row, self._list_col_health())
+        item = index.data(Qt.UserRole)
+        return item if isinstance(item, ViewItem) else None
+
     def _update_list_status_pill_hover(self, pos: QPoint) -> None:
         if self._view_mode != "list":
             return
         self._list_row_delegate.set_hovered_status_row(self._list_status_pill_hit_row(pos))
+
+    def _update_list_interactive_hover(self, pos: QPoint) -> None:
+        """Hover for list status pill, health icon column, and notes column."""
+        if self._view_mode != "list":
+            return
+        self._update_list_status_pill_hover(pos)
+        self._list_row_delegate.set_hovered_health_row(self._list_health_hit_row(pos))
+        self._list_row_delegate.set_hovered_notes_row(self._list_thumb_note_hit_row(pos))
+        vp = self._list_view.viewport()
+        if (
+            self._list_health_hit_row(pos) is not None
+            or self._list_thumb_note_hit_row(pos) is not None
+            or self._list_status_pill_hit_row(pos) is not None
+        ):
+            vp.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            vp.unsetCursor()
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched is self._tile_view.viewport() and event.type() == QEvent.Resize:
@@ -2933,11 +4545,14 @@ class MainView(QWidget):
         if watched is self._tile_view.viewport() and self._view_mode == "tile":
             et = event.type()
             if et == QEvent.MouseMove:
-                self._update_grid_pill_hover(event.pos())
+                self._update_grid_thumb_interactive_hover(event.pos())
             elif et == QEvent.Leave:
                 self._grid_delegate.set_hovered_pill_row(None)
+                self._grid_delegate.set_hovered_health_row(None)
+                self._grid_delegate.set_hovered_notes_row(None)
+                self._tile_view.viewport().unsetCursor()
 
-        # Swallow mouse release on grid status pill so the view does not replace multi-selection.
+        # Swallow mouse release on grid status pill / health icon so the view does not replace multi-selection.
         if (
             watched is self._tile_view.viewport()
             and self._view_mode == "tile"
@@ -2946,6 +4561,12 @@ class MainView(QWidget):
         ):
             hit_sv_item, hit_sv_dep = self._grid_status_pill_hit(event.pos())
             if hit_sv_item and hit_sv_dep:
+                event.accept()
+                return True
+            if self._grid_health_hit_row(event.pos()) is not None:
+                event.accept()
+                return True
+            if self._grid_note_hit_row(event.pos()) is not None:
                 event.accept()
                 return True
 
@@ -2967,6 +4588,30 @@ class MainView(QWidget):
                     self._run_production_status_menu_for(Path(hit_sv_item.path), hit_sv_dep, gp)
                     event.accept()
                     return True
+                health_row = self._grid_health_hit_row(event.pos())
+                if health_row is not None:
+                    idx = self._tile_view.indexAt(event.pos())
+                    item = idx.data(Qt.UserRole) if idx.isValid() else None
+                    dep = (self._active_department or "").strip()
+                    if isinstance(item, ViewItem) and dep:
+                        if idx.isValid():
+                            sm = self._tile_view.selectionModel()
+                            if sm is not None:
+                                sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+                        self._show_item_health_dialog(item, dep)
+                        event.accept()
+                        return True
+                if self._grid_note_hit_row(event.pos()) is not None:
+                    idx = self._tile_view.indexAt(event.pos())
+                    n_item = idx.data(Qt.UserRole) if idx.isValid() else None
+                    if isinstance(n_item, ViewItem) and getattr(n_item, "path", None):
+                        if idx.isValid():
+                            sm = self._tile_view.selectionModel()
+                            if sm is not None:
+                                sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+                        self.item_notes_requested.emit(n_item)
+                        event.accept()
+                        return True
                 hit_item, hit_dcc, hit_dep = self._dcc_badge_hit(event.pos())
                 if hit_item and hit_dcc and hit_dep:
                     self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
@@ -3002,20 +4647,52 @@ class MainView(QWidget):
                             QToolTip.showText(event.globalPos(), active_dep)
                             event.accept()
                             return True
-                        # Status dot tooltip (only when department is focused — dot matches paint)
-                        status_rect = _thumb_status_dot_rect(cell_rect, self._GRID_GAP_PX)
-                        if status_rect.contains(pos) and (getattr(self._grid_delegate, "_active_department", None) or "").strip():
-                            label = _overall_status_tooltip_label_for_item(
-                                item,
-                                getattr(self._grid_delegate, "_active_department", None),
-                                project_root=self._project_root,
-                                hidden_departments=set(
-                                    getattr(self._grid_delegate, "_inspector_hidden_departments", frozenset())
-                                ),
+                        # Notes chip (asset/shot)
+                        if isinstance(item.ref, (Asset, Shot)) and getattr(item, "path", None):
+                            thumb_tt = _thumb_rect_from_cell(cell_rect, self._GRID_GAP_PX)
+                            active_dep_tt = (getattr(self._grid_delegate, "_active_department", None) or "").strip()
+                            hr_note: QRect | None = None
+                            if active_dep_tt:
+                                active_dcc_n = self.get_active_dcc(getattr(item, "path", None), active_dep_tt)
+                                if (
+                                    assess_view_item_health(
+                                        item.ref,
+                                        active_dep_tt,
+                                        active_dcc_id=active_dcc_n,
+                                    )
+                                    is not None
+                                ):
+                                    hr_note = _thumb_health_chip_rect(cell_rect, self._GRID_GAP_PX)
+                            note_r = _thumb_note_chip_rect(thumb_tt, hr_note)
+                            if note_r.contains(pos):
+                                n_open, nmode = self.notes_badge_state(item.path)
+                                QToolTip.showText(
+                                    event.globalPos(),
+                                    _notes_badge_tooltip_text(n_open, nmode),
+                                )
+                                event.accept()
+                                return True
+                        # Health icon tooltip (only when department is focused)
+                        health_rect = _thumb_health_chip_rect(cell_rect, self._GRID_GAP_PX)
+                        active_dep_tt = (getattr(self._grid_delegate, "_active_department", None) or "").strip()
+                        if (
+                            health_rect.contains(pos)
+                            and active_dep_tt
+                            and isinstance(item.ref, (Asset, Shot))
+                        ):
+                            active_dcc_tt = self.get_active_dcc(getattr(item, "path", None), active_dep_tt)
+                            health = assess_view_item_health(
+                                item.ref,
+                                active_dep_tt,
+                                active_dcc_id=active_dcc_tt,
                             )
-                            QToolTip.showText(event.globalPos(), label)
-                            event.accept()
-                            return True
+                            if health is not None:
+                                QToolTip.showText(
+                                    event.globalPos(),
+                                    _item_health_tooltip_text(health),
+                                )
+                                event.accept()
+                                return True
                         # DCC badge tooltip: DCC name — Department
                         hit_item, hit_dcc, hit_dep = self._dcc_badge_hit(pos)
                         if hit_item and hit_dcc:
@@ -3046,17 +4723,48 @@ class MainView(QWidget):
             if self._view_mode == "list":
                 let = event.type()
                 if let == QEvent.MouseMove:
-                    self._update_list_status_pill_hover(event.pos())
+                    self._update_list_interactive_hover(event.pos())
                 elif let == QEvent.Leave:
                     self._list_row_delegate.set_hovered_status_row(None)
+                    self._list_row_delegate.set_hovered_health_row(None)
+                    self._list_row_delegate.set_hovered_notes_row(None)
+                    list_view.viewport().unsetCursor()
             if event.type() == QEvent.MouseButtonRelease and self._view_mode == "list":
                 if event.button() == Qt.MouseButton.LeftButton:
                     dep = (self._active_department or "").strip()
                     if dep and self._list_status_hit(event.pos()):
                         event.accept()
                         return True
+                    if self._list_health_hit_row(event.pos()) is not None:
+                        event.accept()
+                        return True
+                    if self._list_thumb_note_hit_row(event.pos()) is not None:
+                        event.accept()
+                        return True
             if event.type() == QEvent.MouseButtonPress and self._view_mode == "list":
                 if event.button() == Qt.MouseButton.LeftButton:
+                    hit_note = self._list_thumb_note_hit(event.pos())
+                    if hit_note and hit_note.path:
+                        idx = list_view.indexAt(event.pos())
+                        if idx.isValid():
+                            sm = list_view.selectionModel()
+                            if sm is not None:
+                                sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+                        self.item_notes_requested.emit(hit_note)
+                        event.accept()
+                        return True
+                    hit_health = self._list_health_hit(event.pos())
+                    if hit_health:
+                        idx = list_view.indexAt(event.pos())
+                        if idx.isValid():
+                            sm = list_view.selectionModel()
+                            if sm is not None:
+                                sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+                        dep_h = (self._active_department or "").strip()
+                        if dep_h:
+                            self._show_item_health_dialog(hit_health, dep_h)
+                        event.accept()
+                        return True
                     hit_item, hit_dcc, hit_dep = self._list_dcc_hit(event.pos())
                     if hit_item and hit_dcc and hit_dep:
                         self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
@@ -3089,6 +4797,41 @@ class MainView(QWidget):
                         event.accept()
                         return True
             if event.type() == QEvent.ToolTip and self._view_mode == "list":
+                if self._list_thumb_note_hit_row(event.pos()) is not None:
+                    n_item = self._list_thumb_note_hit(event.pos())
+                    if n_item is not None and n_item.path:
+                        n_open, nmode = self.notes_badge_state(n_item.path)
+                        QToolTip.showText(
+                            event.globalPos(),
+                            _notes_badge_tooltip_text(n_open, nmode),
+                        )
+                        event.accept()
+                        return True
+                hc = self._list_col_health()
+                if hc >= 0:
+                    index = list_view.indexAt(event.pos())
+                    if index.isValid() and index.column() == hc:
+                        item = index.data(Qt.UserRole)
+                        dep_tt = (self._active_department or "").strip()
+                        if (
+                            dep_tt
+                            and isinstance(item, ViewItem)
+                            and isinstance(item.ref, (Asset, Shot))
+                        ):
+                            health = assess_view_item_health(
+                                item.ref,
+                                dep_tt,
+                                active_dcc_id=_item_active_dcc(item.path, dep_tt)
+                                if item.path
+                                else None,
+                            )
+                            if health is not None:
+                                QToolTip.showText(
+                                    event.globalPos(),
+                                    _item_health_tooltip_text(health),
+                                )
+                                event.accept()
+                                return True
                 hit_item, hit_dcc, hit_dep = self._list_dcc_hit(event.pos())
                 if hit_item and hit_dcc:
                     try:
@@ -3110,6 +4853,31 @@ class MainView(QWidget):
         self._grid_sync_scheduled = True
         QTimer.singleShot(0, self._sync_grid_layout)
 
+    def _tile_meta_line_count(self) -> int:
+        if self._browser_context not in ("asset", "shot"):
+            return 1
+        return tile_grid_meta_line_count(
+            show_id=self._tile_meta_show_id,
+            show_version=self._tile_meta_show_version,
+            show_last_updated=self._tile_meta_show_last_updated,
+            show_latest_note=self._tile_meta_show_latest_note,
+            show_current_department=self._tile_meta_show_current_department,
+            active_department=self._active_department,
+        )
+
+    def _apply_tile_meta_to_delegate(self) -> None:
+        d = getattr(self, "_grid_delegate", None)
+        if d is None:
+            return
+        d.set_tile_meta_display(
+            show_id=self._tile_meta_show_id,
+            show_version=self._tile_meta_show_version,
+            show_last_updated=self._tile_meta_show_last_updated,
+            show_latest_note=self._tile_meta_show_latest_note,
+            show_current_department=self._tile_meta_show_current_department,
+            show_status_pill=self._tile_meta_show_status_pill,
+        )
+
     def _sync_grid_layout(self) -> None:
         """
         Grid: card size from scale only (no auto-scale on resize).
@@ -3130,10 +4898,26 @@ class MainView(QWidget):
         # Card size from scale only (0.2..1.0), not from viewport width.
         card_w = max(80, int(self._CARD_REFERENCE_WIDTH * self._card_scale()))
         thumb_h = int(card_w * 9 / 16)
-        meta_h = 16 + 20 + 4 + 16 + 16  # p-4 + name + gap + meta + bottom breathing
-        if self._browser_context in ("asset", "shot") and self._view_mode == "tile":
-            if (self._active_department or "").strip():
-                meta_h += 22 + 8  # status pill under title (only when department is focused)
+        show_status_pill = (
+            self._tile_meta_show_status_pill
+            and self._browser_context in ("asset", "shot")
+            and self._view_mode == "tile"
+            and bool((self._active_department or "").strip())
+            and bool((self._project_root or "").strip())
+        )
+        pill_fm = (
+            QFontMetrics(monos_font("Inter", 10, QFont.Weight.DemiBold))
+            if show_status_pill
+            else None
+        )
+        if self._browser_context == "project":
+            meta_h = grid_card_meta_block_height_project()
+        else:
+            meta_h = grid_card_meta_block_height_asset_shot(
+                n_meta_lines=self._tile_meta_line_count(),
+                show_department_status_pill=show_status_pill,
+                pill_font_metrics=pill_fm,
+            )
         card_h = thumb_h + meta_h
 
         # How many cards fit in one row (resize changes this, not card size).
@@ -3169,16 +4953,30 @@ class MainView(QWidget):
         self._tile_model.set_publish_state(self._show_publish, self._active_department)
         self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
         try:
-            self._grid_delegate.set_active_department(self._active_department, icon_name=self._active_department_icon_name)
+            self._grid_delegate.set_active_department(
+                self._active_department,
+                icon_name=self._active_department_icon_name,
+                label=self._active_department_label,
+            )
         except Exception:
             pass
         if prev_dept != self._active_department:
             self._grid_delegate.set_hovered_pill_row(None)
+            self._grid_delegate.set_hovered_health_row(None)
+            self._grid_delegate.set_hovered_notes_row(None)
             self._list_row_delegate.set_hovered_status_row(None)
+            self._list_row_delegate.set_hovered_health_row(None)
+            self._list_row_delegate.set_hovered_notes_row(None)
+            self._grid_last = None
+            self._schedule_grid_layout_sync()
         # Always reset thumb states and prefetch when department changes; also run prefetch when only type changed (set_items already scheduled it, but ensure delegate/context is in sync).
         if prev_dept != self._active_department:
             self._reset_thumb_states_and_prefetch()
             self._refresh_list_status_column()
+            self._refresh_list_last_updated_column()
+            self._list_view.viewport().update()
+            if self._items_unfiltered:
+                self._resort_main_view_visible()
         else:
             self._schedule_thumbnail_prefetch()
 
@@ -3200,6 +4998,44 @@ class MainView(QWidget):
         except Exception:
             pass
         self._list_view.viewport().update()
+
+    def notes_badge_state(self, item_path: Path | str | None) -> tuple[int, str]:
+        """(open_count, visual_mode) with visual_mode in empty|open|all_done — cached per entity path."""
+        if item_path is None:
+            return (0, "empty")
+        try:
+            p = Path(item_path)
+            key = str(p.resolve())
+        except (TypeError, OSError, ValueError):
+            return (0, "empty")
+        hit = self._notes_badge_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            from monostudio.core.item_comments import notes_badge_visual_mode
+
+            n, mode = notes_badge_visual_mode(p)
+        except Exception:
+            n, mode = 0, "empty"
+        self._notes_badge_cache[key] = (int(n), str(mode))
+        return self._notes_badge_cache[key]
+
+    def notes_open_count(self, item_path: Path | str | None) -> int:
+        return self.notes_badge_state(item_path)[0]
+
+    def invalidate_notes_open_count_cache(self, path: Path | str | None = None) -> None:
+        if path is None:
+            self._notes_badge_cache.clear()
+        else:
+            try:
+                k = str(Path(path).resolve())
+            except (OSError, TypeError, ValueError):
+                return
+            self._notes_badge_cache.pop(k, None)
+        self._tile_view.viewport().update()
+        lv = getattr(self, "_list_view", None)
+        if lv is not None:
+            lv.viewport().update()
 
     def update_title(self, *, base_title: str, department: str | None) -> None:
         """
@@ -3292,7 +5128,10 @@ class MainView(QWidget):
         self._tile_model.set_publish_state(self._show_publish, self._active_department)
         self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
         self._sync_tile_drag_mode()
+        self._refresh_list_last_updated_column()
         self._tile_view.viewport().update()
+        if self._sort_field == self._SORT_FIELD_DATE and self._items_unfiltered:
+            self._resort_main_view_visible()
         self.show_publish_changed.emit(self._show_publish)
 
     def get_show_publish(self) -> bool:
@@ -3307,6 +5146,9 @@ class MainView(QWidget):
         Persist view mode per-context when user toggles it.
         """
         if context not in ("project", "asset", "shot"):
+            return
+        prev = self._browser_context
+        if context == prev:
             return
         self._browser_context = context
         self._card_scale_value = self._load_card_scale()
@@ -3324,6 +5166,11 @@ class MainView(QWidget):
         else:
             default_mode = "list" if context == "shot" else "tile"
             self.set_view_mode(default_mode, save=False)
+        # Table column count is 8 (project) vs 10 (asset/shot). Assets↔Shots stays 10 — skip table resetModel.
+        prev_cols = 8 if prev == "project" else 10
+        new_cols = 8 if context == "project" else 10
+        if prev_cols != new_cols:
+            self._list_model.reset_structure()
         self._schedule_grid_layout_sync()
 
     def set_thumbnail_manager(self, manager: object | None) -> None:
@@ -3343,6 +5190,7 @@ class MainView(QWidget):
         self._project_root = path or None
         self._cached_prod_reg = None
         self._cached_prod_reg_root = None
+        self._prune_filter_status_ids_to_registry()
         self._dept_registry = DepartmentRegistry.for_project(Path(path)) if path else None
         self._grid_delegate.set_active_project_root(self._project_root)
         self._grid_delegate.set_dept_registry(self._dept_registry)
@@ -3373,6 +5221,17 @@ class MainView(QWidget):
         except Exception:
             return "Waiting", QColor("#71717a")
 
+    @staticmethod
+    def _list_status_pill_max_natural_width_for_registry(
+        fm: QFontMetrics,
+        reg: ProductionStatusRegistry,
+    ) -> int:
+        """Upper bound for status pill text from registry labels (avoids per-row aggregate_status)."""
+        m = _list_status_pill_natural_width("Waiting", fm)
+        for st in reg.statuses.values():
+            m = max(m, _list_status_pill_natural_width(st.label, fm))
+        return m
+
     def _apply_list_status_column_width(self) -> None:
         """Set Status column width from precomputed pill layout (single resizeSection, no full-table scan)."""
         if self._browser_context not in ("asset", "shot") or self._view_mode != "list":
@@ -3391,41 +5250,27 @@ class MainView(QWidget):
     def _refresh_list_status_column(self) -> None:
         if self._browser_context not in ("asset", "shot"):
             return
-        col = 4
+        col = self._list_col_status()
+        if col < 0:
+            return
         reg = self._production_status_registry_cached()
         dep = (self._active_department or "").strip()
         chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
         fm = QFontMetrics(chip_font)
-        max_natural = 0
-        for row in range(self._list_model.rowCount()):
-            idx_item = self._list_model.item(row, 0)
-            if idx_item is None:
-                continue
-            item = idx_item.data(Qt.UserRole)
-            if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
-                continue
-            if dep:
-                try:
-                    sid = aggregate_status_id_for_item(
-                        item.ref,
-                        active_department=dep,
-                        hidden_departments=self._inspector_hidden_departments,
-                        registry=reg,
-                    )
-                    lbl = reg.label_for(sid)
-                    qc = QColor(color_hex_for_status_id(sid, reg))
-                    max_natural = max(max_natural, _list_status_pill_natural_width(lbl, fm))
-                except Exception:
-                    lbl, qc = "Waiting", QColor("#71717a")
-                    max_natural = max(max_natural, _list_status_pill_natural_width(lbl, fm))
-            else:
-                lbl, qc = self._list_asset_shot_status_label_and_color(item.ref)
-            c_status = self._list_model.item(row, col)
-            if c_status is not None:
-                c_status.setText(lbl)
-                c_status.setForeground(qc)
+        max_natural = (
+            self._list_status_pill_max_natural_width_for_registry(fm, reg) if dep else 0
+        )
         self._list_status_pill_layout_width = max_natural + 16 if dep else 0
         self._apply_list_status_column_width()
+        self._list_model.refresh_column_for_all_rows(col, [Qt.DisplayRole, Qt.ForegroundRole])
+
+    def _refresh_list_last_updated_column(self) -> None:
+        if self._browser_context not in ("asset", "shot"):
+            return
+        col = self._list_col_last_updated()
+        if col < 0 or self._list_model.columnCount() <= col:
+            return
+        self._list_model.refresh_column_for_all_rows(col, [Qt.DisplayRole])
 
     def set_empty_override(self, message: str | None) -> None:
         # Allows higher-level flows (e.g. workspace discovery) to present a neutral empty state.
@@ -3436,27 +5281,307 @@ class MainView(QWidget):
         # Clear Main View (no filesystem scan in this phase).
         self._tile_view.clearSelection()
         self._list_view.clearSelection()
-        self._tile_model.clear()
-        self._list_model.clear()
-        self._list_model.setHorizontalHeaderLabels(self._list_headers())
-        self._apply_list_column_defaults()
         self._all_items = []
+        self._items_unfiltered = []
         self._items = {}
         self._order = []
+        self._tile_model.bind_rows(self._all_items)
+        self._list_model.reset_structure()
+        self._apply_list_column_defaults()
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
 
+    def _load_filter_status_ids_from_settings(self) -> set[str]:
+        raw = self._settings.value(self._SETTINGS_KEY_FILTER_STATUS_IDS)
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple)):
+            return {str(x).strip() for x in raw if str(x).strip()}
+        text = str(raw).strip()
+        if not text:
+            return set()
+        return {p.strip() for p in text.split(",") if p.strip()}
+
+    def _save_filter_status_ids_to_settings(self) -> None:
+        self._settings.setValue(
+            self._SETTINGS_KEY_FILTER_STATUS_IDS,
+            sorted(self._filter_status_ids),
+        )
+
+    def _prune_filter_status_ids_to_registry(self) -> None:
+        if not self._filter_status_ids:
+            return
+        try:
+            known = set(self._production_status_registry_cached().menu_status_ids())
+        except Exception:
+            return
+        pruned = self._filter_status_ids & known
+        if pruned != self._filter_status_ids:
+            self._filter_status_ids = pruned
+            self._save_filter_status_ids_to_settings()
+
+    def _view_item_production_status_id(self, vi: ViewItem) -> str | None:
+        dep = (self._active_department or "").strip()
+        if not dep or not isinstance(vi.ref, (Asset, Shot)):
+            return None
+        try:
+            reg = self._production_status_registry_cached()
+            return aggregate_status_id_for_item(
+                vi.ref,
+                active_department=dep,
+                hidden_departments=self._inspector_hidden_departments,
+                registry=reg,
+            )
+        except Exception:
+            return "waiting"
+
+    def _show_filter_status_menu(self) -> None:
+        menu = self._filter_status_menu
+        if menu.isVisible():
+            menu.close()
+            return
+        btn = self._filter_status_btn
+        pos = btn.mapToGlobal(QPoint(0, btn.height() + 2))
+        menu.popup(pos)
+
+    def _update_filter_status_button_label(self) -> None:
+        btn = getattr(self, "_filter_status_btn", None)
+        if btn is None:
+            return
+        if not self._filter_status_ids:
+            btn.setText("All statuses")
+            btn.setIcon(QIcon())
+            return
+        try:
+            reg = self._production_status_registry_cached()
+        except Exception:
+            reg = None
+        if len(self._filter_status_ids) == 1:
+            sid = next(iter(self._filter_status_ids))
+            label = reg.label_for(sid) if reg is not None else sid
+            btn.setText(label)
+            if reg is not None:
+                btn.setIcon(_menu_status_dot_icon(color_hex_for_status_id(sid, reg)))
+            else:
+                btn.setIcon(QIcon())
+            return
+        btn.setText(f"{len(self._filter_status_ids)} statuses")
+        btn.setIcon(QIcon())
+
+    def _rebuild_filter_status_dropdown(self) -> None:
+        """Rebuild status filter dropdown menu from merged production status registry."""
+        menu = self._filter_status_menu
+        menu.clear()
+        self._filter_status_actions.clear()
+        reg = None
+        try:
+            reg = self._production_status_registry_cached()
+            grouped = reg.statuses_grouped_for_menu()
+        except Exception:
+            grouped = []
+        self._prune_filter_status_ids_to_registry()
+        first_section = True
+        for _cat, status_ids in grouped:
+            if not status_ids:
+                continue
+            if not first_section:
+                menu.addSeparator()
+            first_section = False
+            for sid in status_ids:
+                label = reg.label_for(sid) if reg is not None else sid
+                act = QAction(label, menu)
+                act.setCheckable(True)
+                act.setChecked(sid in self._filter_status_ids)
+                act.setData(sid)
+                if reg is not None:
+                    act.setIcon(_menu_status_dot_icon(color_hex_for_status_id(sid, reg)))
+                    st_def = reg.get(sid)
+                    if st_def and st_def.tooltip:
+                        act.setToolTip(st_def.tooltip)
+                act.toggled.connect(self._on_filter_status_action_toggled)
+                menu.addAction(act)
+                self._filter_status_actions[sid] = act
+        if menu.actions():
+            menu.addSeparator()
+        clear_act = QAction("Clear selection", menu)
+        clear_act.triggered.connect(self._on_filter_status_clear_selection)
+        menu.addAction(clear_act)
+        self._update_filter_status_button_label()
+
+    def _main_view_item_is_skipped_for_active_department(self, vi: ViewItem) -> bool:
+        """True when the focused-department production pill would show Skipped (preset id omitted)."""
+        dep = (self._active_department or "").strip()
+        if not dep or not self._project_root:
+            return False
+        if not isinstance(vi.ref, (Asset, Shot)):
+            return False
+        try:
+            reg = self._production_status_registry_cached()
+            sid = aggregate_status_id_for_item(
+                vi.ref,
+                active_department=dep,
+                hidden_departments=self._inspector_hidden_departments,
+                registry=reg,
+            )
+            return sid == "omitted"
+        except Exception:
+            return False
+
+    def _main_view_filters_active(self) -> bool:
+        if self._browser_context not in ("asset", "shot"):
+            return False
+        if not (self._active_department or "").strip():
+            return False
+        return (
+            self._hide_skipped_cards
+            or self._filter_work_folder != self._FILTER_WORK_ALL
+            or bool(self._filter_status_ids)
+        )
+
+    def _apply_main_view_item_filters(self, items: list[ViewItem]) -> list[ViewItem]:
+        if self._browser_context not in ("asset", "shot"):
+            return list(items)
+        dep = (self._active_department or "").strip()
+        if not dep:
+            return list(items)
+        out = list(items)
+        if self._hide_skipped_cards:
+            out = [vi for vi in out if not self._main_view_item_is_skipped_for_active_department(vi)]
+        wf = self._filter_work_folder
+        if wf == self._FILTER_WORK_HAS:
+            out = [
+                vi
+                for vi in out
+                if isinstance(vi.ref, (Asset, Shot))
+                and _item_has_work_folder_for_department(vi.ref, dep)
+            ]
+        elif wf == self._FILTER_WORK_NO:
+            out = [
+                vi
+                for vi in out
+                if isinstance(vi.ref, (Asset, Shot))
+                and not _item_has_work_folder_for_department(vi.ref, dep)
+            ]
+        if self._filter_status_ids:
+            allowed = self._filter_status_ids
+            out = [
+                vi
+                for vi in out
+                if isinstance(vi.ref, (Asset, Shot))
+                and (self._view_item_production_status_id(vi) or "waiting") in allowed
+            ]
+        return out
+
+    def _prepare_visible_items(self, items: list[ViewItem]) -> list[ViewItem]:
+        """Filter (optional) then sort for Assets/Shots main view."""
+        return self._sort_view_items(self._apply_main_view_item_filters(items))
+
+    def _view_item_sort_key(self, vi: ViewItem) -> tuple:
+        field = self._sort_field
+        if field == self._SORT_FIELD_DATE:
+            return (_view_item_mtime_sort_ts(
+                vi,
+                show_publish=self._show_publish,
+                active_department=self._active_department,
+            ), str(vi.path))
+        if field == self._SORT_FIELD_STATUS:
+            if not isinstance(vi.ref, (Asset, Shot)):
+                return (999, 999, "", str(vi.path))
+            try:
+                reg = self._production_status_registry_cached()
+                sid = aggregate_status_id_for_item(
+                    vi.ref,
+                    active_department=self._active_department,
+                    hidden_departments=self._inspector_hidden_departments,
+                    registry=reg,
+                )
+                cat_idx = reg.category_index(reg.category_for(sid))
+                ent = reg.get(sid)
+                rank = ent.rank if ent else 0
+                label = reg.label_for(sid).casefold()
+                return (cat_idx, rank, label, str(vi.path))
+            except Exception:
+                return (999, 999, "waiting", str(vi.path))
+        if isinstance(vi.ref, Asset):
+            return (vi.ref.asset_type, (vi.ref.name or "").casefold(), str(vi.path))
+        if isinstance(vi.ref, Shot):
+            return ((vi.ref.name or "").casefold(), str(vi.path))
+        return (display_name_for_item(vi).casefold(), str(vi.path))
+
+    def _sort_view_items(self, items: list[ViewItem]) -> list[ViewItem]:
+        if self._browser_context not in ("asset", "shot") or not items:
+            return list(items)
+        return sorted(items, key=self._view_item_sort_key, reverse=not self._sort_ascending)
+
+    def _insert_view_item_sorted(self, lst: list[ViewItem], vi: ViewItem) -> None:
+        if self._browser_context in ("asset", "shot"):
+            new_key = self._view_item_sort_key(vi)
+            asc = self._sort_ascending
+            insert_row = len(lst)
+            for i, existing in enumerate(lst):
+                ek = self._view_item_sort_key(existing)
+                if (ek > new_key) if asc else (ek < new_key):
+                    insert_row = i
+                    break
+            lst.insert(insert_row, vi)
+            return
+        new_key = self._asset_sort_key(vi)
+        insert_row = 0
+        for i, existing in enumerate(lst):
+            if self._asset_sort_key(existing) > new_key:
+                insert_row = i
+                break
+        else:
+            insert_row = len(lst)
+        lst.insert(insert_row, vi)
+
+    def _replace_view_item_in_list_by_path(self, lst: list[ViewItem], vi: ViewItem) -> bool:
+        for i, u in enumerate(lst):
+            if str(u.path) == str(vi.path) or self._paths_equal(u.path, vi.path):
+                lst[i] = vi
+                return True
+        return False
+
+    def _resort_main_view_visible(self) -> None:
+        """Rebuild visible rows from _items_unfiltered (filter + sort). Preserves selection when still visible."""
+        if self._browser_context not in ("asset", "shot") or not self._items_unfiltered:
+            return
+        visible = self._prepare_visible_items(self._items_unfiltered)
+        if tuple(str(v.path) for v in self._all_items) == tuple(str(v.path) for v in visible):
+            return
+        prev = self.selected_view_item()
+        prev_path = str(prev.path) if prev is not None else None
+        self._in_batch_set_items = True
+        self._tile_model.blockSignals(True)
+        self._list_model.blockSignals(True)
+        try:
+            self._all_items = visible
+            self._populate_views(visible)
+            self._order = [str(vi.path) for vi in visible]
+            self._rebuild_items_from_order()
+            if prev_path:
+                if not self.select_item_by_path(Path(prev_path)):
+                    self._tile_view.clearSelection()
+                    self._list_view.clearSelection()
+        finally:
+            self._tile_model.blockSignals(False)
+            self._list_model.blockSignals(False)
+            self._in_batch_set_items = False
+
     def set_items(self, items: list[ViewItem], preserve_selection_id: str | None = None) -> None:
-        # Explicit input only; no hidden filtering here (filter tree lives in Sidebar).
+        # Caller supplies the full list; Filter submenu may trim visible rows when a department is focused.
         # Avoid "all items disappear then reappear": freeze view + block model signals, re-enable next frame.
         self._in_batch_set_items = True
         self.setUpdatesEnabled(False)
         self._tile_model.blockSignals(True)
         self._list_model.blockSignals(True)
         try:
-            self._all_items = list(items)
-            self._populate_views(items)
+            self.invalidate_notes_open_count_cache()
+            self._items_unfiltered = list(items)
+            visible = self._prepare_visible_items(self._items_unfiltered)
+            self._all_items = visible
+            self._populate_views(visible)
             self._order = [str(vi.path) for vi in self._all_items]
             self._rebuild_items_from_order()
             if preserve_selection_id and preserve_selection_id.strip():
@@ -3523,14 +5648,8 @@ class MainView(QWidget):
             item = idx.data(Qt.UserRole)
             if not isinstance(item, ViewItem):
                 continue
-            std_item = self._tile_model.itemFromIndex(idx)
-            if std_item is None:
-                continue
-            std_item.setData(None, self._THUMB_STATE_ROLE)
-            std_item.setIcon(self._icon_for_item(item))
-            list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
-            if list_thumb is not None:
-                list_thumb.setIcon(std_item.icon())
+            self._tile_model.reset_thumbnail_slot_row(row)
+            self._list_model.notify_thumb_column(row)
         self._schedule_thumbnail_prefetch()
 
     def invalidate_thumbnail(self, item_root: Path, department: str | None = None) -> None:
@@ -3562,11 +5681,8 @@ class MainView(QWidget):
                 continue
             if item.path != root:
                 continue
-            std_item = self._tile_model.itemFromIndex(idx)
-            if std_item is None:
-                continue
-            std_item.setData(None, self._THUMB_STATE_ROLE)
-            icon = None
+            self._tile_model.reset_thumbnail_slot_row(row)
+            icon: QIcon | None = None
             if mgr is not None and hasattr(mgr, "request_thumbnail"):
                 pix = mgr.request_thumbnail(
                     asset_id,
@@ -3575,18 +5691,14 @@ class MainView(QWidget):
                 )
                 if pix is not None:
                     icon = QIcon(pix)
-                    std_item.setIcon(icon)
-                    std_item.setData("loaded", self._THUMB_STATE_ROLE)
+                    self._tile_model.set_row_thumbnail(row, icon, "loaded")
                 else:
                     icon = self._icon_for_item(item)
-                    std_item.setIcon(icon)
+                    self._tile_model.set_row_thumbnail(row, icon, None)
             else:
                 icon = self._icon_for_item(item)
-                std_item.setIcon(icon)
-            # Sync list thumbnail column
-            list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
-            if list_thumb is not None and icon is not None:
-                list_thumb.setIcon(icon)
+                self._tile_model.set_row_thumbnail(row, icon, None)
+            self._list_model.notify_thumb_column(row)
 
         self._schedule_thumbnail_prefetch()
 
@@ -3603,6 +5715,7 @@ class MainView(QWidget):
             tl = self._tile_model.index(0, 0)
             br = self._tile_model.index(rc - 1, 0)
             self._tile_model.dataChanged.emit(tl, br, [Qt.UserRole])
+            self._list_model.emit_all_user_role_changed()
         self._tile_view.viewport().update()
         self._list_view.viewport().update()
 
@@ -3634,9 +5747,6 @@ class MainView(QWidget):
             item = idx.data(Qt.UserRole)
             if not isinstance(item, ViewItem):
                 continue
-            std_item = self._tile_model.itemFromIndex(idx)
-            if std_item is None:
-                continue
             pix = mgr.request_thumbnail(
                 entity_path,
                 department=active_dept,
@@ -3644,15 +5754,11 @@ class MainView(QWidget):
             )
             if pix is not None:
                 icon = QIcon(pix)
-                std_item.setIcon(icon)
-                std_item.setData("loaded", self._THUMB_STATE_ROLE)
+                self._tile_model.set_row_thumbnail(row, icon, "loaded")
             else:
                 icon = self._icon_for_item(item)
-                std_item.setIcon(icon)
-                std_item.setData(None, self._THUMB_STATE_ROLE)
-            list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
-            if list_thumb is not None:
-                list_thumb.setIcon(std_item.icon())
+                self._tile_model.set_row_thumbnail(row, icon, None)
+            self._list_model.notify_thumb_column(row)
 
     def _row_for_item_id(self, item_id: str) -> int | None:
         """Return the model row index for the item with the given path id; path-normalized so updated_ids match."""
@@ -3691,71 +5797,9 @@ class MainView(QWidget):
         self._items = {aid: row for row, aid in enumerate(self._order)}
 
     def _insert_row_at(self, row: int, item: ViewItem, one_based_index: int) -> None:
-        """Insert one row at the given position in both tile and list models (asset/shot context)."""
-        tile_entry = QStandardItem(display_name_for_item(item))
-        tile_entry.setEditable(False)
-        tile_entry.setData(item, Qt.UserRole)
-        tile_entry.setData(None, self._THUMB_STATE_ROLE)
-        tile_entry.setIcon(self._icon_for_item(item))
-        self._tile_model.insertRow(row, tile_entry)
-        self._insert_list_row_at(row, item, one_based_index)
-
-    def _insert_list_row_at(self, row: int, item: ViewItem, one_based_index: int) -> None:
-        """Insert list row at position (asset/shot or project)."""
-        mono = monos_font("JetBrains Mono", 11)
-        if self._browser_context == "project":
-            stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
-            status = "WAITING" if not stats else stats.status
-            shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
-            assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
-            updated = "—" if not stats or not stats.last_modified else stats.last_modified
-            c_index = QStandardItem(str(one_based_index))
-            c_thumb = QStandardItem("")
-            c_thumb.setIcon(self._icon_for_item(item))
-            c_name = QStandardItem(display_name_for_item(item))
-            c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-            c_status = QStandardItem(status)
-            c_status.setForeground(self._status_foreground(status))
-            cells = [
-                c_index,
-                c_thumb,
-                c_name,
-                c_status,
-                QStandardItem(shots),
-                QStandardItem(assets),
-                QStandardItem(updated),
-                QStandardItem(str(item.path)),
-            ]
-            cells[7].setFont(mono)
-        else:
-            if isinstance(item.ref, (Asset, Shot)):
-                st_lbl, st_col = self._list_asset_shot_status_label_and_color(item.ref)
-            else:
-                st_lbl, st_col = "Waiting", self._status_foreground("WAITING")
-            c_index = QStandardItem(str(one_based_index))
-            c_thumb = QStandardItem("")
-            c_thumb.setIcon(self._icon_for_item(item))
-            c_name = QStandardItem(display_name_for_item(item))
-            c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-            c_dcc = QStandardItem("")  # painted by delegate
-            c_status = QStandardItem(st_lbl)
-            c_status.setForeground(st_col)
-            c_version = QStandardItem(self._list_version_text(item))
-            c_version.setFont(mono)
-            cells = [
-                c_index,
-                c_thumb,
-                c_name,
-                c_dcc,
-                c_status,
-                c_version,
-                QStandardItem(self._list_last_updated(item)),
-                QStandardItem("—"),  # Assignee
-            ]
-        for c in cells:
-            c.setEditable(False)
-            c.setData(item, Qt.UserRole)
-        self._list_model.insertRow(row, cells)
+        """Notify views after `_all_items.insert(row, …)` (caller mutates `_all_items`)."""
+        self._tile_model.notify_insert_rows(row, 1)
+        self._list_model.notify_insert_rows(row, 1)
 
     def set_selection_from_state(self, selection_id: str | None) -> None:
         """Drive selection from AppState only; does not emit selection_id_changed back."""
@@ -3801,6 +5845,10 @@ class MainView(QWidget):
                 self._list_view.setUpdatesEnabled(True)
                 self._tile_view.viewport().update()
                 self._list_view.viewport().update()
+        if self._browser_context in ("asset", "shot") and self._items_unfiltered and (
+            added_ids or removed_ids or updated_ids
+        ):
+            self._resort_main_view_visible()
         self._renumber_list_indices()
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
@@ -3821,31 +5869,32 @@ class MainView(QWidget):
             r = self._row_for_item_id(rid)
             if r is not None:
                 rows_to_remove.append(r)
-        rows_to_remove.sort(reverse=True)
+        rows_to_remove = sorted(set(rows_to_remove), reverse=True)
         for r in rows_to_remove:
-            self._tile_model.removeRow(r)
-            self._list_model.removeRow(r)
+            self._tile_model.before_remove_row(r)
+            del self._all_items[r]
+            self._tile_model.notify_remove_rows(r, 1)
+            self._list_model.notify_remove_rows(r, 1)
         self._order = [aid for aid in self._order if aid not in removed_set]
-        self._all_items = [vi for vi in self._all_items if str(vi.path) not in removed_set]
+        self._items_unfiltered = [vi for vi in self._items_unfiltered if str(vi.path) not in removed_set]
         self._rebuild_items_from_order()
 
         # 2. Update in place: only affected visuals (label, status, thumbnail). Use path-normalized row lookup.
         for uid in updated_ids:
+            vi = view_item_resolver(uid)
+            if vi is None:
+                continue
+            if not self._replace_view_item_in_list_by_path(self._items_unfiltered, vi):
+                self._insert_view_item_sorted(self._items_unfiltered, vi)
             row = self._row_for_item_id(uid)
             if row is None or row >= self._tile_model.rowCount():
                 _dcc_debug_log.debug("apply_assets_diff_impl skip update uid=%r row=%s model_rows=%d _order[:5]=%s", uid, row, self._tile_model.rowCount(), (self._order[:5] if self._order else []))
                 continue
             _dcc_debug_log.debug("apply_assets_diff_impl updating row=%d uid=%r", row, uid)
-            vi = view_item_resolver(uid)
-            if vi is None:
-                continue
-            tile_item = self._tile_model.item(row, 0)
-            if tile_item is not None:
-                tile_item.setText(display_name_for_item(vi))
-                tile_item.setData(vi, Qt.UserRole)
-                tile_item.setData(None, self._THUMB_STATE_ROLE)
-                tile_item.setIcon(self._icon_for_item(vi))
-            self._set_list_row_for_item(row, vi, row + 1)
+            self._tile_model.replace_row_view_item(row, vi)
+            self._tile_model.reset_thumbnail_slot_row(row)
+            self._list_model.refresh_row(row)
+            self._list_model.notify_thumb_column(row)
             if row < len(self._order):
                 self._order[row] = uid
             if row < len(self._all_items):
@@ -3859,14 +5908,23 @@ class MainView(QWidget):
             vi = view_item_resolver(aid)
             if vi is None:
                 continue
-            new_key = self._asset_sort_key(vi)
-            insert_row = 0
-            for i, existing_vi in enumerate(self._all_items):
-                if self._asset_sort_key(existing_vi) > new_key:
-                    insert_row = i
-                    break
+            self._items_unfiltered = [u for u in self._items_unfiltered if str(u.path) != str(vi.path)]
+            self._insert_view_item_sorted(self._items_unfiltered, vi)
+            insert_row = len(self._all_items)
+            if self._browser_context in ("asset", "shot"):
+                new_key = self._view_item_sort_key(vi)
+                asc = self._sort_ascending
+                for i, existing_vi in enumerate(self._all_items):
+                    ek = self._view_item_sort_key(existing_vi)
+                    if (ek > new_key) if asc else (ek < new_key):
+                        insert_row = i
+                        break
             else:
-                insert_row = len(self._all_items)
+                new_key = self._asset_sort_key(vi)
+                for i, existing_vi in enumerate(self._all_items):
+                    if self._asset_sort_key(existing_vi) > new_key:
+                        insert_row = i
+                        break
             self._order.insert(insert_row, aid)
             self._all_items.insert(insert_row, vi)
             self._insert_row_at(insert_row, vi, insert_row + 1)
@@ -3906,209 +5964,30 @@ class MainView(QWidget):
         """Same as apply_assets_diff for shots context."""
         self.apply_assets_diff(added_ids, removed_ids, updated_ids, view_item_resolver)
 
-    def _append_row_for_item(self, item: ViewItem, row_index: int) -> None:
-        """Append one row to tile and list models (asset/shot context)."""
-        tile_entry = QStandardItem(display_name_for_item(item))
-        tile_entry.setEditable(False)
-        tile_entry.setData(item, Qt.UserRole)
-        tile_entry.setData(None, self._THUMB_STATE_ROLE)
-        tile_entry.setIcon(self._icon_for_item(item))
-        self._tile_model.appendRow(tile_entry)
-        self._append_list_row_for_item(item, row_index)
-
-    def _append_list_row_for_item(self, item: ViewItem, row_index: int) -> None:
-        mono = monos_font("JetBrains Mono", 11)
-        if self._browser_context == "project":
-            stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
-            status = "WAITING" if not stats else stats.status
-            shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
-            assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
-            updated = "—" if not stats or not stats.last_modified else stats.last_modified
-            c_index = QStandardItem(str(row_index))
-            c_thumb = QStandardItem("")
-            c_thumb.setIcon(self._icon_for_item(item))
-            c_name = QStandardItem(display_name_for_item(item))
-            c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-            c_status = QStandardItem(status)
-            c_status.setForeground(self._status_foreground(status))
-            c_shots = QStandardItem(shots)
-            c_assets = QStandardItem(assets)
-            c_updated = QStandardItem(updated)
-            c_path = QStandardItem(str(item.path))
-            c_path.setFont(mono)
-            for cell in (c_index, c_thumb, c_name, c_status, c_shots, c_assets, c_updated, c_path):
-                cell.setEditable(False)
-                cell.setData(item, Qt.UserRole)
-            self._list_model.appendRow([c_index, c_thumb, c_name, c_status, c_shots, c_assets, c_updated, c_path])
-        else:
-            if isinstance(item.ref, (Asset, Shot)):
-                st_lbl, st_col = self._list_asset_shot_status_label_and_color(item.ref)
-            else:
-                st_lbl, st_col = "Waiting", self._status_foreground("WAITING")
-            c_index = QStandardItem(str(row_index))
-            c_thumb = QStandardItem("")
-            c_thumb.setIcon(self._icon_for_item(item))
-            c_name = QStandardItem(display_name_for_item(item))
-            c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-            c_dcc = QStandardItem("")
-            c_status = QStandardItem(st_lbl)
-            c_status.setForeground(st_col)
-            c_version = QStandardItem(self._list_version_text(item))
-            c_version.setFont(mono)
-            c_updated = QStandardItem(self._list_last_updated(item))
-            c_assignee = QStandardItem("—")
-            for cell in (c_index, c_thumb, c_name, c_dcc, c_status, c_version, c_updated, c_assignee):
-                cell.setEditable(False)
-                cell.setData(item, Qt.UserRole)
-            self._list_model.appendRow([c_index, c_thumb, c_name, c_dcc, c_status, c_version, c_updated, c_assignee])
-
-    def _set_list_row_for_item(self, row: int, item: ViewItem, row_index: int) -> None:
-        """Replace list row at index with item (asset/shot or project)."""
-        if self._browser_context == "project":
-            stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
-            status = "WAITING" if not stats else stats.status
-            shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
-            assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
-            updated = "—" if not stats or not stats.last_modified else stats.last_modified
-            mono = monos_font("JetBrains Mono", 11)
-            self._list_model.item(row, 0).setText(str(row_index))
-            self._list_model.item(row, 1).setIcon(self._icon_for_item(item))
-            self._list_model.item(row, 2).setText(display_name_for_item(item))
-            self._list_model.item(row, 2).setData(item, Qt.UserRole)
-            self._list_model.item(row, 2).setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-            self._list_model.item(row, 3).setText(status)
-            self._list_model.item(row, 3).setForeground(self._status_foreground(status))
-            self._list_model.item(row, 4).setText(shots)
-            self._list_model.item(row, 5).setText(assets)
-            self._list_model.item(row, 6).setText(updated)
-            self._list_model.item(row, 7).setText(str(item.path))
-            self._list_model.item(row, 7).setFont(mono)
-            for c in range(8):
-                self._list_model.item(row, c).setData(item, Qt.UserRole)
-        else:
-            if isinstance(item.ref, (Asset, Shot)):
-                st_lbl, st_col = self._list_asset_shot_status_label_and_color(item.ref)
-            else:
-                st_lbl, st_col = "Waiting", self._status_foreground("WAITING")
-            mono = monos_font("JetBrains Mono", 11)
-            self._list_model.item(row, 0).setText(str(row_index))
-            self._list_model.item(row, 1).setIcon(self._icon_for_item(item))
-            self._list_model.item(row, 2).setText(display_name_for_item(item))
-            self._list_model.item(row, 2).setData(item, Qt.UserRole)
-            self._list_model.item(row, 2).setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-            # column 3 = DCC (painted by delegate)
-            self._list_model.item(row, 4).setText(st_lbl)
-            self._list_model.item(row, 4).setForeground(st_col)
-            self._list_model.item(row, 5).setText(self._list_version_text(item))
-            self._list_model.item(row, 5).setFont(mono)
-            self._list_model.item(row, 6).setText(self._list_last_updated(item))
-            self._list_model.item(row, 7).setText("—")  # Assignee
-            for c in range(8):
-                self._list_model.item(row, c).setData(item, Qt.UserRole)
-
     def _renumber_list_indices(self) -> None:
         """Set # column (column 0) to 1-based row index for all rows."""
-        for row in range(self._list_model.rowCount()):
-            it = self._list_model.item(row, 0)
-            if it is not None:
-                it.setText(str(row + 1))
+        self._list_model.refresh_index_column()
 
     def _populate_views(self, items: list[ViewItem]) -> None:
-        # Populate both Tile and List representations from the same items.
+        # Populate both Tile and List from the same backing list (virtual models; no QStandardItem per row).
         self._tile_view.clearSelection()
         self._list_view.clearSelection()
 
-        self._tile_model.clear()
-
-        self._list_model.clear()
-        self._list_model.setHorizontalHeaderLabels(self._list_headers())
+        self._tile_model.bind_rows(items)
+        self._list_model.reset_structure()
         self._apply_list_column_defaults()
 
-        mono = monos_font("JetBrains Mono", 11)
-        list_pill_max_natural = 0
-        fm_list_pill = QFontMetrics(monos_font("Inter", 10, QFont.Weight.DemiBold))
-        reg_list_status = self._production_status_registry_cached()
         dep_list_status = (self._active_department or "").strip()
-
-        for idx, item in enumerate(items, start=1):
-            # Tile: Name only; metadata painted via icon and secondary lines (delegate-friendly).
-            tile_entry = QStandardItem(display_name_for_item(item))
-            tile_entry.setEditable(False)
-            tile_entry.setData(item, Qt.UserRole)
-            tile_entry.setData(None, self._THUMB_STATE_ROLE)
-            tile_entry.setIcon(self._icon_for_item(item))
-            self._tile_model.appendRow(tile_entry)
-
-            if self._browser_context == "project":
-                stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
-                status = "WAITING" if not stats else stats.status
-                shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
-                assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
-                updated = "—" if not stats or not stats.last_modified else stats.last_modified
-
-                c_index = QStandardItem(str(idx))
-                c_thumb = QStandardItem("")
-                c_thumb.setIcon(self._icon_for_item(item))
-                c_name = QStandardItem(display_name_for_item(item))
-                c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-                c_status = QStandardItem(status)
-                c_status.setForeground(self._status_foreground(status))
-                c_shots = QStandardItem(shots)
-                c_assets = QStandardItem(assets)
-                c_updated = QStandardItem(updated)
-                c_path = QStandardItem(str(item.path))
-                c_path.setFont(mono)
-
-                for cell in (c_index, c_thumb, c_name, c_status, c_shots, c_assets, c_updated, c_path):
-                    cell.setEditable(False)
-                    cell.setData(item, Qt.UserRole)
-
-                self._list_model.appendRow([c_index, c_thumb, c_name, c_status, c_shots, c_assets, c_updated, c_path])
-            else:
-                if isinstance(item.ref, (Asset, Shot)):
-                    if dep_list_status:
-                        try:
-                            sid_ls = aggregate_status_id_for_item(
-                                item.ref,
-                                active_department=dep_list_status,
-                                hidden_departments=self._inspector_hidden_departments,
-                                registry=reg_list_status,
-                            )
-                            st_lbl = reg_list_status.label_for(sid_ls)
-                            st_col = QColor(color_hex_for_status_id(sid_ls, reg_list_status))
-                            list_pill_max_natural = max(
-                                list_pill_max_natural, _list_status_pill_natural_width(st_lbl, fm_list_pill)
-                            )
-                        except Exception:
-                            st_lbl, st_col = "Waiting", QColor("#71717a")
-                            list_pill_max_natural = max(
-                                list_pill_max_natural, _list_status_pill_natural_width(st_lbl, fm_list_pill)
-                            )
-                    else:
-                        st_lbl, st_col = self._list_asset_shot_status_label_and_color(item.ref)
-                else:
-                    st_lbl, st_col = "Waiting", self._status_foreground("WAITING")
-                c_index = QStandardItem(str(idx))
-                c_thumb = QStandardItem("")
-                c_thumb.setIcon(self._icon_for_item(item))
-                c_name = QStandardItem(display_name_for_item(item))
-                c_name.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-                c_dcc = QStandardItem("")
-                c_status = QStandardItem(st_lbl)
-                c_status.setForeground(st_col)
-                c_version = QStandardItem(self._list_version_text(item))
-                c_version.setFont(mono)
-                c_updated = QStandardItem(self._list_last_updated(item))
-                c_assignee = QStandardItem("—")
-
-                for cell in (c_index, c_thumb, c_name, c_dcc, c_status, c_version, c_updated, c_assignee):
-                    cell.setEditable(False)
-                    cell.setData(item, Qt.UserRole)
-
-                self._list_model.appendRow([c_index, c_thumb, c_name, c_dcc, c_status, c_version, c_updated, c_assignee])
-
-        if self._browser_context != "project":
-            self._list_status_pill_layout_width = list_pill_max_natural + 16 if dep_list_status else 0
+        if self._browser_context != "project" and dep_list_status:
+            fm_list_pill = QFontMetrics(monos_font("Inter", 10, QFont.Weight.DemiBold))
+            reg_list_status = self._production_status_registry_cached()
+            list_pill_max_natural = self._list_status_pill_max_natural_width_for_registry(
+                fm_list_pill, reg_list_status
+            )
+            self._list_status_pill_layout_width = list_pill_max_natural + 16
+            self._apply_list_status_column_width()
+        elif self._browser_context != "project":
+            self._list_status_pill_layout_width = 0
             self._apply_list_status_column_width()
 
         self._update_empty_states()
@@ -4154,6 +6033,21 @@ class MainView(QWidget):
     def _card_scale(self) -> float:
         return self._card_scale_value
 
+    def _sync_main_view_options_popup_geometry(self) -> None:
+        """Resize popup to fit current content (submenu expand/collapse)."""
+        p = self._main_view_options_popup
+        lay = p.layout()
+        if lay is not None:
+            lay.activate()
+        p.updateGeometry()
+        hint = p.sizeHint()
+        w = max(p.minimumWidth(), hint.width())
+        h = hint.height()
+        p.setMinimumHeight(0)
+        p.setMaximumHeight(16777215)
+        if p.isVisible():
+            p.resize(w, h)
+
     def _show_main_view_options_popup(self) -> None:
         """Show main view options below the header button (size, source; filter/sort later). Toggle if open; reopen grace."""
         if self._main_view_options_popup.isVisible():
@@ -4179,9 +6073,39 @@ class MainView(QWidget):
         self._chk_dept_status_chips.blockSignals(True)
         self._chk_dept_status_chips.setChecked(self._show_dept_status_chips)
         self._chk_dept_status_chips.blockSignals(False)
+        show_asset_shot_opts = ctx in ("asset", "shot")
+        show_metadata = tile and show_asset_shot_opts
+        self._filter_sep.setVisible(show_asset_shot_opts)
+        self._filter_submenu.setVisible(show_asset_shot_opts)
+        self._sort_sep.setVisible(show_asset_shot_opts)
+        self._sort_submenu.setVisible(show_asset_shot_opts)
+        self._metadata_sep.setVisible(show_metadata)
+        self._metadata_submenu.setVisible(show_metadata)
+        if show_asset_shot_opts:
+            self._chk_hide_skipped_cards.blockSignals(True)
+            self._chk_hide_skipped_cards.setChecked(self._hide_skipped_cards)
+            self._chk_hide_skipped_cards.blockSignals(False)
+            self._sync_filter_work_radios_from_settings()
+            self._rebuild_filter_status_dropdown()
+            self._sync_main_view_options_popup_geometry()
+            self._sync_sort_radios_from_settings()
+        if show_metadata:
+            for chk, val in (
+                (self._chk_tile_meta_id, self._tile_meta_show_id),
+                (self._chk_tile_meta_version, self._tile_meta_show_version),
+                (self._chk_tile_meta_last_updated, self._tile_meta_show_last_updated),
+                (self._chk_tile_meta_latest_note, self._tile_meta_show_latest_note),
+                (self._chk_tile_meta_current_dept, self._tile_meta_show_current_department),
+                (self._chk_tile_meta_status_pill, self._tile_meta_show_status_pill),
+            ):
+                chk.blockSignals(True)
+                chk.setChecked(val)
+                chk.blockSignals(False)
         pos = self._btn_main_view_options.mapToGlobal(self._btn_main_view_options.rect().bottomLeft())
         self._main_view_options_popup.move(pos.x(), pos.y() + 2)
         self._main_view_options_popup.show()
+        self._sync_main_view_options_popup_geometry()
+        QTimer.singleShot(0, self._sync_main_view_options_popup_geometry)
 
     def _sync_thumb_source_radios_from_settings(self) -> None:
         ma = read_inspector_thumbnail_source(self._settings, entity="asset")
@@ -4241,6 +6165,185 @@ class MainView(QWidget):
         self._schedule_grid_layout_sync()
         self._tile_view.viewport().update()
 
+    def _on_tile_meta_id_toggled(self, checked: bool) -> None:
+        self._tile_meta_show_id = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_TILE_META_SHOW_ID, self._tile_meta_show_id)
+        self._apply_tile_meta_to_delegate()
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+
+    def _on_tile_meta_version_toggled(self, checked: bool) -> None:
+        self._tile_meta_show_version = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_TILE_META_SHOW_VERSION, self._tile_meta_show_version)
+        self._apply_tile_meta_to_delegate()
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+
+    def _on_tile_meta_last_updated_toggled(self, checked: bool) -> None:
+        self._tile_meta_show_last_updated = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_TILE_META_SHOW_LAST_UPDATED, self._tile_meta_show_last_updated)
+        self._apply_tile_meta_to_delegate()
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+
+    def _on_tile_meta_latest_note_toggled(self, checked: bool) -> None:
+        self._tile_meta_show_latest_note = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_TILE_META_SHOW_LATEST_NOTE, self._tile_meta_show_latest_note)
+        self._apply_tile_meta_to_delegate()
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+
+    def _on_tile_meta_current_dept_toggled(self, checked: bool) -> None:
+        self._tile_meta_show_current_department = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_TILE_META_SHOW_CURRENT_DEPT, self._tile_meta_show_current_department)
+        self._apply_tile_meta_to_delegate()
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+
+    def _on_tile_meta_status_pill_toggled(self, checked: bool) -> None:
+        self._tile_meta_show_status_pill = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_TILE_META_SHOW_STATUS_PILL, self._tile_meta_show_status_pill)
+        self._apply_tile_meta_to_delegate()
+        self._grid_delegate.set_hovered_pill_row(None)
+        self._grid_delegate.set_hovered_health_row(None)
+        self._grid_delegate.set_hovered_notes_row(None)
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+
+    def _on_filter_status_action_toggled(self, checked: bool) -> None:
+        act = self.sender()
+        if not isinstance(act, QAction):
+            return
+        sid = str(act.data() or "").strip()
+        if not sid:
+            return
+        if checked:
+            self._filter_status_ids.add(sid)
+        else:
+            self._filter_status_ids.discard(sid)
+        self._save_filter_status_ids_to_settings()
+        self._update_filter_status_button_label()
+        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
+    def _on_filter_status_clear_selection(self) -> None:
+        if not self._filter_status_ids:
+            return
+        self._filter_status_ids.clear()
+        for act in self._filter_status_actions.values():
+            act.blockSignals(True)
+            act.setChecked(False)
+            act.blockSignals(False)
+        self._save_filter_status_ids_to_settings()
+        self._update_filter_status_button_label()
+        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
+    def _on_hide_skipped_cards_toggled(self, checked: bool) -> None:
+        self._hide_skipped_cards = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_HIDE_SKIPPED_CARDS, self._hide_skipped_cards)
+        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
+    def _sync_sort_radios_from_settings(self) -> None:
+        by_field = {
+            self._SORT_FIELD_NAME: 0,
+            self._SORT_FIELD_DATE: 1,
+            self._SORT_FIELD_STATUS: 2,
+        }
+        field_btn = self._sort_field_group.button(by_field.get(self._sort_field, 0))
+        order_btn = self._sort_order_group.button(0 if self._sort_ascending else 1)
+        for w in (
+            self._sort_by_name,
+            self._sort_by_date,
+            self._sort_by_status,
+            self._sort_ascending_rb,
+            self._sort_descending_rb,
+        ):
+            w.blockSignals(True)
+        if field_btn is not None:
+            field_btn.setChecked(True)
+        if order_btn is not None:
+            order_btn.setChecked(True)
+        for w in (
+            self._sort_by_name,
+            self._sort_by_date,
+            self._sort_by_status,
+            self._sort_ascending_rb,
+            self._sort_descending_rb,
+        ):
+            w.blockSignals(False)
+
+    def _on_sort_field_clicked(self, button_id: int) -> None:
+        by_id = {0: self._SORT_FIELD_NAME, 1: self._SORT_FIELD_DATE, 2: self._SORT_FIELD_STATUS}
+        field = by_id.get(int(button_id), self._SORT_FIELD_NAME)
+        if field == self._sort_field:
+            return
+        self._sort_field = field
+        self._settings.setValue(self._SETTINGS_KEY_SORT_FIELD, field)
+        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
+    def _on_sort_order_clicked(self, button_id: int) -> None:
+        asc = int(button_id) == 0
+        if asc == self._sort_ascending:
+            return
+        self._sort_ascending = asc
+        self._settings.setValue(self._SETTINGS_KEY_SORT_ASCENDING, self._sort_ascending)
+        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
+    def _sync_filter_work_radios_from_settings(self) -> None:
+        by_mode = {
+            self._FILTER_WORK_ALL: 0,
+            self._FILTER_WORK_HAS: 1,
+            self._FILTER_WORK_NO: 2,
+        }
+        btn_id = by_mode.get(self._filter_work_folder, 0)
+        btn = self._filter_work_group.button(btn_id)
+        for w in (self._filter_work_all, self._filter_work_has, self._filter_work_no):
+            w.blockSignals(True)
+        if btn is not None:
+            btn.setChecked(True)
+        for w in (self._filter_work_all, self._filter_work_has, self._filter_work_no):
+            w.blockSignals(False)
+
+    def _on_filter_work_folder_clicked(self, button_id: int) -> None:
+        by_id = {
+            0: self._FILTER_WORK_ALL,
+            1: self._FILTER_WORK_HAS,
+            2: self._FILTER_WORK_NO,
+        }
+        mode = by_id.get(int(button_id), self._FILTER_WORK_ALL)
+        if mode == self._filter_work_folder:
+            return
+        self._filter_work_folder = mode
+        self._settings.setValue(self._SETTINGS_KEY_FILTER_WORK_FOLDER, mode)
+        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
     def _on_main_view_options_popup_hidden(self) -> None:
         self._main_view_options_popup_closed_at = time.monotonic()
         QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._btn_main_view_options))
@@ -4275,19 +6378,37 @@ class MainView(QWidget):
     def _list_headers(self) -> list[str]:
         if self._browser_context == "project":
             return ["", "", "Name", "Status", "Shots", "Assets", "Last Updated", "Path"]
-        return ["", "", "Name", "DCC", "Status", "Version", "Last Updated", "Assignee"]
+        return ["", "", "Name", "Notes", "DCC", "Health", "Status", "Version", "Last Updated", "Assignee"]
 
-    def _list_col_dcc(self) -> int:
-        """Column index for DCC badges (asset/shot only); right after Name = 3."""
+    def _list_col_notes(self) -> int:
+        """Column index for per-item notes chip (asset/shot only); after Name = 3."""
         if self._browser_context != "project":
             return 3
         return -1
 
+    def _list_col_dcc(self) -> int:
+        """Column index for DCC badges (asset/shot only); after Notes = 4."""
+        if self._browser_context != "project":
+            return 4
+        return -1
+
+    def _list_col_health(self) -> int:
+        """Column index for item health icon (asset/shot only); after DCC = 5."""
+        if self._browser_context != "project":
+            return 5
+        return -1
+
     def _list_col_status(self) -> int:
-        """Column index for Status (project: 3, asset/shot: 4)."""
+        """Column index for Status (project: 3, asset/shot: 6)."""
         if self._browser_context == "project":
             return 3
-        return 4
+        return 6
+
+    def _list_col_last_updated(self) -> int:
+        """Column index for Last Updated (project: 6, asset/shot: 8)."""
+        if self._browser_context == "project":
+            return 6
+        return 8
 
     def _list_version_text(self, item: ViewItem) -> str:
         """Version string for list: work or publish version for active department."""
@@ -4302,26 +6423,13 @@ class MainView(QWidget):
         )
         return ver if ver else "—"
 
-    @staticmethod
-    def _list_last_updated(item: ViewItem) -> str:
-        """Last updated string for list: mtime of asset/shot path or '—'."""
-        path = getattr(item, "path", None)
-        if not path or not isinstance(path, Path):
-            return "—"
-        try:
-            if path.is_dir():
-                mtime = path.stat().st_mtime
-            elif path.exists():
-                mtime = path.stat().st_mtime
-            else:
-                return "—"
-        except OSError:
-            return "—"
-        try:
-            from datetime import datetime
-            return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return "—"
+    def _list_last_updated(self, item: ViewItem) -> str:
+        """Last updated for list/tile: work folder or latest publish version folder (Published mode)."""
+        return _view_item_last_updated_display(
+            item,
+            show_publish=self._show_publish,
+            active_department=self._active_department,
+        )
 
     @staticmethod
     def _list_departments_text(item: ViewItem) -> str:
@@ -4373,6 +6481,14 @@ class MainView(QWidget):
             dcc_col = self._list_col_dcc()
             if dcc_col >= 0 and h:
                 h.setMinimumSectionSize(80)
+            notes_col = self._list_col_notes()
+            if notes_col >= 0 and h:
+                h.resizeSection(notes_col, 44)
+                h.setSectionResizeMode(notes_col, QHeaderView.ResizeMode.Fixed)
+            health_col = self._list_col_health()
+            if health_col >= 0 and h:
+                h.resizeSection(health_col, 44)
+                h.setSectionResizeMode(health_col, QHeaderView.ResizeMode.Fixed)
             QTimer.singleShot(0, self._apply_list_status_column_width)
 
     def _icon_for_item(self, item: ViewItem):
@@ -4415,11 +6531,19 @@ class MainView(QWidget):
         # Persistent per-context (stored in QSettings).
         if mode not in ("tile", "list"):
             return
+        if mode == self._view_mode:
+            if save:
+                self._settings.setValue(self._settings_key_view_mode(), mode)
+            return
         self._view_mode = mode
         if mode != "tile":
             self._grid_delegate.set_hovered_pill_row(None)
+            self._grid_delegate.set_hovered_health_row(None)
+            self._grid_delegate.set_hovered_notes_row(None)
         if mode != "list":
             self._list_row_delegate.set_hovered_status_row(None)
+            self._list_row_delegate.set_hovered_health_row(None)
+            self._list_row_delegate.set_hovered_notes_row(None)
         self._content.setCurrentIndex(1 if mode == "list" else 0)
         if save:
             self._settings.setValue(self._settings_key_view_mode(), mode)
@@ -4433,6 +6557,9 @@ class MainView(QWidget):
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
+        if mode == "tile":
+            self._grid_last = None
+            self._schedule_grid_layout_sync()
         if mode == "list":
             self._apply_list_status_column_width()
 
@@ -5002,12 +7129,16 @@ class MainView(QWidget):
         open_publish = None
 
         if item.kind.value in ("asset", "shot"):
+            menu.addAction(
+                lucide_icon("message-circle", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Notes…",
+            )
             refresh_action = menu.addAction(lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
             if item.kind.value == "asset":
                 rename_action = menu.addAction(lucide_icon("pencil", size=16, color_hex=MONOS_COLORS["text_label"]), "Rename… (Beta)")
             kind_word = "Asset" if item.kind.value == "asset" else "Shot"
             ent_name = (item.name or "").strip() or (item.path.name if item.path else "")
-            delete_label = f"Delete {kind_word} {ent_name}…" if ent_name else f"Delete {kind_word}…"
+            delete_label = f"Move {kind_word} {ent_name} to Trash…" if ent_name else f"Move {kind_word} to Trash…"
             delete_action = menu.addAction(lucide_icon("trash-2", size=16, color_hex="#ef4444"), delete_label)
             if delete_action is not None:
                 delete_action.setProperty("class", "danger-action")
@@ -5118,10 +7249,13 @@ class MainView(QWidget):
             _, folder = self._resolved_path_and_folder_for_item(item)
             self._open_folder(folder)
             return
+        if text == "Notes…":
+            self.item_notes_requested.emit(item)
+            return
         if text == "Refresh":
             self.refresh_requested.emit()
             return
-        if text == "Rename…":
+        if text in ("Rename…", "Rename… (Beta)"):
             if item.kind.value == "asset":
                 self.rename_requested.emit(item)
             return
@@ -5205,10 +7339,7 @@ class MainView(QWidget):
 
     def _reset_thumb_states_and_prefetch(self) -> None:
         """Clear all thumb states so thumbnails reload for the new department context."""
-        for row in range(self._tile_model.rowCount()):
-            std_item = self._tile_model.item(row)
-            if std_item is not None:
-                std_item.setData(None, self._THUMB_STATE_ROLE)
+        self._tile_model.clear_thumbnail_state_all()
         self._schedule_thumbnail_prefetch()
 
     def _schedule_thumbnail_prefetch(self, *, force: bool = False) -> None:
@@ -5221,14 +7352,13 @@ class MainView(QWidget):
 
     def _prefetch_visible_thumbnails(self) -> None:
         self._thumb_prefetch_scheduled = False
+        self._thumb_prefetch_gen += 1
+        gen = self._thumb_prefetch_gen
 
         if self._tile_model.rowCount() == 0:
             return
         active_dept = (self._active_department or "").strip() or None
 
-        # Prefetch all rows (asset/shot/project). QListView IconMode lays out lazily, so visualRect-based
-        # visibility checks miss most rows on first tick after set_items. ThumbnailManager dedupes pending /
-        # no-path keys, and WorkerManager queues via QThreadPool, so this stays cheap and idempotent.
         if self._view_mode == "tile":
             if self._tile_page.currentIndex() != 1:
                 return
@@ -5237,7 +7367,17 @@ class MainView(QWidget):
             if list_view is None or self._list_page.currentIndex() != 1:
                 return
 
-        for row in range(self._tile_model.rowCount()):
+        self._prefetch_thumbnails_chunk(gen, active_dept, 0)
+
+    def _prefetch_thumbnails_chunk(self, gen: int, active_dept: str | None, start_row: int) -> None:
+        if gen != self._thumb_prefetch_gen:
+            return
+
+        rc = self._tile_model.rowCount()
+        chunk = max(1, int(self._THUMB_PREFETCH_CHUNK_ROWS))
+        end = min(start_row + chunk, rc)
+
+        for row in range(start_row, end):
             index = self._tile_model.index(row, 0)
             if not index.isValid():
                 continue
@@ -5248,16 +7388,9 @@ class MainView(QWidget):
             if item.kind.value not in ("asset", "shot", "project"):
                 continue
 
-            std_item = self._tile_model.itemFromIndex(index)
-            if std_item is None:
-                continue
-
-            state = std_item.data(self._THUMB_STATE_ROLE)
+            state = self._tile_model.thumbnail_state_for_row(row)
             if state in ("loaded", "missing"):
-                # Still sync current icon to list (in case list was refreshed or never got it)
-                list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
-                if list_thumb is not None:
-                    list_thumb.setIcon(std_item.icon())
+                self._list_model.notify_thumb_column(row)
                 continue
 
             asset_id = str(item.path)
@@ -5270,30 +7403,28 @@ class MainView(QWidget):
                 )
                 if pix is not None:
                     icon = QIcon(pix)
-                    std_item.setIcon(icon)
-                    std_item.setData("loaded", self._THUMB_STATE_ROLE)
-                    list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
-                    if list_thumb is not None:
-                        list_thumb.setIcon(icon)
+                    self._tile_model.set_row_thumbnail(row, icon, "loaded")
+                    self._list_model.notify_thumb_column(row)
                     continue
-                # ThumbnailManager resolves render/sequence paths that legacy ThumbnailCache does not; never infer
-                # "missing" from resolve_thumbnail_file here or visible rows stay stuck until invalidate (e.g. DCC click).
                 continue
 
             thumb_file = self._thumb_cache.resolve_thumbnail_file(item.path, department=active_dept)
             if thumb_file is None:
-                std_item.setData("missing", self._THUMB_STATE_ROLE)
+                self._tile_model.set_thumb_state_only(row, "missing")
                 continue
 
             pix = self._thumb_cache.load_thumbnail_pixmap(thumb_file)
             if pix is None:
-                std_item.setData("missing", self._THUMB_STATE_ROLE)
+                self._tile_model.set_thumb_state_only(row, "missing")
                 continue
 
             icon = QIcon(pix)
-            std_item.setIcon(icon)
-            std_item.setData("loaded", self._THUMB_STATE_ROLE)
-            list_thumb = self._list_model.item(row, 1) if row < self._list_model.rowCount() else None
-            if list_thumb is not None:
-                list_thumb.setIcon(icon)
+            self._tile_model.set_row_thumbnail(row, icon, "loaded")
+            self._list_model.notify_thumb_column(row)
+
+        if end < rc:
+            QTimer.singleShot(
+                0,
+                lambda g=gen, dep=active_dept, nxt=end: self._prefetch_thumbnails_chunk(g, dep, nxt),
+            )
 

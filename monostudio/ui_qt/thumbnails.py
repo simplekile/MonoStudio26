@@ -620,6 +620,22 @@ class ThumbnailManager(QObject):
             self._no_path_keys.discard(cache_key)
         self._app_state.invalidate_thumbnails(keys + [aid] if keys else [aid])
 
+    def invalidate_entity(self, entity_path: str) -> None:
+        """Drop all cached thumbnails for one asset/shot (every department and source mode)."""
+        aid = (entity_path or "").strip()
+        if not aid:
+            return
+        keys: list[str] = []
+        for cache_key in set(self._cache.keys()) | self._pending | self._no_path_keys:
+            ep, _ = parse_department_cache_key(cache_key)
+            if ep != aid:
+                continue
+            keys.append(cache_key)
+            self._cache.pop(cache_key, None)
+            self._pending.discard(cache_key)
+            self._no_path_keys.discard(cache_key)
+        self._app_state.invalidate_thumbnails(keys + [aid] if keys else [aid])
+
     def clear_memory_cache(self) -> None:
         """Drop all in-memory thumbnails and pending loads (e.g. thumbnail source mode changed)."""
         self._cache.clear()
