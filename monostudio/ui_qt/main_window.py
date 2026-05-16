@@ -49,6 +49,7 @@ from monostudio.core.project_trash import (
     purge_expired,
     retention_days_from_settings,
 )
+from monostudio.core.shell_open import open_folder as shell_open_folder
 from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
 from monostudio.core.inbox_reader import add_to_inbox, append_inbox_distributed
 from monostudio.core.outbox_reader import add_to_outbox
@@ -2873,30 +2874,26 @@ class MainWindow(FramelessMainWindow):
                 self._reference_page_widget.set_project_root(self._project_root)
             notification_service.success(f"Added {added} item{'s' if added != 1 else ''} to Project Guide.")
 
+    def _open_path_in_explorer(self, path: object) -> None:
+        if not path:
+            return
+        try:
+            shell_open_folder(Path(path))
+        except (OSError, TypeError, ValueError):
+            pass
+
     def _on_reference_open_folder_requested(self, path) -> None:
-        if path:
-            try:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path))))
-            except Exception:
-                pass
+        self._open_path_in_explorer(path)
 
     def _on_inbox_open_folder_requested(self, path) -> None:
-        if path:
-            try:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-            except Exception:
-                pass
+        self._open_path_in_explorer(path)
 
     def _on_outbox_tree_selection_changed(self, path) -> None:
         """Outbox: inspector preview only (no distribute)."""
         self._inspector.set_inbox_tree_preview(Path(path) if path else None)
 
     def _on_outbox_open_folder_requested(self, path) -> None:
-        if path:
-            try:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-            except Exception:
-                pass
+        self._open_path_in_explorer(path)
 
     def _on_outbox_import_requested(self, _date_path=None) -> None:
         """Import (header or context menu): open file dialog, then Outbox drop dialog."""
@@ -3122,7 +3119,7 @@ class MainWindow(FramelessMainWindow):
                     work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
                     folder = work_path if work_path.is_dir() else work_path.parent
                     if folder.is_dir():
-                        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+                        shell_open_folder(folder)
                     return
         except Exception as e:
             logging.warning("DCC badge open folder failed: %s", e, exc_info=True)
@@ -3233,7 +3230,7 @@ class MainWindow(FramelessMainWindow):
                 self._ensure_entity_special_folders_watched(path.parent)
             except Exception:
                 pass
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        shell_open_folder(path)
 
     def _on_inspector_active_dcc_changed(self, path: object, department: str, dcc_id: str) -> None:
         """Đồng bộ active DCC từ Inspector sang Main View (cache + repaint)."""
@@ -3396,7 +3393,7 @@ class MainWindow(FramelessMainWindow):
                 return
         except (OSError, TypeError):
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        shell_open_folder(path)
 
     def _on_show_publish_changed(self, show_publish: bool) -> None:
         self._inspector.set_show_publish(show_publish)

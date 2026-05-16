@@ -99,6 +99,7 @@ from monostudio.core.fs_reader import (
 from monostudio.core.workspace_reader import ProjectQuickStats
 from monostudio.core.entity_folders import (
     ensure_entity_special_folder,
+    entity_has_concept_files,
     entity_has_reference_files,
     entity_special_folder_path,
 )
@@ -1232,6 +1233,41 @@ def _list_health_chip_rect(cell_rect: QRect) -> QRect:
     )
 
 
+_LIST_SPECIAL_FOLDER_ICON_PX = 16
+_LIST_SPECIAL_FOLDER_CHIP_PAD_PX = 6
+
+
+def _list_special_folder_chip_rect(cell_rect: QRect) -> QRect:
+    chip = _LIST_SPECIAL_FOLDER_ICON_PX + _LIST_SPECIAL_FOLDER_CHIP_PAD_PX * 2
+    return QRect(
+        cell_rect.left() + max(0, (cell_rect.width() - chip) // 2),
+        cell_rect.top() + max(0, (cell_rect.height() - chip) // 2),
+        chip,
+        chip,
+    )
+
+
+def _paint_list_special_folder_icon(
+    painter: QPainter,
+    chip_rect: QRect,
+    icon_name: str,
+    *,
+    has_files: bool,
+    hovered: bool,
+) -> None:
+    if hovered:
+        painter.fillRect(chip_rect, QColor(255, 255, 255, 18))
+    color = MONOS_COLORS["text_label"] if has_files else MONOS_COLORS["text_muted"]
+    pix = lucide_icon(icon_name, size=_LIST_SPECIAL_FOLDER_ICON_PX, color_hex=color).pixmap(
+        _LIST_SPECIAL_FOLDER_ICON_PX, _LIST_SPECIAL_FOLDER_ICON_PX
+    )
+    if pix.isNull():
+        return
+    x = chip_rect.x() + (chip_rect.width() - pix.width()) // 2
+    y = chip_rect.y() + (chip_rect.height() - pix.height()) // 2
+    painter.drawPixmap(x, y, pix)
+
+
 def _paint_health_icon_chip(
     painter: QPainter,
     chip_rect: QRect,
@@ -2030,6 +2066,8 @@ class _ListRowDelegate(QStyledItemDelegate):
         self._hovered_status_row: int | None = None
         self._hovered_health_row: int | None = None
         self._hovered_notes_row: int | None = None
+        self._hovered_ref_row: int | None = None
+        self._hovered_concept_row: int | None = None
 
     def set_hovered_status_row(self, row: int | None) -> None:
         if self._hovered_status_row == row:
@@ -2047,6 +2085,18 @@ class _ListRowDelegate(QStyledItemDelegate):
         if self._hovered_notes_row == row:
             return
         self._hovered_notes_row = row
+        self._view.viewport().update()
+
+    def set_hovered_ref_row(self, row: int | None) -> None:
+        if self._hovered_ref_row == row:
+            return
+        self._hovered_ref_row = row
+        self._view.viewport().update()
+
+    def set_hovered_concept_row(self, row: int | None) -> None:
+        if self._hovered_concept_row == row:
+            return
+        self._hovered_concept_row = row
         self._view.viewport().update()
 
     def set_active_project_root(self, path: str | None) -> None:
@@ -2086,6 +2136,12 @@ class _ListRowDelegate(QStyledItemDelegate):
         list_col_health = main._list_col_health() if hasattr(main, "_list_col_health") else -1
         if col == list_col_health and list_col_health >= 0:
             chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+            base = super().sizeHint(option, index)
+            return QSize(max(base.width(), chip + 12), max(base.height(), chip + 8))
+        list_col_ref = main._list_col_ref() if hasattr(main, "_list_col_ref") else -1
+        list_col_concept = main._list_col_concept() if hasattr(main, "_list_col_concept") else -1
+        if col in (list_col_ref, list_col_concept) and col >= 0:
+            chip = _LIST_SPECIAL_FOLDER_ICON_PX + _LIST_SPECIAL_FOLDER_CHIP_PAD_PX * 2
             base = super().sizeHint(option, index)
             return QSize(max(base.width(), chip + 12), max(base.height(), chip + 8))
         return super().sizeHint(option, index)
@@ -2273,6 +2329,46 @@ class _ListRowDelegate(QStyledItemDelegate):
                     finally:
                         painter.restore()
                     return
+
+        list_col_ref = main._list_col_ref() if hasattr(main, "_list_col_ref") else -1
+        list_col_concept = main._list_col_concept() if hasattr(main, "_list_col_concept") else -1
+        if (
+            col in (list_col_ref, list_col_concept)
+            and col >= 0
+            and getattr(main, "_browser_context", "") in ("asset", "shot")
+            and isinstance(item, ViewItem)
+            and isinstance(item.ref, (Asset, Shot))
+        ):
+            has_files = False
+            if col == list_col_ref and hasattr(main, "entity_has_reference_files_cached"):
+                has_files = bool(main.entity_has_reference_files_cached(item))  # type: ignore[attr-defined]
+            elif col == list_col_concept and hasattr(main, "entity_has_concept_files_cached"):
+                has_files = bool(main.entity_has_concept_files_cached(item))  # type: ignore[attr-defined]
+            icon_name = "eye" if col == list_col_ref else "lightbulb"
+            hovered = (
+                (col == list_col_ref and self._hovered_ref_row == index.row())
+                or (col == list_col_concept and self._hovered_concept_row == index.row())
+            )
+            painter.save()
+            try:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                opt = QStyleOptionViewItem(option)
+                self.initStyleOption(opt, index)
+                opt.text = ""
+                opt.icon = QIcon()
+                self._view.style().drawControl(
+                    QStyle.ControlElement.CE_ItemViewItem, opt, painter, self._view
+                )
+                _paint_list_special_folder_icon(
+                    painter,
+                    _list_special_folder_chip_rect(option.rect),
+                    icon_name,
+                    has_files=has_files,
+                    hovered=hovered,
+                )
+            finally:
+                painter.restore()
+            return
 
         list_col_status = main._list_col_status() if hasattr(main, "_list_col_status") else -1
         if (
@@ -3503,6 +3599,7 @@ class MainView(QWidget):
         self._cached_prod_reg: object | None = None
         self._notes_badge_cache: dict[str, tuple[int, str]] = {}
         self._entity_reference_cache: dict[str, bool] = {}
+        self._entity_concept_cache: dict[str, bool] = {}
         # Precomputed list Status column width (pill); avoids resizeColumnToContents × N rows.
         self._list_status_pill_layout_width: int = 0
 
@@ -4561,6 +4658,44 @@ class MainView(QWidget):
         item = index.data(Qt.UserRole)
         return item if isinstance(item, ViewItem) else None
 
+    def _list_special_folder_hit(
+        self, pos: QPoint, column: int, folder_id: str
+    ) -> ViewItem | None:
+        if self._view_mode != "list" or self._browser_context not in ("asset", "shot"):
+            return None
+        if column < 0:
+            return None
+        index = self._list_view.indexAt(pos)
+        if not index.isValid() or index.column() != column:
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
+            return None
+        cell_rect = self._list_view.visualRect(index)
+        if not _list_special_folder_chip_rect(cell_rect).contains(pos):
+            return None
+        return item
+
+    def _list_ref_hit(self, pos: QPoint) -> ViewItem | None:
+        return self._list_special_folder_hit(pos, self._list_col_ref(), "reference")
+
+    def _list_concept_hit(self, pos: QPoint) -> ViewItem | None:
+        return self._list_special_folder_hit(pos, self._list_col_concept(), "concept")
+
+    def _list_ref_hit_row(self, pos: QPoint) -> int | None:
+        item = self._list_ref_hit(pos)
+        if item is None:
+            return None
+        index = self._list_view.indexAt(pos)
+        return index.row() if index.isValid() else None
+
+    def _list_concept_hit_row(self, pos: QPoint) -> int | None:
+        item = self._list_concept_hit(pos)
+        if item is None:
+            return None
+        index = self._list_view.indexAt(pos)
+        return index.row() if index.isValid() else None
+
     def _update_list_status_pill_hover(self, pos: QPoint) -> None:
         if self._view_mode != "list":
             return
@@ -4573,11 +4708,15 @@ class MainView(QWidget):
         self._update_list_status_pill_hover(pos)
         self._list_row_delegate.set_hovered_health_row(self._list_health_hit_row(pos))
         self._list_row_delegate.set_hovered_notes_row(self._list_thumb_note_hit_row(pos))
+        self._list_row_delegate.set_hovered_ref_row(self._list_ref_hit_row(pos))
+        self._list_row_delegate.set_hovered_concept_row(self._list_concept_hit_row(pos))
         vp = self._list_view.viewport()
         if (
             self._list_health_hit_row(pos) is not None
             or self._list_thumb_note_hit_row(pos) is not None
             or self._list_status_pill_hit_row(pos) is not None
+            or self._list_ref_hit_row(pos) is not None
+            or self._list_concept_hit_row(pos) is not None
         ):
             vp.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
@@ -4773,6 +4912,8 @@ class MainView(QWidget):
                     self._list_row_delegate.set_hovered_status_row(None)
                     self._list_row_delegate.set_hovered_health_row(None)
                     self._list_row_delegate.set_hovered_notes_row(None)
+                    self._list_row_delegate.set_hovered_ref_row(None)
+                    self._list_row_delegate.set_hovered_concept_row(None)
                     list_view.viewport().unsetCursor()
             if event.type() == QEvent.MouseButtonRelease and self._view_mode == "list":
                 if event.button() == Qt.MouseButton.LeftButton:
@@ -4786,8 +4927,24 @@ class MainView(QWidget):
                     if self._list_thumb_note_hit_row(event.pos()) is not None:
                         event.accept()
                         return True
+                    if self._list_ref_hit_row(event.pos()) is not None:
+                        event.accept()
+                        return True
+                    if self._list_concept_hit_row(event.pos()) is not None:
+                        event.accept()
+                        return True
             if event.type() == QEvent.MouseButtonPress and self._view_mode == "list":
                 if event.button() == Qt.MouseButton.LeftButton:
+                    hit_ref = self._list_ref_hit(event.pos())
+                    if hit_ref:
+                        self._open_entity_special_folder_from_item(hit_ref, "reference")
+                        event.accept()
+                        return True
+                    hit_concept = self._list_concept_hit(event.pos())
+                    if hit_concept:
+                        self._open_entity_special_folder_from_item(hit_concept, "concept")
+                        event.accept()
+                        return True
                     hit_note = self._list_thumb_note_hit(event.pos())
                     if hit_note and hit_note.path:
                         idx = list_view.indexAt(event.pos())
@@ -4877,6 +5034,38 @@ class MainView(QWidget):
                                 )
                                 event.accept()
                                 return True
+                ref_col = self._list_col_ref()
+                if ref_col >= 0:
+                    index = list_view.indexAt(event.pos())
+                    if index.isValid() and index.column() == ref_col:
+                        item = index.data(Qt.UserRole)
+                        if isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
+                            has = self.entity_has_reference_files_cached(item)
+                            label = display_name_for_item(item) or item.name
+                            tip = (
+                                f"Open reference folder — {label}"
+                                if has
+                                else f"Reference folder (empty) — {label}"
+                            )
+                            QToolTip.showText(event.globalPos(), tip)
+                            event.accept()
+                            return True
+                concept_col = self._list_col_concept()
+                if concept_col >= 0:
+                    index = list_view.indexAt(event.pos())
+                    if index.isValid() and index.column() == concept_col:
+                        item = index.data(Qt.UserRole)
+                        if isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
+                            has = self.entity_has_concept_files_cached(item)
+                            label = display_name_for_item(item) or item.name
+                            tip = (
+                                f"Open concept folder — {label}"
+                                if has
+                                else f"Concept folder (empty) — {label}"
+                            )
+                            QToolTip.showText(event.globalPos(), tip)
+                            event.accept()
+                            return True
                 hit_item, hit_dcc, hit_dep = self._list_dcc_hit(event.pos())
                 if hit_item and hit_dcc:
                     try:
@@ -5047,12 +5236,14 @@ class MainView(QWidget):
     def invalidate_entity_reference_cache(self, entity_path: Path | str | None = None) -> None:
         if entity_path is None:
             self._entity_reference_cache.clear()
+            self._entity_concept_cache.clear()
         else:
             try:
                 key = str(Path(entity_path).resolve())
             except (TypeError, ValueError, OSError):
                 key = str(entity_path)
             self._entity_reference_cache.pop(key, None)
+            self._entity_concept_cache.pop(key, None)
         self.refresh_reference_hint_badges()
 
     def entity_has_reference_files_cached(self, item: ViewItem) -> bool:
@@ -5075,8 +5266,32 @@ class MainView(QWidget):
         self._entity_reference_cache[key] = has
         return has
 
+    def entity_has_concept_files_cached(self, item: ViewItem) -> bool:
+        if not isinstance(item.ref, (Asset, Shot)):
+            return False
+        try:
+            key = str(Path(item.path).resolve())
+        except (TypeError, ValueError, OSError):
+            key = str(item.path)
+        hit = self._entity_concept_cache.get(key)
+        if hit is not None:
+            return bool(hit)
+        pr: Path | None = None
+        if self._project_root is not None:
+            try:
+                pr = Path(self._project_root).resolve()
+            except OSError:
+                pr = Path(self._project_root)
+        has = entity_has_concept_files(pr, item.ref, dept_registry=self._dept_registry)
+        self._entity_concept_cache[key] = has
+        return has
+
     def refresh_reference_hint_badges(self) -> None:
         self._tile_view.viewport().update()
+        if self._browser_context in ("asset", "shot"):
+            for col in (self._list_col_ref(), self._list_col_concept()):
+                if col >= 0:
+                    self._list_model.refresh_column_for_all_rows(col, [])
 
     def _view_item_has_reference_files(self, item: ViewItem) -> bool:
         return self.entity_has_reference_files_cached(item)
@@ -5109,6 +5324,7 @@ class MainView(QWidget):
         if path is None:
             self._notes_badge_cache.clear()
             self._entity_reference_cache.clear()
+            self._entity_concept_cache.clear()
         else:
             try:
                 k = str(Path(path).resolve())
@@ -6478,7 +6694,20 @@ class MainView(QWidget):
     def _list_headers(self) -> list[str]:
         if self._browser_context == "project":
             return ["", "", "Name", "Status", "Shots", "Assets", "Last Updated", "Path"]
-        return ["", "", "Name", "Notes", "DCC", "Health", "Status", "Version", "Last Updated", "Assignee"]
+        return [
+            "",
+            "",
+            "Name",
+            "Notes",
+            "DCC",
+            "Health",
+            "Ref",
+            "Concept",
+            "Status",
+            "Version",
+            "Last Updated",
+            "Assignee",
+        ]
 
     def _list_col_notes(self) -> int:
         """Column index for per-item notes chip (asset/shot only); after Name = 3."""
@@ -6498,17 +6727,27 @@ class MainView(QWidget):
             return 5
         return -1
 
+    def _list_col_ref(self) -> int:
+        if self._browser_context != "project":
+            return 6
+        return -1
+
+    def _list_col_concept(self) -> int:
+        if self._browser_context != "project":
+            return 7
+        return -1
+
     def _list_col_status(self) -> int:
-        """Column index for Status (project: 3, asset/shot: 6)."""
+        """Column index for Status (project: 3, asset/shot: 8)."""
         if self._browser_context == "project":
             return 3
-        return 6
+        return 8
 
     def _list_col_last_updated(self) -> int:
-        """Column index for Last Updated (project: 6, asset/shot: 8)."""
+        """Column index for Last Updated (project: 6, asset/shot: 10)."""
         if self._browser_context == "project":
             return 6
-        return 8
+        return 10
 
     def _list_version_text(self, item: ViewItem) -> str:
         """Version string for list: work or publish version for active department."""
@@ -6589,6 +6828,14 @@ class MainView(QWidget):
             if health_col >= 0 and h:
                 h.resizeSection(health_col, 44)
                 h.setSectionResizeMode(health_col, QHeaderView.ResizeMode.Fixed)
+            ref_col = self._list_col_ref()
+            if ref_col >= 0 and h:
+                h.resizeSection(ref_col, 40)
+                h.setSectionResizeMode(ref_col, QHeaderView.ResizeMode.Fixed)
+            concept_col = self._list_col_concept()
+            if concept_col >= 0 and h:
+                h.resizeSection(concept_col, 52)
+                h.setSectionResizeMode(concept_col, QHeaderView.ResizeMode.Fixed)
             QTimer.singleShot(0, self._apply_list_status_column_width)
 
     def _icon_for_item(self, item: ViewItem):
@@ -7088,7 +7335,7 @@ class MainView(QWidget):
         has_dept_filter = bool((self._active_department or "").strip())
 
         if item.kind.value in ("asset", "shot") and self._show_publish:
-            open_latest = menu.addAction(lucide_icon("package-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Latest Publish")
+            open_latest = menu.addAction(lucide_icon("package-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Latest Publish Folder")
             open_pub_root = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Publish Folder")
             menu.addSeparator()
             if has_dept_filter:
@@ -7398,7 +7645,7 @@ class MainView(QWidget):
             elif hasattr(item, "ref") and item.ref is not None and hasattr(item.ref, "publish_path"):
                 self._open_folder(Path(item.ref.publish_path))
             return
-        if text == "Open Latest Publish":
+        if text == "Open Latest Publish Folder":
             if isinstance(item.ref, (Asset, Shot)):
                 folder = _resolve_latest_publish_folder(item.ref, self._active_department)
                 if folder is not None:
@@ -7465,7 +7712,9 @@ class MainView(QWidget):
                 return
         except OSError:
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        from monostudio.core.shell_open import open_folder as shell_open_folder
+
+        shell_open_folder(folder)
 
     def _reset_thumb_states_and_prefetch(self) -> None:
         """Clear all thumb states so thumbnails reload for the new department context."""

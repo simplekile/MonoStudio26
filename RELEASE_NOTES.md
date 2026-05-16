@@ -1,3 +1,29 @@
+# MonoStudio 26 — Release v26.12.0
+
+## Highlights
+
+- **Inspector — Reference & Concept**: Tab Ref với thumbnail grid cho `reference/` và `concept/`; kéo-thả hoặc **Add files…** để import; xóa file / xóa toàn bộ; mở folder qua menu; card hover và highlight khi drop.
+- **Main view — List**: Cột **Ref** và **Concept** (icon eye / lightbulb) mở thư mục đặc biệt của entity; badge khi đã có file.
+- **Explorer — mở folder thống nhất**: Module `shell_open` trên Windows focus cửa sổ Explorer đã mở cùng path (tránh nhân đôi); dùng xuyên suốt Main view, Inspector, Inbox.
+- **Project trash & item metadata**: Soft-delete asset/shot vào `.monostudio/trash`; ghi chú per-item (`item_comments.json`); health chip trên grid/list.
+- **Preview & thumbnails**: Pipeline sequence preview/decode và thumbnail ổn định hơn; giảm flicker thumbnail khi đổi tab Assets/Shots.
+
+## Changes in this release
+
+- feat: `inspector_ref_tab.py` — import, drag-drop, delete, context menu, reveal/open folder.
+- feat: `entity_folders.py` — `import_paths_into_special_folder`, `entity_has_concept_files`.
+- feat: `shell_open.py` — `open_folder`, `reveal_in_folder` (Windows COM reuse).
+- feat: `main_view.py` — list Ref/Concept columns, concept cache, open special folders.
+- feat: project trash, item notes dialog, item health UI (commits trước trong nhánh).
+- fix: grid thumbnail flicker sau khi chuyển tab Assets/Shots.
+- docs: `.cursor/rules/rule_open_folder_shell_v1.mdc`.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.11.6
 
 ## Highlights

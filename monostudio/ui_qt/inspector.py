@@ -4249,8 +4249,7 @@ class _DeptCard(QFrame):
             pass
 
     def _open_folder(self) -> None:
-        from PySide6.QtGui import QDesktopServices
-        from PySide6.QtCore import QUrl
+        from monostudio.core.shell_open import open_folder as shell_open_folder
 
         if self._dept is None:
             return
@@ -4259,7 +4258,7 @@ class _DeptCard(QFrame):
                 return
         except OSError:
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._dept.path)))
+        shell_open_folder(self._dept.path)
 
 
 _MAX_DEPT_CARDS = 32

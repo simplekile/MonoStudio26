@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -94,6 +95,70 @@ def entity_has_reference_files(
 ) -> bool:
     """True when top-level ``reference/`` has at least one file."""
     path = entity_special_folder_path(project_root, entity, "reference", dept_registry=dept_registry)
+    if path is None:
+        return False
+    return count_special_folder_files(path) > 0
+
+
+def unique_path_in_folder(folder: Path, name: str) -> Path:
+    """Return ``folder / name`` or ``name (n).ext`` if that path already exists."""
+    dest = folder / name
+    if not dest.exists():
+        return dest
+    p = Path(name)
+    stem, suffix = p.stem, p.suffix
+    n = 1
+    while n < 10_000:
+        candidate = folder / f"{stem} ({n}){suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+    return folder / f"{stem} ({n}){suffix}"
+
+
+def import_paths_into_special_folder(folder: Path, sources: list[Path]) -> int:
+    """
+    Copy local files/folders into a special folder (top-level entries only for listing).
+    Returns the number of source items successfully processed.
+    """
+    if not folder.is_dir():
+        return 0
+    copied = 0
+    for src in sources:
+        if not src.exists():
+            continue
+        try:
+            if src.is_file():
+                dest = unique_path_in_folder(folder, src.name)
+                shutil.copy2(src, dest)
+                copied += 1
+            elif src.is_dir():
+                dest_dir = unique_path_in_folder(folder, src.name)
+                if dest_dir.exists() and dest_dir.is_dir():
+                    for child in src.iterdir():
+                        if child.is_file():
+                            shutil.copy2(child, unique_path_in_folder(folder, child.name))
+                        elif child.is_dir():
+                            child_dest = unique_path_in_folder(folder, child.name)
+                            if not child_dest.exists():
+                                shutil.copytree(child, child_dest)
+                    copied += 1
+                else:
+                    shutil.copytree(src, dest_dir)
+                    copied += 1
+        except OSError:
+            continue
+    return copied
+
+
+def entity_has_concept_files(
+    project_root: Path | None,
+    entity: Asset | Shot,
+    *,
+    dept_registry: object | None = None,
+) -> bool:
+    """True when top-level ``concept/`` has at least one file."""
+    path = entity_special_folder_path(project_root, entity, "concept", dept_registry=dept_registry)
     if path is None:
         return False
     return count_special_folder_files(path) > 0

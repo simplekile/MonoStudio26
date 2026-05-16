@@ -1351,6 +1351,19 @@ def apply_dark_theme(app: QApplication) -> None:
         QScrollArea#InspectorDetailsScrollArea QWidget {
             background: transparent;
         }
+        QScrollArea#InspectorRefScrollArea QWidget#InspectorRefSectionContainer {
+            background-color: #1f1f22;
+            border: 1px solid rgba(39, 39, 42, 0.65);
+            border-radius: 8px;
+        }
+        QScrollArea#InspectorRefScrollArea QWidget#InspectorRefSectionContainer[sectionHover="true"] {
+            background-color: #27272a;
+            border: 1px solid rgba(63, 63, 70, 0.80);
+        }
+        QScrollArea#InspectorRefScrollArea QWidget#InspectorRefSectionContainer[dropHighlight="true"] {
+            background-color: #27272a;
+            border: 1px dashed #3b82f6;
+        }
         QScrollArea#InspectorRefScrollArea QWidget#qt_scrollarea_viewport,
         QScrollArea#InspectorDetailsScrollArea QWidget#qt_scrollarea_viewport {
             background-color: #18181b;
@@ -1362,6 +1375,23 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QWidget#InspectorRefTab {
             background-color: #18181b;
+        }
+        QWidget#InspectorRefSectionContainer {
+            background-color: #1f1f22;
+            border: 1px solid rgba(39, 39, 42, 0.65);
+            border-radius: 8px;
+        }
+        QWidget#InspectorRefSectionContainer[sectionHover="true"] {
+            background-color: #27272a;
+            border: 1px solid rgba(63, 63, 70, 0.80);
+        }
+        QWidget#InspectorRefSectionContainer[dropHighlight="true"] {
+            background-color: #27272a;
+            border: 1px dashed #3b82f6;
+        }
+        QWidget#InspectorRefSection {
+            background: transparent;
+            border: none;
         }
         QListView#InspectorRefGrid {
             background: transparent;

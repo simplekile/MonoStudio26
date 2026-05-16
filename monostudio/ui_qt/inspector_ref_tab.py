@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,13 +21,27 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QFont,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QListView,
+    QMessageBox,
     QScrollArea,
     QSizePolicy,
     QStyledItemDelegate,
@@ -42,10 +55,12 @@ from monostudio.core.entity_folders import (
     EntitySpecialFolderId,
     count_special_folder_files,
     ensure_entity_special_folder,
+    import_paths_into_special_folder,
     is_ref_preview_image,
     list_special_folder_files,
 )
 from monostudio.core.models import Asset, Shot
+from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, monos_font
 from monostudio.ui_qt.thumbnails import ThumbnailCache, decode_ref_preview_qimage_worker
@@ -95,20 +110,6 @@ def _ref_grid_columns_for_width(available_w: int) -> int:
     unit = _REF_THUMB_SIZE + _REF_GRID_GAP
     cols = max(1, (int(available_w) + _REF_GRID_GAP) // unit)
     return min(cols, _REF_MAX_GRID_COLUMNS)
-
-
-def _reveal_in_explorer(path: Path) -> None:
-    try:
-        if sys.platform == "win32":
-            subprocess.Popen(
-                ["explorer", "/select,", str(path.resolve())],
-                **({"creationflags": subprocess.CREATE_NO_WINDOW} if hasattr(subprocess, "CREATE_NO_WINDOW") else {}),
-            )
-            return
-    except (OSError, ValueError):
-        pass
-    parent = path.parent if path.is_file() else path
-    QDesktopServices.openUrl(QUrl.fromLocalFile(str(parent)))
 
 
 @dataclass(frozen=True)
@@ -278,6 +279,7 @@ class _RefSectionHeader(QWidget):
 
 class _InspectorRefSection(QWidget):
     open_folder_clicked = Signal(str)
+    files_imported = Signal(str)
 
     def __init__(
         self,
@@ -288,8 +290,18 @@ class _InspectorRefSection(QWidget):
         empty_hint: str,
         parent=None,
     ) -> None:
-        super().__init__(parent)
+        self._container = QWidget(parent)
+        self._container.setObjectName("InspectorRefSectionContainer")
+        self._container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        card_lay = QVBoxLayout(self._container)
+        card_lay.setContentsMargins(10, 10, 10, 10)
+        card_lay.setSpacing(0)
+
+        super().__init__(self._container)
         self.setObjectName("InspectorRefSection")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        card_lay.addWidget(self, 0)
+
         self._section_id = section_id
         self._folder_path: Path | None = None
         self._files: list[Path] = []
@@ -306,15 +318,28 @@ class _InspectorRefSection(QWidget):
         self._hovered_row: int | None = None
         self._grid_last: tuple[int, int] | None = None  # (cols, list_height)
         self._grid_sync_scheduled = False
+        self._drop_enabled = False
+        self._drop_highlight = False
+        self._drag_over_depth = 0
+        self._container_hover = False
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.setAcceptDrops(True)
+        self._container.setAcceptDrops(True)
+        self._container.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._container.setMouseTracking(True)
+        self.setMouseTracking(True)
+        self._container.installEventFilter(self)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
-        hdr = _RefSectionHeader(self)
-        hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hdr = _RefSectionHeader(self)
+        self._hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hdr.setMouseTracking(True)
+        self._hdr.setAcceptDrops(True)
+        hdr = self._hdr
         hdr_l = QHBoxLayout(hdr)
         hdr_l.setContentsMargins(0, 0, 0, 0)
         hdr_l.setSpacing(6)
@@ -375,8 +400,14 @@ class _InspectorRefSection(QWidget):
         self._delegate = _RefThumbDelegate(self)
         self._list.setItemDelegate(self._delegate)
         self._list.clicked.connect(self._on_list_clicked)
+        self._list.doubleClicked.connect(self._on_list_double_clicked)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._on_list_context_menu)
+        for host in (self._container, self, self._hdr, self._body, self._empty_block):
+            host.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            host.customContextMenuRequested.connect(
+                lambda pos, h=host: self._on_section_context_menu(h, pos)
+            )
         self._list.entered.connect(self._on_list_entered)
         self._list.viewportEntered.connect(lambda: self._set_hovered_row(None))
         body_l.addWidget(self._list, 0)
@@ -391,6 +422,155 @@ class _InspectorRefSection(QWidget):
         body_l.addWidget(self._other_link, 0)
 
         lay.addWidget(self._body, 0)
+        self._body.setMouseTracking(True)
+        for w in (self, self._hdr, self._body, self._empty_block, self._list, self._list.viewport()):
+            w.setAcceptDrops(True)
+            w.installEventFilter(self)
+
+    @property
+    def container(self) -> QWidget:
+        return self._container
+
+    def _pointer_over_section(self) -> bool:
+        if self._container.underMouse() or self.underMouse():
+            return True
+        for w in self._container.findChildren(QWidget):
+            if w.isVisible() and w.underMouse():
+                return True
+        return False
+
+    def _polish_container(self) -> None:
+        st = self._container.style()
+        if st is not None:
+            st.unpolish(self._container)
+            st.polish(self._container)
+        self._container.update()
+
+    def _sync_container_hover(self) -> None:
+        if self._drop_highlight:
+            on = False
+        else:
+            on = self._pointer_over_section()
+        if self._container_hover == on:
+            return
+        self._container_hover = on
+        self._container.setProperty("sectionHover", "true" if on else "false")
+        self._polish_container()
+
+    def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        if obj in (
+            self,
+            self._container,
+            self._hdr,
+            self._body,
+            self._empty_block,
+            self._list,
+            self._list.viewport(),
+        ):
+            t = event.type()
+            if t in (QEvent.Type.Enter, QEvent.Type.MouseMove):
+                self._sync_container_hover()
+            elif t in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                QTimer.singleShot(0, self._sync_container_hover)
+            if t == QEvent.Type.DragEnter and isinstance(event, QDragEnterEvent):
+                self.dragEnterEvent(event)
+                return True
+            if t == QEvent.Type.DragMove and isinstance(event, QDragMoveEvent):
+                self.dragMoveEvent(event)
+                return True
+            if t == QEvent.Type.DragLeave:
+                self.dragLeaveEvent(event)  # type: ignore[arg-type]
+                return True
+            if t == QEvent.Type.Drop and isinstance(event, QDropEvent):
+                self.dropEvent(event)
+                return True
+        return super().eventFilter(obj, event)
+
+    def set_drop_enabled(self, enabled: bool) -> None:
+        self._drop_enabled = bool(enabled)
+        if not enabled:
+            self._drag_over_depth = 0
+            self._set_drop_highlight(False)
+
+    def _set_drop_highlight(self, on: bool) -> None:
+        if self._drop_highlight == on:
+            return
+        self._drop_highlight = on
+        self._container.setProperty("dropHighlight", "true" if on else "false")
+        self._polish_container()
+        self._sync_container_hover()
+
+    @staticmethod
+    def _paths_from_drop_event(event: QDropEvent | QDragEnterEvent | QDragMoveEvent) -> list[Path]:
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls():
+            return []
+        out: list[Path] = []
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            try:
+                p = Path(url.toLocalFile())
+            except (OSError, ValueError):
+                continue
+            if p.exists():
+                out.append(p)
+        return out
+
+    def _can_accept_drag(self, event: QDragEnterEvent | QDragMoveEvent) -> bool:
+        return bool(self._drop_enabled and self._paths_from_drop_event(event))
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+        if not self._can_accept_drag(event):
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._drag_over_depth += 1
+        self._set_drop_highlight(True)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # type: ignore[override]
+        if not self._can_accept_drag(event):
+            event.ignore()
+            self._clear_drop_highlight_if_idle()
+            return
+        event.acceptProposedAction()
+        self._set_drop_highlight(True)
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self._drag_over_depth = max(0, self._drag_over_depth - 1)
+        self._clear_drop_highlight_if_idle()
+        super().dragLeaveEvent(event)
+
+    def _clear_drop_highlight_if_idle(self) -> None:
+        if self._drag_over_depth == 0:
+            self._set_drop_highlight(False)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
+        self._drag_over_depth = 0
+        self._set_drop_highlight(False)
+        if not self._drop_enabled:
+            event.ignore()
+            return
+        sources = self._paths_from_drop_event(event)
+        if not sources:
+            event.ignore()
+            return
+        folder = self._folder_path
+        if folder is None:
+            event.ignore()
+            return
+        if not ensure_entity_special_folder(folder):
+            event.ignore()
+            return
+        n = import_paths_into_special_folder(folder, sources)
+        event.acceptProposedAction()
+        if n > 0:
+            self.set_expanded(True)
+            self.files_imported.emit(self._section_id)
+        else:
+            from monostudio.ui_qt.notification import notify as notification_service
+
+            notification_service.warning("Could not add files to this folder.")
 
     def _set_hovered_row(self, row: int | None) -> None:
         if self._hovered_row == row:
@@ -526,6 +706,7 @@ class _InspectorRefSection(QWidget):
 
     def set_folder_path(self, path: Path | None) -> None:
         self._folder_path = path
+        self.set_drop_enabled(path is not None)
 
     def apply_scan(self, files: list[Path], *, expanded: bool | None = None) -> int:
         self._files = list(files)
@@ -621,6 +802,12 @@ class _InspectorRefSection(QWidget):
             return
         self._selected_path = entry.path
         self._list.viewport().update()
+
+    def _on_list_double_clicked(self, index: QModelIndex) -> None:
+        entry = self._model.entry_at(index.row())
+        if entry is None:
+            return
+        self._selected_path = entry.path
         self._open_file(entry.path)
 
     def _open_file(self, path: Path) -> None:
@@ -630,27 +817,168 @@ class _InspectorRefSection(QWidget):
         except (OSError, ValueError):
             pass
 
+    def _section_import_title(self) -> str:
+        return "Add to Reference" if self._section_id == "reference" else "Add to Concept"
+
+    def _pick_and_import_files(self) -> None:
+        folder = self._folder_path
+        if folder is None or not self._drop_enabled:
+            return
+        if not ensure_entity_special_folder(folder):
+            return
+        parent = self.window()
+        files, _ = QFileDialog.getOpenFileNames(
+            parent,
+            self._section_import_title(),
+            "",
+            "All Files (*)",
+        )
+        if not files:
+            return
+        sources = [Path(f) for f in files]
+        n = import_paths_into_special_folder(folder, sources)
+        if n > 0:
+            self.set_expanded(True)
+            self.files_imported.emit(self._section_id)
+        else:
+            from monostudio.ui_qt.notification import notify as notification_service
+
+            notification_service.warning("Could not add files to this folder.")
+
+    def _delete_file(self, path: Path) -> None:
+        if not path.is_file():
+            return
+        name = path.name or str(path)
+        if not ask_delete(self._list, "Delete", f'Delete file "{name}"?'):
+            return
+        try:
+            path.unlink()
+        except OSError as e:
+            QMessageBox.warning(self._list, "Delete", f"Could not delete: {e}")
+            return
+        key = _ref_path_key(path)
+        self._thumb_pixmaps.pop(key, None)
+        self._thumb_pending.discard(key)
+        self._thumb_missing.discard(key)
+        if self._selected_path == path:
+            self._selected_path = None
+        self.files_imported.emit(self._section_id)
+        from monostudio.ui_qt.notification import notify as notification_service
+
+        notification_service.success(f'Deleted "{name}".')
+
+    def _section_label(self) -> str:
+        return "Reference" if self._section_id == "reference" else "Concept"
+
+    def _section_top_level_entries(self) -> list[Path]:
+        folder = self._folder_path
+        if folder is None or not folder.is_dir():
+            return []
+        try:
+            return list(folder.iterdir())
+        except OSError:
+            return []
+
+    def _delete_all_section_contents(self) -> None:
+        folder = self._folder_path
+        if folder is None or not folder.is_dir():
+            return
+        entries = self._section_top_level_entries()
+        if not entries:
+            return
+        n_files = sum(1 for p in entries if p.is_file())
+        n_dirs = len(entries) - n_files
+        label = self._section_label()
+        if n_dirs:
+            msg = (
+                f"Delete all contents of {label} ({n_files} file"
+                f"{'s' if n_files != 1 else ''}, {n_dirs} folder"
+                f"{'s' if n_dirs != 1 else ''})? This cannot be undone."
+            )
+        else:
+            msg = (
+                f"Delete all {n_files} file{'s' if n_files != 1 else ''} in {label}? "
+                "This cannot be undone."
+            )
+        if not ask_delete(self._list, "Delete all", msg):
+            return
+        failed: list[str] = []
+        for path in entries:
+            try:
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    shutil.rmtree(path)
+            except OSError:
+                failed.append(path.name)
+        self._thumb_pixmaps.clear()
+        self._thumb_pending.clear()
+        self._thumb_missing.clear()
+        self._selected_path = None
+        self.files_imported.emit(self._section_id)
+        from monostudio.ui_qt.notification import notify as notification_service
+
+        if failed:
+            notification_service.warning(f"Could not delete: {', '.join(failed[:5])}")
+        else:
+            notification_service.success(f"Cleared {label}.")
+
+    def _on_section_context_menu(self, host: QWidget, pos: QPoint) -> None:
+        if host is self._list:
+            index = self._list.indexAt(pos)
+            entry = self._model.entry_at(index.row()) if index.isValid() else None
+        else:
+            entry = None
+        self._show_context_menu(host.mapToGlobal(pos), entry)
+
     def _on_list_context_menu(self, pos) -> None:
-        index = self._list.indexAt(pos)
-        entry = self._model.entry_at(index.row()) if index.isValid() else None
-        if entry is None:
+        self._on_section_context_menu(self._list, pos)
+
+    def _show_context_menu(self, global_pos: QPoint, entry: _RefThumbEntry | None) -> None:
+        if not self._drop_enabled or self._folder_path is None:
             return
         menu = MonosMenu(parent=self)
-        menu.addAction(lucide_icon("file", size=16, color_hex=MONOS_COLORS["text_label"]), "Open")
-        menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Reveal in Explorer")
-        menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy file path")
-        chosen = menu.exec(self._list.viewport().mapToGlobal(pos))
+        icon = lambda name: lucide_icon(name, size=16, color_hex=MONOS_COLORS["text_label"])
+        icon_red = lambda name: lucide_icon(name, size=16, color_hex=MONOS_COLORS.get("destructive", "#ef4444"))
+
+        open_act = open_folder_act = copy_act = delete_act = delete_all_act = None
+        if entry is not None:
+            open_act = menu.addAction(icon("file"), "Open")
+            open_folder_act = menu.addAction(icon("folder-open"), "Open folder")
+            copy_act = menu.addAction(icon("copy"), "Copy file path")
+            menu.addSeparator()
+        else:
+            open_folder_act = menu.addAction(icon("folder-open"), "Open folder")
+            menu.addSeparator()
+
+        add_act = menu.addAction(icon("plus"), "Add files…")
+        has_contents = bool(self._section_top_level_entries())
+        if entry is not None or has_contents:
+            menu.addSeparator()
+        if entry is not None:
+            delete_act = menu.addAction(icon_red("trash-2"), "Delete")
+            delete_act.setProperty("class", "danger-action")
+        if has_contents:
+            delete_all_act = menu.addAction(icon_red("trash-2"), "Delete all…")
+            delete_all_act.setProperty("class", "danger-action")
+
+        chosen = menu.exec(global_pos)
         if chosen is None:
             return
-        text = chosen.text()
-        if text == "Open":
-            self._open_file(entry.path)
-        elif text == "Reveal in Explorer":
-            _reveal_in_explorer(entry.path)
-        elif text == "Copy file path":
+        if chosen is open_act:
+            self._open_file(entry.path)  # type: ignore[union-attr]
+        elif chosen is copy_act:
             cb = QApplication.clipboard()
             if cb is not None:
-                cb.setText(str(entry.path.resolve()))
+                cb.setText(str(entry.path.resolve()))  # type: ignore[union-attr]
+        elif chosen is open_folder_act:
+            self.open_folder_clicked.emit(self._section_id)
+        elif chosen is add_act:
+            self._pick_and_import_files()
+        elif chosen is delete_act and entry is not None:
+            self._delete_file(entry.path)
+        elif chosen is delete_all_act:
+            self._delete_all_section_contents()
 
 
 class InspectorRefTab(QWidget):
@@ -693,22 +1021,23 @@ class InspectorRefTab(QWidget):
             "concept",
             title="CONCEPT",
             icon_name="lightbulb",
-            empty_hint="No concept art yet",
+            empty_hint="No concept art yet.\nDrop files here to import.",
             parent=content,
         )
         self._reference = _InspectorRefSection(
             "reference",
             title="REFERENCE",
             icon_name="eye",
-            empty_hint="No reference images yet",
+            empty_hint="No reference images yet.\nDrop files here to import.",
             parent=content,
         )
         for sec in (self._concept, self._reference):
             sec.open_folder_clicked.connect(self._on_open_folder)
+            sec.files_imported.connect(self._on_section_files_imported)
             sec.bind_ref_scroll_area(self._ref_scroll)
 
-        self._content_lay.addWidget(self._concept, 0)
-        self._content_lay.addWidget(self._reference, 0)
+        self._content_lay.addWidget(self._concept.container, 0)
+        self._content_lay.addWidget(self._reference.container, 0)
         self._content_lay.addStretch(1)
         self._ref_scroll.setWidget(content)
         self._ref_scroll.viewport().installEventFilter(self)
@@ -757,6 +1086,7 @@ class InspectorRefTab(QWidget):
         self._paths = {}
         self._scanned_key = None
         for sec in (self._concept, self._reference):
+            sec.set_drop_enabled(False)
             sec.set_folder_path(None)
             sec.apply_scan([], expanded=False)
         self.total_file_count_changed.emit(0)
@@ -809,6 +1139,26 @@ class InspectorRefTab(QWidget):
             files = list_special_folder_files(folder) if folder is not None else []
             total += sec.apply_scan(files)
         self.total_file_count_changed.emit(total)
+
+    def _on_section_files_imported(self, folder_id: str) -> None:
+        if folder_id in self._paths and self._entity is not None:
+            folder = self._paths.get(folder_id)  # type: ignore[arg-type]
+            if folder is not None:
+                self._paths[folder_id] = folder.resolve()  # type: ignore[index]
+        self.refresh_from_disk()
+        try:
+            win = self.window()
+            if self._entity is not None and win is not None:
+                if hasattr(win, "_ensure_entity_special_folders_watched"):
+                    win._ensure_entity_special_folders_watched(Path(self._entity.path))  # type: ignore[attr-defined]
+                if hasattr(win, "invalidate_entity_reference_cache"):
+                    win.invalidate_entity_reference_cache(Path(self._entity.path))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        from monostudio.ui_qt.notification import notify as notification_service
+
+        label = "Reference" if folder_id == "reference" else "Concept"
+        notification_service.success(f"Added to {label}.")
 
     def _on_open_folder(self, folder_id: str) -> None:
         path = self._paths.get(folder_id)  # type: ignore[arg-type]

@@ -201,7 +201,7 @@ class PipelineTableModel(QAbstractTableModel):
         if parent.isValid():
             return 0
         ctx = getattr(self._mv, "_browser_context", "asset")
-        return 8 if ctx == "project" else 10
+        return 8 if ctx == "project" else 12
 
     def notify_insert_rows(self, row: int, count: int = 1) -> None:
         if count <= 0:
@@ -333,9 +333,9 @@ class PipelineTableModel(QAbstractTableModel):
             if role == Qt.ItemDataRole.FontRole:
                 return monos_font("Inter", 13, QFont.Weight.Bold)
             return None
-        if col in (3, 4, 5):
+        if col in (3, 4, 5, 6, 7):
             return "" if role == Qt.ItemDataRole.DisplayRole else None
-        if col == 6:
+        if col == 8:
             if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.ForegroundRole:
                 if isinstance(vi.ref, (Asset, Shot)):
                     st_lbl, st_col = self._mv._list_asset_shot_status_label_and_color(vi.ref)
@@ -345,15 +345,15 @@ class PipelineTableModel(QAbstractTableModel):
                     return st_lbl
                 return st_col
             return None
-        if col == 7:
+        if col == 9:
             if role == Qt.ItemDataRole.DisplayRole:
                 return self._mv._list_version_text(vi)
             if role == Qt.ItemDataRole.FontRole:
                 return monos_font("JetBrains Mono", 11)
             return None
-        if col == 8:
+        if col == 10:
             return self._mv._list_last_updated(vi) if role == Qt.ItemDataRole.DisplayRole else None
-        if col == 9:
+        if col == 11:
             return "—" if role == Qt.ItemDataRole.DisplayRole else None
         return None
 

@@ -385,7 +385,9 @@ class InboxTreePane(QWidget):
         """Open file with default app or folder in explorer."""
         if path.is_dir():
             try:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+                from monostudio.core.shell_open import open_folder as shell_open_folder
+
+                shell_open_folder(path)
             except Exception:
                 pass
         else:
@@ -1108,7 +1110,9 @@ class ReferenceTreePane(QWidget):
     def _ref_open_path(self, path: Path) -> None:
         if path.is_dir():
             try:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+                from monostudio.core.shell_open import open_folder as shell_open_folder
+
+                shell_open_folder(path)
             except Exception:
                 pass
         else:

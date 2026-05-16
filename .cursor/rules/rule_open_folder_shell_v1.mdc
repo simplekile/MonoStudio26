@@ -1,0 +1,73 @@
+---
+description: MONOS — Mở thư mục / reveal trong Explorer qua shell_open (focus cửa sổ trùng path trên Windows)
+alwaysApply: true
+---
+
+# MONOS — Open Folder & Reveal in Explorer (v1)
+
+## Mục đích
+
+Mọi luồng **mở thư mục** hoặc **reveal file trong Explorer** dùng **một API** để trên Windows focus cửa sổ Explorer đã mở cùng path, tránh nhân đôi cửa sổ.
+
+**Module duy nhất:** [`monostudio/core/shell_open.py`](monostudio/core/shell_open.py)
+
+| Hành vi | Hàm |
+|--------|-----|
+| Mở folder (context menu, Inspector, Inbox tree, DCC work path, …) | `open_folder(path: Path)` |
+| Reveal / chọn file trong folder (Reference tab, …) | `reveal_in_folder(path: Path, *, select: bool = True)` |
+
+---
+
+## Bắt buộc
+
+- **Luôn** gọi `open_folder` / `reveal_in_folder` — **không** gọi trực tiếp:
+  - `QDesktopServices.openUrl(QUrl.fromLocalFile(...))` cho **thư mục**
+  - `subprocess` + `explorer` (trừ bên trong `shell_open.py`)
+  - `os.startfile` cho **thư mục**
+- Path truyền vào: `Path`, đã `resolve()` khi có thể; kiểm tra tồn tại / `is_dir()` ở caller nếu cần tạo folder trước (vd Inspector special folders).
+- **UI (`main_window.py`)**: ưu tiên helper `MainWindow._open_path_in_explorer(path)` cho signal/handler — helper gọi `open_folder`.
+- **Không** copy logic COM / so khớp `LocationURL` ra file khác.
+
+```python
+# ❌ BAD — mở folder
+QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+# ✅ GOOD
+from monostudio.core.shell_open import open_folder
+open_folder(folder)
+```
+
+```python
+# ❌ BAD — reveal file
+subprocess.Popen(["explorer", "/select,", str(p)])
+
+# ✅ GOOD
+from monostudio.core.shell_open import reveal_in_folder
+reveal_in_folder(p)
+```
+
+---
+
+## Không thuộc rule này (giữ nguyên)
+
+- Mở **file** với app mặc định: `os.startfile`, `QDesktopServices.openUrl` cho **file** (không phải folder).
+- Mở **URL web** (settings, tài liệu).
+- Mở DCC / scene qua adapter DCC.
+
+---
+
+## Khi thêm tính năng mới
+
+| Kiểm tra | Yêu cầu |
+|----------|---------|
+| Menu / shortcut “Open Folder”, “Open Work/Publish/Reference…” | `open_folder` (hoặc emit signal → MainWindow → `_open_path_in_explorer`) |
+| “Reveal in Explorer”, “Show in folder” | `reveal_in_folder` |
+| Double-click folder trong tree | `open_folder` nếu `path.is_dir()` |
+| Sửa `shell_open.py` | Giữ fallback `QDesktopServices` khi COM lỗi; log `monostudio.shell_open` DEBUG |
+
+---
+
+## Tham chiếu triển khai
+
+- Core: `open_folder`, `reveal_in_folder`, `_try_focus_existing_explorer` (Windows + comtypes).
+- Call site mẫu: `main_view._open_folder`, `main_window._open_path_in_explorer`, `inspector_ref_tab` reveal action.
