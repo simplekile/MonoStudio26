@@ -12,6 +12,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QPoint, Qt, QRect, QSettings, Signal, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QFrame, QMenu, QMessageBox, QSizePolicy, QSplitter, QStackedWidget, QToolTip, QVBoxLayout, QWidget
 from qframelesswindow import FramelessMainWindow
 
@@ -74,6 +75,7 @@ from monostudio.ui_qt.fs_watcher import (
     FsEventCollector,
     append_entity_meta_watch_paths,
     append_entity_monostudio_watch_paths,
+    append_entity_special_folder_watch_paths,
 )
 from monostudio.ui_qt.stress_diagnostics_dialog import StressDiagnosticsDialog
 from monostudio.ui_qt.stress_profiler import enabled as stress_profiler_enabled
@@ -158,6 +160,7 @@ class MainWindow(FramelessMainWindow):
         self._fs_event_collector.batchReady.connect(self._on_fs_batch_ready)
         self._fs_event_collector.metaThumbnailsStale.connect(self._on_fs_meta_thumbnails_stale)
         self._fs_event_collector.itemNotesStale.connect(self._on_fs_item_notes_stale)
+        self._fs_event_collector.entitySpecialFoldersStale.connect(self._on_fs_entity_special_folders_stale)
         self._entered_parent: Asset | Shot | None = None
 
         # Centralized filter state (UI-only; no filtering engine yet)
@@ -343,6 +346,16 @@ class MainWindow(FramelessMainWindow):
         self._inspector.inspector_hidden_departments_changed.connect(self._main_view.set_inspector_hidden_departments)
         self._inspector.production_status_override_requested.connect(self._on_production_status_override)
         self._inspector.item_notes_dialog_requested.connect(self._on_item_notes_dialog_requested)
+        _sc_inspector_tab_1 = QShortcut(QKeySequence("Alt+1"), self)
+        _sc_inspector_tab_1.activated.connect(lambda: self._inspector.set_inspector_tab_index(0))
+        _sc_inspector_tab_2 = QShortcut(QKeySequence("Alt+2"), self)
+        _sc_inspector_tab_2.activated.connect(lambda: self._inspector.set_inspector_tab_index(1))
+        _sc_inspector_tab_3 = QShortcut(QKeySequence("Alt+3"), self)
+        _sc_inspector_tab_3.activated.connect(lambda: self._inspector.set_inspector_tab_index(2))
+        _sc_open_ref = QShortcut(QKeySequence("Alt+R"), self)
+        _sc_open_ref.activated.connect(self._inspector.open_reference_folder_for_selection)
+        _sc_open_concept = QShortcut(QKeySequence("Alt+C"), self)
+        _sc_open_concept.activated.connect(self._inspector.open_concept_folder_for_selection)
         self._main_view.production_status_override_chosen.connect(self._on_production_status_override)
         self._main_view.active_dcc_changed.connect(self._on_main_view_active_dcc_changed)
         self._main_view.thumbnail_source_changed.connect(self._on_main_view_thumbnail_source_changed)
@@ -2101,6 +2114,38 @@ class MainWindow(FramelessMainWindow):
         except Exception:
             pass
 
+    def _ensure_entity_special_folders_watched_for_paths(self, entity_paths: list[str]) -> None:
+        for ep in entity_paths:
+            if not isinstance(ep, str) or not ep.strip():
+                continue
+            try:
+                self._ensure_entity_special_folders_watched(Path(ep.strip()))
+            except Exception:
+                pass
+
+    def _on_fs_entity_special_folders_stale(self, entities: object) -> None:
+        """Changes under ``reference/`` or ``concept/``: refresh Ref tab + grid hint cache."""
+        if not isinstance(entities, list):
+            return
+        entity_paths = [ep for ep in entities if isinstance(ep, str) and ep.strip()]
+        if entity_paths:
+            self._ensure_entity_special_folders_watched_for_paths(entity_paths)
+        for ep in entities:
+            if not isinstance(ep, str) or not ep.strip():
+                continue
+            try:
+                self._main_view.invalidate_entity_reference_cache(Path(ep.strip()))
+            except Exception:
+                pass
+        try:
+            self._inspector.refresh_special_folders_for_entity_paths(entities)
+        except Exception:
+            pass
+        try:
+            self._main_view.refresh_reference_hint_badges()
+        except Exception:
+            pass
+
     def _on_fs_batch_ready(
         self,
         asset_ids: list,
@@ -2121,6 +2166,9 @@ class MainWindow(FramelessMainWindow):
         rs = bool(rescan_shots_listing)
         if not a_ids and not s_ids and not t_folders and not ra and not rs:
             return
+        touched_entities = list(dict.fromkeys([*a_ids, *s_ids]))
+        if touched_entities:
+            self._ensure_entity_special_folders_watched_for_paths(touched_entities)
         _watcher_log.debug(
             "fs_watcher batch_ready -> incremental_scan asset_ids=%s shot_ids=%s type_folders=%s rescan_assets=%s rescan_shots=%s",
             len(a_ids),
@@ -2214,6 +2262,28 @@ class MainWindow(FramelessMainWindow):
     ) -> None:
         append_entity_monostudio_watch_paths(entity_base, to_add, seen, max_paths=max_paths)
 
+    def _append_entity_special_folder_watch_path(
+        self,
+        entity_base: Path,
+        to_add: list[str],
+        seen: set[str],
+        *,
+        max_paths: int,
+    ) -> None:
+        append_entity_special_folder_watch_paths(entity_base, to_add, seen, max_paths=max_paths)
+
+    def _ensure_entity_special_folders_watched(self, entity_base: Path) -> None:
+        """Register ``reference/`` and ``concept/`` after mkdir or first file drop."""
+        if self._watcher_manually_disabled or self._project_root is None:
+            return
+        existing = set(self._fs_watcher.directories()) | set(self._fs_watcher.files())
+        to_add: list[str] = []
+        seen = set(existing)
+        append_entity_special_folder_watch_paths(entity_base, to_add, seen, max_paths=2000)
+        new_paths = [p for p in to_add if p not in existing]
+        if new_paths:
+            self._fs_watcher.addPaths(new_paths)
+
     def _ensure_entity_monostudio_watched(self, entity_base: Path) -> None:
         """Register ``.monostudio`` after first notes write (folder may not exist at initial watcher setup)."""
         if self._watcher_manually_disabled or self._project_root is None:
@@ -2289,6 +2359,7 @@ class MainWindow(FramelessMainWindow):
                     to_add.append(s)
         self._append_entity_meta_watch_path(base, to_add, _seen, max_paths=max_paths)
         self._append_entity_monostudio_watch_path(base, to_add, _seen, max_paths=max_paths)
+        self._append_entity_special_folder_watch_path(base, to_add, _seen, max_paths=max_paths)
         return to_add
 
     def _update_fs_watcher_paths(self) -> None:
@@ -2296,6 +2367,7 @@ class MainWindow(FramelessMainWindow):
         Watches project root, assets/, shots/, each registered ``assets/<type>/`` (new asset folders),
         each entity ``.meta/`` (files + subdirs inside),
         each entity ``.monostudio/`` (notes JSON and peers),
+        each entity ``reference/`` and ``concept/`` (top-level entries),
         and dept/work/publish so changes are detected on Windows
         (no recursive watch).
         For nested (subdepartment) layout, also watches parent dirs of each department
@@ -2414,6 +2486,7 @@ class MainWindow(FramelessMainWindow):
                             to_add.append(s)
                 self._append_entity_meta_watch_path(base, to_add, _seen, max_paths=_max_paths)
                 self._append_entity_monostudio_watch_path(base, to_add, _seen, max_paths=_max_paths)
+                self._append_entity_special_folder_watch_path(base, to_add, _seen, max_paths=_max_paths)
             for shot in self._project_index.shots:
                 base = Path(shot.path)
                 if not base.is_absolute():
@@ -2447,6 +2520,7 @@ class MainWindow(FramelessMainWindow):
                             to_add.append(s)
                 self._append_entity_meta_watch_path(base, to_add, _seen, max_paths=_max_paths)
                 self._append_entity_monostudio_watch_path(base, to_add, _seen, max_paths=_max_paths)
+                self._append_entity_special_folder_watch_path(base, to_add, _seen, max_paths=_max_paths)
         if to_add:
             added = self._fs_watcher.addPaths(to_add)
             failed = len(to_add) - len(added)
@@ -3148,13 +3222,17 @@ class MainWindow(FramelessMainWindow):
         else:
             return
         try:
+            if not path.is_dir():
+                path.mkdir(parents=True, exist_ok=True)
             if not path.exists():
-                if (path.name or "").strip().casefold() == "work":
-                    path.mkdir(parents=True, exist_ok=True)
-                else:
-                    return
+                return
         except (OSError, TypeError):
             return
+        if path.name.lower() in ("reference", "concept"):
+            try:
+                self._ensure_entity_special_folders_watched(path.parent)
+            except Exception:
+                pass
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _on_inspector_active_dcc_changed(self, path: object, department: str, dcc_id: str) -> None:
@@ -3812,7 +3890,7 @@ class MainWindow(FramelessMainWindow):
         created: list[Path] = []
         try:
             use_dcc_folders = read_use_dcc_folders(self._project_root)
-            to_create: list[Path] = [target]
+            to_create: list[Path] = [target, target / "reference", target / "concept"]
             for d in departments:
                 # Nested: relative path can be multi-segment (e.g. 01_modelling/01_sculpt) when mapping has parent.
                 dept_folder = dept_reg.get_department_relative_path(d, "asset")
@@ -3873,7 +3951,7 @@ class MainWindow(FramelessMainWindow):
         use_dcc_folders = read_use_dcc_folders(self._project_root)
         created: list[Path] = []
         try:
-            to_create: list[Path] = [target]
+            to_create: list[Path] = [target, target / "reference", target / "concept"]
             for d in departments:
                 # Nested: relative path can be multi-segment (e.g. 01_modelling/01_sculpt) when mapping has parent.
                 dept_folder = dept_reg.get_department_relative_path(d, "shot")

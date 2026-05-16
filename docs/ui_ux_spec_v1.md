@@ -166,6 +166,8 @@ Department là child, không phải tab.
 
 Inspector luôn hiển thị item đang select.
 
+Asset/Shot dùng **3 tab** (segmented, read-only): **Pipeline** (thumbnail + departments), **Ref** (concept + reference browse), **Details** (technical specs + stakeholders). Quick actions / context menu: Open Reference Folder, Open Concept Folder.
+
 5.1 Asset / Shot
 
 Name
@@ -203,6 +205,10 @@ Không publish button lớn
 Asset / Shot
 
 Open Folder
+
+Open Reference Folder
+
+Open Concept Folder
 
 Create Department
 

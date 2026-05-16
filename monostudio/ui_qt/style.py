@@ -1339,15 +1339,56 @@ def apply_dark_theme(app: QApplication) -> None:
         QScrollArea#InspectorScrollArea QWidget#qt_scrollarea_viewport {
             background-color: #18181b;
         }
-        QWidget#InspectorContent {
+        QStackedWidget#InspectorBodyStack {
+            background-color: #18181b;
+        }
+        QScrollArea#InspectorRefScrollArea,
+        QScrollArea#InspectorDetailsScrollArea {
             background: transparent;
+            border: none;
+        }
+        QScrollArea#InspectorRefScrollArea QWidget,
+        QScrollArea#InspectorDetailsScrollArea QWidget {
+            background: transparent;
+        }
+        QScrollArea#InspectorRefScrollArea QWidget#qt_scrollarea_viewport,
+        QScrollArea#InspectorDetailsScrollArea QWidget#qt_scrollarea_viewport {
+            background-color: #18181b;
+        }
+        QWidget#InspectorContent,
+        QWidget#InspectorRefContent,
+        QWidget#InspectorDetailsContent {
+            background: transparent;
+        }
+        QWidget#InspectorRefTab {
+            background-color: #18181b;
+        }
+        QListView#InspectorRefGrid {
+            background: transparent;
+            border: none;
+            outline: none;
+        }
+        QListView#InspectorRefGrid::item {
+            background: transparent;
+            border: none;
+            padding: 0px;
+        }
+        QListView#InspectorRefGrid::item:selected,
+        QListView#InspectorRefGrid::item:hover {
+            background: transparent;
+            border: none;
         }
         QWidget#InspectorHeader {
             background-color: #18181b;
             border-bottom: 1px solid rgba(39, 39, 42, 0.50);
         }
+        QWidget#InspectorHeader[tabMode="true"] {
+            background-color: #18181b;
+            border-bottom: 1px solid rgba(39, 39, 42, 0.50);
+        }
         QLabel#InspectorHeaderTitle {
             color: #71717a;
+            padding: 10px 0px;
         }
         QToolButton#InspectorCloseButton {
             padding: 6px;
@@ -1402,6 +1443,10 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid rgba(59, 130, 246, 0.95); /* blue-500-ish */
             background: rgba(37, 99, 235, 0.20);        /* subtle blue fill */
         }
+        QFrame#InspectorRefThumbCell {
+            border: none;
+            background: transparent;
+        }
         QToolButton#InspectorManageButton {
             color: #a1a1aa;
         }
@@ -1428,7 +1473,18 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid rgba(63, 63, 70, 0.80);
             color: #e4e4e7;
         }
-        /* But for the dept folder button, use pill-style hover and no border */
+        /* Scope pill segments (sidebar + inspector tabs): match SidebarScopePill QSS, not generic hover */
+        QWidget#InspectorPanel QToolButton#SidebarScopePillSegment:hover {
+            background: transparent;
+            border: none;
+            color: #fafafa;
+        }
+        QWidget#InspectorPanel QToolButton#SidebarScopePillSegment[active="true"]:hover {
+            background-color: #2a2a2c;
+            border: none;
+            color: #60a5fa;
+        }
+        /* Dept folder / status menu: pill-style hover */
         QWidget#InspectorPanel QToolButton#InspectorDeptOpenButton:hover,
         QWidget#InspectorPanel QToolButton#InspectorDeptStatusMenuButton:hover {
             background: rgba(255, 255, 255, 0.08);

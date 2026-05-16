@@ -29,6 +29,7 @@ DEFAULT_DEBOUNCE_MS = 300
 
 _META_WATCH_CAP_PER_ENTITY = 64
 _MONO_WATCH_CAP_PER_ENTITY = 48
+_SPECIAL_FOLDER_WATCH_CAP_PER_ENTITY = 48
 
 
 def append_entity_meta_watch_paths(
@@ -123,6 +124,54 @@ def append_entity_monostudio_watch_paths(
         try_add(mono)
 
 
+def append_entity_special_folder_watch_paths(
+    entity_base: Path,
+    to_add: list[str],
+    seen: set[str],
+    *,
+    max_paths: int,
+    per_entity_cap: int = _SPECIAL_FOLDER_WATCH_CAP_PER_ENTITY,
+) -> None:
+    """Add ``<entity>/reference`` and ``<entity>/concept`` plus top-level entries (non-recursive)."""
+    try:
+        base = Path(entity_base).resolve()
+    except OSError:
+        return
+    budget = per_entity_cap
+
+    def try_add(path: Path) -> None:
+        nonlocal budget
+        if budget <= 0 or len(to_add) >= max_paths:
+            return
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return
+        if not resolved.exists():
+            return
+        s = str(resolved)
+        if s in seen:
+            return
+        seen.add(s)
+        to_add.append(s)
+        budget -= 1
+
+    for folder_name in ("reference", "concept"):
+        folder = base / folder_name
+        if not folder.exists():
+            continue
+        try_add(folder)
+        if not folder.is_dir():
+            continue
+        try:
+            for child in sorted(folder.iterdir()):
+                if budget <= 0 or len(to_add) >= max_paths:
+                    break
+                try_add(child)
+        except OSError:
+            pass
+
+
 def _normalize_path(path: str | Path) -> Path | None:
     """Resolve to absolute path; resolve symlinks. Return None on error."""
     try:
@@ -187,6 +236,29 @@ def _path_under_entity_meta(path: Path) -> bool:
     return ".meta" in path.parts
 
 
+def _entity_path_if_special_folder_touch(
+    project_root: Path,
+    path: Path,
+    type_registry: "TypeRegistry",
+    assets_folder: str,
+    shots_folder: str,
+) -> str | None:
+    """Entity root path when ``path`` is under ``<entity>/reference`` or ``<entity>/concept``."""
+    aid, sid, _ = _classify_path(project_root, path, type_registry, assets_folder, shots_folder)
+    entity_path = aid or sid
+    if not entity_path:
+        return None
+    try:
+        rel = path.resolve().relative_to(Path(entity_path).resolve())
+    except (OSError, ValueError):
+        return None
+    if not rel.parts:
+        return entity_path
+    if rel.parts[0] in ("reference", "concept"):
+        return entity_path
+    return None
+
+
 def _path_triggers_item_notes_refresh(path: Path) -> bool:
     if ".monostudio" not in path.parts:
         return False
@@ -222,6 +294,8 @@ class FsEventCollector(QObject):
     metaThumbnailsStale = Signal(object)
     # Emits list[str] — absolute entity root paths (asset/shot) whose ``.monostudio`` data changed
     itemNotesStale = Signal(object)
+    # Emits list[str] — entity roots whose ``reference/`` or ``concept/`` tree changed
+    entitySpecialFoldersStale = Signal(object)
 
     def __init__(
         self,
@@ -288,6 +362,7 @@ class FsEventCollector(QObject):
         # entity_path -> department (None = invalidate every dept thumb for that entity)
         meta_thumb_stale: dict[str, str | None] = {}
         notes_entities: set[str] = set()
+        special_folder_entities: set[str] = set()
         project_root = self._project_root
         type_reg = self._type_registry
         if project_root is None or type_reg is None:
@@ -326,6 +401,11 @@ class FsEventCollector(QObject):
                 ent = aid or sid
                 if ent:
                     notes_entities.add(ent)
+            ent_special = _entity_path_if_special_folder_touch(
+                project_root, p, type_reg, _assets_f, _shots_f
+            )
+            if ent_special:
+                special_folder_entities.add(ent_special)
             if not _path_under_entity_meta(p):
                 continue
             entity = aid or sid
@@ -360,3 +440,7 @@ class FsEventCollector(QObject):
             n_list = list(notes_entities)
             _watcher_log.debug("watcher item notes stale entities=%d", len(n_list))
             self.itemNotesStale.emit(n_list)
+        if special_folder_entities:
+            s_list = list(special_folder_entities)
+            _watcher_log.debug("watcher entity special folders stale count=%d", len(s_list))
+            self.entitySpecialFoldersStale.emit(s_list)

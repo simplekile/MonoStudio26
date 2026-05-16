@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, QObject, QTimer, QSettings
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QImage, QImageReader, QPixmap
 
 from monostudio.core.ffmpeg_resolve import resolve_ffprobe_executable, resolve_ffmpeg_executable
 from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
@@ -308,6 +308,49 @@ class ThumbnailCache:
         except Exception:
             pass
 
+    def peek_thumbnail_pixmap(self, file_path: Path) -> QPixmap | None:
+        """Return a cached pixmap only (memory or disk PNG); never decodes source on miss."""
+        key = str(file_path)
+        try:
+            stat = file_path.stat()
+        except OSError:
+            return None
+        mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+        cached = self._cache.get(key)
+        if cached is not None and cached.mtime_ns == mtime_ns:
+            return cached.pixmap
+        try:
+            dc_path = _disk_cache_path(file_path, mtime_ns, self._size_px)
+            if dc_path.is_file():
+                pix = QPixmap(str(dc_path))
+                if not pix.isNull():
+                    self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
+                    return pix
+        except OSError:
+            pass
+        return None
+
+    def adopt_decoded_thumbnail(self, file_path: Path, image: QImage) -> QPixmap | None:
+        """Store a worker-decoded image in memory + disk cache; returns pixmap for UI."""
+        if image.isNull():
+            return None
+        try:
+            stat = file_path.stat()
+        except OSError:
+            return None
+        mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+        pix = QPixmap.fromImage(image)
+        if pix.isNull():
+            return None
+        self._cache[str(file_path)] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
+        try:
+            dc_path = _disk_cache_path(file_path, mtime_ns, self._size_px)
+            dc_path.parent.mkdir(parents=True, exist_ok=True)
+            pix.save(str(dc_path), "PNG")
+        except OSError:
+            pass
+        return pix
+
     def load_thumbnail_pixmap(self, file_path: Path) -> QPixmap | None:
         key = str(file_path)
         try:
@@ -368,6 +411,30 @@ class ThumbnailCache:
         return scaled
 
 
+def decode_ref_preview_qimage_worker(file_path: str, size_px: int) -> tuple[str, QImage] | None:
+    """
+    Worker-safe decode for entity reference/concept preview images.
+    Uses disk cache when present; otherwise decodes and scales to ``size_px``.
+    """
+    p = Path(file_path)
+    if not p.is_file():
+        return None
+    try:
+        stat = p.stat()
+    except OSError:
+        return None
+    mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+    try:
+        dc_path = _disk_cache_path(p, mtime_ns, size_px)
+        if dc_path.is_file():
+            img = QImage(str(dc_path))
+            if not img.isNull():
+                return (str(p), img)
+    except OSError:
+        pass
+    return _load_thumbnail_image_worker(file_path, size_px, cache_key=str(p))
+
+
 def _load_thumbnail_image_worker(file_path: str, size_px: int, cache_key: str | None = None) -> tuple[str, QImage] | None:
     """
     Run in worker thread: load file, decode to QImage, scale.
@@ -380,6 +447,10 @@ def _load_thumbnail_image_worker(file_path: str, size_px: int, cache_key: str | 
     try:
         ext = (p.suffix or "").strip().lower()
         img = QImage(str(p))
+        if img.isNull():
+            reader = QImageReader(str(p))
+            reader.setAutoTransform(True)
+            img = reader.read()
         if img.isNull() and ext in (".dpx", ".exr", ".hdr"):
             from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
 

@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QToolButton,
     QToolTip,
     QVBoxLayout,
@@ -56,7 +57,14 @@ from monostudio.core.production_status import (
     load_production_status_registry,
     override_status_id_for_department,
 )
+from monostudio.core.entity_folders import (
+    EntitySpecialFolderId,
+    ensure_entity_special_folder,
+    entity_special_folder_path,
+    entity_special_folder_paths,
+)
 from monostudio.core.inbox_reader import load_inbox_destinations, resolve_destination_path
+from monostudio.ui_qt.inspector_ref_tab import InspectorRefTab
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.pipeline_types_and_presets import (
@@ -419,14 +427,22 @@ class InspectorPanel(QWidget):
 
         self._header = _InspectorHeader(self)
         self._header.close_clicked.connect(self.close_requested.emit)
+        self._tab_buttons = self._header.tab_buttons
+        for idx, btn in enumerate(self._tab_buttons):
+            btn.clicked.connect(lambda checked=False, i=idx: self._set_inspector_tab(i))
         root.addWidget(self._header, 0)
+
+        self._body_stack = QStackedWidget(self)
+        self._body_stack.setObjectName("InspectorBodyStack")
+        self._body_stack.setAttribute(Qt.WA_StyledBackground, True)
 
         self._scroll = QScrollArea(self)
         self._scroll.setObjectName("InspectorScrollArea")
+        self._scroll.setAttribute(Qt.WA_StyledBackground, True)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        root.addWidget(self._scroll, 1)
+        self._scroll.viewport().setAutoFillBackground(False)
 
         content = _InspectorContent(self._scroll)
         content.setObjectName("InspectorContent")
@@ -453,6 +469,14 @@ class InspectorPanel(QWidget):
         self._asset_status.open_asset_folder_clicked.connect(self._on_open_asset_folder_requested)
         self._asset_status.open_work_folder_clicked.connect(self._on_open_work_folder_requested)
         self._asset_status.open_publish_folder_clicked.connect(self._on_open_publish_folder_requested)
+        self._asset_status.open_reference_folder_clicked.connect(self._on_open_reference_folder_requested)
+        self._asset_status.open_concept_folder_clicked.connect(self._on_open_concept_folder_requested)
+        self._asset_status.copy_reference_path_clicked.connect(
+            lambda: self._copy_entity_special_folder_path("reference")
+        )
+        self._asset_status.copy_concept_path_clicked.connect(
+            lambda: self._copy_entity_special_folder_path("concept")
+        )
         self._asset_status._identity.active_dcc_changed.connect(self._on_identity_active_dcc_changed)
         self._asset_status._health.health_changed.connect(self._preview._container._w.set_item_health)
         self._preview._container._w.health_chip_clicked.connect(self._on_preview_health_chip_clicked)
@@ -471,8 +495,6 @@ class InspectorPanel(QWidget):
             self._asset_status,
             self._separator,
             self._dept_pipeline,
-            self._tech,
-            self._stakeholders,
             self._inbox_destination,
         ):
             self._content_layout.addWidget(w, 0)
@@ -480,6 +502,33 @@ class InspectorPanel(QWidget):
         self._content_layout.addStretch(1)
         self._inbox_destination.setVisible(False)
         self._scroll.setWidget(content)
+        self._body_stack.addWidget(self._scroll)
+
+        self._ref_tab = InspectorRefTab(self)
+        self._ref_tab.open_folder_requested.connect(self.open_folder_requested.emit)
+        self._ref_tab.total_file_count_changed.connect(self._on_ref_file_count_changed)
+        self._body_stack.addWidget(self._ref_tab)
+
+        details_content = QWidget(self)
+        details_content.setObjectName("InspectorDetailsContent")
+        details_content.setAttribute(Qt.WA_StyledBackground, True)
+        details_l = QVBoxLayout(details_content)
+        details_l.setContentsMargins(12, 12, 12, 12)
+        details_l.setSpacing(16)
+        details_l.addWidget(self._tech, 0)
+        details_l.addWidget(self._stakeholders, 0)
+        details_l.addStretch(1)
+        self._details_scroll = QScrollArea(self)
+        self._details_scroll.setObjectName("InspectorDetailsScrollArea")
+        self._details_scroll.setAttribute(Qt.WA_StyledBackground, True)
+        self._details_scroll.setWidgetResizable(True)
+        self._details_scroll.setFrameShape(QFrame.NoFrame)
+        self._details_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._details_scroll.viewport().setAutoFillBackground(False)
+        self._details_scroll.setWidget(details_content)
+        self._body_stack.addWidget(self._details_scroll)
+
+        root.addWidget(self._body_stack, 1)
 
         # ACTION card pinned below the scroll area (always visible at bottom when distributing)
         action_wrap = QWidget(self)
@@ -504,6 +553,11 @@ class InspectorPanel(QWidget):
         self._inspector_settings: QSettings = default_qsettings()
         self._preview.set_qsettings(self._inspector_settings)
         self.set_item(None)
+        try:
+            saved_tab = int(self._inspector_settings.value("inspector/last_tab_index", 0))
+        except (TypeError, ValueError):
+            saved_tab = 0
+        self._set_inspector_tab(max(0, min(2, saved_tab)), persist=False)
 
         # Clear department focus when clicking anywhere in the Inspector content
         # that is not a department card.
@@ -605,6 +659,7 @@ class InspectorPanel(QWidget):
         self._tech.setVisible(False)
         self._stakeholders.setVisible(False)
         self._inbox_action_wrapper.setVisible(True)
+        self._set_inspector_tab(0, persist=False)
 
     def set_inbox_tree_preview(self, path: Path | None) -> None:
         """Inbox/Reference: khi chọn file trong tree → hiện thumb + metadata, ẩn block distribute."""
@@ -637,8 +692,13 @@ class InspectorPanel(QWidget):
         self._current_item = item
         has_item = item is not None
         self._empty.setVisible(not has_item)
-        for w in (self._preview, self._asset_status, self._dept_pipeline, self._tech, self._stakeholders):
-            w.setVisible(has_item)
+        is_asset_or_shot = has_item and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
+        is_inbox_item = has_item and item.kind == ViewItemKind.INBOX_ITEM
+        self._header.set_tabs_visible(True)
+        for w in (self._preview, self._asset_status, self._separator, self._dept_pipeline):
+            w.setVisible(has_item and (is_asset_or_shot or is_inbox_item))
+        self._tech.setVisible(is_asset_or_shot)
+        self._stakeholders.setVisible(is_asset_or_shot)
         if has_item:
             self._inbox_action_wrapper.setVisible(False)
 
@@ -646,6 +706,7 @@ class InspectorPanel(QWidget):
             self._empty.set_message("Select an item to view details")
             self.inspector_hidden_departments_changed.emit(set())
             self._preview.set_inspector_notes_chip(False, 0)
+            self._sync_ref_tab_paths()
             return
 
         # Đồng bộ department từ sidebar (active_department_hint):
@@ -715,8 +776,92 @@ class InspectorPanel(QWidget):
 
         if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
             self._sync_preview_notes_chip()
+            self._sync_ref_tab_paths()
+            if self._body_stack.currentIndex() == 1:
+                self._ref_tab.notify_tab_visible()
         else:
             self._preview.set_inspector_notes_chip(False, 0)
+            self._sync_ref_tab_paths()
+
+    def _entity_for_special_folder(self) -> Asset | Shot | None:
+        item = self._current_item
+        if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return None
+        ref = getattr(item, "ref", None)
+        return ref if isinstance(ref, (Asset, Shot)) else None
+
+    def _open_entity_special_folder(self, folder_id: EntitySpecialFolderId) -> None:
+        entity = self._entity_for_special_folder()
+        if entity is None:
+            return
+        reg = self._department_registry if isinstance(self._department_registry, DepartmentRegistry) else None
+        path = entity_special_folder_path(self._project_root, entity, folder_id, dept_registry=reg)
+        if path is None:
+            path = entity.path / folder_id
+        if ensure_entity_special_folder(path):
+            self.open_folder_requested.emit(path.resolve())
+            self._sync_ref_tab_paths()
+            if self._body_stack.currentIndex() == 1:
+                self._ref_tab.refresh_from_disk()
+
+    def _copy_entity_special_folder_path(self, folder_id: EntitySpecialFolderId) -> None:
+        entity = self._entity_for_special_folder()
+        if entity is None:
+            return
+        reg = self._department_registry if isinstance(self._department_registry, DepartmentRegistry) else None
+        path = entity_special_folder_path(self._project_root, entity, folder_id, dept_registry=reg)
+        if path is None or not path.is_dir():
+            return
+        text = str(path.resolve())
+        _TechnicalSpecs._copy_text(text)
+        from monostudio.ui_qt.notification import notify as notification_service
+
+        notification_service.success(f"Copied: {text}")
+
+    def _on_open_reference_folder_requested(self) -> None:
+        self._open_entity_special_folder("reference")
+
+    def _on_open_concept_folder_requested(self) -> None:
+        self._open_entity_special_folder("concept")
+
+    def _sync_ref_tab_paths(self) -> None:
+        entity = self._entity_for_special_folder()
+        if entity is None:
+            self._ref_tab.set_entity_paths(None, {})
+            return
+        reg = self._department_registry if isinstance(self._department_registry, DepartmentRegistry) else None
+        paths = entity_special_folder_paths(self._project_root, entity, dept_registry=reg)
+        self._ref_tab.set_entity_paths(entity, paths)
+        try:
+            win = self.window()
+            if win is not None and hasattr(win, "_ensure_entity_special_folders_watched"):
+                win._ensure_entity_special_folders_watched(Path(entity.path))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _on_ref_file_count_changed(self, count: int) -> None:
+        self._header.set_ref_tab_badge(count)
+
+    def _set_inspector_tab(self, index: int, *, persist: bool = True) -> None:
+        index = max(0, min(2, int(index)))
+        self._header.set_active_tab(index)
+        self._body_stack.setCurrentIndex(index)
+        if persist:
+            self._inspector_settings.setValue("inspector/last_tab_index", index)
+        if index == 1:
+            self._sync_ref_tab_paths()
+            self._ref_tab.notify_tab_visible()
+
+    def set_inspector_tab_index(self, index: int) -> None:
+        """Public API for shortcuts (0=Pipeline, 1=Ref, 2=Details)."""
+        if self._header.tabs_visible():
+            self._set_inspector_tab(index)
+
+    def open_reference_folder_for_selection(self) -> None:
+        self._open_entity_special_folder("reference")
+
+    def open_concept_folder_for_selection(self) -> None:
+        self._open_entity_special_folder("concept")
 
     def _sync_preview_notes_chip(self) -> None:
         item = self._current_item
@@ -739,6 +884,30 @@ class InspectorPanel(QWidget):
         else:
             self._asset_status.refresh_notes_display(None)
         self._sync_preview_notes_chip()
+
+    def refresh_special_folders_for_entity_paths(self, entity_paths: object) -> None:
+        """Refresh Ref tab when ``reference/`` or ``concept/`` changed on disk."""
+        if not isinstance(entity_paths, list):
+            return
+        entity = self._entity_for_special_folder()
+        if entity is None:
+            return
+        try:
+            current = str(Path(entity.path).resolve())
+        except OSError:
+            current = str(entity.path)
+        touched: set[str] = set()
+        for ep in entity_paths:
+            if not isinstance(ep, str) or not ep.strip():
+                continue
+            try:
+                touched.add(str(Path(ep.strip()).resolve()))
+            except OSError:
+                touched.add(ep.strip())
+        if current not in touched:
+            return
+        self._sync_ref_tab_paths()
+        self._ref_tab.refresh_from_disk()
 
     def refresh_thumbnail(self) -> None:
         # Best-effort; safe no-op if nothing selected.
@@ -1052,25 +1221,125 @@ class _InspectorHeader(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorHeader")
+        self._tabs_visible = True
+
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(12, 8, 8, 8)
         layout.setSpacing(8)
 
-        title = QLabel("INSPECTOR", self)
-        title.setObjectName("InspectorHeaderTitle")
-        f = monos_font("Inter", 10, QFont.Weight.ExtraBold)
-        title.setFont(f)
+        self._title = QLabel("INSPECTOR", self)
+        self._title.setObjectName("InspectorHeaderTitle")
+        self._title.setFont(monos_font("Inter", 10, QFont.Weight.ExtraBold))
 
-        btn = QToolButton(self)
-        btn.setObjectName("InspectorCloseButton")
-        btn.setAutoRaise(True)
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setIcon(lucide_icon("x", size=16, color_hex=MONOS_COLORS["text_label"]))
-        btn.clicked.connect(self.close_clicked.emit)
+        self._tab_row = QWidget(self)
+        self._tab_row.setObjectName("InspectorTabRow")
+        tab_row_l = QHBoxLayout(self._tab_row)
+        tab_row_l.setContentsMargins(0, 0, 0, 0)
+        tab_row_l.setSpacing(8)
 
-        layout.addWidget(title, 0, Qt.AlignVCenter)
-        layout.addStretch(1)
-        layout.addWidget(btn, 0, Qt.AlignVCenter)
+        # Reuse SidebarScopePill* objectNames + QSS (Project | Shot | Asset pill).
+        self._tab_pill = QWidget(self._tab_row)
+        self._tab_pill.setObjectName("SidebarScopePill")
+        self._tab_pill.setAttribute(Qt.WA_StyledBackground, True)
+        self._tab_pill.setMinimumHeight(40)
+        self._tab_pill.setMaximumHeight(40)
+        pill_l = QHBoxLayout(self._tab_pill)
+        pill_l.setContentsMargins(4, 4, 4, 4)
+        pill_l.setSpacing(0)
+
+        self._tab_buttons: list[QToolButton] = []
+        self._tab_icon_names: list[str] = []
+        _tab_specs = (
+            ("Pipeline — thumbnail and departments", "Pipeline", "layers"),
+            ("Reference and concept folders", "Ref", "eye"),
+            ("Technical specs and metadata", "Details", "sliders-horizontal"),
+        )
+        for idx, (tip, label, icon_name) in enumerate(_tab_specs):
+            btn = QToolButton(self._tab_pill)
+            btn.setObjectName("SidebarScopePillSegment")
+            btn.setProperty(
+                "position",
+                "left" if idx == 0 else ("right" if idx == len(_tab_specs) - 1 else "center"),
+            )
+            btn.setProperty("active", "false")
+            btn.setAutoRaise(True)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.setText(label)
+            f = monos_font("Inter", 13, QFont.Weight.DemiBold)
+            f.setLetterSpacing(QFont.PercentageSpacing, 97)
+            btn.setFont(f)
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            ic = lucide_icon(icon_name, size=15, color_hex=MONOS_COLORS["text_label"])
+            if not ic.isNull():
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(15, 15))
+            btn.setFixedHeight(32)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._tab_icon_names.append(icon_name)
+            self._tab_buttons.append(btn)
+            pill_l.addWidget(btn, 0, Qt.AlignVCenter)
+
+        tab_row_l.addWidget(self._tab_pill, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        tab_row_l.addStretch(1)
+        self._ref_tab_base_tooltip = "Reference and concept folders"
+
+        self._tab_row.setVisible(True)
+        self._title.setVisible(False)
+        self.setProperty("tabMode", "true")
+        self._active_tab_index = 0
+
+        self._close_btn = QToolButton(self)
+        self._close_btn.setObjectName("InspectorCloseButton")
+        self._close_btn.setAutoRaise(True)
+        self._close_btn.setCursor(Qt.PointingHandCursor)
+        self._close_btn.setIcon(lucide_icon("x", size=16, color_hex=MONOS_COLORS["text_label"]))
+        self._close_btn.clicked.connect(self.close_clicked.emit)
+
+        layout.addWidget(self._title, 0, Qt.AlignVCenter)
+        layout.addWidget(self._tab_row, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(self._close_btn, 0, Qt.AlignVCenter)
+
+    @property
+    def tab_buttons(self) -> list[QToolButton]:
+        return self._tab_buttons
+
+    def tabs_visible(self) -> bool:
+        return self._tabs_visible
+
+    def set_tabs_visible(self, visible: bool) -> None:
+        self._tabs_visible = bool(visible)
+        self._title.setVisible(not visible)
+        self._tab_row.setVisible(visible)
+        self.setProperty("tabMode", "true" if visible else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def set_active_tab(self, index: int) -> None:
+        index = max(0, min(len(self._tab_buttons) - 1, int(index)))
+        self._active_tab_index = index
+        for i, btn in enumerate(self._tab_buttons):
+            is_active = i == index
+            btn.setProperty("active", "true" if is_active else "false")
+            icon_name = self._tab_icon_names[i] if i < len(self._tab_icon_names) else "layers"
+            color = MONOS_COLORS["blue_400"] if is_active else MONOS_COLORS["text_label"]
+            ic = lucide_icon(icon_name, size=15, color_hex=color)
+            if not ic.isNull():
+                btn.setIcon(ic)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def set_ref_tab_badge(self, count: int) -> None:
+        if len(self._tab_buttons) < 2:
+            return
+        btn = self._tab_buttons[1]
+        if count > 0:
+            n = str(count) if count <= 99 else "99+"
+            word = "file" if count == 1 else "files"
+            btn.setToolTip(f"{self._ref_tab_base_tooltip} — {n} preview {word}")
+        else:
+            btn.setToolTip(self._ref_tab_base_tooltip)
 
 
 class _InspectorEmptyState(QWidget):
@@ -3493,6 +3762,10 @@ class _InspectorAssetStatusBlock(QWidget):
     open_asset_folder_clicked = Signal()
     open_work_folder_clicked = Signal()
     open_publish_folder_clicked = Signal()
+    open_reference_folder_clicked = Signal()
+    open_concept_folder_clicked = Signal()
+    copy_reference_path_clicked = Signal()
+    copy_concept_path_clicked = Signal()
     item_notes_clicked = Signal(ViewItem)
 
     def __init__(self, parent=None) -> None:
@@ -3557,6 +3830,22 @@ class _InspectorAssetStatusBlock(QWidget):
         self._act_open_publish_folder.triggered.connect(self._on_open_publish_folder_clicked)
         menu.addAction(self._act_open_publish_folder)
 
+        self._act_open_reference_folder = QAction(
+            lucide_icon("eye", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Open Reference Folder",
+            menu,
+        )
+        self._act_open_reference_folder.triggered.connect(self._on_open_reference_folder_clicked)
+        menu.addAction(self._act_open_reference_folder)
+
+        self._act_open_concept_folder = QAction(
+            lucide_icon("lightbulb", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Open Concept Folder",
+            menu,
+        )
+        self._act_open_concept_folder.triggered.connect(self._on_open_concept_folder_clicked)
+        menu.addAction(self._act_open_concept_folder)
+
         menu.addSeparator()
 
         self._act_copy_dcc_work_path = QAction(
@@ -3575,6 +3864,22 @@ class _InspectorAssetStatusBlock(QWidget):
         self._act_copy_publish_path.triggered.connect(self._on_copy_publish_folder_path_clicked)
         menu.addAction(self._act_copy_publish_path)
 
+        self._act_copy_reference_path = QAction(
+            lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Copy Reference Folder Path",
+            menu,
+        )
+        self._act_copy_reference_path.triggered.connect(self._on_copy_reference_path_clicked)
+        menu.addAction(self._act_copy_reference_path)
+
+        self._act_copy_concept_path = QAction(
+            lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Copy Concept Folder Path",
+            menu,
+        )
+        self._act_copy_concept_path.triggered.connect(self._on_copy_concept_path_clicked)
+        menu.addAction(self._act_copy_concept_path)
+
         self._quick_actions_btn.setMenu(menu)
         row2_l.addWidget(self._quick_actions_btn, 0)
         row2_l.addStretch(1)
@@ -3590,6 +3895,18 @@ class _InspectorAssetStatusBlock(QWidget):
 
     def _on_open_publish_folder_clicked(self) -> None:
         self.open_publish_folder_clicked.emit()
+
+    def _on_open_reference_folder_clicked(self) -> None:
+        self.open_reference_folder_clicked.emit()
+
+    def _on_open_concept_folder_clicked(self) -> None:
+        self.open_concept_folder_clicked.emit()
+
+    def _on_copy_reference_path_clicked(self) -> None:
+        self.copy_reference_path_clicked.emit()
+
+    def _on_copy_concept_path_clicked(self) -> None:
+        self.copy_concept_path_clicked.emit()
 
     def _on_notes_badge_clicked(self) -> None:
         item = self._current_item
@@ -3620,8 +3937,12 @@ class _InspectorAssetStatusBlock(QWidget):
         self._act_open_asset_folder.setEnabled(is_asset_or_shot)
         self._act_open_work_folder.setEnabled(is_asset_or_shot)
         self._act_open_publish_folder.setEnabled(is_asset_or_shot)
+        self._act_open_reference_folder.setEnabled(is_asset_or_shot)
+        self._act_open_concept_folder.setEnabled(is_asset_or_shot)
         self._act_copy_dcc_work_path.setEnabled(is_asset_or_shot)
         self._act_copy_publish_path.setEnabled(is_asset_or_shot)
+        self._act_copy_reference_path.setEnabled(is_asset_or_shot)
+        self._act_copy_concept_path.setEnabled(is_asset_or_shot)
         self.refresh_notes_display(item if is_asset_or_shot else None)
 
     def _on_copy_dcc_work_path_clicked(self) -> None:

@@ -97,6 +97,11 @@ from monostudio.core.fs_reader import (
     work_file_prefix,
 )
 from monostudio.core.workspace_reader import ProjectQuickStats
+from monostudio.core.entity_folders import (
+    ensure_entity_special_folder,
+    entity_has_reference_files,
+    entity_special_folder_path,
+)
 from monostudio.core.models import Asset, Department, Shot
 from monostudio.core.production_status import (
     ProductionStatusRegistry,
@@ -2810,6 +2815,34 @@ class _GridCardDelegate(QStyledItemDelegate):
                     p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
                     p.drawPixmap(ix + pad, iy + pad, dept_pix)
 
+            if isinstance(item.ref, (Asset, Shot)) and getattr(item, "path", None):
+                mw_ref = self._main_view
+                show_ref_hint = False
+                if mw_ref is not None and hasattr(mw_ref, "entity_has_reference_files_cached"):
+                    try:
+                        show_ref_hint = mw_ref.entity_has_reference_files_cached(item)  # type: ignore[attr-defined]
+                    except Exception:
+                        show_ref_hint = False
+                if show_ref_hint:
+                    ref_icon_sz = 14
+                    ref_pad = 4
+                    ref_chip_r = (ref_icon_sz + ref_pad * 2) // 2
+                    ref_chip_h = ref_chip_r * 2
+                    ref_x = thumb.left() + 12
+                    ref_y = thumb.bottom() - 12 - ref_chip_h
+                    ref_color = QColor(MONOS_COLORS.get("zinc_600", "#52525b"))
+                    ref_color.setAlpha(220)
+                    ref_pix = lucide_icon("eye", size=ref_icon_sz, color_hex="#ffffff").pixmap(
+                        ref_icon_sz, ref_icon_sz
+                    )
+                    if not ref_pix.isNull():
+                        rcx = ref_x + ref_chip_r
+                        rcy = ref_y + ref_chip_r
+                        p.setPen(Qt.NoPen)
+                        p.setBrush(ref_color)
+                        p.drawEllipse(QPoint(rcx, rcy), ref_chip_r, ref_chip_r)
+                        p.drawPixmap(ref_x + ref_pad, ref_y + ref_pad, ref_pix)
+
             # DCC badges (bottom-right of thumb) — filesystem-driven; "exists" = icon, "creating" = "Creating…"
             # Prefer dcc_work_states (scan) so subdepartments show badges; fallback to registry for "creating" only.
             def dcc_badges_for_item() -> list[tuple[QIcon | None, str, str]]:
@@ -3381,6 +3414,7 @@ class MainView(QWidget):
     _SETTINGS_KEY_TILE_META_SHOW_CURRENT_DEPT = "main_view/tile_meta_show_current_department"
     _SETTINGS_KEY_TILE_META_SHOW_STATUS_PILL = "main_view/tile_meta_show_status_pill"
     _SETTINGS_KEY_HIDE_SKIPPED_CARDS = "main_view/hide_skipped_cards"
+    _SETTINGS_KEY_FILTER_HAS_REFERENCE = "main_view/filter_has_reference"
     _SETTINGS_KEY_FILTER_WORK_FOLDER = "main_view/filter_work_folder"
     _SETTINGS_KEY_FILTER_STATUS_IDS = "main_view/filter_status_ids"
     _FILTER_WORK_ALL = "all"
@@ -3448,6 +3482,9 @@ class MainView(QWidget):
         self._hide_skipped_cards: bool = bool(
             self._settings.value(self._SETTINGS_KEY_HIDE_SKIPPED_CARDS, False, type=bool)
         )
+        self._filter_has_reference: bool = bool(
+            self._settings.value(self._SETTINGS_KEY_FILTER_HAS_REFERENCE, False, type=bool)
+        )
         _wf_raw = str(self._settings.value(self._SETTINGS_KEY_FILTER_WORK_FOLDER, self._FILTER_WORK_ALL) or "").strip().lower()
         self._filter_work_folder: str = (
             _wf_raw if _wf_raw in (self._FILTER_WORK_HAS, self._FILTER_WORK_NO) else self._FILTER_WORK_ALL
@@ -3465,6 +3502,7 @@ class MainView(QWidget):
         self._cached_prod_reg_root: str | None = None
         self._cached_prod_reg: object | None = None
         self._notes_badge_cache: dict[str, tuple[int, str]] = {}
+        self._entity_reference_cache: dict[str, bool] = {}
         # Precomputed list Status column width (pill); avoids resizeColumnToContents × N rows.
         self._list_status_pill_layout_width: int = 0
 
@@ -3790,6 +3828,13 @@ class MainView(QWidget):
         self._chk_hide_skipped_cards.toggled.connect(self._on_hide_skipped_cards_toggled)
         self._chk_hide_skipped_cards.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         _fl.addWidget(self._chk_hide_skipped_cards)
+        self._chk_filter_has_reference = QCheckBox("Has reference files", self._filter_submenu)
+        self._chk_filter_has_reference.setToolTip(
+            "Only assets/shots with at least one file in the entity reference folder (top-level)."
+        )
+        self._chk_filter_has_reference.toggled.connect(self._on_filter_has_reference_toggled)
+        self._chk_filter_has_reference.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        _fl.addWidget(self._chk_filter_has_reference)
         _fl.addSpacing(2)
         _wf_lbl = QLabel("Work folder", self._filter_submenu)
         _wf_lbl.setObjectName("ViewOptionsGroupLabel")
@@ -4999,6 +5044,43 @@ class MainView(QWidget):
             pass
         self._list_view.viewport().update()
 
+    def invalidate_entity_reference_cache(self, entity_path: Path | str | None = None) -> None:
+        if entity_path is None:
+            self._entity_reference_cache.clear()
+        else:
+            try:
+                key = str(Path(entity_path).resolve())
+            except (TypeError, ValueError, OSError):
+                key = str(entity_path)
+            self._entity_reference_cache.pop(key, None)
+        self.refresh_reference_hint_badges()
+
+    def entity_has_reference_files_cached(self, item: ViewItem) -> bool:
+        if not isinstance(item.ref, (Asset, Shot)):
+            return False
+        try:
+            key = str(Path(item.path).resolve())
+        except (TypeError, ValueError, OSError):
+            key = str(item.path)
+        hit = self._entity_reference_cache.get(key)
+        if hit is not None:
+            return bool(hit)
+        pr: Path | None = None
+        if self._project_root is not None:
+            try:
+                pr = Path(self._project_root).resolve()
+            except OSError:
+                pr = Path(self._project_root)
+        has = entity_has_reference_files(pr, item.ref, dept_registry=self._dept_registry)
+        self._entity_reference_cache[key] = has
+        return has
+
+    def refresh_reference_hint_badges(self) -> None:
+        self._tile_view.viewport().update()
+
+    def _view_item_has_reference_files(self, item: ViewItem) -> bool:
+        return self.entity_has_reference_files_cached(item)
+
     def notes_badge_state(self, item_path: Path | str | None) -> tuple[int, str]:
         """(open_count, visual_mode) with visual_mode in empty|open|all_done — cached per entity path."""
         if item_path is None:
@@ -5026,6 +5108,7 @@ class MainView(QWidget):
     def invalidate_notes_open_count_cache(self, path: Path | str | None = None) -> None:
         if path is None:
             self._notes_badge_cache.clear()
+            self._entity_reference_cache.clear()
         else:
             try:
                 k = str(Path(path).resolve())
@@ -5431,6 +5514,8 @@ class MainView(QWidget):
     def _main_view_filters_active(self) -> bool:
         if self._browser_context not in ("asset", "shot"):
             return False
+        if self._filter_has_reference:
+            return True
         if not (self._active_department or "").strip():
             return False
         return (
@@ -5442,10 +5527,12 @@ class MainView(QWidget):
     def _apply_main_view_item_filters(self, items: list[ViewItem]) -> list[ViewItem]:
         if self._browser_context not in ("asset", "shot"):
             return list(items)
+        out = list(items)
+        if self._filter_has_reference:
+            out = [vi for vi in out if self._view_item_has_reference_files(vi)]
         dep = (self._active_department or "").strip()
         if not dep:
-            return list(items)
-        out = list(items)
+            return out
         if self._hide_skipped_cards:
             out = [vi for vi in out if not self._main_view_item_is_skipped_for_active_department(vi)]
         wf = self._filter_work_folder
@@ -6085,6 +6172,9 @@ class MainView(QWidget):
             self._chk_hide_skipped_cards.blockSignals(True)
             self._chk_hide_skipped_cards.setChecked(self._hide_skipped_cards)
             self._chk_hide_skipped_cards.blockSignals(False)
+            self._chk_filter_has_reference.blockSignals(True)
+            self._chk_filter_has_reference.setChecked(self._filter_has_reference)
+            self._chk_filter_has_reference.blockSignals(False)
             self._sync_filter_work_radios_from_settings()
             self._rebuild_filter_status_dropdown()
             self._sync_main_view_options_popup_geometry()
@@ -6252,6 +6342,16 @@ class MainView(QWidget):
     def _on_hide_skipped_cards_toggled(self, checked: bool) -> None:
         self._hide_skipped_cards = bool(checked)
         self._settings.setValue(self._SETTINGS_KEY_HIDE_SKIPPED_CARDS, self._hide_skipped_cards)
+        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
+    def _on_filter_has_reference_toggled(self, checked: bool) -> None:
+        self._filter_has_reference = bool(checked)
+        self._settings.setValue(self._SETTINGS_KEY_FILTER_HAS_REFERENCE, self._filter_has_reference)
         if self._browser_context in ("asset", "shot") and self._items_unfiltered:
             self._resort_main_view_visible()
         self._grid_last = None
@@ -7119,6 +7219,17 @@ class MainView(QWidget):
                 lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]),
                 "Open Work Folder",
             )
+            open_reference = menu.addAction(
+                lucide_icon("eye", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Open Reference Folder",
+            )
+            open_concept = menu.addAction(
+                lucide_icon("lightbulb", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Open Concept Folder",
+            )
+        else:
+            open_reference = None
+            open_concept = None
 
         menu.addSeparator()
 
@@ -7157,6 +7268,8 @@ class MainView(QWidget):
         menu.setProperty("_act_delete", delete_action)
         menu.setProperty("_act_open_work", open_work)
         menu.setProperty("_act_open_publish", open_publish)
+        menu.setProperty("_act_open_reference", open_reference if item.kind.value in ("asset", "shot") else None)
+        menu.setProperty("_act_open_concept", open_concept if item.kind.value in ("asset", "shot") else None)
         return menu
 
     def _dispatch_item_context_action(self, chosen, item: ViewItem) -> None:
@@ -7249,6 +7362,12 @@ class MainView(QWidget):
             _, folder = self._resolved_path_and_folder_for_item(item)
             self._open_folder(folder)
             return
+        if text == "Open Reference Folder":
+            self._open_entity_special_folder_from_item(item, "reference")
+            return
+        if text == "Open Concept Folder":
+            self._open_entity_special_folder_from_item(item, "concept")
+            return
         if text == "Notes…":
             self.item_notes_requested.emit(item)
             return
@@ -7328,6 +7447,17 @@ class MainView(QWidget):
         cb.setText(path_text)
         from monostudio.ui_qt.notification import notify as notification_service
         notification_service.success(f"Copied: {path_text}")
+
+    def _open_entity_special_folder_from_item(self, item: ViewItem, folder_id: str) -> None:
+        if not isinstance(getattr(item, "ref", None), (Asset, Shot)):
+            return
+        ref = item.ref
+        pr = getattr(self, "_project_root", None)
+        path = entity_special_folder_path(Path(pr) if pr else None, ref, folder_id)  # type: ignore[arg-type]
+        if path is None:
+            path = ref.path / folder_id
+        if ensure_entity_special_folder(path):
+            self._open_folder(path.resolve())
 
     def _open_folder(self, folder: Path) -> None:
         try:
