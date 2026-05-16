@@ -118,6 +118,8 @@ class MainWindow(FramelessMainWindow):
         self._context_switch_in_progress: bool = False
         # Short cooldown after switching to Inbox so a delayed filter signal does not trigger a second reload (items flash then placeholder).
         self._inbox_switch_cooldown: bool = False
+        # Background filesystem_scan after Assets↔Shots switch: sync index only; do not wipe thumb cache + full main view reload.
+        self._filesystem_scan_soft: bool = False
         # Guard: filter (department/type) changes must never trigger Open DCC flows or spawn dialogs.
         self._filter_switch_in_progress: bool = False
         self._workspace_root: Path | None = None
@@ -1430,7 +1432,7 @@ class MainWindow(FramelessMainWindow):
                 # Clear so diff application does not mix with previous context data.
                 self._main_view.clear()
                 # Scan in background to avoid blocking UI when switching between Assets/Shots.
-                self._submit_rescan_task()
+                self._submit_rescan_task(soft=True)
                 self._reload_main_view()
             elif context_name == "Inbox":
                 self._sync_filter_state_from_sidebar()
@@ -1698,12 +1700,23 @@ class MainWindow(FramelessMainWindow):
             self._app_state.update_shots(list(result.shots))
             self._app_state.commit_immediate()
             self._sidebar.set_project_index(result)
-            # Full rescan: drop in-memory thumbs so grid/inspector reload from disk (mtime / new sources).
             try:
-                self._thumbnail_manager.clear_memory_cache()
+                self._update_fs_watcher_paths()
             except Exception:
                 pass
-            self._reload_main_view()
+            soft = bool(getattr(self, "_filesystem_scan_soft", False))
+            self._filesystem_scan_soft = False
+            if soft:
+                # Already reloaded on tab switch; a second full reload clears tile icons -> visible grid flicker.
+                # AppState diffs update rows; keep thumbnail memory cache warm.
+                QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
+            else:
+                # Full rescan (e.g. Refresh): drop in-memory thumbs so grid/inspector reload from disk (mtime / new sources).
+                try:
+                    self._thumbnail_manager.clear_memory_cache()
+                except Exception:
+                    pass
+                self._reload_main_view()
             self._sync_primary_action()
             self._sync_top_bar()
         elif category == "incremental_scan" and isinstance(result, tuple) and len(result) >= 4:
@@ -1942,10 +1955,14 @@ class MainWindow(FramelessMainWindow):
         # So watcher includes new/updated asset and shot paths (incl. nested dept work dirs).
         self._update_fs_watcher_paths()
 
-    def _submit_rescan_task(self) -> None:
-        """Submit a filesystem scan to WorkerManager; result is forwarded to AppState in _on_worker_task_finished."""
+    def _submit_rescan_task(self, *, soft: bool = False) -> None:
+        """Submit a filesystem scan to WorkerManager; result is forwarded to AppState in _on_worker_task_finished.
+
+        soft=True: after Assets↔Shots switch — merge scan into AppState without clearing thumbnail cache or full main view rebuild.
+        """
         if self._project_root is None:
             return
+        self._filesystem_scan_soft = bool(soft)
         root = self._project_root
 
         def run() -> ProjectIndex:
