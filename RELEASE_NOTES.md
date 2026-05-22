@@ -1,3 +1,21 @@
+# MonoStudio 26 — Release v26.13.1
+
+## Highlights
+
+- **Department icons**: Bảng mặc định Lucide tập trung (`DEPARTMENT_ICON_DEFAULTS`); sidebar, main view và pipeline editor hiển thị icon đúng kể cả khi metadata thiếu `icon_name` (đặc biệt FX leaves).
+
+## Changes in this release
+
+- fix: `pipeline_types_and_presets.py` — `department_icon_name`, fill icons khi expand registry.
+- fix: `sidebar.py`, `main_window.py`, `pipeline_structure_editor.py` — dùng defaults thống nhất.
+- fix: `types_and_presets.json`, `main_view.py` — particles icon `wand-sparkles`.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.13.0
 
 ## Highlights

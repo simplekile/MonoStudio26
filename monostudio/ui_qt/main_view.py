@@ -233,7 +233,7 @@ _DEPT_ICON_MAP: dict[str, str] = {
     "pyro": "sun",
     "fluids": "wand",
     "destruction": "triangle-alert",
-    "particles": "sparkles",
+    "particles": "wand-sparkles",
     "lighting": "lightbulb",
     "comp": "sliders-horizontal",
 }

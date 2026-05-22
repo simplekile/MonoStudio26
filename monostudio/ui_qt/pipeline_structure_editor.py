@@ -47,6 +47,7 @@ from monostudio.core.pipeline_types_and_presets import (
     DepartmentDef,
     PipelineTypesAndPresets,
     TypeDef,
+    department_icon_name,
     expand_pipeline_types_and_presets_with_registry,
     get_user_default_config_root,
     load_pipeline_types_and_presets,
@@ -366,11 +367,18 @@ class PipelineStructureEditorWidget(QWidget):
             parent = pr.strip() if isinstance(pr, str) and pr.strip() else None
             if did not in self._preset_depts:
                 sn = did[:4] if len(did) >= 4 else did
-                self._preset_depts[did] = DepartmentDef(did, lab, sn, None, parent)
+                self._preset_depts[did] = DepartmentDef(
+                    did, lab, sn, department_icon_name(did), parent
+                )
             else:
                 d = self._preset_depts[did]
+                icon = department_icon_name(did, explicit=d.icon_name)
                 self._preset_depts[did] = DepartmentDef(
-                    did, d.name or lab, d.short_name, d.icon_name, parent if parent is not None else d.parent
+                    did,
+                    d.name or lab,
+                    d.short_name,
+                    icon,
+                    parent if parent is not None else d.parent,
                 )
 
     def build_pipeline_types_and_presets(self) -> PipelineTypesAndPresets:

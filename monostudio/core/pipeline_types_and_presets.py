@@ -40,6 +40,44 @@ class PipelineTypesAndPresets:
 
 EntityScope = Literal["asset", "shot"]
 
+# Lucide slugs shipped under monostudio_data/icons/lucide/ (sidebar, picker, badges).
+DEPARTMENT_ICON_DEFAULTS: dict[str, str] = {
+    "layout": "layout-dashboard",
+    "modelling": "box",
+    "model": "box",
+    "modeling": "box",
+    "sculpt": "zbrush",
+    "retopo": "hexagon",
+    "uv": "checkerboard",
+    "rigging": "bone",
+    "geoclean": "brush-cleaning",
+    "rig": "bone",
+    "surfacing": "palette",
+    "baking": "chef-hat",
+    "texturing": "palette",
+    "grooming": "scissors",
+    "lookdev": "sparkles",
+    "anim": "spline",
+    "animation": "spline",
+    "fx": "zap",
+    "groom": "scissors",
+    "crowd": "user",
+    "cloth": "layers",
+    "pyro": "sun",
+    "fluids": "wand",
+    "destruction": "triangle-alert",
+    "particles": "wand-sparkles",
+    "lighting": "lightbulb",
+    "comp": "sliders-horizontal",
+}
+
+
+def department_icon_name(dept_id: str, *, explicit: str | None = None) -> str | None:
+    """Resolve Lucide icon slug for a department; explicit metadata wins over defaults."""
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    return DEPARTMENT_ICON_DEFAULTS.get((dept_id or "").strip())
+
 
 def is_shot_type_id(type_id: str) -> bool:
     """Pipeline convention: shot types are ``shot`` or prefixed ``shot_``."""
@@ -188,13 +226,19 @@ def expand_pipeline_types_and_presets_with_registry(
             existing = new_depts.get(dept_id)
             label = registry.get_department_label(dept_id)
             short = (existing.short_name if existing else (dept_id[:4] if len(dept_id) >= 4 else dept_id))
-            icon = existing.icon_name if existing else None
+            icon = department_icon_name(
+                dept_id, explicit=existing.icon_name if existing else None
+            )
             parent_val = parent or (existing.parent if existing else None)
             if existing is None:
                 new_depts[dept_id] = DepartmentDef(dept_id, label, short, icon, parent_val)
             elif parent_val and not existing.parent:
                 new_depts[dept_id] = DepartmentDef(
-                    dept_id, existing.name, existing.short_name, existing.icon_name, parent_val
+                    dept_id, existing.name, existing.short_name, icon or existing.icon_name, parent_val
+                )
+            elif not existing.icon_name and icon:
+                new_depts[dept_id] = DepartmentDef(
+                    dept_id, existing.name, existing.short_name, icon, existing.parent
                 )
 
     return PipelineTypesAndPresets(types=new_types, departments=new_depts)

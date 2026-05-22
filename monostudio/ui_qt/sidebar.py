@@ -65,6 +65,7 @@ from monostudio.core.project_guide_tags import (
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.pipeline_types_and_presets import (
+    department_icon_name,
     load_pipeline_types_and_presets_for_project,
     order_department_ids_grouped_by_parent,
     resolve_department_ids_for_ui,
@@ -946,10 +947,10 @@ class SidebarWidget(QWidget):
         dept_parent: dict[str, str] = {}
         for did in seen:
             dd = meta.departments.get(did)
+            explicit_icon = dd.icon_name if dd is not None else None
+            icon_slug = department_icon_name(did, explicit=explicit_icon)
             if dd is not None:
                 dept_labels[did] = dd.name
-                if dd.icon_name:
-                    dept_icons[did] = dd.icon_name
                 if getattr(dd, "parent", None) and dd.parent.strip():
                     dept_parent[did] = (dd.parent or "").strip()
             if registry is not None:
@@ -960,6 +961,8 @@ class SidebarWidget(QWidget):
                     dept_parent[did] = parent
                     if parent not in dept_labels:
                         dept_labels[parent] = registry.get_department_label(parent)
+            if icon_slug:
+                dept_icons[did] = icon_slug
 
         order_source = (
             registry.get_departments() if registry is not None else list(meta.departments.keys())

@@ -797,9 +797,13 @@ class MainWindow(FramelessMainWindow):
             pass
 
     def _apply_pipeline_types_and_presets_metadata(self, meta: PipelineTypesAndPresets) -> None:
-        self._dept_icon_map = {
-            k: v.icon_name for k, v in meta.departments.items() if v.icon_name
-        }
+        from monostudio.core.pipeline_types_and_presets import department_icon_name
+
+        self._dept_icon_map = {}
+        for dept_id, ddef in meta.departments.items():
+            slug = department_icon_name(dept_id, explicit=ddef.icon_name)
+            if slug:
+                self._dept_icon_map[dept_id] = slug
         self._type_short_name_map = {
             k: v.short_name for k, v in meta.types.items() if v.short_name
         }
