@@ -1,3 +1,27 @@
+# MonoStudio 26 — Release v26.13.0
+
+## Highlights
+
+- **FX subdepartments**: Factory preset thêm groom, crowd, cloth, pyro, fluids, destruction, particles (con của `fx`); sidebar, Inspector và workflow type mở rộng parent → leaf; project cũ merge thiếu từ mono2026 trong memory.
+- **Inspector — Ref tab**: Placeholder khi chưa chọn asset/shot; thumbnail ref/concept DPI-aware, cache disk riêng (`ref_cover`), crop vuông sắc hơn.
+- **Splash**: Cho phép tắt splash (`0` ms) trong Settings → Developer.
+
+## Changes in this release
+
+- feat: `pipeline_types_and_presets.py` — `resolve_department_ids_for_ui`, `order_department_ids_grouped_by_parent`, expand workflow với registry.
+- feat: `department_registry.py` — `merge_factory_departments_into_mapping` khi load project.
+- feat: `sidebar.py`, `inspector.py`, `pipeline_structure_editor.py` — filter/UI theo leaf depts, nhóm theo parent.
+- feat: `project_create.py` — merge factory depts + ghi `types.json` đã expand cho project mới.
+- feat: `inspector_ref_tab.py`, `thumbnails.py` — ref preview decode/crop/cache theo DPR.
+- feat: `mono2026_preset.json`, `types_and_presets.json`, `dccs.json` — FX leaves + Houdini defaults.
+- fix: `app.py` — splash progress khi `splash_display_ms` = 0.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.12.0
 
 ## Highlights

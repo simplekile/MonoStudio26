@@ -63,7 +63,12 @@ from monostudio.core.project_guide_tags import (
     rename_tag_definition,
 )
 from monostudio.core.models import Asset, ProjectIndex, Shot
-from monostudio.core.pipeline_types_and_presets import load_pipeline_types_and_presets_for_project
+from monostudio.core.department_registry import DepartmentRegistry
+from monostudio.core.pipeline_types_and_presets import (
+    load_pipeline_types_and_presets_for_project,
+    order_department_ids_grouped_by_parent,
+    resolve_department_ids_for_ui,
+)
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.brand_icons import brand_icon
@@ -896,6 +901,12 @@ class SidebarWidget(QWidget):
             return
 
         meta = load_pipeline_types_and_presets_for_project(self._project_root)
+        registry: DepartmentRegistry | None = None
+        if self._project_root is not None:
+            try:
+                registry = DepartmentRegistry.for_project(self._project_root)
+            except OSError:
+                registry = None
 
         # Types: stable ids + display names.
         types_out: list[tuple[str, str]] = []
@@ -913,12 +924,11 @@ class SidebarWidget(QWidget):
             if t.icon_name:
                 type_icons[type_id] = t.icon_name
             # Per-type department list (for type tabs in Select Departments dialog and sidebar filtering).
-            dept_ids: list[str] = []
+            raw_ids: list[str] = []
             for d in getattr(t, "departments", []) or []:
-                if isinstance(d, str) and d.strip():
-                    did = d.strip()
-                    if did not in dept_ids:
-                        dept_ids.append(did)
+                if isinstance(d, str) and d.strip() and d.strip() not in raw_ids:
+                    raw_ids.append(d.strip())
+            dept_ids = resolve_department_ids_for_ui(raw_ids, meta=meta, registry=registry)
             if dept_ids:
                 self._dept_ids_by_type[type_id] = dept_ids
         types_out.sort(key=lambda x: x[1].lower())
@@ -926,39 +936,39 @@ class SidebarWidget(QWidget):
         self._type_label_by_id = {tid: name for tid, name in types_out}
         self._type_icon_by_id = type_icons
 
-        # Departments: union across all types, ordered by departments definition in JSON.
+        # Departments: union across all types (leaf-only after parent expansion).
         seen: set[str] = set()
+        for ids in self._dept_ids_by_type.values():
+            seen.update(ids)
         depts: list[str] = []
         dept_labels: dict[str, str] = {}
         dept_icons: dict[str, str] = {}
         dept_parent: dict[str, str] = {}
-        for type_id, t in meta.types.items():
-            if self._mode == "shots":
-                if not _is_shot_type(type_id):
-                    continue
-            else:
-                if _is_shot_type(type_id):
-                    continue
-            for d in t.departments:
-                if isinstance(d, str) and d.strip() and d not in seen:
-                    seen.add(d)
-                    dd = meta.departments.get(d)
-                    if dd is not None:
-                        dept_labels[d] = dd.name
-                        if dd.icon_name:
-                            dept_icons[d] = dd.icon_name
-                        if getattr(dd, "parent", None) and dd.parent.strip():
-                            dept_parent[d] = (dd.parent or "").strip()
+        for did in seen:
+            dd = meta.departments.get(did)
+            if dd is not None:
+                dept_labels[did] = dd.name
+                if dd.icon_name:
+                    dept_icons[did] = dd.icon_name
+                if getattr(dd, "parent", None) and dd.parent.strip():
+                    dept_parent[did] = (dd.parent or "").strip()
+            if registry is not None:
+                if did not in dept_labels:
+                    dept_labels[did] = registry.get_department_label(did)
+                parent = registry.get_parent(did)
+                if parent:
+                    dept_parent[did] = parent
+                    if parent not in dept_labels:
+                        dept_labels[parent] = registry.get_department_label(parent)
 
-        # Primary order = JSON order from meta.departments keys.
-        for dept_id in meta.departments.keys():
-            if dept_id in seen:
-                depts.append(dept_id)
-
-        # Back-compat: departments referenced by types but missing in meta.departments.
-        missing = [d for d in seen if d not in meta.departments]
+        order_source = (
+            registry.get_departments() if registry is not None else list(meta.departments.keys())
+        )
+        depts = [dept_id for dept_id in order_source if dept_id in seen]
+        missing = [d for d in seen if d not in depts]
         missing.sort(key=lambda s: s.lower())
         depts.extend(missing)
+        depts = order_department_ids_grouped_by_parent(depts, dept_parent, order_source)
 
         self._all_departments = depts
         self._dept_label_by_id = dept_labels

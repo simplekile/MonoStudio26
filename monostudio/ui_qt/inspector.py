@@ -176,9 +176,15 @@ def _inspector_allowed_department_ids(ref: Asset | Shot, project_root: Path | No
     meta = load_pipeline_types_and_presets_for_project(project_root)
     if not meta.types:
         return None
+    try:
+        registry = DepartmentRegistry.for_project(project_root)
+    except OSError:
+        registry = None
     scope = "asset" if isinstance(ref, Asset) else "shot"
     type_id = (ref.asset_type or "").strip() if isinstance(ref, Asset) else None
-    ids = ordered_department_ids_for_scope(meta, scope, type_id=type_id or None)
+    ids = ordered_department_ids_for_scope(
+        meta, scope, type_id=type_id or None, registry=registry
+    )
     return ids if ids else None
 
 
@@ -515,6 +521,9 @@ class InspectorPanel(QWidget):
         details_l = QVBoxLayout(details_content)
         details_l.setContentsMargins(12, 12, 12, 12)
         details_l.setSpacing(16)
+        self._details_empty = _InspectorEmptyState()
+        self._details_empty.set_message("Select an item to view details")
+        details_l.addWidget(self._details_empty, 0)
         details_l.addWidget(self._tech, 0)
         details_l.addWidget(self._stakeholders, 0)
         details_l.addStretch(1)
@@ -701,6 +710,9 @@ class InspectorPanel(QWidget):
         self._stakeholders.setVisible(is_asset_or_shot)
         if has_item:
             self._inbox_action_wrapper.setVisible(False)
+
+        self._ref_tab.set_show_placeholder(not is_asset_or_shot)
+        self._details_empty.setVisible(not is_asset_or_shot)
 
         if item is None:
             self._empty.set_message("Select an item to view details")

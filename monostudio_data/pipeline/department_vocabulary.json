@@ -1,1 +1,1 @@
-["layout", "modelling", "sculpt", "retopo", "uv", "rigging", "geoclean", "rig", "surfacing", "baking", "texturing", "grooming", "lookdev", "anim", "fx", "lighting", "comp"]
+["layout", "modelling", "sculpt", "retopo", "uv", "rigging", "geoclean", "rig", "surfacing", "baking", "texturing", "grooming", "lookdev", "anim", "fx", "groom", "crowd", "cloth", "pyro", "fluids", "destruction", "particles", "lighting", "comp"]

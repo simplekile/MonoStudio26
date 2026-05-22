@@ -7,7 +7,16 @@ from datetime import date
 from pathlib import Path
 
 from monostudio.core.app_paths import get_app_base_path
-from monostudio.core.pipeline_types_and_presets import get_user_default_config_root
+from monostudio.core.department_registry import (
+    DepartmentRegistry,
+    merge_factory_departments_into_mapping,
+)
+from monostudio.core.pipeline_types_and_presets import (
+    expand_pipeline_types_and_presets_with_registry,
+    get_user_default_config_root,
+    load_pipeline_types_and_presets,
+    save_pipeline_types_and_presets_to_project,
+)
 from monostudio.core.project_id import generate_project_id
 from monostudio.core.project_create_defaults import (
     CREATE_DEFAULT_DCC_BY_DEPARTMENT_KEY,
@@ -76,6 +85,9 @@ def _resolve_initial_configs() -> tuple[dict, dict, dict]:
     user_structure = _load_user_default_json("structure.json")
     if isinstance(user_structure.get("folders"), dict) and user_structure["folders"]:
         folders = user_structure["folders"]
+
+    if isinstance(depts, dict) and depts:
+        depts = merge_factory_departments_into_mapping(dict(depts))
 
     return (depts, types, folders)
 
@@ -174,11 +186,21 @@ def create_new_project(
         pipeline_dir.mkdir(parents=True, exist_ok=True)
         created_paths.append(pipeline_dir)
 
+        merged_depts: dict = {}
         if isinstance(preset_depts, dict) and preset_depts:
+            merged_depts = merge_factory_departments_into_mapping(dict(preset_depts))
             (pipeline_dir / "departments.json").write_text(
-                json.dumps({"departments": preset_depts}, ensure_ascii=False, indent=2) + "\n",
+                json.dumps({"departments": merged_depts}, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+
+        try:
+            shipped = load_pipeline_types_and_presets()
+            reg = DepartmentRegistry.for_project(project_root)
+            workflow_cfg = expand_pipeline_types_and_presets_with_registry(shipped, reg)
+            save_pipeline_types_and_presets_to_project(project_root, workflow_cfg)
+        except OSError:
+            pass
 
         if isinstance(preset_types, dict) and preset_types:
             (pipeline_dir / "types.json").write_text(

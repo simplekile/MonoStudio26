@@ -4,7 +4,7 @@
       "id": "shot",
       "name": "Shot",
       "short_name": "sh",
-      "departments": ["layout", "anim", "fx", "lighting", "comp"],
+      "departments": ["layout", "anim", "groom", "crowd", "cloth", "pyro", "fluids", "destruction", "particles", "lighting", "comp"],
       "icon_name": "clapperboard"
     },
     "character": {
@@ -52,6 +52,13 @@
     "lookdev": {"name": "Lookdev", "short_name": "ldv", "icon_name": "sparkles"},
     "anim": {"name": "Animation", "short_name": "anim", "icon_name": "spline"},
     "fx": {"name": "FX", "short_name": "fx", "icon_name": "zap"},
+    "groom": {"name": "Groom", "short_name": "grm", "icon_name": "scissors", "parent": "fx"},
+    "crowd": {"name": "Crowd", "short_name": "crd", "icon_name": "user", "parent": "fx"},
+    "cloth": {"name": "Cloth", "short_name": "clt", "icon_name": "layers", "parent": "fx"},
+    "pyro": {"name": "Pyro", "short_name": "pyr", "icon_name": "sun", "parent": "fx"},
+    "fluids": {"name": "Fluids", "short_name": "fld", "icon_name": "wand", "parent": "fx"},
+    "destruction": {"name": "Destruction", "short_name": "dst", "icon_name": "triangle-alert", "parent": "fx"},
+    "particles": {"name": "Particles", "short_name": "ptc", "icon_name": "sparkles", "parent": "fx"},
     "lighting": {"name": "Lighting", "short_name": "lgt", "icon_name": "lightbulb"},
     "comp": {"name": "Comp", "short_name": "comp", "icon_name": "sliders-horizontal"}
   }

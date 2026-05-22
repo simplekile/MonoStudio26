@@ -179,11 +179,30 @@ def _thumbnail_disk_cache_dir() -> Path:
     return Path(tempfile.gettempdir()) / "MonoStudio26" / "thumbnails"
 
 
-def _disk_cache_path(source_path: Path, mtime_ns: int, size_px: int) -> Path:
-    """Path to cached PNG for this source file; same path+mtime+size always yields same file."""
-    raw = f"{source_path.resolve()!s}\n{mtime_ns}\n{size_px}"
+REF_PREVIEW_DISK_CACHE_VARIANT = "ref_cover"
+
+
+def _disk_cache_path(source_path: Path, mtime_ns: int, size_px: int, *, variant: str = "") -> Path:
+    """Path to cached PNG for this source file; same path+mtime+size+variant yields same file."""
+    raw = f"{source_path.resolve()!s}\n{mtime_ns}\n{size_px}\n{variant}"
     h = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:32]
     return _thumbnail_disk_cache_dir() / f"{h}.png"
+
+
+def _qimage_cover_square(img: QImage, side: int) -> QImage:
+    """Center-crop to a square after aspect-fill scale (Inspector ref grid)."""
+    from PySide6.QtCore import Qt
+
+    side = max(1, int(side))
+    scaled = img.scaled(
+        side,
+        side,
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    sx = max(0, (scaled.width() - side) // 2)
+    sy = max(0, (scaled.height() - side) // 2)
+    return scaled.copy(sx, sy, side, side)
 
 
 def resolve_department_thumbnail_path(item_root: Path, department: str) -> Path | None:
@@ -294,9 +313,13 @@ class ThumbnailCache:
     Cache key uses: file path + modification time.
     """
 
-    def __init__(self, *, size_px: int) -> None:
+    def __init__(self, *, size_px: int, cache_variant: str = "") -> None:
         self._size_px = size_px
+        self._cache_variant = cache_variant
         self._cache: dict[str, _CachedPixmap] = {}
+
+    def _disk_cache_path_for(self, file_path: Path, mtime_ns: int) -> Path:
+        return _disk_cache_path(file_path, mtime_ns, self._size_px, variant=self._cache_variant)
 
     def resolve_thumbnail_file(self, item_root: Path, department: str | None = None) -> Path | None:
         return resolve_thumbnail_path(item_root, department=department)
@@ -320,7 +343,7 @@ class ThumbnailCache:
         if cached is not None and cached.mtime_ns == mtime_ns:
             return cached.pixmap
         try:
-            dc_path = _disk_cache_path(file_path, mtime_ns, self._size_px)
+            dc_path = self._disk_cache_path_for(file_path, mtime_ns)
             if dc_path.is_file():
                 pix = QPixmap(str(dc_path))
                 if not pix.isNull():
@@ -344,7 +367,7 @@ class ThumbnailCache:
             return None
         self._cache[str(file_path)] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
         try:
-            dc_path = _disk_cache_path(file_path, mtime_ns, self._size_px)
+            dc_path = self._disk_cache_path_for(file_path, mtime_ns)
             dc_path.parent.mkdir(parents=True, exist_ok=True)
             pix.save(str(dc_path), "PNG")
         except OSError:
@@ -364,7 +387,7 @@ class ThumbnailCache:
             return cached.pixmap
 
         # Disk cache in Windows temp: read first; never deleted by app
-        dc_path = _disk_cache_path(file_path, mtime_ns, self._size_px)
+        dc_path = self._disk_cache_path_for(file_path, mtime_ns)
         try:
             if dc_path.is_file():
                 pix = QPixmap(str(dc_path))
@@ -411,11 +434,10 @@ class ThumbnailCache:
         return scaled
 
 
-def decode_ref_preview_qimage_worker(file_path: str, size_px: int) -> tuple[str, QImage] | None:
-    """
-    Worker-safe decode for entity reference/concept preview images.
-    Uses disk cache when present; otherwise decodes and scales to ``size_px``.
-    """
+def _load_ref_preview_image_worker(file_path: str, size_px: int) -> tuple[str, QImage] | None:
+    """Decode ref/concept preview as a square cover crop at ``size_px`` (worker thread)."""
+    from PySide6.QtGui import QImageReader
+
     p = Path(file_path)
     if not p.is_file():
         return None
@@ -424,15 +446,46 @@ def decode_ref_preview_qimage_worker(file_path: str, size_px: int) -> tuple[str,
     except OSError:
         return None
     mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+    side = max(1, int(size_px))
     try:
-        dc_path = _disk_cache_path(p, mtime_ns, size_px)
+        dc_path = _disk_cache_path(p, mtime_ns, side, variant=REF_PREVIEW_DISK_CACHE_VARIANT)
         if dc_path.is_file():
             img = QImage(str(dc_path))
             if not img.isNull():
                 return (str(p), img)
     except OSError:
         pass
-    return _load_thumbnail_image_worker(file_path, size_px, cache_key=str(p))
+    try:
+        ext = (p.suffix or "").strip().lower()
+        img = QImage(str(p))
+        if img.isNull():
+            reader = QImageReader(str(p))
+            reader.setAutoTransform(True)
+            img = reader.read()
+        if img.isNull() and ext in (".dpx", ".exr", ".hdr"):
+            from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+            img = load_preview_frame_qimage(p, side) or QImage()
+        if img.isNull():
+            return None
+        sq = _qimage_cover_square(img, side)
+        try:
+            dc_path.parent.mkdir(parents=True, exist_ok=True)
+            sq.save(str(dc_path), "PNG")
+        except OSError:
+            pass
+        return (str(p), sq)
+    except Exception as e:
+        logger.warning("Ref preview load failed %s: %s", file_path, e)
+        return None
+
+
+def decode_ref_preview_qimage_worker(file_path: str, size_px: int) -> tuple[str, QImage] | None:
+    """
+    Worker-safe decode for entity reference/concept preview images.
+    Square center-crop at ``size_px``; disk cache variant ``ref_cover``.
+    """
+    return _load_ref_preview_image_worker(file_path, size_px)
 
 
 def _load_thumbnail_image_worker(file_path: str, size_px: int, cache_key: str | None = None) -> tuple[str, QImage] | None:

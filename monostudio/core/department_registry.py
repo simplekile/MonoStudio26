@@ -102,6 +102,19 @@ def get_default_department_mapping() -> dict[str, dict]:
     return dict(_default_department_mapping())
 
 
+def merge_factory_departments_into_mapping(mapping: dict[str, dict]) -> dict[str, dict]:
+    """
+    Add department nodes from shipped factory defaults (mono2026) that are missing in mapping.
+    Does not overwrite existing entries. Re-applies parent links from the factory preset.
+    """
+    factory = get_default_department_mapping()
+    out = {k: dict(v) for k, v in mapping.items()}
+    for dept_id, node in factory.items():
+        if dept_id not in out and isinstance(node, dict):
+            out[dept_id] = dict(node)
+    return ensure_parent_from_preset(out)
+
+
 def ensure_parent_from_preset(
     mapping: dict[str, dict],
     preset_path: Path | None = None,
@@ -299,7 +312,7 @@ class DepartmentRegistry:
         path = get_project_departments_path(project_root)
         raw = _load_departments_json(path)
         if raw is not None:
-            return cls(raw, path)
+            return cls(merge_factory_departments_into_mapping(raw), path)
         return cls(_default_department_mapping(), None)
 
     # ---------- Public API ----------

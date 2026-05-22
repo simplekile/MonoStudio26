@@ -15,8 +15,15 @@
     "lookdev": {"label": "Lookdev", "folder": "lookdev", "shot_folder": "lookdev", "asset_folder": "05_lookdev", "order": 13},
     "anim": {"label": "Animation", "folder": "anim", "shot_folder": "01_anim", "asset_folder": "06_anim", "order": 14},
     "fx": {"label": "FX", "folder": "fx", "shot_folder": "02_fx", "asset_folder": "07_fx", "order": 15},
-    "lighting": {"label": "Lighting", "folder": "lighting", "shot_folder": "03_lighting", "asset_folder": "08_lighting", "order": 16},
-    "comp": {"label": "Comp", "folder": "comp", "shot_folder": "04_comp", "asset_folder": "comp", "order": 17}
+    "groom": {"label": "Groom", "folder": "groom", "shot_folder": "groom", "asset_folder": "groom", "order": 16, "parent": "fx"},
+    "crowd": {"label": "Crowd", "folder": "crowd", "shot_folder": "crowd", "asset_folder": "crowd", "order": 17, "parent": "fx"},
+    "cloth": {"label": "Cloth", "folder": "cloth", "shot_folder": "cloth", "asset_folder": "cloth", "order": 18, "parent": "fx"},
+    "pyro": {"label": "Pyro", "folder": "pyro", "shot_folder": "pyro", "asset_folder": "pyro", "order": 19, "parent": "fx"},
+    "fluids": {"label": "Fluids", "folder": "fluids", "shot_folder": "fluids", "asset_folder": "fluids", "order": 20, "parent": "fx"},
+    "destruction": {"label": "Destruction", "folder": "destruction", "shot_folder": "destruction", "asset_folder": "destruction", "order": 21, "parent": "fx"},
+    "particles": {"label": "Particles", "folder": "particles", "shot_folder": "particles", "asset_folder": "particles", "order": 22, "parent": "fx"},
+    "lighting": {"label": "Lighting", "folder": "lighting", "shot_folder": "03_lighting", "asset_folder": "08_lighting", "order": 23},
+    "comp": {"label": "Comp", "folder": "comp", "shot_folder": "04_comp", "asset_folder": "comp", "order": 24}
   },
   "create_default_dcc_by_department": {
     "layout": "blender",
@@ -34,6 +41,13 @@
     "lookdev": "houdini",
     "anim": "blender",
     "fx": "houdini",
+    "groom": "houdini",
+    "crowd": "houdini",
+    "cloth": "houdini",
+    "pyro": "houdini",
+    "fluids": "houdini",
+    "destruction": "houdini",
+    "particles": "houdini",
     "lighting": "houdini",
     "comp": "fusion"
   },

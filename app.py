@@ -225,7 +225,10 @@ def main() -> int:
     # Keep splash visible until at least configured minimum has passed
     def _tick_splash() -> None:
         elapsed = (time.monotonic() - splash_start) * 1000
-        progress = min(1.0, elapsed / max(1, _splash_display_ms))
+        if _splash_display_ms <= 0:
+            progress = 1.0
+        else:
+            progress = min(1.0, elapsed / _splash_display_ms)
         status = "Ready" if progress >= 1.0 else _splash_status
         splash.setPixmap(_make_splash_pixmap(_icon, progress, status, _version))
         if progress >= 1.0:

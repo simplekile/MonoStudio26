@@ -860,7 +860,7 @@ class SettingsDialog(MonosDialog):
             pass
         splash_row = QHBoxLayout()
         self._access_splash_spin = QSpinBox(grp_dev)
-        self._access_splash_spin.setRange(500, 60_000)
+        self._access_splash_spin.setRange(0, 60_000)
         self._access_splash_spin.setSingleStep(100)
         try:
             if self._settings is not None:
@@ -2013,6 +2013,8 @@ class SettingsDialog(MonosDialog):
         hint = QLabel(
             "Tree colors: root / structure / asset type / shot type / departments / subdepartments. "
             "Under each type, open Workflow to assign leaf departments. "
+            "Missing factory subdepartments (e.g. FX → groom, destruction) are merged in memory from mono2026; "
+            "use Save to project to persist. Reset factory reloads app preset + mono2026. "
             "Use Save in this section for project pipeline JSON; bottom Save also saves all Settings tabs.",
             root,
         )

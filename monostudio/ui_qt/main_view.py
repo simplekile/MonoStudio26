@@ -227,6 +227,13 @@ _DEPT_ICON_MAP: dict[str, str] = {
     "anim": "spline",
     "animation": "spline",
     "fx": "zap",
+    "groom": "scissors",
+    "crowd": "user",
+    "cloth": "layers",
+    "pyro": "sun",
+    "fluids": "wand",
+    "destruction": "triangle-alert",
+    "particles": "sparkles",
     "lighting": "lightbulb",
     "comp": "sliders-horizontal",
 }
@@ -1257,7 +1264,7 @@ def _paint_list_special_folder_icon(
 ) -> None:
     if hovered:
         painter.fillRect(chip_rect, QColor(255, 255, 255, 18))
-    color = MONOS_COLORS["text_label"] if has_files else MONOS_COLORS["text_muted"]
+    color = MONOS_COLORS["text_label"] if has_files else MONOS_COLORS["text_meta"]
     pix = lucide_icon(icon_name, size=_LIST_SPECIAL_FOLDER_ICON_PX, color_hex=color).pixmap(
         _LIST_SPECIAL_FOLDER_ICON_PX, _LIST_SPECIAL_FOLDER_ICON_PX
     )

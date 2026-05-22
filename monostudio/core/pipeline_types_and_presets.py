@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Literal
 
 from monostudio.core.app_paths import get_app_base_path
-from monostudio.core.department_registry import get_project_pipeline_dir
+from monostudio.core.department_registry import (
+    DepartmentRegistry,
+    get_default_department_mapping,
+    get_project_pipeline_dir,
+)
 
 
 @dataclass(frozen=True)
@@ -43,11 +47,165 @@ def is_shot_type_id(type_id: str) -> bool:
     return bool(tid == "shot" or tid.startswith("shot_"))
 
 
+def order_department_ids_grouped_by_parent(
+    dept_ids: list[str],
+    dept_parent: dict[str, str],
+    global_order: list[str],
+) -> list[str]:
+    """
+    Order department ids for sidebar / picker: each parent's subdepartments appear
+    consecutively under that parent (by global_order), not interleaved with unrelated depts.
+    """
+    id_set = set(dept_ids)
+    if not id_set:
+        return []
+
+    by_parent: dict[str, list[str]] = {}
+    roots: list[str] = []
+    for did in dept_ids:
+        p = (dept_parent.get(did) or "").strip()
+        if p:
+            by_parent.setdefault(p, []).append(did)
+        else:
+            roots.append(did)
+
+    order_idx = {d: i for i, d in enumerate(global_order)}
+
+    def sort_ids(ids: list[str]) -> list[str]:
+        return sorted(ids, key=lambda d: (order_idx.get(d, 9999), d.lower()))
+
+    for pid in by_parent:
+        by_parent[pid] = sort_ids(by_parent[pid])
+    roots = sort_ids(roots)
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for gid in global_order:
+        if gid in roots and gid not in seen:
+            out.append(gid)
+            seen.add(gid)
+        for child in by_parent.get(gid, []):
+            if child in id_set and child not in seen:
+                out.append(child)
+                seen.add(child)
+
+    for did in sort_ids([d for d in dept_ids if d not in seen]):
+        out.append(did)
+    return out
+
+
+def resolve_department_ids_for_ui(
+    dept_ids: list[str],
+    *,
+    meta: PipelineTypesAndPresets,
+    registry: DepartmentRegistry | None = None,
+) -> list[str]:
+    """
+    Expand parent-only IDs to leaf subdepartments; drop parents when children are listed.
+
+    Used by sidebar / inspector filters so legacy type presets (e.g. ``fx``) still show
+    ``groom``, ``destruction``, … when the department registry defines nested children.
+    """
+    children_by_parent: dict[str, list[str]] = {}
+    parent_of: dict[str, str] = {}
+
+    def add_child(child: str, parent: str) -> None:
+        c = (child or "").strip()
+        p = (parent or "").strip()
+        if not c or not p:
+            return
+        parent_of[c] = p
+        bucket = children_by_parent.setdefault(p, [])
+        if c not in bucket:
+            bucket.append(c)
+
+    for child_id, ddef in meta.departments.items():
+        if ddef.parent:
+            add_child(child_id, ddef.parent)
+
+    if registry is not None:
+        for child_id in registry.get_departments():
+            parent = registry.get_parent(child_id)
+            if parent:
+                add_child(child_id, parent)
+
+    global_order = (
+        registry.get_departments() if registry is not None else list(meta.departments.keys())
+    )
+
+    def ordered_children(parent: str) -> list[str]:
+        kids = set(children_by_parent.get(parent, []))
+        return [k for k in global_order if k in kids]
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in dept_ids:
+        did = (raw or "").strip()
+        if not did:
+            continue
+        if children_by_parent.get(did):
+            for kid in ordered_children(did):
+                if kid not in seen:
+                    seen.add(kid)
+                    out.append(kid)
+            continue
+        if did not in seen:
+            seen.add(did)
+            out.append(did)
+
+    parents_in_out = {d for d in out if children_by_parent.get(d)}
+    if parents_in_out:
+        out = [d for d in out if d not in parents_in_out]
+    return out
+
+
+def expand_pipeline_types_and_presets_with_registry(
+    config: PipelineTypesAndPresets,
+    registry: DepartmentRegistry | None,
+) -> PipelineTypesAndPresets:
+    """
+    Expand type department lists (e.g. legacy ``fx`` → FX leaves) and enrich department defs
+    from the project registry (factory merge applied in DepartmentRegistry.for_project).
+    """
+    if not config.types and not config.departments:
+        return config
+
+    new_types: dict[str, TypeDef] = {}
+    for type_id, tdef in config.types.items():
+        expanded = resolve_department_ids_for_ui(list(tdef.departments), meta=config, registry=registry)
+        if expanded != tdef.departments:
+            new_types[type_id] = TypeDef(
+                type_id, tdef.name, tdef.short_name, expanded, tdef.icon_name
+            )
+        else:
+            new_types[type_id] = tdef
+
+    new_depts = dict(config.departments)
+    if registry is not None:
+        for dept_id in registry.get_departments():
+            parent = registry.get_parent(dept_id)
+            existing = new_depts.get(dept_id)
+            label = registry.get_department_label(dept_id)
+            short = (existing.short_name if existing else (dept_id[:4] if len(dept_id) >= 4 else dept_id))
+            icon = existing.icon_name if existing else None
+            parent_val = parent or (existing.parent if existing else None)
+            if existing is None:
+                new_depts[dept_id] = DepartmentDef(dept_id, label, short, icon, parent_val)
+            elif parent_val and not existing.parent:
+                new_depts[dept_id] = DepartmentDef(
+                    dept_id, existing.name, existing.short_name, existing.icon_name, parent_val
+                )
+
+    return PipelineTypesAndPresets(types=new_types, departments=new_depts)
+
+
 def ordered_department_ids_for_scope(
     meta: PipelineTypesAndPresets,
     scope: EntityScope,
     *,
     type_id: str | None = None,
+    registry: DepartmentRegistry | None = None,
 ) -> list[str]:
     """
     Department IDs for asset or shot scope, ordered like sidebar filters.
@@ -56,14 +214,16 @@ def ordered_department_ids_for_scope(
     Otherwise returns the union across all types in the scope.
     """
     assets = scope == "asset"
-    seen: set[str] = set()
+    raw_ordered: list[str] = []
+    raw_seen: set[str] = set()
     tid = (type_id or "").strip()
 
     if tid and tid in meta.types:
         if (assets and not is_shot_type_id(tid)) or (not assets and is_shot_type_id(tid)):
             for d in meta.types[tid].departments:
-                if isinstance(d, str) and d.strip() and d not in seen:
-                    seen.add(d)
+                if isinstance(d, str) and d.strip() and d not in raw_seen:
+                    raw_seen.add(d.strip())
+                    raw_ordered.append(d.strip())
     else:
         for type_key, tdef in meta.types.items():
             if assets and is_shot_type_id(type_key):
@@ -71,17 +231,31 @@ def ordered_department_ids_for_scope(
             if not assets and not is_shot_type_id(type_key):
                 continue
             for d in tdef.departments:
-                if isinstance(d, str) and d.strip() and d not in seen:
-                    seen.add(d)
+                if isinstance(d, str) and d.strip() and d not in raw_seen:
+                    raw_seen.add(d.strip())
+                    raw_ordered.append(d.strip())
 
-    depts: list[str] = []
-    for dept_id in meta.departments.keys():
-        if dept_id in seen:
-            depts.append(dept_id)
-    missing = [d for d in seen if d not in meta.departments]
-    missing.sort(key=lambda s: s.lower())
+    resolved = resolve_department_ids_for_ui(raw_ordered, meta=meta, registry=registry)
+    seen = set(resolved)
+
+    if registry is not None:
+        order_source = registry.get_departments()
+    else:
+        order_source = list(meta.departments.keys())
+
+    depts: list[str] = [dept_id for dept_id in order_source if dept_id in seen]
+    missing = [d for d in resolved if d not in depts]
     depts.extend(missing)
-    return depts
+    parent_of: dict[str, str] = {}
+    for dept_id, ddef in meta.departments.items():
+        if ddef.parent:
+            parent_of[dept_id] = ddef.parent.strip()
+    if registry is not None:
+        for dept_id in registry.get_departments():
+            p = registry.get_parent(dept_id)
+            if p:
+                parent_of[dept_id] = p
+    return order_department_ids_grouped_by_parent(depts, parent_of, order_source)
 
 
 def pipeline_root() -> Path:
@@ -308,7 +482,15 @@ def load_pipeline_types_and_presets_for_project(project_root: Path | None) -> Pi
             continue
         cfg = _parse_types_and_presets_data(data)
         if cfg.types or cfg.departments:
-            return cfg
+            registry: DepartmentRegistry | None = None
+            try:
+                if project_root is not None:
+                    registry = DepartmentRegistry.for_project(Path(project_root))
+                else:
+                    registry = DepartmentRegistry(get_default_department_mapping(), None)
+            except OSError:
+                registry = None
+            return expand_pipeline_types_and_presets_with_registry(cfg, registry)
 
     ensure_pipeline_bootstrap()
     return PipelineTypesAndPresets()

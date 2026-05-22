@@ -63,7 +63,11 @@ from monostudio.core.models import Asset, Shot
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, monos_font
-from monostudio.ui_qt.thumbnails import ThumbnailCache, decode_ref_preview_qimage_worker
+from monostudio.ui_qt.thumbnails import (
+    REF_PREVIEW_DISK_CACHE_VARIANT,
+    ThumbnailCache,
+    decode_ref_preview_qimage_worker,
+)
 
 # Fixed square thumbs; QListView IconMode wraps columns like Main View grid.
 _REF_GRID_GAP = 12
@@ -71,9 +75,18 @@ _REF_THUMB_SIZE = 120
 _REF_GRID_SYNC_DEBOUNCE_MS = 0  # singleShot(0) like MainView._schedule_grid_layout_sync
 _REF_CONTENT_H_MARGIN = 24
 _REF_MAX_GRID_COLUMNS = 6
-_REF_THUMB_DECODE_SIZE = 256
+_REF_THUMB_DECODE_MIN = 256
+_REF_THUMB_DECODE_MAX = 512
 _REF_THUMB_PREFETCH_CHUNK = 8
 _REF_THUMB_PREFETCH_ALL_MAX_ROWS = 32
+
+
+def ref_thumb_decode_max_side(*, dpr: float) -> int:
+    """Square decode size in device pixels for ref grid (inner cell × DPR)."""
+    dpr = max(1.0, float(dpr))
+    inner = _REF_THUMB_SIZE - 2  # 1px border each side when not selected
+    side = int(inner * dpr)
+    return max(_REF_THUMB_DECODE_MIN, min(_REF_THUMB_DECODE_MAX, side))
 
 
 def _ref_path_key(path: Path) -> str:
@@ -118,6 +131,26 @@ class _RefThumbEntry:
     placeholder_ext: str = ""
 
 
+def _draw_ref_thumb_pixmap(p: QPainter, thumb: QRect, pixmap: QPixmap, dpr: float) -> None:
+    """Draw pre-cropped square thumb; downscale/crop only (no upscale)."""
+    dpr = max(1.0, float(dpr))
+    pw = max(1, round(thumb.width() * dpr))
+    ph = max(1, round(thumb.height() * dpr))
+    px = pixmap
+    if px.width() < pw or px.height() < ph:
+        px = px.scaled(
+            QSize(pw, ph),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    if px.width() > pw or px.height() > ph:
+        sx = max(0, (px.width() - pw) // 2)
+        sy = max(0, (px.height() - ph) // 2)
+        px = px.copy(sx, sy, pw, ph)
+    px.setDevicePixelRatio(dpr)
+    p.drawPixmap(thumb, px)
+
+
 def _paint_ref_thumb_cell(
     p: QPainter,
     rect: QRect,
@@ -126,6 +159,7 @@ def _paint_ref_thumb_cell(
     placeholder_ext: str,
     selected: bool,
     hovered: bool,
+    dpr: float = 1.0,
 ) -> None:
     g = _REF_GRID_GAP
     outer = rect.adjusted(0, 0, -g, -g)
@@ -150,15 +184,7 @@ def _paint_ref_thumb_cell(
     p.setClipPath(clip)
     thumb = inner
     if pixmap is not None and not pixmap.isNull():
-        scaled = pixmap.scaled(
-            thumb.size(),
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        sx = max(0, (scaled.width() - thumb.width()) // 2)
-        sy = max(0, (scaled.height() - thumb.height()) // 2)
-        crop = scaled.copy(QRect(QPoint(sx, sy), thumb.size()))
-        p.drawPixmap(thumb, crop)
+        _draw_ref_thumb_pixmap(p, thumb, pixmap, dpr)
     elif placeholder_ext:
         p.setPen(QColor(MONOS_COLORS.get("text_muted", "#71717a")))
         p.setFont(monos_font("JetBrains Mono", 10))
@@ -249,6 +275,7 @@ class _RefThumbDelegate(QStyledItemDelegate):
                 self._section._request_thumb_for_path(entry.path, self._section._thumb_prefetch_gen)
         selected = self._section._selected_path == entry.path
         hovered = self._section._hovered_row == index.row()
+        dpr = self._section._list_dpr()
         painter.save()
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -259,6 +286,7 @@ class _RefThumbDelegate(QStyledItemDelegate):
                 placeholder_ext=entry.placeholder_ext if pm is None or pm.isNull() else "",
                 selected=selected,
                 hovered=hovered,
+                dpr=dpr,
             )
         finally:
             painter.restore()
@@ -306,7 +334,11 @@ class _InspectorRefSection(QWidget):
         self._folder_path: Path | None = None
         self._files: list[Path] = []
         self._expanded = True
-        self._thumb_cache = ThumbnailCache(size_px=_REF_THUMB_DECODE_SIZE)
+        self._thumb_decode_bucket = 0
+        self._thumb_cache = ThumbnailCache(
+            size_px=_REF_THUMB_DECODE_MIN,
+            cache_variant=REF_PREVIEW_DISK_CACHE_VARIANT,
+        )
         self._thumb_bridge = _RefThumbDecodeBridge(self)
         self._thumb_bridge.decoded.connect(self._on_thumb_decoded)
         self._thumb_pixmaps: dict[str, QPixmap] = {}
@@ -426,6 +458,29 @@ class _InspectorRefSection(QWidget):
         for w in (self, self._hdr, self._body, self._empty_block, self._list, self._list.viewport()):
             w.setAcceptDrops(True)
             w.installEventFilter(self)
+        self._sync_thumb_decode_bucket()
+
+    def _list_dpr(self) -> float:
+        return max(1.0, float(self._list.devicePixelRatioF()))
+
+    def _sync_thumb_decode_bucket(self) -> int:
+        """Align disk/memory decode size with list DPR; invalidate thumbs when bucket changes."""
+        side = ref_thumb_decode_max_side(dpr=self._list_dpr())
+        if side != self._thumb_decode_bucket:
+            self._thumb_decode_bucket = side
+            self._thumb_cache = ThumbnailCache(
+                size_px=side,
+                cache_variant=REF_PREVIEW_DISK_CACHE_VARIANT,
+            )
+            self._reset_thumb_load_state()
+        return side
+
+    def _on_thumb_display_metrics_changed(self) -> None:
+        prev = self._thumb_decode_bucket
+        self._sync_thumb_decode_bucket()
+        if prev != self._thumb_decode_bucket:
+            self._schedule_thumb_prefetch(force=True)
+        self._list.viewport().update()
 
     @property
     def container(self) -> QWidget:
@@ -468,6 +523,11 @@ class _InspectorRefSection(QWidget):
             self._list.viewport(),
         ):
             t = event.type()
+            if obj is self._list and t in (
+                QEvent.Type.Show,
+                QEvent.Type.DevicePixelRatioChange,
+            ):
+                self._on_thumb_display_metrics_changed()
             if t in (QEvent.Type.Enter, QEvent.Type.MouseMove):
                 self._sync_container_hover()
             elif t in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
@@ -662,8 +722,9 @@ class _InspectorRefSection(QWidget):
             self._repaint_row_for_path(path)
             return
         self._thumb_pending.add(key)
+        decode_side = self._sync_thumb_decode_bucket()
         QThreadPool.globalInstance().start(
-            _RefThumbDecodeRunnable(key, _REF_THUMB_DECODE_SIZE, gen, self._thumb_bridge)
+            _RefThumbDecodeRunnable(key, decode_side, gen, self._thumb_bridge)
         )
 
     def _on_thumb_decoded(self, path_key: str, gen: int, image: object) -> None:
@@ -674,8 +735,6 @@ class _InspectorRefSection(QWidget):
         pm: QPixmap | None = None
         if isinstance(image, QImage) and not image.isNull():
             pm = self._thumb_cache.adopt_decoded_thumbnail(path, image)
-        if pm is None or pm.isNull():
-            pm = self._thumb_cache.load_thumbnail_pixmap(path)
         if pm is not None and not pm.isNull():
             self._thumb_pixmaps[path_key] = pm
             self._thumb_missing.discard(path_key)
@@ -1000,6 +1059,20 @@ class InspectorRefTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        self._placeholder_block = QWidget(self)
+        self._placeholder_block.setObjectName("InspectorRefPlaceholder")
+        ph_lay = QVBoxLayout(self._placeholder_block)
+        ph_lay.setContentsMargins(12, 80, 12, 12)
+        self._placeholder_label = QLabel("Select an item to view details", self._placeholder_block)
+        self._placeholder_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self._placeholder_label.setWordWrap(True)
+        self._placeholder_label.setFont(monos_font("Inter", 13))
+        self._placeholder_label.setStyleSheet(f"color: {MONOS_COLORS.get('text_meta', '#71717a')};")
+        ph_lay.addWidget(self._placeholder_label, 0)
+        ph_lay.addStretch(1)
+        self._placeholder_block.setVisible(False)
+        outer.addWidget(self._placeholder_block, 1)
+
         self._ref_scroll = QScrollArea(self)
         self._ref_scroll.setObjectName("InspectorRefScrollArea")
         self._ref_scroll.setAttribute(Qt.WA_StyledBackground, True)
@@ -1080,6 +1153,16 @@ class InspectorRefTab(QWidget):
         super().showEvent(event)
         self._schedule_sync_all()
 
+    def set_show_placeholder(self, show: bool, message: str = "Select an item to view details") -> None:
+        """Hide concept/reference UI when Main View has no asset/shot selection."""
+        show = bool(show)
+        self._placeholder_block.setVisible(show)
+        self._ref_scroll.setVisible(not show)
+        if message:
+            self._placeholder_label.setText(message)
+        if show:
+            self.clear()
+
     def clear(self) -> None:
         """No asset/shot selected — empty both sections."""
         self._entity = None
@@ -1107,6 +1190,8 @@ class InspectorRefTab(QWidget):
         self._visible_once = True
         self._scan_if_needed()
         self._schedule_sync_all()
+        self._concept._sync_thumb_decode_bucket()
+        self._reference._sync_thumb_decode_bucket()
         self._concept._schedule_thumb_prefetch(force=True)
         self._reference._schedule_thumb_prefetch(force=True)
 

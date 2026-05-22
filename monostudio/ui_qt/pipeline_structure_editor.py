@@ -47,6 +47,7 @@ from monostudio.core.pipeline_types_and_presets import (
     DepartmentDef,
     PipelineTypesAndPresets,
     TypeDef,
+    expand_pipeline_types_and_presets_with_registry,
     get_user_default_config_root,
     load_pipeline_types_and_presets,
     load_pipeline_types_and_presets_for_project,
@@ -327,8 +328,19 @@ class PipelineStructureEditorWidget(QWidget):
         self._preset_depts = dict(preset.departments)
 
         self._merge_preset_with_disk()
+        self._normalize_workflow_from_departments()
         self._rebuild_model(preserve_tree_view=False)
         self.config_changed.emit()
+
+    def _normalize_workflow_from_departments(self) -> None:
+        """Expand legacy parent dept ids in type workflow (e.g. fx → FX leaves) from _depts_map."""
+        if not self._depts_map:
+            return
+        registry = DepartmentRegistry(self._depts_map, None)
+        cfg = self.build_pipeline_types_and_presets()
+        expanded = expand_pipeline_types_and_presets_with_registry(cfg, registry)
+        self._preset_types = dict(expanded.types)
+        self._preset_depts = dict(expanded.departments)
 
     def _merge_preset_with_disk(self) -> None:
         for tid, raw in self._types_map.items():

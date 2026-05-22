@@ -70,6 +70,13 @@
         "lookdev",
         "anim",
         "fx",
+        "groom",
+        "crowd",
+        "cloth",
+        "pyro",
+        "fluids",
+        "destruction",
+        "particles",
         "lighting"
       ],
       "workfile_extensions": [".hiplc", ".hip", ".hipnc"],
