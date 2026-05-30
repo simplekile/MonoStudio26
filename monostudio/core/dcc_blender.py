@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from monostudio.core.dcc_subprocess_env import env_for_dcc_subprocess
+from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
 
 
 def _norm_exe(s: str) -> str:
@@ -196,6 +197,7 @@ class BlenderDccAdapter:
                 cwd=blender_bin,
                 env=env,
                 close_fds=True,
+                **hide_console_subprocess_kwargs(),
             )
         except Exception as e:
             raise RuntimeError(f"Failed to launch Blender using executable: {exe!r}") from e

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from monostudio.core.dcc_subprocess_env import env_for_dcc_subprocess
+from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
 
 
 def _norm_exe(s: str) -> str:
@@ -123,7 +124,13 @@ def _launch_houdini_gui(exe: str, filepath: str | None = None) -> None:
     args = [exe]
     if filepath:
         args.append(filepath)
-    subprocess.Popen(args, cwd=houdini_bin, env=env, close_fds=True)
+    subprocess.Popen(
+        args,
+        cwd=houdini_bin,
+        env=env,
+        close_fds=True,
+        **hide_console_subprocess_kwargs(),
+    )
 
 
 def _houdini_missing_message(configured: str) -> str:
@@ -207,6 +214,7 @@ class HoudiniDccAdapter:
                         check=False,
                         capture_output=True,
                         env=env,
+                        **hide_console_subprocess_kwargs(),
                     )
                 finally:
                     try:

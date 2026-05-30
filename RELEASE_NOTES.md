@@ -1,3 +1,20 @@
+# MonoStudio 26 — Release v26.13.3
+
+## Highlights
+
+- **DCC launch — ẩn console Windows**: Blender và Houdini dùng `hide_console_subprocess_kwargs()` khi spawn subprocess (GUI và batch) — không bật cửa sổ console phụ khi mở DCC từ MonoStudio.
+
+## Changes in this release
+
+- fix: `dcc_blender.py` — `Popen` launch Blender với kwargs ẩn console.
+- fix: `dcc_houdini.py` — GUI launch và subprocess batch dùng kwargs ẩn console.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.13.2
 
 ## Highlights
