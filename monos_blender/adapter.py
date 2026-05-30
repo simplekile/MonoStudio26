@@ -222,12 +222,13 @@ def create_new_file(filepath: str, context: dict[str, Any]) -> None:
 
     validated = _validate_context(context)
 
+    # Use startup template (empty scene) — NOT read_factory_settings, which resets user add-ons.
     try:
-        result = _bpy.ops.wm.read_factory_settings(use_empty=True)
+        result = _bpy.ops.wm.read_homefile(use_empty=True)
     except Exception as e:
-        raise RuntimeError("Blender failed to reset to factory settings (empty scene).") from e
+        raise RuntimeError("Blender failed to create an empty scene from startup template.") from e
     if not isinstance(result, set) or "FINISHED" not in result:
-        raise RuntimeError("Blender failed to reset to factory settings (empty scene).")
+        raise RuntimeError("Blender failed to create an empty scene from startup template.")
 
     _write_context_json(json.dumps(validated.as_dict(), ensure_ascii=False, separators=(",", ":")))
 

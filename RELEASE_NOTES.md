@@ -1,3 +1,22 @@
+# MonoStudio 26 — Release v26.13.2
+
+## Highlights
+
+- **DCC launch — subprocess env**: Module `dcc_subprocess_env` loại bỏ `PYTHON*` và PATH chứa Python/PyInstaller của MonoStudio khi mở Blender/Houdini từ bản frozen — tránh crash kiểu `python313.dll conflicts with this version of Python`.
+- **Blender — file mới**: Adapter dùng `read_homefile(use_empty=True)` thay `read_factory_settings` để tạo scene trống mà không reset add-on người dùng.
+
+## Changes in this release
+
+- feat: `dcc_subprocess_env.py` — `env_for_dcc_subprocess()` cho launch DCC ngoài.
+- fix: `dcc_blender.py`, `dcc_houdini.py` — subprocess dùng env đã sanitize.
+- fix: `monos_blender/adapter.py` — empty scene qua startup template.
+
+## Install
+
+Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
+
+---
+
 # MonoStudio 26 — Release v26.13.1
 
 ## Highlights

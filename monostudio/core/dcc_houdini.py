@@ -1,18 +1,19 @@
 """
 Houdini DCC adapter for MonoStudio (Windows only).
-- open_file: os.startfile(path) — mở theo association, không dính env app.
-- create_new_file: hython tạo file trống (env làm sạch), rồi os.startfile(path) hoặc Popen(houdini) nếu chưa có file.
+- open_file: subprocess houdini.exe with sanitized env (avoids MonoStudio Python DLL conflicts).
+- create_new_file: hython tạo file trống (env làm sạch), rồi launch GUI cùng env.
 """
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from glob import glob
 from pathlib import Path
 from typing import Any
+
+from monostudio.core.dcc_subprocess_env import env_for_dcc_subprocess
 
 
 def _norm_exe(s: str) -> str:
@@ -111,54 +112,18 @@ def resolve_houdini_executable(configured: str) -> str | None:
 
 
 def _env_for_houdini_subprocess() -> dict[str, str]:
-    """
-    Build an environment for Houdini/hython subprocess so it does not load
-    MonoStudio's Python (e.g. python313.dll from PyInstaller bundle).
-    Houdini ships with its own Python (e.g. 3.11); loading another version's DLL causes:
-    "Module use of python313.dll conflicts with this version of Python."
-    """
-    env = os.environ.copy()
+    """Backward-compatible alias; see ``env_for_dcc_subprocess``."""
+    return env_for_dcc_subprocess()
 
-    # Unset Python env vars so hython uses only Houdini's bundled Python (PyInstaller/parent may set these)
-    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE"):
-        env.pop(key, None)
 
-    path_sep = os.pathsep
-    path_raw = env.get("PATH", "")
-    if not path_raw:
-        return env
-    to_remove: set[str] = set()
-    exe_dir = ""
-    # Path of this process (MonoStudio exe or interpreter)
-    try:
-        exe_dir = str(Path(sys.executable).resolve().parent).lower()
-        to_remove.add(exe_dir)
-    except Exception:
-        pass
-    # PyInstaller: _internal next to the exe
-    if getattr(sys, "frozen", False):
-        try:
-            internal = str(Path(sys.executable).resolve().parent / "_internal").lower()
-            to_remove.add(internal)
-        except Exception:
-            pass
-    # Paths containing Python313 / python313 (avoid loading system or bundled 3.13 when Houdini uses 3.11)
-    parts = [p.strip() for p in path_raw.split(path_sep) if p.strip()]
-    filtered = []
-    for p in parts:
-        p_lower = p.lower()
-        if p_lower in to_remove:
-            continue
-        if exe_dir and "_internal" in p_lower and exe_dir in p_lower:
-            continue
-        if "python313" in p_lower:
-            continue
-        # When frozen: drop any PATH entry that lives under the app install dir (DLL search can still pick it up)
-        if exe_dir and exe_dir in p_lower:
-            continue
-        filtered.append(p)
-    env["PATH"] = path_sep.join(filtered)
-    return env
+def _launch_houdini_gui(exe: str, filepath: str | None = None) -> None:
+    """Launch Houdini GUI with a sanitized env (avoids MonoStudio Python DLL conflicts)."""
+    env = _env_for_houdini_subprocess()
+    houdini_bin = str(Path(exe).resolve().parent)
+    args = [exe]
+    if filepath:
+        args.append(filepath)
+    subprocess.Popen(args, cwd=houdini_bin, env=env, close_fds=True)
 
 
 def _houdini_missing_message(configured: str) -> str:
@@ -184,21 +149,25 @@ def _houdini_missing_message(configured: str) -> str:
 
 
 class HoudiniDccAdapter:
-    """Houdini launcher (Windows): open_file = os.startfile, create_new_file = hython rồi startfile hoặc Popen."""
+    """Houdini launcher (Windows): subprocess with sanitized env; create uses hython then GUI."""
 
     def __init__(self, *, houdini_executable: str, repo_root: Path) -> None:
         self._houdini_executable = (houdini_executable or "").strip()
         self._repo_root = Path(repo_root)
 
     def open_file(self, *, filepath: str, context: dict[str, Any]) -> None:
+        _ = context
         path = Path(filepath)
         if not path.is_absolute():
             path = path.resolve()
         if not path.is_file():
             raise RuntimeError(f"Houdini open_file: file not found: {path!r}")
+        exe = resolve_houdini_executable(self._houdini_executable)
+        if not exe:
+            raise RuntimeError(_houdini_missing_message(self._houdini_executable))
         try:
-            os.startfile(str(path))
-        except OSError as e:
+            _launch_houdini_gui(exe, str(path))
+        except Exception as e:
             raise RuntimeError(f"Failed to open file with Houdini: {path!r}") from e
 
     def create_new_file(self, *, filepath: str, context: dict[str, Any]) -> None:
@@ -250,10 +219,8 @@ class HoudiniDccAdapter:
         path_abs = Path(filepath).resolve()
         try:
             if path_abs.is_file():
-                os.startfile(str(path_abs))
+                _launch_houdini_gui(exe, str(path_abs))
             else:
-                env = _env_for_houdini_subprocess()
-                houdini_bin = str(Path(exe).resolve().parent)
-                subprocess.Popen([exe], cwd=houdini_bin, env=env, close_fds=True)
+                _launch_houdini_gui(exe)
         except Exception as e:
             raise RuntimeError(f"Failed to launch Houdini: {e!r}") from e

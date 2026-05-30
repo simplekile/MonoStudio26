@@ -13,6 +13,8 @@ from glob import glob
 from pathlib import Path
 from typing import Any
 
+from monostudio.core.dcc_subprocess_env import env_for_dcc_subprocess
+
 
 def _norm_exe(s: str) -> str:
     s = (s or "").strip()
@@ -187,9 +189,12 @@ class BlenderDccAdapter:
             raise RuntimeError(_blender_missing_message(self._blender_executable))
 
         try:
+            env = env_for_dcc_subprocess()
+            blender_bin = str(Path(exe).resolve().parent)
             subprocess.Popen(
                 [exe, "--python-expr", expr],
-                cwd=str(self._repo_root),
+                cwd=blender_bin,
+                env=env,
                 close_fds=True,
             )
         except Exception as e:
