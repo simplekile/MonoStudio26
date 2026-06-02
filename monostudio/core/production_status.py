@@ -20,6 +20,9 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+# Preset id for per-department skip (category na) — reused assets, N/A pipeline steps.
+SKIPPED_STATUS_ID = "omitted"
+
 # Match MONOS_COLORS semantic usage in inspector/main_view
 CATEGORY_COLOR_HEX: dict[str, str] = {
     "done": "#10b981",
@@ -122,6 +125,21 @@ class ProductionStatusRegistry:
         if d:
             return d.category
         return "unknown"
+
+
+def is_excluded_production_status(
+    registry: ProductionStatusRegistry,
+    status_id: str,
+) -> bool:
+    """True when this department should not count toward schedule overdue / completion."""
+    sid = (status_id or "").strip()
+    if sid == SKIPPED_STATUS_ID:
+        return True
+    return registry.category_for(sid) == "na"
+
+
+def is_excluded_category(category: str) -> bool:
+    return (category or "").strip() == "na"
 
 
 def _default_presets_path() -> Path:

@@ -85,7 +85,12 @@ def append_entity_monostudio_watch_paths(
     max_paths: int,
     per_entity_cap: int = _MONO_WATCH_CAP_PER_ENTITY,
 ) -> None:
-    """Add ``<entity>/.monostudio`` plus files/subdirs (for ``item_comments.json`` and peers)."""
+    """Watch ``<entity>/.monostudio`` and ``item_comments.json`` only.
+
+    Does not watch ``note_media/`` — pasted PNG dirs are large, change often, and
+    can trigger Windows/Dropbox "Access is denied" on QFileSystemWatcher. Notes
+    refresh is driven by ``item_comments.json`` (and the parent dir notification).
+    """
     try:
         mono = (Path(entity_base) / ".monostudio").resolve()
     except OSError:
@@ -113,13 +118,7 @@ def append_entity_monostudio_watch_paths(
 
     if mono.is_dir():
         try_add(mono)
-        try:
-            for child in sorted(mono.rglob("*")):
-                if budget <= 0 or len(to_add) >= max_paths:
-                    break
-                try_add(child)
-        except OSError:
-            pass
+        try_add(mono / "item_comments.json")
     elif mono.is_file():
         try_add(mono)
 
@@ -296,6 +295,8 @@ class FsEventCollector(QObject):
     itemNotesStale = Signal(object)
     # Emits list[str] — entity roots whose ``reference/`` or ``concept/`` tree changed
     entitySpecialFoldersStale = Signal(object)
+    # Emitted when project ``.monostudio/mention_inbox.json`` changes
+    mentionInboxStale = Signal()
 
     def __init__(
         self,
@@ -363,6 +364,7 @@ class FsEventCollector(QObject):
         meta_thumb_stale: dict[str, str | None] = {}
         notes_entities: set[str] = set()
         special_folder_entities: set[str] = set()
+        mention_inbox_stale = False
         project_root = self._project_root
         type_reg = self._type_registry
         if project_root is None or type_reg is None:
@@ -401,6 +403,12 @@ class FsEventCollector(QObject):
                 ent = aid or sid
                 if ent:
                     notes_entities.add(ent)
+            if p.is_file() and p.name == "mention_inbox.json":
+                try:
+                    if project_root and p.parent == (project_root / ".monostudio").resolve():
+                        mention_inbox_stale = True
+                except OSError:
+                    pass
             ent_special = _entity_path_if_special_folder_touch(
                 project_root, p, type_reg, _assets_f, _shots_f
             )
@@ -444,3 +452,6 @@ class FsEventCollector(QObject):
             s_list = list(special_folder_entities)
             _watcher_log.debug("watcher entity special folders stale count=%d", len(s_list))
             self.entitySpecialFoldersStale.emit(s_list)
+        if mention_inbox_stale:
+            _watcher_log.debug("watcher mention inbox stale")
+            self.mentionInboxStale.emit()

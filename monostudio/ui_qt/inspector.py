@@ -65,6 +65,7 @@ from monostudio.core.entity_folders import (
 )
 from monostudio.core.inbox_reader import load_inbox_destinations, resolve_destination_path
 from monostudio.ui_qt.inspector_ref_tab import InspectorRefTab
+from monostudio.ui_qt.inspector_schedule_block import InspectorScheduleBlock
 from monostudio.core.type_registry import TypeRegistry
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.pipeline_types_and_presets import (
@@ -420,6 +421,7 @@ class InspectorPanel(QWidget):
     production_status_override_requested = Signal(object, str, object)  # Path, department, status_id | None
     inspector_hidden_departments_changed = Signal(set)
     item_notes_dialog_requested = Signal(object)  # ViewItem (asset / shot)
+    open_schedule_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -460,6 +462,8 @@ class InspectorPanel(QWidget):
         self._preview = _InspectorPreview()
         self._asset_status = _InspectorAssetStatusBlock()
         self._dept_pipeline = _DepartmentPipeline()
+        self._schedule_block = InspectorScheduleBlock()
+        self._schedule_block.open_schedule_requested.connect(self.open_schedule_requested.emit)
         self._tech = _TechnicalSpecs()
         self._stakeholders = _Stakeholders()
 
@@ -500,6 +504,7 @@ class InspectorPanel(QWidget):
             self._preview,
             self._asset_status,
             self._separator,
+            self._schedule_block,
             self._dept_pipeline,
             self._inbox_destination,
         ):
@@ -552,7 +557,9 @@ class InspectorPanel(QWidget):
 
         self._current_item: ViewItem | None = None
         self._previous_item: ViewItem | None = None
+        self._empty_message_override: str | None = None
         self._project_root: Path | None = None
+        self._schedule_bars: dict = {}
         self._thumbnail_manager: object | None = None
         self._worker_manager: object | None = None
         self._department_label_resolver: object | None = None  # callable[[str], str] | None
@@ -600,9 +607,26 @@ class InspectorPanel(QWidget):
         self._worker_manager = manager
         self._preview.set_worker_manager(manager)
 
+    def set_empty_message(self, message: str) -> None:
+        """Override default empty-state hint (e.g. Schedule timeline)."""
+        self._empty_message_override = (message or "").strip() or None
+        if self._current_item is None:
+            self._sync_empty_message()
+
+    def _sync_empty_message(self) -> None:
+        default = "Select an item to view details"
+        self._empty.set_message(self._empty_message_override or default)
+
     def set_project_root(self, path: Path | str | None) -> None:
         """Open project root for production status presets + overrides."""
         self._project_root = Path(path) if path else None
+        self._schedule_block.set_project_root(self._project_root)
+
+    def set_schedule_bars(self, bars: dict | None) -> None:
+        self._schedule_bars = bars or {}
+
+    def set_schedule_dept_labels(self, labels: dict[str, str]) -> None:
+        self._schedule_block.set_dept_labels(labels)
 
     def set_app_settings(self, settings: QSettings) -> None:
         """Share MainWindow QSettings so Inspector reads the same keys as Settings dialog."""
@@ -704,8 +728,9 @@ class InspectorPanel(QWidget):
         is_asset_or_shot = has_item and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
         is_inbox_item = has_item and item.kind == ViewItemKind.INBOX_ITEM
         self._header.set_tabs_visible(True)
-        for w in (self._preview, self._asset_status, self._separator, self._dept_pipeline):
+        for w in (self._preview, self._asset_status, self._separator, self._schedule_block, self._dept_pipeline):
             w.setVisible(has_item and (is_asset_or_shot or is_inbox_item))
+        self._schedule_block.setVisible(has_item and is_asset_or_shot)
         self._tech.setVisible(is_asset_or_shot)
         self._stakeholders.setVisible(is_asset_or_shot)
         if has_item:
@@ -715,7 +740,7 @@ class InspectorPanel(QWidget):
         self._details_empty.setVisible(not is_asset_or_shot)
 
         if item is None:
-            self._empty.set_message("Select an item to view details")
+            self._sync_empty_message()
             self.inspector_hidden_departments_changed.emit(set())
             self._preview.set_inspector_notes_chip(False, 0)
             self._sync_ref_tab_paths()
@@ -758,6 +783,7 @@ class InspectorPanel(QWidget):
             self._asset_status.set_item(item, self._show_publish, active_department=_ad, active_dcc_id=_ac)
             self._tech.set_item(item)
             self._stakeholders.set_item(item)
+            self._refresh_schedule_block(item)
         else:
             if diff.get("departments"):
                 self._dept_pipeline.set_item(item)
@@ -774,6 +800,7 @@ class InspectorPanel(QWidget):
                 self._tech.set_item(item)
 
         if isinstance(ref, (Asset, Shot)):
+            self._refresh_schedule_block(item)
             self.inspector_hidden_departments_changed.emit(set(self._dept_pipeline._hidden_departments))
         else:
             self.inspector_hidden_departments_changed.emit(set())
@@ -794,6 +821,11 @@ class InspectorPanel(QWidget):
         else:
             self._preview.set_inspector_notes_chip(False, 0)
             self._sync_ref_tab_paths()
+
+    def _refresh_schedule_block(self, item: ViewItem | None = None) -> None:
+        item = item or self._current_item
+        self._schedule_block.set_active_department(self._last_focused_department)
+        self._schedule_block.set_item(item, bars=self._schedule_bars or None)
 
     def _entity_for_special_folder(self) -> Asset | Shot | None:
         item = self._current_item
@@ -1056,11 +1088,13 @@ class InspectorPanel(QWidget):
         self._last_focused_department = (department_name or "").strip() or None
         self._asset_status.set_focused_department(self._last_focused_department)
         self._preview.set_active_department(self._last_focused_department)
+        self._schedule_block.set_active_department(self._last_focused_department)
         self._preview.update_thumbnail_only()
         if self._current_item is not None:
             _ad = self._last_focused_department
             _ac = _inspector_get_active_dcc(getattr(self._current_item, "path", None), _ad) if self._current_item else None
             self._asset_status.set_item(self._current_item, self._show_publish, active_department=_ad, active_dcc_id=_ac)
+            self._refresh_schedule_block()
         item = self._current_item
         if item is None:
             return

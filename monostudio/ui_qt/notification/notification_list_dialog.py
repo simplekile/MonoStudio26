@@ -1,12 +1,12 @@
 """
-Notification list dialog: shows up to 200 most recent general notifications (newest first).
+Notification list dialog: shows up to 200 most recent user alerts (newest first).
 Opened from topbar noti dropdown "Show all".
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.ui_qt.notification.store import all_entries
-from monostudio.ui_qt.notification.toast import TOAST_COLORS, TOAST_ICONS, ToastType
+from monostudio.ui_qt.notification.store import NotificationEntry, all_entries
+from monostudio.ui_qt.notification.toast import TOAST_COLORS, TOAST_ICONS
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MonosDialog, MONOS_COLORS, monos_font
 
@@ -32,7 +32,9 @@ def _format_time(dt) -> str:
 
 
 class NotificationListDialog(MonosDialog):
-    """Shows full notification history (newest first, up to store max)."""
+    """Shows full user notification history (newest first, up to store max)."""
+
+    user_alert_clicked = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -73,6 +75,7 @@ class NotificationListDialog(MonosDialog):
         for entry in entries:
             item = QListWidgetItem(self._list)
             row = _NotificationRowWidget(entry, self._list)
+            row.clicked.connect(self.user_alert_clicked.emit)
             item.setSizeHint(row.sizeHint())
             self._list.addItem(item)
             self._list.setItemWidget(item, row)
@@ -81,8 +84,12 @@ class NotificationListDialog(MonosDialog):
 class _NotificationRowWidget(QWidget):
     """Single row: type icon + message + time."""
 
-    def __init__(self, entry, parent=None) -> None:
+    clicked = Signal(object)
+
+    def __init__(self, entry: NotificationEntry, parent=None) -> None:
         super().__init__(parent)
+        self._entry = entry
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(10)
@@ -106,4 +113,10 @@ class _NotificationRowWidget(QWidget):
         time_label.setFont(monos_font(point_size=11, weight=QFont.Weight.Normal))
         time_label.setStyleSheet(f"color: {MONOS_COLORS['text_meta']}; background: transparent; border: none;")
         layout.addWidget(time_label, 0)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._entry)
+            event.accept()
+            return
+        super().mousePressEvent(event)

@@ -16,6 +16,7 @@ from PySide6.QtGui import (
     QLinearGradient,
     QPainter,
     QPainterPath,
+    QPen,
     QPalette,
     QPixmap,
 )
@@ -46,7 +47,6 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.core.dcc_registry import get_default_dcc_registry
-from monostudio.core.version import get_app_version
 from monostudio.core.project_guide_tags import (
     ALL_TAG_IDS,
     DEFAULT_TAG_DEFINITIONS,
@@ -75,6 +75,7 @@ from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.recent_tasks_store import RecentTask
+from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators
 from monostudio.ui_qt.style import (
     MONOS_COLORS,
     SIDEBAR_DEPT_LIST_STYLE,
@@ -87,10 +88,12 @@ from monostudio.ui_qt.style import (
 
 class SidebarContext(str, Enum):
     PROJECTS = "Projects"
+    DASHBOARD = "Dashboard"
     SHOTS = "Shots"
     ASSETS = "Assets"
     INBOX = "Inbox"
     PROJECT_GUIDE = "Project Guide"
+    SCHEDULE = "Schedule"
     OUTBOX = "Outbox"
     TRASH = "Trash"
 
@@ -303,13 +306,21 @@ class _SidebarDeptListDelegate(QStyledItemDelegate):
             painter.setBrush(_container_gradient(QRectF(r)))
             path = _rounded_rect_path(QRectF(r), radius, round_top, round_bottom)
             painter.drawPath(path)
+            scope_row = isinstance(data, dict) and bool(data.get("scope_id"))
+            if scope_row and data.get("scope_active"):
+                painter.fillPath(path, QColor(59, 130, 246, 26))
+                painter.setPen(QPen(QColor(59, 130, 246, 76), 1))
+                painter.drawPath(path)
             style.drawPrimitive(QStyle.PE_PanelItemViewItem, opt, painter, widget)
             inner = r.adjusted(10, 0, -10, 0)
             dot_r = 4
             dot_gap = 10
             dot_cx = inner.left() + dot_r
             dot_cy = r.center().y()
-            is_selected = bool(opt.state & QStyle.State_Selected)
+            if scope_row:
+                is_selected = bool(data.get("scope_active"))
+            else:
+                is_selected = bool(opt.state & QStyle.State_Selected)
             dot_color = QColor(MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_meta"])
             painter.setRenderHint(QPainter.Antialiasing, True)
             painter.setPen(Qt.NoPen)
@@ -350,7 +361,10 @@ class _SidebarDeptListDelegate(QStyledItemDelegate):
             text_rect = QRect(x, r.top(), max(0, text_right - x), r.height())
             fm = QFontMetrics(opt.font)
             text = fm.elidedText(opt.text, Qt.ElideRight, text_rect.width())
-            pen_color = QColor(MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"])
+            if scope_row and not is_selected:
+                pen_color = QColor(MONOS_COLORS.get("text_meta", "#71717a"))
+            else:
+                pen_color = QColor(MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"])
             painter.setPen(pen_color)
             painter.setFont(opt.font)
             painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
@@ -535,17 +549,30 @@ class _SidebarNavItemWidget(QWidget):
         self._indicator.setGeometry(0, y, 2, 16)
 
 
-# Scope pill: one nav block for Project | Shot | Asset (single pill, three segments).
+# Scope pill: one nav block for Projects | Shot | Asset (single pill, three segments).
 _SCOPE_PILL_CONTEXTS = (
     (SidebarContext.PROJECTS.value, "folder-kanban"),
-    (SidebarContext.SHOTS.value, "clapperboard"),
     (SidebarContext.ASSETS.value, "box"),
+    (SidebarContext.SHOTS.value, "clapperboard"),
 )
-
+_SCOPE_PILL_TOOLTIPS: dict[str, str] = {
+    SidebarContext.PROJECTS.value: "Projects",
+    SidebarContext.SHOTS.value: "Shot",
+    SidebarContext.ASSETS.value: "Asset",
+}
+# None = icon-only segment (Projects); str = visible label beside icon.
+_SCOPE_PILL_LABELS: dict[str, str | None] = {
+    SidebarContext.PROJECTS.value: None,
+    SidebarContext.SHOTS.value: "Shot",
+    SidebarContext.ASSETS.value: "Asset",
+}
+_SCOPE_PILL_ICON_SIZE = 18
+_SCOPE_PILL_SEGMENT_ICON_W = 36
+_SCOPE_PILL_SEGMENT_LABELED_MIN_W = 52
 
 class _SidebarScopePillWidget(QWidget):
     """
-    One pill with three segments: Project, Shot, Asset.
+    One pill with three segments: Projects, Asset, Shot.
     Emits segment_clicked(context_name). set_active_segment(name), set_badges(projects, shots, assets).
     """
 
@@ -554,6 +581,7 @@ class _SidebarScopePillWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("SidebarScopePill")
+        self.setProperty("display", "mixed")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setMinimumHeight(40)
         self.setMaximumHeight(40)
@@ -569,30 +597,40 @@ class _SidebarScopePillWidget(QWidget):
         layout.setSpacing(0)
 
         self._buttons: dict[str, QToolButton] = {}
+        _seg_font = monos_font("Inter", 13, QFont.Weight.DemiBold)
+        _seg_font.setLetterSpacing(QFont.PercentageSpacing, 97)
         for i, (ctx, icon_name) in enumerate(_SCOPE_PILL_CONTEXTS):
             btn = QToolButton(self)
             btn.setObjectName("SidebarScopePillSegment")
             btn.setProperty("segment", ctx)
             btn.setProperty("active", "false")
             btn.setProperty("position", "left" if i == 0 else ("right" if i == 2 else "center"))
+            label = _SCOPE_PILL_LABELS.get(ctx)
+            btn.setProperty("labeled", "true" if label else "false")
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFocusPolicy(Qt.NoFocus)
             btn.setAutoRaise(True)
-            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            label = ctx.rstrip("s") if ctx.endswith("s") else ctx  # "Projects" -> "Project"
-            btn.setText(label)
-            f = monos_font("Inter", 13, QFont.Weight.DemiBold)
-            f.setLetterSpacing(QFont.PercentageSpacing, 97)
-            btn.setFont(f)
-            ic = lucide_icon(icon_name, size=15, color_hex=MONOS_COLORS["text_label"])
+            btn.setToolTip(_SCOPE_PILL_TOOLTIPS.get(ctx, ctx))
+            ic = lucide_icon(icon_name, size=_SCOPE_PILL_ICON_SIZE, color_hex=MONOS_COLORS["text_label"])
             if not ic.isNull():
                 btn.setIcon(ic)
-                btn.setIconSize(QSize(15, 15))
-            btn.setFixedHeight(32)
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                btn.setIconSize(QSize(_SCOPE_PILL_ICON_SIZE, _SCOPE_PILL_ICON_SIZE))
+            if label:
+                btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+                btn.setText(label)
+                btn.setFont(_seg_font)
+                btn.setFixedHeight(32)
+                btn.setMinimumWidth(_SCOPE_PILL_SEGMENT_LABELED_MIN_W)
+                btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            else:
+                btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+                btn.setFixedSize(_SCOPE_PILL_SEGMENT_ICON_W, 32)
+                btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked=False, c=ctx: self.segment_clicked.emit(c))
             self._buttons[ctx] = btn
             layout.addWidget(btn, 0, Qt.AlignVCenter)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def set_active_segment(self, context_name: str | None) -> None:
         """Set which segment is active. Pass None or unknown name to clear (no segment active)."""
@@ -603,10 +641,10 @@ class _SidebarScopePillWidget(QWidget):
             btn.setProperty("active", "true" if is_active else "false")
             color = MONOS_COLORS["blue_400"] if is_active else MONOS_COLORS["text_label"]
             ic_name = next((ic for c, ic in _SCOPE_PILL_CONTEXTS if c == ctx), "box")
-            ic = lucide_icon(ic_name, size=15, color_hex=color)
+            ic = lucide_icon(ic_name, size=_SCOPE_PILL_ICON_SIZE, color_hex=color)
             if not ic.isNull():
                 btn.setIcon(ic)
-                btn.setIconSize(QSize(15, 15))
+                btn.setIconSize(QSize(_SCOPE_PILL_ICON_SIZE, _SCOPE_PILL_ICON_SIZE))
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
@@ -616,11 +654,9 @@ class _SidebarScopePillWidget(QWidget):
         self._badges[SidebarContext.ASSETS.value] = assets_count
         for ctx, btn in self._buttons.items():
             count = self._badges.get(ctx)
-            tip = ctx
-            if count is not None:
-                tip = f"{ctx}: {count}"
+            label = _SCOPE_PILL_TOOLTIPS.get(ctx, ctx)
+            tip = f"{label} ({count})" if count is not None else label
             btn.setToolTip(tip)
-            # Optional: set text to "Project (3)" etc.; keeping label only for now, tooltip has count.
 
 
 _SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX = 180
@@ -639,6 +675,7 @@ class SidebarWidget(QWidget):
 
     departmentClicked = Signal(object)  # str | None
     typeClicked = Signal(object)  # str | None
+    entityScopeChanged = Signal(bool, bool)  # include_shots, include_assets (schedule)
     tagClicked = Signal(object)  # str | None  (tag_id or None for "All")
     tagsDefinitionsChanged = Signal()  # emitted when user modifies tag definitions
 
@@ -652,7 +689,9 @@ class SidebarWidget(QWidget):
         self._active_type: str | None = None
         self._active_tag: str | None = None
 
-        self._mode: str = "assets"  # "assets" | "shots" (UI-only context)
+        self._mode: str = "assets"  # assets | shots | schedule | inbox | reference
+        self._include_shots: bool = True
+        self._include_assets: bool = False
         # Default number of items shown per section (user can pick any count).
         self._max_visible = 6
         self._all_departments: list[str] = []
@@ -675,6 +714,9 @@ class SidebarWidget(QWidget):
         # Item counts for label display (set by sidebar container from ProjectIndex).
         self._count_by_type: dict[str, int] = {}
         self._count_by_department: dict[str, int] = {}
+        # Schedule: which dept ids apply to shot vs asset entities (index + pipeline types).
+        self._schedule_dept_shot_ids: set[str] = set()
+        self._schedule_dept_asset_ids: set[str] = set()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -682,6 +724,46 @@ class SidebarWidget(QWidget):
 
         f_h = monos_font("Inter", 10, QFont.Weight.ExtraBold)  # 800
         f_h.setLetterSpacing(QFont.PercentageSpacing, 112)  # tracking-widest-ish
+
+        # --- SCOPE (Schedule: Shots / Assets multi-toggle)
+        scope_header_row = QWidget(self)
+        scope_header_row.setObjectName("SidebarFilterHeaderRow")
+        scope_header_row_l = QHBoxLayout(scope_header_row)
+        scope_header_row_l.setContentsMargins(0, 0, 0, 0)
+        scope_header_row_l.setSpacing(8)
+        scope_icon = QLabel(scope_header_row)
+        scope_icon.setObjectName("SidebarFilterHeaderIcon")
+        scope_icon.setFixedSize(16, 16)
+        scope_icon.setAlignment(Qt.AlignCenter)
+        scope_icon.setPixmap(
+            lucide_icon("scan", size=16, color_hex=MONOS_COLORS["text_label"]).pixmap(16, 16)
+        )
+        scope_header = QLabel("SCOPE", scope_header_row)
+        scope_header.setObjectName("SidebarSectionHeader")
+        scope_header.setFont(f_h)
+        scope_header_row_l.addWidget(scope_icon, 0, Qt.AlignVCenter)
+        scope_header_row_l.addWidget(scope_header, 0, Qt.AlignVCenter)
+        scope_header_row_l.addStretch(1)
+        self._scope_list = QListWidget(self)
+        self._scope_list.setObjectName("SidebarFilterList")
+        self._scope_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self._scope_list.setUniformItemSizes(False)
+        self._scope_list.setFocusPolicy(Qt.NoFocus)
+        self._scope_list.setIconSize(QSize(16, 16))
+        self._scope_list.setItemDelegate(_SidebarDeptListDelegate(self._scope_list))
+        self._scope_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scope_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scope_list.setMaximumHeight(88)
+        self._scope_list.itemClicked.connect(self._on_scope_clicked)
+        self._scope_section = QWidget(self)
+        self._scope_section.setObjectName("SidebarFilterScopeSection")
+        scope_section_lay = QVBoxLayout(self._scope_section)
+        scope_section_lay.setContentsMargins(0, 0, 0, 0)
+        scope_section_lay.setSpacing(0)
+        scope_section_lay.addWidget(scope_header_row, 0)
+        scope_section_lay.addWidget(self._scope_list, 0)
+        self._scope_section.setVisible(False)
+        self._rebuild_scope_list()
 
         # --- Header rows (label + "+" button, right-aligned)
         dept_header_row = QWidget(self)
@@ -842,6 +924,9 @@ class SidebarWidget(QWidget):
         # Load from pipeline metadata (single source of truth), scoped by current mode.
         self.reload_from_pipeline_metadata()
 
+    def scope_section(self) -> QWidget:
+        return self._scope_section
+
     def dept_section(self) -> QWidget:
         return self._dept_section
 
@@ -874,6 +959,7 @@ class SidebarWidget(QWidget):
             self.set_types(self._all_types)
             self._dept_section.setVisible(False)
             self._type_section.setVisible(True)
+            self._scope_section.setVisible(False)
             self._tag_section.setVisible(False)
             return
 
@@ -897,6 +983,7 @@ class SidebarWidget(QWidget):
             self.set_types([])
             self._dept_section.setVisible(True)
             self._type_section.setVisible(False)
+            self._scope_section.setVisible(False)
             self._tag_section.setVisible(True)
             self._sync_tag_selection()
             return
@@ -918,7 +1005,7 @@ class SidebarWidget(QWidget):
             if self._mode == "shots":
                 if not _is_shot_type(type_id):
                     continue
-            else:
+            elif self._mode == "assets":
                 if _is_shot_type(type_id):
                     continue
             types_out.append((type_id, t.name))
@@ -994,7 +1081,43 @@ class SidebarWidget(QWidget):
         self.set_types(self._all_types)
         self._dept_section.setVisible(True)
         self._type_section.setVisible(True)
+        self._scope_section.setVisible(self._mode == "schedule")
         self._tag_section.setVisible(False)
+        if self._mode == "schedule":
+            self._rebuild_schedule_dept_scope_sets()
+            self._rebuild_scope_list()
+
+    def update_schedule_dept_scope_sets(
+        self,
+        *,
+        on_shots: set[str] | None = None,
+        on_assets: set[str] | None = None,
+    ) -> None:
+        """Refresh shot/asset department id sets (from ProjectIndex + pipeline types)."""
+        self._rebuild_schedule_dept_scope_sets(on_shots=on_shots, on_assets=on_assets)
+        if self._mode == "schedule":
+            self.set_departments(self._all_departments)
+            self.set_types(self._all_types)
+
+    def _rebuild_schedule_dept_scope_sets(
+        self,
+        *,
+        on_shots: set[str] | None = None,
+        on_assets: set[str] | None = None,
+    ) -> None:
+        shots_set: set[str] = set(on_shots or ())
+        assets_set: set[str] = set(on_assets or ())
+        for type_id, dept_ids in self._dept_ids_by_type.items():
+            if _is_shot_type(type_id):
+                shots_set.update(dept_ids)
+            else:
+                assets_set.update(dept_ids)
+        self._schedule_dept_shot_ids = {d.strip() for d in shots_set if d and d.strip()}
+        self._schedule_dept_asset_ids = {d.strip() for d in assets_set if d and d.strip()}
+
+    def visible_department_ids(self) -> list[str]:
+        """Department ids shown in filter list (+ picker); Schedule timeline uses this whitelist."""
+        return list(self._visible_departments or [])
 
     def current_department(self) -> str | None:
         return self._active_department
@@ -1051,6 +1174,7 @@ class SidebarWidget(QWidget):
         self._load_state_for_mode("shots")
         self._load_state_for_mode("inbox")
         self._load_state_for_mode("reference")
+        self._load_state_for_mode("schedule")
         # Apply stored state for current mode (if any) and refresh lists.
         self._apply_state(self._state_by_mode.get(self._mode))
         self.reload_from_pipeline_metadata()
@@ -1061,7 +1185,7 @@ class SidebarWidget(QWidget):
     def _load_state_for_mode(self, mode: str) -> None:
         if self._settings is None:
             return
-        if mode not in ("assets", "shots", "inbox", "reference"):
+        if mode not in ("assets", "shots", "inbox", "reference", "schedule"):
             return
 
         dep = self._settings.value(self._settings_key(mode, "active_department"), "", str) if mode != "inbox" else ""
@@ -1094,19 +1218,26 @@ class SidebarWidget(QWidget):
                 pass
             return {}
 
+        inc_shots = True
+        inc_assets = False
+        if mode == "schedule":
+            inc_shots = bool(self._settings.value(self._settings_key(mode, "include_shots"), True, type=bool))
+            inc_assets = bool(self._settings.value(self._settings_key(mode, "include_assets"), False, type=bool))
         state: dict[str, object] = {
             "active_department": dep.strip() if dep and dep.strip() else None,
             "active_type": typ.strip() if typ and typ.strip() else None,
-            "department_by_type": load_department_by_type(dbt_raw) if mode in ("assets", "shots") else {},
+            "department_by_type": load_department_by_type(dbt_raw) if mode in ("assets", "shots", "schedule") else {},
             "visible_departments": load_list(vd_raw) if mode != "inbox" else None,
             "visible_types": load_list(vt_raw),
+            "include_shots": inc_shots,
+            "include_assets": inc_assets,
         }
         self._state_by_mode[mode] = state
 
     def _save_state_for_mode(self, mode: str) -> None:
         if self._settings is None:
             return
-        if mode not in ("assets", "shots", "inbox", "reference"):
+        if mode not in ("assets", "shots", "inbox", "reference", "schedule"):
             return
         state = self._state_by_mode.get(mode)
         if not state:
@@ -1114,7 +1245,16 @@ class SidebarWidget(QWidget):
             self._state_by_mode[mode] = state
         self._settings.setValue(self._settings_key(mode, "active_department"), state.get("active_department") or "")
         self._settings.setValue(self._settings_key(mode, "active_type"), state.get("active_type") or "")
-        if mode in ("assets", "shots"):
+        if mode == "schedule":
+            self._settings.setValue(
+                self._settings_key(mode, "include_shots"),
+                bool(state.get("include_shots", True)),
+            )
+            self._settings.setValue(
+                self._settings_key(mode, "include_assets"),
+                bool(state.get("include_assets", False)),
+            )
+        if mode in ("assets", "shots", "schedule"):
             dbt = state.get("department_by_type")
             self._settings.setValue(
                 self._settings_key(mode, "department_by_type"),
@@ -1135,7 +1275,7 @@ class SidebarWidget(QWidget):
         Inbox: only Source (Client/Freelancer) list; no departments.
         """
         m = (mode or "").strip().lower()
-        if m not in ("assets", "shots", "inbox", "reference"):
+        if m not in ("assets", "shots", "schedule", "inbox", "reference"):
             return
         if self._mode == m:
             return
@@ -1156,6 +1296,8 @@ class SidebarWidget(QWidget):
             "department_by_type": dict(self._department_by_type),
             "visible_departments": list(self._visible_departments) if self._visible_departments is not None else None,
             "visible_types": list(self._visible_types) if self._visible_types is not None else None,
+            "include_shots": self._include_shots,
+            "include_assets": self._include_assets,
         }
 
     def _apply_state(self, state: dict[str, object] | None) -> None:
@@ -1189,18 +1331,183 @@ class SidebarWidget(QWidget):
             self._visible_types = None
         elif isinstance(vt, list):
             self._visible_types = [x for x in vt if isinstance(x, str) and x.strip()]
+        if self._mode == "schedule":
+            self._include_shots = bool(state.get("include_shots", True))
+            self._include_assets = bool(state.get("include_assets", False))
+            if not self._include_shots and not self._include_assets:
+                self._include_shots = True
+            self._rebuild_scope_list()
+
+    def entity_scope(self) -> tuple[bool, bool]:
+        """Schedule mode: (include_shots, include_assets)."""
+        return self._include_shots, self._include_assets
+
+    def set_entity_scope(self, *, include_shots: bool, include_assets: bool, emit: bool = True) -> None:
+        shots = bool(include_shots)
+        assets = bool(include_assets)
+        if not shots and not assets:
+            shots = True
+        if shots == self._include_shots and assets == self._include_assets:
+            return
+        self._include_shots = shots
+        self._include_assets = assets
+        if self._mode == "schedule":
+            self._sanitize_schedule_type_for_scope()
+            self._sanitize_schedule_department_for_scope()
+            self.set_types(self._all_types)
+            self.set_departments(self._all_departments)
+        self._rebuild_scope_list()
+        if emit:
+            self.entityScopeChanged.emit(self._include_shots, self._include_assets)
+
+    def _sanitize_schedule_type_for_scope(self) -> None:
+        """Clear type filter when it does not match shot/asset scope."""
+        if self._active_type is None:
+            return
+        if _is_shot_type(self._active_type) and not self._include_shots:
+            self._active_type = None
+        elif not _is_shot_type(self._active_type) and not self._include_assets:
+            self._active_type = None
+
+    def _sanitize_schedule_department_for_scope(self) -> None:
+        """Clear department selection when hidden by scope or picker whitelist."""
+        dep = self._active_department
+        if not dep:
+            return
+        visible = self._visible_departments or []
+        if dep not in visible:
+            self._active_department = None
+            return
+        on_shot = dep in self._schedule_dept_shot_ids
+        on_asset = dep in self._schedule_dept_asset_ids
+        if self._include_shots and on_shot:
+            return
+        if self._include_assets and on_asset:
+            return
+        self._active_department = None
+
+    def _rebuild_scope_list(self) -> None:
+        rows = (
+            ("assets", "Assets", "box", self._include_assets),
+            ("shots", "Shots", "clapperboard", self._include_shots),
+        )
+        self._scope_list.blockSignals(True)
+        try:
+            self._scope_list.clear()
+            for i, (scope_id, label, icon_name, selected) in enumerate(rows):
+                it = QListWidgetItem(label)
+                it.setData(
+                    Qt.UserRole,
+                    {
+                        "type": _DEPT_ROW_DEPT,
+                        "scope_id": scope_id,
+                        "scope_active": bool(selected),
+                        "round_top": i == 0,
+                        "round_bottom": i == len(rows) - 1,
+                    },
+                )
+                it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="box"))
+                self._scope_list.addItem(it)
+        finally:
+            self._scope_list.blockSignals(False)
+        self._scope_list.viewport().update()
+
+    def _on_scope_clicked(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.UserRole) or {}
+        if not isinstance(data, dict) or data.get("type") != _DEPT_ROW_DEPT:
+            return
+        scope_id = (data.get("scope_id") or "").strip().lower()
+        if scope_id == "shots":
+            new_shots = not self._include_shots
+            new_assets = self._include_assets
+        elif scope_id == "assets":
+            new_assets = not self._include_assets
+            new_shots = self._include_shots
+        else:
+            return
+        if not new_shots and not new_assets:
+            self._rebuild_scope_list()
+            return
+        self.set_entity_scope(include_shots=new_shots, include_assets=new_assets)
+
+    def _populate_dept_list_schedule(self, visible: list[str]) -> None:
+        """Schedule: departments grouped by Shots vs Assets (picker list = timeline whitelist)."""
+        if self._active_type and self._active_type in self._dept_ids_by_type:
+            allowed = set(self._dept_ids_by_type.get(self._active_type, []))
+            visible = [d for d in visible if d in allowed]
+
+        shot_ids = [d for d in visible if d in self._schedule_dept_shot_ids]
+        asset_ids = [d for d in visible if d in self._schedule_dept_asset_ids]
+        sections: list[tuple[str, list[str]]] = []
+        if self._include_assets and asset_ids:
+            sections.append(("Assets", asset_ids))
+        if self._include_shots and shot_ids:
+            sections.append(("Shots", shot_ids))
+
+        self._dept_list.blockSignals(True)
+        try:
+            self._dept_list.clear()
+            next_dept_round_top = True
+            for sec_idx, (section_label, dept_ids) in enumerate(sections):
+                if self._dept_list.count() > 0:
+                    spacer = QListWidgetItem("")
+                    spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
+                    spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    self._dept_list.addItem(spacer)
+                    next_dept_round_top = True
+                section_item = QListWidgetItem("")
+                section_item.setData(
+                    Qt.UserRole,
+                    {"type": _DEPT_ROW_SECTION, "section_label": section_label},
+                )
+                section_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self._dept_list.addItem(section_item)
+                next_dept_round_top = False
+                for i, dept_id in enumerate(dept_ids):
+                    last_in_block = i + 1 >= len(dept_ids)
+                    label = _title_case_label(self._dept_label_by_id.get(dept_id, dept_id))
+                    count = self._count_by_department.get(dept_id)
+                    it = QListWidgetItem(label)
+                    role: dict = {
+                        "type": _DEPT_ROW_DEPT,
+                        "dept_id": dept_id,
+                        "round_top": next_dept_round_top,
+                        "round_bottom": last_in_block,
+                    }
+                    if count is not None:
+                        role["count"] = count
+                    it.setData(Qt.UserRole, role)
+                    next_dept_round_top = False
+                    icon_name = self._dept_icon_by_id.get(dept_id)
+                    if icon_name:
+                        it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="layers"))
+                    self._dept_list.addItem(it)
+            self._sync_selection()
+        finally:
+            self._dept_list.blockSignals(False)
 
     def set_departments(self, values: list[str]) -> None:
         cleaned = [v.strip() for v in values if isinstance(v, str) and v.strip()]
         self._all_departments = cleaned
         # If never configured, default to first N (one-time). If configured to [], keep empty.
         if self._visible_departments is None:
-            self._visible_departments = cleaned[: self._max_visible]
+            if self._mode == "schedule":
+                eligible = [
+                    d
+                    for d in cleaned
+                    if d in self._schedule_dept_shot_ids or d in self._schedule_dept_asset_ids
+                ]
+                self._visible_departments = eligible if eligible else cleaned[: self._max_visible]
+            else:
+                self._visible_departments = cleaned[: self._max_visible]
         else:
             # Keep only still-valid items (no auto-fill).
             self._visible_departments = [v for v in self._visible_departments if v in cleaned]
 
         visible = self._visible_departments or []
+        if self._mode == "schedule":
+            self._populate_dept_list_schedule(visible)
+            return
         # When a type is active in assets/shots mode, restrict visible departments to those
         # supported by that type. If no type is active, show all departments that pass the
         # Select Departments filter.
@@ -1284,18 +1591,37 @@ class SidebarWidget(QWidget):
         else:
             self._visible_types = [v for v in self._visible_types if v in cleaned]
         # After Assets→Shots→Assets restore, ensure all types are visible so user can select any (e.g. Character).
-        if self._mode in ("assets", "shots") and cleaned and (not self._visible_types or len(self._visible_types) < len(cleaned)):
+        if self._mode in ("assets", "shots") and cleaned and (
+            not self._visible_types or len(self._visible_types) < len(cleaned)
+        ):
+            self._visible_types = cleaned[: self._max_visible]
+        if self._mode == "schedule" and self._visible_types is None and cleaned:
             self._visible_types = cleaned[: self._max_visible]
 
         visible = self._visible_types or []
+        if self._mode == "schedule":
+            scoped: list[str] = []
+            for type_id in visible:
+                if _is_shot_type(type_id) and not self._include_shots:
+                    continue
+                if not _is_shot_type(type_id) and not self._include_assets:
+                    continue
+                scoped.append(type_id)
+            visible = scoped
         # Group by section: Assets vs Shots (same structure as department list).
         asset_types = [t for t in visible if not _is_shot_type(t)]
         shot_types = [t for t in visible if _is_shot_type(t)]
         sections_with_types: list[tuple[str, list[str]]] = []
-        if asset_types:
-            sections_with_types.append(("Assets", asset_types))
-        if shot_types:
-            sections_with_types.append(("Shots", shot_types))
+        if self._mode == "schedule":
+            if self._include_assets and asset_types:
+                sections_with_types.append(("Assets", asset_types))
+            if self._include_shots and shot_types:
+                sections_with_types.append(("Shots", shot_types))
+        else:
+            if asset_types:
+                sections_with_types.append(("Assets", asset_types))
+            if shot_types:
+                sections_with_types.append(("Shots", shot_types))
 
         self._type_list.blockSignals(True)
         try:
@@ -1560,7 +1886,16 @@ class SidebarWidget(QWidget):
         # Build per-type tabs for departments: each tab shows departments that type supports.
         type_tabs: list[tuple[str, str]] = []
         dept_ids_by_type: dict[str, list[str]] = {}
-        if self._mode in ("assets", "shots") and self._dept_ids_by_type:
+        if self._mode == "schedule":
+            shot_list = [d for d in self._all_departments if d in self._schedule_dept_shot_ids]
+            asset_list = [d for d in self._all_departments if d in self._schedule_dept_asset_ids]
+            if asset_list:
+                type_tabs.append(("assets", "Assets"))
+                dept_ids_by_type["assets"] = asset_list
+            if shot_list:
+                type_tabs.append(("shots", "Shots"))
+                dept_ids_by_type["shots"] = shot_list
+        elif self._mode in ("assets", "shots") and self._dept_ids_by_type:
             for type_id in self._all_types:
                 dept_list = [d for d in self._dept_ids_by_type.get(type_id, []) if d in self._all_departments]
                 if not dept_list:
@@ -1595,15 +1930,25 @@ class SidebarWidget(QWidget):
         self.set_departments(self._all_departments)
         self._state_by_mode[self._mode] = self._snapshot_state()
         self._save_state_for_mode(self._mode)
+        if self._mode == "schedule":
+            self.entityScopeChanged.emit(self._include_shots, self._include_assets)
 
     def _open_type_picker(self) -> None:
-        type_section = {tid: ("Shots" if _is_shot_type(tid) else "Assets") for tid in self._all_types}
+        type_ids = list(self._all_types)
+        if self._mode == "schedule":
+            type_ids = [
+                tid
+                for tid in type_ids
+                if (_is_shot_type(tid) and self._include_shots)
+                or (not _is_shot_type(tid) and self._include_assets)
+            ]
+        type_section = {tid: ("Shots" if _is_shot_type(tid) else "Assets") for tid in type_ids}
         # Use top-level window as parent so dialog survives when filter is in compact popup (reparent).
         dlg = _FilterPickDialog(
             title="Select Types",
             items=[
                 (tid, _title_case_label(self._type_label_by_id.get(tid, tid)), self._type_icon_by_id.get(tid))
-                for tid in self._all_types
+                for tid in type_ids
             ],
             selected=set(self._visible_types or []),
             max_selected=None,
@@ -1621,6 +1966,8 @@ class SidebarWidget(QWidget):
         self.set_types(self._all_types)
         self._state_by_mode[self._mode] = self._snapshot_state()
         self._save_state_for_mode(self._mode)
+        if self._mode == "schedule":
+            self.entityScopeChanged.emit(self._include_shots, self._include_assets)
 
     @staticmethod
     def _fit_list_height(w: QListWidget) -> None:
@@ -2417,38 +2764,37 @@ class Sidebar(QWidget):
         self._nav.setMaximumHeight(0)
         self._nav.setVisible(False)
 
-        # Scope pill: outside list so it is never clipped by list viewport
+        # Scope pill (Projects | Shot | Asset) — Dashboard/Schedule live in title bar center
         self._scope_context: str = SidebarContext.ASSETS.value
-        scope_pill_wrapper = QWidget(top)
-        scope_pill_wrapper.setFixedHeight(44)
-        scope_wrap_layout = QVBoxLayout(scope_pill_wrapper)
-        scope_wrap_layout.setContentsMargins(0, 0, 0, 0)
-        scope_wrap_layout.setSpacing(0)
-        self._scope_pill = _SidebarScopePillWidget(parent=scope_pill_wrapper)
-        self._scope_pill.segment_clicked.connect(self._on_scope_segment_clicked)
-        # Limit width so pill is centered in nav block (sidebar content 224px)
-        self._scope_pill.setMaximumWidth(210)
-        self._scope_pill.setSizePolicy(QSizePolicy.Policy.Preferred, self._scope_pill.sizePolicy().verticalPolicy())
-        scope_pill_wrapper.setContextMenuPolicy(Qt.CustomContextMenu)
-        scope_pill_wrapper.customContextMenuRequested.connect(
-            lambda pos: self.context_menu_requested.emit(self._scope_context, scope_pill_wrapper.mapToGlobal(pos))
-        )
-        scope_wrap_layout.addWidget(self._scope_pill, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._footer_context: str | None = None
+        self._footer_buttons: dict[str, QToolButton] = {}
 
         nav_container = QWidget(top)
         nav_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         nav_container_layout = QVBoxLayout(nav_container)
         nav_container_layout.setSpacing(0)
         nav_container_layout.setContentsMargins(0, 0, 0, 0)
+
+        scope_pill_wrapper = QWidget(nav_container)
+        scope_pill_wrapper.setFixedHeight(44)
+        scope_pill_wrapper.setContextMenuPolicy(Qt.CustomContextMenu)
+        scope_pill_wrapper.customContextMenuRequested.connect(
+            lambda pos: self.context_menu_requested.emit(self._scope_context, scope_pill_wrapper.mapToGlobal(pos))
+        )
+        scope_wrap_layout = QVBoxLayout(scope_pill_wrapper)
+        scope_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        scope_wrap_layout.setSpacing(0)
+        self._scope_pill = _SidebarScopePillWidget(parent=scope_pill_wrapper)
+        self._scope_pill.segment_clicked.connect(self._on_scope_segment_clicked)
+        self._scope_pill.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        scope_wrap_layout.addWidget(self._scope_pill, 0, Qt.AlignmentFlag.AlignHCenter)
         nav_container_layout.addWidget(scope_pill_wrapper, 0)
 
-        # Inbox / Project Guide / Outbox (nav page buttons) — tight to scope
-        self._footer_context: str | None = None
-        self._footer_buttons: dict[str, QToolButton] = {}
+        # Inbox / Project Guide / Outbox / Trash — icon row
         nav_pages_row = QWidget(nav_container)
         nav_pages_layout = QHBoxLayout(nav_pages_row)
         nav_pages_layout.setContentsMargins(0, 0, 0, 0)
-        nav_pages_layout.setSpacing(10)
+        nav_pages_layout.setSpacing(0)
         nav_pages_layout.addStretch(1)
         _footer_items = (
             (SidebarContext.INBOX.value, "inbox", "Inbox"),
@@ -2456,6 +2802,7 @@ class Sidebar(QWidget):
             (SidebarContext.OUTBOX.value, "send", "Outbox"),
             (SidebarContext.TRASH.value, "trash-2", "Trash"),
         )
+        footer_btns_row: list[QToolButton] = []
         for context_name, icon_name, tooltip_text in _footer_items:
             btn = QToolButton(nav_pages_row)
             btn.setObjectName("SidebarFooterNavButton")
@@ -2472,7 +2819,8 @@ class Sidebar(QWidget):
             btn.setProperty("active", "false")
             btn.clicked.connect(lambda checked=False, c=context_name: self._on_footer_nav_clicked(c))
             self._footer_buttons[context_name] = btn
-            nav_pages_layout.addWidget(btn, 0)
+            footer_btns_row.append(btn)
+        add_widgets_with_icon_separators(nav_pages_layout, footer_btns_row, nav_pages_row, sep_height=20)
         nav_pages_layout.addStretch(1)
         nav_container_layout.addWidget(nav_pages_row, 0)
         top_layout.addWidget(nav_container, 0)
@@ -2484,8 +2832,8 @@ class Sidebar(QWidget):
         sep_below_nav.setFixedHeight(1)
         top_layout.addWidget(sep_below_nav, 0)
         top_layout.addSpacing(8)  # gap below nav so scroll area does not overlap
-        # Cap top block height so logo + nav never stretch (margins + brand + separators + scope + nav row + spacing)
-        top.setMaximumHeight(200)
+        # Cap top block height so logo + nav never stretch (margins + brand + separators + scope row + nav row + spacing)
+        top.setMaximumHeight(210)
 
         # --- Block 2: Filters (dept/type lists scroll individually; no common scroll)
         self._filters_center = QWidget(self)
@@ -2500,6 +2848,10 @@ class Sidebar(QWidget):
 
         # Section: FILTERS — Dept list stretches down to Types; Types+Tags snap bottom.
         self._filters = SidebarWidget(self._filters_center)
+        self._filters.departmentClicked.connect(self._on_filter_panel_counts_maybe)
+        self._filters.typeClicked.connect(self._on_filter_panel_counts_maybe)
+        self._filters.entityScopeChanged.connect(self._on_filter_panel_counts_maybe)
+        scroll_layout.addWidget(self._filters.scope_section(), 0)
         scroll_layout.addWidget(self._filters.dept_section(), 1)
         scroll_layout.addWidget(self._filters.type_section(), 0)
         scroll_layout.addWidget(self._filters.tag_section(), 0)
@@ -2572,40 +2924,11 @@ class Sidebar(QWidget):
         tasks_layout.addWidget(tasks_header_row, 0)
         tasks_layout.addWidget(self._tasks_stacked, 0)
 
-        # --- Block 4: Footer (logo + name + version, small)
-        bottom = QWidget(self)
-        bottom.setObjectName("SidebarBottom")
-        bottom.setFixedHeight(_SIDEBAR_FOOTER_HEIGHT)
-        bottom.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        bottom_layout = QHBoxLayout(bottom)
-        bottom_layout.setContentsMargins(12, 4, 12, 8)
-        bottom_layout.setSpacing(6)
-        bottom_layout.addStretch(1)
-        _logo_footer = QLabel(bottom)
-        _logo_footer.setObjectName("SidebarFooterLogo")
-        _logo_footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _logo_footer.setFixedSize(16, 16)
-        _logo_pix_footer = _load_logo_pixmap(12, "#71717a")
-        if not _logo_pix_footer.isNull():
-            _logo_footer.setPixmap(_logo_pix_footer)
-        _name_footer = QLabel("MONOS", bottom)
-        _name_footer.setObjectName("SidebarFooterName")
-        _name_footer.setFont(monos_font("Inter", 10, QFont.Weight.DemiBold))
-        _ver_footer = QLabel(get_app_version(), bottom)
-        _ver_footer.setObjectName("SidebarFooterVersion")
-        _ver_footer.setFont(monos_font("JetBrains Mono", 8, QFont.Weight.Normal))
-        _ver_footer.setStyleSheet("color: #52525b;")
-        bottom_layout.addWidget(_logo_footer, 0, Qt.AlignmentFlag.AlignVCenter)
-        bottom_layout.addWidget(_name_footer, 0, Qt.AlignmentFlag.AlignVCenter)
-        bottom_layout.addWidget(_ver_footer, 0, Qt.AlignmentFlag.AlignVCenter)
-        bottom_layout.addStretch(1)
-
         root.addWidget(top_block_56, 0)
         root.addWidget(top, 0)
         root.addWidget(self._filters_center, 1)
         root.addWidget(self._sep_above_tasks, 0)
         root.addWidget(self._tasks_block, 0)
-        root.addWidget(bottom, 0)
 
         self._apply_recent_tasks_visibility()
 
@@ -2620,6 +2943,15 @@ class Sidebar(QWidget):
 
     def filters(self) -> SidebarWidget:
         return self._filters
+
+    def _on_filter_panel_counts_maybe(self, *_args) -> None:
+        ctx = self.current_context()
+        if ctx in (
+            SidebarContext.ASSETS.value,
+            SidebarContext.SHOTS.value,
+            SidebarContext.SCHEDULE.value,
+        ):
+            self._push_filter_counts()
 
     _FILTERS_CENTER_LAYOUT_INDEX = 1  # index in root layout for filters_center
 
@@ -2834,8 +3166,10 @@ class Sidebar(QWidget):
             self.context_changed.emit(context_name)
             return
         if context_name in (
+            SidebarContext.DASHBOARD.value,
             SidebarContext.INBOX.value,
             SidebarContext.PROJECT_GUIDE.value,
+            SidebarContext.SCHEDULE.value,
             SidebarContext.OUTBOX.value,
             SidebarContext.TRASH.value,
         ):
@@ -2844,12 +3178,20 @@ class Sidebar(QWidget):
             self._previous_context_text = getattr(self, "_last_context_text", None)
             self._last_context_text = context_name
             self._sync_nav_active_states()
-            if context_name == SidebarContext.INBOX.value:
+            if context_name == SidebarContext.DASHBOARD.value:
+                self._filters.setVisible(True)
+                self._filters.set_mode("schedule")
+                self._push_filter_counts()
+            elif context_name == SidebarContext.INBOX.value:
                 self._filters.setVisible(True)
                 self._filters.set_mode("inbox")
             elif context_name == SidebarContext.PROJECT_GUIDE.value:
                 self._filters.setVisible(True)
                 self._filters.set_mode("reference")
+            elif context_name == SidebarContext.SCHEDULE.value:
+                self._filters.setVisible(True)
+                self._filters.set_mode("schedule")
+                self._push_filter_counts()
             elif context_name == SidebarContext.OUTBOX.value:
                 self._filters.setVisible(True)
                 self._filters.set_mode("inbox")  # Source filter (Client/Freelancer) like Inbox
@@ -2870,6 +3212,20 @@ class Sidebar(QWidget):
         - Push type/department counts to filter panel for label display.
         """
         self._project_index = project_index
+        on_shots: set[str] = set()
+        on_assets: set[str] = set()
+        if project_index is not None:
+            for shot in project_index.shots:
+                for dep in shot.departments:
+                    name = (getattr(dep, "name", None) or "").strip()
+                    if name:
+                        on_shots.add(name)
+            for asset in project_index.assets:
+                for dep in asset.departments:
+                    name = (getattr(dep, "name", None) or "").strip()
+                    if name:
+                        on_assets.add(name)
+        self._filters.update_schedule_dept_scope_sets(on_shots=on_shots, on_assets=on_assets)
         self._sync_nav_badges()
         self._push_filter_counts()
 
@@ -2925,13 +3281,49 @@ class Sidebar(QWidget):
                         by_dept_norm[dn] = by_dept_norm.get(dn, 0) + 1
             for did in filter_depts:
                 count_by_department[did] = by_dept_norm.get(norm(did), 0)
+        elif ctx == SidebarContext.SCHEDULE.value:
+            include_shots, include_assets = self._filters.entity_scope()
+            active_type = self._filters.current_type()
+            active_type_norm = norm(active_type or "")
+            active_is_shot_type = bool(active_type and _is_shot_type(active_type))
+            by_type_norm: dict[str, int] = {}
+            by_dept_norm: dict[str, int] = {}
+            if include_assets:
+                for a in pi.assets:
+                    at = norm(a.asset_type or "")
+                    if at:
+                        by_type_norm[at] = by_type_norm.get(at, 0) + 1
+                    if active_type and (active_is_shot_type or at != active_type_norm):
+                        continue
+                    for d in a.departments:
+                        dn = norm(getattr(d, "name", None) or "")
+                        if dn:
+                            by_dept_norm[dn] = by_dept_norm.get(dn, 0) + 1
+            shot_count = len(pi.shots) if include_shots else 0
+            if include_shots and (not active_type or active_is_shot_type):
+                for s in pi.shots:
+                    for d in s.departments:
+                        dn = norm(getattr(d, "name", None) or "")
+                        if dn:
+                            by_dept_norm[dn] = by_dept_norm.get(dn, 0) + 1
+            for tid in filter_types:
+                if _is_shot_type(tid):
+                    count_by_type[tid] = shot_count
+                else:
+                    count_by_type[tid] = by_type_norm.get(norm(tid), 0)
+            for did in filter_depts:
+                count_by_department[did] = by_dept_norm.get(norm(did), 0)
 
         return count_by_type, count_by_department
 
     def _push_filter_counts(self) -> None:
         """Update filter panel with current type/department counts and refresh list labels."""
         ctx = self.current_context()
-        if ctx not in (SidebarContext.ASSETS.value, SidebarContext.SHOTS.value):
+        if ctx not in (
+            SidebarContext.ASSETS.value,
+            SidebarContext.SHOTS.value,
+            SidebarContext.SCHEDULE.value,
+        ):
             self._filters.set_item_counts(None, None)
             return
         count_by_type, count_by_department = self._compute_filter_counts()
@@ -2957,6 +3349,9 @@ class Sidebar(QWidget):
                 self._filters.set_mode("shots")
             elif context == SidebarContext.ASSETS.value:
                 self._filters.set_mode("assets")
+            elif context == SidebarContext.SCHEDULE.value:
+                self._filters.set_mode("schedule")
+                self._push_filter_counts()
             elif context == SidebarContext.OUTBOX.value:
                 self._filters.set_mode("inbox")  # Source (Client/Freelancer)
         self.context_changed.emit(context)
@@ -3058,9 +3453,10 @@ class Sidebar(QWidget):
 
     def _sync_nav_badges(self) -> None:
         # Counts are UI-only, derived from already-loaded memory.
+        projects_count = self._projects_count
         assets_count = len(self._project_index.assets) if self._project_index is not None else None
         shots_count = len(self._project_index.shots) if self._project_index is not None else None
-        self._scope_pill.set_badges(self._projects_count, shots_count, assets_count)
+        self._scope_pill.set_badges(projects_count, shots_count, assets_count)
 
         for name, w in self._nav_widgets.items():
             w.set_count_badge(None)
@@ -3069,7 +3465,6 @@ class Sidebar(QWidget):
 # --- SidebarCompact: icon-only vertical sidebar for narrow windows ---
 
 _SIDEBAR_COMPACT_WIDTH = 56
-_SIDEBAR_FOOTER_HEIGHT = 32  # Same height for normal and compact footer
 
 
 def _sep_line(parent: QWidget, object_name: str = "SidebarNavSeparator") -> QFrame:
@@ -3106,6 +3501,7 @@ class SidebarCompact(QWidget):
 
         self._scope_context: str = SidebarContext.ASSETS.value
         self._footer_context: str | None = None
+        self._footer_buttons: dict[str, QToolButton] = {}
         self._last_context_text: str | None = None
         self._filter_source: SidebarWidget | None = None
 
@@ -3147,17 +3543,17 @@ class SidebarCompact(QWidget):
         top_block_56_layout.addWidget(_sep_line(top_block_56), 0)
         root.addWidget(top_block_56, 0)
 
-        # Scope: Projects, Shots, Assets (icon only)
+        # Scope: Projects, Assets, Shots (icon only)
         scope_btns: dict[str, QToolButton] = {}
         _scope_tooltips = {
             SidebarContext.PROJECTS.value: "Projects",
-            SidebarContext.SHOTS.value: "Shots",
             SidebarContext.ASSETS.value: "Assets",
+            SidebarContext.SHOTS.value: "Shots",
         }
         for ctx_name, icon_name in [
             (SidebarContext.PROJECTS.value, "folder-kanban"),
-            (SidebarContext.SHOTS.value, "clapperboard"),
             (SidebarContext.ASSETS.value, "box"),
+            (SidebarContext.SHOTS.value, "clapperboard"),
         ]:
             btn = QToolButton(self)
             btn.setObjectName("SidebarCompactScopeButton")
@@ -3177,7 +3573,7 @@ class SidebarCompact(QWidget):
         self._scope_buttons = scope_btns
         root.addWidget(_sep_line(self), 0)
 
-        # Footer nav: Inbox, Project Guide, Outbox
+        # Footer nav: Inbox, Project Guide, Outbox, Trash (Dashboard/Schedule → title bar)
         footer_btns: dict[str, QToolButton] = {}
         _footer_tooltips = {
             SidebarContext.INBOX.value: "Inbox",
@@ -3240,26 +3636,6 @@ class SidebarCompact(QWidget):
             self._recent_tasks_btn.setIconSize(QSize(20, 20))
         self._recent_tasks_btn.clicked.connect(self._show_recent_tasks_popup)
         root.addWidget(self._recent_tasks_btn, 0, Qt.AlignmentFlag.AlignHCenter)
-
-        # Footer: logo icon only (same height as normal sidebar footer); full width so BG covers sidebar
-        _footer_wrap = QWidget(self)
-        _footer_wrap.setObjectName("SidebarCompactFooter")
-        _footer_wrap.setFixedHeight(_SIDEBAR_FOOTER_HEIGHT)
-        _footer_wrap.setMinimumWidth(_SIDEBAR_COMPACT_WIDTH)
-        _footer_layout = QVBoxLayout(_footer_wrap)
-        _footer_layout.setContentsMargins(0, 0, 0, 0)
-        _footer_layout.setSpacing(0)
-        _footer_layout.addStretch(1)
-        _logo = QLabel(_footer_wrap)
-        _logo.setObjectName("SidebarCompactFooterLogo")
-        _logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _logo.setFixedSize(24, 24)
-        _px = _load_logo_pixmap(20, "#71717a")
-        if not _px.isNull():
-            _logo.setPixmap(_px)
-        _footer_layout.addWidget(_logo, 0, Qt.AlignmentFlag.AlignHCenter)
-        _footer_layout.addStretch(1)
-        root.addWidget(_footer_wrap, 0)
 
         self._recent_tasks_popup: QFrame | None = None
         self._recent_tasks_list: QListWidget | None = None
@@ -3328,8 +3704,10 @@ class SidebarCompact(QWidget):
             self.context_changed.emit(context_name)
             return
         if context_name in (
+            SidebarContext.DASHBOARD.value,
             SidebarContext.INBOX.value,
             SidebarContext.PROJECT_GUIDE.value,
+            SidebarContext.SCHEDULE.value,
             SidebarContext.OUTBOX.value,
             SidebarContext.TRASH.value,
         ):
@@ -3340,11 +3718,16 @@ class SidebarCompact(QWidget):
 
     def _sync_active_states(self) -> None:
         ctx = self.current_context()
+        on_scope = self._footer_context is None
         for name, btn in self._scope_buttons.items():
-            active = name == ctx
+            active = on_scope and name == ctx
             btn.setProperty("active", "true" if active else "false")
             color = MONOS_COLORS["blue_400"] if active else MONOS_COLORS["text_label"]
-            icon_name = "folder-kanban" if name == SidebarContext.PROJECTS.value else ("clapperboard" if name == SidebarContext.SHOTS.value else "box")
+            icon_name = (
+                "folder-kanban"
+                if name == SidebarContext.PROJECTS.value
+                else ("clapperboard" if name == SidebarContext.SHOTS.value else "box")
+            )
             ic = lucide_icon(icon_name, size=20, color_hex=color)
             if not ic.isNull():
                 btn.setIcon(ic)
@@ -3352,16 +3735,16 @@ class SidebarCompact(QWidget):
             if btn.style():
                 btn.style().unpolish(btn)
                 btn.style().polish(btn)
+        _fi = {
+            SidebarContext.INBOX.value: "inbox",
+            SidebarContext.PROJECT_GUIDE.value: "folder-open",
+            SidebarContext.OUTBOX.value: "send",
+            SidebarContext.TRASH.value: "trash-2",
+        }
         for name, btn in self._footer_buttons.items():
             active = name == ctx
             btn.setProperty("active", "true" if active else "false")
             color = MONOS_COLORS["blue_400"] if active else MONOS_COLORS["text_label"]
-            _fi = {
-                SidebarContext.INBOX.value: "inbox",
-                SidebarContext.PROJECT_GUIDE.value: "folder-open",
-                SidebarContext.OUTBOX.value: "send",
-                SidebarContext.TRASH.value: "trash-2",
-            }
             icon_name = _fi.get(name, "inbox")
             ic = lucide_icon(icon_name, size=20, color_hex=color)
             if not ic.isNull():

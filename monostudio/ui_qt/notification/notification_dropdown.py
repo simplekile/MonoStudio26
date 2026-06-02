@@ -1,11 +1,11 @@
 """
-Dropdown popup for topbar notification button: shows 5 most recent notifications + "Show all".
+Dropdown popup for topbar notification button: shows 5 most recent user alerts + "Show all".
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.ui_qt.notification.store import recent
+from monostudio.ui_qt.notification.store import NotificationEntry, recent
 from monostudio.ui_qt.notification.toast import TOAST_COLORS, TOAST_ICONS
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
@@ -32,10 +32,10 @@ def _format_time(dt) -> str:
 
 
 class NotificationDropdown(QFrame):
-    """Popup showing 5 recent notifications and a 'Show all' button."""
+    """Popup showing 5 recent user notifications and a 'Show all' button."""
 
     show_all_requested = Signal()
-    # Emitted when the dropdown is hidden (click outside, Show all, or toggle); parent can clear button hover.
+    user_alert_clicked = Signal(object)  # NotificationEntry
     closed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -104,6 +104,7 @@ class NotificationDropdown(QFrame):
         else:
             for entry in entries:
                 row = _DropdownRow(entry, self._content)
+                row.clicked.connect(self.user_alert_clicked.emit)
                 self._content_layout.addWidget(row)
         self._content_layout.addStretch(1)
 
@@ -123,9 +124,16 @@ class NotificationDropdown(QFrame):
 class _DropdownRow(QFrame):
     """One notification row in the dropdown."""
 
-    def __init__(self, entry, parent=None) -> None:
+    clicked = Signal(object)
+
+    def __init__(self, entry: NotificationEntry, parent=None) -> None:
         super().__init__(parent)
-        self.setStyleSheet("background: transparent; border: none;")
+        self._entry = entry
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            "QFrame { background: transparent; border: none; border-radius: 6px; }"
+            "QFrame:hover { background: rgba(255, 255, 255, 0.04); }"
+        )
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(10)
@@ -149,3 +157,10 @@ class _DropdownRow(QFrame):
         time_label.setFont(monos_font(point_size=11, weight=QFont.Weight.Normal))
         time_label.setStyleSheet(f"color: {MONOS_COLORS['text_meta']}; background: transparent; border: none;")
         layout.addWidget(time_label, 0)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._entry)
+            event.accept()
+            return
+        super().mousePressEvent(event)

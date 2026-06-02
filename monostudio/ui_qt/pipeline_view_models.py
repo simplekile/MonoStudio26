@@ -201,7 +201,7 @@ class PipelineTableModel(QAbstractTableModel):
         if parent.isValid():
             return 0
         ctx = getattr(self._mv, "_browser_context", "asset")
-        return 8 if ctx == "project" else 12
+        return 8 if ctx == "project" else 13
 
     def notify_insert_rows(self, row: int, count: int = 1) -> None:
         if count <= 0:
@@ -306,9 +306,9 @@ class PipelineTableModel(QAbstractTableModel):
                     return self._mv._status_foreground(status)
                 return None
             if col == 4:
-                return shots if role == Qt.ItemDataRole.DisplayRole else None
-            if col == 5:
                 return assets if role == Qt.ItemDataRole.DisplayRole else None
+            if col == 5:
+                return shots if role == Qt.ItemDataRole.DisplayRole else None
             if col == 6:
                 return updated if role == Qt.ItemDataRole.DisplayRole else None
             if col == 7:
@@ -346,14 +346,25 @@ class PipelineTableModel(QAbstractTableModel):
                 return st_col
             return None
         if col == 9:
+            if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.ForegroundRole:
+                text, overdue = self._mv._list_due_text(vi)
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return text
+                if overdue:
+                    return QColor("#ef4444")
+                return QColor("#71717a")
+            if role == Qt.ItemDataRole.FontRole:
+                return monos_font("JetBrains Mono", 11)
+            return None
+        if col == 10:
             if role == Qt.ItemDataRole.DisplayRole:
                 return self._mv._list_version_text(vi)
             if role == Qt.ItemDataRole.FontRole:
                 return monos_font("JetBrains Mono", 11)
             return None
-        if col == 10:
-            return self._mv._list_last_updated(vi) if role == Qt.ItemDataRole.DisplayRole else None
         if col == 11:
+            return self._mv._list_last_updated(vi) if role == Qt.ItemDataRole.DisplayRole else None
+        if col == 12:
             return "—" if role == Qt.ItemDataRole.DisplayRole else None
         return None
 

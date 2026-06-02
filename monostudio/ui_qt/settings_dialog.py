@@ -102,13 +102,17 @@ from monostudio.core.access_control import (
     bundled_access_keys_module_path,
     clear_session,
     dev_key_configured,
+    forget_remembered_access,
     has_access_restrictions,
+    KEY_ACCESS_REMEMBER,
     is_admin_capable,
     is_dev_session,
+    read_access_remember_preferred,
     read_splash_display_ms,
     read_verbose_debug_enabled,
     session_role,
     try_unlock,
+    write_access_remember_preferred,
     write_splash_display_ms,
     write_verbose_debug_enabled,
 )
@@ -325,6 +329,7 @@ class SettingsDialog(MonosDialog):
 
     workspace_root_selected = Signal(str)
     project_root_selected = Signal(str)
+    access_session_changed = Signal()
 
     def __init__(
         self,
@@ -382,6 +387,7 @@ class SettingsDialog(MonosDialog):
         self._pipeline_access_banner: QLabel | None = None
         self._access_status_label: QLabel | None = None
         self._access_unlock_field: QLineEdit | None = None
+        self._access_remember_cb: QCheckBox | None = None
         self._access_keys_info_label: QLabel | None = None
         self._access_debug_cb: QCheckBox | None = None
         self._access_splash_spin: QSpinBox | None = None
@@ -840,9 +846,15 @@ class SettingsDialog(MonosDialog):
         row.addWidget(btn_apply, 0)
         row.addWidget(btn_lock, 0)
         gl.addLayout(row)
+        self._access_remember_cb = QCheckBox(
+            "Remember unlock on this device (restore after restart)", grp_unlock
+        )
+        self._access_remember_cb.setChecked(read_access_remember_preferred())
+        gl.addWidget(self._access_remember_cb)
         hint_u = QLabel(
             "Administrator: pipeline structure and scan rules. Developer: same, plus debug logging and splash timing. "
-            "Unlock lasts until you close the app or click Lock session.",
+            "Unlock lasts for this session; use Remember to skip re-entering the key after restart. "
+            "Lock session clears remembered unlock on this machine.",
             grp_unlock,
         )
         hint_u.setWordWrap(True)
@@ -921,6 +933,14 @@ class SettingsDialog(MonosDialog):
             self._access_status_label.setText("Session: Administrator (pipeline & scan rules).")
         else:
             self._access_status_label.setText("Restricted — unlock with an administrator or developer key.")
+        if role != AccessRole.NONE and has_access_restrictions():
+            from monostudio.core.user_identity import _read_app_settings
+
+            remembered = isinstance(_read_app_settings().get(KEY_ACCESS_REMEMBER), dict)
+            if remembered:
+                self._access_status_label.setText(
+                    self._access_status_label.text() + " · remembered on this device"
+                )
         if self._access_unlock_field:
             self._access_unlock_field.setEnabled(True)
         dev_on = is_dev_session()
@@ -948,16 +968,23 @@ class SettingsDialog(MonosDialog):
         if self._access_unlock_field is None:
             return
         entered = (self._access_unlock_field.text() or "").strip()
-        role = try_unlock(entered)
+        remember = bool(self._access_remember_cb and self._access_remember_cb.isChecked())
+        role = try_unlock(entered, remember=remember)
         if role is None:
             QMessageBox.warning(self, "Access", "Key does not match any configured administrator or developer key.")
         else:
             self._access_unlock_field.clear()
+            write_access_remember_preferred(remember)
+            if not remember:
+                forget_remembered_access()
+        self.access_session_changed.emit()
         self._refresh_access_tab_state()
         self._refresh_pipeline_access_lock()
 
     def _on_access_lock_clicked(self) -> None:
         clear_session()
+        forget_remembered_access()
+        self.access_session_changed.emit()
         self._refresh_access_tab_state()
         self._refresh_pipeline_access_lock()
 

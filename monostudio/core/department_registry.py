@@ -8,6 +8,7 @@ The registry is read-only; mapping is edited only via Project Settings.
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -31,6 +32,34 @@ _DEPARTMENTS_JSON = "departments.json"
 # Shipped default department mapping (monostudio_data/pipeline/department_presets/mono2026_preset.json).
 def _mono2026_preset_path() -> Path:
     return get_app_base_path() / "monostudio_data" / "pipeline" / "department_presets" / "mono2026_preset.json"
+
+
+@lru_cache(maxsize=1)
+def default_preset_department_meta() -> dict[str, dict]:
+    """
+    Shipped mono2026 preset departments (id -> node).
+    Used when project departments.json omits FX children etc. but schedule/history still references them.
+    """
+    data = _read_json_dict_safe(_mono2026_preset_path())
+    raw = data.get("departments") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for dept_id, node in raw.items():
+        did = (dept_id or "").strip()
+        if did and isinstance(node, dict):
+            out[did] = node
+    return out
+
+
+def _read_json_dict_safe(path: Path) -> dict:
+    try:
+        if not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def get_project_pipeline_dir(project_root: Path) -> Path:
@@ -319,17 +348,43 @@ class DepartmentRegistry:
 
     def get_departments(self) -> list[str]:
         """Logical department IDs in order."""
-        return sorted(
-            self._mapping.keys(),
-            key=lambda d: (self._mapping[d].get("order", 999), d),
-        )
+        return self.sort_department_ids(self._mapping.keys())
+
+    def department_sort_key(self, dept_id: str) -> tuple[int, str]:
+        """Sort key from project mapping, else shipped preset order, else last."""
+        did = (dept_id or "").strip()
+        node = self._mapping.get(did)
+        if node:
+            raw = node.get("order", 999)
+            try:
+                order = int(raw)
+            except (TypeError, ValueError):
+                order = 999
+            return (order, did.casefold())
+        preset = default_preset_department_meta().get(did)
+        if preset:
+            try:
+                order = int(preset.get("order", 9999))
+            except (TypeError, ValueError):
+                order = 9999
+            return (order, did.casefold())
+        return (9999, did.casefold())
+
+    def sort_department_ids(self, dept_ids) -> list[str]:
+        """Return unique department ids sorted by registry pipeline order."""
+        uniq = {(d or "").strip() for d in dept_ids if (d or "").strip()}
+        return sorted(uniq, key=self.department_sort_key)
 
     def get_department_label(self, dept_id: str) -> str:
-        """UI label for the department; falls back to dept_id if unknown."""
-        node = self._mapping.get((dept_id or "").strip())
+        """UI label for the department; project mapping, then preset, else id."""
+        did = (dept_id or "").strip()
+        node = self._mapping.get(did)
         if node and isinstance(node.get("label"), str):
             return node["label"].strip()
-        return (dept_id or "").strip() or ""
+        preset = default_preset_department_meta().get(did)
+        if preset and isinstance(preset.get("label"), str):
+            return preset["label"].strip()
+        return did or ""
 
     def is_subdepartment(self, dept_id: str) -> bool:
         """True if this department has a parent (is a subdepartment / leaf task)."""
@@ -338,6 +393,17 @@ class DepartmentRegistry:
             return False
         p = node.get("parent")
         return isinstance(p, str) and bool((p or "").strip())
+
+    def has_child_departments(self, dept_id: str) -> bool:
+        """True if any other department lists this id as parent (grouping node)."""
+        did = (dept_id or "").strip()
+        if not did:
+            return False
+        for node in self._mapping.values():
+            p = node.get("parent")
+            if isinstance(p, str) and (p or "").strip() == did:
+                return True
+        return False
 
     def get_parent(self, dept_id: str) -> str | None:
         """Parent department ID if this is a subdepartment; None otherwise."""

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from datetime import date
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple
 
@@ -82,6 +83,7 @@ from monostudio.ui_qt.inspector_preview_settings import (
     write_inspector_thumbnail_source,
 )
 from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, THUMB_TAG_STYLE, monos_font
+from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators, vertical_icon_separator
 from monostudio.ui_qt.production_status_menu import _menu_status_dot_icon
 from monostudio.ui_qt.production_status_menu import pick_production_status_at
 from monostudio.ui_qt.brand_icons import brand_icon
@@ -104,6 +106,8 @@ from monostudio.core.entity_folders import (
     entity_special_folder_path,
 )
 from monostudio.core.models import Asset, Department, Shot
+from monostudio.core.project_schedule import ProjectSchedule, entity_rel_path, read_project_schedule
+from monostudio.core.schedule_planner import PlannedBar, list_due_display, summarize_entity_schedule
 from monostudio.core.production_status import (
     ProductionStatusRegistry,
     aggregate_status_id_for_item,
@@ -3118,7 +3122,7 @@ class _GridCardDelegate(QStyledItemDelegate):
                 stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
                 shots = "—" if not stats or stats.shots_count is None else str(stats.shots_count)
                 assets = "—" if not stats or stats.assets_count is None else str(stats.assets_count)
-                meta = f"SHOTS {shots}   ASSETS {assets}"
+                meta = f"ASSETS {assets}   SHOTS {shots}"
                 p.setFont(self._font_meta_mono)
                 p.setPen(self._c_text_meta)
                 meta_rect = QRect(x, y_meta, w, _GRID_META_LINE_H)
@@ -3528,6 +3532,7 @@ class MainView(QWidget):
     _SORT_FIELD_NAME = "name"
     _SORT_FIELD_DATE = "date"
     _SORT_FIELD_STATUS = "status"
+    _SORT_FIELD_DUE = "due"
     _THUMBNAIL_SIZE_PX = 512  # backing cache size (square); painted as 16:9 in grid
     _THUMB_STATE_ROLE = PIPELINE_VIEW_THUMB_STATE_ROLE  # per-item state in tile model ("loaded"|"missing")
     _GRID_GAP_PX = 12
@@ -3554,7 +3559,7 @@ class MainView(QWidget):
         self._thumb_prefetch_gen = 0
 
         self._view_mode: str = "tile"
-        self._browser_context: str = "asset"  # "project" | "asset" | "shot"
+        self._browser_context: str = ""  # unset until set_browser_context; "project" | "asset" | "shot"
         self._card_scale_value: float = self._load_card_scale()
         # Header context (read-only)
         self._base_title: str = ""
@@ -3595,7 +3600,7 @@ class MainView(QWidget):
         _sf_raw = str(self._settings.value(self._SETTINGS_KEY_SORT_FIELD, self._SORT_FIELD_NAME) or "").strip().lower()
         self._sort_field: str = (
             _sf_raw
-            if _sf_raw in (self._SORT_FIELD_DATE, self._SORT_FIELD_STATUS)
+            if _sf_raw in (self._SORT_FIELD_DATE, self._SORT_FIELD_STATUS, self._SORT_FIELD_DUE)
             else self._SORT_FIELD_NAME
         )
         self._sort_ascending: bool = bool(self._settings.value(self._SETTINGS_KEY_SORT_ASCENDING, True, type=bool))
@@ -3609,6 +3614,8 @@ class MainView(QWidget):
         self._entity_concept_cache: dict[str, bool] = {}
         # Precomputed list Status column width (pill); avoids resizeColumnToContents × N rows.
         self._list_status_pill_layout_width: int = 0
+        self._schedule_bars: dict[tuple[str, str, str], PlannedBar] = {}
+        self._schedule_data: ProjectSchedule | None = None
 
         header = QWidget(self)
         header.setObjectName("MainViewHeader")
@@ -3751,8 +3758,9 @@ class MainView(QWidget):
         self._btn_grid.clicked.connect(lambda: self.set_view_mode("tile", save=True))
         self._btn_list.clicked.connect(lambda: self.set_view_mode("list", save=True))
 
-        toggle_layout.addWidget(self._btn_grid, 0)
-        toggle_layout.addWidget(self._btn_list, 0)
+        add_widgets_with_icon_separators(
+            toggle_layout, [self._btn_grid, self._btn_list], toggle, sep_height=18
+        )
 
         # Right: Main view options — popup for card size, thumbnail source; room for filter/sort later
         self._main_view_options_popup_closed_at = 0.0
@@ -4017,16 +4025,20 @@ class MainView(QWidget):
         self._sort_by_status.setToolTip(
             "Production status for the focused department (pipeline category order)."
         )
-        for rb in (self._sort_by_name, self._sort_by_date, self._sort_by_status):
+        self._sort_by_due = QRadioButton("Due", self._sort_submenu)
+        self._sort_by_due.setToolTip("Schedule due date (active department, else delivery).")
+        for rb in (self._sort_by_name, self._sort_by_date, self._sort_by_status, self._sort_by_due):
             rb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._sort_field_group.setExclusive(True)
         self._sort_field_group.addButton(self._sort_by_name, 0)
         self._sort_field_group.addButton(self._sort_by_date, 1)
         self._sort_field_group.addButton(self._sort_by_status, 2)
+        self._sort_field_group.addButton(self._sort_by_due, 3)
         self._sort_field_group.idClicked.connect(self._on_sort_field_clicked)
         _sl.addWidget(self._sort_by_name)
         _sl.addWidget(self._sort_by_date)
         _sl.addWidget(self._sort_by_status)
+        _sl.addWidget(self._sort_by_due)
         _sl.addSpacing(2)
         _sort_order_lbl = QLabel("Order", self._sort_submenu)
         _sort_order_lbl.setObjectName("ViewOptionsGroupLabel")
@@ -4228,11 +4240,14 @@ class MainView(QWidget):
 
         header_layout.addWidget(title_row, 0, Qt.AlignVCenter)
         header_layout.addStretch(1)
-        header_layout.addWidget(toggle, 0, Qt.AlignVCenter)
-        header_layout.addStretch(1)
-        header_layout.addWidget(self._btn_main_view_options, 0, Qt.AlignVCenter)
-        header_layout.addWidget(self._btn_search_icon, 0, Qt.AlignVCenter)
-        header_layout.addWidget(self._work_publish_switch, 0, Qt.AlignVCenter)
+        _header_align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
+        header_layout.addWidget(toggle, 0, _header_align)
+        header_layout.addWidget(vertical_icon_separator(header, height=20), 0, Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addWidget(self._btn_main_view_options, 0, _header_align)
+        header_layout.addWidget(vertical_icon_separator(header, height=20), 0, Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addWidget(self._btn_search_icon, 0, _header_align)
+        header_layout.addWidget(vertical_icon_separator(header, height=20), 0, Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addWidget(self._work_publish_switch, 0, _header_align)
 
         self.set_selected_asset_type(None)
         self._work_publish_switch.setVisible(self._browser_context in ("asset", "shot"))
@@ -5215,6 +5230,7 @@ class MainView(QWidget):
             self._reset_thumb_states_and_prefetch()
             self._refresh_list_status_column()
             self._refresh_list_last_updated_column()
+            self._refresh_list_due_column()
             self._list_view.viewport().update()
             if self._items_unfiltered:
                 self._resort_main_view_visible()
@@ -5496,6 +5512,8 @@ class MainView(QWidget):
         self._project_root = path or None
         self._cached_prod_reg = None
         self._cached_prod_reg_root = None
+        self._schedule_bars = {}
+        self._schedule_data = None
         self._prune_filter_status_ids_to_registry()
         self._dept_registry = DepartmentRegistry.for_project(Path(path)) if path else None
         self._grid_delegate.set_active_project_root(self._project_root)
@@ -5507,6 +5525,49 @@ class MainView(QWidget):
         self._update_empty_states()
         self._tile_view.viewport().update()
         self._list_view.viewport().update()
+
+    def set_planned_schedule_bars(
+        self,
+        bars: dict[tuple[str, str, str], PlannedBar] | None,
+        schedule: ProjectSchedule | None = None,
+    ) -> None:
+        self._schedule_bars = dict(bars or {})
+        self._schedule_data = schedule
+        self._refresh_list_due_column()
+
+    def _refresh_list_due_column(self) -> None:
+        if self._browser_context not in ("asset", "shot"):
+            return
+        col = self._list_col_due()
+        if col < 0:
+            return
+        self._list_model.refresh_column_for_all_rows(
+            col, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole]
+        )
+
+    def _list_due_text(self, item: ViewItem) -> tuple[str, bool]:
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)) or not self._project_root:
+            return "—", False
+        schedule = self._schedule_data
+        if schedule is None:
+            try:
+                schedule = read_project_schedule(Path(self._project_root))
+            except OSError:
+                return "—", False
+        kind = "shot" if isinstance(ref, Shot) else "asset"
+        try:
+            rel = entity_rel_path(Path(self._project_root), ref.path)
+        except (OSError, ValueError):
+            rel = ref.path.as_posix()
+        summary = summarize_entity_schedule(
+            self._schedule_bars,
+            schedule,
+            entity_kind=kind,
+            entity_rel=rel,
+            active_department=self._active_department,
+        )
+        return list_due_display(summary, active_department=self._active_department)
 
     def set_inspector_hidden_departments(self, hidden: set[str] | frozenset | None) -> None:
         self._inspector_hidden_departments = set(hidden or ())
@@ -5813,6 +5874,28 @@ class MainView(QWidget):
                 return (cat_idx, rank, label, str(vi.path))
             except Exception:
                 return (999, 999, "waiting", str(vi.path))
+        if field == self._SORT_FIELD_DUE:
+            if not isinstance(vi.ref, (Asset, Shot)) or self._project_root is None:
+                return (1, date.max, "", str(vi.path))
+            kind = "shot" if isinstance(vi.ref, Shot) else "asset"
+            rel = entity_rel_path(Path(self._project_root), vi.ref.path)
+            schedule = self._schedule_data or ProjectSchedule()
+            summary = summarize_entity_schedule(
+                self._schedule_bars,
+                schedule,
+                entity_kind=kind,
+                entity_rel=rel,
+                active_department=self._active_department,
+            )
+            due_txt, _ = list_due_display(summary, active_department=self._active_department)
+            name_key = (vi.ref.name or "").casefold()
+            if due_txt == "—":
+                return (1, date.max, name_key, str(vi.path))
+            try:
+                due_d = date.fromisoformat(due_txt[:10])
+                return (0, due_d, name_key, str(vi.path))
+            except ValueError:
+                return (1, date.max, name_key, str(vi.path))
         if isinstance(vi.ref, Asset):
             return (vi.ref.asset_type, (vi.ref.name or "").casefold(), str(vi.path))
         if isinstance(vi.ref, Shot):
@@ -6587,6 +6670,7 @@ class MainView(QWidget):
             self._SORT_FIELD_NAME: 0,
             self._SORT_FIELD_DATE: 1,
             self._SORT_FIELD_STATUS: 2,
+            self._SORT_FIELD_DUE: 3,
         }
         field_btn = self._sort_field_group.button(by_field.get(self._sort_field, 0))
         order_btn = self._sort_order_group.button(0 if self._sort_ascending else 1)
@@ -6594,6 +6678,7 @@ class MainView(QWidget):
             self._sort_by_name,
             self._sort_by_date,
             self._sort_by_status,
+            self._sort_by_due,
             self._sort_ascending_rb,
             self._sort_descending_rb,
         ):
@@ -6606,13 +6691,19 @@ class MainView(QWidget):
             self._sort_by_name,
             self._sort_by_date,
             self._sort_by_status,
+            self._sort_by_due,
             self._sort_ascending_rb,
             self._sort_descending_rb,
         ):
             w.blockSignals(False)
 
     def _on_sort_field_clicked(self, button_id: int) -> None:
-        by_id = {0: self._SORT_FIELD_NAME, 1: self._SORT_FIELD_DATE, 2: self._SORT_FIELD_STATUS}
+        by_id = {
+            0: self._SORT_FIELD_NAME,
+            1: self._SORT_FIELD_DATE,
+            2: self._SORT_FIELD_STATUS,
+            3: self._SORT_FIELD_DUE,
+        }
         field = by_id.get(int(button_id), self._SORT_FIELD_NAME)
         if field == self._sort_field:
             return
@@ -6700,7 +6791,7 @@ class MainView(QWidget):
 
     def _list_headers(self) -> list[str]:
         if self._browser_context == "project":
-            return ["", "", "Name", "Status", "Shots", "Assets", "Last Updated", "Path"]
+            return ["", "", "Name", "Status", "Assets", "Shots", "Last Updated", "Path"]
         return [
             "",
             "",
@@ -6711,6 +6802,7 @@ class MainView(QWidget):
             "Ref",
             "Concept",
             "Status",
+            "Due",
             "Version",
             "Last Updated",
             "Assignee",
@@ -6750,11 +6842,16 @@ class MainView(QWidget):
             return 3
         return 8
 
+    def _list_col_due(self) -> int:
+        if self._browser_context != "project":
+            return 9
+        return -1
+
     def _list_col_last_updated(self) -> int:
-        """Column index for Last Updated (project: 6, asset/shot: 10)."""
+        """Column index for Last Updated (project: 6, asset/shot: 11)."""
         if self._browser_context == "project":
             return 6
-        return 10
+        return 11
 
     def _list_version_text(self, item: ViewItem) -> str:
         """Version string for list: work or publish version for active department."""
@@ -6888,6 +6985,9 @@ class MainView(QWidget):
         if mode == self._view_mode:
             if save:
                 self._settings.setValue(self._settings_key_view_mode(), mode)
+            # Still sync toggle pills when mode unchanged (startup restore may match default).
+            self._btn_grid.setChecked(mode == "tile")
+            self._btn_list.setChecked(mode == "list")
             return
         self._view_mode = mode
         if mode != "tile":

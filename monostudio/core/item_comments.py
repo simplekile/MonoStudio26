@@ -2,26 +2,44 @@
 Per-item notes / feedback for assets and shots.
 
 Stored at <item_root>/.monostudio/item_comments.json
-Schema v2: { "schema": 2, "entries": [ { id, at, author, text, done, done_at? }, ... ] }
+Schema v3: rich body_html, mentions, author_id; inline images under note_media/
 """
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from getpass import getuser
+from html import unescape
 from pathlib import Path
 from typing import Callable
 
 from monostudio.core.atomic_write import atomic_write_text
 
 COMMENTS_FILENAME = "item_comments.json"
-COMMENTS_SCHEMA = 2
+COMMENTS_SCHEMA = 3
+NOTE_MEDIA_DIR = "note_media"
 _MAX_ENTRIES = 200
 _MAX_TEXT_LEN = 4000
+_MAX_HTML_LEN = 200_000
 _WRITE_RETRIES = 5
+_IMAGE_PLACEHOLDER = "[image]"
+
+_MENTION_DATA_RE = re.compile(r'data-user-id="([^"]+)"', re.IGNORECASE)
+# Qt QTextDocument.toHtml() drops custom attributes; mentions use anchor href instead.
+_MENTION_HREF_RE = re.compile(r'href="mention:([^"]+)"', re.IGNORECASE)
+_MENTION_HASH_HREF_RE = re.compile(r'href="#mention-([^"]+)"', re.IGNORECASE)
+_MENTION_TOKEN_RE = re.compile(r"@([a-zA-Z0-9_]+)")
+
+MENTION_HREF_PREFIX = "mention:"
+_TAG_RE = re.compile(r"<[^>]+>")
+_STYLE_BLOCK_RE = re.compile(r"(?is)<style[^>]*>.*?</style>")
+_HEAD_BLOCK_RE = re.compile(r"(?is)<head[^>]*>.*?</head>")
+_SCRIPT_BLOCK_RE = re.compile(r"(?is)<script[^>]*>.*?</script>")
 
 
 @dataclass(frozen=True)
@@ -32,6 +50,9 @@ class ItemCommentEntry:
     text: str
     done: bool = False
     done_at: str | None = None
+    author_id: str | None = None
+    body_html: str = ""
+    mentions: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -43,7 +64,87 @@ class ItemCommentEntry:
         }
         if self.done_at:
             d["done_at"] = self.done_at
+        if self.author_id:
+            d["author_id"] = self.author_id
+        if self.body_html:
+            d["body_html"] = self.body_html
+        if self.mentions:
+            d["mentions"] = list(self.mentions)
         return d
+
+
+def note_media_root(item_root: Path) -> Path:
+    return Path(item_root) / ".monostudio" / NOTE_MEDIA_DIR
+
+
+def note_media_entry_dir(item_root: Path, entry_id: str) -> Path:
+    return note_media_root(item_root) / (entry_id or "").strip()
+
+
+def delete_note_media(item_root: Path, entry_id: str) -> None:
+    """Remove all media files for a note entry (best-effort)."""
+    d = note_media_entry_dir(item_root, entry_id)
+    if not d.is_dir():
+        return
+    try:
+        shutil.rmtree(d)
+    except OSError:
+        pass
+
+
+def strip_html_preview(html: str, *, max_len: int = _MAX_TEXT_LEN) -> str:
+    """Plain text for previews/search; images become [image]."""
+    s = html or ""
+    if not s.strip():
+        return ""
+    s = _STYLE_BLOCK_RE.sub(" ", s)
+    s = _HEAD_BLOCK_RE.sub(" ", s)
+    s = _SCRIPT_BLOCK_RE.sub(" ", s)
+    s = re.sub(r"(?is)<!DOCTYPE[^>]*>", " ", s)
+    s = re.sub(r"(?is)</?(?:html|body)[^>]*>", " ", s)
+    s = re.sub(r"<img\b[^>]*>", f" {_IMAGE_PLACEHOLDER} ", s, flags=re.IGNORECASE)
+    s = _TAG_RE.sub(" ", s)
+    s = unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        s = s[: max_len - 1].rstrip() + "…"
+    return s
+
+
+def entry_preview_text(entry: ItemCommentEntry, *, max_chars: int = _MAX_TEXT_LEN) -> str:
+    """Human-readable one-line preview for cards, dashboard, list metadata."""
+    if (entry.body_html or "").strip():
+        preview = strip_html_preview(entry.body_html, max_len=max_chars)
+        if preview:
+            return preview
+    return (entry.text or "").replace("\n", " ").strip()[:max_chars]
+
+
+def mention_href_for_user(user_id: str) -> str:
+    """Anchor href stored in note HTML (survives QTextDocument.toHtml)."""
+    return f"{MENTION_HREF_PREFIX}{(user_id or '').strip()}"
+
+
+def parse_mentions_from_html(html: str) -> tuple[str, ...]:
+    """Extract roster user ids from mention anchors / legacy data-user-id spans."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    src = html or ""
+
+    def _add(uid: str) -> None:
+        u = uid.strip()
+        if u and u not in seen:
+            seen.add(u)
+            ids.append(u)
+
+    for pattern in (_MENTION_HREF_RE, _MENTION_HASH_HREF_RE, _MENTION_DATA_RE):
+        for m in pattern.finditer(src):
+            _add(m.group(1))
+    return tuple(ids)
+
+
+def new_entry_id() -> str:
+    return uuid.uuid4().hex[:16]
 
 
 def _comments_path(item_root: Path) -> Path:
@@ -59,11 +160,19 @@ def _parse_entry(raw: object) -> ItemCommentEntry | None:
         return None
     eid = str(raw.get("id") or "").strip()
     at = str(raw.get("at") or "").strip()
-    text = str(raw.get("text") or "").strip()
     if not eid or not at:
         return None
-    text = text[:_MAX_TEXT_LEN]
+    body_html = str(raw.get("body_html") or "").strip()[:_MAX_HTML_LEN]
+    text_raw = str(raw.get("text") or "").strip()
+    if body_html:
+        text = strip_html_preview(body_html) or text_raw[:_MAX_TEXT_LEN]
+    else:
+        text = text_raw[:_MAX_TEXT_LEN]
+    if not text and not body_html:
+        return None
     author = str(raw.get("author") or "").strip()[:200]
+    author_id_raw = raw.get("author_id")
+    author_id = str(author_id_raw).strip()[:64] if author_id_raw else None
     done = bool(raw.get("done"))
     done_at = raw.get("done_at")
     done_at_s = str(done_at).strip()[:64] if done_at else None
@@ -71,7 +180,23 @@ def _parse_entry(raw: object) -> ItemCommentEntry | None:
         done_at_s = at
     if not done:
         done_at_s = None
-    return ItemCommentEntry(id=eid, at=at, author=author, text=text, done=done, done_at=done_at_s)
+    mentions_raw = raw.get("mentions")
+    mentions: tuple[str, ...] = ()
+    if isinstance(mentions_raw, list):
+        mentions = tuple(str(x).strip() for x in mentions_raw if str(x).strip())
+    elif body_html:
+        mentions = parse_mentions_from_html(body_html)
+    return ItemCommentEntry(
+        id=eid,
+        at=at,
+        author=author,
+        text=text,
+        done=done,
+        done_at=done_at_s,
+        author_id=author_id,
+        body_html=body_html,
+        mentions=mentions,
+    )
 
 
 def _read_raw(item_root: Path) -> dict | None:
@@ -120,10 +245,6 @@ def count_open_notes(item_root: Path) -> int:
 
 
 def notes_badge_visual_mode(item_root: Path) -> tuple[int, str]:
-    """
-    Return (open_count, mode) for thumbnail badge painting.
-    mode: "empty" — no entries; "open" — at least one not done; "all_done" — entries exist and all done.
-    """
     entries = read_item_comments(item_root)
     if not entries:
         return (0, "empty")
@@ -134,16 +255,12 @@ def notes_badge_visual_mode(item_root: Path) -> tuple[int, str]:
 
 
 def latest_note_preview_line(item_root: Path, *, max_chars: int = 96) -> tuple[str, bool]:
-    """
-    Most recent note by `at`; single line for tile metadata.
-    Returns (preview, done) — preview empty if no notes or empty text; done is the entry's flag.
-    """
     entries = read_item_comments(Path(item_root))
     if not entries:
         return ("", False)
     last = entries[-1]
     done = bool(last.done)
-    text = (last.text or "").replace("\n", " ").strip()
+    text = entry_preview_text(last, max_chars=max_chars)
     if not text:
         return ("", done)
     if len(text) > max_chars:
@@ -151,25 +268,40 @@ def latest_note_preview_line(item_root: Path, *, max_chars: int = 96) -> tuple[s
     return (text, done)
 
 
-def new_comment_entry(text: str, *, author: str | None = None) -> ItemCommentEntry:
+def new_comment_entry(
+    text: str,
+    *,
+    author: str | None = None,
+    author_id: str | None = None,
+    body_html: str = "",
+    mentions: tuple[str, ...] | None = None,
+    entry_id: str | None = None,
+) -> ItemCommentEntry:
     """In-memory entry for new note (before save batch)."""
-    t = (text or "").strip()
-    if not t:
+    html = (body_html or "").strip()[:_MAX_HTML_LEN]
+    plain = (text or "").strip()
+    if html and not plain:
+        plain = strip_html_preview(html)
+    if not plain and not html:
         raise ValueError("comment text must be non-empty")
-    t = t[:_MAX_TEXT_LEN]
+    plain = plain[:_MAX_TEXT_LEN]
     auth = (author or "").strip() or (getuser() or "").strip()
+    aid = (author_id or "").strip() or None
+    mids = mentions if mentions is not None else parse_mentions_from_html(html)
     return ItemCommentEntry(
-        id=uuid.uuid4().hex[:16],
+        id=(entry_id or new_entry_id()),
         at=_utc_now_iso(),
         author=auth,
-        text=t,
+        text=plain,
         done=False,
         done_at=None,
+        author_id=aid,
+        body_html=html,
+        mentions=tuple(mids),
     )
 
 
 def write_item_comments(item_root: Path, entries: list[ItemCommentEntry]) -> None:
-    """Replace on-disk comment file with the given list (normalized, capped)."""
     _write_payload(Path(item_root), entries)
 
 
@@ -186,7 +318,6 @@ def _atomic_update(
     item_root: Path,
     updater: Callable[[list[ItemCommentEntry]], list[ItemCommentEntry]],
 ) -> None:
-    """Read latest disk → updater → write if changed; retry on OSError."""
     root = Path(item_root)
     last_exc: OSError | None = None
     for attempt in range(_WRITE_RETRIES):
@@ -205,20 +336,7 @@ def _atomic_update(
 
 
 def append_item_comment(item_root: Path, text: str, *, author: str | None = None) -> None:
-    t = (text or "").strip()
-    if not t:
-        raise ValueError("comment text must be non-empty")
-    t = t[:_MAX_TEXT_LEN]
-    auth = (author or "").strip() or (getuser() or "").strip()
-    new_id = uuid.uuid4().hex[:16]
-    new_entry = ItemCommentEntry(
-        id=new_id,
-        at=_utc_now_iso(),
-        author=auth,
-        text=t,
-        done=False,
-        done_at=None,
-    )
+    new_entry = new_comment_entry(text, author=author)
 
     def updater(cur: list[ItemCommentEntry]) -> list[ItemCommentEntry]:
         if any(e.id == new_entry.id for e in cur):
@@ -235,6 +353,7 @@ def delete_item_comment(item_root: Path, comment_id: str) -> None:
     root = Path(item_root)
     if not any(e.id == cid for e in read_item_comments(root)):
         raise ValueError("comment not found")
+    delete_note_media(root, cid)
 
     def updater(cur: list[ItemCommentEntry]) -> list[ItemCommentEntry]:
         return [e for e in cur if e.id != cid]
@@ -261,9 +380,9 @@ def set_item_comment_done(item_root: Path, comment_id: str, done: bool) -> None:
             if bool(e.done) == done_flag:
                 return cur
             if done_flag:
-                out.append(ItemCommentEntry(id=e.id, at=e.at, author=e.author, text=e.text, done=True, done_at=now))
+                out.append(replace(e, done=True, done_at=now))
             else:
-                out.append(ItemCommentEntry(id=e.id, at=e.at, author=e.author, text=e.text, done=False, done_at=None))
+                out.append(replace(e, done=False, done_at=None))
         return out
 
     _atomic_update(root, updater)

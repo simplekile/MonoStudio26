@@ -11,7 +11,11 @@ from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
-from monostudio.core.access_control import read_splash_display_ms, read_verbose_debug_enabled
+from monostudio.core.access_control import (
+    read_splash_display_ms,
+    read_verbose_debug_enabled,
+    restore_remembered_access,
+)
 from monostudio.core.app_paths import get_app_base_path, write_install_path_for_tools
 from monostudio.core.crash_recovery import install_crash_logging
 from monostudio.core.pipeline_types_and_presets import ensure_user_default_config_dir
@@ -154,6 +158,7 @@ def main() -> int:
     # These application attributes are deprecated and emit warnings in Qt6.
 
     app = QApplication(sys.argv)
+    restore_remembered_access()
 
     _boot_settings = QSettings("MonoStudio26", "MonoStudio26")
     _splash_display_ms = read_splash_display_ms(_boot_settings)
@@ -235,6 +240,7 @@ def main() -> int:
             _splash_timer.stop()
             window.show()
             splash.finish(window)
+            window.complete_startup()
 
     _splash_timer = QTimer(splash)
     _splash_timer.timeout.connect(_tick_splash)

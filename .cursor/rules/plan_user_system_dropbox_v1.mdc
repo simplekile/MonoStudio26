@@ -1,0 +1,326 @@
+---
+description: Plan hệ thống User (không server) — danh bạ studio chia sẻ qua Dropbox + danh tính cục bộ mỗi máy.
+alwaysApply: false
+---
+
+# Plan: Hệ thống User serverless qua Dropbox (v1)
+
+Mục tiêu: cho phép nhiều artist dùng chung pipeline mà **không có server / database / auth**. Mọi người mở **cùng workspace nằm trong thư mục Dropbox** (đã sync). App cần biết **"tôi là ai"** để hiển thị (Welcome back, gán author cho note, gán assignee cho task…), và có một **danh bạ (roster) studio dùng chung** để chuẩn hóa tên/màu/role.
+
+> Đây là mô hình **tin tưởng (trust-based)**, **không bảo mật**: ai sửa được file Dropbox đều có thể giả danh. Phù hợp studio nhỏ. Phần "khóa quyền" thật sự vẫn là `access_control.py` (admin/dev key), tách biệt khỏi danh tính.
+
+---
+
+## 1. Bối cảnh hiện tại
+
+- **Không server**: project + workspace nằm trong Dropbox (sync). `workspace_root` là thư mục cha chứa nhiều project (`discover_projects`), cũng được sync.
+- **"User" hiện tại** = OS username (`getpass.getuser()`), dùng làm `author` trong `item_comments.json`. Không có danh tính thật.
+- **Phân tầng lưu trữ** (rất quan trọng cho thiết kế):
+  | Vị trí | Phạm vi | Sync Dropbox? |
+  |---|---|---|
+  | `monostudio_data/config/app_settings.json` (cạnh app) | Cục bộ từng máy | ❌ Không |
+  | `QSettings` (registry/INI) | Cục bộ từng máy | ❌ Không |
+  | `workspace_root/.monostudio/` | Cả studio (mọi project) | ✅ Có |
+  | `project_root/.monostudio/` | Trong 1 project | ✅ Có |
+- Đã có sẵn: `monostudio/core/atomic_write.py` (ghi an toàn), `monostudio/core/user_identity.py` (seam `get_current_user_display_name()` — hiện trả OS name, sẽ mở rộng theo plan này).
+
+---
+
+## 2. Mô hình 2 lớp
+
+### Lớp A — Danh bạ studio (shared, qua Dropbox)
+Danh sách user dùng chung cho cả studio. **Vị trí**: `workspace_root/.monostudio/users.json` (sync). Một file cho mọi project trong workspace.
+
+> Lý do chọn workspace-level (không phải project-level): cùng team làm nhiều project; danh bạ là tài sản studio, không lặp lại theo từng project. Nếu chưa chọn workspace → fallback OS name (xem §6).
+
+### Lớp B — Danh tính cục bộ (local, mỗi máy)
+"Trên máy này tôi là user nào trong danh bạ". **Lưu cục bộ** trong `app_settings.json` (KHÔNG sync), key `current_user_id`. Dùng làm **pin/override** thủ công (chủ yếu cho máy dùng chung); không ghi vào Dropbox để tránh đụng nhau.
+
+### Lớp C — Device fingerprint (auto-resolve, lưu trong roster shared)
+Mỗi user trong roster lưu thêm danh sách **device fingerprint**. Máy mở workspace tự tính fingerprint của mình và tra ngược ra user → **bỏ bước chọn** trong trường hợp phổ biến (1 artist = 1 máy), và **tự lành** khi mất `app_settings.json` / cài lại app (vì mapping nằm trong roster shared). Đây là lớp *auto-chọn người*, **không thay thế** `id` làm đơn vị danh tính. Chi tiết §6.1.
+
+---
+
+## 3. Schema `users.json` (shared)
+
+`workspace_root/.monostudio/users.json`:
+
+```json
+{
+  "schema": 1,
+  "updated_at": "2026-06-02T01:50:00Z",
+  "users": [
+    {
+      "id": "u_8f3a1c",
+      "name": "Tachi",
+      "email": "",
+      "color_hex": "#3b82f6",
+      "role": "artist",
+      "departments": ["model", "lookdev"],
+      "active": true,
+      "created_at": "2026-06-01T10:00:00Z",
+      "devices": [
+        { "fp": "d_1a2b3c4d5e6f", "label": "TACHI-PC / DTA PC", "added_at": "2026-06-01T10:05:00Z" }
+      ]
+    }
+  ]
+}
+```
+
+- `devices[]`: fingerprint của các máy đã đăng ký cho user (xem §6.1). 1 fingerprint chỉ nên thuộc **đúng 1** user (nếu trùng → coi như mơ hồ, không auto-chọn).
+
+- `id`: ổn định, không đổi (vd `"u_" + uuid4().hex[:6]`). Mọi dữ liệu tham chiếu user bằng `id`, không bằng `name`.
+- `name`: tên hiển thị (đổi được mà không vỡ liên kết).
+- `color_hex`: màu nhận diện (avatar/initials, chip assignee). Theo bảng màu MONOS.
+- `role`: nhãn hiển thị/gợi ý gán việc (`artist|lead|supervisor|producer|...`) — **không** phải security.
+- `departments`: gợi ý lọc/gán theo `DepartmentRegistry` (tùy chọn).
+- `active`: false = nghỉ/ẩn khỏi picker nhưng vẫn resolve được tên cho dữ liệu cũ.
+
+---
+
+## 4. Module `user_identity.py` (mở rộng seam hiện có)
+
+API đề xuất (mở rộng `monostudio/core/user_identity.py`):
+
+```python
+@dataclass(frozen=True)
+class StudioUser:
+    id: str; name: str; email: str; color_hex: str
+    role: str; departments: tuple[str, ...]; active: bool; created_at: str
+
+# Roster (shared, workspace-level)
+def users_file(workspace_root: Path) -> Path                      # <ws>/.monostudio/users.json
+def read_roster(workspace_root: Path) -> list[StudioUser]         # [] nếu thiếu/hỏng
+def write_roster(workspace_root: Path, users: list[StudioUser])   # atomic_write + cập nhật updated_at
+def upsert_user(workspace_root, user) -> StudioUser               # thêm/sửa theo id
+def deactivate_user(workspace_root, user_id) -> None              # active=False (không xóa)
+def get_user(workspace_root, user_id) -> StudioUser | None
+
+# Danh tính cục bộ (local pin, app_settings.json)
+def get_current_user_id() -> str | None
+def set_current_user_id(user_id: str | None) -> None
+
+# Device fingerprint (auto-resolve, §6.1)
+def device_fingerprint() -> str                                  # "d_" + sha256(machineguid+host)[:12]
+def device_label() -> str                                        # "HOST / osuser" (để hiển thị)
+def find_user_by_device(workspace_root, fp) -> StudioUser | None # None nếu 0 hoặc >1 match (mơ hồ)
+def register_device(workspace_root, user_id, *, fp=None, label=None) -> None  # gắn fp vào user — ĐỘC QUYỀN: gỡ fp khỏi mọi user khác trước (giữ 1:1), atomic
+def forget_device(workspace_root, *, user_id=None, fp=None) -> None           # gỡ hẳn fp khỏi roster (mặc định fp của máy hiện tại), atomic
+
+# Resolve dùng khắp nơi (đã có get_current_user_display_name, nâng cấp)
+def get_current_user(workspace_root: Path | None) -> StudioUser | None
+def get_current_user_display_name(workspace_root: Path | None = None) -> str
+def resolve_user_name(workspace_root, user_id, *, fallback: str = "") -> str
+```
+
+Quy tắc resolve `get_current_user` (thứ tự ưu tiên):
+1. **Local pin**: `current_user_id` đã set & còn trong roster → user đó (override, cho máy dùng chung).
+2. **Device fingerprint**: `find_user_by_device(ws, device_fingerprint())` khớp đúng 1 user active → user đó.
+3. Không có → `None`; `get_current_user_display_name` fallback **OS username** (`getuser()`), cuối cùng `"Artist"`.
+
+Ghi/đọc `current_user_id`: dùng chung helper đọc/ghi `app_settings.json` (giống cách `main_window` đọc geometry) — thêm vào `app_settings.json`, không động vào QSettings để gom 1 chỗ "local app config".
+
+---
+
+## 5. UI
+
+### 5.1 Identity Picker (lần đầu / đổi user)
+- Dialog `UserIdentityDialog` (theo `MonosDialog`, rule round-corner + dialog UI):
+  - Danh sách user `active` trong roster (avatar initials + màu + tên + role).
+  - Nút **"+ Tôi không có trong danh sách"** → tạo user mới (name, color tự gợi ý, role mặc định `artist`) → `upsert_user` + chọn luôn.
+  - Chọn 1 user → `register_device(ws, id)` (gắn fingerprint máy này) để lần sau **tự nhận**. Tùy chọn checkbox "Máy dùng chung — chỉ nhớ phiên này" → set local pin thay vì đăng ký device.
+- **Khi gọi**:
+  - Sau khi `_apply_workspace_root` thành công mà `get_current_user(ws)` trả `None` (không pin, không khớp device) → mở picker (không chặn nếu user bỏ qua → fallback OS name).
+  - Lệnh "Switch user…" (xem 5.3) — đổi sang người khác sẽ **set local pin** (đè fingerprint cho máy chung).
+
+### 5.2 Quản lý Team (admin) — Settings
+- Tab mới **Settings → Team** (chỉ bật khi `is_admin_capable()`):
+  - Bảng user (Tier theo `table_deep_dark_monos_v1`): Name, Role, Departments, Active.
+  - Thêm/sửa/deactivate. Ghi `users.json` qua `write_roster` (atomic).
+- Non-admin: chỉ xem (read-only) hoặc ẩn tab.
+
+### 5.3 Hiển thị danh tính + Logout / Forget device
+- **Top bar / sidebar**: avatar tròn (initials + `color_hex`) của current user; click → menu:
+  - **Switch user…** → mở picker; chọn người khác = **set local pin** (đè fingerprint, cho máy chung). Không đụng roster.
+  - **Clear identity (logout)** → `set_current_user_id(None)` (chỉ xóa local pin). **Giữ** device binding → lần sau vẫn auto-nhận theo fingerprint, hoặc về owner đã đăng ký. KHÔNG ghi roster.
+  - **Forget this device** (mục riêng, có xác nhận) → `forget_device(ws)` gỡ `fp` của máy này khỏi roster (ghi shared). Dùng khi sang nhượng/dọn máy hoặc không muốn auto-login nữa.
+  - **Edit my profile…** → sửa name/color/role của chính mình trong roster.
+- **Phân biệt rõ**: *logout = local, nhẹ, thường xuyên*; *forget device = shared, có chủ đích, hiếm*. Không gộp 2 thứ.
+- **Dashboard**: `Welcome back, {current_user.name} 👋` — đã wire qua `get_current_user_display_name()` (hiện dùng OS name; sẽ tự đúng khi roster + picker xong, không cần sửa dashboard nữa).
+
+---
+
+## 6. Fallback & trạng thái thiếu
+
+| Tình huống | Hành vi |
+|---|---|
+| Chưa chọn `workspace_root` | `current user` = OS name; không có roster; mọi nơi vẫn chạy. |
+| `users.json` thiếu/hỏng | roster rỗng; current = OS name; admin có thể tạo mới (tạo file). |
+| Local pin & device fp đều không khớp roster | Fallback OS name + nhắc chọn lại ở lần mở picker kế tiếp. |
+| Mất `app_settings.json` (không còn pin) | **Device fingerprint tự nhận lại** → không cần chọn lại (lợi ích chính của Lớp C). |
+| Cài lại OS (đổi MachineGuid) | Device fp mới → coi như máy lạ → picker 1 lần → đăng ký lại. |
+| Máy dùng chung / 1 fp map ≥2 user | `find_user_by_device` trả `None` (mơ hồ) → dùng local pin / picker. |
+| **Logout (Clear identity)** | Xóa local pin, **giữ** device binding → lần sau auto-nhận lại owner; không ghi roster. |
+| **Forget this device** | Gỡ `fp` khỏi roster (shared) → máy thành "lạ" → picker lần sau. |
+| Người khác đăng nhập đầy đủ (register) trên máy đã có chủ | `register_device` chuyển `fp` sang chủ mới (gỡ chủ cũ) — 1:1. |
+| Đổi workspace khác | Re-resolve theo roster workspace đó (pin/fp có thể không tồn tại → fallback). |
+
+---
+
+### 6.1 Device fingerprint (chi tiết)
+
+**Tính fingerprint (ổn định, không phải để bảo mật):**
+
+```python
+import hashlib, socket
+from getpass import getuser
+
+def _machine_guid() -> str:
+    # Windows: HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid (ổn định theo bản cài OS)
+    try:
+        import winreg
+        flags = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Cryptography", 0, flags) as k:
+            return winreg.QueryValueEx(k, "MachineGuid")[0]
+    except Exception:
+        return ""
+
+def device_fingerprint() -> str:
+    host = socket.gethostname() or ""
+    raw = f"{_machine_guid()}|{host}".strip("|")
+    if not raw:                       # cực hiếm: không có gì ổn định
+        raw = getuser() or "unknown"
+    return "d_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+def device_label() -> str:
+    return f"{socket.gethostname() or '?'} / {getuser() or '?'}"
+```
+
+**Nguyên tắc:**
+- Hash để **không** lộ hostname/GUID thô trong file shared (đỡ lo ngại privacy), `label` mới là phần người đọc.
+- **MAC address: không dùng** (đổi theo VPN/NIC/randomization → kém ổn định).
+- 1 `fp` chỉ thuộc 1 user; `find_user_by_device` trả `None` nếu khớp 0 hoặc >1 (mơ hồ) → để pin/picker xử lý.
+- `register_device` **độc quyền**: gỡ `fp` khỏi `devices[]` của mọi user khác **trước**, rồi thêm `{fp,label,added_at}` vào user đích → `write_roster` atomic. Giữ ánh xạ **1:1** và tự xử lý "tiếp quản máy của người khác". **Chỉ ghi khi đổi chủ thật**, không ghi định kỳ.
+- **Logout ≠ forget**: logout chỉ xóa local pin (không đụng roster); `forget_device` mới gỡ `fp` khỏi roster. Tránh ghi shared mỗi lần logout (giảm conflict) và giữ auto-detect cho lần sau.
+- **Bảo mật**: fingerprint **không** chống giả danh (chép được vào roster). Giữ tinh thần trust-based; quyền thật vẫn ở `access_control.py`.
+
+## 7. Đồng bộ / xung đột qua Dropbox (không lock)
+
+- **Ghi `users.json`**: luôn `atomic_write` (ghi temp + replace) để không để file rách giữa lúc Dropbox sync.
+- **Không có file-lock**: chấp nhận **last-write-wins** cho roster (hiếm sửa, thường 1 admin). Đọc-sửa-ghi nhanh; nếu 2 admin sửa cùng lúc, Dropbox tạo file `users (conflicted copy ...).json` → tài liệu hóa: admin merge tay (hiếm).
+- **`current_user_id` ở local** nên **không bao giờ đụng** giữa các máy (đây là điểm mấu chốt của thiết kế serverless).
+- Tránh ghi `users.json` định kỳ/tự động; chỉ ghi khi admin chủ động sửa.
+
+---
+
+## 8. Gắn danh tính vào dữ liệu (theo từng giai đoạn)
+
+- **Notes (`item_comments.json`)**: hiện lưu `author` = chuỗi tên. Nâng v3 (tùy chọn, backward-compat):
+  - Thêm `author_id` (id roster) + giữ `author` (tên cache để hiển thị khi offline/đổi tên).
+  - Khi ghi: `author_id = get_current_user_id()`, `author = current_user.name or OS name`.
+  - Đọc cũ (không có `author_id`) → hiển thị `author` như cũ.
+  - Cập nhật `new_comment_entry` / `append_item_comment` để dùng `user_identity` thay `getuser()` trực tiếp.
+- **Schedule (assignee)**: nếu sau này gán việc cho người → lưu `assignee_id` (roster id) trong allocation/bar. Hiển thị chip màu `color_hex`.
+- Nguyên tắc: **lưu `id`, hiển thị `name` resolve từ roster** (đổi tên không vỡ dữ liệu).
+
+---
+
+## 9. Quan hệ với `access_control.py` (tách bạch)
+
+- `access_control` = **năng lực phiên** (admin/dev) mở bằng key bundled → quyết định *được làm gì* (vd hiện tab Team, xóa vĩnh viễn…).
+- `user_identity` = **danh tính** → quyết định *là ai* (hiển thị, author, assignee).
+- Hai thứ độc lập: một máy admin-capable vẫn có danh tính riêng; danh tính `role` chỉ là nhãn, không cấp quyền.
+
+---
+
+## 10. Thứ tự triển khai
+
+1. **Core roster + local pin + device fingerprint** trong `user_identity.py`: `StudioUser` (kèm `devices`), đọc/ghi `users.json` (atomic), `get/set_current_user_id`, `device_fingerprint`/`device_label`/`find_user_by_device`/`register_device`, nâng `get_current_user(ws)` (pin → fp → None) + `get_current_user_display_name`/`resolve_user_name`. (Dashboard đã sẵn sàng nhận đúng tên.)
+2. **Identity Picker dialog** + gọi sau `_apply_workspace_root` khi `get_current_user(ws)` là `None`; chọn xong `register_device` (hoặc pin nếu máy chung); truyền `workspace_root` vào dashboard (setter mới) để hiển thị tên theo roster.
+3. **Avatar + "Switch user" menu** ở top bar/sidebar.
+4. **Settings → Team** (admin) quản lý roster.
+5. **Notes v3** (author_id) + route `item_comments` qua `user_identity`.
+6. (Sau) **assignee** trong Schedule.
+
+---
+
+## 11. Các file dự kiến
+
+| Khu vực | File |
+|---|---|
+| Core | `monostudio/core/user_identity.py` (mở rộng: roster + current id + resolve), dùng `atomic_write`. |
+| Config local | Helper đọc/ghi `current_user_id` trong `monostudio_data/config/app_settings.json` (gom chung với code geometry trong `main_window` hoặc tách `app_config.py` nhẹ). |
+| UI dialog | `monostudio/ui_qt/user_identity_dialog.py` (picker + tạo nhanh). |
+| UI settings | Tab Team trong `settings_dialog` (admin-only). |
+| UI hiển thị | Avatar/menu ở `top_bar.py`/`sidebar.py`; `dashboard_page_widget.py` (đã xong welcome). |
+| Tích hợp | `main_window.py`: gọi picker sau workspace_root, truyền workspace_root cho dashboard; `item_comments.py`: dùng `user_identity`. |
+
+---
+
+## 12. Không làm (trong v1)
+
+- Không file-lock / khóa phân tán cho `users.json`.
+- Không đồng bộ session đăng nhập qua Dropbox (cố ý giữ local).
+- Không tự xóa user (chỉ `active=false`) để dữ liệu cũ còn resolve được tên.
+
+---
+
+## 13. Mở rộng v2 — Avatar, Mật khẩu, Admin duyệt tạo tài khoản
+
+Bổ sung/ghi đè một phần §3/§5/§6. Vẫn serverless; "bảo mật" là **soft gate** (file Dropbox ai cũng đọc/ghi được) — chống mạo danh tình cờ và tạo tài khoản bừa, **không** chống tấn công chủ đích. Quyền thật vẫn ở `access_control` (admin/dev key bundled).
+
+### 13.1 Schema bổ sung cho `StudioUser`
+- `pwd_hash`: PBKDF2-HMAC-SHA256 dạng `pbkdf2_sha256$<iters>$<salt_hex>$<hash_hex>` (rỗng = chưa đặt).
+- `avatar`: tên file ảnh dưới `<workspace>/.monostudio/avatars/` (vd `u_xxx.png`), rỗng = dùng initials.
+- Avatar lưu **shared** (Dropbox) để cả team thấy; load qua `avatar_path(ws, user)`, fallback initials.
+
+### 13.2 Mật khẩu & đăng nhập
+- `hash_password(pw)` / `verify_password(pw, stored)` bằng `hashlib.pbkdf2_hmac` (stdlib, không thêm dependency).
+- **Đăng nhập**: chọn user → nhập mật khẩu → `verify_password`. Đúng → tạo **session**.
+- User chưa có `pwd_hash` (vd vừa approve): bắt **đặt mật khẩu** ở lần đăng nhập đầu.
+
+### 13.3 Session (thay vai trò "pin" cũ)
+- **In-memory session** (biến module, ưu tiên cao nhất): dùng cho "máy dùng chung — không nhớ"; mất khi đóng app.
+- **Persisted session** (local `app_settings.json`, per-workspace, KHÔNG sync): "stay signed in" trên máy cá nhân; giữ tới khi logout.
+- **Resolve mới**: in-memory session → persisted session → `None` (yêu cầu đăng nhập). *Fingerprint KHÔNG còn auto-login* (mật khẩu là cổng); chỉ dùng để **pre-select user** ở màn đăng nhập + audit "known devices".
+- **Logout** = xóa session (in-memory + persisted), **giữ** device binding (pre-fill lần sau). **Forget device** = gỡ fingerprint.
+- "Remember this device" khi đăng nhập = ghi persisted session (+ `register_device`); bỏ chọn = chỉ in-memory.
+
+### 13.4 Tạo tài khoản phải qua Admin duyệt
+- **Không** ai tự thêm user vào roster nếu không có quyền admin.
+- **Gate**: dùng `access_control.is_admin_capable()` (và `session_role()`); thao tác tạo/duyệt/sửa roster chỉ cho admin/dev đã unlock key.
+- **Non-admin**: chỉ **gửi yêu cầu** → ghi `<workspace>/.monostudio/account_requests.json` (pending). KHÔNG đụng `users.json`.
+- **Admin**: mở **Team Management** → xem pending → **Approve** (tạo `StudioUser` từ request, mang `name/email/pwd_hash/avatar`) hoặc **Reject** (xóa request). Có thể: reset password, đổi avatar, deactivate user.
+- **Bootstrap**: nếu roster **chưa có user active nào** → cho tạo trực tiếp tài khoản đầu tiên (tránh deadlock khi chưa ai là admin trong roster).
+
+### 13.5 `account_requests.json` (shared)
+```json
+{ "schema": 1, "requests": [
+  { "id": "r_ab12cd", "name": "Lan", "email": "", "pwd_hash": "pbkdf2_sha256$...",
+    "avatar": "", "requested_at": "2026-06-02T01:00:00Z", "note": "" } ] }
+```
+
+### 13.6 API bổ sung (`user_identity.py`)
+```python
+def hash_password(pw) -> str ; def verify_password(pw, stored) -> bool
+def set_password(ws, user_id, pw) -> None ; def has_password(user) -> bool
+def avatars_dir(ws) -> Path ; def avatar_path(ws, user) -> Path | None
+def save_avatar(ws, user_id, src_image: Path) -> str        # scale → png, trả filename
+# session
+def session_sign_in(ws, user_id, *, remember: bool, register_device_too: bool) -> None
+def session_sign_out(ws) -> None
+def get_current_user(ws) -> StudioUser | None               # in-mem → persisted → None
+# requests
+@dataclass AccountRequest: id,name,email,pwd_hash,avatar,requested_at,note
+def requests_file(ws) -> Path ; def read_requests(ws) -> list[AccountRequest]
+def submit_request(ws, name, *, email="", pwd_hash="", avatar="", note="") -> AccountRequest
+def approve_request(ws, req_id) -> StudioUser ; def reject_request(ws, req_id) -> None
+def roster_has_active_users(ws) -> bool                      # bootstrap check
+```
+
+### 13.7 UI
+- **Login dialog** (thay picker): list user (avatar ảnh/initials + name + role), chọn → ô mật khẩu → Sign in; checkbox "Remember this device"; nút **Request account…** (non-admin) hoặc **Add user** (admin/bootstrap).
+- **Request Account dialog**: name, email, mật khẩu (+ xác nhận), chọn avatar (tùy chọn) → `submit_request`.
+- **Team Management dialog** (chỉ admin): tab Pending requests (Approve/Reject) + tab Users (reset pw, set avatar, deactivate). Vào từ menu avatar "Manage team…" (chỉ hiện khi `is_admin_capable()`).
+- Menu avatar bổ sung mục **Manage team…** (admin). Avatar topbar dùng ảnh nếu có.

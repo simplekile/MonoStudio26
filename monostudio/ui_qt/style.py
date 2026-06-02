@@ -943,11 +943,14 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#TopBarUpdateBtn,
         QToolButton#TopBarWatcherBtn,
         QToolButton#TopBarAlwaysOnTopBtn,
-        QToolButton#TopBarSettingsBtn {
+        QToolButton#TopBarSettingsBtn,
+        QToolButton#TopBarUserBtn {
             border: none;
             border-radius: 0;
             background: transparent;
             color: #d4d4d8;
+            padding: 0px;
+            margin: 0px;
         }
         QToolButton#WindowMinBtn:hover,
         QToolButton#WindowMaxBtn:hover,
@@ -959,6 +962,12 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(255, 255, 255, 0.08);
             color: #e4e4e7;
             border-radius: 8px;
+        }
+        /* Avatar hover/press drawn circular in _UserAvatarButton.paintEvent */
+        QToolButton#TopBarUserBtn:hover,
+        QToolButton#TopBarUserBtn:pressed {
+            background: transparent;
+            border-radius: 0px;
         }
         QToolButton#WindowCloseBtn:hover {
             background: #ef4444;
@@ -1326,6 +1335,69 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 6px;
         }
 
+        QFrame#ToolbarIconSeparator {
+            background-color: rgba(63, 63, 70, 0.85);
+            border: none;
+            max-width: 1px;
+            min-width: 1px;
+        }
+
+        QWidget#ScheduleToolGroup {
+            background-color: rgba(39, 39, 42, 0.85);
+            border-radius: 6px;
+        }
+        QToolButton#ScheduleToolBtn {
+            border: none;
+            border-radius: 6px;
+            padding: 6px;
+            margin: 0;
+            background: transparent;
+        }
+        QToolButton#ScheduleToolBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QToolButton#ScheduleToolBtn:checked {
+            background: rgba(37, 99, 235, 0.18);
+        }
+        QToolButton#ScheduleHeaderActionBtn {
+            border: none;
+            border-radius: 6px;
+            padding: 6px;
+            background: transparent;
+        }
+        QToolButton#ScheduleHeaderActionBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        /* Schedule timeline corner: search field + filter button */
+        QWidget#ScheduleCornerSearch {
+            background-color: #0d0d0f;
+            border-right: 1px solid #2a2a2c;
+            border-bottom: 1px solid #2a2a2c;
+        }
+        QLineEdit#ScheduleSearchEdit {
+            background-color: #18181b;
+            border: 1px solid #2a2a2c;
+            border-radius: 8px;
+            padding: 4px 8px;
+            color: #e4e4e7;
+            font-family: "Inter";
+            font-size: 12px;
+            selection-background-color: rgba(37, 99, 235, 0.35);
+        }
+        QLineEdit#ScheduleSearchEdit:focus {
+            border: 1px solid rgba(96, 165, 250, 0.55);
+        }
+        QToolButton#ScheduleSearchFilterBtn {
+            border: none;
+            border-radius: 6px;
+            padding: 4px;
+            background: transparent;
+        }
+        QToolButton#ScheduleSearchFilterBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+
         /* --- Inspector --- */
         QWidget#InspectorPanel {
             background-color: #18181b;
@@ -1637,6 +1709,15 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #121214;
             border-radius: 8px;
         }
+        QSplitter#ItemNotesSplit::handle {
+            background: rgba(63, 63, 70, 0.55);
+            width: 1px;
+            margin: 0 4px;
+        }
+        QWidget#ItemNotesComposePanel,
+        QWidget#ItemNotesListPanel {
+            background: transparent;
+        }
         QWidget#ItemNotesListHost {
             background: transparent;
         }
@@ -1645,10 +1726,30 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid rgba(39, 39, 42, 0.50);
             border-radius: 10px;
         }
+        QFrame#ItemNotesCard:hover {
+            background: #1c1c20;
+            border: 1px solid rgba(63, 63, 70, 0.72);
+        }
         QFrame#ItemNotesCardDone {
             background: rgba(16, 185, 129, 0.16);
             border: 1px solid rgba(52, 211, 153, 0.42);
             border-radius: 10px;
+        }
+        QFrame#ItemNotesCardDone:hover {
+            background: rgba(16, 185, 129, 0.22);
+            border: 1px solid rgba(52, 211, 153, 0.55);
+        }
+        QLabel#ItemNotesPreview {
+            background: transparent;
+        }
+        QTextBrowser#ItemNotesPreviewBrowser {
+            background: transparent;
+            border: none;
+        }
+        QLabel#ItemNotesPreviewMore {
+            color: #52525b;
+            background: transparent;
+            padding: 0px;
         }
         QFrame#ItemNotesHRule {
             background-color: rgba(39, 39, 42, 0.80);
@@ -1689,7 +1790,17 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#ItemNotesDeleteButton:hover {
             background: rgba(239, 68, 68, 0.15);
         }
-        QPlainTextEdit#ItemNotesAddEditor {
+        QToolButton#ItemNotesOpenButton {
+            border: none;
+            background: transparent;
+            padding: 4px;
+            border-radius: 8px;
+        }
+        QToolButton#ItemNotesOpenButton:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QPlainTextEdit#ItemNotesAddEditor,
+        QTextEdit#ItemNotesAddEditor {
             background-color: #121214;
             border: 1px solid rgba(39, 39, 42, 0.50);
             border-radius: 8px;
@@ -1698,8 +1809,14 @@ def apply_dark_theme(app: QApplication) -> None:
             font-family: "Inter";
             font-size: 13px;
         }
-        QPlainTextEdit#ItemNotesAddEditor:focus {
+        QPlainTextEdit#ItemNotesAddEditor:focus,
+        QTextEdit#ItemNotesAddEditor:focus {
             border: 1px solid #2563eb;
+        }
+        QTextBrowser#ItemNotesBodyBrowser {
+            background: transparent;
+            border: none;
+            color: #d4d4d8;
         }
         /* MONOS calendar (Inbox drop: date picker) — Deep Dark, 8px radius embed */
         QCalendarWidget#MonosCalendar {
@@ -2600,10 +2717,24 @@ def apply_dark_theme(app: QApplication) -> None:
             background: transparent;
         }
 
-        /* Scope pill: Project | Shot | Asset (one pill, three segments) */
+        /* Scope pill: Projects | Shot | Asset (one pill, three segments) */
         QWidget#SidebarScopePill {
             background-color: #1e1e20;
             border-radius: 12px;
+        }
+        QWidget#SidebarScopePill[display="iconOnly"] QToolButton#SidebarScopePillSegment,
+        QWidget#SidebarScopePill[display="mixed"] QToolButton#SidebarScopePillSegment[labeled="false"] {
+            padding: 0;
+            min-width: 36px;
+            max-width: 36px;
+        }
+        QWidget#SidebarScopePill[display="iconOnly"] QToolButton#SidebarScopePillSegment[active="true"],
+        QWidget#SidebarScopePill[display="mixed"] QToolButton#SidebarScopePillSegment[labeled="false"][active="true"] {
+            font-style: normal;
+        }
+        QWidget#SidebarScopePill[display="mixed"] QToolButton#SidebarScopePillSegment[labeled="true"] {
+            padding: 0 8px 0 6px;
+            min-width: 48px;
         }
         QToolButton#SidebarScopePillSegment {
             background: transparent;
@@ -2849,6 +2980,28 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #1e1e21;
             border-top: 1px solid rgba(39, 39, 42, 0.50);
         }
+        QWidget#AppFooter {
+            background-color: #1e1e21;
+            border-top: 1px solid rgba(39, 39, 42, 0.50);
+        }
+        QLabel#AppFooterName {
+            color: #a1a1aa;
+        }
+        QLabel#AppFooterVersion {
+            color: #52525b;
+        }
+        QLabel#AppFooterLog {
+            color: #71717a;
+        }
+        QLabel#AppFooterLog[level="success"] {
+            color: #86efac;
+        }
+        QLabel#AppFooterLog[level="warning"] {
+            color: #fcd34d;
+        }
+        QLabel#AppFooterLog[level="error"] {
+            color: #fca5a5;
+        }
         QLabel#SidebarFooterName {
             color: #a1a1aa;
         }
@@ -3004,6 +3157,159 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QLabel#AssetCardTagRight {
             background: #10b981; /* Emerald */
+        }
+
+        /* --- Dashboard (bento) --- */
+        QWidget#DashboardRoot {
+            background: #121214;
+        }
+        QFrame#DashboardCard {
+            background: #18181b;
+            border: 1px solid rgba(39, 39, 42, 0.55);
+            border-radius: 12px;
+        }
+        QFrame#DashboardHeaderCard {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 #1c1c20, stop:1 #161618);
+            border: 1px solid rgba(39, 39, 42, 0.65);
+            border-radius: 12px;
+        }
+        QLabel#DashboardCardTitle {
+            color: #e4e4e7; /* Zinc-200 */
+            font-family: "Inter";
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: -0.1px;
+        }
+        QLabel#DashboardProjectTitle {
+            color: #fafafa;
+            font-family: "Inter";
+            font-size: 20px;
+            font-weight: 800;
+            letter-spacing: -0.3px;
+        }
+        QLabel#DashboardProjectPath {
+            color: #71717a;
+            font-family: "JetBrains Mono";
+            font-size: 11px;
+        }
+        QLabel#DashboardWelcomeSub {
+            color: #71717a;
+            font-family: "Inter";
+            font-size: 13px;
+            font-weight: 500;
+        }
+        QLabel#DashboardAttentionBadge {
+            color: #f59e0b;
+            background: rgba(245, 158, 11, 0.14);
+            font-family: "Inter";
+            font-size: 11px;
+            font-weight: 800;
+            border-radius: 6px;
+            padding: 1px 8px;
+        }
+        /* KPI tile */
+        QFrame#DashboardMetricTile {
+            background: #18181b;
+            border: 1px solid rgba(39, 39, 42, 0.55);
+            border-radius: 12px;
+        }
+        QFrame#DashboardMetricTile[clickable="true"]:hover {
+            background: #1f1f22;
+            border: 1px solid rgba(96, 165, 250, 0.45);
+        }
+        QFrame#DashboardMetricTile[tone="danger"] {
+            border: 1px solid rgba(239, 68, 68, 0.35);
+        }
+        QLabel#DashboardTileLabel {
+            color: #71717a;
+            font-family: "Inter";
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 1px;
+        }
+        QPushButton#DashboardTileLink {
+            background: transparent;
+            border: none;
+            padding: 0px;
+            text-align: left;
+            color: #60a5fa;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 600;
+        }
+        QPushButton#DashboardTileLink:hover {
+            color: #93c5fd;
+        }
+        QPushButton#DashboardPrimaryButton {
+            padding: 7px 14px;
+            border-radius: 8px;
+            border: 1px solid #2563eb;
+            background: #2563eb;
+            color: #ffffff;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 700;
+        }
+        QPushButton#DashboardPrimaryButton:hover {
+            background: #1d4ed8;
+            border-color: #1d4ed8;
+        }
+        /* Identity picker rows */
+        QWidget#IdentityUserRow {
+            background: rgba(24, 24, 27, 0.5);
+            border: 1px solid rgba(39, 39, 42, 0.55);
+            border-radius: 10px;
+        }
+        QWidget#IdentityUserRow:hover {
+            background: #1f1f22;
+            border: 1px solid rgba(96, 165, 250, 0.35);
+        }
+        QWidget#IdentityUserRow[selected="true"] {
+            background: rgba(37, 99, 235, 0.12);
+            border: 1px solid #2563eb;
+        }
+        /* Generic clickable row used by Dept load / Next 7 days / Attention / Notes */
+        QFrame#DashboardRow {
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+        }
+        QFrame#DashboardRow[clickable="true"]:hover {
+            background: rgba(255, 255, 255, 0.04);
+        }
+        QLabel#DashboardChip {
+            color: #fafafa;
+            font-family: "Inter";
+            font-size: 10px;
+            font-weight: 800;
+            padding: 2px 8px;
+            border-radius: 6px;
+        }
+        QLabel#DashboardEmptyHint {
+            color: #52525b;
+            font-family: "Inter";
+            font-size: 12px;
+        }
+        QLabel#DashboardMutedMeta {
+            color: #71717a;
+            font-family: "JetBrains Mono";
+            font-size: 11px;
+        }
+        QPushButton#DashboardGhostButton {
+            padding: 6px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(96, 165, 250, 0.35);
+            background: rgba(96, 165, 250, 0.10);
+            color: #93c5fd;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 600;
+        }
+        QPushButton#DashboardGhostButton:hover {
+            background: rgba(96, 165, 250, 0.18);
+            border-color: rgba(96, 165, 250, 0.55);
+            color: #dbeafe;
         }
         """
     )

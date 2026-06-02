@@ -18,6 +18,7 @@ from monostudio.core.pipeline_types_and_presets import (
     save_pipeline_types_and_presets_to_project,
 )
 from monostudio.core.project_id import generate_project_id
+from monostudio.core.project_schedule import SCHEDULE_FILENAME, SCHEDULE_SCHEMA
 from monostudio.core.project_create_defaults import (
     CREATE_DEFAULT_DCC_BY_DEPARTMENT_KEY,
     resolved_create_default_dcc_map_for_new_project,
@@ -180,6 +181,18 @@ def create_new_project(
             json.dumps(manifest_payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+        schedule_seed = monostudio_dir / SCHEDULE_FILENAME
+        schedule_seed.write_text(
+            json.dumps(
+                {"schema": SCHEDULE_SCHEMA, "project_start": start_date},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        created_paths.append(schedule_seed)
 
         # Write pipeline configs so new project starts with the correct mapping.
         pipeline_dir = monostudio_dir / "pipeline"

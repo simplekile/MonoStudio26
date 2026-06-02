@@ -5,15 +5,20 @@ Exposes notify.info / success / warning / error; all UI and logic use only this 
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-import os
 import logging
+import os
+from typing import TYPE_CHECKING
 
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QApplication
 
+from monostudio.ui_qt.activity_log import activity_log
 from monostudio.ui_qt.notification.overlay import NotificationOverlayWidget
-from monostudio.ui_qt.notification.store import append as _store_append
+from monostudio.ui_qt.notification.store import (
+    UserAlertPayload,
+    append_user_alert,
+    unread_count as store_unread_count,
+)
 from monostudio.ui_qt.notification.toast import ToastType
 from monostudio.ui_qt.notification.banner import ImportantNotificationBanner
 
@@ -21,17 +26,22 @@ if TYPE_CHECKING:
     from PySide6.QtWidgets import QMainWindow, QWidget
 
 
-class _NotificationService:
+class _NotificationService(QObject):
     """
     Single notification backend for the app.
     Requires set_main_window() to be called (e.g. from MainWindow) before first use.
     """
+
+    unread_count_changed = Signal(int)
 
     _main_window: QMainWindow | None = None
     _main_view: QWidget | None = None
     _overlay: NotificationOverlayWidget | None = None
     _important_banner: ImportantNotificationBanner | None = None
     _important_anchor_widget: "QWidget | None" = None
+
+    def __init__(self) -> None:
+        super().__init__()
 
     @classmethod
     def set_main_window(cls, main_window: QMainWindow, main_view: QWidget | None = None) -> None:
@@ -95,14 +105,18 @@ class _NotificationService:
         overlay.set_sidebar_anchor_y_from_global(y)
 
     @classmethod
+    def _emit_unread(cls) -> None:
+        notify.unread_count_changed.emit(store_unread_count())
+
+    @classmethod
     def _notify(cls, level: ToastType, message: str, *, category: str = "general") -> None:
-        # Optional debug: mirror notifications to log when env is set.
         if os.getenv("MONOS_DEBUG_NOTI"):
             logging.getLogger("monostudio.notification").info(
                 "NOTI [%s] (%s): %s", level, category, message
             )
         if category == "general":
-            _store_append(level, message)
+            log_level = "error" if level == "error" else "warning" if level == "warning" else "success" if level == "success" else "info"
+            activity_log.append(message, level=log_level)
         overlay = cls._get_overlay()
         if overlay is None:
             return
@@ -126,25 +140,37 @@ class _NotificationService:
         cls._notify("error", message, category=category)
 
     @classmethod
+    def user_alert(
+        cls,
+        message: str,
+        *,
+        payload: UserAlertPayload | None = None,
+        toast_type: ToastType = "info",
+    ) -> None:
+        """User-targeted alert (e.g. @mention) — stored in bell history, not activity log."""
+        append_user_alert(toast_type, message, payload=payload)
+        cls._emit_unread()
+        overlay = cls._get_overlay()
+        if overlay is not None:
+            overlay.show_toast(toast_type, message, category="general")
+            overlay.raise_()
+
+    @classmethod
     def important(cls, message: str, *, category: str = "general") -> None:
         """
         Persistent banner for important announcements (e.g. new update, first-run walkthrough).
-        - Stored in notification history like other general notifications.
-        - Shown as a non-modal banner near the top of the main window.
+        Shown as a non-modal banner near the top of the main window.
         """
         if category == "general":
-            _store_append("important", message)
+            activity_log.append(message, level="info")
 
         if cls._main_window is None:
-            # Fallback: no main window yet, store-only.
             return
 
-        # Reuse existing banner if present.
         if cls._important_banner is None:
             banner = ImportantNotificationBanner(parent=cls._main_window)
 
             def _on_closed() -> None:
-                # Clear reference when banner is closed.
                 if cls._important_banner is banner:
                     cls._important_banner = None
 
@@ -157,5 +183,4 @@ class _NotificationService:
         cls._important_banner.raise_()
 
 
-# Singleton-like instance; use via notify.info(), notify.success(), etc.
 notify = _NotificationService()

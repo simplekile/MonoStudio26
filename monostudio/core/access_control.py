@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
 KEY_DEBUG_VERBOSE = "debug/verbose_ui_logging"
 KEY_SPLASH_MS = "ui/splash_display_ms"
+KEY_ACCESS_REMEMBER = "access_remember"
+KEY_ACCESS_REMEMBER_PREFERRED = "access_remember_preferred"
 
 DEFAULT_SPLASH_DISPLAY_MS = 2000
 MIN_SPLASH_DISPLAY_MS = 0
@@ -85,7 +87,68 @@ def clear_session() -> None:
     _session_role = AccessRole.NONE
 
 
-def try_unlock(entered: str) -> AccessRole | None:
+def read_access_remember_preferred() -> bool:
+    """Default for Settings → Access → Remember unlock on this device."""
+    from monostudio.core.user_identity import _read_app_settings
+
+    return bool(_read_app_settings().get(KEY_ACCESS_REMEMBER_PREFERRED, False))
+
+
+def write_access_remember_preferred(on: bool) -> None:
+    from monostudio.core.user_identity import update_app_settings
+
+    update_app_settings({KEY_ACCESS_REMEMBER_PREFERRED: bool(on)})
+
+
+def remember_access_session(role: AccessRole) -> None:
+    """Persist unlock for this machine (app_settings.json, not synced)."""
+    from monostudio.core.user_identity import device_fingerprint, update_app_settings
+
+    if role == AccessRole.NONE:
+        return
+    tag = "dev" if role == AccessRole.DEV else "admin"
+    update_app_settings(
+        {
+            KEY_ACCESS_REMEMBER: {
+                "device_fp": device_fingerprint(),
+                "role": tag,
+            }
+        }
+    )
+
+
+def forget_remembered_access() -> None:
+    from monostudio.core.user_identity import _read_app_settings, _write_app_settings
+
+    data = _read_app_settings()
+    if KEY_ACCESS_REMEMBER in data:
+        del data[KEY_ACCESS_REMEMBER]
+        _write_app_settings(data)
+
+
+def restore_remembered_access() -> AccessRole | None:
+    """Re-apply admin/dev session from a prior Remember unlock on this device."""
+    global _session_role
+    if not has_access_restrictions():
+        return None
+    from monostudio.core.user_identity import _read_app_settings, device_fingerprint
+
+    raw = _read_app_settings().get(KEY_ACCESS_REMEMBER)
+    if not isinstance(raw, dict):
+        return None
+    if str(raw.get("device_fp") or "").strip() != device_fingerprint():
+        return None
+    tag = str(raw.get("role") or "").strip().lower()
+    if tag == "dev" and dev_key_configured():
+        _session_role = AccessRole.DEV
+        return AccessRole.DEV
+    if tag == "admin" and admin_key_configured():
+        _session_role = AccessRole.ADMIN
+        return AccessRole.ADMIN
+    return None
+
+
+def try_unlock(entered: str, *, remember: bool = False) -> AccessRole | None:
     """Set session role if entered key matches dev (preferred) or admin. Returns new role or None."""
     global _session_role
     key = _norm(entered)
@@ -94,9 +157,13 @@ def try_unlock(entered: str) -> AccessRole | None:
     ak, dk = get_effective_access_keys()
     if dk and _secure_str_equals(key, dk):
         _session_role = AccessRole.DEV
+        if remember:
+            remember_access_session(AccessRole.DEV)
         return AccessRole.DEV
     if ak and _secure_str_equals(key, ak):
         _session_role = AccessRole.ADMIN
+        if remember:
+            remember_access_session(AccessRole.ADMIN)
         return AccessRole.ADMIN
     return None
 

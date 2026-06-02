@@ -3,18 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -22,12 +22,18 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.item_comments import (
     ItemCommentEntry,
+    delete_note_media,
     new_comment_entry,
     read_item_comments,
     write_item_comments,
 )
+from monostudio.core.mention_inbox import append_mentions
+from monostudio.core.user_identity import get_current_user
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
+from monostudio.ui_qt.note_body_browser import NoteListPreviewBrowser
+from monostudio.ui_qt.note_compose_editor import NoteComposeEditor
+from monostudio.ui_qt.note_view_dialog import NoteViewDialog
+from monostudio.ui_qt.style import MonosDialog, monos_font
 
 
 def _utc_stamp() -> str:
@@ -51,14 +57,47 @@ def _format_local_time(iso_at: str) -> str:
 
 def _entries_fingerprint(entries: list[ItemCommentEntry]) -> tuple:
     return tuple(
-        (e.id, e.at, e.author, e.text, e.done, e.done_at)
+        (e.id, e.at, e.author, e.text, e.done, e.done_at, e.author_id, e.body_html, e.mentions)
         for e in sorted(entries, key=lambda x: x.id)
     )
 
 
+def _click_target_blocks_card(w: QWidget | None) -> bool:
+    while w is not None:
+        if isinstance(w, (QCheckBox, QToolButton)):
+            return True
+        w = w.parentWidget()
+    return False
+
+
+class _NoteListCard(QFrame):
+    """Compact note row; click opens full note viewer."""
+
+    def __init__(self, entry: ItemCommentEntry, *, parent=None) -> None:
+        super().__init__(parent)
+        self._entry = entry
+        self.setObjectName("ItemNotesCardDone" if entry.done else "ItemNotesCard")
+        self.setProperty("noteCardId", entry.id)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Click to view full note")
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if not _click_target_blocks_card(self.childAt(pos)):
+                host = self.window()
+                opener = getattr(host, "_open_note_view", None)
+                if callable(opener):
+                    opener(self._entry.id)
+                    event.accept()
+                    return
+        super().mouseReleaseEvent(event)
+
+
 class ItemNotesDialog(MonosDialog):
     """
-    Notes editor: draft in memory — header + inline add (+) + checklist rows + Cancel / Save changes.
+    Notes editor: draft in memory — header + rich compose + checklist rows + Cancel / Save changes.
     """
 
     notes_changed = Signal()
@@ -69,23 +108,35 @@ class ItemNotesDialog(MonosDialog):
         parent=None,
         item_path: Path,
         item_display_name: str,
+        author: str | None = None,
+        author_id: str | None = None,
+        workspace_root: Path | None = None,
+        project_root: Path | None = None,
+        highlight_note_id: str | None = None,
     ) -> None:
         super().__init__(parent)
         self._item_path = Path(item_path)
+        self._item_display_name = (item_display_name or "—").strip()
+        self._author = (author or "").strip() or None
+        self._author_id = (author_id or "").strip() or None
+        self._workspace_root = Path(workspace_root) if workspace_root else None
+        self._project_root = Path(project_root) if project_root else None
+        self._highlight_note_id = (highlight_note_id or "").strip() or None
         self._draft: list[ItemCommentEntry] = list(read_item_comments(self._item_path))
         self._initial_fp = _entries_fingerprint(self._draft)
+        self._known_ids = {e.id for e in self._draft}
 
         self.setWindowTitle("Notes")
         self.setModal(True)
         self.setObjectName("ItemNotesDialog")
-        self.setMinimumSize(480, 420)
-        self.resize(560, 520)
+        self.setMinimumSize(880, 560)
+        self.resize(960, 640)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(14)
 
-        title = QLabel(f"Notes — {(item_display_name or '—').strip()}", self)
+        title = QLabel(f"Notes — {self._item_display_name}", self)
         title.setObjectName("DialogSectionTitle")
         title.setFont(monos_font("Inter", 16, QFont.Weight.DemiBold))
         root.addWidget(title)
@@ -97,33 +148,56 @@ class ItemNotesDialog(MonosDialog):
 
         root.addWidget(self._make_h_sep())
 
-        add_row = QWidget(self)
-        add_l = QHBoxLayout(add_row)
-        add_l.setContentsMargins(0, 0, 0, 0)
-        add_l.setSpacing(10)
+        split = QSplitter(Qt.Orientation.Horizontal, self)
+        split.setObjectName("ItemNotesSplit")
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(1)
 
-        self._add_edit = QLineEdit(add_row)
-        self._add_edit.setObjectName("ItemNotesLineInput")
-        self._add_edit.setPlaceholderText("Add a new note…")
-        self._add_edit.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
-        self._add_edit.returnPressed.connect(self._on_add_draft)
-        add_l.addWidget(self._add_edit, 1)
+        # --- Left: compose ---
+        compose_panel = QWidget(split)
+        compose_panel.setObjectName("ItemNotesComposePanel")
+        compose_l = QVBoxLayout(compose_panel)
+        compose_l.setContentsMargins(0, 0, 8, 0)
+        compose_l.setSpacing(10)
 
-        self._add_btn = QToolButton(add_row)
-        self._add_btn.setObjectName("ItemNotesAddPlusButton")
-        self._add_btn.setIcon(lucide_icon("plus", size=20, color_hex=MONOS_COLORS["text_label"]))
-        self._add_btn.setIconSize(QSize(20, 20))
-        self._add_btn.setFixedSize(44, 44)
-        self._add_btn.setAutoRaise(True)
+        compose_heading = QLabel("New note", compose_panel)
+        compose_heading.setObjectName("DialogHint")
+        compose_heading.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
+        compose_l.addWidget(compose_heading, 0)
+
+        self._add_edit = NoteComposeEditor(
+            item_root=self._item_path,
+            workspace_root=self._workspace_root,
+            parent=compose_panel,
+        )
+        compose_l.addWidget(self._add_edit, 1)
+
+        add_row = QHBoxLayout()
+        add_row.setContentsMargins(0, 0, 0, 0)
+        add_row.setSpacing(10)
+        add_row.addStretch(1)
+        self._add_btn = QPushButton("Add note", compose_panel)
+        self._add_btn.setObjectName("DialogPrimaryButton")
         self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._add_btn.setToolTip("Add note")
         self._add_btn.clicked.connect(self._on_add_draft)
-        add_l.addWidget(self._add_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        add_row.addWidget(self._add_btn, 0)
+        compose_l.addLayout(add_row, 0)
 
-        root.addWidget(add_row)
-        root.addWidget(self._make_h_sep())
+        split.addWidget(compose_panel)
 
-        self._scroll = QScrollArea(self)
+        # --- Right: note list ---
+        list_panel = QWidget(split)
+        list_panel.setObjectName("ItemNotesListPanel")
+        list_l = QVBoxLayout(list_panel)
+        list_l.setContentsMargins(8, 0, 0, 0)
+        list_l.setSpacing(10)
+
+        list_heading = QLabel("All notes", list_panel)
+        list_heading.setObjectName("DialogHint")
+        list_heading.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
+        list_l.addWidget(list_heading, 0)
+
+        self._scroll = QScrollArea(list_panel)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -136,7 +210,14 @@ class ItemNotesDialog(MonosDialog):
         self._list_layout.setSpacing(12)
         self._list_layout.addStretch(1)
         self._scroll.setWidget(self._list_host)
-        root.addWidget(self._scroll, 1)
+        list_l.addWidget(self._scroll, 1)
+
+        split.addWidget(list_panel)
+        split.setStretchFactor(0, 44)
+        split.setStretchFactor(1, 56)
+        split.setSizes([420, 520])
+
+        root.addWidget(split, 1)
 
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 8, 0, 0)
@@ -158,6 +239,32 @@ class ItemNotesDialog(MonosDialog):
 
         self._update_summary()
         self._rebuild_list()
+        if self._highlight_note_id:
+            QTimer.singleShot(0, self._scroll_to_highlight)
+
+    def _scroll_to_highlight(self) -> None:
+        if not self._highlight_note_id:
+            return
+        for card in self._list_host.findChildren(QFrame):
+            if card.property("noteCardId") == self._highlight_note_id:
+                self._scroll.ensureWidgetVisible(card, 0, 40)
+                break
+        QTimer.singleShot(0, lambda: self._open_note_view(self._highlight_note_id))
+
+    def _open_note_view(self, note_id: str) -> None:
+        eid = (note_id or "").strip()
+        if not eid:
+            return
+        entry = next((e for e in self._draft if e.id == eid), None)
+        if entry is None:
+            return
+        dlg = NoteViewDialog(
+            entry=entry,
+            item_root=self._item_path,
+            item_display_name=self._item_display_name,
+            parent=self,
+        )
+        dlg.exec()
 
     def _make_h_sep(self) -> QFrame:
         line = QFrame(self)
@@ -190,9 +297,7 @@ class ItemNotesDialog(MonosDialog):
             self._list_layout.insertWidget(0, self._make_note_card(e))
 
     def _make_note_card(self, entry: ItemCommentEntry) -> QFrame:
-        card = QFrame(self._list_host)
-        card.setObjectName("ItemNotesCardDone" if entry.done else "ItemNotesCard")
-        card.setFrameShape(QFrame.Shape.NoFrame)
+        card = _NoteListCard(entry, parent=self._list_host)
 
         row = QHBoxLayout(card)
         row.setContentsMargins(12, 10, 10, 10)
@@ -209,28 +314,56 @@ class ItemNotesDialog(MonosDialog):
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(4)
 
-        body = QLabel(entry.text, card)
-        body.setWordWrap(True)
-        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        body.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
-        if entry.done:
-            body.setStyleSheet(f"color: {MONOS_COLORS.get('text_muted', '#71717a')}; text-decoration: line-through;")
+        preview = NoteListPreviewBrowser(item_root=self._item_path, parent=card)
+        preview.set_body(entry.body_html, plain_fallback=entry.text, done=entry.done)
+        preview.open_requested.connect(lambda eid=entry.id: self._open_note_view(eid))
+
+        preview_row = QHBoxLayout()
+        preview_row.setContentsMargins(0, 0, 0, 0)
+        preview_row.setSpacing(8)
+        preview_row.addWidget(preview, 1)
+
+        see_more = QLabel("see more", card)
+        see_more.setObjectName("ItemNotesPreviewMore")
+        see_more.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
+        see_more.setCursor(Qt.CursorShape.PointingHandCursor)
+        see_more.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if preview.is_content_truncated():
+            preview_row.addWidget(see_more, 0, Qt.AlignmentFlag.AlignBottom)
+
+            def _on_see_more(event, *, eid: str = entry.id) -> None:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._open_note_view(eid)
+                    event.accept()
+
+            see_more.mouseReleaseEvent = _on_see_more  # type: ignore[method-assign]
         else:
-            body.setStyleSheet(f"color: {MONOS_COLORS.get('text_body', '#d4d4d8')};")
+            see_more.hide()
 
         time_l = QLabel(_format_local_time(entry.at), card)
         time_l.setObjectName("DialogHint")
         time_l.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
 
-        text_col.addWidget(body)
+        text_col.addLayout(preview_row)
         text_col.addWidget(time_l)
         row.addLayout(text_col, 1)
+
+        open_btn = QToolButton(card)
+        open_btn.setObjectName("ItemNotesOpenButton")
+        open_btn.setAutoRaise(True)
+        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_btn.setIcon(lucide_icon("maximize-2", size=16, color_hex="#a1a1aa"))
+        open_btn.setIconSize(QSize(16, 16))
+        open_btn.setToolTip("View full note")
+        open_btn.clicked.connect(lambda _=False, eid=entry.id: self._open_note_view(eid))
+        row.addWidget(open_btn, 0, Qt.AlignmentFlag.AlignTop)
 
         del_btn = QToolButton(card)
         del_btn.setObjectName("ItemNotesDeleteButton")
         del_btn.setAutoRaise(True)
         del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        del_btn.setIcon(lucide_icon("trash-2", size=18, color_hex="#ef4444"))
+        del_btn.setIcon(lucide_icon("trash-2", size=16, color_hex="#ef4444"))
+        del_btn.setIconSize(QSize(16, 16))
         del_btn.setToolTip("Remove note")
         del_btn.clicked.connect(lambda _=False, eid=entry.id: self._on_remove_draft(eid))
         row.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignTop)
@@ -238,19 +371,27 @@ class ItemNotesDialog(MonosDialog):
         return card
 
     def _on_add_draft(self) -> None:
-        text = self._add_edit.text().strip()
-        if not text:
+        if not self._add_edit.has_content():
             return
         try:
-            self._draft.append(new_comment_entry(text))
+            entry = new_comment_entry(
+                self._add_edit.plain_text(),
+                author=self._author,
+                author_id=self._author_id,
+                body_html=self._add_edit.body_html(),
+                mentions=self._add_edit.mention_ids(),
+                entry_id=self._add_edit.draft_entry_id,
+            )
         except ValueError as ex:
             QMessageBox.warning(self, "Notes", str(ex))
             return
-        self._add_edit.clear()
+        self._draft.append(entry)
+        self._add_edit.reset_draft()
         self._update_summary()
         self._rebuild_list()
 
     def _on_remove_draft(self, eid: str) -> None:
+        delete_note_media(self._item_path, eid)
         self._draft = [e for e in self._draft if e.id != eid]
         self._update_summary()
         self._rebuild_list()
@@ -271,6 +412,9 @@ class ItemNotesDialog(MonosDialog):
                         text=e.text,
                         done=True,
                         done_at=now_iso,
+                        author_id=e.author_id,
+                        body_html=e.body_html,
+                        mentions=e.mentions,
                     )
                 )
             else:
@@ -282,11 +426,49 @@ class ItemNotesDialog(MonosDialog):
                         text=e.text,
                         done=False,
                         done_at=None,
+                        author_id=e.author_id,
+                        body_html=e.body_html,
+                        mentions=e.mentions,
                     )
                 )
         self._draft = new_list
         self._update_summary()
         self._rebuild_list()
+
+    def _item_rel_path(self) -> str:
+        if self._project_root is None:
+            return self._item_path.name
+        try:
+            return self._item_path.relative_to(self._project_root).as_posix()
+        except ValueError:
+            return self._item_path.name
+
+    def _dispatch_mentions_for_new_entries(self) -> None:
+        if self._project_root is None:
+            return
+        current = get_current_user(self._workspace_root)
+        from_uid = self._author_id or (current.id if current else "")
+        from_name = self._author or (current.name if current else "Someone")
+        for e in self._draft:
+            if e.id in self._known_ids:
+                continue
+            if not e.mentions:
+                continue
+            try:
+                new_items = append_mentions(
+                    self._project_root,
+                    from_user_id=from_uid,
+                    from_name=from_name,
+                    mentions=e.mentions,
+                    item_rel=self._item_rel_path(),
+                    item_display=self._item_display_name,
+                    note_id=e.id,
+                    snippet=e.text,
+                )
+            except OSError:
+                continue
+            # Bell alerts are created in MainWindow._sync_mention_inbox_alerts for the
+            # signed-in user only — do not notify the author's session for other targets.
 
     def _on_save(self) -> None:
         try:
@@ -294,7 +476,9 @@ class ItemNotesDialog(MonosDialog):
         except OSError as ex:
             QMessageBox.warning(self, "Notes", str(ex) or "Could not save notes.")
             return
+        self._dispatch_mentions_for_new_entries()
         self._initial_fp = _entries_fingerprint(self._draft)
+        self._known_ids = {e.id for e in self._draft}
         self.notes_changed.emit()
         self.accept()
 
