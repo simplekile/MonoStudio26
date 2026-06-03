@@ -29,15 +29,9 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.inbox_reader import scan_inbox
 from monostudio.core.outbox_reader import scan_outbox
-from monostudio.ui_qt.calendar_date_picker import MonosCalendarWidget
+from monostudio.ui_qt.calendar_date_picker import run_date_picker_dialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MonosDialog, MONOS_COLORS, monos_font
-
-
-def _calendar_go_today(cal: MonosCalendarWidget) -> None:
-    today = QDate.currentDate()
-    cal.setSelectedDate(today)
-    cal.setCurrentPage(today.year(), today.month())
+from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 
 
 def _get_date_folders_for_source(
@@ -277,43 +271,10 @@ class InboxDropDialog(MonosDialog):
             return None
 
     def _on_open_calendar_popup(self) -> None:
-        popup = MonosDialog(self)
-        popup.setWindowTitle("Choose date")
-        lay = QVBoxLayout(popup)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(12)
-        cal = MonosCalendarWidget(popup)
-        cal.setMinimumSize(420, 360)
         initial = self._parse_new_date_edit() or QDate.currentDate()
-        cal.setSelectedDate(initial)
-        cal.setCurrentPage(initial.year(), initial.month())
-        lay.addWidget(cal.nav_bar(), 0)
-        lay.addWidget(cal, 0)
-        btn_row = QHBoxLayout()
-        today_btn = QPushButton("Today", popup)
-        today_btn.setObjectName("InboxDropCalendarTodayBtn")
-        today_btn.setToolTip("Go to current date")
-        today_btn.clicked.connect(lambda: _calendar_go_today(cal))
-        btn_row.addWidget(today_btn, 0)
-        btn_row.addStretch(1)
-        ok_btn = QPushButton("OK", popup)
-        ok_btn.setObjectName("DialogPrimaryButton")
-        ok_btn.setDefault(True)
-        def on_ok() -> None:
-            d = cal.selectedDate()
-            if d.isValid():
-                self._new_date_edit.setText(d.toString("yyyy-MM-dd"))
-            popup.accept()
-        ok_btn.clicked.connect(on_ok)
-        btn_row.addWidget(ok_btn, 0)
-        cancel_btn = QPushButton("Cancel", popup)
-        cancel_btn.setObjectName("DialogSecondaryButton")
-        cancel_btn.clicked.connect(popup.reject)
-        btn_row.addWidget(cancel_btn, 0)
-        lay.addLayout(btn_row, 0)
-        popup.setMinimumSize(460, 480)
-        popup.resize(480, 520)
-        popup.exec()
+        picked = run_date_picker_dialog(self, initial=initial, title="Choose date")
+        if picked is not None and picked.isValid():
+            self._new_date_edit.setText(picked.toString("yyyy-MM-dd"))
 
     def _get_date_str(self) -> str | None:
         if self._radio_new.isChecked():

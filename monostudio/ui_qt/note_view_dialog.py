@@ -9,6 +9,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout
 
 from monostudio.core.item_comments import ItemCommentEntry
+from monostudio.ui_qt.note_author_row import NoteAuthorRow
 from monostudio.ui_qt.note_body_browser import NoteBodyBrowser
 from monostudio.ui_qt.style import MonosDialog, monos_font
 
@@ -37,6 +38,7 @@ class NoteViewDialog(MonosDialog):
         entry: ItemCommentEntry,
         item_root: Path,
         item_display_name: str,
+        workspace_root: Path | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -55,18 +57,18 @@ class NoteViewDialog(MonosDialog):
         title.setFont(monos_font("Inter", 15, QFont.Weight.DemiBold))
         root.addWidget(title)
 
-        meta_parts: list[str] = []
-        author = (entry.author or "").strip()
-        if author:
-            meta_parts.append(author)
-        meta_parts.append(_format_local_time(entry.at))
+        time_meta = _format_local_time(entry.at)
         if entry.done:
-            meta_parts.append("Completed")
-
-        meta = QLabel(" · ".join(meta_parts), self)
-        meta.setObjectName("DialogHint")
-        meta.setFont(monos_font("Inter", 12, QFont.Weight.Normal))
-        root.addWidget(meta)
+            time_meta = f"{time_meta} · Completed"
+        root.addWidget(
+            NoteAuthorRow.for_entry(
+                entry,
+                workspace_root,
+                avatar_size=36,
+                time_text=time_meta,
+                parent=self,
+            )
+        )
 
         line = QFrame(self)
         line.setObjectName("ItemNotesHRule")
@@ -79,7 +81,11 @@ class NoteViewDialog(MonosDialog):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setObjectName("ItemNotesScroll")
 
-        body = NoteBodyBrowser(item_root=item_root, parent=scroll)
+        body = NoteBodyBrowser(
+            item_root=item_root,
+            workspace_root=workspace_root,
+            parent=scroll,
+        )
         body.set_body(entry.body_html, plain_fallback=entry.text, done=entry.done)
         body.setMinimumHeight(max(120, body.document().size().height()))
         scroll.setWidget(body)

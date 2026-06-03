@@ -1,24 +1,20 @@
-# MonoStudio 26 — Release v26.14.0
+# MonoStudio 26 — Release v26.14.1
 
 ## Highlights
 
-- **Schedule — timeline & planning**: Trang Schedule với timeline Gantt, milestone, allocate/autoplan, template, bulk allocate, filter department; lưu `schedule` trong project; nhảy từ Dashboard/Inspector sang đúng entity + due date.
-- **Dashboard**: Trang tổng quan project (stats, unscheduled, liên kết Schedule); sidebar filter đồng bộ với Schedule.
-- **User system (serverless)**: Danh bạ studio trong `workspace/.monostudio/users.json` (Dropbox); danh tính cục bộ + device fingerprint; profile/avatar, quản lý team; author/assignee cho note và mention.
-- **Notes nâng cao**: Soạn/xem note có mention (@user), ảnh inline, viewer; mention inbox; tích hợp Inspector và activity.
-- **Notifications & activity**: Dropdown/danh sách thông báo mở rộng; activity log; footer app.
-- **Navigation**: Sidebar/top bar — Dashboard, Schedule; nav pills; Inspector block lịch trình.
+- **Schedule history**: Lịch sử chỉnh sửa schedule (ai, khi nào, tóm tắt thay đổi); dialog xem lịch sử, mở profile tác giả từ roster.
+- **Milestone dialog**: Thiết kế lại — tab Production range + Milestones, thêm/sửa milestone trong form, đồng bộ timeline.
+- **Calendar date picker**: UI/UX lịch chọn ngày thống nhất (Schedule, Inbox drop, dialogs).
+- **Notes & profiles**: Hàng author (avatar + tên roster); link mở profile studio từ note; cải thiện image viewer và mention popup.
+- **Dashboard & timeline**: Cập nhật stats/tiles; tinh chỉnh timeline và điều hướng Schedule.
 
 ## Changes in this release
 
-- feat: Core schedule — `project_schedule`, `schedule_document`, `schedule_planner`, `schedule_dept_filter`, `schedule_date_display`, `project_dashboard_stats`, `mention_inbox`, `user_identity`.
-- feat: UI Schedule — `schedule_page_widget`, `schedule_timeline_widget`, dialogs (plan, allocate, autoplan, milestone, template, view options, legend).
-- feat: UI Dashboard — `dashboard_page_widget`; jump Schedule từ Inspector.
-- feat: UI User/Notes — `team_management_dialog`, `user_*` dialogs, `note_*` editors/viewers, `activity_log`, `app_footer`, `inspector_schedule_block`.
-- feat: `main_window`, `sidebar`, `top_bar`, `main_view`, `inspector` — wiring pages, filters, notifications.
-- feat: `item_comments`, `access_control`, `atomic_write`, `fs_watcher` — notes/mentions và ghi file an toàn trên Dropbox.
-- style: `style.py`, Lucide icons (filter, flag, save, timer, …).
-- docs: `rule_build_v1` — `RELEASE_NOTES.md` chỉ giữ một bản mới nhất.
+- feat: `schedule_history.py`, `schedule_history_dialog.py` — ghi/đọc `schedule_history.json` khi lưu schedule.
+- feat: `schedule_milestone_dialog.py` — UI mới range + danh sách milestone.
+- feat: `note_author_row.py`, `user_profile_view_dialog.py` — author row và xem profile từ note/history.
+- feat: `item_comments.py` — `NoteAuthorVisual` / avatar từ roster.
+- fix/style: `calendar_date_picker.py`, `style.py`, schedule dialogs, `dashboard_page_widget`, `schedule_timeline_widget`, `main_window`.
 
 ## Install
 

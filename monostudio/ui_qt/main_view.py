@@ -2570,6 +2570,7 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._active_department = dep
         self._active_department_icon_name = ic
         self._active_department_label = lab
+        self.invalidate_notes_open_count_cache()
         self._view.viewport().update()
 
     def set_active_project_root(self, path: str | None) -> None:
@@ -3223,7 +3224,10 @@ class _GridCardDelegate(QStyledItemDelegate):
                 if self._tile_meta_show_latest_note and isinstance(item.ref, (Asset, Shot)) and getattr(item, "path", None):
                     from monostudio.core.item_comments import latest_note_preview_line
 
-                    snip, last_done = latest_note_preview_line(Path(item.path))
+                    snip, last_done = latest_note_preview_line(
+                        Path(item.path),
+                        self._active_department,
+                    )
                     note_line = snip if snip else "—"
                     strike = bool(snip and last_done)
                     ico_px = 12
@@ -5319,22 +5323,35 @@ class MainView(QWidget):
     def _view_item_has_reference_files(self, item: ViewItem) -> bool:
         return self.entity_has_reference_files_cached(item)
 
-    def notes_badge_state(self, item_path: Path | str | None) -> tuple[int, str]:
-        """(open_count, visual_mode) with visual_mode in empty|open|all_done — cached per entity path."""
+    def notes_badge_state(
+        self,
+        item_path: Path | str | None,
+        department_id: str | None = None,
+    ) -> tuple[int, str]:
+        """(open_count, visual_mode) for the active sidebar department."""
         if item_path is None:
             return (0, "empty")
         try:
             p = Path(item_path)
-            key = str(p.resolve())
+            path_key = str(p.resolve())
         except (TypeError, OSError, ValueError):
             return (0, "empty")
+        dept = (
+            department_id
+            if department_id is not None
+            else self._active_department
+        )
+        from monostudio.core.item_comments import normalize_note_department_id
+
+        dept_key = normalize_note_department_id(dept)
+        key = f"{path_key}|{dept_key}"
         hit = self._notes_badge_cache.get(key)
         if hit is not None:
             return hit
         try:
             from monostudio.core.item_comments import notes_badge_visual_mode
 
-            n, mode = notes_badge_visual_mode(p)
+            n, mode = notes_badge_visual_mode(p, dept or None)
         except Exception:
             n, mode = 0, "empty"
         self._notes_badge_cache[key] = (int(n), str(mode))
@@ -5343,6 +5360,13 @@ class MainView(QWidget):
     def notes_open_count(self, item_path: Path | str | None) -> int:
         return self.notes_badge_state(item_path)[0]
 
+    def _drop_notes_badge_cache_for_path(self, path_key: str) -> None:
+        """Remove cached note badge counts for one entity (all department keys)."""
+        prefix = f"{path_key}|"
+        stale = [k for k in self._notes_badge_cache if k == path_key or k.startswith(prefix)]
+        for k in stale:
+            self._notes_badge_cache.pop(k, None)
+
     def invalidate_notes_open_count_cache(self, path: Path | str | None = None) -> None:
         if path is None:
             self._notes_badge_cache.clear()
@@ -5350,10 +5374,25 @@ class MainView(QWidget):
             self._entity_concept_cache.clear()
         else:
             try:
-                k = str(Path(path).resolve())
+                path_key = str(Path(path).resolve())
             except (OSError, TypeError, ValueError):
                 return
-            self._notes_badge_cache.pop(k, None)
+            self._drop_notes_badge_cache_for_path(path_key)
+            row = self._row_for_item_id(path_key)
+            if row is not None and row >= 0:
+                if row < self._tile_model.rowCount():
+                    ix = self._tile_model.index(row, 0)
+                    self._tile_model.dataChanged.emit(ix, ix, [])
+                notes_col = self._list_col_notes()
+                if (
+                    notes_col >= 0
+                    and row < self._list_model.rowCount()
+                    and self._browser_context in ("asset", "shot")
+                ):
+                    nix = self._list_model.index(row, notes_col)
+                    self._list_model.dataChanged.emit(nix, nix, [])
+                if row < self._list_model.rowCount():
+                    self._list_model.notify_thumb_column(row)
         self._tile_view.viewport().update()
         lv = getattr(self, "_list_view", None)
         if lv is not None:

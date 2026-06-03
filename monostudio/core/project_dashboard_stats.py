@@ -4,7 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from monostudio.core.item_comments import entry_preview_text, read_item_comments
+from monostudio.core.item_comments import (
+    entry_author_display,
+    entry_preview_text,
+    normalize_note_department_id,
+    read_item_comments,
+)
 from monostudio.core.production_status import CATEGORY_COLOR_HEX
 from monostudio.core.project_schedule import (
     ProjectSchedule,
@@ -29,7 +34,9 @@ class DashboardNoteRow:
     comment_id: str
     at: str
     author: str
+    author_id: str | None
     text: str
+    department: str = ""  # note department id (empty = legacy / general)
 
 
 @dataclass(frozen=True)
@@ -54,11 +61,13 @@ class DashboardSnapshot:
     assets_count: int
     shots_count: int
     open_notes_count: int
+    mention_notes_count: int
     overdue_count: int
     unscheduled_count: int
     unscheduled_entities: tuple[tuple[str, str], ...]  # (entity_kind, entity_rel)
     allocation_count: int
     open_notes: tuple[DashboardNoteRow, ...]
+    mention_notes: tuple[DashboardNoteRow, ...]  # unread @mentions for signed-in user
     upcoming_due: tuple  # UpcomingDueRow
     # Pipeline health (derived from planned bars)
     total_bars: int = 0
@@ -82,6 +91,7 @@ def collect_open_notes(
     assets: tuple,
     shots: tuple,
     *,
+    workspace_root: Path | None = None,
     limit: int = 100,
 ) -> list[DashboardNoteRow]:
     rows: list[DashboardNoteRow] = []
@@ -97,8 +107,10 @@ def collect_open_notes(
                     entity_path=path,
                     comment_id=entry.id,
                     at=entry.at,
-                    author=entry.author,
+                    author=entry_author_display(entry, workspace_root),
+                    author_id=entry.author_id,
                     text=entry_preview_text(entry),
+                    department=normalize_note_department_id(entry.department),
                 )
             )
     for shot in shots:
@@ -113,10 +125,69 @@ def collect_open_notes(
                     entity_path=path,
                     comment_id=entry.id,
                     at=entry.at,
-                    author=entry.author,
+                    author=entry_author_display(entry, workspace_root),
+                    author_id=entry.author_id,
                     text=entry_preview_text(entry),
+                    department=normalize_note_department_id(entry.department),
                 )
             )
+    rows.sort(key=lambda r: r.at, reverse=True)
+    return rows[:limit]
+
+
+def _department_for_note(entity_path: Path, note_id: str) -> str:
+    nid = (note_id or "").strip()
+    if not nid:
+        return ""
+    try:
+        for entry in read_item_comments(entity_path):
+            if entry.id == nid:
+                return normalize_note_department_id(entry.department)
+    except OSError:
+        pass
+    return ""
+
+
+def collect_mention_notes(
+    project_root: Path,
+    user_id: str,
+    *,
+    limit: int = 50,
+) -> list[DashboardNoteRow]:
+    """Unread @mention inbox rows for ``user_id`` (same source as the bell)."""
+    from monostudio.core.mention_inbox import unread_for_user
+
+    uid = (user_id or "").strip()
+    if not uid:
+        return []
+    root = Path(project_root)
+    rows: list[DashboardNoteRow] = []
+    for item in unread_for_user(root, uid):
+        rel = (item.item_rel or "").strip().replace("\\", "/")
+        if not rel:
+            continue
+        try:
+            entity_path = (root / rel).resolve()
+        except OSError:
+            entity_path = root / rel
+        if not entity_path.is_dir():
+            continue
+        kind = "shot" if rel.startswith("shots/") else "asset"
+        name = item.item_display or Path(rel).name
+        text = (item.snippet or "").strip() or "Mentioned you"
+        rows.append(
+            DashboardNoteRow(
+                entity_kind=kind,
+                entity_name=name,
+                entity_path=entity_path,
+                comment_id=item.note_id,
+                at=item.at,
+                author=item.from_name or "Someone",
+                author_id=item.from_user_id or None,
+                text=text,
+                department=_department_for_note(entity_path, item.note_id),
+            )
+        )
     rows.sort(key=lambda r: r.at, reverse=True)
     return rows[:limit]
 
@@ -163,6 +234,7 @@ def build_dashboard_snapshot(
     *,
     assets: tuple,
     shots: tuple,
+    workspace_root: Path | None = None,
     project_index=None,
     allowed_departments: set[str] | None = None,
     hidden_departments: set[str] | None = None,
@@ -173,7 +245,14 @@ def build_dashboard_snapshot(
         return None
     root = Path(project_root)
     schedule: ProjectSchedule = read_project_schedule(root)
-    open_notes = collect_open_notes(root, assets, shots)
+    open_notes = collect_open_notes(root, assets, shots, workspace_root=workspace_root)
+    mention_notes: list[DashboardNoteRow] = []
+    if workspace_root is not None:
+        from monostudio.core.user_identity import get_current_user
+
+        user = get_current_user(workspace_root)
+        if user is not None:
+            mention_notes = collect_mention_notes(root, user.id)
     shot_rels = [_rel_path(root, Path(s.path)) for s in shots]
     asset_rels = [_rel_path(root, Path(a.path)) for a in assets]
 
@@ -219,6 +298,7 @@ def build_dashboard_snapshot(
         assets_count=len(assets),
         shots_count=len(shots),
         open_notes_count=len(open_notes),
+        mention_notes_count=len(mention_notes),
         overdue_count=overdue_count,
         unscheduled_entities=tuple(
             unscheduled_keys := collect_unscheduled_entity_keys(
@@ -231,6 +311,7 @@ def build_dashboard_snapshot(
         unscheduled_count=len(unscheduled_keys),
         allocation_count=len(schedule.targets) + len(schedule.waves) + len(schedule.allocations),
         open_notes=tuple(open_notes),
+        mention_notes=tuple(mention_notes),
         upcoming_due=upcoming,
         total_bars=total_bars,
         done_count=done_count,

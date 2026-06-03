@@ -4,9 +4,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QFont, QShowEvent
-from PySide6.QtWidgets import QDateEdit, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
 
 from monostudio.core.project_id import generate_project_id
+from monostudio.ui_qt.calendar_date_picker import MonosDateEdit
 from monostudio.ui_qt.style import MonosDialog
 
 
@@ -30,8 +31,7 @@ class NewProjectDialog(MonosDialog):
         self._name.textChanged.connect(self._update_ok_enabled)
         self._name.textChanged.connect(self._sync_preview)
 
-        self._start_date = QDateEdit(self)
-        self._start_date.setCalendarPopup(True)
+        self._start_date = MonosDateEdit(self)
         self._start_date.setDate(QDate.currentDate())
         self._start_date.dateChanged.connect(lambda _d: self._update_ok_enabled())
 

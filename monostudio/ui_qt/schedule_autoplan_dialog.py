@@ -9,7 +9,6 @@ from PySide6.QtCore import QDate
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDateEdit,
     QDialogButtonBox,
     QFormLayout,
     QLabel,
@@ -17,6 +16,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from monostudio.ui_qt.calendar_date_picker import MonosDateEdit
 from monostudio.core.fs_reader import ProjectIndex
 from monostudio.core.project_schedule import (
     DEFAULT_TEMPLATE_NAME,
@@ -96,9 +96,7 @@ class ScheduleAutoPlanDialog(MonosDialog):
         root.addWidget(hint)
 
         form = QFormLayout()
-        self._delivery = QDateEdit(self)
-        self._delivery.setCalendarPopup(True)
-        self._delivery.setDisplayFormat("yyyy-MM-dd")
+        self._delivery = MonosDateEdit(self)
         self._delivery.setDate(QDate.currentDate().addDays(28))
         form.addRow("Delivery", self._delivery)
 

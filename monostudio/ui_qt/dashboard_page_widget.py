@@ -10,12 +10,13 @@ from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -24,13 +25,16 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.core.fs_reader import ProjectIndex
+from monostudio.core.item_comments import ItemCommentEntry
 from monostudio.core.production_status import CATEGORY_COLOR_HEX
 from monostudio.core.project_dashboard_stats import (
+    DashboardNoteRow,
     DashboardSnapshot,
     build_dashboard_snapshot,
 )
-from monostudio.core.user_identity import get_current_user_display_name
+from monostudio.core.user_identity import get_current_user, get_current_user_display_name
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.note_author_row import NoteAuthorRow
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 
 _COLOR_DONE = CATEGORY_COLOR_HEX.get("done", "#10b981")
@@ -38,6 +42,7 @@ _COLOR_PROGRESS = CATEGORY_COLOR_HEX.get("in_progress", "#f59e0b")
 _COLOR_WAITING = CATEGORY_COLOR_HEX.get("not_started", "#71717a")
 _COLOR_BLOCKED = CATEGORY_COLOR_HEX.get("blocked", "#ef4444")
 _RED = "#ef4444"
+_DEPT_LOAD_PREVIEW = 8
 
 
 def _hex_to_rgba(hex_str: str, alpha: float) -> str:
@@ -67,38 +72,86 @@ def _relative_due(due: date, today: date) -> tuple[str, bool]:
 class _HealthRing(QWidget):
     """Donut showing completion split (done/progress/waiting), DPI-aware paint."""
 
+    _OUTER = 92
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setFixedSize(72, 72)
+        self.setFixedSize(self._OUTER, self._OUTER)
         self._segments: list[tuple[float, str]] = []
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
+        self._sub_base_pt = 7.0
+        self._center = QWidget(self)
+        self._center.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        lay = QVBoxLayout(self._center)
+        lay.setContentsMargins(4, 0, 4, 0)
         lay.setSpacing(0)
-        lay.addStretch(1)
-        self._value = QLabel("—", self)
-        self._value.setAlignment(Qt.AlignCenter)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._value = QLabel("—", self._center)
+        self._value.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._value.setStyleSheet("background: transparent; color: #fafafa;")
-        self._value.setFont(monos_font("Inter", 15, QFont.Weight.ExtraBold))
-        self._sub = QLabel("no plan", self)
-        self._sub.setAlignment(Qt.AlignCenter)
+        self._value.setFont(monos_font("Inter", 14, QFont.Weight.ExtraBold))
+        self._sub = QLabel("no plan", self._center)
+        self._sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._sub.setStyleSheet("background: transparent; color: #71717a;")
-        self._sub.setFont(monos_font("Inter", 8, QFont.Weight.DemiBold))
-        lay.addWidget(self._value)
-        lay.addWidget(self._sub)
-        lay.addStretch(1)
+        self._sub.setFont(monos_font("Inter", int(self._sub_base_pt), QFont.Weight.DemiBold))
+        lay.addWidget(self._value, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(self._sub, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._position_center_labels()
+
+    def _ring_metrics(self) -> tuple[int, float, float]:
+        side = min(self.width(), self.height())
+        thickness = max(6, int(side * 0.07))
+        margin = thickness / 2 + 2
+        return side, thickness, margin
+
+    def _inner_hole_side(self) -> int:
+        side, thickness, margin = self._ring_metrics()
+        return max(36, int(side - 2 * (margin + thickness)))
+
+    def _position_center_labels(self) -> None:
+        inner = self._inner_hole_side()
+        x = (self.width() - inner) // 2
+        y = (self.height() - inner) // 2
+        self._center.setGeometry(x, y, inner, inner)
+        self._fit_sub_font()
+
+    def _fit_sub_font(self) -> None:
+        text = (self._sub.text() or "").strip()
+        if not text:
+            self._sub.setVisible(False)
+            return
+        self._sub.setVisible(True)
+        max_w = max(24, self._center.width() - 8)
+        pt = self._sub_base_pt
+        font = monos_font("Inter", int(pt), QFont.Weight.DemiBold)
+        while pt > 5.0:
+            metrics = QFontMetrics(font)
+            if metrics.horizontalAdvance(text) <= max_w:
+                break
+            pt -= 0.5
+            font = monos_font("Inter", max(5, int(round(pt))), QFont.Weight.DemiBold)
+        self._sub.setFont(font)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._position_center_labels()
 
     def set_data(self, segments: list[tuple[float, str]], center: str, sub: str) -> None:
         self._segments = [(max(0.0, float(v)), c) for v, c in segments]
         self._value.setText(center)
-        self._sub.setText(sub)
+        sub_clean = (sub or "").strip()
+        if sub_clean.lower() == "complete":
+            sub_clean = "done"
+        self._sub.setText(sub_clean)
+        pct = (center or "").strip()
+        tip = f"{pct} {sub_clean}".strip() if sub_clean else pct
+        self.setToolTip(tip)
+        self._fit_sub_font()
         self.update()
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        side = min(self.width(), self.height())
-        thickness = max(9, int(side * 0.11))
-        margin = thickness / 2 + 2
+        _side, thickness, margin = self._ring_metrics()
         rect = QRectF(margin, margin, self.width() - 2 * margin, self.height() - 2 * margin)
         track = QPen(QColor("#27272a"), thickness)
         track.setCapStyle(Qt.PenCapStyle.FlatCap)
@@ -304,6 +357,27 @@ class _ClickableRow(QFrame):
         super().mouseReleaseEvent(event)
 
 
+class _NoteDashboardRow(_ClickableRow):
+    """Note row with context menu: open notes / jump to department."""
+
+    open_notes = Signal()
+    go_to_department = Signal()
+
+    def __init__(self, parent=None, *, has_department: bool = False) -> None:
+        super().__init__(parent)
+        self._has_department = bool(has_department)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
+
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        menu = QMenu(self)
+        menu.addAction("Open notes…", self.open_notes.emit)
+        go = menu.addAction("Go to department", self.go_to_department.emit)
+        go.setEnabled(self._has_department)
+        if not self._has_department:
+            go.setToolTip("This note has no department tag")
+        menu.exec(event.globalPos())
+
+
 def _chip(text: str, color_hex: str, parent=None) -> QLabel:
     lab = QLabel(text, parent)
     lab.setFont(monos_font("Inter", 10, QFont.Weight.ExtraBold))
@@ -386,7 +460,8 @@ class DashboardPageWidget(QWidget):
     open_schedule_requested = Signal()
     schedule_jump_requested = Signal(str, str, str, str)  # kind, rel, dept, due_iso
     unscheduled_entities_requested = Signal(object)  # list[tuple[str, str]] kind, rel
-    open_notes_entity_requested = Signal(object)  # Path
+    open_notes_entity_requested = Signal(object)  # DashboardNoteRow
+    note_go_to_department_requested = Signal(object)  # DashboardNoteRow
     open_scope_requested = Signal(str)  # "Assets" | "Shots"
 
     def __init__(self, parent=None) -> None:
@@ -399,6 +474,8 @@ class DashboardPageWidget(QWidget):
         self._hidden_departments: set[str] = set()
         self._respect_hidden: bool = True
         self._dept_scope: str = "all"
+        self._notes_filter: str = "all"  # "all" | "mentions"
+        self._dept_load_expanded: bool = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -513,6 +590,13 @@ class DashboardPageWidget(QWidget):
         self._dept_list.setContentsMargins(0, 0, 0, 0)
         self._dept_list.setSpacing(4)
         dlb.addWidget(self._dept_list_host)
+        self._dept_show_more_btn = QPushButton("", self._dept_card)
+        self._dept_show_more_btn.setObjectName("DashboardTileLink")
+        self._dept_show_more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._dept_show_more_btn.setFlat(True)
+        self._dept_show_more_btn.setVisible(False)
+        self._dept_show_more_btn.clicked.connect(self._toggle_dept_load_expanded)
+        dlb.addWidget(self._dept_show_more_btn, 0, Qt.AlignLeft)
         dlb.addStretch(1)
 
         # Next 7 days card
@@ -538,8 +622,9 @@ class DashboardPageWidget(QWidget):
         atb.addWidget(self._attention_list_host)
         atb.addStretch(1)
 
-        # Recent notes card
-        self._notes_card, ntb = _card("Recent Notes")
+        # Recent notes card (All open vs Mentions me)
+        self._notes_filter_host = self._build_notes_filter_bar()
+        self._notes_card, ntb = _card("Recent Notes", right_widget=self._notes_filter_host)
         self._notes_list_host = QWidget(self._notes_card)
         self._notes_list = QVBoxLayout(self._notes_list_host)
         self._notes_list.setContentsMargins(0, 0, 0, 0)
@@ -559,8 +644,109 @@ class DashboardPageWidget(QWidget):
         self._grid.setColumnStretch(0, 1)
         self._grid.setColumnStretch(1, 1)
 
+    def _build_notes_filter_bar(self) -> QWidget:
+        host = QWidget()
+        host.setObjectName("DashboardNotesFilterBar")
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._btn_notes_all = QPushButton("All open", host)
+        self._btn_notes_all.setObjectName("DashboardNotesFilterBtn")
+        self._btn_notes_all.setCheckable(True)
+        self._btn_notes_all.setChecked(True)
+        self._btn_notes_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_notes_all.clicked.connect(lambda: self._set_notes_filter("all"))
+        self._btn_notes_mentions = QPushButton("Mentions me", host)
+        self._btn_notes_mentions.setObjectName("DashboardNotesFilterBtn")
+        self._btn_notes_mentions.setCheckable(True)
+        self._btn_notes_mentions.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_notes_mentions.clicked.connect(lambda: self._set_notes_filter("mentions"))
+        row.addWidget(self._btn_notes_all)
+        row.addWidget(self._btn_notes_mentions)
+        return host
+
+    def _set_notes_filter(self, mode: str) -> None:
+        mode = (mode or "all").strip().lower()
+        if mode not in ("all", "mentions"):
+            return
+        if self._notes_filter == mode:
+            return
+        self._notes_filter = mode
+        self._btn_notes_all.setChecked(mode == "all")
+        self._btn_notes_mentions.setChecked(mode == "mentions")
+        if self._snapshot is not None:
+            self._update_notes(self._snapshot)
+
     def _scroll_to_notes(self) -> None:
         self._scroll.ensureWidgetVisible(self._notes_card)
+
+    def _scroll_to_mention_notes(self) -> None:
+        self._set_notes_filter("mentions")
+        self._scroll_to_notes()
+
+    def _dept_label(self, dept_id: str) -> str:
+        did = (dept_id or "").strip()
+        if not did:
+            return ""
+        if self._project_root is not None:
+            try:
+                from monostudio.core.department_registry import DepartmentRegistry
+
+                return DepartmentRegistry.for_project(self._project_root).get_department_label(did)
+            except OSError:
+                pass
+        return did.replace("_", " ").title()
+
+    def _add_note_row(self, note: DashboardNoteRow) -> None:
+        row = _NoteDashboardRow(self._notes_list_host, has_department=bool(note.department))
+        row.clicked.connect(lambda n=note: self.open_notes_entity_requested.emit(n))
+        row.open_notes.connect(lambda n=note: self.open_notes_entity_requested.emit(n))
+        row.go_to_department.connect(lambda n=note: self.note_go_to_department_requested.emit(n))
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(6, 5, 6, 5)
+        rl.setSpacing(8)
+        kind = "Shot" if note.entity_kind == "shot" else "Asset"
+        chip_color = _COLOR_PROGRESS if note.entity_kind == "shot" else _COLOR_DONE
+        rl.addWidget(_chip(f"{kind} · {note.entity_name}", chip_color, row), 0, Qt.AlignVCenter)
+        text = note.text.replace("\n", " ").strip()
+        if len(text) > 90:
+            text = text[:89].rstrip() + "…"
+        body = QLabel(text, row)
+        body.setFont(monos_font("Inter", 12))
+        body.setStyleSheet("color: #d4d4d8; background: transparent;")
+        rl.addWidget(body, 1)
+        if note.department:
+            dept_btn = QPushButton(self._dept_label(note.department), row)
+            dept_btn.setObjectName("DashboardNoteDeptBtn")
+            dept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            dept_btn.setToolTip("Open this asset/shot in the note's department")
+            dept_btn.clicked.connect(
+                lambda _=False, n=note: self.note_go_to_department_requested.emit(n)
+            )
+            rl.addWidget(dept_btn, 0, Qt.AlignVCenter)
+        stub = ItemCommentEntry(
+            id=note.comment_id,
+            at=note.at,
+            author=note.author,
+            text=".",
+            author_id=note.author_id,
+            department=note.department,
+        )
+        rl.addWidget(
+            NoteAuthorRow.for_entry(
+                stub,
+                self._workspace_root,
+                avatar_size=22,
+                name_only=True,
+                parent=row,
+            ),
+            0,
+            Qt.AlignRight | Qt.AlignVCenter,
+        )
+        when = QLabel(note.at[:16].replace("T", " "), row)
+        when.setObjectName("DashboardMutedMeta")
+        rl.addWidget(when, 0, Qt.AlignRight | Qt.AlignVCenter)
+        self._notes_list.addWidget(row)
 
     def _emit_unscheduled(self) -> None:
         keys = list(self._snapshot.unscheduled_entities) if self._snapshot else []
@@ -606,6 +792,7 @@ class DashboardPageWidget(QWidget):
             self._project_root,
             assets=project_index.assets,
             shots=project_index.shots,
+            workspace_root=self._workspace_root,
             project_index=project_index,
             allowed_departments=self._allowed_departments,
             hidden_departments=self._hidden_departments,
@@ -638,7 +825,7 @@ class DashboardPageWidget(QWidget):
                     (snap.waiting_count, _COLOR_WAITING),
                 ],
                 f"{int(round(snap.completion_pct))}%",
-                "complete",
+                "done",
             )
         else:
             self._ring.set_data([], "—", "no plan")
@@ -696,41 +883,64 @@ class DashboardPageWidget(QWidget):
         note.setObjectName("DashboardMutedMeta")
         self._health_legend.addWidget(note)
 
+    def _toggle_dept_load_expanded(self) -> None:
+        self._dept_load_expanded = not self._dept_load_expanded
+        if self._snapshot is not None:
+            self._update_dept_load(self._snapshot)
+
+    def _add_dept_load_row(self, s) -> None:
+        row = _ClickableRow(self._dept_list_host)
+        row.clicked.connect(
+            lambda _checked=False, dep_id=s.department: self.schedule_jump_requested.emit(
+                "", "", dep_id, ""
+            )
+        )
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(6, 5, 6, 5)
+        rl.setSpacing(8)
+        rl.addWidget(_dot(s.color_hex, 9), 0, Qt.AlignVCenter)
+        name = QLabel(s.department_label, row)
+        name.setFont(monos_font("Inter", 12, QFont.Weight.DemiBold))
+        name.setStyleSheet("color: #e4e4e7; background: transparent;")
+        rl.addWidget(name, 1)
+        bar = _StackedBar(row, height=6)
+        bar.setFixedWidth(96)
+        done_part = s.done
+        rest = max(0, s.total - s.done)
+        bar.set_segments([(done_part, _COLOR_DONE), (rest, _COLOR_WAITING)])
+        rl.addWidget(bar, 0, Qt.AlignVCenter)
+        meta = QLabel(f"{s.done}/{s.total}", row)
+        meta.setObjectName("DashboardMutedMeta")
+        meta.setMinimumWidth(44)
+        meta.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        rl.addWidget(meta, 0)
+        if s.overdue > 0:
+            rl.addWidget(_chip(f"{s.overdue} late", _RED, row), 0)
+        self._dept_list.addWidget(row)
+
     def _update_dept_load(self, snap: DashboardSnapshot) -> None:
         _clear_layout(self._dept_list)
         stats = [s for s in snap.dept_stats if s.total > 0]
         if not stats:
+            self._dept_show_more_btn.setVisible(False)
             self._dept_list.addWidget(_empty_state("layers", "No scheduled work yet"))
             return
-        for s in stats[:8]:
-            row = _ClickableRow(self._dept_list_host)
-            row.clicked.connect(
-                lambda _checked=False, dep_id=s.department: self.schedule_jump_requested.emit(
-                    "", "", dep_id, ""
-                )
-            )
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(6, 5, 6, 5)
-            rl.setSpacing(8)
-            rl.addWidget(_dot(s.color_hex, 9), 0, Qt.AlignVCenter)
-            name = QLabel(s.department_label, row)
-            name.setFont(monos_font("Inter", 12, QFont.Weight.DemiBold))
-            name.setStyleSheet("color: #e4e4e7; background: transparent;")
-            rl.addWidget(name, 1)
-            bar = _StackedBar(row, height=6)
-            bar.setFixedWidth(96)
-            done_part = s.done
-            rest = max(0, s.total - s.done)
-            bar.set_segments([(done_part, _COLOR_DONE), (rest, _COLOR_WAITING)])
-            rl.addWidget(bar, 0, Qt.AlignVCenter)
-            meta = QLabel(f"{s.done}/{s.total}", row)
-            meta.setObjectName("DashboardMutedMeta")
-            meta.setMinimumWidth(44)
-            meta.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            rl.addWidget(meta, 0)
-            if s.overdue > 0:
-                rl.addWidget(_chip(f"{s.overdue} late", _RED, row), 0)
-            self._dept_list.addWidget(row)
+        total = len(stats)
+        if total <= _DEPT_LOAD_PREVIEW:
+            visible = stats
+            self._dept_show_more_btn.setVisible(False)
+        elif self._dept_load_expanded:
+            visible = stats
+            self._dept_show_more_btn.setText("Show less")
+            self._dept_show_more_btn.setVisible(True)
+        else:
+            visible = stats[:_DEPT_LOAD_PREVIEW]
+            hidden = total - _DEPT_LOAD_PREVIEW
+            self._dept_show_more_btn.setText(f"Show all ({total})")
+            self._dept_show_more_btn.setToolTip(f"{hidden} more department{'s' if hidden != 1 else ''}")
+            self._dept_show_more_btn.setVisible(True)
+        for s in visible:
+            self._add_dept_load_row(s)
 
     def _update_next_7_days(self, snap: DashboardSnapshot) -> None:
         _clear_layout(self._next_list)
@@ -817,35 +1027,29 @@ class DashboardPageWidget(QWidget):
 
     def _update_notes(self, snap: DashboardSnapshot) -> None:
         _clear_layout(self._notes_list)
-        notes = list(snap.open_notes)
-        if not notes:
-            self._notes_list.addWidget(self._empty_hint("No open notes"))
-            return
+        self._btn_notes_all.setChecked(self._notes_filter == "all")
+        self._btn_notes_mentions.setChecked(self._notes_filter == "mentions")
+        mention_n = snap.mention_notes_count
+        self._btn_notes_mentions.setText(
+            f"Mentions me ({mention_n})" if mention_n else "Mentions me"
+        )
+        if self._notes_filter == "mentions":
+            notes = list(snap.mention_notes)
+            if not get_current_user(self._workspace_root):
+                self._notes_list.addWidget(
+                    self._empty_hint("Sign in to see notes that mention you")
+                )
+                return
+            if not notes:
+                self._notes_list.addWidget(self._empty_hint("No unread mentions"))
+                return
+        else:
+            notes = list(snap.open_notes)
+            if not notes:
+                self._notes_list.addWidget(self._empty_hint("No open notes"))
+                return
         for note in notes[:8]:
-            row = _ClickableRow(self._notes_list_host)
-            row.clicked.connect(
-                lambda _checked=False, p=Path(note.entity_path): self.open_notes_entity_requested.emit(p)
-            )
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(6, 5, 6, 5)
-            rl.setSpacing(8)
-            kind = "Shot" if note.entity_kind == "shot" else "Asset"
-            chip_color = _COLOR_PROGRESS if note.entity_kind == "shot" else _COLOR_DONE
-            rl.addWidget(_chip(f"{kind} · {note.entity_name}", chip_color, row), 0, Qt.AlignVCenter)
-            text = note.text.replace("\n", " ").strip()
-            if len(text) > 90:
-                text = text[:89].rstrip() + "…"
-            body = QLabel(text, row)
-            body.setFont(monos_font("Inter", 12))
-            body.setStyleSheet("color: #d4d4d8; background: transparent;")
-            rl.addWidget(body, 1)
-            author = QLabel(note.author or "—", row)
-            author.setObjectName("DashboardMutedMeta")
-            rl.addWidget(author, 0, Qt.AlignRight | Qt.AlignVCenter)
-            when = QLabel(note.at[:16].replace("T", " "), row)
-            when.setObjectName("DashboardMutedMeta")
-            rl.addWidget(when, 0, Qt.AlignRight | Qt.AlignVCenter)
-            self._notes_list.addWidget(row)
+            self._add_note_row(note)
 
     def _empty_hint(self, text: str) -> QLabel:
         lab = QLabel(text)

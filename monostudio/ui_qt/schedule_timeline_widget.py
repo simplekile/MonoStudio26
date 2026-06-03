@@ -7,6 +7,7 @@ collapsed. Click the chevron to expand into per-department rows.
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -98,10 +99,17 @@ if TYPE_CHECKING:
 
 _LABEL_W = 220
 _ROW_H = 34
-_HEADER_H = 56
-# Top strip: start/deadline markers + horizontal connector; month labels sit below.
+_HEADER_H = 64
+# Header rows below IN/OUT band (14px): milestone names → month → day numbers.
 _HEADER_RANGE_BAND_H = 14
-_HEADER_TIME_TOP = 26
+_HEADER_MILESTONE_TOP = 15
+_HEADER_MILESTONE_H = 11
+_HEADER_MONTH_TOP = 28
+_HEADER_MONTH_H = 12
+_HEADER_DAY_TOP = 42
+_HEADER_DAY_H = 18
+# Vertical marker lines in the header stop above the day-number row.
+_HEADER_MARKER_LINE_BOTTOM = _HEADER_DAY_TOP - 1
 _DAY_W = 28.0
 _BAR_H = 18
 _MINI_BAR_H = 6
@@ -843,6 +851,20 @@ class _GanttCanvas(QWidget):
     def _date_to_x_end(self, d: date) -> float:
         return (d - self._view_start).days * self._day_w + self._day_w
 
+    @staticmethod
+    def _month_last_day(d: date) -> date:
+        if d.month == 12:
+            return date(d.year, 12, 31)
+        return date(d.year, d.month + 1, 1) - timedelta(days=1)
+
+    def _month_label_span_px(self, start_i: int) -> int:
+        """Width for a month title from day index ``start_i`` through month end (in view)."""
+        d0 = self._view_start + timedelta(days=start_i)
+        clip_end = min(self._month_last_day(d0), self._view_end)
+        x0 = int(start_i * self._day_w)
+        x1 = int(self._date_to_x_end(clip_end))
+        return max(int(self._day_w), x1 - x0)
+
     def _project_range(self) -> tuple[date | None, date | None]:
         ps_raw = resolve_schedule_project_start(self._schedule, self._project_root)
         ps = self._parse(ps_raw or "")
@@ -853,11 +875,58 @@ class _GanttCanvas(QWidget):
         _ps, pe = self._project_range()
         return pe
 
-    def _paint_deadline_marker(self, p: QPainter, h: int, *, header: bool) -> None:
+    def _deadline_x(self) -> int | None:
+        """Right edge of the deadline day column (OUT marker sits at end of that cell)."""
         pe = self._deadline_date()
         if pe is None or pe < self._view_start or pe > self._view_end:
+            return None
+        return int(self._date_to_x_end(pe))
+
+    def _paint_header_column_line(
+        self,
+        p: QPainter,
+        x: int,
+        color: QColor,
+        *,
+        width: int = 2,
+        dashed: bool = False,
+    ) -> None:
+        """Vertical guide in the header — never crosses the day-number row."""
+        pen = QPen(color, width)
+        if dashed:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.drawLine(x, _HEADER_RANGE_BAND_H, x, _HEADER_MARKER_LINE_BOTTOM)
+
+    def _paint_today_header_marker(self, p: QPainter) -> None:
+        today = date.today()
+        if not (self._view_start <= today <= self._view_end):
             return
-        x = int(self._date_to_x_start(pe))
+        tx = int(self._date_to_x(today))
+        blue = QColor(MONOS_COLORS.get("blue_400", "#60a5fa"))
+        self._paint_header_column_line(p, tx, blue, width=2)
+
+        if self._day_w <= _DAY_W_WEEK_IN_MONTH_MAX:
+            return
+
+        i = (today - self._view_start).days
+        x = int(i * self._day_w)
+        col_w = max(int(self._day_w), 1)
+        underline_y = _HEADER_DAY_TOP + _HEADER_DAY_H - 3
+        p.setPen(QPen(blue, 2))
+        p.drawLine(x + 3, underline_y, x + col_w - 3, underline_y)
+        p.setPen(blue)
+        p.setFont(monos_font("JetBrains Mono", 9, QFont.Weight.DemiBold))
+        p.drawText(
+            QRect(x, _HEADER_DAY_TOP, col_w, _HEADER_DAY_H),
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+            str(today.day),
+        )
+
+    def _paint_deadline_marker(self, p: QPainter, h: int, *, header: bool) -> None:
+        x = self._deadline_x()
+        if x is None:
+            return
         marker_h = _HEADER_RANGE_BAND_H if header else h
         self._paint_range_edge_marker(
             p, x, marker_h, edge="out", color=_DEADLINE_HEADER, header=header
@@ -1198,7 +1267,13 @@ class _GanttCanvas(QWidget):
                 p.setPen(month_pen)
                 p.setFont(month_font)
                 month_label = ws.strftime("%b %Y").upper()
-                p.drawText(x0 + 4, _HEADER_TIME_TOP, month_label)
+                month_end = min(self._month_last_day(ws), self._view_end)
+                month_w = max(band_w, int(self._date_to_x_end(month_end)) - x0)
+                p.drawText(
+                    QRect(x0 + 4, _HEADER_MONTH_TOP, max(1, month_w - 4), _HEADER_MONTH_H),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    month_label,
+                )
 
             label = f"W{wnum}"
             min_w = 12 + len(label) * 5
@@ -1206,8 +1281,8 @@ class _GanttCanvas(QWidget):
                 p.setPen(week_pen)
                 p.setFont(week_font)
                 p.drawText(
-                    QRect(x0, _HEADER_TIME_TOP + 10, band_w, 18),
-                    Qt.AlignHCenter | Qt.AlignTop,
+                    QRect(x0, _HEADER_DAY_TOP, band_w, _HEADER_DAY_H),
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                     label,
                 )
 
@@ -1243,38 +1318,63 @@ class _GanttCanvas(QWidget):
 
             if dw >= 18:
                 if d.day == 1 or i == 0:
+                    month_w = self._month_label_span_px(i)
                     p.setPen(month_pen)
                     p.setFont(monos_font("Inter", 9, QFont.Weight.DemiBold))
-                    p.drawText(x + 4, _HEADER_TIME_TOP, d.strftime("%b %Y"))
+                    p.drawText(
+                        QRect(x + 4, _HEADER_MONTH_TOP, max(1, month_w - 4), _HEADER_MONTH_H),
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                        d.strftime("%b %Y"),
+                    )
                 p.setPen(day_pen)
                 p.setFont(monos_font("JetBrains Mono", 9))
                 p.drawText(
-                    QRect(x, _HEADER_TIME_TOP + 8, col_w, 20),
-                    Qt.AlignHCenter | Qt.AlignTop,
+                    QRect(x, _HEADER_DAY_TOP, col_w, _HEADER_DAY_H),
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                     str(d.day),
                 )
             elif dw >= 9:
                 if d.day == 1 or i == 0:
+                    month_w = self._month_label_span_px(i)
                     p.setPen(month_pen)
                     p.setFont(monos_font("Inter", 9, QFont.Weight.DemiBold))
-                    p.drawText(x + 4, _HEADER_TIME_TOP, d.strftime("%b"))
+                    p.drawText(
+                        QRect(x + 4, _HEADER_MONTH_TOP, max(1, month_w - 4), _HEADER_MONTH_H),
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                        d.strftime("%b"),
+                    )
                 if col_w >= 11 or d.weekday() < 5:
                     p.setPen(day_pen)
                     p.setFont(monos_font("JetBrains Mono", 9))
                     p.drawText(
-                        QRect(x, _HEADER_TIME_TOP + 10, col_w, 18),
-                        Qt.AlignHCenter | Qt.AlignTop,
+                        QRect(x, _HEADER_DAY_TOP, col_w, _HEADER_DAY_H),
+                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                         str(d.day),
                     )
             elif dw >= 4:
+                month_w = self._month_label_span_px(i) if i == 0 else col_w
                 p.setPen(month_pen)
                 p.setFont(monos_font("Inter", 9, QFont.Weight.DemiBold))
                 label = d.strftime("%b %d") if i == 0 else d.strftime("%d %b")
-                p.drawText(x + 4, _HEADER_TIME_TOP, label)
+                p.drawText(
+                    QRect(
+                        x + (4 if i == 0 else 0),
+                        _HEADER_MONTH_TOP,
+                        max(1, (month_w - 4) if i == 0 else col_w),
+                        _HEADER_MONTH_H + _HEADER_DAY_H,
+                    ),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    label,
+                )
             else:
+                month_w = self._month_label_span_px(i)
                 p.setPen(month_pen)
                 p.setFont(monos_font("Inter", 10, QFont.Weight.DemiBold))
-                p.drawText(x + 4, _HEADER_TIME_TOP + 2, d.strftime("%b %Y"))
+                p.drawText(
+                    QRect(x + 4, _HEADER_MONTH_TOP, max(1, month_w - 4), _HEADER_MONTH_H + _HEADER_DAY_H),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    d.strftime("%b %Y"),
+                )
 
     def _paint_outside_production_range(self, p: QPainter, w: int, h: int) -> None:
         """Dim days before project start and after deadline (still visible in the scroll range)."""
@@ -1475,10 +1575,11 @@ class _GanttCanvas(QWidget):
                 p, x, h, edge="in", color=QColor(_RANGE_IN_HEX), header=False
             )
         if pe is not None and self._view_start <= pe <= self._view_end:
-            x = int(self._date_to_x_start(pe))
-            self._paint_range_edge_marker(
-                p, x, h, edge="out", color=_DEADLINE_HEADER, header=False
-            )
+            x = self._deadline_x()
+            if x is not None:
+                self._paint_range_edge_marker(
+                    p, x, h, edge="out", color=_DEADLINE_HEADER, header=False
+                )
 
     def _entity_span_dates(
         self, entity_kind: str, entity_rel: str, departments: list
@@ -1579,30 +1680,88 @@ class _GanttCanvas(QWidget):
         p.drawLine(w - 1, 0, w - 1, h)
         p.drawLine(0, h - 1, w, h - 1)
 
-    def _paint_header_pane(self, p: QPainter, w: int, h: int) -> None:
-        p.fillRect(self.rect(), QColor("#0d0d0f"))
-        self._paint_time_header_labels(p, w)
-        self._paint_project_range_header(p, w, h)
-        self._paint_deadline_marker(p, h, header=True)
-
-        header_grid_top = _HEADER_RANGE_BAND_H
-        today = date.today()
-        if self._view_start <= today <= self._view_end:
-            tx = int(self._date_to_x(today))
-            p.setPen(QPen(QColor(MONOS_COLORS.get("blue_400", "#60a5fa")), 2))
-            p.drawLine(tx, header_grid_top, tx, h)
-
+    def _paint_milestone_header_markers(
+        self, p: QPainter, *, header_grid_top: int, h: int
+    ) -> None:
+        """Purple milestone guides + labels above month/day header rows."""
+        del header_grid_top, h
+        by_date: dict[date, list] = defaultdict(list)
         for m in self._schedule.milestones:
             md = self._parse(m.date)
             if md is None or md < self._view_start or md > self._view_end:
                 continue
+            by_date[md].append(m)
+
+        label_font = monos_font("Inter", 8, QFont.Weight.DemiBold)
+        label_fm = QFontMetrics(label_font)
+        max_label_bottom = _HEADER_MONTH_TOP - 1
+
+        for md in sorted(by_date.keys()):
+            items = by_date[md]
             mx = int(self._date_to_x(md))
-            p.setPen(QPen(QColor("#a855f7"), 1, Qt.PenStyle.DashLine))
-            p.drawLine(mx, header_grid_top, mx, h)
-            if self._day_w >= 8:
-                p.setPen(QColor("#a1a1aa"))
-                p.setFont(monos_font("Inter", 9))
-                p.drawText(mx + 4, h - 6, m.label[:24])
+            self._paint_header_column_line(
+                p, mx, QColor("#a855f7"), width=1, dashed=True
+            )
+
+            if self._day_w < 8:
+                continue
+
+            parts = [(m.label or "").strip() for m in items if (m.label or "").strip()]
+            if not parts:
+                continue
+            combined = " · ".join(parts)
+            max_w = max(56, min(int(self._day_w * 2.5), 140))
+            text = label_fm.elidedText(combined, Qt.TextElideMode.ElideRight, max_w)
+            if not text:
+                continue
+
+            tx = mx + 5
+            tw = label_fm.horizontalAdvance(text)
+            ty = _HEADER_MILESTONE_TOP
+            if ty + _HEADER_MILESTONE_H > max_label_bottom:
+                continue
+
+            pill = QRect(tx, ty, tw + 6, _HEADER_MILESTONE_H)
+            p.fillRect(pill, QColor(24, 24, 27, 230))
+            p.setPen(QColor("#c084fc"))
+            p.setFont(label_font)
+            p.drawText(
+                QRect(tx + 3, ty, tw, _HEADER_MILESTONE_H),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                text,
+            )
+
+    def _paint_milestone_day_marks(self, p: QPainter) -> None:
+        """Purple underline on day cells that have milestones (header only)."""
+        if self._day_w <= _DAY_W_WEEK_IN_MONTH_MAX:
+            return
+        today = date.today()
+        purple = QColor("#a855f7")
+        underline_y = _HEADER_DAY_TOP + _HEADER_DAY_H - 3
+        seen: set[date] = set()
+        for m in self._schedule.milestones:
+            md = self._parse(m.date)
+            if md is None or md in seen or md < self._view_start or md > self._view_end:
+                continue
+            if md == today:
+                continue
+            seen.add(md)
+            i = (md - self._view_start).days
+            x = int(i * self._day_w)
+            col_w = max(int(self._day_w), 1)
+            p.setPen(QPen(purple, 2))
+            p.drawLine(x + 3, underline_y, x + col_w - 3, underline_y)
+
+    def _paint_header_pane(self, p: QPainter, w: int, h: int) -> None:
+        p.fillRect(self.rect(), QColor("#0d0d0f"))
+        self._paint_project_range_header(p, w, h)
+        self._paint_deadline_marker(p, h, header=True)
+
+        header_grid_top = _HEADER_RANGE_BAND_H
+        self._paint_milestone_header_markers(p, header_grid_top=header_grid_top, h=h)
+        self._paint_time_header_labels(p, w)
+        self._paint_milestone_day_marks(p)
+        self._paint_today_header_marker(p)
 
         p.setPen(QPen(QColor("#3f3f46"), 1))
         p.drawLine(0, h - 1, w, h - 1)

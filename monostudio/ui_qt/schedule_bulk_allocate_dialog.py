@@ -19,12 +19,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSpinBox,
-    QDateEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from monostudio.core.project_schedule import ScheduleAllocation, bulk_upsert_allocations, new_allocation_id
+from monostudio.ui_qt.calendar_date_picker import MonosDateEdit
 from monostudio.ui_qt.schedule_allocate_dialog import _EntityOption
 from monostudio.ui_qt.style import MonosDialog
 
@@ -92,12 +92,8 @@ class ScheduleBulkAllocateDialog(MonosDialog):
             self._dept.addItem(dept_labels.get(dep, dep), dep)
         form.addRow("Department", self._dept)
 
-        self._start = QDateEdit(self)
-        self._start.setCalendarPopup(True)
-        self._start.setDisplayFormat("yyyy-MM-dd")
-        self._due = QDateEdit(self)
-        self._due.setCalendarPopup(True)
-        self._due.setDisplayFormat("yyyy-MM-dd")
+        self._start = MonosDateEdit(self)
+        self._due = MonosDateEdit(self)
         today = QDate.currentDate()
         self._start.setDate(today)
         self._due.setDate(today.addDays(7))

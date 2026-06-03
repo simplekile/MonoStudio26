@@ -6,11 +6,16 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt, QUrl, Signal
-from PySide6.QtGui import QFont, QMouseEvent, QTextDocument
-from PySide6.QtWidgets import QTextBrowser
+from PySide6.QtGui import (
+    QFont,
+    QFontMetrics,
+    QMouseEvent,
+    QColor,
+)
+from PySide6.QtWidgets import QLabel, QSizePolicy, QTextBrowser
 
+from monostudio.core.item_comments import is_mention_note_href, user_id_from_mention_href
 from monostudio.ui_qt.note_compose_editor import (
-    NOTE_LINE_MIN_H,
     NOTE_RICH_TEXT_STYLESHEET,
     normalize_note_document_spacing,
     note_html_for_display,
@@ -35,16 +40,18 @@ def _open_note_image(item_root: Path, href: str, *, parent) -> bool:
 
 
 class NoteBodyBrowser(QTextBrowser):
-    def __init__(self, *, item_root: Path, parent=None) -> None:
+    def __init__(self, *, item_root: Path, workspace_root: Path | None = None, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("ItemNotesBodyBrowser")
         self.setOpenExternalLinks(False)
+        self.setOpenLinks(False)
         self.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
         self.setFrameShape(self.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setSizeAdjustPolicy(QTextBrowser.SizeAdjustPolicy.AdjustToContents)
         self._item_root = Path(item_root)
+        self._workspace_root = Path(workspace_root) if workspace_root else None
         mono = self._item_root / ".monostudio"
         self.document().setBaseUrl(QUrl.fromLocalFile(str(mono) + os.sep))
         self.document().setDefaultStyleSheet(NOTE_RICH_TEXT_STYLESHEET)
@@ -71,6 +78,13 @@ class NoteBodyBrowser(QTextBrowser):
         self.viewport().update()
 
     def _handle_mouse_move(self, viewport_pos) -> None:
+        href = self.anchorAt(viewport_pos)
+        if href and is_mention_note_href(href):
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self._handle_image_mouse_move(viewport_pos)
+
+    def _handle_image_mouse_move(self, viewport_pos) -> None:
         href = image_href_at_widget_pos(self, viewport_pos)
         if href != self._hover_img_href:
             if self._hover_img_href:
@@ -136,75 +150,65 @@ class NoteBodyBrowser(QTextBrowser):
         self.setStyleSheet(f"color: {color}; background: transparent;")
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
+    def setSource(self, url: QUrl) -> None:  # type: ignore[override]
+        """Block Qt from loading custom mention: anchors as documents."""
+        if is_mention_note_href(url.toString()):
+            return
+        super().setSource(url)
+
     def _on_anchor(self, url: QUrl) -> None:
         href = url.toString()
-        if href.startswith("mention:") or href.startswith("#mention-"):
+        if is_mention_note_href(href):
+            uid = user_id_from_mention_href(href)
+            if uid:
+                from monostudio.ui_qt.user_profile_view_dialog import open_studio_user_profile
+
+                open_studio_user_profile(self._workspace_root, uid, parent=self.window())
             return
         if href.startswith("monos-img:") or "note_media" in href:
             _open_note_image(self._item_root, href, parent=self.window())
 
 
-class NoteListPreviewBrowser(NoteBodyBrowser):
-    """Compact rich preview for note list cards — one line, no scroll."""
+class NoteListPreviewLabel(QLabel):
+    """One-line note preview — plain text elided like schedule milestone labels."""
 
     open_requested = Signal()
 
-    _PREVIEW_ONE_LINE_H = NOTE_LINE_MIN_H
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ItemNotesPreviewLabel")
+        self.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._full_text = ""
 
-    def __init__(self, *, item_root: Path, parent=None) -> None:
-        super().__init__(item_root=item_root, parent=parent)
-        self.setObjectName("ItemNotesPreviewBrowser")
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._content_truncated = False
-        self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+    def set_preview(self, text: str, *, done: bool = False) -> None:
+        self._full_text = (text or "").replace("\n", " ").strip()
+        color = "#71717a" if done else "#d4d4d8"
+        self.setStyleSheet(f"color: {color}; background: transparent;")
+        fm = QFontMetrics(self.font())
+        self.setMinimumHeight(fm.height() + 2)
+        self._apply_elide()
 
-    def is_content_truncated(self) -> bool:
-        return self._content_truncated
+    def _apply_elide(self) -> None:
+        if not self._full_text:
+            self.setText("")
+            self.setToolTip("")
+            return
+        fm = QFontMetrics(self.font())
+        max_w = max(8, self.contentsRect().width())
+        elided = fm.elidedText(self._full_text, Qt.TextElideMode.ElideRight, max_w)
+        self.setText(elided)
+        self.setToolTip(self._full_text if elided != self._full_text else "")
 
-    @staticmethod
-    def _exceeds_one_line(doc: QTextDocument) -> bool:
-        if doc.size().height() > NoteListPreviewBrowser._PREVIEW_ONE_LINE_H + 1.0:
-            return True
-        non_empty_blocks = 0
-        block = doc.firstBlock()
-        while block.isValid():
-            has_content = bool(block.text().strip())
-            if not has_content:
-                it = block.begin()
-                while not it.atEnd():
-                    if it.fragment().charFormat().isImageFormat():
-                        has_content = True
-                        break
-                    it += 1
-            if has_content:
-                non_empty_blocks += 1
-                if non_empty_blocks > 1:
-                    return True
-            block = block.next()
-        return False
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_elide()
 
-    def set_body(self, html: str, *, plain_fallback: str = "", done: bool = False) -> None:
-        super().set_body(html, plain_fallback=plain_fallback, done=done)
-        doc_h = int(self.document().size().height()) + 2
-        self._content_truncated = self._exceeds_one_line(self.document())
-        view_h = min(doc_h, self._PREVIEW_ONE_LINE_H)
-        self.setFixedHeight(max(view_h, 20))
-
-    def _handle_mouse_press(self, viewport_pos) -> bool:
-        name = image_href_at_widget_pos(self, viewport_pos)
-        if name:
-            return _open_note_image(self._item_root, name, parent=self.window())
-        return False
-
-    def viewportEvent(self, event: QEvent) -> bool:  # type: ignore[override]
-        if isinstance(event, QMouseEvent):
-            pos = event.position().toPoint()
-            if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-                if self._handle_mouse_press(pos):
-                    event.accept()
-                    return True
-                self.open_requested.emit()
-                event.accept()
-                return True
-        return super().viewportEvent(event)
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.open_requested.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)

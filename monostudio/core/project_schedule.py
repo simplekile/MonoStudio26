@@ -395,6 +395,9 @@ def write_project_schedule_to_disk(project_root: Path, schedule: ProjectSchedule
     }
     path = _schedule_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    from monostudio.core.schedule_history import record_schedule_save
+
+    record_schedule_save(root, schedule)
     content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     atomic_write_text(path, content, encoding="utf-8")
 

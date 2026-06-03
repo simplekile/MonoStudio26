@@ -8,7 +8,6 @@ from pathlib import Path
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
     QComboBox,
-    QDateEdit,
     QDialogButtonBox,
     QFormLayout,
     QGroupBox,
@@ -25,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.ui_qt.calendar_date_picker import MonosDateEdit
 from monostudio.core.project_schedule import (
     DEFAULT_TEMPLATE_NAME,
     ScheduleTarget,
@@ -122,9 +122,7 @@ class SchedulePlanDialog(MonosDialog):
         delivery_l.addWidget(delivery_hint)
 
         delivery_form = QFormLayout()
-        self._delivery = QDateEdit(delivery_tab)
-        self._delivery.setCalendarPopup(True)
-        self._delivery.setDisplayFormat("yyyy-MM-dd")
+        self._delivery = MonosDateEdit(delivery_tab)
         self._delivery.setDate(QDate.currentDate().addDays(21))
         delivery_form.addRow("Delivery", self._delivery)
 
@@ -159,9 +157,7 @@ class SchedulePlanDialog(MonosDialog):
             self._wave_dept.addItem(self._dept_labels.get(dep, dep), dep)
         wave_form.addRow("Department", self._wave_dept)
 
-        self._wave_due = QDateEdit(wave_tab)
-        self._wave_due.setCalendarPopup(True)
-        self._wave_due.setDisplayFormat("yyyy-MM-dd")
+        self._wave_due = MonosDateEdit(wave_tab)
         self._wave_due.setDate(QDate.currentDate().addDays(14))
         wave_form.addRow("Due", self._wave_due)
 

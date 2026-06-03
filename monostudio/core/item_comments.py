@@ -2,7 +2,7 @@
 Per-item notes / feedback for assets and shots.
 
 Stored at <item_root>/.monostudio/item_comments.json
-Schema v3: rich body_html, mentions, author_id; inline images under note_media/
+Schema v3+: rich body_html, mentions, author_id, department; inline images under note_media/
 """
 from __future__ import annotations
 
@@ -36,6 +36,24 @@ _MENTION_HASH_HREF_RE = re.compile(r'href="#mention-([^"]+)"', re.IGNORECASE)
 _MENTION_TOKEN_RE = re.compile(r"@([a-zA-Z0-9_]+)")
 
 MENTION_HREF_PREFIX = "mention:"
+
+
+def is_mention_note_href(href: str) -> bool:
+    """True for @mention anchor hrefs stored in note HTML (not navigable documents)."""
+    h = (href or "").strip()
+    return h.startswith(MENTION_HREF_PREFIX) or h.startswith("#mention-")
+
+
+def user_id_from_mention_href(href: str) -> str | None:
+    """Extract roster user id from a mention anchor href."""
+    h = (href or "").strip()
+    if h.startswith(MENTION_HREF_PREFIX):
+        uid = h[len(MENTION_HREF_PREFIX) :].strip()
+        return uid or None
+    if h.startswith("#mention-"):
+        uid = h[len("#mention-") :].strip()
+        return uid or None
+    return None
 _TAG_RE = re.compile(r"<[^>]+>")
 _STYLE_BLOCK_RE = re.compile(r"(?is)<style[^>]*>.*?</style>")
 _HEAD_BLOCK_RE = re.compile(r"(?is)<head[^>]*>.*?</head>")
@@ -53,6 +71,7 @@ class ItemCommentEntry:
     author_id: str | None = None
     body_html: str = ""
     mentions: tuple[str, ...] = ()
+    department: str = ""  # department id (sidebar); empty = legacy / general
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -70,6 +89,9 @@ class ItemCommentEntry:
             d["body_html"] = self.body_html
         if self.mentions:
             d["mentions"] = list(self.mentions)
+        dept = normalize_note_department_id(self.department)
+        if dept:
+            d["department"] = dept
         return d
 
 
@@ -109,6 +131,91 @@ def strip_html_preview(html: str, *, max_len: int = _MAX_TEXT_LEN) -> str:
     if len(s) > max_len:
         s = s[: max_len - 1].rstrip() + "…"
     return s
+
+
+def _initials_from_display_name(name: str) -> str:
+    parts = [p for p in (name or "").replace("_", " ").split() if p]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[-1][0]).upper()
+
+
+@dataclass(frozen=True)
+class NoteAuthorVisual:
+    """Avatar + label data for a note author row."""
+
+    name: str
+    initials: str
+    color_hex: str = "#52525b"
+    image_path: Path | None = None
+
+
+def normalize_note_department_id(department_id: str | None) -> str:
+    return (department_id or "").strip()
+
+
+def entry_matches_department(entry: ItemCommentEntry, department_id: str | None) -> bool:
+    """Whether a note belongs to the sidebar department view.
+
+    Legacy notes (no ``department``) appear in every department view; the general
+    bucket (no department selected) shows only legacy notes.
+    """
+    entry_dept = normalize_note_department_id(entry.department)
+    filter_dept = normalize_note_department_id(department_id)
+    if not entry_dept:
+        return True
+    if not filter_dept:
+        return False
+    return entry_dept == filter_dept
+
+
+def entry_author_display(
+    entry: ItemCommentEntry,
+    workspace_root: Path | None = None,
+    *,
+    unknown: str = "Unknown",
+) -> str:
+    """Display name for who wrote a note (roster via author_id, then stored author)."""
+    if entry.author_id and workspace_root is not None:
+        from monostudio.core.user_identity import get_user
+
+        u = get_user(workspace_root, entry.author_id)
+        if u is not None and u.name.strip():
+            return u.name.strip()
+    author = (entry.author or "").strip()
+    if author:
+        return author
+    return unknown
+
+
+def entry_author_visual(
+    entry: ItemCommentEntry,
+    workspace_root: Path | None = None,
+    *,
+    unknown: str = "Unknown",
+) -> NoteAuthorVisual:
+    """Resolve roster avatar/initials for a note author."""
+    if entry.author_id and workspace_root is not None:
+        from monostudio.core.user_identity import avatar_path, get_user
+
+        u = get_user(workspace_root, entry.author_id)
+        if u is not None:
+            name = u.name.strip() or entry_author_display(entry, workspace_root, unknown=unknown)
+            return NoteAuthorVisual(
+                name=name,
+                initials=u.initials,
+                color_hex=u.color_hex or "#3b82f6",
+                image_path=avatar_path(workspace_root, u),
+            )
+    name = entry_author_display(entry, workspace_root, unknown=unknown)
+    return NoteAuthorVisual(
+        name=name,
+        initials=_initials_from_display_name(name),
+        color_hex="#52525b",
+        image_path=None,
+    )
 
 
 def entry_preview_text(entry: ItemCommentEntry, *, max_chars: int = _MAX_TEXT_LEN) -> str:
@@ -186,6 +293,7 @@ def _parse_entry(raw: object) -> ItemCommentEntry | None:
         mentions = tuple(str(x).strip() for x in mentions_raw if str(x).strip())
     elif body_html:
         mentions = parse_mentions_from_html(body_html)
+    department = normalize_note_department_id(str(raw.get("department") or ""))
     return ItemCommentEntry(
         id=eid,
         at=at,
@@ -196,6 +304,7 @@ def _parse_entry(raw: object) -> ItemCommentEntry | None:
         author_id=author_id,
         body_html=body_html,
         mentions=mentions,
+        department=department,
     )
 
 
@@ -240,12 +349,53 @@ def read_item_comments(item_root: Path) -> list[ItemCommentEntry]:
     return _normalize_entries(out)
 
 
-def count_open_notes(item_root: Path) -> int:
-    return sum(1 for e in read_item_comments(item_root) if not e.done)
+def read_item_comments_for_department(
+    item_root: Path,
+    department_id: str | None,
+) -> list[ItemCommentEntry]:
+    return [
+        e
+        for e in read_item_comments(item_root)
+        if entry_matches_department(e, department_id)
+    ]
 
 
-def notes_badge_visual_mode(item_root: Path) -> tuple[int, str]:
-    entries = read_item_comments(item_root)
+def write_item_comments_for_department(
+    item_root: Path,
+    department_id: str | None,
+    entries: list[ItemCommentEntry],
+) -> None:
+    """Replace notes for one department; other departments and legacy notes are kept."""
+    dept = normalize_note_department_id(department_id)
+    all_entries = read_item_comments(item_root)
+    kept = [
+        e for e in all_entries if normalize_note_department_id(e.department) != dept
+    ]
+    stamped: list[ItemCommentEntry] = []
+    for e in entries:
+        if dept and not normalize_note_department_id(e.department):
+            stamped.append(replace(e, department=dept))
+        else:
+            stamped.append(e)
+    _write_payload(Path(item_root), kept + stamped)
+
+
+def _entries_for_department_view(
+    item_root: Path,
+    department_id: str | None,
+) -> list[ItemCommentEntry]:
+    return read_item_comments_for_department(item_root, department_id)
+
+
+def count_open_notes(item_root: Path, department_id: str | None = None) -> int:
+    return sum(1 for e in _entries_for_department_view(item_root, department_id) if not e.done)
+
+
+def notes_badge_visual_mode(
+    item_root: Path,
+    department_id: str | None = None,
+) -> tuple[int, str]:
+    entries = _entries_for_department_view(item_root, department_id)
     if not entries:
         return (0, "empty")
     open_n = sum(1 for e in entries if not e.done)
@@ -254,8 +404,13 @@ def notes_badge_visual_mode(item_root: Path) -> tuple[int, str]:
     return (0, "all_done")
 
 
-def latest_note_preview_line(item_root: Path, *, max_chars: int = 96) -> tuple[str, bool]:
-    entries = read_item_comments(Path(item_root))
+def latest_note_preview_line(
+    item_root: Path,
+    department_id: str | None = None,
+    *,
+    max_chars: int = 96,
+) -> tuple[str, bool]:
+    entries = _entries_for_department_view(Path(item_root), department_id)
     if not entries:
         return ("", False)
     last = entries[-1]
@@ -276,6 +431,7 @@ def new_comment_entry(
     body_html: str = "",
     mentions: tuple[str, ...] | None = None,
     entry_id: str | None = None,
+    department: str | None = None,
 ) -> ItemCommentEntry:
     """In-memory entry for new note (before save batch)."""
     html = (body_html or "").strip()[:_MAX_HTML_LEN]
@@ -298,6 +454,7 @@ def new_comment_entry(
         author_id=aid,
         body_html=html,
         mentions=tuple(mids),
+        department=normalize_note_department_id(department),
     )
 
 

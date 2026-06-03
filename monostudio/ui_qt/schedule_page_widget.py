@@ -38,6 +38,8 @@ from monostudio.core.project_schedule import (
 from monostudio.core.schedule_planner import build_planned_bars, count_overdue_bars
 from monostudio.ui_qt.schedule_allocate_dialog import ScheduleAllocateDialog, _EntityOption
 from monostudio.ui_qt.schedule_autoplan_dialog import ScheduleAutoPlanDialog
+from monostudio.core.schedule_history import set_history_workspace
+from monostudio.ui_qt.schedule_history_dialog import ScheduleHistoryDialog
 from monostudio.ui_qt.schedule_milestone_dialog import ScheduleMilestoneDialog
 from monostudio.ui_qt.schedule_plan_dialog import SchedulePlanDialog
 from monostudio.ui_qt.schedule_template_dialog import ScheduleTemplateDialog
@@ -98,6 +100,7 @@ class SchedulePageWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._project_root: Path | None = None
+        self._workspace_root: Path | None = None
         self._project_index: ProjectIndex | None = None
         self._schedule: ProjectSchedule | None = None
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
@@ -354,6 +357,7 @@ class SchedulePageWidget(QWidget):
         tpl = act(menu, "file-text", "Edit templates…")
         auto = act(menu, "sparkles", "Auto-plan…")
         mile = act(menu, "pin", "Project milestones…")
+        hist = act(menu, "layers", "Schedule history…")
 
         chosen = menu.exec(global_pos)
         if chosen is None:
@@ -376,6 +380,18 @@ class SchedulePageWidget(QWidget):
             self._on_autoplan_clicked()
         elif chosen is mile:
             self._on_milestone_clicked()
+        elif chosen is hist:
+            self._on_history_clicked()
+
+    def _on_history_clicked(self) -> None:
+        if self._project_root is None:
+            return
+        dlg = ScheduleHistoryDialog(
+            parent=self,
+            project_root=self._project_root,
+            workspace_root=self._workspace_root,
+        )
+        dlg.exec()
 
     def _cycle_layout_view(self) -> None:
         if self._btn_view_entity.isChecked():
@@ -427,6 +443,10 @@ class SchedulePageWidget(QWidget):
         lay.addLayout(text_col, 1)
         frame._value_label = value  # type: ignore[attr-defined]
         return frame
+
+    def set_workspace_root(self, path: Path | None) -> None:
+        self._workspace_root = Path(path).resolve() if path else None
+        set_history_workspace(self._workspace_root)
 
     def set_project_root(self, path: Path | None) -> None:
         new_root = Path(path) if path else None
@@ -858,9 +878,15 @@ class SchedulePageWidget(QWidget):
         if self._project_root is None:
             return
         dlg = ScheduleMilestoneDialog(parent=self, project_root=self._project_root)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._on_schedule_changed()
-            self._gantt.reload()
+        dlg.schedule_changed.connect(self._on_milestone_dialog_changed)
+        dlg.exec()
+        self._on_schedule_changed()
+        self._gantt.reload()
+
+    def _on_milestone_dialog_changed(self) -> None:
+        """Refresh timeline while the milestones dialog is still open."""
+        self._on_schedule_changed()
+        self._gantt.reload()
 
     def _dept_labels(self) -> dict[str, str]:
         if self._project_root is None:

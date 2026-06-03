@@ -1954,16 +1954,45 @@ class MainWindow(FramelessMainWindow):
             except OSError:
                 pass
 
+    def _notes_department_for_dialog(self) -> tuple[str, str]:
+        """(department_id, display_label) from sidebar / main view focus."""
+        dept_id = (
+            self._sidebar.filters().current_department()
+            or self.current_department
+            or ""
+        )
+        dept_id = (dept_id or "").strip()
+        if not dept_id:
+            return ("", "General")
+        label = dept_id
+        if self._project_root is not None:
+            try:
+                from monostudio.core.department_registry import DepartmentRegistry
+
+                label = DepartmentRegistry.for_project(self._project_root).get_department_label(
+                    dept_id
+                )
+            except OSError:
+                pass
+        return (dept_id, label or dept_id)
+
     def _open_item_notes_dialog(
         self,
         item_path: Path,
         *,
         display_name: str | None = None,
         highlight_note_id: str | None = None,
+        department_id: str | None = None,
+        department_label: str | None = None,
     ) -> None:
         from monostudio.ui_qt.item_notes_dialog import ItemNotesDialog
 
         p = Path(item_path)
+        if department_id is not None or department_label is not None:
+            dept_id = (department_id or "").strip()
+            dept_label = (department_label or dept_id or "General").strip()
+        else:
+            dept_id, dept_label = self._notes_department_for_dialog()
         dlg = ItemNotesDialog(
             parent=self,
             item_path=p,
@@ -1972,26 +2001,99 @@ class MainWindow(FramelessMainWindow):
             author_id=self._current_author_id(),
             workspace_root=self._workspace_root,
             project_root=self._project_root,
+            department_id=dept_id or None,
+            department_label=dept_label,
             highlight_note_id=highlight_note_id,
         )
-        dlg.notes_changed.connect(lambda: self._main_view.invalidate_notes_open_count_cache(p))
-        dlg.notes_changed.connect(self._inspector.refresh_notes_badge)
+        dlg.notes_changed.connect(lambda: self._on_item_notes_saved(p))
         dlg.notes_changed.connect(lambda: self._ensure_entity_monostudio_watched(p))
         dlg.notes_changed.connect(self._refresh_dashboard_if_visible)
         dlg.notes_changed.connect(self._sync_mention_inbox_alerts)
         dlg.exec()
 
-    def _on_dashboard_open_notes_entity(self, entity_path: object) -> None:
+    def _on_item_notes_saved(self, item_path: Path) -> None:
+        """Refresh main view note badges / metadata after Notes dialog save."""
+        self._main_view.invalidate_notes_open_count_cache(item_path)
+        self._inspector.refresh_notes_badge()
+
+    def _on_dashboard_open_notes_entity(self, target: object) -> None:
+        from monostudio.core.project_dashboard_stats import DashboardNoteRow
+
+        if isinstance(target, DashboardNoteRow):
+            note = target
+            try:
+                p = Path(note.entity_path)
+            except (TypeError, ValueError):
+                return
+            if not self._note_entity_path_valid(p):
+                return
+            dept_label = self._department_label_for_id(note.department)
+            self._open_item_notes_dialog(
+                p,
+                display_name=note.entity_name,
+                highlight_note_id=note.comment_id or None,
+                department_id=note.department or None,
+                department_label=dept_label,
+            )
+            return
         try:
-            p = Path(entity_path)
+            p = Path(target)
         except (TypeError, ValueError):
             return
-        try:
-            if not p.is_dir():
-                return
-        except OSError:
+        if not self._note_entity_path_valid(p):
             return
         self._open_item_notes_dialog(p, display_name=p.name)
+
+    @staticmethod
+    def _note_entity_path_valid(p: Path) -> bool:
+        try:
+            return p.is_dir()
+        except OSError:
+            return False
+
+    def _department_label_for_id(self, dept_id: str) -> str:
+        did = (dept_id or "").strip()
+        if not did:
+            return "General"
+        if self._project_root is not None:
+            try:
+                from monostudio.core.department_registry import DepartmentRegistry
+
+                return DepartmentRegistry.for_project(self._project_root).get_department_label(did)
+            except OSError:
+                pass
+        return did.replace("_", " ").title()
+
+    def _on_dashboard_note_go_to_department(self, target: object) -> None:
+        from monostudio.core.project_dashboard_stats import DashboardNoteRow
+
+        if not isinstance(target, DashboardNoteRow):
+            return
+        try:
+            p = Path(target.entity_path)
+        except (TypeError, ValueError):
+            return
+        if not self._note_entity_path_valid(p):
+            return
+        dept = (target.department or "").strip() or None
+        ctx = "Shots" if target.entity_kind == "shot" else "Assets"
+        self._sidebar.set_current_context(ctx)
+        self._sidebar_compact.set_current_context(ctx)
+        if dept:
+            self._controller.sync_filter_state(department=dept, type_id=self.current_type)
+            self._sidebar.filters().set_selected_department(dept, emit=False)
+        self._sync_filter_state_from_sidebar()
+        self._reload_main_view()
+        if not self._main_view.select_item_by_path(p):
+            notification_service.warning(f"Could not find {target.entity_name} in the current view.")
+            return
+        label = self._department_label_for_id(dept or "")
+        if dept:
+            notification_service.info(f"{target.entity_name} · {label}")
+        else:
+            notification_service.info(
+                f"{target.entity_name} — note has no department; opened in {ctx}."
+            )
 
     def _on_item_notes_dialog_requested(self, item: object) -> None:
         if not isinstance(item, ViewItem):
@@ -2223,7 +2325,12 @@ class MainWindow(FramelessMainWindow):
                 if self._dashboard_page_widget is None:
                     self._dashboard_page_widget = DashboardPageWidget(self)
                     self._dashboard_page_widget.open_schedule_requested.connect(self._on_dashboard_open_schedule)
-                    self._dashboard_page_widget.open_notes_entity_requested.connect(self._on_dashboard_open_notes_entity)
+                    self._dashboard_page_widget.open_notes_entity_requested.connect(
+                        self._on_dashboard_open_notes_entity
+                    )
+                    self._dashboard_page_widget.note_go_to_department_requested.connect(
+                        self._on_dashboard_note_go_to_department
+                    )
                     self._dashboard_page_widget.open_scope_requested.connect(self._on_dashboard_open_scope)
                     self._dashboard_page_widget.schedule_jump_requested.connect(
                         self._on_dashboard_schedule_jump
@@ -2262,6 +2369,7 @@ class MainWindow(FramelessMainWindow):
                         Qt.ConnectionType.UniqueConnection,
                     )
                 self._schedule_page_widget.set_project_root(self._project_root)
+                self._schedule_page_widget.set_workspace_root(self._workspace_root)
                 self._schedule_page_widget.set_thumbnail_manager(self._thumbnail_manager)
                 self._schedule_page_widget.refresh(self._project_index)
                 self._apply_schedule_sidebar_filters()
@@ -2783,6 +2891,8 @@ class MainWindow(FramelessMainWindow):
 
         if self._dashboard_page_widget is not None:
             self._dashboard_page_widget.set_workspace_root(self._workspace_root)
+        if self._schedule_page_widget is not None:
+            self._schedule_page_widget.set_workspace_root(self._workspace_root)
         self._refresh_user_button()
         self._schedule_identity_prompt()
 

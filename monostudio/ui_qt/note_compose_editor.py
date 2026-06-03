@@ -142,7 +142,7 @@ class NoteComposeEditor(QTextEdit):
         self._entry_id = uuid.uuid4().hex[:16]
         self._monostudio_dir = self._item_root / ".monostudio"
         self._media_dir = note_media_entry_dir(self._item_root, self._entry_id)
-        self._mention_popup = NoteMentionPopup(self)
+        self._mention_popup = NoteMentionPopup(self, workspace_root=self._workspace_root)
         self._mention_popup.user_selected.connect(self._insert_mention)
         self._mention_popup.set_users(read_roster(self._workspace_root))
         self._mention_start = -1

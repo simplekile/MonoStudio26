@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, QEvent, QObject
 
 from monostudio.core.app_paths import get_app_base_path
 from PySide6.QtGui import (
@@ -131,6 +131,22 @@ class MonosMenu(QMenu):
         self.setMask(bitmap)
 
 
+def monos_modal_parent(parent: QWidget | None = None) -> QWidget | None:
+    """Best parent for a nested MonosDialog — active modal, else outermost QDialog ancestor."""
+    modal = QApplication.activeModalWidget()
+    if isinstance(modal, QDialog):
+        return modal
+    if parent is None:
+        return None
+    outermost: QWidget | None = None
+    w: QWidget | None = parent if isinstance(parent, QWidget) else None
+    while w is not None:
+        if isinstance(w, QDialog):
+            outermost = w
+        w = w.parentWidget()
+    return outermost or parent
+
+
 class MonosDialog(QDialog):
     """
     Base dialog for MONOS: borderless window, rounded corners, border,
@@ -140,6 +156,7 @@ class MonosDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._overlay: QWidget | None = None
+        self._overlay_host: QWidget | None = None
         self._border_overlay: _DialogBorderOverlay | None = None
         flags = self.windowFlags()
         self.setWindowFlags(
@@ -187,6 +204,32 @@ class MonosDialog(QDialog):
         painter.end()
         self.setMask(bitmap)
 
+    def _resolve_overlay_host(self) -> QWidget | None:
+        """Dim layer target: outermost parent QDialog (nested modals), else top-level host."""
+        outermost: QWidget | None = None
+        w: QWidget | None = self.parentWidget()
+        while isinstance(w, QWidget):
+            if isinstance(w, QDialog):
+                outermost = w
+            w = w.parentWidget()
+        if outermost is not None:
+            return outermost
+        w = self.parentWidget()
+        while isinstance(w, QWidget) and w.parentWidget() is not None:
+            w = w.parentWidget()
+        return w if isinstance(w, QWidget) else None
+
+    def _sync_overlay_geometry(self) -> None:
+        host = self._overlay_host
+        if self._overlay is None or host is None:
+            return
+        self._overlay.setGeometry(0, 0, host.width(), host.height())
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if watched is self._overlay_host and event.type() == QEvent.Type.Resize:
+            self._sync_overlay_geometry()
+        return super().eventFilter(watched, event)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._update_rounded_mask()
@@ -203,20 +246,24 @@ class MonosDialog(QDialog):
         self._border_overlay.setGeometry(self.rect())
         self._border_overlay.raise_()
         self._border_overlay.show()
-        # Overlay phủ toàn bộ cửa sổ chính (top-level), không chỉ parent trực tiếp (vd. sidebar)
-        parent = self.parent()
-        while isinstance(parent, QWidget) and parent.parent() and isinstance(parent.parent(), QWidget):
-            parent = parent.parent()
-        if isinstance(parent, QWidget) and parent.isWidgetType():
+        host = self._resolve_overlay_host()
+        self._overlay_host = host
+        if host is not None:
             if self._overlay is None:
-                self._overlay = QWidget(parent)
+                self._overlay = QWidget(host)
                 self._overlay.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
                 self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-            self._overlay.setGeometry(0, 0, parent.width(), parent.height())
-            self._overlay.raise_()
+            host.installEventFilter(self)
+            self._sync_overlay_geometry()
             self._overlay.show()
+            self._overlay.raise_()
+        self.raise_()
+        self.activateWindow()
 
     def _hide_overlay(self) -> None:
+        if self._overlay_host is not None:
+            self._overlay_host.removeEventFilter(self)
+            self._overlay_host = None
         if self._overlay is not None:
             self._overlay.hide()
             self._overlay.deleteLater()
@@ -1724,7 +1771,7 @@ def apply_dark_theme(app: QApplication) -> None:
         QFrame#ItemNotesCard {
             background: #18181b;
             border: 1px solid rgba(39, 39, 42, 0.50);
-            border-radius: 10px;
+            border-radius: 8px;
         }
         QFrame#ItemNotesCard:hover {
             background: #1c1c20;
@@ -1733,19 +1780,143 @@ def apply_dark_theme(app: QApplication) -> None:
         QFrame#ItemNotesCardDone {
             background: rgba(16, 185, 129, 0.16);
             border: 1px solid rgba(52, 211, 153, 0.42);
-            border-radius: 10px;
+            border-radius: 8px;
         }
         QFrame#ItemNotesCardDone:hover {
             background: rgba(16, 185, 129, 0.22);
             border: 1px solid rgba(52, 211, 153, 0.55);
         }
-        QLabel#ItemNotesPreview {
+        /* User profile (@mention click) — single MonosDialog border only */
+        QLabel#UserProfileViewName {
+            color: #fafafa;
             background: transparent;
         }
-        QTextBrowser#ItemNotesPreviewBrowser {
+        QLabel#UserProfileViewSubtitle {
+            color: #a1a1aa;
+            background: transparent;
+        }
+        QLabel#UserProfileViewAvatar {
+            background: transparent;
+        }
+        QPushButton#UserProfileActionBtn {
+            background: transparent;
+            border: 1px solid #52525b;
+            border-radius: 20px;
+            padding: 0px;
+        }
+        QPushButton#UserProfileActionBtn:hover:enabled {
+            border-color: #a1a1aa;
+            background: rgba(255, 255, 255, 0.06);
+        }
+        QPushButton#UserProfileActionBtn:disabled {
+            border-color: #3f3f46;
+            opacity: 0.35;
+        }
+        QFrame#UserProfileActionDivider {
+            background: #3f3f46;
+            border: none;
+            max-width: 1px;
+            min-width: 1px;
+        }
+        QDialog#UserProfileViewDialog QPushButton#UserProfileCloseBtn {
+            background: rgba(239, 68, 68, 0.12);
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.45);
+            border-radius: 8px;
+            padding: 8px 16px;
+            font-family: "Inter";
+            font-size: 13px;
+            font-weight: 600;
+        }
+        QDialog#UserProfileViewDialog QPushButton#UserProfileCloseBtn:hover {
+            background: rgba(239, 68, 68, 0.22);
+            border-color: #ef4444;
+            color: #fca5a5;
+        }
+        QLabel#ItemNotesPreviewLabel {
             background: transparent;
             border: none;
         }
+        QLabel#ItemNotesMeta {
+            color: #a1a1aa;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        QLabel#NoteAuthorAvatar {
+            background: transparent;
+        }
+        QWidget#NoteAuthorRow {
+            background: transparent;
+        }
+
+        /* @mention autocomplete (note compose) */
+        QFrame#NoteMentionPopup {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+        }
+        QListWidget#NoteMentionList {
+            background: transparent;
+            border: none;
+            outline: none;
+            padding: 2px;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 500;
+            color: #d4d4d8;
+        }
+        QListWidget#NoteMentionList::item {
+            height: 30px;
+            padding: 0px 4px;
+            border-radius: 6px;
+        }
+        QListWidget#NoteMentionList::item:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QListWidget#NoteMentionList::item:selected {
+            background: rgba(59, 130, 246, 0.14);
+            border: 1px solid rgba(59, 130, 246, 0.35);
+        }
+        QListWidget#NoteMentionList::item:selected:focus {
+            background: rgba(59, 130, 246, 0.18);
+            border: 1px solid rgba(59, 130, 246, 0.45);
+        }
+
+        QLabel#NoteImageViewerLabel {
+            background: transparent;
+            color: #a1a1aa;
+        }
+        QLabel#NoteImageViewerZoomValue {
+            color: #a1a1aa;
+            background: transparent;
+        }
+        QSlider#NoteImageViewerZoomSlider {
+            min-height: 20px;
+        }
+        QSlider#NoteImageViewerZoomSlider::groove:horizontal {
+            background: #27272a;
+            height: 6px;
+            border-radius: 3px;
+        }
+        QSlider#NoteImageViewerZoomSlider::handle:horizontal {
+            background: #a1a1aa;
+            width: 14px;
+            height: 14px;
+            margin: -4px 0;
+            border-radius: 7px;
+        }
+        QSlider#NoteImageViewerZoomSlider::handle:horizontal:hover {
+            background: #fafafa;
+        }
+        QSlider#NoteImageViewerZoomSlider::sub-page:horizontal {
+            background: rgba(59, 130, 246, 0.45);
+            border-radius: 3px;
+        }
+        QSlider#NoteImageViewerZoomSlider::add-page:horizontal {
+            background: #27272a;
+            border-radius: 3px;
+        }
+
         QLabel#ItemNotesPreviewMore {
             color: #52525b;
             background: transparent;
@@ -1799,10 +1970,32 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#ItemNotesOpenButton:hover {
             background: rgba(255, 255, 255, 0.08);
         }
+        QPushButton#ItemNotesAddButton {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(16, 185, 129, 0.70);
+            background: rgba(16, 185, 129, 0.22);
+            color: #fafafa;
+            font-family: "Inter";
+            font-size: 13px;
+            font-weight: 600;
+        }
+        QPushButton#ItemNotesAddButton:hover {
+            background: rgba(16, 185, 129, 0.38);
+            border-color: rgba(52, 211, 153, 0.85);
+        }
+        QPushButton#ItemNotesAddButton:pressed {
+            background: rgba(16, 185, 129, 0.48);
+        }
+        QPushButton#ItemNotesAddButton:disabled {
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            background: rgba(24, 24, 27, 0.35);
+            color: rgba(250, 250, 250, 0.45);
+        }
         QPlainTextEdit#ItemNotesAddEditor,
         QTextEdit#ItemNotesAddEditor {
-            background-color: #121214;
-            border: 1px solid rgba(39, 39, 42, 0.50);
+            background-color: #0a0a0c;
+            border: 1px solid rgba(39, 39, 42, 0.65);
             border-radius: 8px;
             padding: 8px 10px;
             color: #e4e4e7;
@@ -1811,63 +2004,40 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QPlainTextEdit#ItemNotesAddEditor:focus,
         QTextEdit#ItemNotesAddEditor:focus {
+            background-color: #0c0c0e;
             border: 1px solid #2563eb;
+        }
+        QPlainTextEdit#ItemNotesAddEditor QAbstractScrollArea::viewport,
+        QTextEdit#ItemNotesAddEditor QAbstractScrollArea::viewport {
+            background-color: #0a0a0c;
+        }
+        QPlainTextEdit#ItemNotesAddEditor:focus QAbstractScrollArea::viewport,
+        QTextEdit#ItemNotesAddEditor:focus QAbstractScrollArea::viewport {
+            background-color: #0c0c0e;
         }
         QTextBrowser#ItemNotesBodyBrowser {
             background: transparent;
             border: none;
             color: #d4d4d8;
         }
-        /* MONOS calendar (Inbox drop: date picker) — Deep Dark, 8px radius embed */
-        QCalendarWidget#MonosCalendar {
+        /* MONOS calendar (custom month grid) */
+        QWidget#MonosCalendar {
             background-color: #18181b;
             border: 1px solid #3f3f46;
             border-radius: 8px;
-            color: #d4d4d8;
-            font-family: "Inter";
-            font-size: 13px;
         }
-        QCalendarWidget#MonosCalendar QWidget#qt_calendar_navigationbar {
-            background: transparent;
-            min-height: 36px;
-        }
-        QCalendarWidget#MonosCalendar QToolButton {
-            background: transparent;
-            color: #a1a1aa;
-            border: none;
-            border-radius: 4px;
-            min-width: 28px;
-            min-height: 28px;
-        }
-        QCalendarWidget#MonosCalendar QToolButton:hover {
-            background: rgba(255, 255, 255, 0.06);
-            color: #fafafa;
-        }
-        QCalendarWidget#MonosCalendar QAbstractItemView {
-            background: transparent;
-            selection-background-color: transparent;
-            color: #d4d4d8;
-            font-size: 13px;
-            outline: none;
-            border: none;
-            gridline-color: transparent;
-        }
-        QCalendarWidget#MonosCalendar QAbstractItemView:focus {
-            outline: none;
-            border: none;
-        }
-        QCalendarWidget#MonosCalendar QAbstractItemView:disabled {
+        QLabel#MonosCalendarWeekday {
             color: #71717a;
-        }
-        /* Weekday header: avoid "..." elision; match code section size 56px */
-        QCalendarWidget#MonosCalendar QHeaderView::section {
+            font-family: "Inter";
             font-size: 10px;
             font-weight: 600;
-            color: #71717a;
-            padding: 6px 2px;
-            min-width: 52px;
         }
-        /* Custom nav bar buttons (MonosCalendarWidget) */
+        QLabel#MonosCalendarMonthLabel {
+            color: #e4e4e7;
+            font-family: "Inter";
+            font-size: 13px;
+            font-weight: 600;
+        }
         QPushButton#MonosCalendarPrevBtn,
         QPushButton#MonosCalendarNextBtn {
             background: transparent;
@@ -1876,6 +2046,73 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QPushButton#MonosCalendarPrevBtn:hover,
         QPushButton#MonosCalendarNextBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QPushButton#MonosCalendarDayBtn {
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            color: #d4d4d8;
+            font-family: "Inter";
+            font-size: 13px;
+            font-weight: 500;
+        }
+        QPushButton#MonosCalendarDayBtn:hover {
+            background: rgba(255, 255, 255, 0.06);
+            color: #fafafa;
+        }
+        QPushButton#MonosCalendarDayBtn[weekend="true"] {
+            color: #f87171;
+        }
+        QPushButton#MonosCalendarDayBtn[weekend="true"]:hover {
+            color: #fca5a5;
+        }
+        QPushButton#MonosCalendarDayBtn[today="true"] {
+            border: 1px solid #52525b;
+        }
+        QPushButton#MonosCalendarDayBtn[selected="true"] {
+            background-color: #2563eb;
+            color: #ffffff;
+            font-weight: 600;
+        }
+        QPushButton#MonosCalendarDayBtn[selected="true"]:hover {
+            background-color: #3b82f6;
+            color: #ffffff;
+        }
+        QPushButton#MonosCalendarDayBtn[selected="true"][weekend="true"] {
+            color: #ffffff;
+        }
+        QPushButton#MonosCalendarDayBtn:disabled {
+            background: transparent;
+            border: none;
+            color: transparent;
+        }
+        /* MonosDateEdit: calendar button inside field (matches QLineEdit width) */
+        QWidget#MonosDateEditHost {
+            background: transparent;
+        }
+        QWidget#MonosDateEdit QDateEdit#MonosDateEditField {
+            min-height: 32px;
+            padding: 6px 30px 6px 10px;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 6px;
+            background: #27272a;
+        }
+        QWidget#MonosDateEdit QDateEdit#MonosDateEditField:focus {
+            border: 1px solid #2563eb;
+        }
+        QWidget#MonosDateEdit QToolButton#MonosDateEditCalendarBtn {
+            padding: 0;
+            margin: 0 6px 0 0;
+            min-width: 24px;
+            max-width: 24px;
+            min-height: 24px;
+            max-height: 24px;
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+        }
+        QWidget#MonosDateEdit QToolButton#MonosDateEditCalendarBtn:hover {
             background: rgba(255, 255, 255, 0.08);
         }
         /* Inbox Drop Dialog: panel bg #18181b (override app_bg #09090b) */
@@ -2544,6 +2781,107 @@ def apply_dark_theme(app: QApplication) -> None:
             border-color: rgba(239, 68, 68, 0.85);
             color: #fafafa;
         }
+
+        QTableWidget#ScheduleHistoryTable {
+            background-color: #0d0d0f;
+            border: 1px solid #27272a;
+            border-radius: 8px;
+            gridline-color: transparent;
+            font-size: 10px;
+        }
+        QTableWidget#ScheduleHistoryTable::item {
+            padding: 4px 8px;
+            border-bottom: 1px solid #1e1e20;
+        }
+        QTableWidget#ScheduleHistoryTable::item:selected {
+            background-color: rgba(37, 99, 235, 0.12);
+        }
+        QLabel#ScheduleHistoryAvatar {
+            background: transparent;
+        }
+        QLabel#ScheduleHistoryAuthorName {
+            color: #d4d4d8;
+            background: transparent;
+        }
+        QLabel#ScheduleHistoryAuthorLink {
+            color: #93c5fd;
+            background: transparent;
+            padding: 0 4px;
+        }
+        QLabel#ScheduleHistoryAuthorLink:hover {
+            color: #bfdbfe;
+            text-decoration: underline;
+        }
+        QDialog#ScheduleHistoryDialog QHeaderView::section {
+            background-color: #18181b;
+            color: #71717a;
+            padding: 6px 8px;
+            border: none;
+            border-bottom: 1px solid #27272a;
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        /* Schedule — Timeline markers dialog */
+        QDialog#ScheduleMilestoneDialog QPushButton#Tier3Pill {
+            padding: 7px 20px;
+            font-size: 12px;
+            min-height: 28px;
+        }
+        QDialog#ScheduleMilestoneDialog QLineEdit {
+            padding: 8px 12px;
+        }
+        QDialog#ScheduleMilestoneDialog QWidget#MonosDateEdit {
+            min-width: 0;
+        }
+        QFrame#ScheduleMilestoneFormCard {
+            background-color: #18181b;
+            border: 1px solid #27272a;
+            border-radius: 8px;
+        }
+        QFrame#ScheduleMilestoneListBody {
+            background-color: #0d0d0f;
+            border: 1px solid #27272a;
+            border-radius: 8px;
+        }
+        QListWidget#ScheduleMilestoneList {
+            background: transparent;
+            border: none;
+            outline: none;
+            padding: 2px 0 0 0;
+        }
+        QListWidget#ScheduleMilestoneList::item {
+            color: #d4d4d8;
+            padding: 8px 10px;
+            margin-bottom: 2px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        QListWidget#ScheduleMilestoneList::item:hover {
+            background: rgba(255, 255, 255, 0.04);
+            color: #fafafa;
+        }
+        QListWidget#ScheduleMilestoneList::item:selected {
+            background: rgba(37, 99, 235, 0.12);
+            color: #93c5fd;
+        }
+        QToolButton#ScheduleIconToolBtn {
+            border: 1px solid transparent;
+            border-radius: 6px;
+            padding: 4px;
+            background: transparent;
+        }
+        QToolButton#ScheduleIconToolBtn:hover:enabled {
+            background: rgba(239, 68, 68, 0.12);
+            border-color: rgba(239, 68, 68, 0.35);
+        }
+        QToolButton#ScheduleIconToolBtn:disabled {
+            opacity: 0.35;
+        }
+
         /* Categories (Asset/Shot Depts): nút Create/Delete Type — style giống nhau cho cả hai trang */
         QPushButton#SettingsCategoryActionButton {
             padding: 8px 12px;
@@ -3180,6 +3518,39 @@ def apply_dark_theme(app: QApplication) -> None:
             font-size: 14px;
             font-weight: 700;
             letter-spacing: -0.1px;
+        }
+        QPushButton#DashboardNotesFilterBtn {
+            background: transparent;
+            border: 1px solid rgba(63, 63, 70, 0.8);
+            border-radius: 6px;
+            padding: 4px 10px;
+            color: #a1a1aa;
+            font-family: "Inter";
+            font-size: 11px;
+            font-weight: 600;
+        }
+        QPushButton#DashboardNotesFilterBtn:hover {
+            color: #e4e4e7;
+            border-color: rgba(113, 113, 122, 0.9);
+        }
+        QPushButton#DashboardNotesFilterBtn:checked {
+            background: rgba(59, 130, 246, 0.18);
+            border-color: rgba(96, 165, 250, 0.55);
+            color: #fafafa;
+        }
+        QPushButton#DashboardNoteDeptBtn {
+            background: rgba(59, 130, 246, 0.12);
+            border: 1px solid rgba(96, 165, 250, 0.35);
+            border-radius: 6px;
+            padding: 2px 8px;
+            color: #93c5fd;
+            font-family: "Inter";
+            font-size: 10px;
+            font-weight: 700;
+        }
+        QPushButton#DashboardNoteDeptBtn:hover {
+            background: rgba(59, 130, 246, 0.22);
+            color: #bfdbfe;
         }
         QLabel#DashboardProjectTitle {
             color: #fafafa;

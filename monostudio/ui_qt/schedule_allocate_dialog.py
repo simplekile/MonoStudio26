@@ -10,7 +10,6 @@ from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
-    QDateEdit,
     QDialogButtonBox,
     QFormLayout,
     QLineEdit,
@@ -19,6 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from monostudio.ui_qt.calendar_date_picker import MonosDateEdit
 from monostudio.core.project_schedule import (
     ScheduleAllocation,
     delete_allocation,
@@ -81,12 +81,8 @@ class ScheduleAllocateDialog(MonosDialog):
         self._dept_combo = QComboBox(self)
         form.addRow("Department", self._dept_combo)
 
-        self._start = QDateEdit(self)
-        self._start.setCalendarPopup(True)
-        self._start.setDisplayFormat("yyyy-MM-dd")
-        self._due = QDateEdit(self)
-        self._due.setCalendarPopup(True)
-        self._due.setDisplayFormat("yyyy-MM-dd")
+        self._start = MonosDateEdit(self)
+        self._due = MonosDateEdit(self)
         today = QDate.currentDate()
         self._start.setDate(today)
         self._due.setDate(today.addDays(7))

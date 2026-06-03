@@ -913,7 +913,10 @@ class InspectorPanel(QWidget):
             try:
                 from monostudio.core.item_comments import notes_badge_visual_mode
 
-                n, mode = notes_badge_visual_mode(Path(item.path))
+                n, mode = notes_badge_visual_mode(
+                    Path(item.path),
+                    self._last_focused_department,
+                )
             except Exception:
                 n, mode = 0, "empty"
             self._preview.set_inspector_notes_chip(True, int(n), str(mode))
@@ -1100,6 +1103,7 @@ class InspectorPanel(QWidget):
             return
         if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
             return
+        self._sync_preview_notes_chip()
         dep = self._last_focused_department
         if not dep:
             self._tech.set_resolved_path(None)

@@ -23,14 +23,17 @@ from PySide6.QtWidgets import (
 from monostudio.core.item_comments import (
     ItemCommentEntry,
     delete_note_media,
+    entry_preview_text,
     new_comment_entry,
-    read_item_comments,
-    write_item_comments,
+    normalize_note_department_id,
+    read_item_comments_for_department,
+    write_item_comments_for_department,
 )
 from monostudio.core.mention_inbox import append_mentions
 from monostudio.core.user_identity import get_current_user
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.note_body_browser import NoteListPreviewBrowser
+from monostudio.ui_qt.note_author_row import NoteAuthorRow
+from monostudio.ui_qt.note_body_browser import NoteListPreviewLabel
 from monostudio.ui_qt.note_compose_editor import NoteComposeEditor
 from monostudio.ui_qt.note_view_dialog import NoteViewDialog
 from monostudio.ui_qt.style import MonosDialog, monos_font
@@ -57,7 +60,18 @@ def _format_local_time(iso_at: str) -> str:
 
 def _entries_fingerprint(entries: list[ItemCommentEntry]) -> tuple:
     return tuple(
-        (e.id, e.at, e.author, e.text, e.done, e.done_at, e.author_id, e.body_html, e.mentions)
+        (
+            e.id,
+            e.at,
+            e.author,
+            e.text,
+            e.done,
+            e.done_at,
+            e.author_id,
+            e.body_html,
+            e.mentions,
+            e.department,
+        )
         for e in sorted(entries, key=lambda x: x.id)
     )
 
@@ -79,6 +93,7 @@ class _NoteListCard(QFrame):
         self.setObjectName("ItemNotesCardDone" if entry.done else "ItemNotesCard")
         self.setProperty("noteCardId", entry.id)
         self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Click to view full note")
 
@@ -112,6 +127,8 @@ class ItemNotesDialog(MonosDialog):
         author_id: str | None = None,
         workspace_root: Path | None = None,
         project_root: Path | None = None,
+        department_id: str | None = None,
+        department_label: str | None = None,
         highlight_note_id: str | None = None,
     ) -> None:
         super().__init__(parent)
@@ -121,8 +138,14 @@ class ItemNotesDialog(MonosDialog):
         self._author_id = (author_id or "").strip() or None
         self._workspace_root = Path(workspace_root) if workspace_root else None
         self._project_root = Path(project_root) if project_root else None
+        self._department_id = normalize_note_department_id(department_id)
+        self._department_label = (department_label or "").strip() or (
+            self._department_id or "General"
+        )
         self._highlight_note_id = (highlight_note_id or "").strip() or None
-        self._draft: list[ItemCommentEntry] = list(read_item_comments(self._item_path))
+        self._draft: list[ItemCommentEntry] = list(
+            read_item_comments_for_department(self._item_path, self._department_id or None)
+        )
         self._initial_fp = _entries_fingerprint(self._draft)
         self._known_ids = {e.id for e in self._draft}
 
@@ -136,7 +159,10 @@ class ItemNotesDialog(MonosDialog):
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(14)
 
-        title = QLabel(f"Notes — {self._item_display_name}", self)
+        title = QLabel(
+            f"Notes — {self._item_display_name} · {self._department_label}",
+            self,
+        )
         title.setObjectName("DialogSectionTitle")
         title.setFont(monos_font("Inter", 16, QFont.Weight.DemiBold))
         root.addWidget(title)
@@ -177,7 +203,7 @@ class ItemNotesDialog(MonosDialog):
         add_row.setSpacing(10)
         add_row.addStretch(1)
         self._add_btn = QPushButton("Add note", compose_panel)
-        self._add_btn.setObjectName("DialogPrimaryButton")
+        self._add_btn.setObjectName("ItemNotesAddButton")
         self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._add_btn.clicked.connect(self._on_add_draft)
         add_row.addWidget(self._add_btn, 0)
@@ -192,7 +218,7 @@ class ItemNotesDialog(MonosDialog):
         list_l.setContentsMargins(8, 0, 0, 0)
         list_l.setSpacing(10)
 
-        list_heading = QLabel("All notes", list_panel)
+        list_heading = QLabel(f"{self._department_label} notes", list_panel)
         list_heading.setObjectName("DialogHint")
         list_heading.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
         list_l.addWidget(list_heading, 0)
@@ -206,8 +232,8 @@ class ItemNotesDialog(MonosDialog):
         self._list_host = QWidget(self._scroll)
         self._list_host.setObjectName("ItemNotesListHost")
         self._list_layout = QVBoxLayout(self._list_host)
-        self._list_layout.setContentsMargins(0, 4, 4, 0)
-        self._list_layout.setSpacing(12)
+        self._list_layout.setContentsMargins(8, 8, 8, 8)
+        self._list_layout.setSpacing(10)
         self._list_layout.addStretch(1)
         self._scroll.setWidget(self._list_host)
         list_l.addWidget(self._scroll, 1)
@@ -262,6 +288,7 @@ class ItemNotesDialog(MonosDialog):
             entry=entry,
             item_root=self._item_path,
             item_display_name=self._item_display_name,
+            workspace_root=self._workspace_root,
             parent=self,
         )
         dlg.exec()
@@ -300,8 +327,8 @@ class ItemNotesDialog(MonosDialog):
         card = _NoteListCard(entry, parent=self._list_host)
 
         row = QHBoxLayout(card)
-        row.setContentsMargins(12, 10, 10, 10)
-        row.setSpacing(12)
+        row.setContentsMargins(14, 10, 10, 10)
+        row.setSpacing(10)
 
         cb = QCheckBox(card)
         cb.setObjectName("ItemNotesDoneCheck")
@@ -314,38 +341,20 @@ class ItemNotesDialog(MonosDialog):
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(4)
 
-        preview = NoteListPreviewBrowser(item_root=self._item_path, parent=card)
-        preview.set_body(entry.body_html, plain_fallback=entry.text, done=entry.done)
+        text_col.addWidget(
+            NoteAuthorRow.for_entry(
+                entry,
+                self._workspace_root,
+                avatar_size=24,
+                time_text=_format_local_time(entry.at),
+                parent=card,
+            )
+        )
+
+        preview = NoteListPreviewLabel(card)
+        preview.set_preview(entry_preview_text(entry), done=entry.done)
         preview.open_requested.connect(lambda eid=entry.id: self._open_note_view(eid))
-
-        preview_row = QHBoxLayout()
-        preview_row.setContentsMargins(0, 0, 0, 0)
-        preview_row.setSpacing(8)
-        preview_row.addWidget(preview, 1)
-
-        see_more = QLabel("see more", card)
-        see_more.setObjectName("ItemNotesPreviewMore")
-        see_more.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
-        see_more.setCursor(Qt.CursorShape.PointingHandCursor)
-        see_more.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        if preview.is_content_truncated():
-            preview_row.addWidget(see_more, 0, Qt.AlignmentFlag.AlignBottom)
-
-            def _on_see_more(event, *, eid: str = entry.id) -> None:
-                if event.button() == Qt.MouseButton.LeftButton:
-                    self._open_note_view(eid)
-                    event.accept()
-
-            see_more.mouseReleaseEvent = _on_see_more  # type: ignore[method-assign]
-        else:
-            see_more.hide()
-
-        time_l = QLabel(_format_local_time(entry.at), card)
-        time_l.setObjectName("DialogHint")
-        time_l.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
-
-        text_col.addLayout(preview_row)
-        text_col.addWidget(time_l)
+        text_col.addWidget(preview, 1)
         row.addLayout(text_col, 1)
 
         open_btn = QToolButton(card)
@@ -381,6 +390,7 @@ class ItemNotesDialog(MonosDialog):
                 body_html=self._add_edit.body_html(),
                 mentions=self._add_edit.mention_ids(),
                 entry_id=self._add_edit.draft_entry_id,
+                department=self._department_id or None,
             )
         except ValueError as ex:
             QMessageBox.warning(self, "Notes", str(ex))
@@ -415,6 +425,7 @@ class ItemNotesDialog(MonosDialog):
                         author_id=e.author_id,
                         body_html=e.body_html,
                         mentions=e.mentions,
+                        department=e.department,
                     )
                 )
             else:
@@ -429,6 +440,7 @@ class ItemNotesDialog(MonosDialog):
                         author_id=e.author_id,
                         body_html=e.body_html,
                         mentions=e.mentions,
+                        department=e.department,
                     )
                 )
         self._draft = new_list
@@ -472,7 +484,11 @@ class ItemNotesDialog(MonosDialog):
 
     def _on_save(self) -> None:
         try:
-            write_item_comments(self._item_path, self._draft)
+            write_item_comments_for_department(
+                self._item_path,
+                self._department_id or None,
+                self._draft,
+            )
         except OSError as ex:
             QMessageBox.warning(self, "Notes", str(ex) or "Could not save notes.")
             return
