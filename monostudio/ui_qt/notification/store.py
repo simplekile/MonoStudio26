@@ -10,6 +10,7 @@ import json
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from PySide6.QtCore import QSettings
@@ -39,6 +40,7 @@ class UserAlertPayload:
     from_name: str = ""
     from_user_id: str = ""
     department_label: str = ""
+    to_user_id: str = ""
 
     def to_dict(self) -> dict[str, str]:
         d = {
@@ -51,6 +53,7 @@ class UserAlertPayload:
             "from_name": self.from_name,
             "from_user_id": self.from_user_id,
             "department_label": self.department_label,
+            "to_user_id": self.to_user_id,
         }
         return d
 
@@ -68,6 +71,7 @@ class UserAlertPayload:
             from_name=str(data.get("from_name") or ""),
             from_user_id=str(data.get("from_user_id") or ""),
             department_label=str(data.get("department_label") or ""),
+            to_user_id=str(data.get("to_user_id") or ""),
         )
 
 
@@ -177,6 +181,44 @@ def _save_to_settings() -> None:
 _load_from_settings()
 
 
+def entry_belongs_to_user(
+    entry: NotificationEntry,
+    user_id: str,
+    project_root: Path | None = None,
+) -> bool:
+    """True if this bell row is for ``user_id`` (legacy rows resolve via mention inbox)."""
+    uid = (user_id or "").strip()
+    if not uid or entry.kind != "user":
+        return False
+    tid = (entry.payload.to_user_id or "").strip()
+    if tid:
+        return tid == uid
+    mid = (entry.payload.mention_inbox_id or "").strip()
+    if not mid or project_root is None:
+        return False
+    try:
+        from monostudio.core.mention_inbox import read_inbox
+
+        for item in read_inbox(Path(project_root)):
+            if item.id == mid:
+                return item.to_user_id == uid
+    except OSError:
+        pass
+    return False
+
+
+def _user_entries(
+    *,
+    user_id: str = "",
+    project_root: Path | None = None,
+) -> list[NotificationEntry]:
+    items = [e for e in _history if e.kind == "user"]
+    uid = (user_id or "").strip()
+    if not uid:
+        return []
+    return [e for e in items if entry_belongs_to_user(e, uid, project_root)]
+
+
 def append_user_alert(
     toast_type: ToastType,
     message: str,
@@ -197,26 +239,43 @@ def append_user_alert(
     return entry
 
 
-def recent(n: int = 5) -> list[NotificationEntry]:
-    """Last n user entries, newest first."""
-    items = [e for e in _history if e.kind == "user"]
+def recent(
+    n: int = 5,
+    *,
+    user_id: str = "",
+    project_root: Path | None = None,
+) -> list[NotificationEntry]:
+    """Last n user entries for ``user_id``, newest first."""
+    items = _user_entries(user_id=user_id, project_root=project_root)
     items.reverse()
     return items[:n]
 
 
-def all_entries() -> list[NotificationEntry]:
-    """All stored user entries, newest first."""
-    items = [e for e in _history if e.kind == "user"]
+def all_entries(
+    *,
+    user_id: str = "",
+    project_root: Path | None = None,
+) -> list[NotificationEntry]:
+    """All stored user entries for ``user_id``, newest first."""
+    items = _user_entries(user_id=user_id, project_root=project_root)
     items.reverse()
     return items
 
 
-def count() -> int:
-    return sum(1 for e in _history if e.kind == "user")
+def count(
+    *,
+    user_id: str = "",
+    project_root: Path | None = None,
+) -> int:
+    return len(_user_entries(user_id=user_id, project_root=project_root))
 
 
-def unread_count() -> int:
-    return sum(1 for e in _history if e.kind == "user" and not e.read)
+def unread_count(
+    *,
+    user_id: str = "",
+    project_root: Path | None = None,
+) -> int:
+    return sum(1 for e in _user_entries(user_id=user_id, project_root=project_root) if not e.read)
 
 
 def has_mention_inbox_id(mention_inbox_id: str) -> bool:
@@ -230,13 +289,40 @@ def has_mention_inbox_id(mention_inbox_id: str) -> bool:
 
 
 def clear_mention_user_alerts() -> None:
-    """Drop cached @mention bell rows (e.g. before reloading inbox for another user)."""
+    """Drop all cached @mention bell rows."""
     kept = [
         e
         for e in _history
         if not (e.kind == "user" and (e.payload.mention_inbox_id or "").strip())
     ]
     if len(kept) == len(_history):
+        return
+    _history.clear()
+    _history.extend(kept)
+    _save_to_settings()
+
+
+def prune_mention_alerts_not_for_user(
+    user_id: str,
+    project_root: Path | None = None,
+) -> None:
+    """Remove @mention bell rows that belong to another signed-in account."""
+    uid = (user_id or "").strip()
+    if not uid:
+        clear_mention_user_alerts()
+        return
+    kept: list[NotificationEntry] = []
+    changed = False
+    for e in _history:
+        mid = (e.payload.mention_inbox_id or "").strip() if e.kind == "user" else ""
+        if not mid:
+            kept.append(e)
+            continue
+        if entry_belongs_to_user(e, uid, project_root):
+            kept.append(e)
+        else:
+            changed = True
+    if not changed:
         return
     _history.clear()
     _history.extend(kept)

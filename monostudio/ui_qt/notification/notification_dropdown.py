@@ -104,22 +104,30 @@ class NotificationDropdown(QFrame):
         self.setFixedWidth(380)
         self._workspace_root: Path | None = None
         self._project_root: Path | None = None
+        self._current_user_id: str = ""
         self._fill()
 
     def set_context(
         self,
         workspace_root: Path | None,
         project_root: Path | None,
+        *,
+        user_id: str = "",
     ) -> None:
         self._workspace_root = workspace_root
         self._project_root = project_root
+        self._current_user_id = (user_id or "").strip()
 
     def _fill(self) -> None:
         while self._content_layout.count():
             child = self._content_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
-        entries = recent(RECENT_COUNT)
+        entries = recent(
+            RECENT_COUNT,
+            user_id=self._current_user_id,
+            project_root=self._project_root,
+        )
         if not entries:
             empty = QLabel("No notifications", self._content)
             empty.setFont(monos_font("Inter", 13, QFont.Weight.Medium))

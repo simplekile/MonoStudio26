@@ -1277,6 +1277,101 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(255, 255, 255, 0.08);
             border-radius: 6px;
         }
+        QFrame#TrayMiniPopup {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+        }
+        QLabel#TrayMiniPopupHeader {
+            color: #71717a;
+            padding: 8px 12px 4px 12px;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+        }
+        QLabel#TrayMiniPopupEmpty {
+            color: #71717a;
+            padding: 12px;
+            font-size: 12px;
+        }
+        QListWidget#TrayMiniPopupList {
+            background: transparent;
+            border: none;
+            outline: none;
+            padding: 2px 4px;
+        }
+        QListWidget#TrayMiniPopupList::item {
+            padding: 2px 4px;
+            border-radius: 4px;
+            color: #e4e4e7;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        QListWidget#TrayMiniPopupList::item:hover {
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+        QListWidget#TrayMiniPopupList::item:selected {
+            background-color: rgba(37, 99, 235, 0.22);
+            color: #fafafa;
+        }
+        QPushButton#TrayMiniPopupOpenButton {
+            background: transparent;
+            border: none;
+            border-top: 1px solid #3f3f46;
+            color: #60a5fa;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 0 12px;
+            text-align: left;
+        }
+        QPushButton#TrayMiniPopupOpenButton:hover {
+            background-color: rgba(37, 99, 235, 0.12);
+            color: #93c5fd;
+        }
+        QPushButton#TrayMiniFilterPill {
+            background-color: #27272a;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+            color: #d4d4d8;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 4px 10px;
+            text-align: left;
+        }
+        QPushButton#TrayMiniFilterPill:hover {
+            background-color: #3f3f46;
+            color: #fafafa;
+        }
+        QWidget#TrayMiniListRow {
+            background: transparent;
+        }
+        QLabel#TrayMiniThumb,
+        QFrame#TrayMiniThumb {
+            background-color: #27272a;
+            border: 1px solid #3f3f46;
+            border-radius: 4px;
+            min-width: 72px;
+            max-width: 72px;
+            min-height: 41px;
+            max-height: 41px;
+        }
+        QLabel#TrayMiniRowTitle {
+            color: #fafafa;
+        }
+        QLabel#TrayMiniRowSub {
+            color: #71717a;
+        }
+        QWidget#TrayMiniNotiRow[unread="true"] {
+            background: rgba(59, 130, 246, 0.08);
+            border-radius: 6px;
+        }
+        QLabel#TrayMiniNotiAvatar {
+            background: transparent;
+            border: none;
+        }
         QFrame#MainViewOptionsPopup {
             background-color: #1c1c1f;
             border: 1px solid #2a2a2d;

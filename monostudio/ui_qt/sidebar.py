@@ -1691,6 +1691,46 @@ class SidebarWidget(QWidget):
         self._state_by_mode[self._mode] = self._snapshot_state()
         self._save_state_for_mode(self._mode)
 
+    def set_selected_type(self, type_id: str | None, *, emit: bool = True) -> None:
+        """Set type filter programmatically (e.g. tray mini popup). Use emit=False to avoid main-view reload churn."""
+        tid = (type_id or "").strip() or None
+        if self._active_type:
+            self._department_by_type[self._active_type] = self._active_department
+        self._active_type = tid
+        if tid:
+            allowed_list = self._dept_ids_by_type.get(tid, [])
+            allowed_set = set(allowed_list)
+            restored = self._department_by_type.get(tid)
+            if restored and restored in allowed_set:
+                self._active_department = restored
+            else:
+                self._active_department = allowed_list[0] if allowed_list else None
+        self.set_departments(self._all_departments)
+        self._sync_selection()
+        if emit:
+            self.typeClicked.emit(tid)
+        self._state_by_mode[self._mode] = self._snapshot_state()
+        self._save_state_for_mode(self._mode)
+
+    def filter_option_lists(self) -> tuple[list[tuple[str, str, str | None]], list[tuple[str, str, str | None]]]:
+        """(dept_id, label, lucide_icon), (type_id, label, lucide_icon) — same visible scope as sidebar lists."""
+        dept_ids = list(self._visible_departments or self._all_departments)
+        if self._mode in ("assets", "shots") and self._active_type and self._active_type in self._dept_ids_by_type:
+            allowed = set(self._dept_ids_by_type.get(self._active_type, []))
+            dept_ids = [d for d in dept_ids if d in allowed]
+        depts: list[tuple[str, str, str | None]] = []
+        for did in dept_ids:
+            label = _title_case_label(self._dept_label_by_id.get(did, did))
+            icon = self._dept_icon_by_id.get(did)
+            depts.append((did, label, icon))
+        type_ids = list(self._visible_types or self._all_types)
+        types: list[tuple[str, str, str | None]] = []
+        for tid in type_ids:
+            label = _title_case_label(self._type_label_by_id.get(tid, tid))
+            icon = self._type_icon_by_id.get(tid)
+            types.append((tid, label, icon))
+        return depts, types
+
     def _sync_selection(self) -> None:
         self._dept_list.blockSignals(True)
         self._type_list.blockSignals(True)

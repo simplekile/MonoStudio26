@@ -326,6 +326,7 @@ class TopBar(QWidget):
         self._noti_dropdown_closed_at = 0.0  # monotonic time when dropdown last closed (avoid reopen on same click)
         self._notification_workspace_root: Path | None = None
         self._notification_project_root: Path | None = None
+        self._notification_user_id: str = ""
         self._noti_dropdown = NotificationDropdown(self)
         self._noti_dropdown.show_all_requested.connect(self._open_notification_list_dialog)
         self._noti_dropdown.user_alert_clicked.connect(self._on_user_alert_clicked)
@@ -410,13 +411,24 @@ class TopBar(QWidget):
         self,
         workspace_root: Path | None,
         project_root: Path | None,
+        *,
+        user_id: str = "",
     ) -> None:
-        """Workspace/project roots for roster avatars and mention inbox timestamps."""
+        """Workspace/project/user scope for bell history and mention timestamps."""
         self._notification_workspace_root = workspace_root
         self._notification_project_root = project_root
-        self._noti_dropdown.set_context(workspace_root, project_root)
+        self._notification_user_id = (user_id or "").strip()
+        self._noti_dropdown.set_context(
+            workspace_root,
+            project_root,
+            user_id=self._notification_user_id,
+        )
         if self._notification_list_dialog is not None:
-            self._notification_list_dialog.set_context(workspace_root, project_root)
+            self._notification_list_dialog.set_context(
+                workspace_root,
+                project_root,
+                user_id=self._notification_user_id,
+            )
 
     def set_identity(
         self,
@@ -670,6 +682,7 @@ class TopBar(QWidget):
             self._notification_list_dialog.set_context(
                 self._notification_workspace_root,
                 self._notification_project_root,
+                user_id=self._notification_user_id,
             )
             self._notification_list_dialog._load()
         self._notification_list_dialog.show()

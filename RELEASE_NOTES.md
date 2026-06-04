@@ -1,17 +1,16 @@
-# MonoStudio 26 — Release v26.14.3
+# MonoStudio 26 — Release v26.14.4
 
 ## Highlights
 
-- **System tray**: Thu nhỏ xuống tray, menu tray (mở/ẩn/thoát), tùy chọn hành vi khi đóng cửa sổ (thoát / minimize to tray / hỏi mỗi lần).
-- **Single instance**: Mở app lần hai sẽ đưa cửa sổ đang chạy lên trước (không nhân đôi process).
-- **Windows autostart**: Bật/tắt chạy cùng Windows từ Settings (HKCU Run).
-- **Toast**: Tinh chỉnh focus bridge khi bấm notification.
+- **Tray mini popup**: Click tray icon — popup Recent tasks, entities, notifications (thumbnail + DCC badges); mở file / nhảy vào app từ tray.
+- **Tray icon badge**: Số unread mention/notification trên icon tray.
+- **Notifications**: Store/unread đồng bộ với tray và dropdown; tinh chỉnh list UI.
 
 ## Changes in this release
 
-- feat: `tray_manager.py`, `close_behavior_dialog.py`, `tray_preferences.py`.
-- feat: `single_instance.py`, `app_launch.py`, `windows_autostart.py`.
-- feat: `main_window.py`, `settings_dialog.py`, `app.py` — tray, close, autostart wiring.
+- feat: `tray_mini_popup.py`, `tray_icon_badges.py`; `tray_manager.py` mở rộng.
+- feat: `main_window.py` — wiring task/entity/notification từ tray.
+- fix/style: `notification/store.py`, dropdown/list, `sidebar.py`, `top_bar.py`, `style.py`.
 
 ## Install
 

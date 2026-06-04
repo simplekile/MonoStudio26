@@ -414,10 +414,11 @@ class MainWindow(FramelessMainWindow):
 
         self._tray_manager = TrayManager(self, settings=self._settings)
         self._tray_manager.install()
+        self._sync_tray_status_badges()
         notification_service.set_general_toast_anchor_widget(self._top_bar.get_noti_button())
         # Anchor important banner under the update button so it appears as a callout.
         notification_service.set_important_anchor_widget(self._top_bar.get_update_button())
-        notification_service.unread_count_changed.connect(self._top_bar.set_noti_unread_count)
+        notification_service.unread_count_changed.connect(self._refresh_noti_unread_badge)
         self._top_bar.user_alert_clicked.connect(self._on_user_alert_clicked)
         self._mention_sync_timer = QTimer(self)
         self._mention_sync_timer.setInterval(45000)
@@ -455,6 +456,8 @@ class MainWindow(FramelessMainWindow):
             return
         self._settings.setValue("updates/last_check_time", datetime.now().isoformat())
         self._top_bar.set_update_available(result.update_available, result.latest_version)
+        if self._tray_manager is not None:
+            self._tray_manager.set_update_available(bool(result.update_available))
         if result.update_available:
             # Important: show a sticky notification that only disappears when the user closes it.
             # Format:
@@ -1323,7 +1326,14 @@ class MainWindow(FramelessMainWindow):
         )
         ctx = self._sidebar.current_context()
         self._top_bar.set_nav_page_active(ctx if ctx in ("Dashboard", "Schedule") else None)
-        self._top_bar.set_notification_context(self._workspace_root, self._project_root)
+        from monostudio.core.user_identity import get_current_user
+
+        user = get_current_user(self._workspace_root)
+        self._top_bar.set_notification_context(
+            self._workspace_root,
+            self._project_root,
+            user_id=user.id if user is not None else "",
+        )
 
     def _copy_project_inventory(self) -> None:
         """
@@ -1676,6 +1686,11 @@ class MainWindow(FramelessMainWindow):
             self._top_bar.set_identity(user.name, user.color_hex, user.initials, pix)
         else:
             self._top_bar.set_identity(None)
+        self._top_bar.set_notification_context(
+            self._workspace_root,
+            self._project_root,
+            user_id=user.id if user is not None else "",
+        )
 
     def _schedule_identity_prompt(self) -> None:
         """Prompt sign-in once workspace is ready — never while splash is still on screen."""
@@ -1703,12 +1718,146 @@ class MainWindow(FramelessMainWindow):
         """User clicked window close — may hide to tray per settings."""
         self.close()
 
-    def apply_recent_task(self, task: object, *, open_dcc: bool = False) -> None:
+    def apply_recent_task(
+        self, task: object, *, open_dcc: bool = False, present: bool = True
+    ) -> None:
         if open_dcc:
-            self._on_recent_task_double_clicked(task)
-        else:
+            if present:
+                self._on_recent_task_double_clicked(task)
+            else:
+                self._open_recent_task_file_silent(task)
+        elif present:
             self.present()
             self._on_recent_task_clicked(task)
+        else:
+            self._on_recent_task_clicked(task)
+
+    def open_tray_entity(
+        self,
+        *,
+        item_type: str,
+        item_path: Path,
+        department: str | None = None,
+        type_id: str | None = None,
+    ) -> None:
+        """Open asset or shot from tray mini popup with filters aligned to sidebar."""
+        kind = (item_type or "").strip().lower()
+        if kind not in ("asset", "shot"):
+            return
+        self.present()
+        ctx = "Assets" if kind == "asset" else "Shots"
+        self._sidebar.set_current_context(ctx)
+        self._sidebar_compact.set_current_context(ctx)
+        filters = self._sidebar.filters()
+        filters.set_mode("assets" if kind == "asset" else "shots")
+        dept = (department or "").strip() or None
+        typ = (type_id or "").strip() or None
+        if typ:
+            filters.set_selected_type(typ, emit=False)
+        if dept:
+            filters.set_selected_department(dept, emit=False)
+        elif typ:
+            filters.set_selected_department(filters.current_department(), emit=False)
+        self._sync_filter_state_from_sidebar()
+        self._main_view.select_item_by_path(Path(item_path))
+
+    def _pipeline_ref_for_path(self, item_path: Path, item_type: str) -> Asset | Shot | None:
+        if self._project_index is None:
+            return None
+        try:
+            target = item_path.resolve()
+        except OSError:
+            target = item_path
+        kind = (item_type or "").strip().lower()
+
+        def _matches(p: Path) -> bool:
+            try:
+                return p.resolve() == target
+            except OSError:
+                return p == item_path
+
+        if kind == "asset":
+            for asset in self._project_index.assets:
+                if _matches(asset.path):
+                    return asset
+        elif kind == "shot":
+            for shot in self._project_index.shots:
+                if _matches(shot.path):
+                    return shot
+        return None
+
+    def _sync_tray_filter_state(
+        self,
+        *,
+        item_type: str,
+        department: str | None,
+        type_id: str | None,
+    ) -> None:
+        """Update sidebar/controller filters for tray open without raising the window."""
+        kind = (item_type or "").strip().lower()
+        if kind not in ("asset", "shot"):
+            return
+        filters = self._sidebar.filters()
+        filters.set_mode("assets" if kind == "asset" else "shots")
+        dept = (department or "").strip() or None
+        typ = (type_id or "").strip() or None
+        if typ:
+            filters.set_selected_type(typ, emit=False)
+        if dept:
+            filters.set_selected_department(dept, emit=False)
+        elif typ:
+            filters.set_selected_department(filters.current_department(), emit=False)
+        self._sync_filter_state_from_sidebar()
+
+    def open_tray_entity_file(
+        self,
+        *,
+        item_type: str,
+        item_path: Path,
+        department: str | None = None,
+        type_id: str | None = None,
+    ) -> None:
+        """Tray double-click: open work file in DCC without focusing main window."""
+        ref = self._pipeline_ref_for_path(Path(item_path), item_type)
+        if ref is None:
+            return
+        self._sync_tray_filter_state(
+            item_type=item_type,
+            department=department,
+            type_id=type_id,
+        )
+        try:
+            if self._controller.smart_open(item=ref, force_dialog=False, parent=self):
+                self._refresh_recent_tasks()
+        except Exception as e:
+            logging.warning("Tray DCC launch failed: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Open DCC", str(e))
+
+    def _open_recent_task_file_silent(self, task: object) -> None:
+        from monostudio.ui_qt.recent_tasks_store import RecentTask
+
+        if not isinstance(task, RecentTask):
+            return
+        ref = self._pipeline_ref_for_path(Path(task.item_path), task.item_type)
+        if ref is None:
+            return
+        self._controller.sync_filter_state(
+            department=task.department, type_id=self.current_type
+        )
+        self._sidebar.filters().set_selected_department(task.department, emit=False)
+        dept = (task.department or "").strip()
+        dcc = (task.dcc or "").strip()
+        try:
+            if dept and dcc:
+                self._controller.open_with_dcc(
+                    item=ref, department=dept, dcc=dcc, parent=self
+                )
+            elif self._controller.smart_open(item=ref, force_dialog=False, parent=self):
+                pass
+            self._refresh_recent_tasks()
+        except Exception as e:
+            logging.warning("Tray DCC launch failed (recent): %s", e, exc_info=True)
+            QMessageBox.critical(self, "Open DCC", str(e))
 
     def restore_last_project_from_settings(self) -> None:
         self.present()
@@ -1821,6 +1970,7 @@ class MainWindow(FramelessMainWindow):
         session_sign_out(self._workspace_root)
         self._refresh_user_button()
         self._refresh_dashboard_if_visible()
+        self._refresh_noti_unread_badge()
 
     def _on_forget_device(self) -> None:
         from monostudio.core.user_identity import forget_device, session_sign_out
@@ -1831,6 +1981,7 @@ class MainWindow(FramelessMainWindow):
         session_sign_out(self._workspace_root)
         self._refresh_user_button()
         self._refresh_dashboard_if_visible()
+        self._refresh_noti_unread_badge()
         notification_service.info("This device was unlinked from your studio account.")
 
     def _on_edit_profile(self) -> None:
@@ -1975,14 +2126,49 @@ class MainWindow(FramelessMainWindow):
         return user.id if user is not None else None
 
     def _refresh_noti_unread_badge(self) -> None:
+        from monostudio.core.user_identity import get_current_user
         from monostudio.ui_qt.notification.store import unread_count
 
-        self._top_bar.set_noti_unread_count(unread_count())
+        user = get_current_user(self._workspace_root)
+        uid = user.id if user is not None else ""
+        count = unread_count(user_id=uid, project_root=self._project_root)
+        self._top_bar.set_noti_unread_count(count)
+        self._on_tray_notification_count(count)
+
+    def _on_tray_notification_count(self, count: int) -> None:
+        if self._tray_manager is not None:
+            self._tray_manager.set_notification_pending(count > 0)
+            self._tray_manager.refresh_menu()
+
+    def _sync_tray_status_badges(self) -> None:
+        if self._tray_manager is None:
+            return
+        from monostudio.core.update_checker import get_cached_check_result
+        from monostudio.core.user_identity import get_current_user
+        from monostudio.ui_qt.notification.store import unread_count
+
+        user = get_current_user(self._workspace_root)
+        uid = user.id if user is not None else ""
+        self._tray_manager.set_notification_pending(
+            unread_count(user_id=uid, project_root=self._project_root) > 0
+        )
+        cached = get_cached_check_result()
+        has_update = bool(cached is not None and getattr(cached, "update_available", False))
+        self._tray_manager.set_update_available(has_update)
 
     def _reload_mention_alerts_for_current_user(self) -> None:
-        from monostudio.ui_qt.notification.store import clear_mention_user_alerts
+        from monostudio.core.user_identity import get_current_user
+        from monostudio.ui_qt.notification.store import prune_mention_alerts_not_for_user
 
-        clear_mention_user_alerts()
+        user = get_current_user(self._workspace_root)
+        if user is None:
+            from monostudio.ui_qt.notification.store import clear_mention_user_alerts
+
+            clear_mention_user_alerts()
+            notification_service.reset_mention_popup_session()
+            self._refresh_noti_unread_badge()
+            return
+        prune_mention_alerts_not_for_user(user.id, self._project_root)
         notification_service.reset_mention_popup_session()
         self._sync_mention_inbox_alerts()
 
@@ -1990,13 +2176,18 @@ class MainWindow(FramelessMainWindow):
         from monostudio.core.mention_inbox import items_for_user, resolve_mention_entity_path
         from monostudio.core.user_identity import get_current_user
         from monostudio.ui_qt.notification.mention_alert_format import mention_alert_plain_message
-        from monostudio.ui_qt.notification.store import UserAlertPayload, has_mention_inbox_id
+        from monostudio.ui_qt.notification.store import (
+            UserAlertPayload,
+            has_mention_inbox_id,
+            prune_mention_alerts_not_for_user,
+        )
 
         if self._project_root is None:
             return
         user = get_current_user(self._workspace_root)
         if user is None:
             return
+        prune_mention_alerts_not_for_user(user.id, self._project_root)
         popup_batch: list[tuple[str, str]] = []
         for item in items_for_user(self._project_root, user.id):
             entity = resolve_mention_entity_path(
@@ -2030,6 +2221,7 @@ class MainWindow(FramelessMainWindow):
                     from_name=from_name,
                     from_user_id=item.from_user_id,
                     department_label=dept_label,
+                    to_user_id=user.id,
                 ),
                 toast_type="info",
                 read=item.read,

@@ -41,6 +41,7 @@ class NotificationListDialog(MonosDialog):
         self.setObjectName("NotificationListDialog")
         self._workspace_root = workspace_root
         self._project_root = project_root
+        self._current_user_id = ""
         self.setWindowTitle("Notifications")
         self.setModal(False)
         root = QVBoxLayout(self)
@@ -86,13 +87,19 @@ class NotificationListDialog(MonosDialog):
         self,
         workspace_root: Path | None,
         project_root: Path | None,
+        *,
+        user_id: str = "",
     ) -> None:
         self._workspace_root = workspace_root
         self._project_root = project_root
+        self._current_user_id = (user_id or "").strip()
 
     def _load(self) -> None:
         self._list.clear()
-        for entry in all_entries():
+        for entry in all_entries(
+            user_id=self._current_user_id,
+            project_root=self._project_root,
+        ):
             item = QListWidgetItem(self._list)
             row = NotificationAlertRow(
                 entry,
