@@ -1,16 +1,13 @@
-# MonoStudio 26 — Release v26.14.4
+# MonoStudio 26 — Release v26.14.5
 
 ## Highlights
 
-- **Tray mini popup**: Click tray icon — popup Recent tasks, entities, notifications (thumbnail + DCC badges); mở file / nhảy vào app từ tray.
-- **Tray icon badge**: Số unread mention/notification trên icon tray.
-- **Notifications**: Store/unread đồng bộ với tray và dropdown; tinh chỉnh list UI.
+- **Single instance fix**: Kiểm tra instance trùng ngay khi khởi động (trước splash/tray); gửi “raise” tới cửa sổ đang chạy ổn định hơn; không bỏ lỡ focus khi callback chưa gắn.
 
 ## Changes in this release
 
-- feat: `tray_mini_popup.py`, `tray_icon_badges.py`; `tray_manager.py` mở rộng.
-- feat: `main_window.py` — wiring task/entity/notification từ tray.
-- fix/style: `notification/store.py`, dropdown/list, `sidebar.py`, `top_bar.py`, `style.py`.
+- fix: `single_instance.py` — signal trước khi listen, pending raise, timeout connect/write.
+- fix: `app.py` — `acquire_single_instance()` gọi sớm hơn trong `main()`.
 
 ## Install
 

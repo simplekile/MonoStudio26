@@ -173,6 +173,10 @@ def main() -> int:
     # These application attributes are deprecated and emit warnings in Qt6.
 
     app = QApplication(sys.argv)
+    instance_guard = acquire_single_instance()
+    if instance_guard is None:
+        return 0
+
     from monostudio.core.tray_preferences import read_tray_enabled
 
     if read_tray_enabled():
@@ -244,11 +248,6 @@ def main() -> int:
 
     _splash_step("Checking dependencies…", 0.50)
     _ensure_comtypes_on_windows()
-
-    instance_guard = acquire_single_instance()
-    if instance_guard is None:
-        splash.close()
-        return 0
 
     _splash_step("Building interface…", 0.65)
     window = MainWindow()

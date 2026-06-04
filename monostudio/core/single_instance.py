@@ -13,6 +13,8 @@ _log = logging.getLogger("monostudio.single_instance")
 
 SERVER_NAME = "MonoStudio26.SingleInstance"
 _MSG_RAISE = b"raise"
+_CONNECT_MS = 800
+_WRITE_MS = 800
 
 
 class SingleInstanceGuard(QObject):
@@ -25,9 +27,13 @@ class SingleInstanceGuard(QObject):
         self._on_raise = on_raise
         self._server: QLocalServer | None = None
         self._is_primary = False
+        self._pending_raise = False
 
     def set_on_raise(self, on_raise: Callable[[], None] | None) -> None:
         self._on_raise = on_raise
+        if on_raise is not None and self._pending_raise:
+            self._pending_raise = False
+            QTimer.singleShot(0, on_raise)
 
     @property
     def is_primary(self) -> bool:
@@ -35,30 +41,34 @@ class SingleInstanceGuard(QObject):
 
     def try_acquire(self) -> bool:
         """Return True if this process should continue as the primary instance."""
+        if self._signal_existing():
+            return False
+
         QLocalServer.removeServer(SERVER_NAME)
         server = QLocalServer(self)
-        if not server.listen(SERVER_NAME):
-            if self._try_signal_existing():
-                return False
-            QLocalServer.removeServer(SERVER_NAME)
-            if not server.listen(SERVER_NAME):
-                _log.warning("SingleInstance listen failed; continuing without guard")
-                self._is_primary = True
-                return True
-        server.newConnection.connect(self._on_new_connection)
-        self._server = server
+        if server.listen(SERVER_NAME):
+            server.newConnection.connect(self._on_new_connection)
+            self._server = server
+            self._is_primary = True
+            return True
+
+        if self._signal_existing():
+            return False
+
+        _log.warning("SingleInstance listen failed; continuing without guard")
         self._is_primary = True
         return True
 
-    def _try_signal_existing(self) -> bool:
+    def _signal_existing(self) -> bool:
+        """Connect to running instance and ask it to raise. Return True if signaled."""
         sock = QLocalSocket(self)
         sock.connectToServer(SERVER_NAME)
-        if not sock.waitForConnected(800):
+        if not sock.waitForConnected(_CONNECT_MS):
             sock.abort()
             return False
         sock.write(_MSG_RAISE)
         sock.flush()
-        sock.waitForBytesWritten(800)
+        sock.waitForBytesWritten(_WRITE_MS)
         sock.disconnectFromServer()
         return True
 
@@ -77,8 +87,12 @@ class SingleInstanceGuard(QObject):
         except Exception:
             data = b""
         socket.disconnectFromServer()
-        if _MSG_RAISE in data and self._on_raise is not None:
+        if _MSG_RAISE not in data:
+            return
+        if self._on_raise is not None:
             QTimer.singleShot(0, self._on_raise)
+        else:
+            self._pending_raise = True
 
 
 def acquire_single_instance(on_raise: Callable[[], None] | None = None) -> SingleInstanceGuard | None:
