@@ -17,7 +17,11 @@ from monostudio.core.access_control import (
     read_verbose_debug_enabled,
     restore_remembered_access,
 )
-from monostudio.core.app_paths import get_app_base_path, write_install_path_for_tools
+from monostudio.core.app_paths import (
+    get_app_base_path,
+    migrate_app_settings_if_needed,
+    write_install_path_for_tools,
+)
 from monostudio.core.windows_toast import register_aumid_on_startup
 from monostudio.core.crash_recovery import install_crash_logging
 from monostudio.core.pipeline_types_and_presets import ensure_user_default_config_dir
@@ -234,6 +238,7 @@ def main() -> int:
     QImageReader.setAllocationLimit(0)
     QApplication.setWheelScrollLines(1)
     ensure_user_default_config_dir()
+    migrate_app_settings_if_needed()
     write_install_path_for_tools()  # so MonoFXSuite etc. can discover install dir for "Under MonoStudio"
 
     _splash_step("Applying theme…", 0.25)

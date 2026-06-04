@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from getpass import getuser
 from pathlib import Path
 
-from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.app_paths import get_app_settings_path, migrate_app_settings_if_needed
 from monostudio.core.atomic_write import atomic_write_text
 
 ROSTER_SCHEMA = 1
@@ -438,10 +438,11 @@ def forget_device(
 # Local pin (per-machine, per-workspace) — app_settings.json
 # --------------------------------------------------------------------------- #
 def _app_settings_path() -> Path:
-    return get_app_base_path() / "monostudio_data" / "config" / "app_settings.json"
+    return get_app_settings_path()
 
 
 def _read_app_settings() -> dict:
+    migrate_app_settings_if_needed()
     try:
         data = json.loads(_app_settings_path().read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
@@ -498,6 +499,25 @@ def set_current_user_id(user_id: str | None, workspace_root: Path | None = None)
     _write_app_settings(data)
 
 
+def _set_last_signed_in_user_id(user_id: str, workspace_root: Path) -> None:
+    """Remember the last successful sign-in for sign-in pre-select (not auto-login)."""
+    data = _read_app_settings()
+    last = data.get("last_signed_in")
+    if not isinstance(last, dict):
+        last = {}
+    last[_pin_key(workspace_root)] = str(user_id).strip()
+    data["last_signed_in"] = last
+    _write_app_settings(data)
+
+
+def get_last_signed_in_user_id(workspace_root: Path | None) -> str | None:
+    last = _read_app_settings().get("last_signed_in")
+    if not isinstance(last, dict):
+        return None
+    val = last.get(_pin_key(workspace_root))
+    return str(val).strip() if val else None
+
+
 # --------------------------------------------------------------------------- #
 # Resolution (used everywhere)
 # --------------------------------------------------------------------------- #
@@ -517,14 +537,16 @@ def session_sign_in(
     Returns a short warning if sign-in succeeded but device binding could not be saved.
     """
     key = _pin_key(workspace_root)
-    _session_user_ids[key] = str(user_id).strip()
+    uid = str(user_id).strip()
+    _session_user_ids[key] = uid
+    _set_last_signed_in_user_id(uid, workspace_root)
     if remember:
-        set_current_user_id(user_id, workspace_root)
+        set_current_user_id(uid, workspace_root)
     else:
         set_current_user_id(None, workspace_root)
     # Device binding follows the last successful sign-in (even without Remember),
     # so the sign-in picker does not keep highlighting a previous account.
-    if register_device_too and not register_device(workspace_root, user_id):
+    if register_device_too and not register_device(workspace_root, uid):
         return (
             "Signed in, but could not update the shared roster on disk "
             "(file may be locked by Dropbox). This device may still be linked to another account."

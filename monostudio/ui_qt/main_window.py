@@ -1953,7 +1953,8 @@ class MainWindow(FramelessMainWindow):
         remember = dlg.remember()
         warn = session_sign_in(
             self._workspace_root, user_id,
-            remember=remember, register_device_too=remember,
+            remember=remember,
+            register_device_too=True,
         )
         if warn:
             notification_service.warning(warn)
@@ -4946,7 +4947,9 @@ class MainWindow(FramelessMainWindow):
 
     @staticmethod
     def _app_settings_path() -> Path:
-        return get_app_base_path() / "monostudio_data" / "config" / "app_settings.json"
+        from monostudio.core.app_paths import get_app_settings_path
+
+        return get_app_settings_path()
 
     def _toggle_maximize(self) -> None:
         if sys.platform == "win32":

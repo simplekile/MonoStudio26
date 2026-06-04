@@ -29,6 +29,7 @@ from monostudio.core.user_identity import (
     active_users,
     avatar_path,
     find_user_by_device,
+    get_last_signed_in_user_id,
     has_password,
     hash_password,
     new_user,
@@ -199,10 +200,15 @@ class UserIdentityDialog(MonosDialog):
             self._on_row_clicked(pre)
 
     def _preselect_id(self, users: list[StudioUser]) -> str | None:
-        # Only pre-select when this machine is explicitly bound in the roster (devices[]).
-        # Do not default to users[0] — that forced everyone onto the first-created account.
+        # Pre-select last successful sign-in, else device binding — never users[0].
+        active_ids = {u.id for u in users}
+        last_id = get_last_signed_in_user_id(self._workspace_root)
+        if last_id and last_id in active_ids:
+            return last_id
         u = find_user_by_device(self._workspace_root)
-        return u.id if u is not None else None
+        if u is not None and u.id in active_ids:
+            return u.id
+        return None
 
     def _on_row_clicked(self, user_id: str) -> None:
         self._selected_id = user_id

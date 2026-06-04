@@ -1,13 +1,15 @@
-# MonoStudio 26 — Release v26.14.5
+# MonoStudio 26 — Release v26.14.6
 
 ## Highlights
 
-- **Single instance fix**: Kiểm tra instance trùng ngay khi khởi động (trước splash/tray); gửi “raise” tới cửa sổ đang chạy ổn định hơn; không bỏ lỡ focus khi callback chưa gắn.
+- **Cấu hình local đúng chỗ**: `app_settings.json` (session, geometry, user pins) lưu `%LOCALAPPDATA%\MonoStudio\config` — cài lại app không “dính” user cũ từ thư mục cài; tự migrate file legacy một lần.
+- **Sign-in**: Pre-select theo lần đăng nhập gần nhất, rồi device binding; luôn cập nhật device khi Sign in (kể cả không tick Stay signed in).
 
 ## Changes in this release
 
-- fix: `single_instance.py` — signal trước khi listen, pending raise, timeout connect/write.
-- fix: `app.py` — `acquire_single_instance()` gọi sớm hơn trong `main()`.
+- feat: `app_paths.py` — `get_app_user_config_dir`, `migrate_app_settings_if_needed`.
+- feat: `user_identity.py` — `last_signed_in`, đường dẫn config mới.
+- fix: `main_window.py`, `user_identity_dialog.py`, `app.py`.
 
 ## Install
 
