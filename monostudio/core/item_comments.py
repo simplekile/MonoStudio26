@@ -61,6 +61,32 @@ _SCRIPT_BLOCK_RE = re.compile(r"(?is)<script[^>]*>.*?</script>")
 
 
 @dataclass(frozen=True)
+class NoteEditRevision:
+    """Snapshot stored when a note is edited."""
+
+    at: str
+    editor: str
+    text: str
+    body_html: str = ""
+    editor_id: str | None = None
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "at": self.at,
+            "editor": self.editor,
+            "text": self.text,
+        }
+        if self.body_html:
+            d["body_html"] = self.body_html
+        if self.editor_id:
+            d["editor_id"] = self.editor_id
+        return d
+
+
+_MAX_EDIT_HISTORY = 30
+
+
+@dataclass(frozen=True)
 class ItemCommentEntry:
     id: str
     at: str
@@ -72,6 +98,7 @@ class ItemCommentEntry:
     body_html: str = ""
     mentions: tuple[str, ...] = ()
     department: str = ""  # department id (sidebar); empty = legacy / general
+    edit_history: tuple[NoteEditRevision, ...] = ()
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -92,6 +119,8 @@ class ItemCommentEntry:
         dept = normalize_note_department_id(self.department)
         if dept:
             d["department"] = dept
+        if self.edit_history:
+            d["edit_history"] = [r.to_dict() for r in self.edit_history]
         return d
 
 
@@ -150,6 +179,7 @@ class NoteAuthorVisual:
     initials: str
     color_hex: str = "#52525b"
     image_path: Path | None = None
+    user_id: str | None = None
 
 
 def normalize_note_department_id(department_id: str | None) -> str:
@@ -208,6 +238,7 @@ def entry_author_visual(
                 initials=u.initials,
                 color_hex=u.color_hex or "#3b82f6",
                 image_path=avatar_path(workspace_root, u),
+                user_id=entry.author_id,
             )
     name = entry_author_display(entry, workspace_root, unknown=unknown)
     return NoteAuthorVisual(
@@ -215,6 +246,7 @@ def entry_author_visual(
         initials=_initials_from_display_name(name),
         color_hex="#52525b",
         image_path=None,
+        user_id=(entry.author_id or "").strip() or None,
     )
 
 
@@ -262,6 +294,26 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _parse_edit_revision(raw: object) -> NoteEditRevision | None:
+    if not isinstance(raw, dict):
+        return None
+    at = str(raw.get("at") or "").strip()
+    editor = str(raw.get("editor") or "").strip()
+    text = str(raw.get("text") or "").strip()
+    body_html = str(raw.get("body_html") or "").strip()
+    if not at or not (text or body_html):
+        return None
+    editor_id_raw = raw.get("editor_id")
+    editor_id = str(editor_id_raw).strip()[:64] if editor_id_raw else None
+    return NoteEditRevision(
+        at=at,
+        editor=editor or "Someone",
+        text=text[:_MAX_TEXT_LEN],
+        body_html=body_html[:_MAX_HTML_LEN],
+        editor_id=editor_id,
+    )
+
+
 def _parse_entry(raw: object) -> ItemCommentEntry | None:
     if not isinstance(raw, dict):
         return None
@@ -294,6 +346,16 @@ def _parse_entry(raw: object) -> ItemCommentEntry | None:
     elif body_html:
         mentions = parse_mentions_from_html(body_html)
     department = normalize_note_department_id(str(raw.get("department") or ""))
+    history_raw = raw.get("edit_history")
+    edit_history: tuple[NoteEditRevision, ...] = ()
+    if isinstance(history_raw, list):
+        revs: list[NoteEditRevision] = []
+        for h in history_raw:
+            r = _parse_edit_revision(h)
+            if r is not None:
+                revs.append(r)
+        if revs:
+            edit_history = tuple(revs[:_MAX_EDIT_HISTORY])
     return ItemCommentEntry(
         id=eid,
         at=at,
@@ -305,6 +367,7 @@ def _parse_entry(raw: object) -> ItemCommentEntry | None:
         body_html=body_html,
         mentions=mentions,
         department=department,
+        edit_history=edit_history,
     )
 
 
@@ -332,6 +395,17 @@ def _normalize_entries(entries: list[ItemCommentEntry]) -> list[ItemCommentEntry
     if len(out) > _MAX_ENTRIES:
         out = out[-_MAX_ENTRIES:]
     return out
+
+
+def department_for_note_id(item_root: Path, note_id: str) -> str:
+    """Department id for a note entry, or '' if missing / legacy."""
+    nid = (note_id or "").strip()
+    if not nid:
+        return ""
+    for entry in read_item_comments(item_root):
+        if entry.id == nid:
+            return normalize_note_department_id(entry.department)
+    return ""
 
 
 def read_item_comments(item_root: Path) -> list[ItemCommentEntry]:

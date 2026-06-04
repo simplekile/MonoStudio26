@@ -22,7 +22,7 @@ from monostudio.core.user_identity import (
 )
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MonosDialog, monos_font, monos_modal_parent
-from monostudio.ui_qt.user_avatar import avatar_pixmap_for, effective_device_pixel_ratio
+from monostudio.ui_qt.user_avatar import ProfileAvatarLabel
 
 
 def _format_departments(user: StudioUser) -> str:
@@ -75,20 +75,13 @@ class UserProfileViewDialog(MonosDialog):
         layout.setSpacing(0)
         layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
 
-        avatar_lbl = QLabel(self)
-        avatar_lbl.setObjectName("UserProfileViewAvatar")
-        avatar_size = 96
-        avatar_lbl.setFixedSize(avatar_size, avatar_size)
-        avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        dpr = effective_device_pixel_ratio(self)
-        avatar_lbl.setPixmap(
-            avatar_pixmap_for(
-                avatar_path(workspace_root, user),
-                user.initials,
-                user.color_hex,
-                avatar_size,
-                dpr=dpr,
-            )
+        photo = avatar_path(workspace_root, user)
+        avatar_lbl = ProfileAvatarLabel(
+            photo_path=photo,
+            initials=user.initials,
+            color_hex=user.color_hex,
+            size=96,
+            parent=self,
         )
         layout.addWidget(avatar_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addSpacing(16)

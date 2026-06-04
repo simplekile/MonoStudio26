@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from PySide6.QtCore import QSettings
@@ -31,17 +31,28 @@ class UserAlertPayload:
     """Metadata for a user-targeted notification (e.g. @mention)."""
 
     item_path: str = ""
+    item_rel: str = ""
     item_display: str = ""
     note_id: str = ""
     mention_inbox_id: str = ""
+    department: str = ""
+    from_name: str = ""
+    from_user_id: str = ""
+    department_label: str = ""
 
     def to_dict(self) -> dict[str, str]:
-        return {
+        d = {
             "item_path": self.item_path,
+            "item_rel": self.item_rel,
             "item_display": self.item_display,
             "note_id": self.note_id,
             "mention_inbox_id": self.mention_inbox_id,
+            "department": self.department,
+            "from_name": self.from_name,
+            "from_user_id": self.from_user_id,
+            "department_label": self.department_label,
         }
+        return d
 
     @classmethod
     def from_dict(cls, data: dict | None) -> UserAlertPayload:
@@ -49,9 +60,14 @@ class UserAlertPayload:
             return cls()
         return cls(
             item_path=str(data.get("item_path") or ""),
+            item_rel=str(data.get("item_rel") or ""),
             item_display=str(data.get("item_display") or ""),
             note_id=str(data.get("note_id") or ""),
             mention_inbox_id=str(data.get("mention_inbox_id") or ""),
+            department=str(data.get("department") or ""),
+            from_name=str(data.get("from_name") or ""),
+            from_user_id=str(data.get("from_user_id") or ""),
+            department_label=str(data.get("department_label") or ""),
         )
 
 
@@ -66,7 +82,9 @@ class NotificationEntry:
 
     def __post_init__(self) -> None:
         if isinstance(self.at, (int, float)):
-            self.at = datetime.fromtimestamp(self.at)
+            self.at = datetime.fromtimestamp(self.at, tz=timezone.utc)
+        elif isinstance(self.at, datetime) and self.at.tzinfo is None:
+            self.at = self.at.replace(tzinfo=timezone.utc)
         if isinstance(self.payload, dict):
             self.payload = UserAlertPayload.from_dict(self.payload)
 
@@ -90,9 +108,15 @@ class NotificationEntry:
         if t not in ("info", "success", "warning", "error", "important") or msg is None:
             return None
         try:
-            at = datetime.fromisoformat(str(at_raw).replace("Z", "+00:00")) if at_raw else datetime.now()
+            at = (
+                datetime.fromisoformat(str(at_raw).replace("Z", "+00:00"))
+                if at_raw
+                else datetime.now(timezone.utc)
+            )
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
-            at = datetime.now()
+            at = datetime.now(timezone.utc)
         kind_raw = str(data.get("kind") or "system")
         kind: NotificationKind = "user" if kind_raw == "user" else "system"
         payload = UserAlertPayload.from_dict(data.get("payload") if isinstance(data.get("payload"), dict) else None)
@@ -110,12 +134,10 @@ _history: deque[NotificationEntry] = deque(maxlen=MAX_HISTORY)
 
 
 def _migrate_legacy_history() -> None:
-    """Drop legacy operational log entries on first run after upgrade."""
+    """One-time flag: older builds stored operational log rows in bell history."""
     s = _settings()
     if s.value(_MIGRATED_KEY):
         return
-    _history.clear()
-    s.setValue(_SETTINGS_KEY, json.dumps([], ensure_ascii=False))
     s.setValue(_MIGRATED_KEY, True)
 
 
@@ -147,7 +169,9 @@ def _load_from_settings() -> None:
 
 def _save_to_settings() -> None:
     arr = [e.to_dict() for e in _history]
-    _settings().setValue(_SETTINGS_KEY, json.dumps(arr, ensure_ascii=False))
+    s = _settings()
+    s.setValue(_SETTINGS_KEY, json.dumps(arr, ensure_ascii=False))
+    s.sync()
 
 
 _load_from_settings()
@@ -158,14 +182,15 @@ def append_user_alert(
     message: str,
     *,
     payload: UserAlertPayload | None = None,
+    read: bool = False,
 ) -> NotificationEntry:
     entry = NotificationEntry(
         toast_type=toast_type,
         message=message,
-        at=datetime.now(),
+        at=datetime.now(timezone.utc),
         kind="user",
         payload=payload or UserAlertPayload(),
-        read=False,
+        read=bool(read),
     )
     _history.append(entry)
     _save_to_settings()

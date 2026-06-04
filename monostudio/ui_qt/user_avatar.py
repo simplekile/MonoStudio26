@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QMouseEvent, QPainter, QPainterPath, QPixmap
+from PySide6.QtWidgets import QLabel, QWidget
 
 from monostudio.core.user_identity import avatars_dir
 from monostudio.ui_qt.style import monos_font
@@ -113,6 +113,107 @@ def _circular_image(src: QPixmap, size: int, *, dpr: float = 2.0) -> QPixmap:
     p.end()
     out.setDevicePixelRatio(dpr)
     return out
+
+
+class ProfileAvatarLabel(QLabel):
+    """Large profile avatar; opens image preview when a photo file is available."""
+
+    def __init__(
+        self,
+        *,
+        photo_path: Path | None,
+        initials: str,
+        color_hex: str,
+        size: int = 96,
+        object_name: str = "UserProfileViewAvatar",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName(object_name)
+        self.setProperty("avatarSize", str(size))
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFixedSize(size, size)
+        self._photo_path: Path | None = None
+        if photo_path is not None:
+            try:
+                resolved = Path(photo_path)
+                if resolved.is_file():
+                    self._photo_path = resolved
+            except OSError:
+                pass
+
+        dpr = effective_device_pixel_ratio(self)
+        self.setPixmap(
+            avatar_pixmap_for(
+                self._photo_path,
+                initials,
+                color_hex,
+                size,
+                dpr=dpr,
+            )
+        )
+
+        self._apply_clickable_state()
+
+    def update_display(
+        self,
+        *,
+        photo_path: Path | None,
+        initials: str,
+        color_hex: str,
+        size: int | None = None,
+    ) -> None:
+        """Refresh pixmap after pick/remove (My profile dialog)."""
+        if size is not None:
+            self.setFixedSize(size, size)
+            self.setProperty("avatarSize", str(size))
+        self._photo_path = None
+        if photo_path is not None:
+            try:
+                resolved = Path(photo_path)
+                if resolved.is_file():
+                    self._photo_path = resolved
+            except OSError:
+                pass
+        side = size if size is not None else self.width()
+        dpr = effective_device_pixel_ratio(self)
+        self.setPixmap(
+            avatar_pixmap_for(
+                self._photo_path,
+                initials,
+                color_hex,
+                side,
+                dpr=dpr,
+            )
+        )
+        self._apply_clickable_state()
+
+    def _apply_clickable_state(self) -> None:
+        if self._photo_path is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setToolTip("View photo")
+            self.setProperty("clickable", "true")
+        else:
+            self.unsetCursor()
+            self.setToolTip("")
+            self.setProperty("clickable", "false")
+        st = self.style()
+        if st is not None:
+            st.unpolish(self)
+            st.polish(self)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if (
+            self._photo_path is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            from monostudio.ui_qt.note_image_viewer_dialog import NoteImageViewerDialog
+
+            dlg = NoteImageViewerDialog(self._photo_path, parent=self.window())
+            dlg.exec()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 def save_avatar_image(workspace_root: Path, user_id: str, src_image: Path) -> str:

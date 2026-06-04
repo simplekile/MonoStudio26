@@ -732,12 +732,24 @@ class DashboardPageWidget(QWidget):
             author_id=note.author_id,
             department=note.department,
         )
+        uid = (note.author_id or "").strip()
+        on_author = None
+        if uid:
+
+            def _open_profile(u: str = uid) -> None:
+                from monostudio.ui_qt.user_profile_view_dialog import open_studio_user_profile
+
+                open_studio_user_profile(self._workspace_root, u, parent=self)
+
+            on_author = _open_profile
+
         rl.addWidget(
             NoteAuthorRow.for_entry(
                 stub,
                 self._workspace_root,
                 avatar_size=22,
                 name_only=True,
+                on_author_click=on_author,
                 parent=row,
             ),
             0,

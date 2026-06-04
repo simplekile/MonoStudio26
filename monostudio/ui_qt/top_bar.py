@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -323,6 +324,8 @@ class TopBar(QWidget):
         self._btn_noti.setFixedSize(_action_icon_w, _action_icon_h)
         self._btn_noti.setToolTip("Notifications")
         self._noti_dropdown_closed_at = 0.0  # monotonic time when dropdown last closed (avoid reopen on same click)
+        self._notification_workspace_root: Path | None = None
+        self._notification_project_root: Path | None = None
         self._noti_dropdown = NotificationDropdown(self)
         self._noti_dropdown.show_all_requested.connect(self._open_notification_list_dialog)
         self._noti_dropdown.user_alert_clicked.connect(self._on_user_alert_clicked)
@@ -402,6 +405,18 @@ class TopBar(QWidget):
         layout.addWidget(self._btn_min, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_max, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_close, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+    def set_notification_context(
+        self,
+        workspace_root: Path | None,
+        project_root: Path | None,
+    ) -> None:
+        """Workspace/project roots for roster avatars and mention inbox timestamps."""
+        self._notification_workspace_root = workspace_root
+        self._notification_project_root = project_root
+        self._noti_dropdown.set_context(workspace_root, project_root)
+        if self._notification_list_dialog is not None:
+            self._notification_list_dialog.set_context(workspace_root, project_root)
 
     def set_identity(
         self,
@@ -516,35 +531,42 @@ class TopBar(QWidget):
             pass
         btn.update()
 
-    def _show_noti_dropdown(self) -> None:
-        """Toggle notification dropdown: if open, close; else if just closed (same click), do nothing; else show.
-        Position is clamped so the dropdown stays inside the main window."""
-        if self._noti_dropdown.isVisible():
-            self._noti_dropdown.close()
-            return
-        if (time.monotonic() - self._noti_dropdown_closed_at) < self._POPUP_REOPEN_GRACE:
-            return
+    def _position_noti_dropdown(self) -> None:
         btn = self._btn_noti
         pos = btn.mapToGlobal(btn.rect().bottomLeft())
         win = self.window()
-        frame = win.frameGeometry()  # main window rect in global coords
+        frame = win.frameGeometry()
         dw = self._noti_dropdown.width()
         dh = self._noti_dropdown.height()
         gap = 4
-        margin = 8  # inset from window edges (8px grid)
+        margin = 8
         x = pos.x()
         y = pos.y() + gap
-        # Clamp horizontally: keep dropdown inside window with margin
         if x + dw > frame.right() - margin:
             x = frame.right() - margin - dw
         if x < frame.left() + margin:
             x = frame.left() + margin
-        # Clamp vertically: if would go below window, show above button; respect bottom margin
         if y + dh > frame.bottom() - margin:
             y = pos.y() - gap - dh
         if y < frame.top() + margin:
             y = frame.top() + margin
         self._noti_dropdown.move(x, y)
+
+    def open_noti_dropdown(self) -> None:
+        """Open the bell dropdown (e.g. from a Windows toast); does not toggle closed."""
+        if self._noti_dropdown.isVisible():
+            return
+        self._position_noti_dropdown()
+        self._noti_dropdown.show()
+
+    def _show_noti_dropdown(self) -> None:
+        """Toggle notification dropdown: if open, close; else if just closed (same click), do nothing; else show."""
+        if self._noti_dropdown.isVisible():
+            self._noti_dropdown.close()
+            return
+        if (time.monotonic() - self._noti_dropdown_closed_at) < self._POPUP_REOPEN_GRACE:
+            return
+        self._position_noti_dropdown()
         self._noti_dropdown.show()
 
     def _on_noti_dropdown_closed(self) -> None:
@@ -638,9 +660,17 @@ class TopBar(QWidget):
         """Open the full notification list dialog (lazy-created)."""
         win = self.window()
         if self._notification_list_dialog is None:
-            self._notification_list_dialog = NotificationListDialog(win)
+            self._notification_list_dialog = NotificationListDialog(
+                win,
+                workspace_root=self._notification_workspace_root,
+                project_root=self._notification_project_root,
+            )
             self._notification_list_dialog.user_alert_clicked.connect(self._on_user_alert_clicked)
         else:
+            self._notification_list_dialog.set_context(
+                self._notification_workspace_root,
+                self._notification_project_root,
+            )
             self._notification_list_dialog._load()
         self._notification_list_dialog.show()
 

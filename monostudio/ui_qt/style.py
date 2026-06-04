@@ -1798,6 +1798,15 @@ def apply_dark_theme(app: QApplication) -> None:
         QLabel#UserProfileViewAvatar {
             background: transparent;
         }
+        QLabel#UserProfileViewAvatar[avatarSize="96"] {
+            border-radius: 48px;
+        }
+        QLabel#UserProfileViewAvatar[avatarSize="64"] {
+            border-radius: 32px;
+        }
+        QLabel#UserProfileViewAvatar[clickable="true"]:hover {
+            outline: 2px solid rgba(96, 165, 250, 0.55);
+        }
         QPushButton#UserProfileActionBtn {
             background: transparent;
             border: 1px solid #52525b;
@@ -1845,6 +1854,19 @@ def apply_dark_theme(app: QApplication) -> None:
         QLabel#NoteAuthorAvatar {
             background: transparent;
         }
+        QLabel#NoteAuthorNameLink {
+            color: #93c5fd;
+            background: transparent;
+            padding: 0 2px;
+        }
+        QLabel#NoteAuthorNameLink:hover {
+            color: #bfdbfe;
+            text-decoration: underline;
+        }
+        QLabel#ItemNotesMetaTime {
+            color: #71717a;
+            background: transparent;
+        }
         QWidget#NoteAuthorRow {
             background: transparent;
         }
@@ -1880,6 +1902,22 @@ def apply_dark_theme(app: QApplication) -> None:
         QListWidget#NoteMentionList::item:selected:focus {
             background: rgba(59, 130, 246, 0.18);
             border: 1px solid rgba(59, 130, 246, 0.45);
+        }
+
+        /* Notification list dialog (Show all) */
+        QListWidget#NotificationList {
+            background: transparent;
+            border: none;
+            outline: none;
+            padding: 0px;
+        }
+        QListWidget#NotificationList::viewport {
+            background: transparent;
+        }
+        QListWidget#NotificationList::item {
+            background: transparent;
+            border: none;
+            padding: 0px;
         }
 
         QLabel#NoteImageViewerLabel {
@@ -1968,6 +2006,15 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 8px;
         }
         QToolButton#ItemNotesOpenButton:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QToolButton#ItemNotesDoneCheck {
+            border: none;
+            background: transparent;
+            padding: 6px;
+            border-radius: 8px;
+        }
+        QToolButton#ItemNotesDoneCheck:hover {
             background: rgba(255, 255, 255, 0.08);
         }
         QPushButton#ItemNotesAddButton {
@@ -2366,6 +2413,157 @@ def apply_dark_theme(app: QApplication) -> None:
         QLabel#DialogHelper {
             color: #a1a1aa;
             font-size: 11px;
+        }
+        /* Settings → General → UI: section cards */
+        QScrollArea#SettingsPageScroll {
+            background: transparent;
+            border: none;
+        }
+        QScrollArea#SettingsPageScroll > QWidget > QWidget {
+            background: transparent;
+        }
+        QFrame#SettingsSectionCard {
+            background-color: #18181b;
+            border: 1px solid rgba(39, 39, 42, 0.55);
+            border-radius: 10px;
+        }
+        QLabel#SettingsSectionTitle {
+            color: #fafafa;
+        }
+        QLabel#SettingsSectionDesc {
+            color: #71717a;
+            line-height: 1.45;
+        }
+        QLabel#SettingsSubsectionTitle {
+            color: #71717a;
+            letter-spacing: 0.08em;
+        }
+        QLabel#SettingsFieldLabel {
+            color: #d4d4d8;
+        }
+        QFrame#SettingsSectionDivider {
+            background-color: rgba(39, 39, 42, 0.45);
+            border: none;
+            max-height: 1px;
+        }
+        QPushButton#SettingsInlineActionButton {
+            padding: 8px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(59, 130, 246, 0.35);
+            background: rgba(37, 99, 235, 0.12);
+            color: #93c5fd;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        QPushButton#SettingsInlineActionButton:hover {
+            background: rgba(37, 99, 235, 0.22);
+            border-color: rgba(59, 130, 246, 0.55);
+            color: #bfdbfe;
+        }
+        QPushButton#SettingsInlineActionButton:disabled {
+            color: rgba(161, 161, 170, 0.55);
+            background: rgba(24, 24, 27, 0.35);
+            border-color: rgba(39, 39, 42, 0.45);
+        }
+        QFrame#SettingsSectionCard QComboBox#SettingsComboBox {
+            padding: 6px 10px;
+            padding-right: 28px;
+            border: 1px solid rgba(39, 39, 42, 0.55);
+            border-radius: 8px;
+            background-color: #27272a;
+            color: #fafafa;
+            font-size: 13px;
+            font-weight: 500;
+            min-height: 28px;
+        }
+        QFrame#SettingsSectionCard QComboBox#SettingsComboBox:hover {
+            border-color: rgba(63, 63, 70, 0.90);
+            background-color: #2a2a2e;
+        }
+        QFrame#SettingsSectionCard QComboBox#SettingsComboBox:focus {
+            border: 1px solid #2563eb;
+        }
+        QFrame#SettingsSectionCard QComboBox#SettingsComboBox:disabled {
+            color: #71717a;
+            background-color: #1f1f22;
+        }
+        QFrame#SettingsSectionCard QComboBox#SettingsComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 26px;
+            border: none;
+            border-left: 1px solid rgba(39, 39, 42, 0.55);
+            border-top-right-radius: 7px;
+            border-bottom-right-radius: 7px;
+            background-color: #1f1f22;
+        }
+        QFrame#SettingsSectionCard QComboBox#SettingsComboBox::down-arrow {
+            width: 12px;
+            height: 12px;
+            border: none;
+        }
+        QFrame#SettingsSectionCard QComboBox#SettingsComboBox QAbstractItemView {
+            background-color: #18181b;
+            color: #fafafa;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+            padding: 4px;
+            outline: none;
+            selection-background-color: rgba(59, 130, 246, 0.22);
+            selection-color: #93c5fd;
+        }
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox {
+            padding: 6px 8px;
+            border: 1px solid rgba(39, 39, 42, 0.55);
+            border-radius: 8px;
+            background-color: #27272a;
+            color: #fafafa;
+            font-size: 13px;
+            font-weight: 500;
+            min-height: 28px;
+        }
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox:hover {
+            border-color: rgba(63, 63, 70, 0.90);
+        }
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox:focus {
+            border: 1px solid #2563eb;
+        }
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox::up-button,
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox::down-button {
+            width: 22px;
+            border: none;
+            background-color: #1f1f22;
+        }
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox::up-button {
+            border-left: 1px solid rgba(39, 39, 42, 0.45);
+            border-top-right-radius: 7px;
+        }
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox::down-button {
+            border-left: 1px solid rgba(39, 39, 42, 0.45);
+            border-bottom-right-radius: 7px;
+        }
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox::up-button:hover,
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox::down-button:hover {
+            background-color: #27272a;
+        }
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox::up-arrow,
+        QFrame#SettingsSectionCard QSpinBox#SettingsSpinBox::down-arrow {
+            width: 12px;
+            height: 12px;
+            border: none;
+        }
+        QFrame#SettingsSectionCard QLineEdit#SettingsLineEdit {
+            padding: 6px 10px;
+            border: 1px solid rgba(39, 39, 42, 0.55);
+            border-radius: 8px;
+            background-color: #27272a;
+            color: #e4e4e7;
+            font-size: 12px;
+            font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
+            min-height: 28px;
+        }
+        QFrame#SettingsSectionCard QLineEdit#SettingsLineEdit:focus {
+            border: 1px solid #2563eb;
         }
         QLabel#DialogWarning {
             color: #f59e0b;

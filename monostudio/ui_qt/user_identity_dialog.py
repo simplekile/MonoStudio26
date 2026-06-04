@@ -147,7 +147,7 @@ class UserIdentityDialog(MonosDialog):
         self._error.setVisible(False)
         layout.addWidget(self._error)
 
-        self._remember_cb = QCheckBox("Remember this device (stay signed in)", self)
+        self._remember_cb = QCheckBox("Stay signed in on this PC (save session)", self)
         self._remember_cb.setChecked(True)
         layout.addWidget(self._remember_cb)
 
@@ -199,11 +199,10 @@ class UserIdentityDialog(MonosDialog):
             self._on_row_clicked(pre)
 
     def _preselect_id(self, users: list[StudioUser]) -> str | None:
-        # Known device → pre-select that account (still needs password).
+        # Only pre-select when this machine is explicitly bound in the roster (devices[]).
+        # Do not default to users[0] — that forced everyone onto the first-created account.
         u = find_user_by_device(self._workspace_root)
-        if u is not None:
-            return u.id
-        return users[0].id if len(users) == 1 else None
+        return u.id if u is not None else None
 
     def _on_row_clicked(self, user_id: str) -> None:
         self._selected_id = user_id

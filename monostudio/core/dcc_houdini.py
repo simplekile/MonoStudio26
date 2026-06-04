@@ -5,6 +5,7 @@ Houdini DCC adapter for MonoStudio (Windows only).
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -13,8 +14,13 @@ from glob import glob
 from pathlib import Path
 from typing import Any
 
-from monostudio.core.dcc_subprocess_env import env_for_dcc_subprocess
+from monostudio.core.dcc_subprocess_env import env_for_dcc_subprocess, filter_path_for_dcc
 from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
+
+_log = logging.getLogger("monostudio.dcc_debug")
+
+# Empty .hip from hython is typically several KB; smaller likely means a failed save.
+_MIN_HIP_FILE_BYTES = 512
 
 
 def _norm_exe(s: str) -> str:
@@ -112,14 +118,36 @@ def resolve_houdini_executable(configured: str) -> str | None:
     return None
 
 
-def _env_for_houdini_subprocess() -> dict[str, str]:
-    """Backward-compatible alias; see ``env_for_dcc_subprocess``."""
-    return env_for_dcc_subprocess()
+def _houdini_install_roots(houdini_exe: str) -> tuple[Path, Path]:
+    """Return (HFS root, bin dir) for a resolved houdini.exe."""
+    exe = Path(houdini_exe).resolve()
+    return exe.parent.parent, exe.parent
+
+
+def env_for_houdini_subprocess(houdini_exe: str) -> dict[str, str]:
+    """
+    Subprocess env for hython / houdini.exe: strip MonoStudio Python & Qt, set HFS, prioritize Houdini bin on PATH.
+    """
+    hfs, houdini_bin = _houdini_install_roots(houdini_exe)
+    preserve = (str(hfs), str(houdini_bin))
+    env = env_for_dcc_subprocess(preserve_path_roots=preserve)
+    env["HFS"] = str(hfs)
+    path_raw = env.get("PATH", "")
+    env["PATH"] = filter_path_for_dcc(
+        path_raw,
+        preserve_roots=preserve,
+        prepend=(str(houdini_bin),),
+    )
+    return env
+
+
+def _env_for_houdini_subprocess(houdini_exe: str) -> dict[str, str]:
+    return env_for_houdini_subprocess(houdini_exe)
 
 
 def _launch_houdini_gui(exe: str, filepath: str | None = None) -> None:
     """Launch Houdini GUI with a sanitized env (avoids MonoStudio Python DLL conflicts)."""
-    env = _env_for_houdini_subprocess()
+    env = _env_for_houdini_subprocess(exe)
     houdini_bin = str(Path(exe).resolve().parent)
     args = [exe]
     if filepath:
@@ -184,18 +212,20 @@ class HoudiniDccAdapter:
         Path(filepath).parent.mkdir(parents=True, exist_ok=True)
         filepath_norm = filepath.replace("\\", "/")
 
-        # Use hython to create an empty scene file (.hiplc/.hip/.hipnc per path): hou.hipFile.clear(); hou.hipFile.save(path)
+        hip_ready = False
         hython_exe = _hython_executable(exe)
         if hython_exe:
-            env = _env_for_houdini_subprocess()
+            env = _env_for_houdini_subprocess(exe)
             env["MONOSTUDIO_HOUDINI_SAVE_PATH"] = filepath_norm
-            # Run hython with cwd = Houdini bin so DLL search uses Houdini's Python, not MonoStudio's
             hython_cwd = str(Path(hython_exe).resolve().parent)
             script_body = (
-                "import os\n"
+                "import os, sys\n"
                 "import hou\n"
+                "path = os.environ.get('MONOSTUDIO_HOUDINI_SAVE_PATH', '').strip()\n"
+                "if not path:\n"
+                "    sys.exit(2)\n"
                 "hou.hipFile.clear()\n"
-                "hou.hipFile.save(os.environ.get('MONOSTUDIO_HOUDINI_SAVE_PATH', ''))\n"
+                "hou.hipFile.save(path)\n"
             )
             try:
                 with tempfile.NamedTemporaryFile(
@@ -207,7 +237,7 @@ class HoudiniDccAdapter:
                     f.write(script_body)
                     tmp_script = f.name
                 try:
-                    subprocess.run(
+                    proc = subprocess.run(
                         [hython_exe, tmp_script],
                         cwd=hython_cwd,
                         timeout=60,
@@ -216,17 +246,37 @@ class HoudiniDccAdapter:
                         env=env,
                         **hide_console_subprocess_kwargs(),
                     )
+                    if proc.returncode != 0:
+                        err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+                        _log.warning(
+                            "hython create hip failed (code=%s): %s",
+                            proc.returncode,
+                            err[:500] or "(no stderr)",
+                        )
                 finally:
                     try:
                         os.unlink(tmp_script)
                     except OSError:
                         pass
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                pass
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+                _log.warning("hython create hip subprocess error: %s", e)
 
         path_abs = Path(filepath).resolve()
+        if path_abs.is_file() and path_abs.stat().st_size >= _MIN_HIP_FILE_BYTES:
+            hip_ready = True
+        elif path_abs.is_file():
+            _log.warning(
+                "hython did not produce a valid hip (size=%s); launching Houdini without file: %s",
+                path_abs.stat().st_size,
+                path_abs,
+            )
+            try:
+                path_abs.unlink()
+            except OSError:
+                pass
+
         try:
-            if path_abs.is_file():
+            if hip_ready:
                 _launch_houdini_gui(exe, str(path_abs))
             else:
                 _launch_houdini_gui(exe)

@@ -520,13 +520,15 @@ def session_sign_in(
     _session_user_ids[key] = str(user_id).strip()
     if remember:
         set_current_user_id(user_id, workspace_root)
-        if register_device_too and not register_device(workspace_root, user_id):
-            return (
-                "Signed in, but could not update the shared roster on disk "
-                "(file may be locked by Dropbox). Device auto-login may not work until sync allows writes."
-            )
     else:
         set_current_user_id(None, workspace_root)
+    # Device binding follows the last successful sign-in (even without Remember),
+    # so the sign-in picker does not keep highlighting a previous account.
+    if register_device_too and not register_device(workspace_root, user_id):
+        return (
+            "Signed in, but could not update the shared roster on disk "
+            "(file may be locked by Dropbox). This device may still be linked to another account."
+        )
     return None
 
 

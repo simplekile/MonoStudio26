@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QSettings, Signal
 from PySide6.QtGui import QCursor
 
+from monostudio.core.notification_preferences import read_mention_delivery
+from monostudio.core.windows_toast import show_mention_toast
+from monostudio.ui_qt.notification.mention_alert_format import aggregated_mention_popup_message
 from monostudio.ui_qt.activity_log import activity_log
 from monostudio.ui_qt.notification.overlay import NotificationOverlayWidget
 from monostudio.ui_qt.notification.store import (
@@ -24,6 +28,15 @@ from monostudio.ui_qt.notification.banner import ImportantNotificationBanner
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QMainWindow, QWidget
+
+
+def _plain_toast_message(message: str) -> str:
+    """Strip simple HTML tags for Windows toast body."""
+    text = (message or "").strip()
+    if not text:
+        return "New mention"
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip() or "New mention"
 
 
 class _NotificationService(QObject):
@@ -39,6 +52,7 @@ class _NotificationService(QObject):
     _overlay: NotificationOverlayWidget | None = None
     _important_banner: ImportantNotificationBanner | None = None
     _important_anchor_widget: "QWidget | None" = None
+    _mention_popup_shown: set[str] = set()
 
     def __init__(self) -> None:
         super().__init__()
@@ -117,6 +131,9 @@ class _NotificationService(QObject):
         if category == "general":
             log_level = "error" if level == "error" else "warning" if level == "warning" else "success" if level == "success" else "info"
             activity_log.append(message, level=log_level)
+            # Routine ops (info/success) → footer only; avoid a toast on every action.
+            if level in ("info", "success"):
+                return
         overlay = cls._get_overlay()
         if overlay is None:
             return
@@ -140,20 +157,103 @@ class _NotificationService(QObject):
         cls._notify("error", message, category=category)
 
     @classmethod
+    def reset_mention_popup_session(cls) -> None:
+        """Allow @mention popups again for unread items (e.g. after switch user)."""
+        cls._mention_popup_shown.clear()
+
+    @classmethod
+    def _show_mention_popup_message(
+        cls,
+        message: str,
+        *,
+        toast_type: ToastType = "info",
+    ) -> bool:
+        use_windows = read_mention_delivery(QSettings("MonoStudio26", "MonoStudio26")) == "windows"
+        if use_windows:
+            plain = _plain_toast_message(message)
+            if show_mention_toast("MONOS", plain):
+                return True
+            logging.getLogger("monostudio.windows_toast").warning(
+                "Windows mention toast failed; using in-app fallback",
+            )
+        overlay = cls._get_overlay()
+        if overlay is not None:
+            overlay.show_toast(toast_type, message, category="general")
+            overlay.raise_()
+            return True
+        return False
+
+    @classmethod
+    def deliver_mention_popup_batch(
+        cls,
+        items: list[tuple[str, str]],
+        *,
+        toast_type: ToastType = "info",
+    ) -> None:
+        """
+        One popup for a batch of unread mentions.
+        items: (mention_inbox_id, from_name) pairs not yet shown this session.
+        """
+        pending = [
+            ((mid or "").strip(), (name or "").strip() or "Someone")
+            for mid, name in items
+            if (mid or "").strip() and (mid or "").strip() not in cls._mention_popup_shown
+        ]
+        if not pending:
+            return
+
+        if len(pending) == 1:
+            _mid, name = pending[0]
+            body = f"{name} mentioned you"
+        else:
+            body = aggregated_mention_popup_message([name for _, name in pending])
+
+        if cls._show_mention_popup_message(body, toast_type=toast_type):
+            for mid, _ in pending:
+                cls._mention_popup_shown.add(mid)
+
+    @classmethod
+    def deliver_mention_popup(
+        cls,
+        message: str,
+        *,
+        mention_inbox_id: str = "",
+        toast_type: ToastType = "info",
+    ) -> None:
+        """Show @mention popup for a single inbox id (delegates to batch API)."""
+        mid = (mention_inbox_id or "").strip()
+        if not mid:
+            cls._show_mention_popup_message(message, toast_type=toast_type)
+            return
+        name = "Someone"
+        if " mentioned you in " in message:
+            name = message.split(" mentioned you in ", 1)[0].strip() or name
+        cls.deliver_mention_popup_batch([(mid, name)], toast_type=toast_type)
+
+    @classmethod
     def user_alert(
         cls,
         message: str,
         *,
         payload: UserAlertPayload | None = None,
         toast_type: ToastType = "info",
+        read: bool = False,
+        show_popup: bool = True,
     ) -> None:
         """User-targeted alert (e.g. @mention) — stored in bell history, not activity log."""
-        append_user_alert(toast_type, message, payload=payload)
+        append_user_alert(toast_type, message, payload=payload, read=read)
         cls._emit_unread()
-        overlay = cls._get_overlay()
-        if overlay is not None:
-            overlay.show_toast(toast_type, message, category="general")
-            overlay.raise_()
+        if read or not show_popup:
+            return
+        mid = ""
+        name = "Someone"
+        if payload is not None:
+            mid = (payload.mention_inbox_id or "").strip()
+            name = (payload.from_name or "").strip() or name
+        if mid:
+            cls.deliver_mention_popup_batch([(mid, name)], toast_type=toast_type)
+        else:
+            cls.deliver_mention_popup(message, mention_inbox_id=mid, toast_type=toast_type)
 
     @classmethod
     def important(cls, message: str, *, category: str = "general") -> None:

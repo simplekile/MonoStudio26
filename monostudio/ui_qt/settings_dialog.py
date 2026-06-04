@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -81,6 +82,17 @@ from monostudio.ui_qt.inspector_preview_settings import (
     write_sequence_preview_fps,
 )
 from monostudio.ui_qt.pipeline_structure_editor import PipelineStructureEditorWidget
+from monostudio.ui_qt.settings_section_widgets import (
+    SettingsSegmentedControl,
+    add_settings_field_row,
+    add_settings_helper,
+    add_settings_section,
+    add_settings_subsection_title,
+    settings_divider,
+    style_settings_combo,
+    style_settings_line_edit,
+    style_settings_spin,
+)
 from monostudio.core.update_checker import (
     CheckResult,
     ExtraRepoRelease,
@@ -368,15 +380,10 @@ class SettingsDialog(MonosDialog):
         self._create_default_form_layout: QFormLayout | None = None
         self._use_dcc_folders_cb: QCheckBox | None = None
         self._notification_max_visible_combo: QComboBox | None = None
+        self._mention_delivery_combo: QComboBox | None = None
         self._publish_ignore_ext_field: QLineEdit | None = None
-        self._inspector_thumb_source_group_asset: QButtonGroup | None = None
-        self._inspector_thumb_source_group_shot: QButtonGroup | None = None
-        self._inspector_thumb_radio_asset_user: QRadioButton | None = None
-        self._inspector_thumb_radio_asset_render: QRadioButton | None = None
-        self._inspector_thumb_radio_asset_both: QRadioButton | None = None
-        self._inspector_thumb_radio_shot_user: QRadioButton | None = None
-        self._inspector_thumb_radio_shot_render: QRadioButton | None = None
-        self._inspector_thumb_radio_shot_both: QRadioButton | None = None
+        self._inspector_thumb_segment_asset: SettingsSegmentedControl | None = None
+        self._inspector_thumb_segment_shot: SettingsSegmentedControl | None = None
         self._inspector_sequence_fps_spin: QSpinBox | None = None
         self._inspector_thumb_open_exe_field: QLineEdit | None = None
 
@@ -608,16 +615,27 @@ class SettingsDialog(MonosDialog):
 
     def _build_ui_tab(self) -> QWidget:
         """General → UI: notifications and other UI options."""
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsPageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        grp = QGroupBox("Notifications", root)
-        grp_layout = QVBoxLayout(grp)
-        form = QFormLayout()
-        self._notification_max_visible_combo = QComboBox(grp)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(4, 4, 4, 16)
+        layout.setSpacing(16)
+
+        noti_card, noti_l = add_settings_section(
+            inner,
+            "Notifications",
+            "@mention popups only — bell history always stays in the app. "
+            "Use Send test when Windows notification is selected.",
+        )
+
+        self._notification_max_visible_combo = QComboBox(noti_card)
         self._notification_max_visible_combo.addItems(["1", "2", "3"])
+        style_settings_combo(self._notification_max_visible_combo, width=88)
         try:
             cur = 1
             if self._settings is not None:
@@ -626,127 +644,211 @@ class SettingsDialog(MonosDialog):
         except Exception:
             cur = 1
         self._notification_max_visible_combo.setCurrentIndex(cur - 1)
-        form.addRow("Max visible toasts:", self._notification_max_visible_combo)
-        hint = QLabel("Sidebar toasts (page, department, type) appear bottom-left; others bottom-right.", grp)
-        hint.setWordWrap(True)
-        hint.setObjectName("DialogHelper")
-        grp_layout.addLayout(form)
-        grp_layout.addWidget(hint)
-        layout.addWidget(grp)
+        add_settings_field_row(noti_l, "Max visible toasts", self._notification_max_visible_combo)
 
-        grp_insp = QGroupBox("Inspector preview", root)
-        insp_l = QVBoxLayout(grp_insp)
+        from monostudio.core.notification_preferences import read_mention_delivery
+
+        self._mention_delivery_combo = QComboBox(noti_card)
+        style_settings_combo(self._mention_delivery_combo, width=248)
+        self._mention_delivery_combo.addItem("In-app toast (MONOS)", "builtin")
+        win_idx = self._mention_delivery_combo.count()
+        self._mention_delivery_combo.addItem("Windows notification", "windows")
+        delivery = read_mention_delivery(self._settings)
+        self._mention_delivery_combo.setCurrentIndex(
+            win_idx if delivery == "windows" else 0
+        )
+        if sys.platform != "win32":
+            self._mention_delivery_combo.setCurrentIndex(0)
+            self._mention_delivery_combo.setEnabled(False)
+        add_settings_field_row(noti_l, "@mention popup", self._mention_delivery_combo)
+        self._mention_delivery_combo.currentIndexChanged.connect(
+            self._refresh_windows_noti_status
+        )
+
+        self._windows_noti_status = QLabel("", noti_card)
+        self._windows_noti_status.setWordWrap(True)
+        self._windows_noti_status.setObjectName("DialogHelper")
+        noti_l.addWidget(self._windows_noti_status)
+
+        test_row = QWidget(noti_card)
+        test_row_l = QHBoxLayout(test_row)
+        test_row_l.setContentsMargins(0, 4, 0, 0)
+        self._test_windows_noti_btn = QPushButton("Send test notification", test_row)
+        self._test_windows_noti_btn.setObjectName("SettingsInlineActionButton")
+        self._test_windows_noti_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._test_windows_noti_btn.clicked.connect(self._on_test_windows_notification)
+        if sys.platform != "win32":
+            self._test_windows_noti_btn.setEnabled(False)
+        test_row_l.addWidget(self._test_windows_noti_btn, 0)
+        test_row_l.addStretch(1)
+        noti_l.addWidget(test_row)
+        self._refresh_windows_noti_status()
+        layout.addWidget(noti_card)
+
+        insp_card, insp_l = add_settings_section(
+            inner,
+            "Inspector preview",
+            "Thumbnail source for grid, list, and Inspector. Assets and Shots can use different modes.",
+        )
+
         _tip_u = (
-            "Only user thumbnails (pasted or .user.* files).\nWork render/preview sequences are ignored."
+            "Only user thumbnails (pasted or .user.* files).\n"
+            "Work render/preview sequences are ignored."
         )
         _tip_r = (
             "Image sequence under the active work file folder:\n"
             "work/render → preview → playblast → flipbook, then <work name>/."
         )
         _tip_s = "Prefer the Render sequence when it exists;\notherwise use the User thumbnail."
+        _seg_opts = [
+            ("User", _tip_u, "user"),
+            ("Render", _tip_r, "render"),
+            ("Smart", _tip_s, "smart"),
+        ]
 
-        insp_l.addWidget(QLabel("Thumbnail source — Assets", grp_insp))
-        self._inspector_thumb_source_group_asset = QButtonGroup(grp_insp)
-        r_au = QRadioButton("User", grp_insp)
-        r_au.setToolTip(_tip_u)
-        r_ar = QRadioButton("Render", grp_insp)
-        r_ar.setToolTip(_tip_r)
-        r_ab = QRadioButton("Smart", grp_insp)
-        r_ab.setToolTip(_tip_s)
-        self._inspector_thumb_radio_asset_user = r_au
-        self._inspector_thumb_radio_asset_render = r_ar
-        self._inspector_thumb_radio_asset_both = r_ab
-        self._inspector_thumb_source_group_asset.addButton(r_au)
-        self._inspector_thumb_source_group_asset.addButton(r_ar)
-        self._inspector_thumb_source_group_asset.addButton(r_ab)
+        add_settings_subsection_title(insp_l, "Thumbnail source — Assets")
+        self._inspector_thumb_segment_asset = SettingsSegmentedControl(_seg_opts, insp_card)
         try:
             ma = read_inspector_thumbnail_source(self._settings, entity="asset")
             if ma == THUMB_SOURCE_USER:
-                r_au.setChecked(True)
+                self._inspector_thumb_segment_asset.set_value("user")
             elif ma == THUMB_SOURCE_RENDER_SEQUENCE:
-                r_ar.setChecked(True)
+                self._inspector_thumb_segment_asset.set_value("render")
             else:
-                r_ab.setChecked(True)
+                self._inspector_thumb_segment_asset.set_value("smart")
         except Exception:
-            r_ab.setChecked(True)
-        insp_l.addWidget(r_au)
-        insp_l.addWidget(r_ar)
-        insp_l.addWidget(r_ab)
+            self._inspector_thumb_segment_asset.set_value("smart")
+        insp_l.addWidget(self._inspector_thumb_segment_asset)
 
-        insp_l.addWidget(QLabel("Thumbnail source — Shots", grp_insp))
-        self._inspector_thumb_source_group_shot = QButtonGroup(grp_insp)
-        r_su = QRadioButton("User", grp_insp)
-        r_su.setToolTip(_tip_u)
-        r_sr = QRadioButton("Render", grp_insp)
-        r_sr.setToolTip(_tip_r)
-        r_sb = QRadioButton("Smart", grp_insp)
-        r_sb.setToolTip(_tip_s)
-        self._inspector_thumb_radio_shot_user = r_su
-        self._inspector_thumb_radio_shot_render = r_sr
-        self._inspector_thumb_radio_shot_both = r_sb
-        self._inspector_thumb_source_group_shot.addButton(r_su)
-        self._inspector_thumb_source_group_shot.addButton(r_sr)
-        self._inspector_thumb_source_group_shot.addButton(r_sb)
+        add_settings_subsection_title(insp_l, "Thumbnail source — Shots")
+        self._inspector_thumb_segment_shot = SettingsSegmentedControl(_seg_opts, insp_card)
         try:
             ms = read_inspector_thumbnail_source(self._settings, entity="shot")
             if ms == THUMB_SOURCE_USER:
-                r_su.setChecked(True)
+                self._inspector_thumb_segment_shot.set_value("user")
             elif ms == THUMB_SOURCE_RENDER_SEQUENCE:
-                r_sr.setChecked(True)
+                self._inspector_thumb_segment_shot.set_value("render")
             else:
-                r_sb.setChecked(True)
+                self._inspector_thumb_segment_shot.set_value("smart")
         except Exception:
-            r_sb.setChecked(True)
-        insp_l.addWidget(r_su)
-        insp_l.addWidget(r_sr)
-        insp_l.addWidget(r_sb)
+            self._inspector_thumb_segment_shot.set_value("smart")
+        insp_l.addWidget(self._inspector_thumb_segment_shot)
 
-        hint_insp = QLabel(
-            "Grid, list, and Inspector. Assets and Shots can use different modes. "
-            "Render uses work/render → preview → playblast → flipbook/<work name>/.",
-            grp_insp,
+        add_settings_helper(
+            insp_l,
+            "Render path: work/render → preview → playblast → flipbook/<work name>/.",
         )
-        hint_insp.setWordWrap(True)
-        hint_insp.setObjectName("DialogHelper")
-        insp_l.addWidget(hint_insp)
-        fps_form = QFormLayout()
-        self._inspector_sequence_fps_spin = QSpinBox(grp_insp)
+
+        insp_l.addWidget(settings_divider(insp_card))
+
+        self._inspector_sequence_fps_spin = QSpinBox(insp_card)
         self._inspector_sequence_fps_spin.setRange(1, 60)
+        style_settings_spin(self._inspector_sequence_fps_spin, width=72)
         try:
             self._inspector_sequence_fps_spin.setValue(read_sequence_preview_fps(self._settings))
         except Exception:
             self._inspector_sequence_fps_spin.setValue(30)
-        fps_form.addRow("Sequence playback FPS:", self._inspector_sequence_fps_spin)
-        insp_l.addLayout(fps_form)
-        insp_l.addWidget(QLabel("Default app for thumbnail file:", grp_insp))
-        thumb_app_row = QHBoxLayout()
-        self._inspector_thumb_open_exe_field = QLineEdit(grp_insp)
-        self._inspector_thumb_open_exe_field.setPlaceholderText("Use default app for file type (Windows “Open with”)")
+        add_settings_field_row(insp_l, "Sequence playback FPS", self._inspector_sequence_fps_spin)
+
+        add_settings_subsection_title(insp_l, "Open thumbnail with")
+        thumb_app_row = QWidget(insp_card)
+        thumb_app_row_l = QHBoxLayout(thumb_app_row)
+        thumb_app_row_l.setContentsMargins(0, 0, 0, 0)
+        thumb_app_row_l.setSpacing(8)
+        self._inspector_thumb_open_exe_field = QLineEdit(thumb_app_row)
+        style_settings_line_edit(self._inspector_thumb_open_exe_field, min_width=200)
+        self._inspector_thumb_open_exe_field.setPlaceholderText(
+            "System default for file type (Windows “Open with”)"
+        )
         try:
             self._inspector_thumb_open_exe_field.setText(read_inspector_thumbnail_open_exe(self._settings))
         except Exception:
             self._inspector_thumb_open_exe_field.setText("")
-        btn_thumb_browse = QPushButton("Browse…", grp_insp)
+        btn_thumb_browse = QPushButton("Browse…", thumb_app_row)
+        btn_thumb_browse.setObjectName("SettingsCategoryActionButton")
         btn_thumb_browse.clicked.connect(self._browse_inspector_thumbnail_open_exe)
-        btn_thumb_clear = QPushButton("Clear", grp_insp)
+        btn_thumb_clear = QPushButton("Clear", thumb_app_row)
+        btn_thumb_clear.setObjectName("SettingsCategoryActionButton")
         btn_thumb_clear.clicked.connect(lambda: self._inspector_thumb_open_exe_field.setText(""))
-        thumb_app_row.addWidget(self._inspector_thumb_open_exe_field, 1)
-        thumb_app_row.addWidget(btn_thumb_browse, 0)
-        thumb_app_row.addWidget(btn_thumb_clear, 0)
-        insp_l.addLayout(thumb_app_row)
-        hint_thumb_app = QLabel(
-            "Double-click the Inspector thumbnail (or context menu → Open thumbnail file) launches this executable "
-            "with the image path. Sequence play/pause appears at the center when you hover the preview (like other overlay buttons). "
-            "Leave empty to use the system default.",
-            grp_insp,
+        thumb_app_row_l.addWidget(self._inspector_thumb_open_exe_field, 1)
+        thumb_app_row_l.addWidget(btn_thumb_browse, 0)
+        thumb_app_row_l.addWidget(btn_thumb_clear, 0)
+        insp_l.addWidget(thumb_app_row)
+        add_settings_helper(
+            insp_l,
+            "Double-click the Inspector thumbnail (or Open thumbnail file) runs this app with the image path. "
+            "Hover the preview for sequence play/pause.",
         )
-        hint_thumb_app.setWordWrap(True)
-        hint_thumb_app.setObjectName("DialogHelper")
-        insp_l.addWidget(hint_thumb_app)
-        layout.addWidget(grp_insp)
-
+        layout.addWidget(insp_card)
         layout.addStretch(1)
-        return root
+
+        scroll.setWidget(inner)
+        return scroll
+
+    def _write_inspector_thumb_segment(
+        self,
+        segment: SettingsSegmentedControl | None,
+        entity: str,
+    ) -> None:
+        if self._settings is None or segment is None:
+            return
+        mode = segment.value()
+        if mode == "user":
+            write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER, entity=entity)
+        elif mode == "render":
+            write_inspector_thumbnail_source(
+                self._settings, THUMB_SOURCE_RENDER_SEQUENCE, entity=entity
+            )
+        else:
+            write_inspector_thumbnail_source(
+                self._settings, THUMB_SOURCE_USER_THEN_RENDER, entity=entity
+            )
+
+    def _refresh_windows_noti_status(self) -> None:
+        label = getattr(self, "_windows_noti_status", None)
+        btn = getattr(self, "_test_windows_noti_btn", None)
+        if label is None:
+            return
+        if sys.platform != "win32":
+            label.setText("Windows notifications are only available on Windows.")
+            if btn is not None:
+                btn.setEnabled(False)
+            return
+        combo = getattr(self, "_mention_delivery_combo", None)
+        if combo is not None and combo.currentIndex() != 1:
+            label.setText("Select “Windows notification” to enable Action Center @mention popups.")
+            if btn is not None:
+                btn.setEnabled(False)
+            return
+        if btn is not None:
+            btn.setEnabled(True)
+        from monostudio.core.windows_toast import toast_readiness
+
+        _ready, msg = toast_readiness()
+        label.setText(msg)
+
+    def _on_test_windows_notification(self) -> None:
+        from monostudio.core.windows_toast import show_mention_toast, toast_readiness
+
+        ready, msg = toast_readiness()
+        if not ready:
+            QMessageBox.warning(self, "Windows notification", msg)
+            self._refresh_windows_noti_status()
+            return
+        if show_mention_toast("MONOS", "Test notification from MONOS."):
+            QMessageBox.information(
+                self,
+                "Windows notification",
+                "Test sent. Check the Windows Action Center (bell icon on the taskbar). "
+                "If nothing appears, open Settings → System → Notifications and allow MONOS.",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Windows notification",
+                "Could not send the test toast. @mentions will fall back to in-app MONOS toasts.",
+            )
+        self._refresh_windows_noti_status()
 
     def _browse_inspector_thumbnail_open_exe(self) -> None:
         start = ""
@@ -2543,39 +2645,23 @@ class SettingsDialog(MonosDialog):
             if self._settings is not None and self._notification_max_visible_combo is not None:
                 idx = self._notification_max_visible_combo.currentIndex()
                 self._settings.setValue("notification/max_visible", idx + 1)
+            if self._settings is not None and self._mention_delivery_combo is not None:
+                from monostudio.core.notification_preferences import write_mention_delivery
+
+                idx = self._mention_delivery_combo.currentIndex()
+                mode = "windows" if idx == 1 else "builtin"
+                data = self._mention_delivery_combo.currentData()
+                if data in ("builtin", "windows"):
+                    mode = data
+                write_mention_delivery(self._settings, mode)
         except Exception:
             pass
 
         # Inspector preview: thumbnail source (asset vs shot) + sequence playback FPS.
         try:
-            if self._settings is not None and self._inspector_thumb_radio_asset_user is not None:
-                if self._inspector_thumb_radio_asset_user.isChecked():
-                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER, entity="asset")
-                elif (
-                    self._inspector_thumb_radio_asset_render is not None
-                    and self._inspector_thumb_radio_asset_render.isChecked()
-                ):
-                    write_inspector_thumbnail_source(
-                        self._settings, THUMB_SOURCE_RENDER_SEQUENCE, entity="asset"
-                    )
-                else:
-                    write_inspector_thumbnail_source(
-                        self._settings, THUMB_SOURCE_USER_THEN_RENDER, entity="asset"
-                    )
-            if self._settings is not None and self._inspector_thumb_radio_shot_user is not None:
-                if self._inspector_thumb_radio_shot_user.isChecked():
-                    write_inspector_thumbnail_source(self._settings, THUMB_SOURCE_USER, entity="shot")
-                elif (
-                    self._inspector_thumb_radio_shot_render is not None
-                    and self._inspector_thumb_radio_shot_render.isChecked()
-                ):
-                    write_inspector_thumbnail_source(
-                        self._settings, THUMB_SOURCE_RENDER_SEQUENCE, entity="shot"
-                    )
-                else:
-                    write_inspector_thumbnail_source(
-                        self._settings, THUMB_SOURCE_USER_THEN_RENDER, entity="shot"
-                    )
+            if self._settings is not None:
+                self._write_inspector_thumb_segment(self._inspector_thumb_segment_asset, "asset")
+                self._write_inspector_thumb_segment(self._inspector_thumb_segment_shot, "shot")
             if self._settings is not None and self._inspector_sequence_fps_spin is not None:
                 write_sequence_preview_fps(self._settings, self._inspector_sequence_fps_spin.value())
             if self._settings is not None and self._inspector_thumb_open_exe_field is not None:

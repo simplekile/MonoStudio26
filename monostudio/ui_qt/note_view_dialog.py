@@ -60,12 +60,24 @@ class NoteViewDialog(MonosDialog):
         time_meta = _format_local_time(entry.at)
         if entry.done:
             time_meta = f"{time_meta} · Completed"
+        uid = (entry.author_id or "").strip()
+        on_author = None
+        if uid:
+
+            def _open_profile(u: str = uid) -> None:
+                from monostudio.ui_qt.user_profile_view_dialog import open_studio_user_profile
+
+                open_studio_user_profile(workspace_root, u, parent=self)
+
+            on_author = _open_profile
+
         root.addWidget(
             NoteAuthorRow.for_entry(
                 entry,
                 workspace_root,
                 avatar_size=36,
                 time_text=time_meta,
+                on_author_click=on_author,
                 parent=self,
             )
         )

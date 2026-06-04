@@ -1,20 +1,19 @@
-# MonoStudio 26 — Release v26.14.1
+# MonoStudio 26 — Release v26.14.2
 
 ## Highlights
 
-- **Schedule history**: Lịch sử chỉnh sửa schedule (ai, khi nào, tóm tắt thay đổi); dialog xem lịch sử, mở profile tác giả từ roster.
-- **Milestone dialog**: Thiết kế lại — tab Production range + Milestones, thêm/sửa milestone trong form, đồng bộ timeline.
-- **Calendar date picker**: UI/UX lịch chọn ngày thống nhất (Schedule, Inbox drop, dialogs).
-- **Notes & profiles**: Hàng author (avatar + tên roster); link mở profile studio từ note; cải thiện image viewer và mention popup.
-- **Dashboard & timeline**: Cập nhật stats/tiles; tinh chỉnh timeline và điều hướng Schedule.
+- **Sign-in / identity fix**: Gắn device mỗi lần Sign in (không phụ thuộc “Stay signed in”); bỏ auto-chọn user đầu tiên trong roster khi chỉ có 1 account — tránh luôn vào tài khoản tạo đầu.
+- **Mention notifications**: Windows toast (@mention), tùy chọn delivery trong Settings; dropdown/list notification UI mới.
+- **Notes**: Đánh dấu done, lịch sử chỉnh sửa, context menu; author row/avatar cải thiện.
+- **Houdini DCC**: Cải thiện subprocess env / launch trên Windows.
 
 ## Changes in this release
 
-- feat: `schedule_history.py`, `schedule_history_dialog.py` — ghi/đọc `schedule_history.json` khi lưu schedule.
-- feat: `schedule_milestone_dialog.py` — UI mới range + danh sách milestone.
-- feat: `note_author_row.py`, `user_profile_view_dialog.py` — author row và xem profile từ note/history.
-- feat: `item_comments.py` — `NoteAuthorVisual` / avatar từ roster.
-- fix/style: `calendar_date_picker.py`, `style.py`, schedule dialogs, `dashboard_page_widget`, `schedule_timeline_widget`, `main_window`.
+- fix: `user_identity.py`, `user_identity_dialog.py` — device binding + pre-select.
+- feat: `windows_toast.py`, `windows_toast_bridge.py`, `notification_preferences.py` — toast mention + focus app.
+- feat: `note_done_toggle.py`, `note_edit_history_dialog.py`, `note_context_menu.py`; `item_comments.py` done/edit_history.
+- feat: notification row widgets, `mention_alert_format.py`; `settings_section_widgets.py`, Settings notifications section.
+- fix: `dcc_houdini.py`, `dcc_subprocess_env.py`; `requirements.txt` — `windows-toasts`.
 
 ## Install
 

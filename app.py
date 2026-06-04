@@ -17,6 +17,7 @@ from monostudio.core.access_control import (
     restore_remembered_access,
 )
 from monostudio.core.app_paths import get_app_base_path, write_install_path_for_tools
+from monostudio.core.windows_toast import register_aumid_on_startup
 from monostudio.core.crash_recovery import install_crash_logging
 from monostudio.core.pipeline_types_and_presets import ensure_user_default_config_dir
 from monostudio.ui_qt.main_window import MainWindow
@@ -158,6 +159,7 @@ def main() -> int:
     # These application attributes are deprecated and emit warnings in Qt6.
 
     app = QApplication(sys.argv)
+    register_aumid_on_startup()
     restore_remembered_access()
 
     _boot_settings = QSettings("MonoStudio26", "MonoStudio26")

@@ -1,11 +1,13 @@
 """
-Dropdown popup for topbar notification button: shows 5 most recent user alerts + "Show all".
+Dropdown popup for topbar notification button: shows up to 10 recent user alerts + "Show all".
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QMouseEvent
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -16,23 +18,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.ui_qt.notification.store import NotificationEntry, recent
-from monostudio.ui_qt.notification.toast import TOAST_COLORS, TOAST_ICONS
-from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.notification.notification_row_widget import NotificationAlertRow
+from monostudio.ui_qt.notification.store import recent
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 
-RECENT_COUNT = 5
-
-
-def _format_time(dt) -> str:
-    try:
-        return dt.strftime("%H:%M") if hasattr(dt, "strftime") else str(dt)
-    except Exception:
-        return "—"
+RECENT_COUNT = 10
+_ROW_MIN_HEIGHT = 76
+_FOOTER_HEIGHT = 48
+_DROPDOWN_CHROME_V = 16
+_VIEWPORT_MAX_HEIGHT = RECENT_COUNT * _ROW_MIN_HEIGHT
 
 
 class NotificationDropdown(QFrame):
-    """Popup showing 5 recent user notifications and a 'Show all' button."""
+    """Popup showing up to 10 recent user notifications and a 'Show all' button."""
 
     show_all_requested = Signal()
     user_alert_clicked = Signal(object)  # NotificationEntry
@@ -53,12 +51,13 @@ class NotificationDropdown(QFrame):
             """
         )
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(0)
 
         self._scroll = QScrollArea(self)
         self._scroll.setObjectName("NotificationDropdownScroll")
-        self._scroll.setWidgetResizable(True)
+        # False: do not squash all rows into the viewport height (caused footer overlap).
+        self._scroll.setWidgetResizable(False)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -69,26 +68,51 @@ class NotificationDropdown(QFrame):
         self._content = QWidget(self._scroll)
         self._content.setStyleSheet("background: transparent;")
         self._content_layout = QVBoxLayout(self._content)
-        self._content_layout.setContentsMargins(8, 4, 8, 4)
-        self._content_layout.setSpacing(0)
+        self._content_layout.setContentsMargins(6, 4, 6, 8)
+        self._content_layout.setSpacing(2)
         self._scroll.setWidget(self._content)
-        layout.addWidget(self._scroll, 1)
+        layout.addWidget(self._scroll, 0)
 
-        show_all_btn = QPushButton("Show all", self)
+        footer = QFrame(self)
+        footer.setObjectName("NotificationDropdownFooter")
+        footer.setFixedHeight(_FOOTER_HEIGHT)
+        footer.setStyleSheet(
+            """
+            QFrame#NotificationDropdownFooter {
+                background-color: #1c1c1f;
+                border: none;
+                border-top: 1px solid #3f3f46;
+                border-bottom-left-radius: 12px;
+                border-bottom-right-radius: 12px;
+            }
+            """
+        )
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        show_all_btn = QPushButton("Show all", footer)
         show_all_btn.setObjectName("NotificationDropdownShowAll")
         show_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        show_all_btn.setFont(monos_font(point_size=12, weight=QFont.Weight.Medium))
+        show_all_btn.setFont(monos_font("Inter", 12, QFont.Weight.Medium))
         show_all_btn.setStyleSheet(
-            "QPushButton { background: transparent; color: #60a5fa; border: none; padding: 10px 16px; }"
+            "QPushButton { background: transparent; color: #60a5fa; border: none; padding: 12px 16px; }"
             "QPushButton:hover { background: rgba(96, 165, 250, 0.12); color: #93c5fd; }"
         )
         show_all_btn.clicked.connect(self._on_show_all)
-        layout.addWidget(show_all_btn, 0)
+        footer_layout.addWidget(show_all_btn)
+        layout.addWidget(footer, 0)
 
-        self.setFixedWidth(320)
-        self.setMinimumHeight(120)
-        self.setMaximumHeight(320)
+        self.setFixedWidth(380)
+        self._workspace_root: Path | None = None
+        self._project_root: Path | None = None
         self._fill()
+
+    def set_context(
+        self,
+        workspace_root: Path | None,
+        project_root: Path | None,
+    ) -> None:
+        self._workspace_root = workspace_root
+        self._project_root = project_root
 
     def _fill(self) -> None:
         while self._content_layout.count():
@@ -98,15 +122,40 @@ class NotificationDropdown(QFrame):
         entries = recent(RECENT_COUNT)
         if not entries:
             empty = QLabel("No notifications", self._content)
-            empty.setFont(monos_font(point_size=13, weight=QFont.Weight.Medium))
-            empty.setStyleSheet(f"color: {MONOS_COLORS['text_meta']}; background: transparent; padding: 12px;")
+            empty.setFont(monos_font("Inter", 13, QFont.Weight.Medium))
+            empty.setStyleSheet(
+                f"color: {MONOS_COLORS['text_meta']}; background: transparent; padding: 12px;"
+            )
             self._content_layout.addWidget(empty)
+            self._adjust_popup_size(0)
         else:
             for entry in entries:
-                row = _DropdownRow(entry, self._content)
+                row = NotificationAlertRow(
+                    entry,
+                    self._content,
+                    workspace_root=self._workspace_root,
+                    project_root=self._project_root,
+                )
+                row.setMinimumHeight(_ROW_MIN_HEIGHT)
                 row.clicked.connect(self.user_alert_clicked.emit)
                 self._content_layout.addWidget(row)
-        self._content_layout.addStretch(1)
+            self._adjust_popup_size(len(entries))
+
+    def _adjust_popup_size(self, entry_count: int) -> None:
+        """Viewport scrolls when content exceeds max; footer stays below the list."""
+        inner_w = max(360, self.width() - 12)
+        if entry_count <= 0:
+            content_h = 72
+        else:
+            self._content.adjustSize()
+            hint = self._content_layout.sizeHint()
+            content_h = max(hint.height(), entry_count * _ROW_MIN_HEIGHT)
+        self._content.setFixedWidth(inner_w)
+        self._content.setFixedHeight(content_h)
+        viewport_h = min(content_h, _VIEWPORT_MAX_HEIGHT)
+        self._scroll.setFixedHeight(viewport_h)
+        total_h = viewport_h + _FOOTER_HEIGHT + _DROPDOWN_CHROME_V
+        self.setFixedHeight(total_h)
 
     def _on_show_all(self) -> None:
         self.close()
@@ -119,48 +168,3 @@ class NotificationDropdown(QFrame):
     def showEvent(self, event) -> None:
         self._fill()
         super().showEvent(event)
-
-
-class _DropdownRow(QFrame):
-    """One notification row in the dropdown."""
-
-    clicked = Signal(object)
-
-    def __init__(self, entry: NotificationEntry, parent=None) -> None:
-        super().__init__(parent)
-        self._entry = entry
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet(
-            "QFrame { background: transparent; border: none; border-radius: 6px; }"
-            "QFrame:hover { background: rgba(255, 255, 255, 0.04); }"
-        )
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(10)
-        t = entry.toast_type
-        pair = TOAST_COLORS.get(t, (MONOS_COLORS["blue_600"], MONOS_COLORS["text_label"]))
-        accent_hex = pair[0]
-        icon_name = TOAST_ICONS.get(t, "message-circle")
-        icon = lucide_icon(icon_name, size=16, color_hex=accent_hex)
-        if not icon.isNull():
-            icon_label = QLabel(self)
-            icon_label.setPixmap(icon.pixmap(16, 16))
-            icon_label.setScaledContents(False)
-            layout.addWidget(icon_label, 0)
-        msg_label = QLabel(entry.message, self)
-        msg_label.setFont(monos_font(point_size=13, weight=QFont.Weight.Medium))
-        msg_label.setStyleSheet(f"color: {MONOS_COLORS['text_primary']}; background: transparent; border: none;")
-        msg_label.setWordWrap(True)
-        msg_label.setMaximumWidth(220)
-        layout.addWidget(msg_label, 1)
-        time_label = QLabel(_format_time(entry.at), self)
-        time_label.setFont(monos_font(point_size=11, weight=QFont.Weight.Normal))
-        time_label.setStyleSheet(f"color: {MONOS_COLORS['text_meta']}; background: transparent; border: none;")
-        layout.addWidget(time_label, 0)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self._entry)
-            event.accept()
-            return
-        super().mousePressEvent(event)

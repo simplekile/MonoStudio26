@@ -215,6 +215,20 @@ class NoteComposeEditor(QTextEdit):
         self._entry_id = uuid.uuid4().hex[:16]
         self._media_dir = note_media_entry_dir(self._item_root, self._entry_id)
 
+    def load_entry_for_edit(self, entry_id: str, *, body_html: str, plain_fallback: str = "") -> None:
+        """Reuse an existing note id (and media folder) when editing."""
+        eid = (entry_id or "").strip()
+        if not eid:
+            return
+        self._entry_id = eid
+        self._media_dir = note_media_entry_dir(self._item_root, self._entry_id)
+        self.clear()
+        html = (body_html or "").strip()
+        if not html and plain_fallback:
+            html = f"<p>{plain_fallback.replace(chr(10), '<br>')}</p>"
+        if html:
+            self.setHtml(note_html_for_display(html))
+
     @property
     def draft_entry_id(self) -> str:
         return self._entry_id

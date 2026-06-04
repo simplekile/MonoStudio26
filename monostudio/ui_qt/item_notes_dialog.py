@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QSize, QTimer
-from PySide6.QtGui import QCloseEvent, QFont
+from PySide6.QtGui import QCloseEvent, QFont, QGuiApplication
 from PySide6.QtWidgets import (
-    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -20,13 +20,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.access_control import is_admin_capable
+
 from monostudio.core.item_comments import (
     ItemCommentEntry,
+    NoteEditRevision,
     delete_note_media,
     entry_preview_text,
     new_comment_entry,
     normalize_note_department_id,
     read_item_comments_for_department,
+    strip_html_preview,
     write_item_comments_for_department,
 )
 from monostudio.core.mention_inbox import append_mentions
@@ -35,6 +39,9 @@ from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.note_author_row import NoteAuthorRow
 from monostudio.ui_qt.note_body_browser import NoteListPreviewLabel
 from monostudio.ui_qt.note_compose_editor import NoteComposeEditor
+from monostudio.ui_qt.note_context_menu import build_note_context_menu
+from monostudio.ui_qt.note_done_toggle import NoteDoneToggleButton
+from monostudio.ui_qt.note_edit_history_dialog import NoteEditHistoryDialog
 from monostudio.ui_qt.note_view_dialog import NoteViewDialog
 from monostudio.ui_qt.style import MonosDialog, monos_font
 
@@ -71,6 +78,7 @@ def _entries_fingerprint(entries: list[ItemCommentEntry]) -> tuple:
             e.body_html,
             e.mentions,
             e.department,
+            tuple((r.at, r.editor, r.text) for r in e.edit_history),
         )
         for e in sorted(entries, key=lambda x: x.id)
     )
@@ -78,7 +86,12 @@ def _entries_fingerprint(entries: list[ItemCommentEntry]) -> tuple:
 
 def _click_target_blocks_card(w: QWidget | None) -> bool:
     while w is not None:
-        if isinstance(w, (QCheckBox, QToolButton)):
+        if isinstance(w, QToolButton):
+            return True
+        if isinstance(w, QLabel) and w.objectName() in (
+            "NoteAuthorNameLink",
+            "ItemNotesMetaTime",
+        ):
             return True
         w = w.parentWidget()
     return False
@@ -148,6 +161,7 @@ class ItemNotesDialog(MonosDialog):
         )
         self._initial_fp = _entries_fingerprint(self._draft)
         self._known_ids = {e.id for e in self._draft}
+        self._editing_note_id: str | None = None
 
         self.setWindowTitle("Notes")
         self.setModal(True)
@@ -186,10 +200,10 @@ class ItemNotesDialog(MonosDialog):
         compose_l.setContentsMargins(0, 0, 8, 0)
         compose_l.setSpacing(10)
 
-        compose_heading = QLabel("New note", compose_panel)
-        compose_heading.setObjectName("DialogHint")
-        compose_heading.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
-        compose_l.addWidget(compose_heading, 0)
+        self._compose_heading = QLabel("New note", compose_panel)
+        self._compose_heading.setObjectName("DialogHint")
+        self._compose_heading.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
+        compose_l.addWidget(self._compose_heading, 0)
 
         self._add_edit = NoteComposeEditor(
             item_root=self._item_path,
@@ -205,7 +219,7 @@ class ItemNotesDialog(MonosDialog):
         self._add_btn = QPushButton("Add note", compose_panel)
         self._add_btn.setObjectName("ItemNotesAddButton")
         self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._add_btn.clicked.connect(self._on_add_draft)
+        self._add_btn.clicked.connect(self._on_compose_primary)
         add_row.addWidget(self._add_btn, 0)
         compose_l.addLayout(add_row, 0)
 
@@ -277,6 +291,155 @@ class ItemNotesDialog(MonosDialog):
                 break
         QTimer.singleShot(0, lambda: self._open_note_view(self._highlight_note_id))
 
+    def _can_modify_note(self, entry: ItemCommentEntry) -> bool:
+        """Author or admin/dev may edit or delete."""
+        if is_admin_capable():
+            return True
+        author_id = (entry.author_id or "").strip()
+        if not author_id:
+            return False
+        user = get_current_user(self._workspace_root)
+        if user is None:
+            return False
+        return (user.id or "").strip() == author_id
+
+    def _can_delete_note(self, entry: ItemCommentEntry) -> bool:
+        return self._can_modify_note(entry)
+
+    def _can_edit_note(self, entry: ItemCommentEntry) -> bool:
+        return self._can_modify_note(entry)
+
+    def _open_author_profile(self, user_id: str) -> None:
+        from monostudio.ui_qt.user_profile_view_dialog import open_studio_user_profile
+
+        open_studio_user_profile(self._workspace_root, user_id, parent=self)
+
+    def _author_click_handler(self, entry: ItemCommentEntry):
+        uid = (entry.author_id or "").strip()
+        if not uid:
+            return None
+        return lambda: self._open_author_profile(uid)
+
+    def _copy_note_text(self, entry: ItemCommentEntry) -> str:
+        if (entry.body_html or "").strip():
+            return strip_html_preview(entry.body_html) or entry.text
+        return entry.text
+
+    def _on_copy_note(self, entry: ItemCommentEntry) -> None:
+        text = self._copy_note_text(entry)
+        if not text.strip():
+            return
+        QGuiApplication.clipboard().setText(text)
+        from monostudio.ui_qt.notification import notify as notification_service
+
+        notification_service.info("Note copied to clipboard.")
+
+    def _on_note_context_menu(
+        self,
+        entry: ItemCommentEntry,
+        card: QWidget,
+        pos,
+    ) -> None:
+        menu = build_note_context_menu(
+            card,
+            entry,
+            can_edit=self._can_edit_note(entry),
+            can_delete=self._can_delete_note(entry),
+            on_view=lambda: self._open_note_view(entry.id),
+            on_copy=lambda: self._on_copy_note(entry),
+            on_edit=lambda: self._start_edit_note(entry.id),
+            on_history=lambda: self._open_edit_history(entry),
+            on_toggle_done=lambda: self._on_done_toggled(entry.id, not entry.done),
+            on_delete=lambda: self._on_remove_draft(entry.id),
+        )
+        menu.exec(card.mapToGlobal(pos))
+
+    def _open_edit_history(self, entry: ItemCommentEntry) -> None:
+        if not entry.edit_history:
+            return
+        dlg = NoteEditHistoryDialog(
+            entry=entry,
+            workspace_root=self._workspace_root,
+            parent=self,
+        )
+        dlg.exec()
+
+    def _start_edit_note(self, note_id: str) -> None:
+        eid = (note_id or "").strip()
+        entry = next((e for e in self._draft if e.id == eid), None)
+        if entry is None:
+            return
+        if not self._can_edit_note(entry):
+            QMessageBox.warning(
+                self,
+                "Notes",
+                "Only the note author or an admin can edit this note.",
+            )
+            return
+        if self._editing_note_id and self._editing_note_id != eid:
+            self._cancel_edit_mode()
+        self._editing_note_id = eid
+        self._compose_heading.setText(f"Editing note · {_format_local_time(entry.at)}")
+        self._add_btn.setText("Save edit")
+        self._add_edit.load_entry_for_edit(
+            entry.id,
+            body_html=entry.body_html,
+            plain_fallback=entry.text,
+        )
+        self._add_edit.setFocus()
+
+    def _cancel_edit_mode(self) -> None:
+        self._editing_note_id = None
+        self._compose_heading.setText("New note")
+        self._add_btn.setText("Add note")
+        self._add_edit.reset_draft()
+
+    def _on_compose_primary(self) -> None:
+        if self._editing_note_id:
+            self._on_save_edit()
+        else:
+            self._on_add_draft()
+
+    def _on_save_edit(self) -> None:
+        eid = self._editing_note_id
+        if not eid:
+            return
+        entry = next((e for e in self._draft if e.id == eid), None)
+        if entry is None:
+            self._cancel_edit_mode()
+            return
+        if not self._add_edit.has_content():
+            QMessageBox.warning(self, "Notes", "Note cannot be empty.")
+            return
+        if not self._can_edit_note(entry):
+            QMessageBox.warning(self, "Notes", "You cannot edit this note.")
+            self._cancel_edit_mode()
+            return
+        current = get_current_user(self._workspace_root)
+        editor_name = self._author or (current.name if current else "Someone")
+        editor_id = self._author_id or (current.id if current else None)
+        rev = NoteEditRevision(
+            at=_utc_stamp(),
+            editor=editor_name,
+            text=entry.text,
+            body_html=entry.body_html,
+            editor_id=editor_id,
+        )
+        history = (rev,) + entry.edit_history
+        if len(history) > 30:
+            history = history[:30]
+        updated = replace(
+            entry,
+            text=self._add_edit.plain_text(),
+            body_html=self._add_edit.body_html(),
+            mentions=self._add_edit.mention_ids(),
+            edit_history=history,
+        )
+        self._draft = [updated if e.id == eid else e for e in self._draft]
+        self._cancel_edit_mode()
+        self._update_summary()
+        self._rebuild_list()
+
     def _open_note_view(self, note_id: str) -> None:
         eid = (note_id or "").strip()
         if not eid:
@@ -330,10 +493,7 @@ class ItemNotesDialog(MonosDialog):
         row.setContentsMargins(14, 10, 10, 10)
         row.setSpacing(10)
 
-        cb = QCheckBox(card)
-        cb.setObjectName("ItemNotesDoneCheck")
-        cb.setChecked(entry.done)
-        cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        cb = NoteDoneToggleButton(checked=entry.done, parent=card)
         cb.toggled.connect(lambda checked, eid=entry.id: self._on_done_toggled(eid, checked))
         row.addWidget(cb, 0, Qt.AlignmentFlag.AlignTop)
 
@@ -347,6 +507,7 @@ class ItemNotesDialog(MonosDialog):
                 self._workspace_root,
                 avatar_size=24,
                 time_text=_format_local_time(entry.at),
+                on_author_click=self._author_click_handler(entry),
                 parent=card,
             )
         )
@@ -367,15 +528,14 @@ class ItemNotesDialog(MonosDialog):
         open_btn.clicked.connect(lambda _=False, eid=entry.id: self._open_note_view(eid))
         row.addWidget(open_btn, 0, Qt.AlignmentFlag.AlignTop)
 
-        del_btn = QToolButton(card)
-        del_btn.setObjectName("ItemNotesDeleteButton")
-        del_btn.setAutoRaise(True)
-        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        del_btn.setIcon(lucide_icon("trash-2", size=16, color_hex="#ef4444"))
-        del_btn.setIconSize(QSize(16, 16))
-        del_btn.setToolTip("Remove note")
-        del_btn.clicked.connect(lambda _=False, eid=entry.id: self._on_remove_draft(eid))
-        row.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignTop)
+        card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        card.customContextMenuRequested.connect(
+            lambda pos, ent=entry, c=card: self._on_note_context_menu(ent, c, pos)
+        )
+        if self._can_delete_note(entry):
+            card.setToolTip("Click to view · Right-click for options")
+        else:
+            card.setToolTip("Click to view full note")
 
         return card
 
@@ -401,6 +561,16 @@ class ItemNotesDialog(MonosDialog):
         self._rebuild_list()
 
     def _on_remove_draft(self, eid: str) -> None:
+        entry = next((e for e in self._draft if e.id == eid), None)
+        if entry is None:
+            return
+        if not self._can_delete_note(entry):
+            QMessageBox.warning(
+                self,
+                "Notes",
+                "Only the note author or an admin can delete this note.",
+            )
+            return
         delete_note_media(self._item_path, eid)
         self._draft = [e for e in self._draft if e.id != eid]
         self._update_summary()
@@ -414,35 +584,9 @@ class ItemNotesDialog(MonosDialog):
                 new_list.append(e)
                 continue
             if checked:
-                new_list.append(
-                    ItemCommentEntry(
-                        id=e.id,
-                        at=e.at,
-                        author=e.author,
-                        text=e.text,
-                        done=True,
-                        done_at=now_iso,
-                        author_id=e.author_id,
-                        body_html=e.body_html,
-                        mentions=e.mentions,
-                        department=e.department,
-                    )
-                )
+                new_list.append(replace(e, done=True, done_at=now_iso))
             else:
-                new_list.append(
-                    ItemCommentEntry(
-                        id=e.id,
-                        at=e.at,
-                        author=e.author,
-                        text=e.text,
-                        done=False,
-                        done_at=None,
-                        author_id=e.author_id,
-                        body_html=e.body_html,
-                        mentions=e.mentions,
-                        department=e.department,
-                    )
-                )
+                new_list.append(replace(e, done=False, done_at=None))
         self._draft = new_list
         self._update_summary()
         self._rebuild_list()
@@ -476,6 +620,7 @@ class ItemNotesDialog(MonosDialog):
                     item_display=self._item_display_name,
                     note_id=e.id,
                     snippet=e.text,
+                    department=self._department_id or "",
                 )
             except OSError:
                 continue

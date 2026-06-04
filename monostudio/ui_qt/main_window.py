@@ -404,6 +404,9 @@ class MainWindow(FramelessMainWindow):
         self._app_state.set_filters(self.current_department, self.current_type)
 
         notification_service.set_main_window(self, self._main_view)
+        from monostudio.ui_qt.windows_toast_bridge import install_windows_toast_focus
+
+        self._windows_toast_focus_bridge = install_windows_toast_focus(self)
         notification_service.set_general_toast_anchor_widget(self._top_bar.get_noti_button())
         # Anchor important banner under the update button so it appears as a callout.
         notification_service.set_important_anchor_widget(self._top_bar.get_update_button())
@@ -1313,6 +1316,7 @@ class MainWindow(FramelessMainWindow):
         )
         ctx = self._sidebar.current_context()
         self._top_bar.set_nav_page_active(ctx if ctx in ("Dashboard", "Schedule") else None)
+        self._top_bar.set_notification_context(self._workspace_root, self._project_root)
 
     def _copy_project_inventory(self) -> None:
         """
@@ -1889,11 +1893,13 @@ class MainWindow(FramelessMainWindow):
         from monostudio.ui_qt.notification.store import clear_mention_user_alerts
 
         clear_mention_user_alerts()
+        notification_service.reset_mention_popup_session()
         self._sync_mention_inbox_alerts()
 
     def _sync_mention_inbox_alerts(self) -> None:
-        from monostudio.core.mention_inbox import unread_for_user
+        from monostudio.core.mention_inbox import items_for_user, resolve_mention_entity_path
         from monostudio.core.user_identity import get_current_user
+        from monostudio.ui_qt.notification.mention_alert_format import mention_alert_plain_message
         from monostudio.ui_qt.notification.store import UserAlertPayload, has_mention_inbox_id
 
         if self._project_root is None:
@@ -1901,34 +1907,53 @@ class MainWindow(FramelessMainWindow):
         user = get_current_user(self._workspace_root)
         if user is None:
             return
-        for item in unread_for_user(self._project_root, user.id):
-            if has_mention_inbox_id(item.id):
-                continue
-            item_path_str = ""
-            if item.item_rel:
-                try:
-                    candidate = (self._project_root / item.item_rel.replace("/", os.sep)).resolve()
-                    if candidate.is_dir():
-                        item_path_str = str(candidate)
-                except OSError:
-                    pass
-            msg = (
-                f"{item.from_name or 'Someone'} mentioned you in "
-                f"{item.item_display or item.item_rel or 'an item'}"
+        popup_batch: list[tuple[str, str]] = []
+        for item in items_for_user(self._project_root, user.id):
+            entity = resolve_mention_entity_path(
+                self._project_root,
+                item_rel=item.item_rel,
             )
+            item_path_str = str(entity) if entity is not None else ""
+            from_name = (item.from_name or "").strip() or "Someone"
+            item_display = item.item_display or item.item_rel or "an item"
+            dept_label = self._department_label_for_id(item.department)
+            msg = mention_alert_plain_message(
+                from_name=from_name,
+                item_display=item_display,
+                department_id=item.department,
+                department_label=dept_label,
+            )
+            in_bell = has_mention_inbox_id(item.id)
+            if in_bell:
+                if not item.read:
+                    popup_batch.append((item.id, from_name))
+                continue
             notification_service.user_alert(
                 msg,
                 payload=UserAlertPayload(
                     item_path=item_path_str,
-                    item_display=item.item_display,
+                    item_rel=item.item_rel,
+                    item_display=item_display,
                     note_id=item.note_id,
                     mention_inbox_id=item.id,
+                    department=item.department,
+                    from_name=from_name,
+                    from_user_id=item.from_user_id,
+                    department_label=dept_label,
                 ),
+                toast_type="info",
+                read=item.read,
+                show_popup=False,
             )
+            if not item.read:
+                popup_batch.append((item.id, from_name))
+        if popup_batch:
+            notification_service.deliver_mention_popup_batch(popup_batch)
         self._refresh_noti_unread_badge()
 
     def _on_user_alert_clicked(self, entry: object) -> None:
-        from monostudio.core.mention_inbox import mark_read as inbox_mark_read
+        from monostudio.core.item_comments import department_for_note_id
+        from monostudio.core.mention_inbox import mark_read as inbox_mark_read, resolve_mention_entity_path
         from monostudio.ui_qt.notification.store import NotificationEntry, mark_read as store_mark_read
 
         if not isinstance(entry, NotificationEntry):
@@ -1941,18 +1966,48 @@ class MainWindow(FramelessMainWindow):
                 pass
         store_mark_read(payload.mention_inbox_id)
         self._refresh_noti_unread_badge()
-        item_path = (payload.item_path or "").strip()
-        if item_path:
-            try:
-                p = Path(item_path)
-                if p.is_dir():
-                    self._open_item_notes_dialog(
-                        p,
-                        display_name=payload.item_display or p.name,
-                        highlight_note_id=payload.note_id or None,
-                    )
-            except OSError:
-                pass
+        if self._project_root is None:
+            return
+        entity = resolve_mention_entity_path(
+            self._project_root,
+            item_rel=payload.item_rel,
+            item_path=payload.item_path,
+        )
+        if entity is None:
+            notification_service.warning("Could not find that asset or shot in this project.")
+            return
+        dept_id = (payload.department or "").strip()
+        if not dept_id and payload.note_id:
+            dept_id = department_for_note_id(entity, payload.note_id)
+        self._navigate_to_entity_for_notes(entity, dept_id)
+        dept_label = self._department_label_for_id(dept_id)
+        self._open_item_notes_dialog(
+            entity,
+            display_name=payload.item_display or entity.name,
+            highlight_note_id=payload.note_id or None,
+            department_id=dept_id or None,
+            department_label=dept_label,
+        )
+
+    def _navigate_to_entity_for_notes(self, entity_path: Path, department_id: str) -> None:
+        """Select asset/shot in main view and align sidebar department before opening Notes."""
+        try:
+            rel = entity_path.relative_to(self._project_root).as_posix()
+        except ValueError:
+            rel = ""
+        ctx = "Shots" if rel.startswith("shots/") else "Assets"
+        self._sidebar.set_current_context(ctx)
+        self._sidebar_compact.set_current_context(ctx)
+        dept = (department_id or "").strip() or None
+        if dept:
+            self._controller.sync_filter_state(department=dept, type_id=self.current_type)
+            self._sidebar.filters().set_selected_department(dept, emit=False)
+        self._sync_filter_state_from_sidebar()
+        self._reload_main_view()
+        if not self._main_view.select_item_by_path(entity_path):
+            notification_service.warning(
+                f"Could not find {(entity_path.name)} in the current view."
+            )
 
     def _notes_department_for_dialog(self) -> tuple[str, str]:
         """(department_id, display_label) from sidebar / main view focus."""

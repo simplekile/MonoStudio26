@@ -27,7 +27,7 @@ from monostudio.core.user_identity import (
     user_color_choices,
 )
 from monostudio.ui_qt.style import MonosDialog, monos_font
-from monostudio.ui_qt.user_avatar import avatar_pixmap, avatar_pixmap_for, save_avatar_image
+from monostudio.ui_qt.user_avatar import ProfileAvatarLabel, avatar_pixmap, save_avatar_image
 
 
 class _ColorSwatch(QWidget):
@@ -103,8 +103,14 @@ class UserProfileDialog(MonosDialog):
         # Avatar
         av_row = QHBoxLayout()
         av_row.setSpacing(12)
-        self._avatar_lbl = QLabel(self)
-        self._avatar_lbl.setFixedSize(64, 64)
+        self._avatar_lbl = ProfileAvatarLabel(
+            photo_path=self._avatar_src if not self._clear_avatar else None,
+            initials=user.initials,
+            color_hex=self._color_hex,
+            size=64,
+            object_name="UserProfileViewAvatar",
+            parent=self,
+        )
         self._refresh_avatar_preview()
         av_row.addWidget(self._avatar_lbl, 0, Qt.AlignVCenter)
         av_btns = QVBoxLayout()
@@ -220,9 +226,12 @@ class UserProfileDialog(MonosDialog):
     def _refresh_avatar_preview(self) -> None:
         name = self._name.text().strip() if hasattr(self, "_name") else self._user.name
         initials = (name[:2].upper() if name else self._user.initials)
-        src = self._avatar_src
-        self._avatar_lbl.setPixmap(
-            avatar_pixmap_for(src, initials, self._color_hex, 64)
+        src = None if self._clear_avatar else self._avatar_src
+        self._avatar_lbl.update_display(
+            photo_path=src,
+            initials=initials,
+            color_hex=self._color_hex,
+            size=64,
         )
         if hasattr(self, "_initials_preview"):
             self._initials_preview.setPixmap(

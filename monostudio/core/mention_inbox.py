@@ -29,9 +29,10 @@ class MentionInboxItem:
     item_display: str
     note_id: str
     snippet: str
+    department: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "at": self.at,
             "to_user_id": self.to_user_id,
@@ -43,6 +44,10 @@ class MentionInboxItem:
             "note_id": self.note_id,
             "snippet": self.snippet,
         }
+        dept = (self.department or "").strip()
+        if dept:
+            d["department"] = dept
+        return d
 
 
 def _inbox_path(project_root: Path) -> Path:
@@ -72,6 +77,7 @@ def _parse_item(raw: object) -> MentionInboxItem | None:
         item_display=str(raw.get("item_display") or "").strip()[:200],
         note_id=str(raw.get("note_id") or "").strip(),
         snippet=str(raw.get("snippet") or "").strip()[:200],
+        department=str(raw.get("department") or "").strip(),
     )
 
 
@@ -115,6 +121,7 @@ def append_mentions(
     item_display: str,
     note_id: str,
     snippet: str,
+    department: str = "",
 ) -> list[MentionInboxItem]:
     """Append unread mention items for each target user (excluding author). Returns new items."""
     author_id = (from_user_id or "").strip()
@@ -125,6 +132,7 @@ def append_mentions(
     display = (item_display or "").strip()
     snip = (snippet or "").strip()[:120]
     nid = (note_id or "").strip()
+    dept = (department or "").strip()
     now = _utc_now_iso()
     new_items: list[MentionInboxItem] = []
     for uid in targets:
@@ -140,6 +148,7 @@ def append_mentions(
                 item_display=display,
                 note_id=nid,
                 snippet=snip,
+                department=dept,
             )
         )
 
@@ -156,6 +165,40 @@ def append_mentions(
     if last_exc:
         raise last_exc
     return new_items
+
+
+def resolve_mention_entity_path(
+    project_root: Path,
+    *,
+    item_rel: str = "",
+    item_path: str = "",
+) -> Path | None:
+    """Resolve asset/shot folder for a mention (stored path or project-relative)."""
+    path_str = (item_path or "").strip()
+    if path_str:
+        try:
+            p = Path(path_str)
+            if p.is_dir():
+                return p
+        except OSError:
+            pass
+    rel = (item_rel or "").strip().replace("\\", "/")
+    if not rel:
+        return None
+    try:
+        p = (Path(project_root) / rel).resolve()
+        if p.is_dir():
+            return p
+    except OSError:
+        pass
+    return None
+
+
+def items_for_user(project_root: Path, user_id: str) -> list[MentionInboxItem]:
+    uid = (user_id or "").strip()
+    if not uid:
+        return []
+    return [i for i in read_inbox(project_root) if i.to_user_id == uid]
 
 
 def unread_for_user(project_root: Path, user_id: str) -> list[MentionInboxItem]:
@@ -186,6 +229,7 @@ def mark_read(project_root: Path, inbox_id: str) -> None:
                     item_display=it.item_display,
                     note_id=it.note_id,
                     snippet=it.snippet,
+                    department=it.department,
                 )
             )
             changed = True
@@ -216,6 +260,7 @@ def mark_all_read(project_root: Path, user_id: str) -> None:
                     item_display=it.item_display,
                     note_id=it.note_id,
                     snippet=it.snippet,
+                    department=it.department,
                 )
             )
             changed = True
