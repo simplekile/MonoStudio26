@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import subprocess
@@ -20,6 +21,8 @@ from monostudio.core.app_paths import get_app_base_path, write_install_path_for_
 from monostudio.core.windows_toast import register_aumid_on_startup
 from monostudio.core.crash_recovery import install_crash_logging
 from monostudio.core.pipeline_types_and_presets import ensure_user_default_config_dir
+from monostudio.core.single_instance import acquire_single_instance
+from monostudio.core.tray_preferences import read_start_minimized_to_tray, read_startup_splash_ms
 from monostudio.ui_qt.main_window import MainWindow
 from monostudio.core.version import get_app_version
 from monostudio.ui_qt.style import apply_dark_theme
@@ -33,6 +36,14 @@ SPLASH_SUBTITLE_COLOR = "#71717a"  # Zinc-500
 SPLASH_STATUS_COLOR = "#52525b"   # Zinc-600 (status text)
 SPLASH_LOADING_COLOR = "#3f3f46"  # track
 SPLASH_LOADING_FILL = "#2563eb"   # Electric Blue (active)
+
+
+def _parse_launch_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--startup", action="store_true", help="Launched from Windows autostart")
+    parser.add_argument("--minimized", action="store_true", help="Alias for startup-to-tray flow")
+    known, _rest = parser.parse_known_args(argv[1:])
+    return known
 
 
 def _make_splash_pixmap(
@@ -139,6 +150,9 @@ def _ensure_comtypes_on_windows() -> None:
 
 
 def main() -> int:
+    launch_args = _parse_launch_args(sys.argv)
+    startup_launch = bool(launch_args.startup or launch_args.minimized)
+
     install_crash_logging()
     # DCC / pending_create / assets-diff tracing: quiet by default (no DEBUG to console or log file).
     _dcc_log = logging.getLogger("monostudio.dcc_debug")
@@ -159,11 +173,20 @@ def main() -> int:
     # These application attributes are deprecated and emit warnings in Qt6.
 
     app = QApplication(sys.argv)
+    from monostudio.core.tray_preferences import read_tray_enabled
+
+    if read_tray_enabled():
+        app.setQuitOnLastWindowClosed(False)
     register_aumid_on_startup()
     restore_remembered_access()
 
     _boot_settings = QSettings("MonoStudio26", "MonoStudio26")
-    _splash_display_ms = read_splash_display_ms(_boot_settings)
+    if startup_launch and read_start_minimized_to_tray(_boot_settings):
+        _splash_display_ms = read_startup_splash_ms(_boot_settings)
+    else:
+        _splash_display_ms = read_splash_display_ms(_boot_settings)
+
+    hide_to_tray_after_splash = startup_launch and read_start_minimized_to_tray(_boot_settings)
 
     # Verbose UI debug: env override or General → Access (developer) + Save Settings.
     if os.environ.get("MONOS_DEBUG_PROJECT_GUIDE_DROP") or read_verbose_debug_enabled(_boot_settings):
@@ -222,10 +245,17 @@ def main() -> int:
     _splash_step("Checking dependencies…", 0.50)
     _ensure_comtypes_on_windows()
 
+    instance_guard = acquire_single_instance()
+    if instance_guard is None:
+        splash.close()
+        return 0
+
     _splash_step("Building interface…", 0.65)
     window = MainWindow()
+    window.launch_hidden_to_tray = hide_to_tray_after_splash
     if not _icon.isNull():
         window.setWindowIcon(_icon)
+    instance_guard.set_on_raise(lambda: window.present())
 
     _splash_step("Almost ready…", 0.90)
 
@@ -240,9 +270,14 @@ def main() -> int:
         splash.setPixmap(_make_splash_pixmap(_icon, progress, status, _version))
         if progress >= 1.0:
             _splash_timer.stop()
-            window.show()
-            splash.finish(window)
-            window.complete_startup()
+            if hide_to_tray_after_splash:
+                splash.finish(window)
+                window.hide()
+                window.complete_startup()
+            else:
+                window.show()
+                splash.finish(window)
+                window.complete_startup()
 
     _splash_timer = QTimer(splash)
     _splash_timer.timeout.connect(_tick_splash)
@@ -254,4 +289,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

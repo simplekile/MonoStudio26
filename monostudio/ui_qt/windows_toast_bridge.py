@@ -22,12 +22,12 @@ class WindowsToastFocusBridge(QObject):
         w = self._window
         if w is None:
             return
-        w.showNormal()
-        w.raise_()
-        w.activateWindow()
-        top_bar = getattr(w, "_top_bar", None)
-        if top_bar is not None and hasattr(top_bar, "open_noti_dropdown"):
-            top_bar.open_noti_dropdown()
+        if hasattr(w, "present"):
+            w.present(open_notifications=True)
+        else:
+            w.showNormal()
+            w.raise_()
+            w.activateWindow()
 
 
 def install_windows_toast_focus(window: QMainWindow) -> WindowsToastFocusBridge:

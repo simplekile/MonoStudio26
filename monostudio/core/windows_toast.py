@@ -52,19 +52,9 @@ def _icon_uri_for_registry() -> str | None:
 
 def _app_launch_target() -> tuple[str, str, str]:
     """Return (executable, arguments, working_directory) for Start Menu shortcut."""
-    if getattr(sys, "frozen", False):
-        exe = sys.executable
-        return exe, "", str(Path(exe).parent)
-    try:
-        from monostudio.core.app_paths import get_app_base_path
+    from monostudio.core.app_launch import app_launch_target
 
-        root = get_app_base_path()
-        app_py = root / "app.py"
-        if app_py.is_file():
-            return sys.executable, f'"{app_py.resolve()}"', str(root)
-    except Exception:
-        pass
-    return sys.executable, "", os.getcwd()
+    return app_launch_target()
 
 
 def ensure_start_menu_shortcut() -> bool:

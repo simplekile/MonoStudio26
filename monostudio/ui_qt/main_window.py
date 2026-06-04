@@ -142,6 +142,9 @@ class MainWindow(FramelessMainWindow):
         self._filter_switch_in_progress: bool = False
         self._startup_complete: bool = False
         self._identity_prompt_pending: bool = False
+        self.launch_hidden_to_tray: bool = False
+        self._force_quit: bool = False
+        self._tray_manager = None
         self._workspace_root: Path | None = None
         self._workspace_projects: list[DiscoveredProject] = []
         self._workspace_project_status: dict[str, str] = {}
@@ -326,7 +329,7 @@ class MainWindow(FramelessMainWindow):
         self.typeChanged.connect(self._on_filter_state_changed)
         self._top_bar.minimize_clicked.connect(self.showMinimized)
         self._top_bar.maximize_clicked.connect(self._toggle_maximize)
-        self._top_bar.close_clicked.connect(self.close)
+        self._top_bar.close_clicked.connect(self.request_close)
         self._top_bar.title_double_clicked.connect(self._toggle_maximize)
         self._top_bar.nav_page_clicked.connect(self._sidebar.set_current_context)
         self._top_bar.switch_user_requested.connect(self._on_switch_user)
@@ -407,6 +410,10 @@ class MainWindow(FramelessMainWindow):
         from monostudio.ui_qt.windows_toast_bridge import install_windows_toast_focus
 
         self._windows_toast_focus_bridge = install_windows_toast_focus(self)
+        from monostudio.ui_qt.tray_manager import TrayManager
+
+        self._tray_manager = TrayManager(self, settings=self._settings)
+        self._tray_manager.install()
         notification_service.set_general_toast_anchor_widget(self._top_bar.get_noti_button())
         # Anchor important banner under the update button so it appears as a callout.
         notification_service.set_important_anchor_widget(self._top_bar.get_update_button())
@@ -1684,6 +1691,89 @@ class MainWindow(FramelessMainWindow):
             self._identity_prompt_pending = False
             QTimer.singleShot(0, self._ensure_identity_for_workspace)
 
+    def present(self, *, open_notifications: bool = False) -> None:
+        """Raise main window (from tray, toast, or second instance)."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if open_notifications:
+            self._top_bar.open_noti_dropdown()
+
+    def request_close(self) -> None:
+        """User clicked window close — may hide to tray per settings."""
+        self.close()
+
+    def apply_recent_task(self, task: object, *, open_dcc: bool = False) -> None:
+        if open_dcc:
+            self._on_recent_task_double_clicked(task)
+        else:
+            self.present()
+            self._on_recent_task_clicked(task)
+
+    def restore_last_project_from_settings(self) -> None:
+        self.present()
+        path = self._settings.value("project/root", "", str)
+        if path:
+            self._apply_project_root(path, save=False)
+
+    def open_settings_tray_section(self) -> None:
+        self.present()
+        dialog = SettingsDialog(
+            workspace_root=self._workspace_root,
+            project_root=self._project_root,
+            settings=self._settings,
+            parent=self,
+        )
+        dialog.workspace_root_selected.connect(lambda p: self._apply_workspace_root(p, save=True))
+        dialog.project_root_selected.connect(lambda p: self._apply_project_root(p, save=True))
+        dialog.access_session_changed.connect(self._refresh_user_button)
+        dialog.open_to_ui_tab()
+        dialog.exec()
+        self._refresh_user_button()
+
+    def quit_application(self) -> None:
+        """Exit from tray menu — bypass hide-to-tray."""
+        self._force_quit = True
+        self._persist_window_state()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+        else:
+            self.close()
+
+    def _persist_window_state(self) -> None:
+        try:
+            self._settings.setValue("ui/sidebar_context", self._sidebar.current_context())
+            self._persist_panel_layout_prefs()
+        except Exception:
+            pass
+        path = self._app_settings_path()
+        ms_cur = self._main_splitter.sizes()
+        if len(ms_cur) >= 1 and ms_cur[0] == 0:
+            main_sizes = self._main_splitter_sizes_restore
+        elif self._sidebar_stack.currentIndex() == 1:
+            main_sizes = self._main_splitter_sizes_restore
+        else:
+            main_sizes = ms_cur
+        content_sizes = (
+            self._content_splitter_sizes_restore
+            if not self._inspector.isVisible()
+            else self._content_splitter.sizes()
+        )
+        payload = {
+            "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
+            "window_maximized": self.isMaximized(),
+            "window_always_on_top": self._window_always_on_top,
+            "main_splitter_sizes": main_sizes,
+            "content_splitter_sizes": content_sizes,
+        }
+        try:
+            from monostudio.core.user_identity import update_app_settings
+
+            update_app_settings(payload)
+        except OSError:
+            pass
+
     def _ensure_identity_for_workspace(self) -> None:
         """Prompt sign-in once when a workspace is chosen but nobody is signed in."""
         from monostudio.core.user_identity import get_current_user
@@ -2909,11 +2999,15 @@ class MainWindow(FramelessMainWindow):
         self._refresh_recent_tasks()
         self._sync_primary_action()
         self._sync_top_bar()
+        if self._tray_manager is not None:
+            self._tray_manager.refresh_tooltip()
 
     def _refresh_recent_tasks(self) -> None:
         tasks = self._recent_tasks_store.get_for_project(self._project_root) if self._project_root else []
         self._sidebar.set_recent_tasks(tasks)
         self._sidebar_compact.set_recent_tasks(tasks)
+        if self._tray_manager is not None:
+            self._tray_manager.refresh_menu()
 
     def _apply_workspace_root(self, folder: str | None, *, save: bool) -> None:
         # No validation. Read-only discovery.
@@ -4778,38 +4872,49 @@ class MainWindow(FramelessMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """
         Save window geometry on close (size + position + maximized).
-        Save sidebar nav page (Assets/Shots/Inbox/...) to QSettings.
-        Save splitter sizes to app_settings.json.
-        Silent failure on IO errors.
+        May hide to system tray instead of quitting when configured.
         """
-        try:
-            self._settings.setValue("ui/sidebar_context", self._sidebar.current_context())
-            self._persist_panel_layout_prefs()
-        except Exception:
-            pass
-        path = self._app_settings_path()
-        # Persist "full" layout (sizes when both panels visible) so restore doesn't get 0 for hidden panels.
-        ms_cur = self._main_splitter.sizes()
-        if len(ms_cur) >= 1 and ms_cur[0] == 0:
-            main_sizes = self._main_splitter_sizes_restore
-        elif self._sidebar_stack.currentIndex() == 1:
-            main_sizes = self._main_splitter_sizes_restore
-        else:
-            main_sizes = ms_cur
-        content_sizes = self._content_splitter_sizes_restore if not self._inspector.isVisible() else self._content_splitter.sizes()
-        payload = {
-            "window_geometry_b64": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
-            "window_maximized": self.isMaximized(),
-            "window_always_on_top": self._window_always_on_top,
-            "main_splitter_sizes": main_sizes,
-            "content_splitter_sizes": content_sizes,
-        }
-        try:
-            from monostudio.core.user_identity import update_app_settings
+        if not self._force_quit:
+            from monostudio.core.tray_preferences import (
+                read_close_action,
+                read_tray_enabled,
+                should_prompt_close_behavior,
+                write_close_action,
+                write_close_prompt_shown,
+            )
+            from monostudio.ui_qt.close_behavior_dialog import CloseBehaviorDialog
 
-            update_app_settings(payload)
-        except OSError:
-            pass
+            action = read_close_action(self._settings)
+            if should_prompt_close_behavior(self._settings):
+                dlg = CloseBehaviorDialog(self)
+                if dlg.exec() != QDialog.DialogCode.Accepted:
+                    event.ignore()
+                    return
+                action = dlg.chosen_action()
+                if dlg.remember_choice():
+                    write_close_action(self._settings, action)
+                    write_close_prompt_shown(self._settings, True)
+                else:
+                    write_close_prompt_shown(self._settings, True)
+
+            tray_ok = (
+                read_tray_enabled(self._settings)
+                and self._tray_manager is not None
+                and self._tray_manager.is_available()
+            )
+            if action == "minimize" and tray_ok:
+                self._persist_window_state()
+                event.ignore()
+                self.hide()
+                if not self._tray_manager._shown_tray_hint:
+                    self._tray_manager._shown_tray_hint = True
+                    self._tray_manager.show_tray_message(
+                        "MONOS",
+                        "MONOS is still running in the system tray.",
+                    )
+                return
+
+        self._persist_window_state()
         super().closeEvent(event)
 
     def _switch_project(self, project_root: str) -> None:

@@ -486,6 +486,17 @@ class SettingsDialog(MonosDialog):
         self._apply_cached_update_result(get_cached_check_result())
         self._refresh_ffmpeg_update_row()
 
+    def open_to_ui_tab(self) -> None:
+        """Switch to General → UI (system tray and notification options)."""
+        self._nav.setCurrentRow(0)
+        self._content_stack.setCurrentIndex(0)
+        stack = getattr(self, "_general_tier2_stack", None)
+        buttons = getattr(self, "_general_tier2_buttons", None)
+        if stack is not None and buttons is not None and len(buttons) > 1:
+            stack.setCurrentIndex(1)
+            for i, b in enumerate(buttons):
+                b.setChecked(i == 1)
+
     def _load_persisted_last_check_time(self) -> None:
         """Load last check time from settings so 'Last checked' is visible across sessions."""
         if self._update_last_checked_time is not None:
@@ -780,10 +791,92 @@ class SettingsDialog(MonosDialog):
             "Hover the preview for sequence play/pause.",
         )
         layout.addWidget(insp_card)
+
+        tray_card, tray_l = add_settings_section(
+            inner,
+            "System tray",
+            "Run MONOS in the background and open it quickly from the notification area.",
+        )
+
+        from monostudio.core.tray_preferences import (
+            read_close_action,
+            read_start_minimized_to_tray,
+            read_start_with_windows,
+            read_tray_enabled,
+        )
+
+        self._tray_enabled_cb = QCheckBox("Show MONOS icon in the system tray", tray_card)
+        try:
+            self._tray_enabled_cb.setChecked(read_tray_enabled(self._settings))
+        except Exception:
+            self._tray_enabled_cb.setChecked(True)
+        tray_l.addWidget(self._tray_enabled_cb)
+
+        self._tray_close_action_combo = QComboBox(tray_card)
+        style_settings_combo(self._tray_close_action_combo, width=280)
+        self._tray_close_action_combo.addItem("Ask when I close the window", "unset")
+        self._tray_close_action_combo.addItem("Hide to system tray", "minimize")
+        self._tray_close_action_combo.addItem("Quit MONOS completely", "quit")
+        try:
+            cur = read_close_action(self._settings)
+            for i in range(self._tray_close_action_combo.count()):
+                if self._tray_close_action_combo.itemData(i) == cur:
+                    self._tray_close_action_combo.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+        add_settings_field_row(tray_l, "When I close the window", self._tray_close_action_combo)
+
+        self._tray_start_windows_cb = QCheckBox("Start MONOS when Windows starts", tray_card)
+        self._tray_start_windows_cb.setEnabled(sys.platform == "win32")
+        try:
+            self._tray_start_windows_cb.setChecked(read_start_with_windows(self._settings))
+        except Exception:
+            self._tray_start_windows_cb.setChecked(False)
+        tray_l.addWidget(self._tray_start_windows_cb)
+
+        self._tray_start_minimized_cb = QCheckBox(
+            "After Windows sign-in, show a short splash then stay in the tray",
+            tray_card,
+        )
+        try:
+            self._tray_start_minimized_cb.setChecked(read_start_minimized_to_tray(self._settings))
+        except Exception:
+            self._tray_start_minimized_cb.setChecked(True)
+        tray_l.addWidget(self._tray_start_minimized_cb)
+
+        self._tray_autostart_status = QLabel("", tray_card)
+        self._tray_autostart_status.setWordWrap(True)
+        self._tray_autostart_status.setObjectName("DialogHelper")
+        tray_l.addWidget(self._tray_autostart_status)
+        self._tray_start_windows_cb.toggled.connect(self._on_tray_start_windows_toggled)
+        self._tray_start_windows_cb.toggled.connect(self._refresh_tray_autostart_status)
+        self._on_tray_start_windows_toggled(self._tray_start_windows_cb.isChecked())
+        self._refresh_tray_autostart_status()
+
+        layout.addWidget(tray_card)
         layout.addStretch(1)
 
         scroll.setWidget(inner)
         return scroll
+
+    def _on_tray_start_windows_toggled(self, checked: bool) -> None:
+        if self._tray_start_minimized_cb is not None:
+            self._tray_start_minimized_cb.setEnabled(bool(checked))
+
+    def _refresh_tray_autostart_status(self) -> None:
+        label = getattr(self, "_tray_autostart_status", None)
+        if label is None:
+            return
+        if sys.platform != "win32":
+            label.setText("Windows startup registration is only available on Windows.")
+            return
+        from monostudio.core.windows_autostart import is_autostart_enabled
+
+        if is_autostart_enabled():
+            label.setText("Registered in Windows startup (current user). Save Settings to apply changes.")
+        else:
+            label.setText("Not registered for Windows startup. Enable the option above and save.")
 
     def _write_inspector_thumb_segment(
         self,
@@ -2639,6 +2732,43 @@ class SettingsDialog(MonosDialog):
                     "Settings",
                     "Failed to save Use DCC folders to project.",
                 )
+
+        # System tray and Windows autostart.
+        try:
+            if self._settings is not None:
+                from monostudio.core.tray_preferences import (
+                    write_close_action,
+                    write_close_prompt_shown,
+                    write_start_minimized_to_tray,
+                    write_start_with_windows,
+                    write_tray_enabled,
+                )
+                from monostudio.core.windows_autostart import set_autostart
+
+                if getattr(self, "_tray_enabled_cb", None) is not None:
+                    write_tray_enabled(self._settings, self._tray_enabled_cb.isChecked())
+                combo = getattr(self, "_tray_close_action_combo", None)
+                if combo is not None:
+                    data = combo.currentData()
+                    if data in ("unset", "minimize", "quit"):
+                        write_close_action(self._settings, data)
+                        if data != "unset":
+                            write_close_prompt_shown(self._settings, True)
+                start_cb = getattr(self, "_tray_start_windows_cb", None)
+                if start_cb is not None and sys.platform == "win32":
+                    want = start_cb.isChecked()
+                    write_start_with_windows(self._settings, want)
+                    ok, msg = set_autostart(want)
+                    if not ok:
+                        QMessageBox.warning(self, "Windows startup", msg)
+                    elif want:
+                        write_start_with_windows(self._settings, True)
+                min_cb = getattr(self, "_tray_start_minimized_cb", None)
+                if min_cb is not None:
+                    write_start_minimized_to_tray(self._settings, min_cb.isChecked())
+                self._refresh_tray_autostart_status()
+        except Exception:
+            pass
 
         # Persist notification UI setting.
         try:

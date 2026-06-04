@@ -1,19 +1,17 @@
-# MonoStudio 26 — Release v26.14.2
+# MonoStudio 26 — Release v26.14.3
 
 ## Highlights
 
-- **Sign-in / identity fix**: Gắn device mỗi lần Sign in (không phụ thuộc “Stay signed in”); bỏ auto-chọn user đầu tiên trong roster khi chỉ có 1 account — tránh luôn vào tài khoản tạo đầu.
-- **Mention notifications**: Windows toast (@mention), tùy chọn delivery trong Settings; dropdown/list notification UI mới.
-- **Notes**: Đánh dấu done, lịch sử chỉnh sửa, context menu; author row/avatar cải thiện.
-- **Houdini DCC**: Cải thiện subprocess env / launch trên Windows.
+- **System tray**: Thu nhỏ xuống tray, menu tray (mở/ẩn/thoát), tùy chọn hành vi khi đóng cửa sổ (thoát / minimize to tray / hỏi mỗi lần).
+- **Single instance**: Mở app lần hai sẽ đưa cửa sổ đang chạy lên trước (không nhân đôi process).
+- **Windows autostart**: Bật/tắt chạy cùng Windows từ Settings (HKCU Run).
+- **Toast**: Tinh chỉnh focus bridge khi bấm notification.
 
 ## Changes in this release
 
-- fix: `user_identity.py`, `user_identity_dialog.py` — device binding + pre-select.
-- feat: `windows_toast.py`, `windows_toast_bridge.py`, `notification_preferences.py` — toast mention + focus app.
-- feat: `note_done_toggle.py`, `note_edit_history_dialog.py`, `note_context_menu.py`; `item_comments.py` done/edit_history.
-- feat: notification row widgets, `mention_alert_format.py`; `settings_section_widgets.py`, Settings notifications section.
-- fix: `dcc_houdini.py`, `dcc_subprocess_env.py`; `requirements.txt` — `windows-toasts`.
+- feat: `tray_manager.py`, `close_behavior_dialog.py`, `tray_preferences.py`.
+- feat: `single_instance.py`, `app_launch.py`, `windows_autostart.py`.
+- feat: `main_window.py`, `settings_dialog.py`, `app.py` — tray, close, autostart wiring.
 
 ## Install
 
