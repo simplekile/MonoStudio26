@@ -1090,6 +1090,15 @@ def apply_dark_theme(app: QApplication) -> None:
         QLineEdit:focus {
             border: 1px solid #2563eb; /* Blue-600 */
         }
+        QPlainTextEdit#DialogBatchNamesInput {
+            padding: 6px 8px;
+            border: 1px solid rgba(39, 39, 42, 0.50);
+            border-radius: 6px;
+            background: #27272a;
+        }
+        QPlainTextEdit#DialogBatchNamesInput:focus {
+            border: 1px solid #2563eb;
+        }
         QListWidget, QTableView, QTreeView, QListView {
             solid rgba(39, 39, 42, 0.50);
             background: #27272a; /* Zinc-800 */

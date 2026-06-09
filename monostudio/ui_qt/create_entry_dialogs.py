@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QTextOption
 from PySide6.QtWidgets import (
     QComboBox,
     QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMenu,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QToolButton,
@@ -78,6 +81,87 @@ def _is_shot_type_id(type_id: str) -> bool:
     # Convention (deterministic):
     # - Shot-capable types must use id == "shot" or start with "shot_".
     return type_id == "shot" or type_id.startswith("shot_")
+
+
+_BATCH_CREATE_DIALOG_WIDTH = 420
+_BATCH_INPUT_LINE_COUNT = 10
+_BATCH_INPUT_VERTICAL_PAD_PX = 12  # QSS padding 6px top + 6px bottom
+_BATCH_INPUT_BORDER_PX = 2  # QSS border 1px top + bottom
+
+
+class _BatchNamesInput(QPlainTextEdit):
+    """Multi-line batch input: fixed width and fixed height (10 lines)."""
+
+    def __init__(self, parent=None, *, placeholder: str = "") -> None:
+        super().__init__(parent)
+        self.setObjectName("DialogBatchNamesInput")
+        self.setPlaceholderText(placeholder)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setTabChangesFocus(True)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        input_w = _BATCH_CREATE_DIALOG_WIDTH - 24  # dialog side margins (12 + 12)
+        self.setFixedWidth(input_w)
+        opt = QTextOption()
+        opt.setWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.document().setDefaultTextOption(opt)
+        self.document().setDocumentMargin(0)
+        line_h = self.fontMetrics().lineSpacing()
+        chrome = _BATCH_INPUT_VERTICAL_PAD_PX + _BATCH_INPUT_BORDER_PX
+        self.setFixedHeight(_BATCH_INPUT_LINE_COUNT * line_h + chrome)
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+
+def parse_comma_separated_tokens(text: str) -> list[str]:
+    """Split comma- or newline-separated user input into non-empty trimmed tokens."""
+    tokens: list[str] = []
+    for line in text.splitlines():
+        for part in line.split(","):
+            part = part.strip()
+            if part:
+                tokens.append(part)
+    if not tokens and text.strip():
+        tokens.append(text.strip())
+    return tokens
+
+
+def final_asset_name_from_base(base: str, type_def: TypeDef | None) -> str:
+    """Apply type short_name prefix to a single asset base name."""
+    base = base.strip()
+    if not base:
+        return ""
+    if type_def is None:
+        return base
+    short = type_def.short_name.strip()
+    if not short:
+        return base
+    prefix = short if short.endswith("_") else f"{short}_"
+    return base if base.startswith(prefix) else f"{prefix}{base}"
+
+
+def final_shot_name_from_token(token: str, type_def: TypeDef | None, *, padding: int = 3) -> str:
+    """
+    Build final shot folder name from one batch token.
+    Token format: digits with optional suffix (e.g. 10, 010, 10a).
+    """
+    token = token.strip()
+    if not token or type_def is None:
+        return ""
+    short = type_def.short_name.strip()
+    if not short:
+        return ""
+    m = re.fullmatch(r"(\d+)([a-z0-9_]*)", token)
+    if not m:
+        return ""
+    try:
+        num = str(int(m.group(1))).zfill(padding)
+    except ValueError:
+        return ""
+    return f"{short}{num}{m.group(2)}"
 
 
 def _field_block_with_preview(label_text: str, field: QWidget, preview: QLabel, helper_text: str) -> QWidget:
@@ -650,3 +734,446 @@ class CreateShotDialog(MonosDialog):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._shot_number.setFocus()
+
+
+class BatchCreateAssetDialog(MonosDialog):
+    """Create multiple assets from comma-separated base names."""
+
+    def __init__(self, project_root: Path, parent=None, *, initial_type_id: str | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Batch Create Assets")
+        self.setModal(True)
+
+        self._project_root = project_root
+        self._initial_type_id = (initial_type_id or "").strip() or None
+        self._types: dict[str, TypeDef] = load_pipeline_types_and_presets_for_project(project_root).types
+        self._dept_vocab: set[str] = set(load_department_vocabulary())
+        self._selected_type_id: str | None = None
+
+        self._type_preview = QLabel("")
+        self._type_preview.setVisible(False)
+        self._type_preview.setWordWrap(True)
+        self._type_preview.setObjectName("DialogHelper")
+
+        self._type_button = QToolButton()
+        self._type_button.setPopupMode(QToolButton.InstantPopup)
+        self._type_button.setText("Select Type…")
+        self._type_menu = QMenu(self._type_button)
+        self._type_button.setMenu(self._type_menu)
+        self._build_type_menu()
+
+        self._names_input = _BatchNamesInput(placeholder="e.g. aya, bob, zen")
+        self._names_input.textChanged.connect(self._update_preview_and_ok)
+
+        self._preview = QLabel("")
+        self._preview.setVisible(False)
+        self._preview.setWordWrap(True)
+        self._preview.setObjectName("DialogHelper")
+
+        self._warning = QLabel("")
+        self._warning.setVisible(False)
+        self._warning.setWordWrap(True)
+        self._warning.setObjectName("DialogWarning")
+
+        button_row = QWidget()
+        button_row_l = QHBoxLayout(button_row)
+        button_row_l.setContentsMargins(0, 0, 0, 0)
+        button_row_l.setSpacing(10)
+        self._ok_btn = QPushButton("Create Assets")
+        self._ok_btn.setObjectName("DialogPrimaryButton")
+        self._ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        button_row_l.addWidget(self._ok_btn)
+        button_row_l.addWidget(cancel_btn)
+        button_row_l.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(0)
+        layout.addWidget(
+            _field_block_with_preview(
+                "Type",
+                self._type_button,
+                self._type_preview,
+                "Type is defined in Pipeline Settings.",
+            )
+        )
+        layout.addSpacing(14)
+        layout.addWidget(
+            _field_block_with_preview(
+                "Asset Names",
+                self._names_input,
+                self._preview,
+                "One name per line or comma-separated. Type prefix is applied to each.",
+            )
+        )
+        layout.addWidget(self._warning)
+        layout.addSpacing(12)
+        layout.addWidget(button_row)
+
+        self.setFixedWidth(_BATCH_CREATE_DIALOG_WIDTH)
+
+        type_to_set = None
+        if self._initial_type_id and self._initial_type_id in self._types and not _is_shot_type_id(self._initial_type_id):
+            type_to_set = self._initial_type_id
+        if type_to_set is None:
+            type_to_set = self._get_first_asset_type_id()
+        if type_to_set is not None:
+            self._set_type(type_to_set)
+        self._update_preview_and_ok()
+
+    def asset_type(self) -> str:
+        return (self._selected_type_id or "").strip()
+
+    def asset_names(self) -> list[str]:
+        type_def = self._types.get(self._selected_type_id or "")
+        names: list[str] = []
+        seen: set[str] = set()
+        for token in parse_comma_separated_tokens(self._names_input.text()):
+            final = final_asset_name_from_base(token, type_def)
+            if not final or final in seen:
+                continue
+            seen.add(final)
+            names.append(final)
+        return names
+
+    def selected_departments(self) -> list[str]:
+        t = self._types.get(self._selected_type_id or "")
+        if t is None:
+            return []
+        raw = t.departments
+        if not raw:
+            return []
+        if self._dept_vocab:
+            return [d for d in raw if d in self._dept_vocab]
+        return list(raw)
+
+    def create_subfolders(self) -> bool:
+        return _global_create_work_publish_subfolders_default()
+
+    def _build_type_menu(self) -> None:
+        self._type_menu.clear()
+        self._selected_type_id = None
+        allowed = [(type_id, t) for type_id, t in self._types.items() if not _is_shot_type_id(type_id)]
+        allowed.sort(key=lambda kv: kv[1].name.lower())
+        self._type_button.setEnabled(bool(allowed))
+        if not allowed:
+            self._type_button.setText("No asset types")
+            self._type_preview.setVisible(False)
+            return
+        self._type_button.setText("Select Type…")
+        for type_id, t in allowed:
+            act = QAction(t.name, self._type_menu)
+            act.triggered.connect(lambda checked=False, tid=type_id: self._set_type(tid))
+            self._type_menu.addAction(act)
+
+    def _get_first_asset_type_id(self) -> str | None:
+        allowed = [(type_id, t) for type_id, t in self._types.items() if not _is_shot_type_id(type_id)]
+        allowed.sort(key=lambda kv: kv[1].name.lower())
+        return allowed[0][0] if allowed else None
+
+    def _set_type(self, type_id: str) -> None:
+        self._selected_type_id = type_id
+        t = self._types.get(type_id)
+        if t is None:
+            return
+        self._type_button.setText(t.name)
+        depts = self.selected_departments()
+        if depts:
+            self._type_preview.setText("Departments: " + " / ".join(depts))
+            self._type_preview.setVisible(True)
+        else:
+            self._type_preview.setText("Departments:")
+            self._type_preview.setVisible(True)
+        self._update_preview_and_ok()
+
+    def _resolve_final_names(self) -> tuple[list[str], list[str], list[str]]:
+        """Return (valid unique final names, invalid tokens, already-existing names)."""
+        type_def = self._types.get(self._selected_type_id or "")
+        tokens = parse_comma_separated_tokens(self._names_input.text())
+        valid: list[str] = []
+        invalid: list[str] = []
+        existing: list[str] = []
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+
+        for token in tokens:
+            final = final_asset_name_from_base(token, type_def)
+            if not final:
+                invalid.append(token)
+                continue
+            if final in seen:
+                duplicates.add(final)
+                continue
+            seen.add(final)
+            path = self._asset_target_path(final)
+            if path is not None and path.exists():
+                existing.append(final)
+                continue
+            valid.append(final)
+
+        if duplicates:
+            invalid.extend(sorted(duplicates))
+        return valid, invalid, existing
+
+    def _asset_target_path(self, asset_name: str) -> Path | None:
+        if not asset_name or not self._selected_type_id:
+            return None
+        try:
+            struct_reg = StructureRegistry.for_project(self._project_root)
+            type_reg = TypeRegistry.for_project(self._project_root)
+            type_folder = type_reg.get_type_folder(self._selected_type_id)
+            assets_folder = struct_reg.get_folder("assets")
+            return self._project_root / assets_folder / type_folder / asset_name
+        except Exception:
+            return None
+
+    def _update_preview_and_ok(self) -> None:
+        valid, invalid, existing = self._resolve_final_names()
+        warnings: list[str] = []
+        if invalid:
+            warnings.append(f"Invalid or duplicate: {', '.join(invalid)}")
+        if existing:
+            warnings.append(f"Already exists: {', '.join(existing)}")
+        if warnings:
+            self._warning.setText("\n".join(warnings))
+            self._warning.setVisible(True)
+        else:
+            self._warning.setVisible(False)
+
+        if valid:
+            preview_text = f"Will create {len(valid)} asset(s): " + ", ".join(valid)
+            self._preview.setText(preview_text)
+            self._preview.setVisible(True)
+        else:
+            self._preview.setVisible(False)
+
+        self._ok_btn.setEnabled(bool(self._selected_type_id and valid))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._names_input.setFocus()
+
+
+class BatchCreateShotDialog(MonosDialog):
+    """Create multiple shots from comma-separated shot numbers."""
+
+    def __init__(self, project_root: Path, parent=None, *, initial_type_id: str | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Batch Create Shots")
+        self.setModal(True)
+
+        self._project_root = project_root
+        self._initial_type_id = (initial_type_id or "").strip() or None
+        self._types: dict[str, TypeDef] = load_pipeline_types_and_presets_for_project(project_root).types
+        self._dept_vocab: set[str] = set(load_department_vocabulary())
+        self._selected_type_id: str | None = None
+        self._padding: int = 3
+
+        self._type_preview = QLabel("")
+        self._type_preview.setVisible(False)
+        self._type_preview.setWordWrap(True)
+        self._type_preview.setObjectName("DialogHelper")
+
+        self._type_button = QToolButton()
+        self._type_button.setPopupMode(QToolButton.InstantPopup)
+        self._type_button.setText("Select Type…")
+        self._type_menu = QMenu(self._type_button)
+        self._type_button.setMenu(self._type_menu)
+        self._build_type_menu()
+
+        self._numbers_input = _BatchNamesInput(placeholder="e.g. 10, 20, 30 or 10a, 20b")
+        self._numbers_input.textChanged.connect(self._update_preview_and_ok)
+
+        self._preview = QLabel("")
+        self._preview.setVisible(False)
+        self._preview.setWordWrap(True)
+        self._preview.setObjectName("DialogHelper")
+
+        self._warning = QLabel("")
+        self._warning.setVisible(False)
+        self._warning.setWordWrap(True)
+        self._warning.setObjectName("DialogWarning")
+
+        button_row = QWidget()
+        button_row_l = QHBoxLayout(button_row)
+        button_row_l.setContentsMargins(0, 0, 0, 0)
+        button_row_l.setSpacing(10)
+        self._ok_btn = QPushButton("Create Shots")
+        self._ok_btn.setObjectName("DialogPrimaryButton")
+        self._ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        button_row_l.addWidget(self._ok_btn)
+        button_row_l.addWidget(cancel_btn)
+        button_row_l.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(0)
+        layout.addWidget(
+            _field_block(
+                "Type",
+                self._type_button,
+                "Types are defined in Project → Types & Presets.",
+            )
+        )
+        layout.addSpacing(8)
+        layout.addWidget(self._type_preview)
+        layout.addSpacing(14)
+        layout.addWidget(
+            _field_block_with_preview(
+                "Shot Numbers",
+                self._numbers_input,
+                self._preview,
+                "One number per line or comma-separated. Optional suffix per number (e.g. 10a).",
+            )
+        )
+        layout.addWidget(self._warning)
+        layout.addSpacing(12)
+        layout.addWidget(button_row)
+
+        self.setFixedWidth(_BATCH_CREATE_DIALOG_WIDTH)
+
+        type_to_set = None
+        if self._initial_type_id and self._initial_type_id in self._types and _is_shot_type_id(self._initial_type_id):
+            type_to_set = self._initial_type_id
+        if type_to_set is None:
+            type_to_set = self._get_first_shot_type_id()
+        if type_to_set is not None:
+            self._set_type(type_to_set)
+        self._update_preview_and_ok()
+
+    def shot_names(self) -> list[str]:
+        type_def = self._types.get(self._selected_type_id or "")
+        names: list[str] = []
+        seen: set[str] = set()
+        for token in parse_comma_separated_tokens(self._numbers_input.text()):
+            final = final_shot_name_from_token(token, type_def, padding=self._padding)
+            if not final or final in seen:
+                continue
+            seen.add(final)
+            names.append(final)
+        return names
+
+    def selected_departments(self) -> list[str]:
+        t = self._types.get(self._selected_type_id or "")
+        if t is None:
+            return []
+        raw = t.departments
+        if not raw:
+            return []
+        if self._dept_vocab:
+            return [d for d in raw if d in self._dept_vocab]
+        return list(raw)
+
+    def create_subfolders(self) -> bool:
+        return _global_create_work_publish_subfolders_default()
+
+    def _build_type_menu(self) -> None:
+        self._type_menu.clear()
+        self._selected_type_id = None
+        allowed = [
+            (type_id, t)
+            for type_id, t in sorted(self._types.items(), key=lambda kv: kv[1].name.lower())
+            if _is_shot_type_id(type_id)
+        ]
+        self._type_button.setEnabled(bool(allowed))
+        if not allowed:
+            self._type_button.setText("No types")
+            return
+        self._type_button.setText("Select Type…")
+        for type_id, t in allowed:
+            act = QAction(t.name, self._type_menu)
+            act.triggered.connect(lambda checked=False, tid=type_id: self._set_type(tid))
+            self._type_menu.addAction(act)
+
+    def _get_first_shot_type_id(self) -> str | None:
+        allowed = [
+            (type_id, t)
+            for type_id, t in sorted(self._types.items(), key=lambda kv: kv[1].name.lower())
+            if _is_shot_type_id(type_id)
+        ]
+        return allowed[0][0] if allowed else None
+
+    def _set_type(self, type_id: str) -> None:
+        self._selected_type_id = type_id
+        t = self._types.get(type_id)
+        if t is None:
+            return
+        self._type_button.setText(t.name)
+        depts = self.selected_departments()
+        if depts:
+            self._type_preview.setText("Departments: " + " / ".join(depts))
+            self._type_preview.setVisible(True)
+        else:
+            self._type_preview.setText("Departments:")
+            self._type_preview.setVisible(True)
+        self._update_preview_and_ok()
+
+    def _shot_target_path(self, shot_name: str) -> Path | None:
+        if not shot_name:
+            return None
+        try:
+            struct_reg = StructureRegistry.for_project(self._project_root)
+            shots_folder = struct_reg.get_folder("shots")
+            return self._project_root / shots_folder / shot_name
+        except Exception:
+            return None
+
+    def _resolve_final_names(self) -> tuple[list[str], list[str], list[str]]:
+        type_def = self._types.get(self._selected_type_id or "")
+        tokens = parse_comma_separated_tokens(self._numbers_input.text())
+        valid: list[str] = []
+        invalid: list[str] = []
+        existing: list[str] = []
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+
+        for token in tokens:
+            final = final_shot_name_from_token(token, type_def, padding=self._padding)
+            if not final:
+                invalid.append(token)
+                continue
+            if final in seen:
+                duplicates.add(final)
+                continue
+            seen.add(final)
+            path = self._shot_target_path(final)
+            if path is not None and path.exists():
+                existing.append(final)
+                continue
+            valid.append(final)
+
+        if duplicates:
+            invalid.extend(sorted(duplicates))
+        return valid, invalid, existing
+
+    def _update_preview_and_ok(self) -> None:
+        valid, invalid, existing = self._resolve_final_names()
+        warnings: list[str] = []
+        if invalid:
+            warnings.append(f"Invalid or duplicate: {', '.join(invalid)}")
+        if existing:
+            warnings.append(f"Already exists: {', '.join(existing)}")
+        if warnings:
+            self._warning.setText("\n".join(warnings))
+            self._warning.setVisible(True)
+        else:
+            self._warning.setVisible(False)
+
+        if valid:
+            preview_text = f"Will create {len(valid)} shot(s): " + ", ".join(valid)
+            self._preview.setText(preview_text)
+            self._preview.setVisible(True)
+        else:
+            self._preview.setVisible(False)
+
+        self._ok_btn.setEnabled(bool(self._selected_type_id and valid))
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._numbers_input.setFocus()

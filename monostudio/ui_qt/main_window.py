@@ -52,7 +52,12 @@ from monostudio.core.project_trash import (
     retention_days_from_settings,
 )
 from monostudio.core.shell_open import open_folder as shell_open_folder
-from monostudio.ui_qt.create_entry_dialogs import CreateAssetDialog, CreateShotDialog
+from monostudio.ui_qt.create_entry_dialogs import (
+    BatchCreateAssetDialog,
+    BatchCreateShotDialog,
+    CreateAssetDialog,
+    CreateShotDialog,
+)
 from monostudio.core.inbox_reader import (
     add_to_inbox,
     append_inbox_distributed,
@@ -6633,10 +6638,20 @@ class MainWindow(FramelessMainWindow):
         create_asset = None
         create_shot = None
 
+        batch_create_asset = None
+        batch_create_shot = None
         if context == "Assets":
             create_asset = menu.addAction(lucide_icon("box", size=16, color_hex=MONOS_COLORS["text_label"]), "Create Asset…")
+            batch_create_asset = menu.addAction(
+                lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Batch Create Assets…",
+            )
         elif context == "Shots":
             create_shot = menu.addAction(lucide_icon("clapperboard", size=16, color_hex=MONOS_COLORS["text_label"]), "Create Shot…")
+            batch_create_shot = menu.addAction(
+                lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Batch Create Shots…",
+            )
 
         chosen = menu.exec(global_pos)
         if chosen is None:
@@ -6646,8 +6661,12 @@ class MainWindow(FramelessMainWindow):
             return
         if create_asset is not None and chosen == create_asset:
             self._create_asset()
+        if batch_create_asset is not None and chosen == batch_create_asset:
+            self._batch_create_assets()
         if create_shot is not None and chosen == create_shot:
             self._create_shot()
+        if batch_create_shot is not None and chosen == batch_create_shot:
+            self._batch_create_shots()
 
     @staticmethod
     def _is_safe_single_folder_name(name: str) -> bool:
@@ -6660,6 +6679,52 @@ class MainWindow(FramelessMainWindow):
         if any(ch in name for ch in ("/", "\\", ":", "\n", "\r", "\t")):
             return False
         return True
+
+    def _mkdir_pipeline_entry(
+        self,
+        target: Path,
+        departments: list[str],
+        *,
+        entity_kind: str,
+        create_subfolders: bool,
+    ) -> bool:
+        """Create asset/shot folder tree at target. Returns False on failure (best-effort rollback)."""
+        if self._project_root is None:
+            return False
+        dept_reg = DepartmentRegistry.for_project(self._project_root)
+        use_dcc_folders = read_use_dcc_folders(self._project_root)
+        created: list[Path] = []
+        try:
+            to_create: list[Path] = [target, target / "reference", target / "concept"]
+            for d in departments:
+                dept_folder = dept_reg.get_department_relative_path(d, entity_kind)
+                dept_dir = target / dept_folder
+                to_create.append(dept_dir)
+                if create_subfolders:
+                    if not use_dcc_folders:
+                        to_create.append(dept_dir / "work")
+                    to_create.append(dept_dir / "publish")
+
+            for p in to_create:
+                try:
+                    p.mkdir(parents=True, exist_ok=False)
+                    created.append(p)
+                except FileExistsError:
+                    continue
+        except OSError:
+            for p in reversed(created):
+                try:
+                    p.rmdir()
+                except OSError:
+                    pass
+            return False
+        return True
+
+    def _after_pipeline_entries_created(self) -> None:
+        self._entered_parent = None
+        self._rescan_project()
+        self._inspector.set_item(None)
+        QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
 
     def _create_asset(self) -> None:
         if self._project_root is None:
@@ -6679,51 +6744,62 @@ class MainWindow(FramelessMainWindow):
             return
 
         type_reg = TypeRegistry.for_project(self._project_root)
-        dept_reg = DepartmentRegistry.for_project(self._project_root)
         struct_reg = StructureRegistry.for_project(self._project_root)
         type_folder = type_reg.get_type_folder(asset_type)
         target = self._project_root / struct_reg.get_folder("assets") / type_folder / asset_name
         if target.exists():
             return
 
-        created: list[Path] = []
-        try:
-            use_dcc_folders = read_use_dcc_folders(self._project_root)
-            to_create: list[Path] = [target, target / "reference", target / "concept"]
-            for d in departments:
-                # Nested: relative path can be multi-segment (e.g. 01_modelling/01_sculpt) when mapping has parent.
-                dept_folder = dept_reg.get_department_relative_path(d, "asset")
-                dept_dir = target / dept_folder
-                to_create.append(dept_dir)
-                if create_subfolders:
-                    # Only department + work + publish. DCC subfolders (dept/<dcc>/work) are created on demand when user does "Create New…".
-                    if not use_dcc_folders:
-                        to_create.append(dept_dir / "work")
-                    to_create.append(dept_dir / "publish")
-
-            for p in to_create:
-                try:
-                    p.mkdir(parents=True, exist_ok=False)
-                    created.append(p)
-                except FileExistsError:
-                    # Folder already exists: skip silently.
-                    continue
-        except OSError:
-            # Best-effort rollback inside target only (no dialogs).
-            for p in reversed(created):
-                try:
-                    p.rmdir()
-                except OSError:
-                    pass
+        if not self._mkdir_pipeline_entry(
+            target, departments, entity_kind="asset", create_subfolders=create_subfolders
+        ):
             return
 
-        # After creation: rescan so app_state has the new asset; commit_immediate() emits
-        # assetsChanged and apply_assets_diff updates the grid incrementally (no full reload = no flicker).
-        self._entered_parent = None
-        self._rescan_project()
-        self._inspector.set_item(None)
-        QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
+        self._after_pipeline_entries_created()
         notification_service.success(f"Created Asset '{asset_name}'.")
+
+    def _batch_create_assets(self) -> None:
+        if self._project_root is None:
+            return
+
+        dialog = BatchCreateAssetDialog(
+            self._project_root, self, initial_type_id=self.current_type
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        asset_type = dialog.asset_type()
+        asset_names = dialog.asset_names()
+        departments = dialog.selected_departments()
+        create_subfolders = dialog.create_subfolders()
+        if not asset_type or not asset_names:
+            return
+
+        type_reg = TypeRegistry.for_project(self._project_root)
+        struct_reg = StructureRegistry.for_project(self._project_root)
+        type_folder = type_reg.get_type_folder(asset_type)
+        assets_root = self._project_root / struct_reg.get_folder("assets") / type_folder
+
+        created_names: list[str] = []
+        for asset_name in asset_names:
+            target = assets_root / asset_name
+            if target.exists():
+                continue
+            if not self._is_safe_single_folder_name(asset_name):
+                continue
+            if self._mkdir_pipeline_entry(
+                target, departments, entity_kind="asset", create_subfolders=create_subfolders
+            ):
+                created_names.append(asset_name)
+
+        if not created_names:
+            return
+
+        self._after_pipeline_entries_created()
+        if len(created_names) == 1:
+            notification_service.success(f"Created Asset '{created_names[0]}'.")
+        else:
+            notification_service.success(f"Created {len(created_names)} assets.")
 
     def _create_shot(self) -> None:
         if self._project_root is None:
@@ -6746,41 +6822,51 @@ class MainWindow(FramelessMainWindow):
         if target.exists():
             return
 
-        dept_reg = DepartmentRegistry.for_project(self._project_root)
-        use_dcc_folders = read_use_dcc_folders(self._project_root)
-        created: list[Path] = []
-        try:
-            to_create: list[Path] = [target, target / "reference", target / "concept"]
-            for d in departments:
-                # Nested: relative path can be multi-segment (e.g. 01_modelling/01_sculpt) when mapping has parent.
-                dept_folder = dept_reg.get_department_relative_path(d, "shot")
-                dept_dir = target / dept_folder
-                to_create.append(dept_dir)
-                if create_subfolders:
-                    # Only department + work + publish. DCC subfolders (dept/<dcc>/work) are created on demand when user does "Create New…".
-                    if not use_dcc_folders:
-                        to_create.append(dept_dir / "work")
-                    to_create.append(dept_dir / "publish")
-
-            for p in to_create:
-                try:
-                    p.mkdir(parents=True, exist_ok=False)
-                    created.append(p)
-                except FileExistsError:
-                    continue
-        except OSError:
-            for p in reversed(created):
-                try:
-                    p.rmdir()
-                except OSError:
-                    pass
+        if not self._mkdir_pipeline_entry(
+            target, departments, entity_kind="shot", create_subfolders=create_subfolders
+        ):
             return
 
-        # After creation: rescan so app_state has the new shot; commit_immediate() emits
-        # shotsChanged and apply_assets_diff updates the grid incrementally (no full reload = no flicker).
-        self._entered_parent = None
-        self._rescan_project()
-        self._inspector.set_item(None)
-        QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
+        self._after_pipeline_entries_created()
         notification_service.success(f"Created Shot '{shot_name}'.")
+
+    def _batch_create_shots(self) -> None:
+        if self._project_root is None:
+            return
+
+        dialog = BatchCreateShotDialog(
+            self._project_root, self, initial_type_id=self.current_type
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        shot_names = dialog.shot_names()
+        departments = dialog.selected_departments()
+        create_subfolders = dialog.create_subfolders()
+        if not shot_names:
+            return
+
+        struct_reg = StructureRegistry.for_project(self._project_root)
+        shots_root = self._project_root / struct_reg.get_folder("shots")
+
+        created_names: list[str] = []
+        for shot_name in shot_names:
+            target = shots_root / shot_name
+            if target.exists():
+                continue
+            if not self._is_safe_single_folder_name(shot_name):
+                continue
+            if self._mkdir_pipeline_entry(
+                target, departments, entity_kind="shot", create_subfolders=create_subfolders
+            ):
+                created_names.append(shot_name)
+
+        if not created_names:
+            return
+
+        self._after_pipeline_entries_created()
+        if len(created_names) == 1:
+            notification_service.success(f"Created Shot '{created_names[0]}'.")
+        else:
+            notification_service.success(f"Created {len(created_names)} shots.")
 

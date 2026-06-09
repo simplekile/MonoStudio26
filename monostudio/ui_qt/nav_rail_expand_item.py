@@ -38,24 +38,17 @@ _FLYOUT_RADIUS = 8
 
 _PILL_ACTIVE_FG = MONOS_COLORS["pill_segment_active_fg"]
 
-# Nav rail: unified Electric Blue for primary nav; neutral group shell for utility/footer;
-# trash keeps red (destructive). Matches sidebar + pill_segment_active tokens.
+# Nav rail item states: Electric Blue active/hover; trash keeps red when selected.
+# Group pill shells (NavRailGroup) share one neutral gray — no per-group tint.
+_GROUP_PILL_BG_RGBA = (255, 255, 255, 16)
+
 _NAV_ICON_COLORS: dict[str, str] = {
     "inactive_icon": "#d4d4d8",
     "hover_icon": "#e4e4e7",
     "active_icon": "#fafafa",
 }
 
-_NAV_BLUE_STYLE: dict[str, object] = {
-    "inactive_bg": (37, 99, 235, 40),
-    "hover_bg": "#1e3a8a",
-    "active_bg": MONOS_COLORS["blue_600"],
-    "active_hover_bg": MONOS_COLORS["blue_500"],
-    **_NAV_ICON_COLORS,
-}
-
-_NAV_UTILITY_STYLE: dict[str, object] = {
-    "inactive_bg": (255, 255, 255, 16),
+_NAV_ITEM_STYLE: dict[str, object] = {
     "hover_bg": "#1e3a8a",
     "active_bg": MONOS_COLORS["blue_600"],
     "active_hover_bg": MONOS_COLORS["blue_500"],
@@ -63,13 +56,12 @@ _NAV_UTILITY_STYLE: dict[str, object] = {
 }
 
 _NAV_GROUP_STYLES: dict[str, dict[str, object]] = {
-    "home": _NAV_BLUE_STYLE,
-    "scope": _NAV_BLUE_STYLE,
-    "workflow": _NAV_BLUE_STYLE,
-    "utility": _NAV_UTILITY_STYLE,
-    "bottom": {**_NAV_UTILITY_STYLE, "inactive_bg": (255, 255, 255, 14)},
+    "home": _NAV_ITEM_STYLE,
+    "scope": _NAV_ITEM_STYLE,
+    "workflow": _NAV_ITEM_STYLE,
+    "utility": _NAV_ITEM_STYLE,
+    "bottom": _NAV_ITEM_STYLE,
     "trash": {
-        "inactive_bg": (239, 68, 68, 32),
         "hover_bg": "#7f1d1d",
         "active_bg": "#dc2626",
         "active_hover_bg": "#ef4444",
@@ -84,9 +76,8 @@ def _nav_group_style(nav_group: str) -> dict[str, object]:
     return _NAV_GROUP_STYLES.get(nav_group, _NAV_GROUP_STYLES["utility"])
 
 
-def _group_inactive_color(nav_group: str) -> QColor:
-    style = _nav_group_style(nav_group)
-    r, g, b, a = style["inactive_bg"]  # type: ignore[misc]
+def _group_inactive_color(_nav_group: str = "") -> QColor:
+    r, g, b, a = _GROUP_PILL_BG_RGBA
     return QColor(int(r), int(g), int(b), int(a))
 
 

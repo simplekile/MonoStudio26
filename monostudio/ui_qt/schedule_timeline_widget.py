@@ -146,6 +146,8 @@ _RANGE_OUT_HEX = "#ef4444"
 _RANGE_FILL = QColor(16, 185, 129, 12)
 _OUTSIDE_RANGE_FILL = QColor(0, 0, 0, 28)
 _DEADLINE_HEADER = QColor("#ef4444")
+_SUNDAY_HEADER = QColor("#f87171")
+_MONTH_START_HEADER = QColor("#d4d4d8")
 
 TOOL_SELECT = "select"
 TOOL_DRAW = "draw"
@@ -904,6 +906,14 @@ class _GanttCanvas(QWidget):
         full = _WEEKDAY_ABBR[d.weekday()]
         return full[0] if abbreviated else full
 
+    @staticmethod
+    def _month_label_pen(d: date, *, is_deadline: bool) -> QColor:
+        if is_deadline:
+            return _DEADLINE_HEADER
+        if d.day == 1:
+            return _MONTH_START_HEADER
+        return QColor("#71717a")
+
     def _paint_day_header_cell(
         self,
         p: QPainter,
@@ -917,8 +927,9 @@ class _GanttCanvas(QWidget):
     ) -> None:
         inset_x, text_w = self._day_header_text_inset(col_w)
         tx = x + inset_x
+        is_sunday = d.weekday() == 6
         if self._show_weekday_in_day_header():
-            p.setPen(QColor("#71717a"))
+            p.setPen(_SUNDAY_HEADER if is_sunday else QColor("#71717a"))
             p.setFont(monos_font("Inter", 9))
             p.drawText(
                 QRect(tx, _HEADER_DAY_TOP, text_w, _HEADER_WEEKDAY_H),
@@ -930,7 +941,10 @@ class _GanttCanvas(QWidget):
         else:
             num_top = _HEADER_DAY_TOP
             num_h = _HEADER_DAY_H
-        p.setPen(day_pen)
+        num_pen = day_pen
+        if is_sunday and day_pen == QColor("#52525b"):
+            num_pen = _SUNDAY_HEADER
+        p.setPen(num_pen)
         p.setFont(day_font or monos_font("JetBrains Mono", 9))
         p.drawText(
             QRect(tx, num_top, text_w, num_h),
@@ -1309,7 +1323,6 @@ class _GanttCanvas(QWidget):
                 p.setPen(major_pen)
                 p.drawLine(x, grid_top, x, _HEADER_H)
 
-        month_pen = QColor("#71717a")
         week_pen = QColor("#52525b")
         month_font = monos_font("Inter", 9, QFont.Weight.DemiBold)
         week_font = monos_font("JetBrains Mono", 9)
@@ -1322,7 +1335,7 @@ class _GanttCanvas(QWidget):
             band_w = max(1, x1 - x0)
 
             if wnum == 1:
-                p.setPen(month_pen)
+                p.setPen(_MONTH_START_HEADER)
                 p.setFont(month_font)
                 month_label = ws.strftime("%b %Y").upper()
                 month_end = min(self._month_last_day(ws), self._view_end)
@@ -1375,7 +1388,7 @@ class _GanttCanvas(QWidget):
             col_w = col_w_base
             is_deadline = pe is not None and d == pe
             day_pen = _DEADLINE_HEADER if is_deadline else QColor("#52525b")
-            month_pen = _DEADLINE_HEADER if is_deadline else QColor("#71717a")
+            month_pen = self._month_label_pen(d, is_deadline=is_deadline)
 
             if dw >= 18:
                 if d.day == 1 or i == 0:
