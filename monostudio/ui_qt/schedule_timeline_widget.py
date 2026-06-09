@@ -120,6 +120,7 @@ _HEADER_DAY_GAP = 3
 _HEADER_DAY_NUM_H = 13  # fits JetBrains Mono 9 without vertical clip
 _HEADER_DAY_H = _HEADER_WEEKDAY_H + _HEADER_DAY_GAP + _HEADER_DAY_NUM_H
 _HEADER_BOTTOM_PAD = 4
+_HEADER_DAY_UNDERLINE_Y = _HEADER_DAY_TOP + _HEADER_DAY_H + 1
 _HEADER_H = _HEADER_DAY_TOP + _HEADER_DAY_H + _HEADER_BOTTOM_PAD
 # Vertical marker lines in the header stop above the day-number row.
 _HEADER_MARKER_LINE_BOTTOM = _HEADER_DAY_TOP - 1
@@ -486,6 +487,8 @@ def _build_visible_rows(
 # (entity_kind, entity_rel, department or None for all depts on entity)
 _ScheduleHighlight = tuple[str, str, str | None]
 
+_SELECTABLE_ROW_MODES = frozenset({"collapsed", "header", "dept", "dept_lane"})
+
 _HIGHLIGHT_FILL = QColor(37, 99, 235, 42)
 _HIGHLIGHT_EDGE = QColor("#60a5fa")
 
@@ -523,6 +526,7 @@ class _GanttCanvas(QWidget):
         self._drag_dates: dict[tuple[str, str, str], tuple[date, date]] = {}
         self._drag_collapsed_orig: dict[tuple[str, str, str], tuple[date, date]] = {}
         self._hover_row: int | None = None
+        self._hover_col: int | None = None  # day index in view
         self._hover_bar: tuple[int, str] | None = None  # (visible_index, dept)
         self._highlight: _ScheduleHighlight | None = None
         self._highlight_entities: frozenset[tuple[str, str]] | None = None
@@ -982,9 +986,6 @@ class _GanttCanvas(QWidget):
         i = (today - self._view_start).days
         x = int(i * self._day_w)
         col_w = max(int(self._day_w), 1)
-        underline_y = _HEADER_DAY_TOP + _HEADER_DAY_H - 3
-        p.setPen(QPen(blue, 2))
-        p.drawLine(x + 3, underline_y, x + col_w - 3, underline_y)
         self._paint_day_header_cell(
             p,
             x,
@@ -994,6 +995,8 @@ class _GanttCanvas(QWidget):
             abbrev_weekday=self._weekday_abbreviated_mode(col_w),
             day_font=monos_font("JetBrains Mono", 9, QFont.Weight.DemiBold),
         )
+        p.setPen(QPen(blue, 2))
+        p.drawLine(x + 3, _HEADER_DAY_UNDERLINE_Y, x + col_w - 3, _HEADER_DAY_UNDERLINE_Y)
 
     def _paint_deadline_marker(self, p: QPainter, h: int, *, header: bool) -> None:
         x = self._deadline_x()
@@ -1009,6 +1012,14 @@ class _GanttCanvas(QWidget):
         day_index = int(rel / self._day_w)
         day_index = max(0, min(day_index, self._num_days() - 1))
         return self._view_start + timedelta(days=day_index)
+
+    def _col_at_x(self, x: float) -> int | None:
+        if x < 0:
+            return None
+        day_index = int(x / self._day_w)
+        if day_index < 0 or day_index >= self._num_days():
+            return None
+        return day_index
 
     def _pointer_to_date(self, event: QMouseEvent) -> date:
         if self._is_label_pane() and self._gantt is not None:
@@ -1508,6 +1519,22 @@ class _GanttCanvas(QWidget):
             self._partner._hover_row = row
             self._partner.update()
 
+    def _set_hover_col(self, col: int | None) -> None:
+        panes: list[_GanttCanvas] = [self]
+        if self._gantt is not None:
+            panes.extend([self._gantt._timeline_pane, self._gantt._header_pane])
+        if self._partner is not None:
+            panes.append(self._partner)
+        seen: set[int] = set()
+        for pane in panes:
+            pid = id(pane)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if pane._hover_col != col:
+                pane._hover_col = col
+                pane.update()
+
     def _sync_highlight(self, highlight: _ScheduleHighlight | None) -> None:
         self._highlight = highlight
         self._highlight_entities = None
@@ -1542,9 +1569,37 @@ class _GanttCanvas(QWidget):
         mode = self._visible[row].mode
         if mode in ("scope_separator", "dept_lane_header"):
             return True
-        if not self._is_label_pane() and self._tool == TOOL_SELECT and self._hit_test(pos) is None:
+        if (
+            not self._is_label_pane()
+            and self._tool == TOOL_SELECT
+            and mode not in _SELECTABLE_ROW_MODES
+            and self._hit_test(pos) is None
+        ):
             return True
         return False
+
+    def _try_select_visible_row(self, row: int) -> bool:
+        """Apply entity row highlight + Inspector selection for a visible row index."""
+        if row < 0 or row >= len(self._visible):
+            return False
+        display = self._visible[row]
+        if display.mode not in _SELECTABLE_ROW_MODES:
+            return False
+        group = display.group
+        if group is None:
+            return False
+        dep_h: str | None = None
+        if display.dept is not None:
+            dep_h = (display.dept.department or "").strip() or None
+        if self._gantt is not None:
+            self._gantt.set_entity_highlight(group.entity_kind, group.entity_rel, dep_h)
+        kind = group.entity_kind
+        rel = group.entity_rel
+        if display.mode == "dept_lane" and display.dept is not None:
+            kind = display.dept.entity_kind
+            rel = display.dept.entity_rel
+        self.entity_row_selected.emit(kind, rel)
+        return True
 
     @staticmethod
     def _norm_entity_key(entity_kind: str, entity_rel: str) -> tuple[str, str]:
@@ -1586,6 +1641,11 @@ class _GanttCanvas(QWidget):
     def _paint_row_highlight(self, p: QPainter, y: int, row_w: int) -> None:
         p.fillRect(0, y, row_w, _ROW_H, _HIGHLIGHT_FILL)
         p.fillRect(0, y, 3, _ROW_H, _HIGHLIGHT_EDGE)
+
+    def _paint_col_highlight(self, p: QPainter, col: int, h: int) -> None:
+        x0 = int(col * self._day_w)
+        col_w = max(1, int(self._day_w))
+        p.fillRect(x0, 0, col_w, h, QColor(255, 255, 255, 10))
 
     @staticmethod
     def _paint_range_edge_marker(
@@ -1803,7 +1863,6 @@ class _GanttCanvas(QWidget):
             return
         today = date.today()
         purple = QColor("#a855f7")
-        underline_y = _HEADER_DAY_TOP + _HEADER_DAY_H - 3
         seen: set[date] = set()
         for m in self._schedule.milestones:
             md = self._parse(m.date)
@@ -1816,7 +1875,7 @@ class _GanttCanvas(QWidget):
             x = int(i * self._day_w)
             col_w = max(int(self._day_w), 1)
             p.setPen(QPen(purple, 2))
-            p.drawLine(x + 3, underline_y, x + col_w - 3, underline_y)
+            p.drawLine(x + 3, _HEADER_DAY_UNDERLINE_Y, x + col_w - 3, _HEADER_DAY_UNDERLINE_Y)
 
     def _paint_header_pane(self, p: QPainter, w: int, h: int) -> None:
         p.fillRect(self.rect(), QColor("#0d0d0f"))
@@ -1831,6 +1890,9 @@ class _GanttCanvas(QWidget):
 
         p.setPen(QPen(QColor("#3f3f46"), 1))
         p.drawLine(0, h - 1, w, h - 1)
+
+        if self._hover_col is not None:
+            self._paint_col_highlight(p, self._hover_col, h)
 
     def _paint_label_pane(self, p: QPainter, w: int, h: int) -> None:
         p.fillRect(self.rect(), QColor("#141416"))
@@ -2014,6 +2076,9 @@ class _GanttCanvas(QWidget):
                     )
 
         self._paint_filler_rows(p, w, h)
+
+        if self._hover_col is not None:
+            self._paint_col_highlight(p, self._hover_col, h)
 
         if self._draw_state is not None and self._pane == _PANE_TIMELINE:
             preview = self._draw_preview_rect(self._draw_state)
@@ -2299,6 +2364,10 @@ class _GanttCanvas(QWidget):
         if self._gantt is not None and self._gantt._forward_nav_mouse_move(event):
             return
 
+        if self._pane == _PANE_HEADER:
+            self._set_hover_col(self._col_at_x(event.position().x()))
+            return
+
         if self._is_label_pane():
             if self._gantt is not None and self._gantt.is_label_column_resizing():
                 self._gantt.update_label_column_resize(int(event.globalPosition().x()))
@@ -2309,6 +2378,7 @@ class _GanttCanvas(QWidget):
             row = self._row_at_y(event.position().y())
             self._hover_row = row
             self._sync_hover_row(row)
+            self._set_hover_col(None)
             if on_resize_edge:
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
                 self.setToolTip("Drag to resize item column")
@@ -2349,9 +2419,11 @@ class _GanttCanvas(QWidget):
                     is_wave_row=self._draw_state.is_wave_row,
                 )
             )
+            self._set_hover_col(self._col_at_x(event.position().x()))
             return
 
         if self._drag is not None:
+            self._set_hover_col(self._col_at_x(event.position().x()))
             if self._drag_orig_start is None or self._drag_orig_due is None:
                 return
             delta = int(round((event.position().x() - self._drag_origin_x) / self._day_w))
@@ -2413,6 +2485,7 @@ class _GanttCanvas(QWidget):
         row = self._row_at_y(event.position().y())
         self._hover_row = row
         self._sync_hover_row(row)
+        self._set_hover_col(self._col_at_x(event.position().x()))
         hit = self._hit_test(event.position().toPoint())
         self._hover_bar = (hit.visible_index, hit.department) if hit else None
         if hit:
@@ -2529,25 +2602,7 @@ class _GanttCanvas(QWidget):
                     if self._chevron_rect(row).contains(pos):
                         self._toggle_expand(group.key)
                         return
-                if group is not None and display.mode in (
-                    "collapsed",
-                    "header",
-                    "dept",
-                    "dept_lane",
-                ):
-                    dep_h: str | None = None
-                    if display.dept is not None:
-                        dep_h = (display.dept.department or "").strip() or None
-                    if self._gantt is not None:
-                        self._gantt.set_entity_highlight(
-                            group.entity_kind, group.entity_rel, dep_h
-                        )
-                    kind = group.entity_kind
-                    rel = group.entity_rel
-                    if display.mode == "dept_lane" and display.dept is not None:
-                        kind = display.dept.entity_kind
-                        rel = display.dept.entity_rel
-                    self.entity_row_selected.emit(kind, rel)
+                self._try_select_visible_row(row)
             return
 
         if self._tool == TOOL_DRAW and row is not None and self._schedule_editable():
@@ -2571,6 +2626,9 @@ class _GanttCanvas(QWidget):
 
         if self._tool != TOOL_SELECT:
             return
+
+        if row is not None:
+            self._try_select_visible_row(row)
 
         if not self._schedule_editable():
             return
@@ -3173,6 +3231,7 @@ class _GanttCanvas(QWidget):
         if not self._is_label_pane():
             self._hover_bar = None
         self._sync_hover_row(None)
+        self._set_hover_col(None)
         if self._gantt is not None:
             self._gantt._apply_tool_cursors()
         else:
@@ -3403,6 +3462,7 @@ class ScheduleGanttWidget(QWidget):
             self.entity_clear_plan_requested.emit
         )
         self._label_pane.entity_row_selected.connect(self.entity_row_selected.emit)
+        self._timeline_pane.entity_row_selected.connect(self.entity_row_selected.emit)
         self._label_pane.entity_row_cleared.connect(self.entity_row_cleared.emit)
         self._timeline_pane.entity_row_cleared.connect(self.entity_row_cleared.emit)
         self._timeline_pane.department_skip_toggle_requested.connect(

@@ -1,16 +1,13 @@
-# MonoStudio 26 — Release v26.15.3
+# MonoStudio 26 — Release v26.15.4
 
 ## Highlights
 
-- **Create Asset / Shot**: Dialog thiết kế lại — preview tên theo type/prefix, chọn department, tùy chọn work/publish subfolders.
-- **Batch create**: Tạo nhiều asset hoặc shot một lần (danh sách tên, comma-separated); menu/context từ Main View.
-- **Schedule timeline**: Tinh chỉnh nhỏ label/resize; nav rail hover.
+- **Schedule timeline**: Hover highlight theo cột ngày (header + Gantt); click vùng timeline chọn entity → Inspector; today/milestone underline căn đúng.
 
 ## Changes in this release
 
-- feat: `create_entry_dialogs.py` — `BatchCreateAssetDialog`, `BatchCreateShotDialog`, name preview helpers.
-- feat: `main_window.py` — `_batch_create_assets`, `_batch_create_shots`, shared post-create flow.
-- fix/style: `schedule_timeline_widget.py`, `nav_rail_expand_item.py`, `style.py`.
+- feat: `schedule_timeline_widget.py` — `_hover_col`, `_try_select_visible_row`, timeline `entity_row_selected` wiring.
+- fix: header day underline Y; chọn row trên timeline pane (không chỉ label).
 
 ## Install
 
