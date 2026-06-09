@@ -21,6 +21,7 @@ from monostudio.core.schedule_planner import (
     STATUS_EXCLUDED,
     STATUS_PROGRESS,
     build_planned_bars,
+    collect_overdue_entity_keys,
     collect_upcoming_due_rows,
     count_overdue_bars,
 )
@@ -37,6 +38,7 @@ class DashboardNoteRow:
     author_id: str | None
     text: str
     department: str = ""  # note department id (empty = legacy / general)
+    mentions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,12 +64,14 @@ class DashboardSnapshot:
     shots_count: int
     open_notes_count: int
     mention_notes_count: int
+    unread_mention_count: int  # unread @mentions in mention_inbox (not yet viewed)
     overdue_count: int
+    overdue_entities: tuple[tuple[str, str], ...]  # (entity_kind, entity_rel)
     unscheduled_count: int
     unscheduled_entities: tuple[tuple[str, str], ...]  # (entity_kind, entity_rel)
     allocation_count: int
     open_notes: tuple[DashboardNoteRow, ...]
-    mention_notes: tuple[DashboardNoteRow, ...]  # unread @mentions for signed-in user
+    mention_notes: tuple[DashboardNoteRow, ...]  # open notes @mentioning signed-in user
     upcoming_due: tuple  # UpcomingDueRow
     # Pipeline health (derived from planned bars)
     total_bars: int = 0
@@ -111,6 +115,7 @@ def collect_open_notes(
                     author_id=entry.author_id,
                     text=entry_preview_text(entry),
                     department=normalize_note_department_id(entry.department),
+                    mentions=entry.mentions,
                 )
             )
     for shot in shots:
@@ -129,66 +134,34 @@ def collect_open_notes(
                     author_id=entry.author_id,
                     text=entry_preview_text(entry),
                     department=normalize_note_department_id(entry.department),
+                    mentions=entry.mentions,
                 )
             )
     rows.sort(key=lambda r: r.at, reverse=True)
     return rows[:limit]
 
 
-def _department_for_note(entity_path: Path, note_id: str) -> str:
-    nid = (note_id or "").strip()
-    if not nid:
-        return ""
-    try:
-        for entry in read_item_comments(entity_path):
-            if entry.id == nid:
-                return normalize_note_department_id(entry.department)
-    except OSError:
-        pass
-    return ""
-
-
-def collect_mention_notes(
-    project_root: Path,
-    user_id: str,
-    *,
-    limit: int = 50,
-) -> list[DashboardNoteRow]:
+def count_unread_mentions(project_root: Path, user_id: str) -> int:
     """Unread @mention inbox rows for ``user_id`` (same source as the bell)."""
     from monostudio.core.mention_inbox import unread_for_user
 
     uid = (user_id or "").strip()
     if not uid:
+        return 0
+    return len(unread_for_user(Path(project_root), uid))
+
+
+def collect_mention_notes(
+    open_notes: list[DashboardNoteRow],
+    user_id: str,
+    *,
+    limit: int = 50,
+) -> list[DashboardNoteRow]:
+    """Open notes whose @mentions include ``user_id`` (Recent Notes filter)."""
+    uid = (user_id or "").strip()
+    if not uid:
         return []
-    root = Path(project_root)
-    rows: list[DashboardNoteRow] = []
-    for item in unread_for_user(root, uid):
-        rel = (item.item_rel or "").strip().replace("\\", "/")
-        if not rel:
-            continue
-        try:
-            entity_path = (root / rel).resolve()
-        except OSError:
-            entity_path = root / rel
-        if not entity_path.is_dir():
-            continue
-        kind = "shot" if rel.startswith("shots/") else "asset"
-        name = item.item_display or Path(rel).name
-        text = (item.snippet or "").strip() or "Mentioned you"
-        rows.append(
-            DashboardNoteRow(
-                entity_kind=kind,
-                entity_name=name,
-                entity_path=entity_path,
-                comment_id=item.note_id,
-                at=item.at,
-                author=item.from_name or "Someone",
-                author_id=item.from_user_id or None,
-                text=text,
-                department=_department_for_note(entity_path, item.note_id),
-            )
-        )
-    rows.sort(key=lambda r: r.at, reverse=True)
+    rows = [n for n in open_notes if uid in n.mentions]
     return rows[:limit]
 
 
@@ -247,12 +220,14 @@ def build_dashboard_snapshot(
     schedule: ProjectSchedule = read_project_schedule(root)
     open_notes = collect_open_notes(root, assets, shots, workspace_root=workspace_root)
     mention_notes: list[DashboardNoteRow] = []
+    unread_mention_count = 0
     if workspace_root is not None:
         from monostudio.core.user_identity import get_current_user
 
         user = get_current_user(workspace_root)
         if user is not None:
-            mention_notes = collect_mention_notes(root, user.id)
+            mention_notes = collect_mention_notes(open_notes, user.id)
+            unread_mention_count = count_unread_mentions(root, user.id)
     shot_rels = [_rel_path(root, Path(s.path)) for s in shots]
     asset_rels = [_rel_path(root, Path(a.path)) for a in assets]
 
@@ -299,7 +274,9 @@ def build_dashboard_snapshot(
         shots_count=len(shots),
         open_notes_count=len(open_notes),
         mention_notes_count=len(mention_notes),
+        unread_mention_count=unread_mention_count,
         overdue_count=overdue_count,
+        overdue_entities=tuple(collect_overdue_entity_keys(bars)),
         unscheduled_entities=tuple(
             unscheduled_keys := collect_unscheduled_entity_keys(
                 schedule,

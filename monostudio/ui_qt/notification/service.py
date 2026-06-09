@@ -72,6 +72,7 @@ class _NotificationService(QObject):
                 main_view=cls._main_view,
             )
             cls._overlay.setGeometry(cls._main_window.rect())
+            cls._overlay.installEventFilter(cls._main_window)
             cls._overlay.raise_()
             cls._overlay.show()
         return cls._overlay
@@ -149,6 +150,19 @@ class _NotificationService(QObject):
         cls._notify("success", message, category=category)
 
     @classmethod
+    def operational_success(cls, message: str) -> None:
+        """Important user action: activity log + toast (not footer-only)."""
+        msg = (message or "").strip()
+        if not msg:
+            return
+        activity_log.append(msg, level="success")
+        overlay = cls._get_overlay()
+        if overlay is None:
+            return
+        overlay.show_toast("success", msg, category="general")
+        overlay.raise_()
+
+    @classmethod
     def warning(cls, message: str, *, category: str = "general") -> None:
         cls._notify("warning", message, category=category)
 
@@ -204,13 +218,47 @@ class _NotificationService(QObject):
 
         if len(pending) == 1:
             _mid, name = pending[0]
-            body = f"{name} mentioned you"
+            from monostudio.core.notification_copy import pick_copy
+
+            body = pick_copy(f"{name} đã nhắc bạn", f"{name} mentioned you")
         else:
             body = aggregated_mention_popup_message([name for _, name in pending])
 
         if cls._show_mention_popup_message(body, toast_type=toast_type):
             for mid, _ in pending:
                 cls._mention_popup_shown.add(mid)
+
+    @classmethod
+    def deliver_assign_popup_batch(
+        cls,
+        items: list[tuple[str, str]],
+        *,
+        toast_type: ToastType = "info",
+    ) -> None:
+        """One popup for a batch of unread schedule assignments."""
+        from monostudio.core.notification_copy import pick_copy
+
+        pending = [
+            ((aid or "").strip(), (name or "").strip() or "Someone")
+            for aid, name in items
+            if (aid or "").strip() and (aid or "").strip() not in cls._mention_popup_shown
+        ]
+        if not pending:
+            return
+
+        if len(pending) == 1:
+            _aid, name = pending[0]
+            body = pick_copy(f"{name} đã giao việc cho bạn", f"{name} assigned work to you")
+        else:
+            names = [name for _, name in pending]
+            body = pick_copy(
+                f"{names[0]} và người khác đã giao việc cho bạn +{len(pending) - 1}",
+                f"{names[0]} and others assigned work to you +{len(pending) - 1}",
+            )
+
+        if cls._show_mention_popup_message(body, toast_type=toast_type):
+            for aid, _ in pending:
+                cls._mention_popup_shown.add(aid)
 
     @classmethod
     def deliver_mention_popup(
@@ -246,11 +294,15 @@ class _NotificationService(QObject):
         if read or not show_popup:
             return
         mid = ""
+        aid = ""
         name = "Someone"
         if payload is not None:
             mid = (payload.mention_inbox_id or "").strip()
+            aid = (payload.assign_inbox_id or "").strip()
             name = (payload.from_name or "").strip() or name
-        if mid:
+        if aid:
+            cls.deliver_assign_popup_batch([(aid, name)], toast_type=toast_type)
+        elif mid:
             cls.deliver_mention_popup_batch([(mid, name)], toast_type=toast_type)
         else:
             cls.deliver_mention_popup(message, mention_inbox_id=mid, toast_type=toast_type)

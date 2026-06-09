@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings, QTimer, Signal
+from PySide6.QtCore import Qt, QSettings, QSize, QTimer, Signal
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -92,6 +93,7 @@ class SchedulePageWidget(QWidget):
     """Deadline allocation timeline — full-page schedule management."""
 
     schedule_changed = Signal()
+    back_to_dashboard_requested = Signal()
     sidebar_department_sync_requested = Signal(object)  # str | None — wave drilldown → sidebar highlight
     entity_row_selected = Signal(str, str)  # entity_kind, entity_rel → Inspector
     entity_row_cleared = Signal()  # deselect timeline row / Inspector
@@ -113,14 +115,29 @@ class SchedulePageWidget(QWidget):
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self._on_autosave_tick)
+        self._schedule_editable = True
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        # --- Page header: title + last-saved status (left) | view toggle + options (right) ---
+        # --- Page header: back + title + last-saved status (left) | view toggle + options (right) ---
         header = QHBoxLayout()
         header.setSpacing(8)
+
+        self._btn_back_dashboard = QToolButton(self)
+        self._btn_back_dashboard.setObjectName("ScheduleHeaderActionBtn")
+        self._btn_back_dashboard.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._btn_back_dashboard.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_back_dashboard.setToolTip("Back to Dashboard")
+        _back_ic = lucide_icon("chevron-left", size=16, color_hex=MONOS_COLORS["text_label"])
+        if not _back_ic.isNull():
+            self._btn_back_dashboard.setIcon(_back_ic)
+            self._btn_back_dashboard.setIconSize(QSize(16, 16))
+        self._btn_back_dashboard.setText("Dashboard")
+        self._btn_back_dashboard.clicked.connect(self.back_to_dashboard_requested.emit)
+        header.addWidget(self._btn_back_dashboard, 0, Qt.AlignmentFlag.AlignVCenter)
+
         title = QLabel("Schedule", self)
         title.setFont(monos_font("Inter", 20, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {MONOS_COLORS.get('text_primary', '#fafafa')};")
@@ -320,6 +337,8 @@ class SchedulePageWidget(QWidget):
         self._sync_wave_draw_controls()
 
     def _activate_draw_tool(self) -> None:
+        if not self._schedule_editable:
+            return
         self._current_tool = TOOL_DRAW
         self._gantt.set_tool(TOOL_DRAW)
         self._sync_wave_draw_controls()
@@ -338,25 +357,30 @@ class SchedulePageWidget(QWidget):
             return menu.addAction(lucide_icon(icon_name, size=16, color_hex=label_color), text)
 
         menu = QMenu(self)
+        editable = self._schedule_editable
         sel = act(menu, "hand", "Select — move and resize bars")
         sel.setCheckable(True)
         sel.setChecked(self._current_tool == TOOL_SELECT)
         draw = act(menu, "pencil", "Draw bar — drag to pin dates")
         draw.setCheckable(True)
         draw.setChecked(self._current_tool == TOOL_DRAW)
+        draw.setEnabled(editable)
         menu.addSeparator()
         today = act(menu, "scan", "Focus today")
         menu.addSeparator()
         undo = act(menu, "undo-2", "Undo")
-        undo.setEnabled(can_undo)
+        undo.setEnabled(editable and can_undo)
         redo = act(menu, "redo-2", "Redo")
-        redo.setEnabled(can_redo)
+        redo.setEnabled(editable and can_redo)
         save = act(menu, "save", "Save now")
-        save.setEnabled(dirty)
+        save.setEnabled(editable and dirty)
         menu.addSeparator()
         tpl = act(menu, "file-text", "Edit templates…")
+        tpl.setEnabled(editable)
         auto = act(menu, "sparkles", "Auto-plan…")
+        auto.setEnabled(editable)
         mile = act(menu, "pin", "Project milestones…")
+        mile.setEnabled(editable)
         hist = act(menu, "layers", "Schedule history…")
 
         chosen = menu.exec(global_pos)
@@ -447,6 +471,13 @@ class SchedulePageWidget(QWidget):
     def set_workspace_root(self, path: Path | None) -> None:
         self._workspace_root = Path(path).resolve() if path else None
         set_history_workspace(self._workspace_root)
+        self._gantt.set_workspace_root(self._workspace_root)
+
+    def set_schedule_editable(self, editable: bool) -> None:
+        self._schedule_editable = bool(editable)
+        self._gantt.set_schedule_editable(editable)
+        if not editable and self._current_tool != TOOL_SELECT:
+            self._activate_select_tool()
 
     def set_project_root(self, path: Path | None) -> None:
         new_root = Path(path) if path else None
@@ -676,6 +707,22 @@ class SchedulePageWidget(QWidget):
             allowed_department_ids=allowed_department_ids,
         )
 
+    def clear_transient_view_filters(self) -> None:
+        """Drop dashboard-driven Schedule filters (Unscheduled/Overdue only) and row highlights."""
+        changed = False
+        for chk in (self._view_options.chk_unscheduled, self._view_options.chk_overdue):
+            if not chk.isChecked():
+                continue
+            chk.blockSignals(True)
+            try:
+                chk.setChecked(False)
+            finally:
+                chk.blockSignals(False)
+            changed = True
+        self._gantt.clear_entity_highlight()
+        if changed:
+            self._apply_filters()
+
     def _update_stats(self) -> None:
         if self._project_root is None:
             return
@@ -726,6 +773,24 @@ class SchedulePageWidget(QWidget):
             finally:
                 chk.blockSignals(False)
             self._apply_filters()
+        self._gantt.highlight_entities(entities, expand_entity_rows=True)
+        self._gantt.scroll_to_entity_keys(entities)
+        kind, rel = entities[0]
+        self._gantt.entity_row_selected.emit(kind, rel)
+        return True
+
+    def focus_overdue_entities(self, entities: list[tuple[str, str]]) -> bool:
+        """Enable Overdue-only filter + highlight overdue entities from Dashboard."""
+        chk = self._view_options.chk_overdue
+        if not chk.isChecked():
+            chk.blockSignals(True)
+            try:
+                chk.setChecked(True)
+            finally:
+                chk.blockSignals(False)
+            self._apply_filters()
+        if not entities:
+            return True
         self._gantt.highlight_entities(entities, expand_entity_rows=True)
         self._gantt.scroll_to_entity_keys(entities)
         kind, rel = entities[0]
@@ -805,7 +870,7 @@ class SchedulePageWidget(QWidget):
         self.schedule_changed.emit()
 
     def _on_entity_plan_requested(self, entity_kind: str, entity_rel: str) -> None:
-        if self._project_root is None:
+        if not self._schedule_editable or self._project_root is None:
             return
         rel = (entity_rel or "").replace("\\", "/")
         kind = (entity_kind or "").strip().lower()
@@ -828,7 +893,7 @@ class SchedulePageWidget(QWidget):
         self._gantt.reload()
 
     def _on_entity_clear_plan(self, entity_kind: str, entity_rel: str) -> None:
-        if self._project_root is None:
+        if not self._schedule_editable or self._project_root is None:
             return
         ok = QMessageBox.question(
             self,
@@ -851,7 +916,7 @@ class SchedulePageWidget(QWidget):
         self._gantt.reload()
 
     def _on_template_clicked(self) -> None:
-        if self._project_root is None:
+        if not self._schedule_editable or self._project_root is None:
             return
         dlg = ScheduleTemplateDialog(
             parent=self,
@@ -863,7 +928,7 @@ class SchedulePageWidget(QWidget):
             self._gantt.reload()
 
     def _on_autoplan_clicked(self) -> None:
-        if self._project_root is None or self._project_index is None:
+        if not self._schedule_editable or self._project_root is None or self._project_index is None:
             return
         dlg = ScheduleAutoPlanDialog(
             parent=self,
@@ -875,7 +940,7 @@ class SchedulePageWidget(QWidget):
             self._gantt.reload()
 
     def _on_milestone_clicked(self) -> None:
-        if self._project_root is None:
+        if not self._schedule_editable or self._project_root is None:
             return
         dlg = ScheduleMilestoneDialog(parent=self, project_root=self._project_root)
         dlg.schedule_changed.connect(self._on_milestone_dialog_changed)
@@ -906,30 +971,63 @@ class SchedulePageWidget(QWidget):
         )
 
     def _open_allocate_for_row(self, row: TimelineRow) -> None:
-        if self._project_root is None:
-            return
-        preset_start: str | None = None
-        preset_due: str | None = None
-        dates = self._gantt.planned_dates_for_row(row)
-        if dates is not None:
-            preset_start, preset_due = dates
+        self.open_allocate_for_entity(
+            row.entity_kind,
+            row.entity_rel,
+            row.department,
+            preset_start=None,
+            preset_due=None,
+            row=row,
+        )
+
+    def open_allocate_for_entity(
+        self,
+        entity_kind: str,
+        entity_rel: str,
+        department: str | None,
+        *,
+        preset_start: str | None = None,
+        preset_due: str | None = None,
+        row: TimelineRow | None = None,
+    ) -> bool:
+        """Open allocate/edit dialog for one entity + department row."""
+        if not self._schedule_editable or self._project_root is None:
+            return False
+        rel = (entity_rel or "").replace("\\", "/").strip()
+        kind = (entity_kind or "").strip().lower()
+        dept = (department or "").strip() or None
+        if row is not None:
+            dates = self._gantt.planned_dates_for_row(row)
+            if dates is not None:
+                preset_start, preset_due = dates
+        schedule = read_project_schedule(self._project_root)
+        existing = allocation_for_row(
+            schedule,
+            entity_kind=kind,
+            entity_rel=rel,
+            department=dept,
+        )
         dlg = ScheduleAllocateDialog(
             parent=self,
             project_root=self._project_root,
+            workspace_root=self._workspace_root,
             entities=self._entity_options(),
             dept_labels=self._dept_labels(),
-            preset_kind=row.entity_kind,
-            preset_rel=row.entity_rel,
-            preset_department=row.department,
+            existing=existing,
+            preset_kind=kind,
+            preset_rel=rel,
+            preset_department=dept,
             preset_start=preset_start,
             preset_due=preset_due,
         )
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._on_schedule_changed()
-            self._gantt.reload()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        self._on_schedule_changed()
+        self._gantt.reload()
+        return True
 
     def _open_allocate_for_existing(self, alloc: ScheduleAllocation) -> None:
-        if self._project_root is None:
+        if not self._schedule_editable or self._project_root is None:
             return
         schedule = read_project_schedule(self._project_root)
         rel = (alloc.entity_rel or "").replace("\\", "/").strip()
@@ -942,6 +1040,7 @@ class SchedulePageWidget(QWidget):
         dlg = ScheduleAllocateDialog(
             parent=self,
             project_root=self._project_root,
+            workspace_root=self._workspace_root,
             entities=self._entity_options(),
             dept_labels=self._dept_labels(),
             existing=existing or alloc,

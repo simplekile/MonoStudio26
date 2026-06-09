@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -316,6 +317,71 @@ class WorkInvalidExtCleanDialog(MonosDialog):
             try:
                 if p.is_file():
                     p.unlink()
+            except OSError as e:
+                QMessageBox.critical(self, "Delete failed", f"{p}\n{e!s}")
+                return
+        if self._on_deleted is not None:
+            self._on_deleted()
+        self.accept()
+
+
+class HoudiniBackupCleanDialog(MonosDialog):
+    """Confirm permanent delete of Houdini automatic backup folders in work."""
+
+    def __init__(
+        self,
+        *,
+        parent: QWidget | None,
+        paths: tuple[str, ...],
+        on_deleted: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Clean Houdini backup folders")
+        self.setModal(True)
+        self.setMinimumSize(480, 320)
+        self.resize(560, 420)
+        self._on_deleted = on_deleted
+        self._paths = paths
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        warn = QLabel(
+            "Houdini stores automatic scene copies in a backup/ subfolder next to the work file. "
+            "The folders below will be permanently deleted (not moved to Trash).",
+            self,
+        )
+        warn.setObjectName("DialogHint")
+        warn.setWordWrap(True)
+        root.addWidget(warn)
+
+        list_box = QTextEdit(self)
+        list_box.setReadOnly(True)
+        list_box.setPlainText("\n".join(paths))
+        mono = monos_font("JetBrains Mono", 11)
+        list_box.setFont(mono)
+        list_box.setMinimumHeight(180)
+        root.addWidget(list_box, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        del_btn = QPushButton("Delete listed folders", self)
+        del_btn.setObjectName("DialogDestructiveButton")
+        del_btn.clicked.connect(self._on_delete)
+        actions.addWidget(del_btn)
+        cancel_btn = QPushButton("Cancel", self)
+        cancel_btn.setObjectName("DialogSecondaryButton")
+        cancel_btn.clicked.connect(self.reject)
+        actions.addWidget(cancel_btn)
+        root.addLayout(actions)
+
+    def _on_delete(self) -> None:
+        for raw in self._paths:
+            p = Path(raw)
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p)
             except OSError as e:
                 QMessageBox.critical(self, "Delete failed", f"{p}\n{e!s}")
                 return
@@ -730,6 +796,25 @@ class ItemHealthDialog(MonosDialog):
                 actions.addWidget(clean_btn)
             actions.addStretch(1)
             block_l.addLayout(actions)
+        elif issue.issue_id == "houdini_backup_folder" and issue.bad_files:
+            sec = _HealthBadFilesSection(
+                issue.bad_files,
+                expanded=issue.level != "ok",
+                section_title=f"Backup folders ({len(issue.bad_files)})",
+            )
+            sec.setContentsMargins(30, 0, 0, 0)
+            block_l.addWidget(sec)
+            actions = QHBoxLayout()
+            actions.setContentsMargins(30, 0, 0, 0)
+            actions.setSpacing(8)
+            clean_btn = QPushButton("Clean…", block)
+            clean_btn.setObjectName("DialogDestructiveButton")
+            clean_btn.clicked.connect(
+                lambda _checked=False, t=tuple(issue.bad_files): self._open_clean_houdini_backup_dialog(t)
+            )
+            actions.addWidget(clean_btn)
+            actions.addStretch(1)
+            block_l.addLayout(actions)
         elif issue.bad_files:
             files_section = _HealthBadFilesSection(
                 issue.bad_files,
@@ -835,6 +920,16 @@ class ItemHealthDialog(MonosDialog):
         if not paths:
             return
         dlg = WorkInvalidExtCleanDialog(
+            parent=self,
+            paths=paths,
+            on_deleted=self._after_repair,
+        )
+        dlg.exec()
+
+    def _open_clean_houdini_backup_dialog(self, paths: tuple[str, ...]) -> None:
+        if not paths:
+            return
+        dlg = HoudiniBackupCleanDialog(
             parent=self,
             paths=paths,
             on_deleted=self._after_repair,

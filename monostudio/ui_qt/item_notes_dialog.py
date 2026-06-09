@@ -30,6 +30,7 @@ from monostudio.core.item_comments import (
     new_comment_entry,
     normalize_note_department_id,
     read_item_comments_for_department,
+    record_note_seen,
     strip_html_preview,
     write_item_comments_for_department,
 )
@@ -42,6 +43,7 @@ from monostudio.ui_qt.note_compose_editor import NoteComposeEditor
 from monostudio.ui_qt.note_context_menu import build_note_context_menu
 from monostudio.ui_qt.note_done_toggle import NoteDoneToggleButton
 from monostudio.ui_qt.note_edit_history_dialog import NoteEditHistoryDialog
+from monostudio.ui_qt.note_seen_by_label import note_seen_by_label
 from monostudio.ui_qt.note_view_dialog import NoteViewDialog
 from monostudio.ui_qt.style import MonosDialog, monos_font
 
@@ -79,6 +81,7 @@ def _entries_fingerprint(entries: list[ItemCommentEntry]) -> tuple:
             e.mentions,
             e.department,
             tuple((r.at, r.editor, r.text) for r in e.edit_history),
+            tuple((s.user_id, s.at, s.name) for s in e.seen_by),
         )
         for e in sorted(entries, key=lambda x: x.id)
     )
@@ -161,6 +164,8 @@ class ItemNotesDialog(MonosDialog):
         )
         self._initial_fp = _entries_fingerprint(self._draft)
         self._known_ids = {e.id for e in self._draft}
+        self._initial_mentions_by_id = {e.id: frozenset(e.mentions) for e in self._draft}
+        self._initial_done_by_id = {e.id: bool(e.done) for e in self._draft}
         self._editing_note_id: str | None = None
 
         self.setWindowTitle("Notes")
@@ -440,6 +445,21 @@ class ItemNotesDialog(MonosDialog):
         self._update_summary()
         self._rebuild_list()
 
+    def _record_view_seen(self, entry: ItemCommentEntry) -> ItemCommentEntry:
+        user = get_current_user(self._workspace_root)
+        if user is None:
+            return entry
+        updated = record_note_seen(
+            self._item_path,
+            entry.id,
+            user_id=user.id,
+            user_name=user.name,
+        )
+        if updated is None:
+            return entry
+        self._draft = [updated if e.id == updated.id else e for e in self._draft]
+        return updated
+
     def _open_note_view(self, note_id: str) -> None:
         eid = (note_id or "").strip()
         if not eid:
@@ -447,6 +467,7 @@ class ItemNotesDialog(MonosDialog):
         entry = next((e for e in self._draft if e.id == eid), None)
         if entry is None:
             return
+        entry = self._record_view_seen(entry)
         dlg = NoteViewDialog(
             entry=entry,
             item_root=self._item_path,
@@ -455,6 +476,7 @@ class ItemNotesDialog(MonosDialog):
             parent=self,
         )
         dlg.exec()
+        self._rebuild_list()
 
     def _make_h_sep(self) -> QFrame:
         line = QFrame(self)
@@ -516,6 +538,9 @@ class ItemNotesDialog(MonosDialog):
         preview.set_preview(entry_preview_text(entry), done=entry.done)
         preview.open_requested.connect(lambda eid=entry.id: self._open_note_view(eid))
         text_col.addWidget(preview, 1)
+        seen_lab = note_seen_by_label(entry, self._workspace_root, card)
+        if seen_lab is not None:
+            text_col.addWidget(seen_lab, 0)
         row.addLayout(text_col, 1)
 
         open_btn = QToolButton(card)
@@ -606,16 +631,18 @@ class ItemNotesDialog(MonosDialog):
         from_uid = self._author_id or (current.id if current else "")
         from_name = self._author or (current.name if current else "Someone")
         for e in self._draft:
-            if e.id in self._known_ids:
-                continue
             if not e.mentions:
+                continue
+            previous = self._initial_mentions_by_id.get(e.id, frozenset())
+            new_targets = tuple(m for m in e.mentions if m not in previous)
+            if not new_targets:
                 continue
             try:
                 new_items = append_mentions(
                     self._project_root,
                     from_user_id=from_uid,
                     from_name=from_name,
-                    mentions=e.mentions,
+                    mentions=new_targets,
                     item_rel=self._item_rel_path(),
                     item_display=self._item_display_name,
                     note_id=e.id,
@@ -624,10 +651,76 @@ class ItemNotesDialog(MonosDialog):
                 )
             except OSError:
                 continue
+            if new_items and self._workspace_root is not None:
+                from monostudio.core.discord_webhook import dispatch_discord_event
+
+                project_name = (
+                    self._project_root.name
+                    if self._project_root is not None
+                    else self._item_path.name
+                )
+                dispatch_discord_event(
+                    self._workspace_root,
+                    "mention",
+                    {
+                        "from_user_id": from_uid,
+                        "from_name": from_name,
+                        "to_user_ids": [i.to_user_id for i in new_items],
+                        "item_rel": self._item_rel_path(),
+                        "item_display": self._item_display_name,
+                        "department": self._department_id or "",
+                        "department_label": self._department_label,
+                        "snippet": e.text,
+                        "project_name": project_name,
+                        "mention_ids": [i.id for i in new_items],
+                    },
+                    dedupe_key=f"mention:{new_items[0].id}",
+                    project_root=self._project_root,
+                )
             # Bell alerts are created in MainWindow._sync_mention_inbox_alerts for the
             # signed-in user only — do not notify the author's session for other targets.
 
+    def _dispatch_note_done_for_changed_entries(self) -> None:
+        if self._workspace_root is None or self._project_root is None:
+            return
+        current = get_current_user(self._workspace_root)
+        from_uid = self._author_id or (current.id if current else "")
+        from_name = self._author or (current.name if current else "Someone")
+        project_name = self._project_root.name
+        for e in self._draft:
+            was_done = self._initial_done_by_id.get(e.id, False)
+            if not e.done or was_done:
+                continue
+            from monostudio.core.discord_webhook import dispatch_discord_event
+
+            dispatch_discord_event(
+                self._workspace_root,
+                "note_done",
+                {
+                    "from_user_id": from_uid,
+                    "from_name": from_name,
+                    "item_rel": self._item_rel_path(),
+                    "item_display": self._item_display_name,
+                    "department": self._department_id or "",
+                    "department_label": self._department_label,
+                    "snippet": e.text,
+                    "project_name": project_name,
+                    "note_id": e.id,
+                },
+                dedupe_key=f"note_done:{e.id}",
+                project_root=self._project_root,
+            )
+
+    def _flush_compose_into_draft(self) -> None:
+        """Add pending compose text to draft before Save (same as Add note)."""
+        if self._editing_note_id:
+            self._on_save_edit()
+            return
+        if self._add_edit.has_content():
+            self._on_add_draft()
+
     def _on_save(self) -> None:
+        self._flush_compose_into_draft()
         try:
             write_item_comments_for_department(
                 self._item_path,
@@ -638,8 +731,10 @@ class ItemNotesDialog(MonosDialog):
             QMessageBox.warning(self, "Notes", str(ex) or "Could not save notes.")
             return
         self._dispatch_mentions_for_new_entries()
+        self._dispatch_note_done_for_changed_entries()
         self._initial_fp = _entries_fingerprint(self._draft)
         self._known_ids = {e.id for e in self._draft}
+        self._initial_done_by_id = {e.id: bool(e.done) for e in self._draft}
         self.notes_changed.emit()
         self.accept()
 

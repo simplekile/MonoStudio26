@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.assign_inbox import read_inbox as read_assign_inbox
 from monostudio.core.mention_inbox import read_inbox
 from monostudio.core.user_identity import avatar_path, get_user, read_roster
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -65,6 +66,14 @@ def _resolve_from_user_id(
     uid = (p.from_user_id or "").strip()
     if uid:
         return uid
+    aid = (p.assign_inbox_id or "").strip()
+    if aid and project_root is not None:
+        try:
+            for item in read_assign_inbox(project_root):
+                if item.id == aid and (item.from_user_id or "").strip():
+                    return item.from_user_id.strip()
+        except OSError:
+            pass
     mid = (p.mention_inbox_id or "").strip()
     if mid and project_root is not None:
         try:
@@ -88,8 +97,18 @@ def display_time_for_entry(
     entry: NotificationEntry,
     project_root: Path | None,
 ) -> datetime:
-    """Prefer mention inbox timestamp over bell-append time."""
+    """Prefer project inbox timestamp over bell-append time."""
     p = _payload(entry)
+    aid = (p.assign_inbox_id or "").strip()
+    if aid and project_root is not None:
+        try:
+            for item in read_assign_inbox(project_root):
+                if item.id == aid and item.at:
+                    parsed = _parse_iso_datetime(item.at)
+                    if parsed is not None:
+                        return parsed
+        except OSError:
+            pass
     mid = (p.mention_inbox_id or "").strip()
     if mid and project_root is not None:
         try:
@@ -208,11 +227,12 @@ def _sender_visual(
     if from_uid and workspace_root is not None:
         user = get_user(workspace_root, from_uid)
         if user is not None:
+            badge = "user" if (p.assign_inbox_id or "").strip() else "message-circle"
             return (
                 avatar_path(workspace_root, user),
                 user.initials,
                 user.color_hex or "#3b82f6",
-                "message-circle",
+                badge,
             )
     initials = "?"
     if from_name:

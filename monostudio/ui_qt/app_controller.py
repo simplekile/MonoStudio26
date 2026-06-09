@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
 
 from monostudio.core.dcc_blender import BlenderDccAdapter
+from monostudio.core.dcc_affinity import AffinityDccAdapter
 from monostudio.core.dcc_fusion import FusionDccAdapter
 from monostudio.core.dcc_houdini import HoudiniDccAdapter
 from monostudio.core.dcc_maya import MayaDccAdapter
@@ -150,7 +151,7 @@ class AppController(QObject):
             for d in item.departments:
                 if self._norm(d.name) == self._norm(resolved_department):
                     resolved_dept_has_work_file = getattr(d, "work_file_exists", False)
-                    if resolved_dept_has_work_file:
+                    if resolved_dept_has_work_file and not force_create_new:
                         # Department already has work file(s): open that DCC, never "first in create list".
                         # User may not have clicked the badge, so meta may have no active_dcc; use scan.
                         existing_dccs = [(x or "").strip() for x in (getattr(d, "work_file_dccs", ()) or ()) if (x or "").strip()]
@@ -163,6 +164,13 @@ class AppController(QObject):
                             resolved_dcc = next((x for x in existing_dccs if (x or "").casefold() == (meta_dcc or "").casefold()), meta_dcc)
                         else:
                             resolved_dcc = work_file_dcc or (existing_dccs[0] if existing_dccs else None)
+                    elif force_create_new and resolved_dept_has_work_file:
+                        # Create New… while other DCCs already have work files: same default logic, skip occupied DCCs.
+                        resolved_dcc = self._resolve_dcc_for_create_new(
+                            item=item,
+                            department=resolved_department,
+                            meta=meta,
+                        )
                     else:
                         # No work file: use registry/default for "Create New" flow.
                         resolved_dcc = self._resolve_dcc(
@@ -464,6 +472,102 @@ class AppController(QObject):
         return self._dcc_registry.resolve_default_dcc(department=department, last_used=last_used)
 
     @staticmethod
+    def _dcc_ids_with_work_file(item: Asset | Shot, department: str) -> set[str]:
+        """DCC IDs that already have a scanned work file for this item + department."""
+        dep_norm = (department or "").strip().casefold()
+        blocked: set[str] = set()
+        for (dept_id, dcc_id), state in getattr(item, "dcc_work_states", None) or ():
+            if (dept_id or "").strip().casefold() != dep_norm:
+                continue
+            if getattr(state, "work_file_path", None) is None:
+                continue
+            d = (dcc_id or "").strip()
+            if d:
+                blocked.add(d)
+        return blocked
+
+    def _pick_allowed_dcc(
+        self,
+        dcc_id: str | None,
+        *,
+        department: str,
+        blocked: set[str],
+    ) -> str | None:
+        if not isinstance(dcc_id, str) or not dcc_id.strip():
+            return None
+        d = dcc_id.strip()
+        if any(d.casefold() == (b or "").casefold() for b in blocked):
+            return None
+        if self._project_root is not None:
+            dre = DepartmentRegistry.for_project(self._project_root)
+            if dre.is_dcc_allowed_for(self._dcc_registry, department, d):
+                return d
+        elif self._dcc_registry.is_dcc_allowed(d, department):
+            return d
+        return None
+
+    def _resolve_dcc_for_create_new(
+        self,
+        *,
+        item: Asset | Shot,
+        department: str,
+        meta: dict[str, Any],
+    ) -> str | None:
+        """
+        Pre-select DCC for Create New when the department already has work file(s).
+        Mirrors Create New without work files (project create-default, last-used, registry default)
+        but skips DCCs that already have a work file.
+        """
+        blocked = self._dcc_ids_with_work_file(item, department)
+
+        if self._project_root is not None:
+            cd = read_create_default_dcc(self._project_root, department)
+            chosen = self._pick_allowed_dcc(cd, department=department, blocked=blocked)
+            if chosen:
+                return chosen
+
+        last_used: str | None = None
+        by_dep = meta.get("last_open_by_department") if isinstance(meta, dict) else None
+        if isinstance(by_dep, dict):
+            node = by_dep.get(department)
+            if isinstance(node, dict):
+                dcc = node.get("dcc")
+                if isinstance(dcc, str) and dcc.strip():
+                    last_used = dcc.strip()
+
+        last_open = meta.get("last_open") if isinstance(meta, dict) else None
+        if isinstance(last_open, dict) and self._norm(last_open.get("department")) == self._norm(department):
+            dcc = last_open.get("dcc")
+            if isinstance(dcc, str) and dcc.strip():
+                last_used = dcc.strip()
+
+        chosen = self._pick_allowed_dcc(last_used, department=department, blocked=blocked)
+        if chosen:
+            return chosen
+
+        if self._project_root is not None:
+            dre = DepartmentRegistry.for_project(self._project_root)
+            fallback = dre.pick_default_dcc(self._dcc_registry, department=department, last_used=None)
+            chosen = self._pick_allowed_dcc(fallback, department=department, blocked=blocked)
+            if chosen:
+                return chosen
+            for dcc_id in dre.supported_dcc_ids(self._dcc_registry, department):
+                chosen = self._pick_allowed_dcc(dcc_id, department=department, blocked=blocked)
+                if chosen:
+                    return chosen
+            return None
+
+        fallback = self._dcc_registry.resolve_default_dcc(department=department, last_used=None)
+        chosen = self._pick_allowed_dcc(fallback, department=department, blocked=blocked)
+        if chosen:
+            return chosen
+        for dcc_id in self._dcc_registry.get_all_dccs():
+            chosen = self._pick_allowed_dcc(dcc_id, department=department, blocked=blocked)
+            if chosen:
+                return chosen
+        return None
+
+    @staticmethod
     def _resolve_open_action(work_file_path: Path) -> Literal["open", "create"]:
         """
         Resolve whether to open existing file or create new one.
@@ -704,6 +808,24 @@ class AppController(QObject):
             repo_root=self._repo_root,
         )
 
+    def _affinity_executable(self) -> str:
+        exe = self._settings.value("integrations/affinity_exe", "", str)
+        exe = (exe or "").strip()
+        if not exe:
+            exe = (self._settings.value("integrations/affinity_photo_exe", "", str) or "").strip()
+        if exe:
+            return exe
+        try:
+            return str(self._dcc_registry.get_dcc_info("affinity").get("executable") or "Affinity.exe")
+        except Exception:
+            return "Affinity.exe"
+
+    def _affinity_adapter(self) -> AffinityDccAdapter:
+        return AffinityDccAdapter(
+            affinity_executable=self._affinity_executable(),
+            repo_root=self._repo_root,
+        )
+
     def _rizomuv_executable(self) -> str:
         exe = self._settings.value("integrations/rizomuv_exe", "", str)
         exe = (exe or "").strip()
@@ -734,6 +856,7 @@ class AppController(QObject):
         self, dcc: str
     ) -> (
         BlenderDccAdapter
+        | AffinityDccAdapter
         | MayaDccAdapter
         | HoudiniDccAdapter
         | SubstancePainterDccAdapter
@@ -743,6 +866,8 @@ class AppController(QObject):
     ):
         if dcc == "blender":
             return self._blender_adapter()
+        if dcc == "affinity":
+            return self._affinity_adapter()
         if dcc == "maya":
             return self._maya_adapter()
         if dcc == "houdini":

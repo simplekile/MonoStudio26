@@ -35,6 +35,7 @@ from monostudio.core.schedule_dept_filter import (
     BAR_LABEL_ENTITY_NAME,
     BAR_LABEL_OFF,
 )
+from monostudio.ui_qt.popup_position import position_popup_near_anchor
 from monostudio.ui_qt.style import monos_font
 from PySide6.QtGui import QFont
 
@@ -198,9 +199,7 @@ class ScheduleViewOptionsPopup:
         if (time.monotonic() - self._closed_at) < self._POPUP_REOPEN_GRACE:
             return
         self.popup.adjustSize()
-        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
-        pos.setY(pos.y() + 4)
-        self.popup.move(pos)
+        position_popup_near_anchor(self.popup, anchor)
         self.popup.show()
 
     def close(self) -> None:

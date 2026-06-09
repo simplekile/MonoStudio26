@@ -301,7 +301,7 @@ class PipelineTableModel(QAbstractTableModel):
                 return None
             if col == 3:
                 if role == Qt.ItemDataRole.DisplayRole:
-                    return status
+                    return ""
                 if role == Qt.ItemDataRole.ForegroundRole:
                     return self._mv._status_foreground(status)
                 return None
@@ -365,7 +365,12 @@ class PipelineTableModel(QAbstractTableModel):
         if col == 11:
             return self._mv._list_last_updated(vi) if role == Qt.ItemDataRole.DisplayRole else None
         if col == 12:
-            return "—" if role == Qt.ItemDataRole.DisplayRole else None
+            if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.ForegroundRole:
+                text, color = self._mv._list_assignee_display(vi)
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return text
+                return color if color is not None else QColor("#71717a")
+            return None
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:  # type: ignore[override]

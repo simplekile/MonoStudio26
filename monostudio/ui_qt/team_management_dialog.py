@@ -34,12 +34,15 @@ from monostudio.core.user_identity import (
     deactivate_user,
     delete_user,
     get_current_user,
+    is_valid_discord_user_id,
+    normalize_discord_user_id,
     normalize_studio_role,
     read_requests,
     read_roster,
     reject_request,
     set_password,
     set_user_avatar,
+    set_user_discord_id,
     set_user_role,
     studio_role_choices,
     studio_role_label,
@@ -243,6 +246,25 @@ class TeamManagementDialog(MonosDialog):
         top.addWidget(role_combo, 0, Qt.AlignVCenter)
         outer.addLayout(top)
 
+        discord_row = QHBoxLayout()
+        discord_row.setSpacing(8)
+        discord_lab = QLabel("Discord ID", w)
+        discord_lab.setObjectName("DialogHint")
+        discord_lab.setMinimumWidth(72)
+        discord_field = QLineEdit(w)
+        discord_field.setObjectName("SettingsLineEdit")
+        discord_field.setProperty("mono", True)
+        discord_field.setPlaceholderText("Optional — Developer Mode → Copy User ID")
+        discord_field.setText(user.discord_user_id or "")
+        discord_field.setToolTip(
+            "Numeric Discord user ID for @ping in pipeline webhooks.\n"
+            "User must be in the same Discord server as the webhook channel."
+        )
+        self._wire_discord_field(discord_field, user.id)
+        discord_row.addWidget(discord_lab, 0, Qt.AlignVCenter)
+        discord_row.addWidget(discord_field, 1)
+        outer.addLayout(discord_row)
+
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addStretch(1)
@@ -276,6 +298,28 @@ class TeamManagementDialog(MonosDialog):
             set_user_role(self._workspace_root, user_id, str(role))
 
         combo.currentIndexChanged.connect(on_change)
+
+    def _wire_discord_field(self, field: QLineEdit, user_id: str) -> None:
+        def on_commit() -> None:
+            raw = (field.text() or "").strip()
+            if raw and not is_valid_discord_user_id(raw):
+                QMessageBox.warning(
+                    self,
+                    "Discord ID",
+                    "Enter a numeric Discord user ID (17–20 digits), or leave empty.\n"
+                    "Discord → User Settings → Advanced → Developer Mode → right-click user → Copy User ID.",
+                )
+                user = next((u for u in read_roster(self._workspace_root) if u.id == user_id), None)
+                field.setText(user.discord_user_id if user else "")
+                return
+            normalized = normalize_discord_user_id(raw)
+            if normalized:
+                field.setText(normalized)
+            result = set_user_discord_id(self._workspace_root, user_id, raw)
+            if result is None and raw:
+                QMessageBox.warning(self, "Discord ID", "Could not save Discord ID.")
+
+        field.editingFinished.connect(on_commit)
 
     # --- actions ------------------------------------------------------------
     def _approve(self, req_id: str, role: str) -> None:

@@ -1,15 +1,22 @@
-# MonoStudio 26 — Release v26.14.6
+# MonoStudio 26 — Release v26.15.0
 
 ## Highlights
 
-- **Cấu hình local đúng chỗ**: `app_settings.json` (session, geometry, user pins) lưu `%LOCALAPPDATA%\MonoStudio\config` — cài lại app không “dính” user cũ từ thư mục cài; tự migrate file legacy một lần.
-- **Sign-in**: Pre-select theo lần đăng nhập gần nhất, rồi device binding; luôn cập nhật device khi Sign in (kể cả không tick Stay signed in).
+- **Discord webhooks**: Thông báo Inbox (assign/distribute), Outbox received, Schedule due — cấu hình trong Settings → Integrations; debounce và copy chuẩn.
+- **Deep link `monostudio://`**: URL protocol (installer đăng ký HKCU); mở assign/entity từ link; local deep-link server khi app chạy.
+- **Inbox redesign**: Split view, browse bar, date folders, grid/list card paint, toolbar; assignee picker + assign confirm; drag-drop ngoài Explorer.
+- **Sidebar nav rail**: Điều hướng dạng rail mở rộng; Dashboard bento layout; production UI refresh (style, pills, popover position).
+- **Schedule & assign**: Phân quyền schedule, notify assign; inspector schedule block; allocate dialog assignee.
+- **Affinity DCC**: Hỗ trợ Affinity trong pipeline (`dcc_affinity`, template `.af`).
+- **Notes**: Seen-by label; mention/assign alert format; roster user combo.
 
 ## Changes in this release
 
-- feat: `app_paths.py` — `get_app_user_config_dir`, `migrate_app_settings_if_needed`.
-- feat: `user_identity.py` — `last_signed_in`, đường dẫn config mới.
-- fix: `main_window.py`, `user_identity_dialog.py`, `app.py`.
+- feat: `discord_*.py`, `integrations_config.py`, `notification_copy.py`, `assign_inbox.py`, `deep_link*.py`, `url_protocol.py`.
+- feat: Inbox/Outbox UI — `inbox_split_view`, `inbox_browse_bar`, `inbox_page_toolbar`, `outbox_history_dialog`, `external_drop*`.
+- feat: `sidebar_nav_rail`, `dashboard_bento_host`, `dashboard_layout.py`, `project_picker_dialog`, `project_lifecycle.py`.
+- feat: `schedule_permissions.py`, `schedule_assign_notify.py`, `assignee_picker_widget`, `roster_user_combo.py`.
+- feat: Settings Integrations; installer `monostudio://` protocol; `dccs.json` + Affinity icon/template.
 
 ## Install
 

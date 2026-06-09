@@ -36,6 +36,7 @@ class UserAlertPayload:
     item_display: str = ""
     note_id: str = ""
     mention_inbox_id: str = ""
+    assign_inbox_id: str = ""
     department: str = ""
     from_name: str = ""
     from_user_id: str = ""
@@ -49,6 +50,7 @@ class UserAlertPayload:
             "item_display": self.item_display,
             "note_id": self.note_id,
             "mention_inbox_id": self.mention_inbox_id,
+            "assign_inbox_id": self.assign_inbox_id,
             "department": self.department,
             "from_name": self.from_name,
             "from_user_id": self.from_user_id,
@@ -67,6 +69,7 @@ class UserAlertPayload:
             item_display=str(data.get("item_display") or ""),
             note_id=str(data.get("note_id") or ""),
             mention_inbox_id=str(data.get("mention_inbox_id") or ""),
+            assign_inbox_id=str(data.get("assign_inbox_id") or ""),
             department=str(data.get("department") or ""),
             from_name=str(data.get("from_name") or ""),
             from_user_id=str(data.get("from_user_id") or ""),
@@ -194,14 +197,22 @@ def entry_belongs_to_user(
     if tid:
         return tid == uid
     mid = (entry.payload.mention_inbox_id or "").strip()
-    if not mid or project_root is None:
+    aid = (entry.payload.assign_inbox_id or "").strip()
+    if (not mid and not aid) or project_root is None:
         return False
     try:
-        from monostudio.core.mention_inbox import read_inbox
+        if mid:
+            from monostudio.core.mention_inbox import read_inbox
 
-        for item in read_inbox(Path(project_root)):
-            if item.id == mid:
-                return item.to_user_id == uid
+            for item in read_inbox(Path(project_root)):
+                if item.id == mid:
+                    return item.to_user_id == uid
+        if aid:
+            from monostudio.core.assign_inbox import read_inbox as read_assign_inbox
+
+            for item in read_assign_inbox(Path(project_root)):
+                if item.id == aid:
+                    return item.to_user_id == uid
     except OSError:
         pass
     return False
@@ -288,12 +299,28 @@ def has_mention_inbox_id(mention_inbox_id: str) -> bool:
     )
 
 
+def has_assign_inbox_id(assign_inbox_id: str) -> bool:
+    aid = (assign_inbox_id or "").strip()
+    if not aid:
+        return False
+    return any(
+        e.kind == "user" and e.payload.assign_inbox_id == aid
+        for e in _history
+    )
+
+
 def clear_mention_user_alerts() -> None:
-    """Drop all cached @mention bell rows."""
+    """Drop all cached user inbox bell rows (@mention and schedule assign)."""
     kept = [
         e
         for e in _history
-        if not (e.kind == "user" and (e.payload.mention_inbox_id or "").strip())
+        if not (
+            e.kind == "user"
+            and (
+                (e.payload.mention_inbox_id or "").strip()
+                or (e.payload.assign_inbox_id or "").strip()
+            )
+        )
     ]
     if len(kept) == len(_history):
         return
@@ -315,7 +342,8 @@ def prune_mention_alerts_not_for_user(
     changed = False
     for e in _history:
         mid = (e.payload.mention_inbox_id or "").strip() if e.kind == "user" else ""
-        if not mid:
+        aid = (e.payload.assign_inbox_id or "").strip() if e.kind == "user" else ""
+        if not mid and not aid:
             kept.append(e)
             continue
         if entry_belongs_to_user(e, uid, project_root):
@@ -329,13 +357,18 @@ def prune_mention_alerts_not_for_user(
     _save_to_settings()
 
 
-def mark_read(mention_inbox_id: str) -> None:
-    mid = (mention_inbox_id or "").strip()
-    if not mid:
+def mark_read(inbox_id: str) -> None:
+    iid = (inbox_id or "").strip()
+    if not iid:
         return
     changed = False
     for i, e in enumerate(_history):
-        if e.kind == "user" and e.payload.mention_inbox_id == mid and not e.read:
+        if e.kind != "user" or e.read:
+            continue
+        p = e.payload
+        if p.mention_inbox_id != iid and p.assign_inbox_id != iid:
+            continue
+        if e.kind == "user" and not e.read:
             _history[i] = NotificationEntry(
                 toast_type=e.toast_type,
                 message=e.message,

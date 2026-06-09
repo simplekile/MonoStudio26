@@ -8,7 +8,7 @@ Max visible per stack from settings (default 1).
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QSettings, QRect, QPoint
-from PySide6.QtGui import QPalette, QColor
+from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QPalette, QColor
 from PySide6.QtWidgets import (
     QMainWindow,
     QVBoxLayout,
@@ -62,6 +62,7 @@ class NotificationOverlayWidget(QWidget):
         self.setAutoFillBackground(False)
         self.setStyleSheet("background: transparent;")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAcceptDrops(True)
         pal = self.palette()
         pal.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0, 0))
         self.setPalette(pal)
@@ -102,6 +103,25 @@ class NotificationOverlayWidget(QWidget):
         layout.addLayout(top_row)
 
         layout.addStretch()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        parent = self.parent()
+        if isinstance(parent, QMainWindow) and event.mimeData().hasUrls():
+            parent.dropEvent(event)
+            return
+        super().dropEvent(event)
 
     def set_general_toast_anchor_widget(self, widget: QWidget | None) -> None:
         """Position general toasts below this widget (e.g. topbar noti button) so they don't overlap."""

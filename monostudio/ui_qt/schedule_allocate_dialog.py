@@ -18,6 +18,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from monostudio.core.user_identity import (
+    build_schedule_assignee_fields,
+    get_current_user,
+    match_roster_user_by_name,
+)
 from monostudio.ui_qt.calendar_date_picker import MonosDateEdit
 from monostudio.core.project_schedule import (
     ScheduleAllocation,
@@ -25,6 +30,7 @@ from monostudio.core.project_schedule import (
     new_allocation_id,
     upsert_allocation_for_row,
 )
+from monostudio.ui_qt.assignee_picker_widget import AssigneePickerWidget
 from monostudio.ui_qt.style import MonosDialog
 
 
@@ -44,6 +50,7 @@ class ScheduleAllocateDialog(MonosDialog):
         *,
         parent=None,
         project_root: Path,
+        workspace_root: Path | None = None,
         entities: list[_EntityOption],
         dept_labels: dict[str, str],
         existing: ScheduleAllocation | None = None,
@@ -55,6 +62,7 @@ class ScheduleAllocateDialog(MonosDialog):
     ) -> None:
         super().__init__(parent)
         self._project_root = Path(project_root)
+        self._workspace_root = Path(workspace_root).resolve() if workspace_root else None
         self._existing = existing
         self._entities = entities
         self._dept_labels = dept_labels
@@ -89,9 +97,8 @@ class ScheduleAllocateDialog(MonosDialog):
         form.addRow("Start", self._start)
         form.addRow("Due", self._due)
 
-        self._assignee = QLineEdit(self)
-        self._assignee.setPlaceholderText("Optional")
-        form.addRow("Assignee", self._assignee)
+        self._assignee = AssigneePickerWidget(self._workspace_root, self)
+        form.addRow("Assignees", self._assignee)
 
         self._note = QLineEdit(self)
         self._note.setPlaceholderText("Optional")
@@ -131,6 +138,13 @@ class ScheduleAllocateDialog(MonosDialog):
                 dd = QDate.fromString(preset_due[:10], "yyyy-MM-dd")
                 if dd.isValid():
                     self._due.setDate(dd)
+            current = get_current_user(self._workspace_root)
+            if current is not None:
+                self._assignee.set_user_ids([current.id])
+        elif get_current_user(self._workspace_root) is not None:
+            cur = get_current_user(self._workspace_root)
+            if cur is not None:
+                self._assignee.set_user_ids([cur.id])
 
     def result_allocation(self) -> ScheduleAllocation | None:
         return self._saved
@@ -184,7 +198,15 @@ class ScheduleAllocateDialog(MonosDialog):
             self._start.setDate(ds)
         if dd.isValid():
             self._due.setDate(dd)
-        self._assignee.setText(alloc.assignee or "")
+        if alloc.assignee_ids:
+            self._assignee.set_user_ids(list(alloc.assignee_ids))
+        elif (alloc.assignee_id or "").strip():
+            self._assignee.set_user_ids([alloc.assignee_id])
+        elif (alloc.assignee or "").strip():
+            matched = match_roster_user_by_name(self._workspace_root, alloc.assignee)
+            self._assignee.set_user_ids([matched.id] if matched else [])
+        else:
+            self._assignee.set_user_ids([])
         self._note.setText(alloc.note or "")
 
     def _on_save(self) -> None:
@@ -202,6 +224,10 @@ class ScheduleAllocateDialog(MonosDialog):
             QMessageBox.warning(self, "Schedule", "Due date must be on or after start date.")
             return
         aid = self._existing.id if self._existing else new_allocation_id()
+        ids, names, legacy_id, legacy_label = build_schedule_assignee_fields(
+            self._workspace_root,
+            self._assignee.selected_user_ids(),
+        )
         alloc = ScheduleAllocation(
             id=aid,
             entity_kind=ent.kind,
@@ -209,7 +235,10 @@ class ScheduleAllocateDialog(MonosDialog):
             department=str(dep) if dep else None,
             start=start_d.isoformat(),
             due=due_d.isoformat(),
-            assignee=self._assignee.text().strip(),
+            assignee_ids=ids,
+            assignees=names,
+            assignee_id=legacy_id,
+            assignee=legacy_label,
             note=self._note.text().strip(),
         )
         try:
@@ -217,6 +246,25 @@ class ScheduleAllocateDialog(MonosDialog):
         except OSError as ex:
             QMessageBox.critical(self, "Schedule", f"Failed to save allocation:\n{ex}")
             return
+        from monostudio.core.schedule_assign_notify import (
+            collect_previous_assignee_ids,
+            notify_new_schedule_assignments,
+        )
+
+        ent = self._current_entity()
+        display = ent.name if ent is not None else ""
+        prev_assignee_ids = collect_previous_assignee_ids(self._existing)
+        try:
+            notify_new_schedule_assignments(
+                self._project_root,
+                self._workspace_root,
+                previous=self._existing,
+                allocation=alloc,
+                entity_display=display,
+                previous_assignee_ids=prev_assignee_ids,
+            )
+        except OSError:
+            pass
         self._saved = alloc
         self.accept()
 

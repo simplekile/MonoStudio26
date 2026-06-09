@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 
 import time
-from PySide6.QtCore import QByteArray, QEvent, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal, QSettings
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal, QSettings
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -71,16 +71,19 @@ from monostudio.core.pipeline_types_and_presets import (
     resolve_department_ids_for_ui,
 )
 from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.shell_open import open_folder as shell_open_folder
 from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.popup_position import max_popup_height_for_anchor, position_popup_near_anchor
 from monostudio.ui_qt.recent_tasks_store import RecentTask
-from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators
+from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators, apply_pill_segment_positions
 from monostudio.ui_qt.style import (
     MONOS_COLORS,
     SIDEBAR_DEPT_LIST_STYLE,
     MonosDialog,
     MonosMenu,
+    clear_stuck_widget_hover,
     monos_font,
     project_accent_color,
 )
@@ -113,6 +116,37 @@ def _is_shot_type(type_id: str) -> bool:
 def _title_case_label(value: str) -> str:
     # UI display only (ids remain unchanged). Keep simple + deterministic.
     return (value or "").strip().replace("_", " ").title()
+
+
+def _sidebar_filter_list_container(parent: QWidget | None = None) -> QFrame:
+    """Raised panel wrapping a sidebar filter / recent list (QSS: SidebarFilterListContainer)."""
+    frame = QFrame(parent)
+    frame.setObjectName("SidebarFilterListContainer")
+    frame.setAttribute(Qt.WA_StyledBackground, True)
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
+    return frame
+
+
+def _update_filter_section_chevron(btn: QToolButton, *, expanded: bool) -> None:
+    name = "chevron-down" if expanded else "chevron-right"
+    icon = lucide_icon(name, size=12, color_hex=MONOS_COLORS["text_label"])
+    if not icon.isNull():
+        btn.setIcon(icon)
+        btn.setIconSize(QSize(12, 12))
+
+
+def _make_filter_section_chevron(parent: QWidget, *, expanded: bool, on_toggle) -> QToolButton:
+    btn = QToolButton(parent)
+    btn.setObjectName("SidebarFilterSectionChevron")
+    btn.setAutoRaise(True)
+    btn.setFixedSize(16, 16)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    btn.clicked.connect(on_toggle)
+    _update_filter_section_chevron(btn, expanded=expanded)
+    return btn
 
 
 def _lucide_two_state_icon(icon_name: str, *, fallback_name: str) -> QIcon:
@@ -159,13 +193,67 @@ def _load_logo_pixmap(size: int, color_hex: str) -> QPixmap:
     return pix
 
 
-# Row kinds: section (container header), dept (selectable), spacer (gap between containers).
+# Row kinds for sidebar filter / recent-task tree lists.
+_FILTER_ROW_GROUP = "group"
+_FILTER_ROW_LEAF = "leaf"
+# Legacy aliases (picker dialog still uses section/spacer in places).
 _DEPT_ROW_SECTION = "section"
-_DEPT_ROW_DEPT = "dept"
+_DEPT_ROW_DEPT = "leaf"
 _DEPT_ROW_SPACER = "spacer"
 
-# Section order for type list (Assets then Shots).
-_TYPE_SECTION_ORDER = ("Assets", "Shots")
+_FILTER_GROUP_KEY_SEP = ":"
+
+
+def _filter_group_key(scope: str, group_id: str) -> str:
+    return f"{scope}{_FILTER_GROUP_KEY_SEP}{group_id}"
+
+
+def _paint_filter_count_badge(
+    painter: QPainter,
+    *,
+    rect: QRect,
+    count: int,
+    selected: bool,
+) -> None:
+    badge_font = monos_font("Inter", 9, QFont.Weight.Medium)
+    fm = QFontMetrics(badge_font)
+    text = str(count)
+    pad_x = 6
+    badge_w = max(22, fm.horizontalAdvance(text) + pad_x * 2)
+    badge_h = 18
+    badge_x = rect.right() - badge_w
+    badge_y = rect.center().y() - badge_h // 2
+    badge_rect = QRect(badge_x, badge_y, badge_w, badge_h)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    if selected:
+        painter.setBrush(QColor(37, 99, 235, 120))
+        painter.setPen(QPen(QColor(96, 165, 250, 90), 1))
+    else:
+        painter.setBrush(QColor(39, 39, 42))
+    painter.drawRoundedRect(badge_rect, 4, 4)
+    painter.setFont(badge_font)
+    painter.setPen(QColor(MONOS_COLORS["blue_400"] if selected else "#d4d4d8"))
+    painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+
+def _paint_filter_chevron(
+    painter: QPainter,
+    *,
+    rect: QRect,
+    expanded: bool,
+    x: int,
+    cy: int,
+    selected: bool = False,
+) -> int:
+    name = "chevron-down" if expanded else "chevron-right"
+    color = MONOS_COLORS["blue_400"] if selected else MONOS_COLORS["text_label"]
+    icon = lucide_icon(name, size=12, color_hex=color)
+    if icon.isNull():
+        return x
+    ir = QRect(x, cy - 6, 12, 12)
+    icon.paint(painter, ir, Qt.AlignCenter)
+    return x + 12 + 4
 
 
 def _container_gradient(rect: QRectF) -> QLinearGradient:
@@ -211,6 +299,37 @@ def _rounded_rect_path(rect: QRectF, radius: float, round_top: bool, round_botto
     return path
 
 
+def _filter_row_highlight_rect(rect: QRect) -> QRect:
+    ix = int(SIDEBAR_DEPT_LIST_STYLE.get("row_highlight_inset_x", 2))
+    iy = int(SIDEBAR_DEPT_LIST_STYLE.get("row_highlight_inset_y", 0))
+    return rect.adjusted(ix, iy, -ix, -iy)
+
+
+def _filter_row_highlight_radius() -> int:
+    return int(SIDEBAR_DEPT_LIST_STYLE.get("row_highlight_radius_px", 6))
+
+
+def _filter_row_content_pad_left(*, indent: int = 0) -> int:
+    base = int(SIDEBAR_DEPT_LIST_STYLE.get("row_content_pad_left_px", 12))
+    return base + indent * int(SIDEBAR_DEPT_LIST_STYLE.get("indent_step_px", 16))
+
+
+def _filter_row_content_pad_right() -> int:
+    return int(SIDEBAR_DEPT_LIST_STYLE.get("row_content_pad_right_px", 12))
+
+
+def _paint_filter_lead_dot(painter: QPainter, *, x: int, cy: int, selected: bool) -> int:
+    """Small circular socket before leaf row icon; returns x after dot + gap."""
+    dot_r = int(SIDEBAR_DEPT_LIST_STYLE.get("row_lead_dot_radius_px", 3))
+    gap = int(SIDEBAR_DEPT_LIST_STYLE.get("row_lead_dot_gap_px", 6))
+    dot_color = MONOS_COLORS["blue_400"] if selected else MONOS_COLORS["text_meta"]
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(dot_color))
+    painter.drawEllipse(x, cy - dot_r, dot_r * 2, dot_r * 2)
+    return x + dot_r * 2 + gap
+
+
 class _TagListDelegate(QStyledItemDelegate):
     """Paints tag list item: default icon + text, then a small rounded count badge on the right."""
 
@@ -251,123 +370,153 @@ class _TagListDelegate(QStyledItemDelegate):
         return s
 
 
-class _SidebarDeptListDelegate(QStyledItemDelegate):
-    """
-    Department list: section = container header (fill + title 7px); dept = fill + dot + icon + text.
-    Section non-interactive. UserRole: dict with type + section_label or dept_id (+ optional in_section).
-    """
+class _SidebarFilterTreeDelegate(QStyledItemDelegate):
+    """Flat tree rows: group (chevron + toggle) and leaf (selectable). No gradients."""
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[override]
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-
         data = opt.index.data(Qt.UserRole) if opt.index.isValid() else None
-        if isinstance(data, dict):
-            if data.get("type") == _DEPT_ROW_SECTION:
-                self._paint_section(painter, opt, data.get("section_label", ""))
-                return
-            if data.get("type") == _DEPT_ROW_SPACER:
-                return  # empty row, list background shows through
-        self._paint_dept_row(painter, opt, data if isinstance(data, dict) else None)
+        if not isinstance(data, dict):
+            super().paint(painter, option, index)
+            return
+        row_type = data.get("type")
+        if row_type == _DEPT_ROW_SPACER:
+            return
+        if row_type == _DEPT_ROW_SECTION:
+            self._paint_legacy_section(painter, opt, str(data.get("section_label", "")))
+            return
+        if row_type == _FILTER_ROW_GROUP:
+            self._paint_group_row(painter, opt, data)
+            return
+        self._paint_leaf_row(painter, opt, data)
 
-    def _paint_section(self, painter: QPainter, opt: QStyleOptionViewItem, title: str) -> None:
+    def _paint_legacy_section(self, painter: QPainter, opt: QStyleOptionViewItem, title: str) -> None:
+        if not title:
+            return
         r = opt.rect
-        radius = float(SIDEBAR_DEPT_LIST_STYLE.get("container_radius_px", 6))
         painter.save()
         try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(_container_gradient(QRectF(r)))
-            path = _rounded_rect_path(QRectF(r), radius, round_top=True, round_bottom=False)
-            painter.drawPath(path)
-            if title:
-                fs = int(SIDEBAR_DEPT_LIST_STYLE["section_font_size_px"])
-                f = QFont(opt.font.family(), fs, QFont.Weight.Normal)
-                painter.setFont(f)
-                key = str(SIDEBAR_DEPT_LIST_STYLE["section_title_color_key"])
-                painter.setPen(QColor(MONOS_COLORS.get(key, MONOS_COLORS["text_meta"])))
-                # Cùng padding trái như dept (10px) để title nằm chung container
-                text_r = r.adjusted(10, 0, -10, 0)
-                painter.drawText(text_r, Qt.AlignVCenter | Qt.AlignLeft, title)
+            fs = int(SIDEBAR_DEPT_LIST_STYLE.get("section_font_size_px", 9))
+            f = monos_font("Inter", fs, QFont.Weight.DemiBold)
+            painter.setFont(f)
+            painter.setPen(QColor(MONOS_COLORS["text_meta"]))
+            text_r = r.adjusted(10, 0, -10, 0)
+            painter.drawText(text_r, Qt.AlignVCenter | Qt.AlignLeft, title.upper())
         finally:
             painter.restore()
 
-    def _paint_dept_row(self, painter: QPainter, opt: QStyleOptionViewItem, data: dict | None) -> None:
-        widget = opt.widget
-        style = widget.style() if widget else QApplication.style()
+    def _row_metrics(self) -> tuple[int, int, QFont]:
+        row_px = int(SIDEBAR_DEPT_LIST_STYLE.get("row_font_size_px", 11))
+        icon_px = int(SIDEBAR_DEPT_LIST_STYLE.get("row_icon_size_px", 14))
+        body_font = monos_font("Inter", row_px, QFont.Weight.Medium)
+        return row_px, icon_px, body_font
+
+    def _paint_group_row(self, painter: QPainter, opt: QStyleOptionViewItem, data: dict) -> None:
         r = opt.rect
-        radius = float(SIDEBAR_DEPT_LIST_STYLE.get("container_radius_px", 6))
-        round_top = bool(data.get("round_top")) if isinstance(data, dict) else False
-        round_bottom = bool(data.get("round_bottom")) if isinstance(data, dict) else False
+        is_hovered = bool(opt.state & QStyle.State_MouseOver)
         painter.save()
         try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(_container_gradient(QRectF(r)))
-            path = _rounded_rect_path(QRectF(r), radius, round_top, round_bottom)
-            painter.drawPath(path)
-            scope_row = isinstance(data, dict) and bool(data.get("scope_id"))
-            if scope_row and data.get("scope_active"):
-                painter.fillPath(path, QColor(59, 130, 246, 26))
-                painter.setPen(QPen(QColor(59, 130, 246, 76), 1))
-                painter.drawPath(path)
-            style.drawPrimitive(QStyle.PE_PanelItemViewItem, opt, painter, widget)
-            inner = r.adjusted(10, 0, -10, 0)
-            dot_r = 4
-            dot_gap = 10
-            dot_cx = inner.left() + dot_r
-            dot_cy = r.center().y()
-            if scope_row:
-                is_selected = bool(data.get("scope_active"))
-            else:
-                is_selected = bool(opt.state & QStyle.State_Selected)
-            dot_color = QColor(MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_meta"])
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(dot_color)
-            painter.drawEllipse(dot_cx - dot_r, dot_cy - dot_r, dot_r * 2, dot_r * 2)
-            x = dot_cx + dot_r + dot_gap
-            icon_size = opt.decorationSize if opt.decorationSize.isValid() else QSize(16, 16)
-            if not opt.icon.isNull():
-                ir = QRect(x, r.center().y() - icon_size.height() // 2, icon_size.width(), icon_size.height())
-                opt.icon.paint(painter, ir, Qt.AlignCenter, QIcon.Selected if is_selected else QIcon.Normal)
-                x = ir.right() + 8
-            text_right = inner.right()
-            count = data.get("count") if isinstance(data, dict) else None
-            if count is not None:
-                badge_font = QFont(opt.font.family(), 8, QFont.Weight.Medium)
-                badge_fm = QFontMetrics(badge_font)
-                badge_text = str(count)
-                badge_pad_h = 4
-                badge_pad_v = 1
-                badge_w = badge_fm.horizontalAdvance(badge_text) + badge_pad_h * 2
-                badge_h = min(badge_fm.height() + badge_pad_v * 2, r.height() - 6)
-                badge_w = max(badge_w, 14)
-                text_right = inner.right() - badge_w - 2
-                badge_rect = QRect(inner.right() - badge_w, r.center().y() - badge_h // 2, badge_w, badge_h)
+            if is_hovered:
+                hover = _filter_row_highlight_rect(r)
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 painter.setPen(Qt.PenStyle.NoPen)
-                is_zero = count == 0
-                if is_zero:
-                    painter.setBrush(QColor(39, 39, 42))
-                    painter.drawRoundedRect(badge_rect, 3, 3)
-                    painter.setPen(QColor(MONOS_COLORS.get("text_meta", "#71717a")))
-                else:
-                    painter.setBrush(QColor(MONOS_COLORS.get("blue_700", "#075985")))
-                    painter.drawRoundedRect(badge_rect, 3, 3)
-                    painter.setPen(QColor(255, 255, 255, 180))
-                painter.setFont(badge_font)
-                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+                painter.setBrush(QColor(255, 255, 255, 14))
+                painter.drawRoundedRect(hover, _filter_row_highlight_radius(), _filter_row_highlight_radius())
+            indent = int(data.get("indent") or 0)
+            pad_left = _filter_row_content_pad_left(indent=indent)
+            cy = r.center().y()
+            x = pad_left
+            expanded = bool(data.get("expanded", True))
+            x = _paint_filter_chevron(painter, rect=r, expanded=expanded, x=x, cy=cy)
+            _, icon_px, body_font = self._row_metrics()
+            if not opt.icon.isNull():
+                ir = QRect(x, cy - icon_px // 2, icon_px, icon_px)
+                opt.icon.paint(painter, ir, Qt.AlignCenter)
+                x = ir.right() + 6
+            count = data.get("count")
+            pad_right = _filter_row_content_pad_right()
+            text_right = r.right() - pad_right
+            if count is not None:
+                fm_b = QFontMetrics(monos_font("Inter", 10, QFont.Weight.Medium))
+                text_right -= max(22, fm_b.horizontalAdvance(str(count)) + 12)
+            label = opt.text or ""
+            fm = QFontMetrics(body_font)
             text_rect = QRect(x, r.top(), max(0, text_right - x), r.height())
-            fm = QFontMetrics(opt.font)
-            text = fm.elidedText(opt.text, Qt.ElideRight, text_rect.width())
+            painter.setFont(body_font)
+            painter.setPen(QColor(MONOS_COLORS["text_label"]))
+            painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, fm.elidedText(label, Qt.ElideRight, text_rect.width()))
+            if count is not None:
+                try:
+                    _paint_filter_count_badge(painter, rect=r.adjusted(0, 0, -pad_right, 0), count=int(count), selected=False)
+                except (TypeError, ValueError):
+                    pass
+        finally:
+            painter.restore()
+
+    def _paint_leaf_row(self, painter: QPainter, opt: QStyleOptionViewItem, data: dict) -> None:
+        r = opt.rect
+        scope_row = bool(data.get("scope_id"))
+        if scope_row:
+            is_selected = bool(data.get("scope_active"))
+        else:
+            is_selected = bool(opt.state & QStyle.State_Selected)
+        is_hovered = bool(opt.state & QStyle.State_MouseOver)
+        painter.save()
+        try:
+            sel_rect = _filter_row_highlight_rect(r)
+            radius = _filter_row_highlight_radius()
+            if is_selected:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(37, 99, 235, 100))
+                painter.drawRoundedRect(sel_rect, radius, radius)
+            elif is_hovered:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 255, 255, 14))
+                painter.drawRoundedRect(sel_rect, radius, radius)
+            indent = int(data.get("indent") or 0)
+            pad_left = _filter_row_content_pad_left(indent=indent)
+            cy = r.center().y()
+            x = pad_left
+            # Child rows under a group: chevron column spacer for alignment.
+            if indent > 0:
+                x += 16
+            x = _paint_filter_lead_dot(painter, x=x, cy=cy, selected=is_selected)
+            _, icon_px, body_font = self._row_metrics()
+            if not opt.icon.isNull():
+                ir = QRect(x, cy - icon_px // 2, icon_px, icon_px)
+                opt.icon.paint(painter, ir, Qt.AlignCenter, QIcon.Selected if is_selected else QIcon.Normal)
+                x = ir.right() + 6
+            count = data.get("count")
+            pad_right = _filter_row_content_pad_right()
+            text_right = r.right() - pad_right
+            if count is not None:
+                fm_b = QFontMetrics(monos_font("Inter", 10, QFont.Weight.Medium))
+                text_right -= max(22, fm_b.horizontalAdvance(str(count)) + 12)
+            fm = QFontMetrics(body_font)
+            text_rect = QRect(x, r.top(), max(0, text_right - x), r.height())
             if scope_row and not is_selected:
-                pen_color = QColor(MONOS_COLORS.get("text_meta", "#71717a"))
+                pen_color = QColor(MONOS_COLORS["text_meta"])
+            elif is_selected:
+                pen_color = QColor(MONOS_COLORS["blue_400"])
             else:
-                pen_color = QColor(MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"])
+                pen_color = QColor(MONOS_COLORS["text_label"])
+            painter.setFont(body_font)
             painter.setPen(pen_color)
-            painter.setFont(opt.font)
-            painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+            painter.drawText(
+                text_rect,
+                Qt.AlignVCenter | Qt.AlignLeft,
+                fm.elidedText(opt.text, Qt.ElideRight, text_rect.width()),
+            )
+            if count is not None:
+                try:
+                    _paint_filter_count_badge(
+                        painter, rect=r.adjusted(0, 0, -pad_right, 0), count=int(count), selected=is_selected
+                    )
+                except (TypeError, ValueError):
+                    pass
         finally:
             painter.restore()
 
@@ -375,10 +524,15 @@ class _SidebarDeptListDelegate(QStyledItemDelegate):
         data = index.data(Qt.UserRole) if index.isValid() else None
         if isinstance(data, dict):
             if data.get("type") == _DEPT_ROW_SECTION:
-                return QSize(-1, int(SIDEBAR_DEPT_LIST_STYLE["section_row_height_px"]))
+                return QSize(-1, int(SIDEBAR_DEPT_LIST_STYLE.get("section_row_height_px", 20)))
             if data.get("type") == _DEPT_ROW_SPACER:
-                return QSize(-1, int(SIDEBAR_DEPT_LIST_STYLE["spacer_row_height_px"]))
-        return super().sizeHint(option, index)
+                return QSize(-1, int(SIDEBAR_DEPT_LIST_STYLE.get("spacer_row_height_px", 4)))
+        h = int(SIDEBAR_DEPT_LIST_STYLE.get("dept_row_height_px", 28))
+        return QSize(-1, h)
+
+
+# Back-compat alias for picker dialog.
+_SidebarDeptListDelegate = _SidebarFilterTreeDelegate
 
 
 class _SidebarDotItemDelegate(QStyledItemDelegate):
@@ -599,19 +753,19 @@ class _SidebarScopePillWidget(QWidget):
         self._buttons: dict[str, QToolButton] = {}
         _seg_font = monos_font("Inter", 13, QFont.Weight.DemiBold)
         _seg_font.setLetterSpacing(QFont.PercentageSpacing, 97)
-        for i, (ctx, icon_name) in enumerate(_SCOPE_PILL_CONTEXTS):
+        segment_btns: list[QToolButton] = []
+        for _i, (ctx, icon_name) in enumerate(_SCOPE_PILL_CONTEXTS):
             btn = QToolButton(self)
             btn.setObjectName("SidebarScopePillSegment")
             btn.setProperty("segment", ctx)
             btn.setProperty("active", "false")
-            btn.setProperty("position", "left" if i == 0 else ("right" if i == 2 else "center"))
             label = _SCOPE_PILL_LABELS.get(ctx)
             btn.setProperty("labeled", "true" if label else "false")
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFocusPolicy(Qt.NoFocus)
             btn.setAutoRaise(True)
             btn.setToolTip(_SCOPE_PILL_TOOLTIPS.get(ctx, ctx))
-            ic = lucide_icon(icon_name, size=_SCOPE_PILL_ICON_SIZE, color_hex=MONOS_COLORS["text_label"])
+            ic = lucide_icon(icon_name, size=_SCOPE_PILL_ICON_SIZE, color_hex=MONOS_COLORS["pill_segment_inactive_fg"])
             if not ic.isNull():
                 btn.setIcon(ic)
                 btn.setIconSize(QSize(_SCOPE_PILL_ICON_SIZE, _SCOPE_PILL_ICON_SIZE))
@@ -628,7 +782,8 @@ class _SidebarScopePillWidget(QWidget):
                 btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked=False, c=ctx: self.segment_clicked.emit(c))
             self._buttons[ctx] = btn
-            layout.addWidget(btn, 0, Qt.AlignVCenter)
+            segment_btns.append(btn)
+        add_widgets_with_icon_separators(layout, segment_btns, self, sep_height=20)
         self.style().unpolish(self)
         self.style().polish(self)
 
@@ -639,7 +794,7 @@ class _SidebarScopePillWidget(QWidget):
         for ctx, btn in self._buttons.items():
             is_active = ctx == active_ctx
             btn.setProperty("active", "true" if is_active else "false")
-            color = MONOS_COLORS["blue_400"] if is_active else MONOS_COLORS["text_label"]
+            color = MONOS_COLORS["pill_segment_active_fg"] if is_active else MONOS_COLORS["pill_segment_inactive_fg"]
             ic_name = next((ic for c, ic in _SCOPE_PILL_CONTEXTS if c == ctx), "box")
             ic = lucide_icon(ic_name, size=_SCOPE_PILL_ICON_SIZE, color_hex=color)
             if not ic.isNull():
@@ -659,7 +814,8 @@ class _SidebarScopePillWidget(QWidget):
             btn.setToolTip(tip)
 
 
-_SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX = 180
+_SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX = int(SIDEBAR_DEPT_LIST_STYLE.get("max_list_height_px", 280))
+_SIDEBAR_DEPT_LIST_MAX_HEIGHT_PX = _SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX
 
 
 class SidebarWidget(QWidget):
@@ -681,7 +837,7 @@ class SidebarWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setObjectName("SidebarFilterPanel")
+        self.setObjectName("MetadataNavRoot")
 
         self._settings: QSettings | None = None
 
@@ -714,16 +870,28 @@ class SidebarWidget(QWidget):
         # Item counts for label display (set by sidebar container from ProjectIndex).
         self._count_by_type: dict[str, int] = {}
         self._count_by_department: dict[str, int] = {}
+        self._collapsed_filter_groups: set[str] = set()
+        self._dept_section_expanded = True
+        self._type_section_expanded = True
+        self._dept_list_max_height_px: int | None = None
+        self._type_list_max_height_px: int | None = None
+        self._filters_dept_stretch_callback = None
+        self._filters_layout_callback = None
         # Schedule: which dept ids apply to shot vs asset entities (index + pipeline types).
         self._schedule_dept_shot_ids: set[str] = set()
         self._schedule_dept_asset_ids: set[str] = set()
+        self._header_filter_popup: QFrame | None = None
+        self._header_filter_popup_scope: str | None = None
+        self._header_filter_popup_anchor: QWidget | None = None
+        self._header_filter_popup_closed_at = 0.0
+        self._HEADER_FILTER_POPUP_REOPEN_GRACE = 0.25
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
-        f_h = monos_font("Inter", 10, QFont.Weight.ExtraBold)  # 800
-        f_h.setLetterSpacing(QFont.PercentageSpacing, 112)  # tracking-widest-ish
+        f_h = monos_font("Inter", 11, QFont.Weight.ExtraBold)  # 800 — DEPARTMENTS/TYPES title
+        f_h.setLetterSpacing(QFont.PercentageSpacing, 108)
 
         # --- SCOPE (Schedule: Shots / Assets multi-toggle)
         scope_header_row = QWidget(self)
@@ -744,13 +912,16 @@ class SidebarWidget(QWidget):
         scope_header_row_l.addWidget(scope_icon, 0, Qt.AlignVCenter)
         scope_header_row_l.addWidget(scope_header, 0, Qt.AlignVCenter)
         scope_header_row_l.addStretch(1)
-        self._scope_list = QListWidget(self)
+        self._scope_list_container = _sidebar_filter_list_container(self)
+        self._scope_list = QListWidget(self._scope_list_container)
+        self._scope_list_container.layout().addWidget(self._scope_list)
         self._scope_list.setObjectName("SidebarFilterList")
         self._scope_list.setSelectionMode(QAbstractItemView.NoSelection)
         self._scope_list.setUniformItemSizes(False)
         self._scope_list.setFocusPolicy(Qt.NoFocus)
         self._scope_list.setIconSize(QSize(16, 16))
-        self._scope_list.setItemDelegate(_SidebarDeptListDelegate(self._scope_list))
+        self._scope_list.setItemDelegate(_SidebarFilterTreeDelegate(self._scope_list))
+        self._scope_list.setSpacing(int(SIDEBAR_DEPT_LIST_STYLE.get("list_row_spacing_px", 3)))
         self._scope_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scope_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scope_list.setMaximumHeight(88)
@@ -759,18 +930,25 @@ class SidebarWidget(QWidget):
         self._scope_section.setObjectName("SidebarFilterScopeSection")
         scope_section_lay = QVBoxLayout(self._scope_section)
         scope_section_lay.setContentsMargins(0, 0, 0, 0)
-        scope_section_lay.setSpacing(0)
+        scope_section_lay.setSpacing(4)
         scope_section_lay.addWidget(scope_header_row, 0)
-        scope_section_lay.addWidget(self._scope_list, 0)
+        scope_section_lay.addWidget(self._scope_list_container, 0)
         self._scope_section.setVisible(False)
         self._rebuild_scope_list()
 
         # --- Header rows (label + "+" button, right-aligned)
         dept_header_row = QWidget(self)
+        self._dept_header_row = dept_header_row
         dept_header_row.setObjectName("SidebarFilterHeaderRow")
         dept_header_row_l = QHBoxLayout(dept_header_row)
         dept_header_row_l.setContentsMargins(0, 0, 0, 0)
-        dept_header_row_l.setSpacing(8)
+        dept_header_row_l.setSpacing(6)
+
+        self._btn_dept_section_chevron = _make_filter_section_chevron(
+            dept_header_row,
+            expanded=True,
+            on_toggle=self._toggle_dept_section_expanded,
+        )
 
         dept_icon = QLabel(dept_header_row)
         dept_icon.setObjectName("SidebarFilterHeaderIcon")
@@ -785,39 +963,53 @@ class SidebarWidget(QWidget):
         self._btn_dept_pick = QToolButton(dept_header_row)
         self._btn_dept_pick.setObjectName("SidebarFilterAddButton")
         self._btn_dept_pick.setText("+")
+        self._btn_dept_pick.setFixedSize(18, 18)
         self._btn_dept_pick.setCursor(Qt.PointingHandCursor)
         self._btn_dept_pick.clicked.connect(self._open_department_picker)
 
+        dept_header_row_l.addWidget(self._btn_dept_section_chevron, 0, Qt.AlignVCenter)
         dept_header_row_l.addWidget(dept_icon, 0, Qt.AlignVCenter)
         dept_header_row_l.addWidget(dept_header, 0, Qt.AlignVCenter)
         dept_header_row_l.addStretch(1)
         dept_header_row_l.addWidget(self._btn_dept_pick, 0, Qt.AlignVCenter)
+        dept_header_row.setFixedHeight(20)
 
-        self._dept_list = QListWidget(self)
+        self._dept_list_container = _sidebar_filter_list_container(self)
+        self._dept_list_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self._dept_list = QListWidget(self._dept_list_container)
+        self._dept_list_container.layout().addWidget(self._dept_list, 0)
         self._dept_list.setObjectName("SidebarFilterList")
         self._dept_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._dept_list.setUniformItemSizes(False)  # section/spacer/dept have different heights
         self._dept_list.setFocusPolicy(Qt.NoFocus)
-        self._dept_list.setIconSize(QSize(16, 16))
-        self._dept_list.setItemDelegate(_SidebarDeptListDelegate(self._dept_list))
+        self._dept_list.setIconSize(QSize(12, 12))
+        self._dept_list.setItemDelegate(_SidebarFilterTreeDelegate(self._dept_list))
+        self._dept_list.setSpacing(int(SIDEBAR_DEPT_LIST_STYLE.get("list_row_spacing_px", 3)))
         self._dept_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._dept_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._dept_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self._dept_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._dept_list.itemClicked.connect(self._on_department_clicked)
 
         self._dept_section = QWidget(self)
         self._dept_section.setObjectName("SidebarFilterDeptSection")
+        self._dept_section.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         dept_section_lay = QVBoxLayout(self._dept_section)
         dept_section_lay.setContentsMargins(0, 0, 0, 0)
-        dept_section_lay.setSpacing(0)
+        dept_section_lay.setSpacing(4)
         dept_section_lay.addWidget(dept_header_row, 0)
-        dept_section_lay.addWidget(self._dept_list, 1)
+        dept_section_lay.addWidget(self._dept_list_container, 0)
 
         type_header_row = QWidget(self)
         type_header_row.setObjectName("SidebarFilterHeaderRow")
         type_header_row_l = QHBoxLayout(type_header_row)
         type_header_row_l.setContentsMargins(0, 0, 0, 0)
-        type_header_row_l.setSpacing(8)
+        type_header_row_l.setSpacing(6)
+
+        self._btn_type_section_chevron = _make_filter_section_chevron(
+            type_header_row,
+            expanded=True,
+            on_toggle=self._toggle_type_section_expanded,
+        )
 
         type_icon = QLabel(type_header_row)
         type_icon.setObjectName("SidebarFilterHeaderIcon")
@@ -832,33 +1024,42 @@ class SidebarWidget(QWidget):
         self._btn_type_pick = QToolButton(type_header_row)
         self._btn_type_pick.setObjectName("SidebarFilterAddButton")
         self._btn_type_pick.setText("+")
+        self._btn_type_pick.setFixedSize(18, 18)
         self._btn_type_pick.setCursor(Qt.PointingHandCursor)
         self._btn_type_pick.clicked.connect(self._open_type_picker)
 
+        type_header_row_l.addWidget(self._btn_type_section_chevron, 0, Qt.AlignVCenter)
         type_header_row_l.addWidget(type_icon, 0, Qt.AlignVCenter)
         type_header_row_l.addWidget(type_header, 0, Qt.AlignVCenter)
         type_header_row_l.addStretch(1)
         type_header_row_l.addWidget(self._btn_type_pick, 0, Qt.AlignVCenter)
 
-        self._type_list = QListWidget(self)
+        type_header_row.setFixedHeight(20)
+
+        self._type_list_container = _sidebar_filter_list_container(self)
+        self._type_list = QListWidget(self._type_list_container)
+        self._type_list_container.layout().addWidget(self._type_list)
         self._type_list.setObjectName("SidebarFilterList")
         self._type_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._type_list.setUniformItemSizes(False)  # section/spacer/type like departments
+        self._type_list.setUniformItemSizes(False)
         self._type_list.setFocusPolicy(Qt.NoFocus)
-        self._type_list.setIconSize(QSize(16, 16))
-        self._type_list.setItemDelegate(_SidebarDeptListDelegate(self._type_list))
+        self._type_list.setIconSize(QSize(12, 12))
+        self._type_list.setItemDelegate(_SidebarFilterTreeDelegate(self._type_list))
+        self._type_list.setSpacing(int(SIDEBAR_DEPT_LIST_STYLE.get("list_row_spacing_px", 3)))
         self._type_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._type_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._type_list.setMaximumHeight(_SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX)
+        self._type_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._type_list.itemClicked.connect(self._on_type_clicked)
 
         self._type_section = QWidget(self)
         self._type_section.setObjectName("SidebarFilterTypeSection")
+        self._type_section.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         type_section_lay = QVBoxLayout(self._type_section)
         type_section_lay.setContentsMargins(0, 0, 0, 0)
-        type_section_lay.setSpacing(0)
-        type_section_lay.addWidget(type_header_row, 0)
-        type_section_lay.addWidget(self._type_list, 0)
+        type_section_lay.setSpacing(4)
+        type_section_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+        type_section_lay.addWidget(type_header_row, 0, Qt.AlignmentFlag.AlignTop)
+        type_section_lay.addWidget(self._type_list_container, 0, Qt.AlignmentFlag.AlignTop)
 
         # --- TAGS section (visible only in "reference" mode) ---
         tag_header_row = QWidget(self)
@@ -880,6 +1081,7 @@ class SidebarWidget(QWidget):
         self._btn_tag_pick = QToolButton(tag_header_row)
         self._btn_tag_pick.setObjectName("SidebarFilterAddButton")
         self._btn_tag_pick.setText("+")
+        self._btn_tag_pick.setFixedSize(18, 18)
         self._btn_tag_pick.setCursor(Qt.PointingHandCursor)
         self._btn_tag_pick.clicked.connect(self._open_tag_picker)
 
@@ -887,8 +1089,11 @@ class SidebarWidget(QWidget):
         tag_header_row_l.addWidget(tag_header_label, 0, Qt.AlignVCenter)
         tag_header_row_l.addStretch(1)
         tag_header_row_l.addWidget(self._btn_tag_pick, 0, Qt.AlignVCenter)
+        tag_header_row.setFixedHeight(20)
 
-        self._tag_list = QListWidget(self)
+        self._tag_list_container = _sidebar_filter_list_container(self)
+        self._tag_list = QListWidget(self._tag_list_container)
+        self._tag_list_container.layout().addWidget(self._tag_list)
         self._tag_list.setObjectName("SidebarTagList")
         self._tag_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tag_list.setFocusPolicy(Qt.NoFocus)
@@ -910,9 +1115,9 @@ class SidebarWidget(QWidget):
         self._tag_section.setObjectName("SidebarFilterTagSection")
         tag_section_lay = QVBoxLayout(self._tag_section)
         tag_section_lay.setContentsMargins(0, 0, 0, 0)
-        tag_section_lay.setSpacing(0)
+        tag_section_lay.setSpacing(4)
         tag_section_lay.addWidget(tag_header_row, 0)
-        tag_section_lay.addWidget(self._tag_list, 0)
+        tag_section_lay.addWidget(self._tag_list_container, 0)
 
         self._tag_section.setVisible(False)
 
@@ -936,6 +1141,19 @@ class SidebarWidget(QWidget):
     def tag_section(self) -> QWidget:
         return self._tag_section
 
+    def set_filters_dept_stretch_callback(self, callback) -> None:
+        """Deprecated: use set_filters_layout_callback."""
+        self._filters_dept_stretch_callback = callback
+
+    def set_filters_layout_callback(self, callback) -> None:
+        """Sidebar syncs filter section stretch/alignment when mode or dept expand changes."""
+        self._filters_layout_callback = callback
+
+    def _notify_filters_layout(self) -> None:
+        cb = self._filters_layout_callback or self._filters_dept_stretch_callback
+        if cb is not None:
+            cb()
+
     def reload_from_pipeline_metadata(self) -> None:
         """
         UI-only: load departments/types from pipeline metadata JSON for current mode.
@@ -944,7 +1162,7 @@ class SidebarWidget(QWidget):
         if self._mode == "inbox":
             self._all_types = ["client", "freelancer"]
             self._type_label_by_id = {"client": "Client", "freelancer": "Freelancer"}
-            self._type_icon_by_id = {}
+            self._type_icon_by_id = {"client": "package", "freelancer": "user"}
             self._all_departments = []
             self._dept_label_by_id = {}
             self._dept_icon_by_id = {}
@@ -961,6 +1179,7 @@ class SidebarWidget(QWidget):
             self._type_section.setVisible(True)
             self._scope_section.setVisible(False)
             self._tag_section.setVisible(False)
+            self._notify_filters_layout()
             return
 
         if self._mode == "reference":
@@ -986,6 +1205,7 @@ class SidebarWidget(QWidget):
             self._scope_section.setVisible(False)
             self._tag_section.setVisible(True)
             self._sync_tag_selection()
+            self._notify_filters_layout()
             return
 
         meta = load_pipeline_types_and_presets_for_project(self._project_root)
@@ -1086,6 +1306,7 @@ class SidebarWidget(QWidget):
         if self._mode == "schedule":
             self._rebuild_schedule_dept_scope_sets()
             self._rebuild_scope_list()
+        self._notify_filters_layout()
 
     def update_schedule_dept_scope_sets(
         self,
@@ -1278,6 +1499,7 @@ class SidebarWidget(QWidget):
         if m not in ("assets", "shots", "schedule", "inbox", "reference"):
             return
         if self._mode == m:
+            self._notify_filters_layout()
             return
         # Snapshot outgoing mode state.
         self._state_by_mode[self._mode] = self._snapshot_state()
@@ -1399,11 +1621,10 @@ class SidebarWidget(QWidget):
                 it.setData(
                     Qt.UserRole,
                     {
-                        "type": _DEPT_ROW_DEPT,
+                        "type": _FILTER_ROW_LEAF,
                         "scope_id": scope_id,
                         "scope_active": bool(selected),
-                        "round_top": i == 0,
-                        "round_bottom": i == len(rows) - 1,
+                        "indent": 0,
                     },
                 )
                 it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="box"))
@@ -1414,7 +1635,7 @@ class SidebarWidget(QWidget):
 
     def _on_scope_clicked(self, item: QListWidgetItem) -> None:
         data = item.data(Qt.UserRole) or {}
-        if not isinstance(data, dict) or data.get("type") != _DEPT_ROW_DEPT:
+        if not isinstance(data, dict) or data.get("type") != _FILTER_ROW_LEAF:
             return
         scope_id = (data.get("scope_id") or "").strip().lower()
         if scope_id == "shots":
@@ -1429,6 +1650,153 @@ class SidebarWidget(QWidget):
             self._rebuild_scope_list()
             return
         self.set_entity_scope(include_shots=new_shots, include_assets=new_assets)
+
+    def _is_filter_group_expanded(self, scope: str, group_id: str) -> bool:
+        return _filter_group_key(scope, group_id) not in self._collapsed_filter_groups
+
+    def _toggle_filter_group(self, scope: str, group_id: str) -> None:
+        key = _filter_group_key(scope, group_id)
+        if key in self._collapsed_filter_groups:
+            self._collapsed_filter_groups.discard(key)
+        else:
+            self._collapsed_filter_groups.add(key)
+        if scope == "dept":
+            self.set_departments(self._all_departments)
+        elif scope == "type":
+            self.set_types(self._all_types)
+        self._sync_selection()
+
+    def _toggle_dept_section_expanded(self, _checked: bool = False) -> None:
+        self._dept_section_expanded = not self._dept_section_expanded
+        self._dept_list_container.setVisible(self._dept_section_expanded)
+        self._btn_dept_pick.setVisible(self._dept_section_expanded)
+        _update_filter_section_chevron(self._btn_dept_section_chevron, expanded=self._dept_section_expanded)
+        self._notify_filters_layout()
+
+    def _toggle_type_section_expanded(self, _checked: bool = False) -> None:
+        self._type_section_expanded = not self._type_section_expanded
+        self._type_list_container.setVisible(self._type_section_expanded)
+        self._btn_type_pick.setVisible(self._type_section_expanded)
+        _update_filter_section_chevron(self._btn_type_section_chevron, expanded=self._type_section_expanded)
+        self._notify_filters_layout()
+
+    def _append_filter_group_row(
+        self,
+        list_w: QListWidget,
+        *,
+        scope: str,
+        group_id: str,
+        label: str,
+        icon_name: str | None,
+        indent: int = 0,
+    ) -> None:
+        expanded = self._is_filter_group_expanded(scope, group_id)
+        it = QListWidgetItem(label)
+        it.setData(
+            Qt.UserRole,
+            {
+                "type": _FILTER_ROW_GROUP,
+                "scope": scope,
+                "group_id": group_id,
+                "expanded": expanded,
+                "indent": indent,
+            },
+        )
+        if icon_name:
+            it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="layers"))
+        it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        list_w.addItem(it)
+
+    def _append_filter_leaf_row(
+        self,
+        list_w: QListWidget,
+        *,
+        scope: str,
+        item_id: str,
+        label: str,
+        count_map: dict[str, int],
+        icon_name: str | None,
+        indent: int = 0,
+        extra: dict | None = None,
+    ) -> None:
+        role: dict = {
+            "type": _FILTER_ROW_LEAF,
+            "scope": scope,
+            "item_id": item_id,
+            "indent": indent,
+        }
+        if item_id in count_map:
+            role["count"] = count_map[item_id]
+        if extra:
+            role.update(extra)
+        it = QListWidgetItem(label)
+        it.setData(Qt.UserRole, role)
+        if icon_name:
+            fb = "folder" if scope == "type" else "layers"
+            it.setIcon(_lucide_two_state_icon(icon_name, fallback_name=fb))
+        list_w.addItem(it)
+
+    def _build_dept_tree_rows(self, list_w: QListWidget, visible: list[str]) -> None:
+        parents_with_children = {self._dept_parent[d] for d in visible if self._dept_parent.get(d)}
+        children_by_parent: dict[str, list[str]] = {}
+        for dept_id in visible:
+            parent_id = self._dept_parent.get(dept_id)
+            if parent_id and parent_id in parents_with_children:
+                children_by_parent.setdefault(parent_id, []).append(dept_id)
+
+        emitted_groups: set[str] = set()
+        for dept_id in visible:
+            parent_id = self._dept_parent.get(dept_id)
+            if parent_id and parent_id in parents_with_children:
+                if parent_id in emitted_groups:
+                    continue
+                emitted_groups.add(parent_id)
+                label = _title_case_label(self._dept_label_by_id.get(parent_id, parent_id))
+                child_ids = children_by_parent.get(parent_id, [])
+                icon = self._dept_icon_by_id.get(parent_id) or self._dept_icon_by_id.get(dept_id)
+                self._append_filter_group_row(
+                    list_w,
+                    scope="dept",
+                    group_id=parent_id,
+                    label=label,
+                    icon_name=icon,
+                )
+                if self._is_filter_group_expanded("dept", parent_id):
+                    for child_id in child_ids:
+                        child_label = _title_case_label(self._dept_label_by_id.get(child_id, child_id))
+                        self._append_filter_leaf_row(
+                            list_w,
+                            scope="dept",
+                            item_id=child_id,
+                            label=child_label,
+                            count_map=self._count_by_department,
+                            icon_name=self._dept_icon_by_id.get(child_id),
+                            indent=1,
+                        )
+            else:
+                label = _title_case_label(self._dept_label_by_id.get(dept_id, dept_id))
+                self._append_filter_leaf_row(
+                    list_w,
+                    scope="dept",
+                    item_id=dept_id,
+                    label=label,
+                    count_map=self._count_by_department,
+                    icon_name=self._dept_icon_by_id.get(dept_id),
+                    indent=0,
+                )
+
+    def _build_type_flat_rows(self, list_w: QListWidget, type_ids: list[str]) -> None:
+        for type_id in type_ids:
+            label = _title_case_label(self._type_label_by_id.get(type_id, type_id))
+            self._append_filter_leaf_row(
+                list_w,
+                scope="type",
+                item_id=type_id,
+                label=label,
+                count_map=self._count_by_type,
+                icon_name=self._type_icon_by_id.get(type_id),
+                indent=0,
+            )
 
     def _populate_dept_list_schedule(self, visible: list[str]) -> None:
         """Schedule: departments grouped by Shots vs Assets (picker list = timeline whitelist)."""
@@ -1447,41 +1815,28 @@ class SidebarWidget(QWidget):
         self._dept_list.blockSignals(True)
         try:
             self._dept_list.clear()
-            next_dept_round_top = True
-            for sec_idx, (section_label, dept_ids) in enumerate(sections):
-                if self._dept_list.count() > 0:
-                    spacer = QListWidgetItem("")
-                    spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
-                    spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                    self._dept_list.addItem(spacer)
-                    next_dept_round_top = True
-                section_item = QListWidgetItem("")
-                section_item.setData(
-                    Qt.UserRole,
-                    {"type": _DEPT_ROW_SECTION, "section_label": section_label},
+            for section_label, dept_ids in sections:
+                if not dept_ids:
+                    continue
+                self._append_filter_group_row(
+                    self._dept_list,
+                    scope="dept",
+                    group_id=f"schedule:{section_label}",
+                    label=section_label,
+                    icon_name="box" if section_label == "Assets" else "clapperboard",
                 )
-                section_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                self._dept_list.addItem(section_item)
-                next_dept_round_top = False
-                for i, dept_id in enumerate(dept_ids):
-                    last_in_block = i + 1 >= len(dept_ids)
-                    label = _title_case_label(self._dept_label_by_id.get(dept_id, dept_id))
-                    count = self._count_by_department.get(dept_id)
-                    it = QListWidgetItem(label)
-                    role: dict = {
-                        "type": _DEPT_ROW_DEPT,
-                        "dept_id": dept_id,
-                        "round_top": next_dept_round_top,
-                        "round_bottom": last_in_block,
-                    }
-                    if count is not None:
-                        role["count"] = count
-                    it.setData(Qt.UserRole, role)
-                    next_dept_round_top = False
-                    icon_name = self._dept_icon_by_id.get(dept_id)
-                    if icon_name:
-                        it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="layers"))
-                    self._dept_list.addItem(it)
+                if self._is_filter_group_expanded("dept", f"schedule:{section_label}"):
+                    for dept_id in dept_ids:
+                        label = _title_case_label(self._dept_label_by_id.get(dept_id, dept_id))
+                        self._append_filter_leaf_row(
+                            self._dept_list,
+                            scope="dept",
+                            item_id=dept_id,
+                            label=label,
+                            count_map=self._count_by_department,
+                            icon_name=self._dept_icon_by_id.get(dept_id),
+                            indent=1,
+                        )
             self._sync_selection()
         finally:
             self._dept_list.blockSignals(False)
@@ -1507,6 +1862,7 @@ class SidebarWidget(QWidget):
         visible = self._visible_departments or []
         if self._mode == "schedule":
             self._populate_dept_list_schedule(visible)
+            self._notify_filters_layout()
             return
         # When a type is active in assets/shots mode, restrict visible departments to those
         # supported by that type. If no type is active, show all departments that pass the
@@ -1514,74 +1870,62 @@ class SidebarWidget(QWidget):
         if self._mode in ("assets", "shots") and self._active_type and self._active_type in self._dept_ids_by_type:
             allowed = set(self._dept_ids_by_type.get(self._active_type, []))
             visible = [d for d in visible if d in allowed]
-        parents_with_children = {
-            self._dept_parent[d] for d in visible if self._dept_parent.get(d)
-        }
-        sections_emitted: set[str] = set()
 
         self._dept_list.blockSignals(True)
         try:
             self._dept_list.clear()
-            next_dept_round_top = True  # first dept in list or after section/spacer
-            for i, dept_id in enumerate(visible):
-                parent_id = self._dept_parent.get(dept_id)
-                is_in_section = bool(parent_id and parent_id in parents_with_children)
-                # Spacer before each new container so blocks are clearly separated.
-                if self._dept_list.count() > 0:
-                    if is_in_section:
-                        if parent_id not in sections_emitted:
-                            spacer = QListWidgetItem("")
-                            spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
-                            spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                            self._dept_list.addItem(spacer)
-                    else:
-                        spacer = QListWidgetItem("")
-                        spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
-                        spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                        self._dept_list.addItem(spacer)
-                        next_dept_round_top = True  # standalone dept after spacer
-
-                if is_in_section and parent_id not in sections_emitted:
-                    section_label = _title_case_label(
-                        self._dept_label_by_id.get(parent_id, parent_id)
-                    )
-                    section_item = QListWidgetItem("")
-                    section_item.setData(
-                        Qt.UserRole,
-                        {"type": _DEPT_ROW_SECTION, "section_label": section_label},
-                    )
-                    section_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                    self._dept_list.addItem(section_item)
-                    sections_emitted.add(parent_id)
-                    next_dept_round_top = False  # subdept đầu nối liền section, không bo góc trên
-
-                # Last in block: no next dept or next dept has different parent
-                if i + 1 >= len(visible):
-                    last_in_block = True
-                else:
-                    next_parent = self._dept_parent.get(visible[i + 1])
-                    last_in_block = next_parent != parent_id
-
-                label = _title_case_label(self._dept_label_by_id.get(dept_id, dept_id))
-                count = self._count_by_department.get(dept_id)
-                it = QListWidgetItem(label)
-                role: dict = {
-                    "type": _DEPT_ROW_DEPT,
-                    "dept_id": dept_id,
-                    "round_top": next_dept_round_top,
-                    "round_bottom": last_in_block,
-                }
-                if count is not None:
-                    role["count"] = count
-                it.setData(Qt.UserRole, role)
-                next_dept_round_top = False
-                icon_name = self._dept_icon_by_id.get(dept_id)
-                if icon_name:
-                    it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="layers"))
-                self._dept_list.addItem(it)
+            self._build_dept_tree_rows(self._dept_list, visible)
             self._sync_selection()
         finally:
             self._dept_list.blockSignals(False)
+        self._notify_filters_layout()
+
+    def set_dept_list_max_height(self, px: int | None) -> None:
+        """Cap department list height (scroll when content exceeds); None = fit content only."""
+        self._dept_list_max_height_px = px
+        if self._dept_section_expanded and self._all_departments:
+            self._fit_dept_list()
+
+    def set_type_list_max_height(self, px: int | None) -> None:
+        """Cap type list height (scroll when content exceeds); None = fit content only."""
+        self._type_list_max_height_px = px
+        if self._type_section_expanded and self._all_types:
+            self._fit_type_list()
+
+    def _fit_dept_list(self) -> None:
+        self._fit_list_height(
+            self._dept_list,
+            max_height_px=self._dept_list_max_height_px,
+            allow_shrink=False,
+        )
+        self._sync_list_container_height(self._dept_list, self._dept_list_container)
+        QTimer.singleShot(0, self._deferred_refine_dept_list)
+
+    def _fit_type_list(self) -> None:
+        allow_shrink = self._type_list_max_height_px is None
+        self._fit_list_height(
+            self._type_list,
+            max_height_px=self._type_list_max_height_px,
+            allow_shrink=allow_shrink,
+        )
+        self._sync_list_container_height(self._type_list, self._type_list_container)
+        QTimer.singleShot(0, self._deferred_refine_type_list)
+
+    def _deferred_refine_dept_list(self) -> None:
+        if SidebarWidget._ensure_list_fully_visible(self._dept_list, self._dept_list_max_height_px):
+            self._sync_list_container_height(self._dept_list, self._dept_list_container)
+
+    def _deferred_refine_type_list(self) -> None:
+        if SidebarWidget._ensure_list_fully_visible(self._type_list, self._type_list_max_height_px):
+            self._sync_list_container_height(self._type_list, self._type_list_container)
+
+    @staticmethod
+    def _sync_list_container_height(list_w: QListWidget, container: QFrame) -> None:
+        h = int(list_w.height())
+        # QFrame border (1px) is inside the widget rect; match list to inner client area.
+        container.setFixedHeight(h)
+        container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        list_w.updateGeometry()
 
     def set_types(self, values: list[str]) -> None:
         cleaned = [v.strip() for v in values if isinstance(v, str) and v.strip()]
@@ -1589,12 +1933,8 @@ class SidebarWidget(QWidget):
         if self._visible_types is None:
             self._visible_types = cleaned[: self._max_visible]
         else:
+            # Keep user picker selection; only drop ids no longer in pipeline metadata.
             self._visible_types = [v for v in self._visible_types if v in cleaned]
-        # After Assets→Shots→Assets restore, ensure all types are visible so user can select any (e.g. Character).
-        if self._mode in ("assets", "shots") and cleaned and (
-            not self._visible_types or len(self._visible_types) < len(cleaned)
-        ):
-            self._visible_types = cleaned[: self._max_visible]
         if self._mode == "schedule" and self._visible_types is None and cleaned:
             self._visible_types = cleaned[: self._max_visible]
 
@@ -1608,62 +1948,26 @@ class SidebarWidget(QWidget):
                     continue
                 scoped.append(type_id)
             visible = scoped
-        # Group by section: Assets vs Shots (same structure as department list).
-        asset_types = [t for t in visible if not _is_shot_type(t)]
-        shot_types = [t for t in visible if _is_shot_type(t)]
-        sections_with_types: list[tuple[str, list[str]]] = []
+        # Flat list — scope (Assets/Shots pill or schedule toggles) already defines context.
+        flat_types = list(visible)
         if self._mode == "schedule":
-            if self._include_assets and asset_types:
-                sections_with_types.append(("Assets", asset_types))
-            if self._include_shots and shot_types:
-                sections_with_types.append(("Shots", shot_types))
-        else:
-            if asset_types:
-                sections_with_types.append(("Assets", asset_types))
-            if shot_types:
-                sections_with_types.append(("Shots", shot_types))
+            asset_types = [t for t in visible if not _is_shot_type(t)]
+            shot_types = [t for t in visible if _is_shot_type(t)]
+            flat_types = []
+            if self._include_assets:
+                flat_types.extend(asset_types)
+            if self._include_shots:
+                flat_types.extend(shot_types)
 
         self._type_list.blockSignals(True)
         try:
             self._type_list.clear()
-            next_type_round_top = True
-            for sec_idx, (section_label, type_ids) in enumerate(sections_with_types):
-                if self._type_list.count() > 0:
-                    spacer = QListWidgetItem("")
-                    spacer.setData(Qt.UserRole, {"type": _DEPT_ROW_SPACER})
-                    spacer.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                    self._type_list.addItem(spacer)
-                    next_type_round_top = True
-                section_item = QListWidgetItem("")
-                section_item.setData(
-                    Qt.UserRole,
-                    {"type": _DEPT_ROW_SECTION, "section_label": section_label},
-                )
-                section_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                self._type_list.addItem(section_item)
-                next_type_round_top = False
-                for i, type_id in enumerate(type_ids):
-                    last_in_block = i + 1 >= len(type_ids)
-                    label = _title_case_label(self._type_label_by_id.get(type_id, type_id))
-                    count = self._count_by_type.get(type_id)
-                    it = QListWidgetItem(label)
-                    role = {
-                        "type": _DEPT_ROW_DEPT,
-                        "dept_id": type_id,
-                        "round_top": next_type_round_top,
-                        "round_bottom": last_in_block,
-                    }
-                    if count is not None:
-                        role["count"] = count
-                    it.setData(Qt.UserRole, role)
-                    next_type_round_top = False
-                    icon_name = self._type_icon_by_id.get(type_id)
-                    if icon_name:
-                        it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="folder"))
-                    self._type_list.addItem(it)
+            self._build_type_flat_rows(self._type_list, flat_types)
             self._sync_selection()
         finally:
             self._type_list.blockSignals(False)
+        self._fit_type_list()
+        self._notify_filters_layout()
 
     def set_item_counts(
         self,
@@ -1712,6 +2016,25 @@ class SidebarWidget(QWidget):
         self._state_by_mode[self._mode] = self._snapshot_state()
         self._save_state_for_mode(self._mode)
 
+    def export_filter_snapshot(self) -> dict[str, object]:
+        """Capture sidebar filter state for nav quick-view assign."""
+        return dict(self._snapshot_state())
+
+    def import_filter_snapshot(self, state: dict[str, object] | None, *, emit: bool = False) -> None:
+        """Restore filter state from nav quick-view recall (after page switch)."""
+        if not state:
+            return
+        self._apply_state(state)
+        self.reload_from_pipeline_metadata()
+        self._sync_selection()
+        self._state_by_mode[self._mode] = self._snapshot_state()
+        self._save_state_for_mode(self._mode)
+        if emit:
+            if self._mode == "schedule":
+                self.entityScopeChanged.emit(self._include_shots, self._include_assets)
+            self.typeClicked.emit(self._active_type)
+            self.departmentClicked.emit(self._active_department)
+
     def filter_option_lists(self) -> tuple[list[tuple[str, str, str | None]], list[tuple[str, str, str | None]]]:
         """(dept_id, label, lucide_icon), (type_id, label, lucide_icon) — same visible scope as sidebar lists."""
         dept_ids = list(self._visible_departments or self._all_departments)
@@ -1731,6 +2054,126 @@ class SidebarWidget(QWidget):
             types.append((tid, label, icon))
         return depts, types
 
+    def show_type_filter_popup(self, anchor: QWidget) -> None:
+        """Popup to pick active type (header badge click)."""
+        self._show_header_filter_popup(anchor, scope="type")
+
+    def show_department_filter_popup(self, anchor: QWidget) -> None:
+        """Popup to pick active department (header badge click)."""
+        self._show_header_filter_popup(anchor, scope="dept")
+
+    def _close_header_filter_popup(self, *, record_closed_at: bool = False) -> None:
+        popup = self._header_filter_popup
+        if popup is not None and popup.isVisible():
+            popup.close()
+        self._header_filter_popup = None
+        if record_closed_at:
+            self._header_filter_popup_closed_at = time.monotonic()
+
+    def _show_header_filter_popup(self, anchor: QWidget, *, scope: str) -> None:
+        if anchor is None or not anchor.isVisible():
+            return
+
+        popup = self._header_filter_popup
+        same_target = (
+            self._header_filter_popup_scope == scope and self._header_filter_popup_anchor is anchor
+        )
+        # Toggle off when the same badge is clicked while its list is still open.
+        if popup is not None and popup.isVisible() and same_target:
+            self._close_header_filter_popup(record_closed_at=True)
+            return
+        # Qt Popup closes on outside click before the badge handler runs — suppress immediate reopen.
+        if (time.monotonic() - self._header_filter_popup_closed_at) < self._HEADER_FILTER_POPUP_REOPEN_GRACE:
+            if same_target:
+                return
+
+        depts, types = self.filter_option_lists()
+        items = types if scope == "type" else depts
+        if not items:
+            return
+
+        self._close_header_filter_popup()
+        active = self._active_type if scope == "type" else self._active_department
+        count_map = self._count_by_type if scope == "type" else self._count_by_department
+        sidebar = self
+
+        class _HeaderFilterPickerPopup(QFrame):
+            def __init__(self, parent, badge_anchor: QWidget) -> None:
+                super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+                self._badge_anchor = badge_anchor
+
+            def hideEvent(self, event) -> None:  # noqa: N802
+                sidebar._header_filter_popup = None
+                sidebar._header_filter_popup_closed_at = time.monotonic()
+                QTimer.singleShot(0, lambda: clear_stuck_widget_hover(self._badge_anchor))
+                super().hideEvent(event)
+
+        popup = _HeaderFilterPickerPopup(anchor.window(), anchor)
+        popup.setObjectName("HeaderFilterPickerPopup")
+        popup.setAttribute(Qt.WA_StyledBackground, True)
+
+        lay = QVBoxLayout(popup)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(0)
+
+        container = _sidebar_filter_list_container(popup)
+        list_w = QListWidget(container)
+        container.layout().addWidget(list_w, 0)
+        list_w.setObjectName("SidebarFilterList")
+        list_w.setSelectionMode(QAbstractItemView.SingleSelection)
+        list_w.setUniformItemSizes(False)
+        list_w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        list_w.setIconSize(QSize(16, 16))
+        list_w.setItemDelegate(_SidebarFilterTreeDelegate(list_w))
+        list_w.setSpacing(int(SIDEBAR_DEPT_LIST_STYLE.get("list_row_spacing_px", 3)))
+        list_w.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        list_w.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        for item_id, label, icon_name in items:
+            self._append_filter_leaf_row(
+                list_w,
+                scope=scope,
+                item_id=item_id,
+                label=label,
+                count_map=count_map,
+                icon_name=icon_name,
+            )
+
+        for i in range(list_w.count()):
+            it = list_w.item(i)
+            if it is None:
+                continue
+            data = it.data(Qt.UserRole)
+            if isinstance(data, dict) and data.get("item_id") == active:
+                it.setSelected(True)
+                list_w.setCurrentItem(it)
+                break
+
+        def _on_pick(item: QListWidgetItem) -> None:
+            if scope == "type":
+                picked = item.data(Qt.UserRole)
+                if isinstance(picked, dict) and picked.get("item_id") != self._active_type:
+                    self._on_type_clicked(item)
+            else:
+                picked = item.data(Qt.UserRole)
+                if isinstance(picked, dict) and picked.get("item_id") != self._active_department:
+                    self._on_department_clicked(item)
+            popup.close()
+
+        list_w.itemClicked.connect(_on_pick)
+        lay.addWidget(container, 0)
+
+        popup.setMinimumWidth(max(int(anchor.width()), 220))
+        max_list_h = min(320, max_popup_height_for_anchor(anchor, gap=4) - 24)
+        SidebarWidget._fit_list_height(list_w, max_height_px=max(120, max_list_h))
+
+        position_popup_near_anchor(popup, anchor)
+        self._header_filter_popup = popup
+        self._header_filter_popup_scope = scope
+        self._header_filter_popup_anchor = anchor
+        popup.show()
+        QTimer.singleShot(0, lambda: clear_stuck_widget_hover(anchor))
+
     def _sync_selection(self) -> None:
         self._dept_list.blockSignals(True)
         self._type_list.blockSignals(True)
@@ -1744,8 +2187,9 @@ class SidebarWidget(QWidget):
                     if it is None:
                         continue
                     data = it.data(Qt.UserRole)
-                    if isinstance(data, dict) and data.get("type") == _DEPT_ROW_DEPT:
-                        if data.get("dept_id") == self._active_department:
+                    if isinstance(data, dict) and data.get("type") == _FILTER_ROW_LEAF:
+                        item_id = data.get("item_id") or data.get("dept_id")
+                        if item_id == self._active_department:
                             it.setSelected(True)
                             self._dept_list.setCurrentItem(it)
                             break
@@ -1756,23 +2200,40 @@ class SidebarWidget(QWidget):
                     if it is None:
                         continue
                     data = it.data(Qt.UserRole)
-                    if isinstance(data, dict) and data.get("type") == _DEPT_ROW_DEPT:
-                        if data.get("dept_id") == self._active_type:
+                    if isinstance(data, dict) and data.get("type") == _FILTER_ROW_LEAF:
+                        item_id = data.get("item_id") or data.get("dept_id")
+                        if item_id == self._active_type:
                             it.setSelected(True)
                             self._type_list.setCurrentItem(it)
                             break
         finally:
             self._dept_list.blockSignals(False)
             self._type_list.blockSignals(False)
+        # Custom delegate: force repaint so the previous row loses selected styling.
+        self._dept_list.viewport().update()
+        self._type_list.viewport().update()
 
     def _on_department_clicked(self, item: QListWidgetItem) -> None:
         data = item.data(Qt.UserRole)
-        if not isinstance(data, dict) or data.get("type") != _DEPT_ROW_DEPT:
+        if not isinstance(data, dict):
             return
-        clicked = data.get("dept_id") if isinstance(data.get("dept_id"), str) else None
+        if data.get("type") == _FILTER_ROW_GROUP:
+            scope = str(data.get("scope") or "dept")
+            group_id = data.get("group_id")
+            if isinstance(group_id, str) and group_id:
+                self._toggle_filter_group(scope, group_id)
+            return
+        if data.get("type") != _FILTER_ROW_LEAF:
+            return
+        clicked = data.get("item_id") if isinstance(data.get("item_id"), str) else None
+        if clicked is None:
+            clicked = data.get("dept_id") if isinstance(data.get("dept_id"), str) else None
         if clicked is None:
             return
         if clicked == self._active_department:
+            # Project Guide: department required (same as Inbox source type).
+            if self._mode == "reference":
+                return
             self._active_department = None
             self._sync_selection()
             self.departmentClicked.emit(None)
@@ -1789,9 +2250,19 @@ class SidebarWidget(QWidget):
 
     def _on_type_clicked(self, item: QListWidgetItem) -> None:
         data = item.data(Qt.UserRole)
-        if not isinstance(data, dict) or data.get("type") != _DEPT_ROW_DEPT:
+        if not isinstance(data, dict):
             return
-        clicked = data.get("dept_id") if isinstance(data.get("dept_id"), str) else None
+        if data.get("type") == _FILTER_ROW_GROUP:
+            scope = str(data.get("scope") or "type")
+            group_id = data.get("group_id")
+            if isinstance(group_id, str) and group_id:
+                self._toggle_filter_group(scope, group_id)
+            return
+        if data.get("type") != _FILTER_ROW_LEAF:
+            return
+        clicked = data.get("item_id") if isinstance(data.get("item_id"), str) else None
+        if clicked is None:
+            clicked = data.get("dept_id") if isinstance(data.get("dept_id"), str) else None
         if clicked is None:
             return
         # Inbox: không cho unselect type (bắt buộc Client hoặc Freelancer).
@@ -1982,7 +2453,6 @@ class SidebarWidget(QWidget):
                 if (_is_shot_type(tid) and self._include_shots)
                 or (not _is_shot_type(tid) and self._include_assets)
             ]
-        type_section = {tid: ("Shots" if _is_shot_type(tid) else "Assets") for tid in type_ids}
         # Use top-level window as parent so dialog survives when filter is in compact popup (reparent).
         dlg = _FilterPickDialog(
             title="Select Types",
@@ -1993,7 +2463,6 @@ class SidebarWidget(QWidget):
             selected=set(self._visible_types or []),
             max_selected=None,
             parent=self.window(),
-            type_section_by_id=type_section,
             list_min_height_px=_FILTER_PICK_LIST_MIN_HEIGHT_TYPE_PX,
         )
         if dlg.exec() != QDialog.Accepted:
@@ -2010,19 +2479,91 @@ class SidebarWidget(QWidget):
             self.entityScopeChanged.emit(self._include_shots, self._include_assets)
 
     @staticmethod
-    def _fit_list_height(w: QListWidget) -> None:
+    def _list_content_height(w: QListWidget) -> int:
+        """Natural list height from row sizes only (immune to current widget height)."""
+        rows = int(w.count())
+        if rows <= 0:
+            return 0
+
+        row_heights = sum(max(1, int(w.sizeHintForRow(i))) for i in range(rows))
+        gaps = max(0, rows - 1) * int(w.spacing())
+        margins = w.contentsMargins()
+        frame = 2 * int(w.frameWidth())
+        # Nested QSS: QFrame#SidebarFilterListContainer QListWidget#SidebarFilterList { padding: 4px; }
+        list_pad = 8
+        slack = 4
+        return row_heights + gaps + list_pad + margins.top() + margins.bottom() + frame + slack
+
+    @staticmethod
+    def _fit_list_height(
+        w: QListWidget, *, max_height_px: int | None = None, allow_shrink: bool = False
+    ) -> None:
         """
-        No-scroll policy: make the list tall enough to show all items.
-        Sums row heights (supports variable heights for section/separator/dept rows).
+        Size list to fit rows; max_height_px caps height and enables scroll when content exceeds.
+        allow_shrink: only for compact type lists — never shrink department lists after ensure.
         """
         rows = int(w.count())
         if rows <= 0:
             w.setFixedHeight(0)
+            w.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             return
 
-        total_h = sum(max(1, int(w.sizeHintForRow(i))) for i in range(rows))
-        extra = 2 * int(w.frameWidth()) + 12 + 4
-        w.setFixedHeight(total_h + extra)
+        content_h = SidebarWidget._list_content_height(w)
+        cap = max_height_px
+        if cap is not None:
+            target = min(content_h, cap)
+        else:
+            target = content_h
+
+        w.setMinimumHeight(0)
+        w.setMaximumHeight(cap if cap is not None else 16777215)
+        w.setFixedHeight(target)
+        w.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded if cap is not None and content_h > cap else Qt.ScrollBarAlwaysOff
+        )
+
+        SidebarWidget._ensure_list_fully_visible(w, cap)
+        if allow_shrink:
+            SidebarWidget._shrink_list_if_oversized(w, content_h, cap)
+        elif cap is not None and int(w.height()) > cap:
+            w.setFixedHeight(cap)
+            w.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+    @staticmethod
+    def _ensure_list_fully_visible(w: QListWidget, cap: int | None) -> bool:
+        rows = int(w.count())
+        if rows <= 0:
+            return False
+        last = w.item(rows - 1)
+        if last is None:
+            return False
+        rect = w.visualItemRect(last)
+        if not rect.isValid():
+            return False
+        clip = int(rect.bottom()) + 1 - int(w.viewport().height())
+        if clip <= 0:
+            return False
+        expanded = int(w.height()) + clip
+        if cap is not None and expanded > cap:
+            w.setFixedHeight(cap)
+            w.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            return False
+        w.setFixedHeight(expanded)
+        w.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return True
+
+    @staticmethod
+    def _shrink_list_if_oversized(
+        w: QListWidget, content_h: int, cap: int | None
+    ) -> None:
+        """Remove dead space when list is taller than its rows (Type with few items)."""
+        if int(w.verticalScrollBar().maximum()) > 0:
+            return
+        natural = content_h if cap is None else min(content_h, cap)
+        if int(w.height()) <= natural + 2:
+            return
+        w.setFixedHeight(natural)
+        w.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
 
 # Default list min heights for picker dialogs (from SIDEBAR_DEPT_LIST_STYLE usage).
@@ -2116,6 +2657,7 @@ class _FilterPickDialog(MonosDialog):
                 self._tab_group.addButton(btn)
                 tabs_row_l.addWidget(btn, 0)
                 self._tab_buttons.append(btn)
+            apply_pill_segment_positions(self._tab_buttons)
             tabs_row_l.addStretch(1)
 
         # Build initial list content.
@@ -2549,10 +3091,10 @@ class _TagPickerDialog(MonosDialog):
         return out
 
 
-# --- Recent Task row: icon type + item name + department icon + DCC icon (right)
+# --- Recent Task row: type icon + item name + department icon + DCC brand icon (right)
 _TASK_ROW_HEIGHT = 26
 _TASK_ICON_SIZE = 14
-_TASK_SMALL_ICON_SIZE = 12  # department + DCC icons
+_TASK_SMALL_ICON_SIZE = 12
 _TASK_ICON_GAP = 8
 _TASK_RIGHT_MARGIN = 4
 
@@ -2572,12 +3114,14 @@ def _task_dcc_icon(dcc_id: str, is_selected: bool) -> QIcon:
     slug = (slug or dcc_id or "").strip()
     if not slug:
         return lucide_icon("layers", size=_TASK_SMALL_ICON_SIZE, color_hex=MONOS_COLORS["text_label"])
-    hex_color = (color if isinstance(color, str) else None) or (MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"])
+    hex_color = (color if isinstance(color, str) else None) or (
+        MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"]
+    )
     return brand_icon(slug, size=_TASK_SMALL_ICON_SIZE, color_hex=hex_color)
 
 
 def _task_dept_icon(sidebar_widget: QWidget | None, dept_id: str, is_selected: bool) -> QIcon:
-    """Department icon from sidebar filters pipeline (label, icon_name); fallback lucide layers."""
+    """Department icon from sidebar filters pipeline; fallback lucide layers."""
     if not (dept_id or "").strip() or not sidebar_widget:
         return QIcon()
     filters = getattr(sidebar_widget, "filters", None)
@@ -2594,10 +3138,7 @@ def _task_dept_icon(sidebar_widget: QWidget | None, dept_id: str, is_selected: b
 
 
 class _SidebarRecentTaskDelegate(QStyledItemDelegate):
-    """
-    Paints one recent task row: icon (task's own type) + item name + department icon + DCC icon (right).
-    UserRole = RecentTask.
-    """
+    """Paints one recent task row: type icon + name + department icon + DCC icon (right)."""
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[override]
         opt = QStyleOptionViewItem(option)
@@ -2611,11 +3152,9 @@ class _SidebarRecentTaskDelegate(QStyledItemDelegate):
 
         r = opt.rect
         widget = opt.widget
-        style = widget.style() if widget else QApplication.style()
         is_selected = bool(opt.state & QStyle.State_Selected)
-        style.drawPrimitive(QStyle.PE_PanelItemViewItem, opt, painter, widget)
+        is_hovered = bool(opt.state & QStyle.State_MouseOver)
 
-        # Resolve sidebar (for context + department icon)
         sidebar_widget: QWidget | None = None
         w = widget
         while w:
@@ -2626,10 +3165,22 @@ class _SidebarRecentTaskDelegate(QStyledItemDelegate):
 
         painter.save()
         try:
-            x = r.left() + 4
+            highlight = _filter_row_highlight_rect(r)
+            radius = _filter_row_highlight_radius()
+            if is_selected:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(37, 99, 235, 100))
+                painter.drawRoundedRect(highlight, radius, radius)
+            elif is_hovered:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 255, 255, 14))
+                painter.drawRoundedRect(highlight, radius, radius)
+
+            x = r.left() + _filter_row_content_pad_left()
             cy = r.center().y()
 
-            # 1) Icon = this task's own item type (asset type or shot), never current filter state.
             type_icon_name = "package"
             if (task.item_type or "").strip().lower() == "shot":
                 type_icon_name = "clapperboard"
@@ -2644,14 +3195,15 @@ class _SidebarRecentTaskDelegate(QStyledItemDelegate):
                             type_icon_name = (icon or "").strip() or "package"
                     except Exception:
                         type_icon_name = "package"
-            color = MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_label"]
+            color = MONOS_COLORS["blue_400"] if is_selected else (
+                MONOS_COLORS["text_label"] if not is_hovered else "#e4e4e7"
+            )
             icon = lucide_icon(type_icon_name, size=_TASK_ICON_SIZE, color_hex=color)
             if not icon.isNull():
                 ir = QRect(x, cy - _TASK_ICON_SIZE // 2, _TASK_ICON_SIZE, _TASK_ICON_SIZE)
                 icon.paint(painter, ir, Qt.AlignCenter, QIcon.Selected if is_selected else QIcon.Normal)
             x += _TASK_ICON_SIZE + _TASK_ICON_GAP
 
-            # 2) Right side: department icon + DCC icon (both right-aligned)
             has_dept = bool((task.department or "").strip())
             has_dcc = bool((task.dcc or "").strip())
             right_w = 0
@@ -2662,32 +3214,39 @@ class _SidebarRecentTaskDelegate(QStyledItemDelegate):
             if has_dcc or has_dept:
                 right_w += _TASK_RIGHT_MARGIN
 
-            # 3) Item name only (elided)
             text_w = max(0, r.width() - (x - r.left()) - right_w)
             name_str = (task.item_name or "").strip()
             fm = QFontMetrics(opt.font)
             elided = fm.elidedText(name_str, Qt.TextElideMode.ElideRight, text_w)
             text_rect = QRect(x, r.top(), text_w, r.height())
-            primary_color = MONOS_COLORS["blue_400"] if is_selected else MONOS_COLORS["text_primary"]
+            if is_selected:
+                primary_color = MONOS_COLORS["blue_400"]
+            elif is_hovered:
+                primary_color = "#e4e4e7"
+            else:
+                primary_color = MONOS_COLORS["text_primary"]
             painter.setPen(QColor(primary_color))
             painter.setFont(opt.font)
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
 
-            # 4) Department icon then DCC icon (right-aligned, dept left of DCC)
             right_x = r.right() - _TASK_RIGHT_MARGIN
             if has_dcc:
                 dcc_icon = _task_dcc_icon(task.dcc, is_selected)
                 if not dcc_icon.isNull():
                     ix = right_x - _TASK_SMALL_ICON_SIZE
                     iy = cy - _TASK_SMALL_ICON_SIZE // 2
-                    dcc_icon.paint(painter, QRect(ix, iy, _TASK_SMALL_ICON_SIZE, _TASK_SMALL_ICON_SIZE), Qt.AlignCenter)
+                    dcc_icon.paint(
+                        painter, QRect(ix, iy, _TASK_SMALL_ICON_SIZE, _TASK_SMALL_ICON_SIZE), Qt.AlignCenter
+                    )
                 right_x -= _TASK_SMALL_ICON_SIZE + _TASK_ICON_GAP
             if has_dept:
                 dept_icon = _task_dept_icon(sidebar_widget, task.department, is_selected)
                 if not dept_icon.isNull():
                     ix = right_x - _TASK_SMALL_ICON_SIZE
                     iy = cy - _TASK_SMALL_ICON_SIZE // 2
-                    dept_icon.paint(painter, QRect(ix, iy, _TASK_SMALL_ICON_SIZE, _TASK_SMALL_ICON_SIZE), Qt.AlignCenter)
+                    dept_icon.paint(
+                        painter, QRect(ix, iy, _TASK_SMALL_ICON_SIZE, _TASK_SMALL_ICON_SIZE), Qt.AlignCenter
+                    )
         finally:
             painter.restore()
 
@@ -2695,83 +3254,86 @@ class _SidebarRecentTaskDelegate(QStyledItemDelegate):
         return QSize(-1, _TASK_ROW_HEIGHT)
 
 
+def _populate_recent_tasks_flat(
+    list_w: QListWidget,
+    tasks: list[RecentTask],
+) -> None:
+    """Flat list of most-recent tasks (no department grouping)."""
+    list_w.clear()
+    for task in tasks:
+        it = QListWidgetItem("")
+        it.setData(Qt.UserRole, task)
+        it.setSizeHint(QSize(0, _TASK_ROW_HEIGHT))
+        base_tt = f"{task.item_name}\n{task.department}" + (f" · {task.dcc}" if task.dcc else "")
+        hint_html = '<span style="font-size:80%; color:#71717a;">Double-click to open</span>'
+        it.setToolTip(f"<html>{base_tt.replace(chr(10), '<br/>')}<br/><br/>{hint_html}</html>")
+        list_w.addItem(it)
+
+
 class Sidebar(QWidget):
     """
-    MONOS Sidebar (fixed 256px) with 4 blocks:
-    1) Brand + Primary Nav (top fixed)
-    2) Hierarchy (scrollable): search + tree
-    3) Recent Tasks (bottom of scroll) — placeholder only
-    4) Global Settings (bottom fixed)
+    Filter panel (256px): project name, department/type filters, recent tasks.
+    Primary navigation lives in SidebarNavRail.
     """
 
-    context_changed = Signal(str)  # emitted when selection changes (nav)
-    context_clicked = Signal(str)  # emitted when clicking already-selected nav item
-    context_menu_requested = Signal(str, object)  # (context_text, global_pos) for nav items
-    project_switch_requested = Signal(str)  # project root path
-    settings_requested = Signal()
     recent_task_clicked = Signal(object)  # RecentTask
     recent_task_double_clicked = Signal(object)  # RecentTask
     clear_recent_tasks_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setObjectName("SidebarContainer")
+        self.setObjectName("SidebarFilterPanel")
         # Ensure application-level QSS background renders for this container.
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setMinimumWidth(256)
         self.setMaximumWidth(256)
 
-        self._last_context_text: str | None = None
         self._project_index: ProjectIndex | None = None
-        self._projects_count: int | None = None
-
-        self._nav_widgets: dict[str, _SidebarNavItemWidget] = {}
+        self._scope_context: str = SidebarContext.ASSETS.value
+        self._project_root: Path | None = None
+        self._project_display_name_raw: str | None = None
+        self._footer_context: str | None = None
+        self._recent_tasks_cache: list[RecentTask] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # --- Block 1: Project switcher + separator aligned with top bar bottom (56px)
+        # --- Block 1: Project name (read-only) + separator aligned with top bar bottom (56px)
         _TOP_BAR_HEIGHT = 56
         top_block_56 = QWidget(self)
         top_block_56.setFixedHeight(_TOP_BAR_HEIGHT)
         top_block_56.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         top_block_56_layout = QVBoxLayout(top_block_56)
-        top_block_56_layout.setContentsMargins(16, 11, 16, 0)
+        top_block_56_layout.setContentsMargins(16, 8, 16, 0)
         top_block_56_layout.setSpacing(0)
 
-        self._project_menu = MonosMenu(self, rounded=False)
-        self._project_menu.setObjectName("ProjectSwitchMenu")
-        self._project_menu.setWindowOpacity(1.0)
-        self._project_menu_closed_at = 0.0
-        self._project_menu.aboutToHide.connect(self._on_sidebar_project_menu_closed)
-        _shadow = QGraphicsDropShadowEffect(self._project_menu)
-        _shadow.setBlurRadius(15)
-        _shadow.setOffset(0, 8)
-        _shadow.setColor(QColor(0, 0, 0, int(255 * 0.40)))
-        self._project_menu.setGraphicsEffect(_shadow)
+        self._project_name_row = QWidget(top_block_56)
+        self._project_name_row.setFixedHeight(40)
+        self._project_name_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        project_name_row_layout = QHBoxLayout(self._project_name_row)
+        project_name_row_layout.setContentsMargins(0, 0, 0, 0)
+        project_name_row_layout.setSpacing(0)
 
-        self._project_switch = QToolButton(top_block_56)
-        self._project_switch.setObjectName("SidebarProjectSwitch")
-        self._project_switch.setProperty("state", "empty")
-        self._project_switch.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._project_switch.setIcon(self._project_dot_icon("#71717a"))
-        self._project_switch.setText("SELECT PROJECT")
-        self._project_switch.setPopupMode(QToolButton.InstantPopup)
-        self._project_switch.setCursor(Qt.PointingHandCursor)
-        self._project_switch.setFocusPolicy(Qt.NoFocus)
-        self._project_switch.setFixedHeight(34)
+        self._project_name_label = QLabel("SELECT PROJECT", self._project_name_row)
+        self._project_name_label.setObjectName("SidebarProjectNameLabel")
+        self._project_name_label.setWordWrap(False)
+        self._project_name_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._project_name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._project_name_label.setMinimumWidth(0)
         try:
-            bf = self._project_switch.font()
-            bf.setPointSize(11)
-            bf.setWeight(QFont.Weight.DemiBold)
-            self._project_switch.setFont(bf)
+            pf = self._project_name_label.font()
+            pf.setPointSize(11)
+            pf.setWeight(QFont.Weight.DemiBold)
+            self._project_name_label.setFont(pf)
         except Exception:
             pass
-        self._project_switch.clicked.connect(self._show_sidebar_project_menu)
+        project_name_row_layout.addWidget(self._project_name_label, 1)
 
-        top_block_56_layout.addWidget(self._project_switch, 0)
+        self._project_name_row.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._project_name_row.customContextMenuRequested.connect(self._on_project_name_context_menu)
+        top_block_56_layout.addWidget(self._project_name_row, 0)
         top_block_56_layout.addStretch(1)
         sep_top = QFrame(top_block_56)
         sep_top.setObjectName("SidebarNavSeparator")
@@ -2780,121 +3342,32 @@ class Sidebar(QWidget):
         sep_top.setFixedHeight(1)
         top_block_56_layout.addWidget(sep_top, 0)
 
-        # --- Primary Nav (scope pill + footer nav)
-        top = QWidget(self)
-        top.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        top_layout = QVBoxLayout(top)
-        top_layout.setContentsMargins(16, 12, 16, 16)
-        top_layout.setSpacing(12)
-
-        self._nav = QListWidget(top)
-        self._nav.setObjectName("SidebarPrimaryNav")
-        self._nav.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._nav.setUniformItemSizes(True)
-        self._nav.setSpacing(4)
-        self._nav.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._nav.setFocusPolicy(Qt.NoFocus)
-        self._nav.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._nav.customContextMenuRequested.connect(self._on_nav_context_menu_requested)
-
-        self._nav.currentItemChanged.connect(self._on_current_nav_item_changed)
-        self._nav.itemClicked.connect(self._on_nav_item_clicked)
-
-        self._nav.setMaximumHeight(0)
-        self._nav.setVisible(False)
-
-        # Scope pill (Projects | Shot | Asset) — Dashboard/Schedule live in title bar center
-        self._scope_context: str = SidebarContext.ASSETS.value
-        self._footer_context: str | None = None
-        self._footer_buttons: dict[str, QToolButton] = {}
-
-        nav_container = QWidget(top)
-        nav_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        nav_container_layout = QVBoxLayout(nav_container)
-        nav_container_layout.setSpacing(0)
-        nav_container_layout.setContentsMargins(0, 0, 0, 0)
-
-        scope_pill_wrapper = QWidget(nav_container)
-        scope_pill_wrapper.setFixedHeight(44)
-        scope_pill_wrapper.setContextMenuPolicy(Qt.CustomContextMenu)
-        scope_pill_wrapper.customContextMenuRequested.connect(
-            lambda pos: self.context_menu_requested.emit(self._scope_context, scope_pill_wrapper.mapToGlobal(pos))
-        )
-        scope_wrap_layout = QVBoxLayout(scope_pill_wrapper)
-        scope_wrap_layout.setContentsMargins(0, 0, 0, 0)
-        scope_wrap_layout.setSpacing(0)
-        self._scope_pill = _SidebarScopePillWidget(parent=scope_pill_wrapper)
-        self._scope_pill.segment_clicked.connect(self._on_scope_segment_clicked)
-        self._scope_pill.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        scope_wrap_layout.addWidget(self._scope_pill, 0, Qt.AlignmentFlag.AlignHCenter)
-        nav_container_layout.addWidget(scope_pill_wrapper, 0)
-
-        # Inbox / Project Guide / Outbox / Trash — icon row
-        nav_pages_row = QWidget(nav_container)
-        nav_pages_layout = QHBoxLayout(nav_pages_row)
-        nav_pages_layout.setContentsMargins(0, 0, 0, 0)
-        nav_pages_layout.setSpacing(0)
-        nav_pages_layout.addStretch(1)
-        _footer_items = (
-            (SidebarContext.INBOX.value, "inbox", "Inbox"),
-            (SidebarContext.PROJECT_GUIDE.value, "folder-open", "Project Guide"),
-            (SidebarContext.OUTBOX.value, "send", "Outbox"),
-            (SidebarContext.TRASH.value, "trash-2", "Trash"),
-        )
-        footer_btns_row: list[QToolButton] = []
-        for context_name, icon_name, tooltip_text in _footer_items:
-            btn = QToolButton(nav_pages_row)
-            btn.setObjectName("SidebarFooterNavButton")
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setAutoRaise(True)
-            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-            btn.setFixedSize(36, 36)
-            btn.setToolTip(tooltip_text)
-            ic = lucide_icon(icon_name, size=18, color_hex=MONOS_COLORS["text_label"])
-            if not ic.isNull():
-                btn.setIcon(ic)
-                btn.setIconSize(QSize(18, 18))
-            btn.setProperty("active", "false")
-            btn.clicked.connect(lambda checked=False, c=context_name: self._on_footer_nav_clicked(c))
-            self._footer_buttons[context_name] = btn
-            footer_btns_row.append(btn)
-        add_widgets_with_icon_separators(nav_pages_layout, footer_btns_row, nav_pages_row, sep_height=20)
-        nav_pages_layout.addStretch(1)
-        nav_container_layout.addWidget(nav_pages_row, 0)
-        top_layout.addWidget(nav_container, 0)
-
-        sep_below_nav = QFrame(top)
-        sep_below_nav.setObjectName("SidebarNavSeparator")
-        sep_below_nav.setFrameShape(QFrame.Shape.HLine)
-        sep_below_nav.setFrameShadow(QFrame.Shadow.Sunken)
-        sep_below_nav.setFixedHeight(1)
-        top_layout.addWidget(sep_below_nav, 0)
-        top_layout.addSpacing(8)  # gap below nav so scroll area does not overlap
-        # Cap top block height so logo + nav never stretch (margins + brand + separators + scope row + nav row + spacing)
-        top.setMaximumHeight(210)
-
         # --- Block 2: Filters (dept/type lists scroll individually; no common scroll)
         self._filters_center = QWidget(self)
         self._filters_center.setObjectName("SidebarFiltersCenter")
         self._filters_center.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         scroll_layout = QVBoxLayout(self._filters_center)
         scroll_layout.setContentsMargins(16, 8, 16, 16)  # 8px top so content doesn’t sit under nav pill
-        scroll_layout.setSpacing(24)  # mt-6 between sections
+        scroll_layout.setSpacing(16)
 
-        f_h = monos_font("Inter", 10, QFont.Weight.ExtraBold)  # 800
-        f_h.setLetterSpacing(QFont.PercentageSpacing, 112)  # tracking-widest-ish
+        f_h = monos_font("Inter", 11, QFont.Weight.ExtraBold)  # 800
+        f_h.setLetterSpacing(QFont.PercentageSpacing, 108)
 
-        # Section: FILTERS — Dept list stretches down to Types; Types+Tags snap bottom.
+        # Section: FILTERS — lists size to content; spare space below tags.
         self._filters = SidebarWidget(self._filters_center)
         self._filters.departmentClicked.connect(self._on_filter_panel_counts_maybe)
         self._filters.typeClicked.connect(self._on_filter_panel_counts_maybe)
         self._filters.entityScopeChanged.connect(self._on_filter_panel_counts_maybe)
-        scroll_layout.addWidget(self._filters.scope_section(), 0)
-        scroll_layout.addWidget(self._filters.dept_section(), 1)
-        scroll_layout.addWidget(self._filters.type_section(), 0)
-        scroll_layout.addWidget(self._filters.tag_section(), 0)
+        scroll_layout.addWidget(self._filters.scope_section(), 0, Qt.AlignmentFlag.AlignTop)
+        scroll_layout.addWidget(self._filters.type_section(), 0, Qt.AlignmentFlag.AlignTop)
+        scroll_layout.addWidget(self._filters.dept_section(), 0, Qt.AlignmentFlag.AlignTop)
+        scroll_layout.addWidget(self._filters.tag_section(), 0, Qt.AlignmentFlag.AlignTop)
+        self._filters_tail_spacer = QWidget(self._filters_center)
+        self._filters_tail_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scroll_layout.addWidget(self._filters_tail_spacer, 1)
+        self._filters_scroll_layout = scroll_layout
+        self._filters.set_filters_layout_callback(self._sync_filters_center_layout)
+        self._sync_filters_center_layout()
         self._filters.setFixedSize(0, 0)
         self._filters.hide()
 
@@ -2947,39 +3420,174 @@ class Sidebar(QWidget):
 
         self._tasks_stacked = QStackedWidget(self._tasks_block)
         self._tasks_stacked.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        self._tasks_empty = QLabel("No tasks", self._tasks_block)
+        self._tasks_empty = QLabel("No recent tasks")
         self._tasks_empty.setObjectName("SidebarMutedText")
-        self._tasks_list = QListWidget(self._tasks_block)
+        self._tasks_list_container = _sidebar_filter_list_container()
+        self._tasks_list = QListWidget(self._tasks_list_container)
+        self._tasks_list_container.layout().addWidget(self._tasks_list)
         self._tasks_list.setObjectName("SidebarRecentTasksList")
         self._tasks_list.setItemDelegate(_SidebarRecentTaskDelegate(self._tasks_list))
         self._tasks_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tasks_list.setFocusPolicy(Qt.NoFocus)
+        self._tasks_list.setMouseTracking(True)
         self._tasks_list.setSpacing(2)
         self._tasks_list.setMaximumHeight(5 * _TASK_ROW_HEIGHT + 4 * 2)  # 5 tasks + gaps
         self._tasks_list.itemClicked.connect(self._on_recent_task_item_clicked)
         self._tasks_list.itemDoubleClicked.connect(self._on_recent_task_item_double_clicked)
-        self._tasks_stacked.addWidget(self._tasks_empty)
-        self._tasks_stacked.addWidget(self._tasks_list)
+        self._tasks_page_empty = self._tasks_stacked.addWidget(self._tasks_empty)
+        self._tasks_page_list = self._tasks_stacked.addWidget(self._tasks_list_container)
 
         tasks_layout.addWidget(tasks_header_row, 0)
         tasks_layout.addWidget(self._tasks_stacked, 0)
 
         root.addWidget(top_block_56, 0)
-        root.addWidget(top, 0)
         root.addWidget(self._filters_center, 1)
         root.addWidget(self._sep_above_tasks, 0)
         root.addWidget(self._tasks_block, 0)
 
         self._apply_recent_tasks_visibility()
 
-        # Default context: Assets (keeps existing workflow stable)
-        self.set_current_context(SidebarContext.ASSETS.value, force=True)
+        # Default filter mode: Assets
+        self.sync_nav_context(SidebarContext.ASSETS.value, force=True)
 
         # Start with empty hierarchy until MainWindow provides an index.
         self.set_project_index(None)
 
     _RECENT_TASKS_VISIBLE_KEY = "sidebar/recent_tasks_visible"
     _APP_SETTINGS_ORG, _APP_SETTINGS_APP = "MonoStudio26", "MonoStudio26"
+
+    def _sync_filters_center_layout(self) -> None:
+        """Type above Department when both visible; single filter snaps top; tail spacer fills remainder."""
+        lay = getattr(self, "_filters_scroll_layout", None)
+        tail = getattr(self, "_filters_tail_spacer", None)
+        if lay is None or tail is None:
+            return
+
+        scope_w = self._filters.scope_section()
+        type_w = self._filters.type_section()
+        dept_w = self._filters.dept_section()
+        tag_w = self._filters.tag_section()
+
+        type_idx = lay.indexOf(type_w)
+        dept_idx = lay.indexOf(dept_w)
+        tail_idx = lay.indexOf(tail)
+        if min(type_idx, dept_idx, tail_idx) < 0:
+            return
+
+        for i in range(lay.count()):
+            lay.setStretch(i, 0)
+
+        lay.setAlignment(scope_w, Qt.AlignmentFlag.AlignTop)
+        lay.setAlignment(type_w, Qt.AlignmentFlag.AlignTop)
+        lay.setAlignment(dept_w, Qt.AlignmentFlag.AlignTop)
+        lay.setAlignment(tag_w, Qt.AlignmentFlag.AlignTop)
+
+        type_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        dept_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        tail.setVisible(True)
+        tail.setMinimumHeight(0)
+        tail.setMaximumHeight(16777215)
+        lay.setStretch(tail_idx, 1)
+
+        self._apply_filter_list_heights()
+
+    def _apply_filter_list_heights(self) -> None:
+        type_max, dept_max = self._compute_filter_list_max_heights()
+        fw = self._filters
+        # Type first so it compacts to row count before department claims remaining space.
+        if fw.type_section().isVisible() and fw._type_section_expanded and fw._all_types:
+            fw.set_type_list_max_height(type_max)
+        else:
+            fw.set_type_list_max_height(None)
+        if fw.dept_section().isVisible() and fw._dept_section_expanded and fw._all_departments:
+            fw.set_dept_list_max_height(dept_max)
+        else:
+            fw.set_dept_list_max_height(None)
+
+    def _compute_filter_list_max_heights(self) -> tuple[int | None, int | None]:
+        """Split filters_center height between type and department lists (top → bottom)."""
+        center_h = int(self._filters_center.height())
+        if center_h <= 1:
+            return None, None
+
+        lay = self._filters_scroll_layout
+        margins = lay.contentsMargins()
+        budget = center_h - margins.top() - margins.bottom()
+        spacing = lay.spacing()
+        fw = self._filters
+
+        type_list = (
+            fw.type_section().isVisible()
+            and fw._type_section_expanded
+            and bool(fw._all_types)
+        )
+        dept_list = (
+            fw.dept_section().isVisible()
+            and fw._dept_section_expanded
+            and bool(fw._all_departments)
+        )
+        if not type_list and not dept_list:
+            return None, None
+
+        _HEADER_EXPANDED = 24
+        _HEADER_COLLAPSED = 20
+        _SECTION_LIST_GAP = 4  # dept/type section layout spacing below header
+        visible_blocks: list[QWidget] = []
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if w is None or not w.isVisible() or w is self._filters_tail_spacer:
+                continue
+            visible_blocks.append(w)
+
+        fixed = 0
+        type_header = 0
+        dept_header = 0
+        for w in visible_blocks:
+            if w is fw.type_section():
+                if type_list:
+                    type_header = _HEADER_EXPANDED + _SECTION_LIST_GAP
+                else:
+                    fixed += _HEADER_COLLAPSED
+            elif w is fw.dept_section():
+                if dept_list:
+                    dept_header = _HEADER_EXPANDED + _SECTION_LIST_GAP
+                else:
+                    fixed += _HEADER_COLLAPSED
+            else:
+                fixed += int(w.sizeHint().height())
+
+        fixed += type_header + dept_header
+        if len(visible_blocks) > 1:
+            fixed += spacing * (len(visible_blocks) - 1)
+
+        list_budget = budget - fixed
+        if list_budget <= 0:
+            return None, None
+
+        type_content = (
+            SidebarWidget._list_content_height(fw._type_list) if type_list else 0
+        )
+        dept_content = (
+            SidebarWidget._list_content_height(fw._dept_list) if dept_list else 0
+        )
+
+        if type_list and dept_list:
+            if type_content + dept_content <= list_budget:
+                return None, None
+            return self._split_filter_list_budget(list_budget, type_content, dept_content)
+        if type_list:
+            return None if type_content <= list_budget else list_budget, None
+        return None, None if dept_content <= list_budget else list_budget
+
+    @staticmethod
+    def _split_filter_list_budget(
+        list_budget: int, type_content: int, _dept_content: int
+    ) -> tuple[int, int]:
+        """Type keeps natural height; department gets all remaining budget."""
+        if type_content >= list_budget:
+            half = list_budget // 2
+            return half, list_budget - half
+        return type_content, list_budget - type_content
 
     def filters(self) -> SidebarWidget:
         return self._filters
@@ -3037,173 +3645,153 @@ class Sidebar(QWidget):
         s.sync()
         self._apply_recent_tasks_visibility()
 
-    _POPUP_REOPEN_GRACE = 0.25
-
-    def _clear_tool_button_hover(self, btn: QToolButton) -> None:
-        """Clear stuck hover/pressed state (after popup closes), same as TopBar."""
-        QApplication.sendEvent(btn, QEvent(QEvent.Type.Leave))
-        btn.setDown(False)
-        try:
-            st = btn.style()
-            if st:
-                st.unpolish(btn)
-                st.polish(btn)
-        except Exception:
-            pass
-        btn.update()
-
-    def _show_sidebar_project_menu(self) -> None:
-        """Same as noti: if menu is open, close it; if just closed (grace), don't reopen."""
-        if self._project_menu.isVisible():
-            self._project_menu.close()
-            return
-        if (time.monotonic() - self._project_menu_closed_at) < self._POPUP_REOPEN_GRACE:
-            return
-        pos = self._project_switch.mapToGlobal(self._project_switch.rect().bottomLeft())
-        self._project_menu.popup(pos)
-
-    def _on_sidebar_project_menu_closed(self) -> None:
-        self._project_menu_closed_at = time.monotonic()
-        QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._project_switch))
-
-    @staticmethod
-    def _project_dot_icon(color_hex: str, *, diameter: int = 6) -> QIcon:
-        try:
-            dpr = float(QApplication.primaryScreen().devicePixelRatio())
-        except Exception:
-            dpr = 1.0
-        canvas = max(16, diameter + 8)
-        dev_w = int(round(canvas * dpr))
-        pm = QPixmap(dev_w, dev_w)
-        pm.setDevicePixelRatio(dpr)
-        pm.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(color_hex))
-        cx = canvas / 2.0
-        cy = canvas / 2.0
-        r = diameter / 2.0
-        p.drawEllipse(QRectF(cx - r, cy - r, diameter, diameter))
-        p.end()
-        return QIcon(pm)
-
-    def set_projects(
-        self,
-        projects: list[DiscoveredProject],
-        *,
-        current_root: Path | None,
-        status_by_root: dict[str, str] | None = None,
+    def set_project_display_name(
+        self, name: str | None, *, project_root: Path | None = None
     ) -> None:
-        self._project_menu.clear()
-        current = str(current_root) if current_root else None
-        if not projects:
-            empty = QAction("No projects", self._project_menu)
-            empty.setEnabled(False)
-            self._project_menu.addAction(empty)
-            self._project_switch.setEnabled(False)
-            self._project_switch.setText("NO PROJECTS")
-            self._project_switch.setIcon(self._project_dot_icon("#52525b"))
-            self._project_switch.setProperty("state", "disabled")
-            if self._project_switch.style():
-                self._project_switch.style().unpolish(self._project_switch)
-                self._project_switch.style().polish(self._project_switch)
-            return
-        self._project_switch.setEnabled(True)
-        if current_root is None:
-            self._project_switch.setText("SELECT PROJECT")
-            self._project_switch.setIcon(self._project_dot_icon("#71717a"))
-            self._project_switch.setProperty("state", "empty")
+        self._project_root = project_root.resolve() if project_root is not None else None
+        if not name:
+            self._project_display_name_raw = None
+            self._project_name_label.setText("SELECT PROJECT")
+            self._project_name_label.setToolTip("")
         else:
-            folder_name = current_root.name or ""
-            self._project_switch.setText(folder_name.upper())
-            accent = project_accent_color(folder_name)
-            self._project_switch.setIcon(self._project_dot_icon(accent, diameter=8))
-            self._project_switch.setProperty("state", "active")
-        if self._project_switch.style():
-            self._project_switch.style().unpolish(self._project_switch)
-            self._project_switch.style().polish(self._project_switch)
-        group = QActionGroup(self._project_menu)
-        group.setExclusive(True)
-        for proj in projects:
-            label = proj.root.name
-            accent = project_accent_color(label)
-            is_current = current == str(proj.root)
-            dot = self._project_dot_icon(accent, diameter=8 if is_current else 6)
-            act = QAction(label, self._project_menu, checkable=True)
-            act.setIcon(dot)
-            act.setChecked(is_current)
-            if is_current:
-                f = act.font()
-                f.setWeight(QFont.Weight.DemiBold)
-                act.setFont(f)
-            act.triggered.connect(lambda checked=False, p=str(proj.root): self.project_switch_requested.emit(p))
-            group.addAction(act)
-            self._project_menu.addAction(act)
+            self._project_display_name_raw = name
+            self._sync_project_name_label_text()
+        self._project_name_row.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+            if self._project_display_name_raw
+            else Qt.ContextMenuPolicy.NoContextMenu
+        )
 
-    def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
-        self._tasks_list.clear()
+    def _sync_project_name_label_text(self) -> None:
+        raw = self._project_display_name_raw
+        if not raw:
+            return
+        display = raw.upper()
+        label = self._project_name_label
+        available = max(0, label.width())
+        if available > 0:
+            fm = QFontMetrics(label.font())
+            if fm.horizontalAdvance(display) > available:
+                label.setText(fm.elidedText(display, Qt.TextElideMode.ElideRight, available))
+                label.setToolTip(display)
+                return
+        label.setText(display)
+        label.setToolTip("")
+
+    def _on_project_name_context_menu(self, pos) -> None:
+        if not self._project_display_name_raw:
+            return
+        menu = MonosMenu(self)
+        open_act = None
+        root = self._project_root
+        if root is not None and root.is_dir():
+            open_act = menu.addAction(
+                lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Open folder",
+            )
+        copy_act = menu.addAction(
+            lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Copy name",
+        )
+        chosen = menu.exec(self._project_name_row.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if open_act is not None and chosen == open_act and root is not None:
+            shell_open_folder(root)
+        elif chosen == copy_act:
+            QApplication.clipboard().setText(self._project_display_name_raw)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._project_display_name_raw:
+            self._sync_project_name_label_text()
+        if hasattr(self, "_filters_center") and self._filters_center.height() > 1:
+            self._apply_filter_list_heights()
+
+    def _rebuild_recent_tasks_list(self) -> None:
+        tasks = list(self._recent_tasks_cache)
         self._tasks_clear_btn.setEnabled(bool(tasks))
         if not tasks:
-            self._tasks_stacked.setCurrentWidget(self._tasks_empty)
+            self._tasks_stacked.setCurrentIndex(self._tasks_page_empty)
+            self._tasks_list.clear()
             return
-        self._tasks_stacked.setCurrentWidget(self._tasks_list)
-        for t in tasks:
-            it = QListWidgetItem("")
-            it.setData(Qt.UserRole, t)
-            it.setSizeHint(QSize(0, _TASK_ROW_HEIGHT))
-            base_tt = f"{t.item_name}\n{t.department}" + (f" · {t.dcc}" if t.dcc else "")
-            base_html = base_tt.replace("\n", "<br/>")
-            hint_html = '<span style="font-size:80%; color:#71717a;">Double-click to open</span>'
-            it.setToolTip(f"<html>{base_html}<br/><br/>{hint_html}</html>")
-            self._tasks_list.addItem(it)
-        # Focus the first (most recently opened) task
-        self._tasks_list.setCurrentRow(0)
+        self._tasks_stacked.setCurrentIndex(self._tasks_page_list)
+        _populate_recent_tasks_flat(self._tasks_list, tasks)
+        if self._tasks_list.count():
+            self._tasks_list.setCurrentRow(0)
+        self._fit_recent_tasks_list_height()
+
+    @staticmethod
+    def _apply_recent_tasks_list_height(list_w: QListWidget, *, max_rows: int = 5, max_height_px: int | None = None) -> None:
+        rows = int(list_w.count())
+        if rows <= 0:
+            list_w.setFixedHeight(0)
+            return
+        total_h = sum(max(1, int(list_w.sizeHintForRow(i))) for i in range(rows))
+        gap = max(0, rows - 1) * int(list_w.spacing())
+        cap = max_rows * _TASK_ROW_HEIGHT + max(0, max_rows - 1) * int(list_w.spacing())
+        if max_height_px is not None:
+            cap = min(cap, max(1, int(max_height_px)))
+        content_h = total_h + gap
+        list_w.setMaximumHeight(cap)
+        list_w.setFixedHeight(min(content_h, cap))
+        list_w.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded if content_h > cap else Qt.ScrollBarAlwaysOff
+        )
+
+    def _fit_recent_tasks_list_height(self) -> None:
+        self._apply_recent_tasks_list_height(self._tasks_list)
+        # Container QSS padding 4px top + bottom
+        container_h = self._tasks_list.height() + 8
+        self._tasks_list_container.setFixedHeight(container_h)
+        self._tasks_block_h_expanded = 12 + 20 + 8 + container_h + 8
+        if self._recent_tasks_visible_from_settings():
+            self._tasks_block.setFixedHeight(self._tasks_block_h_expanded)
+
+    def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
+        self._recent_tasks_cache = list(tasks) if tasks else []
+        self._rebuild_recent_tasks_list()
+
+    def _recent_task_from_item(self, item: QListWidgetItem | None) -> RecentTask | None:
+        if item is None:
+            return None
+        data = item.data(Qt.UserRole)
+        if isinstance(data, dict):
+            task = data.get("task")
+            if isinstance(task, RecentTask):
+                return task
+        if isinstance(data, RecentTask):
+            return data
+        return None
 
     def _on_recent_task_item_clicked(self, item: QListWidgetItem) -> None:
-        task = item.data(Qt.UserRole) if item else None
-        if isinstance(task, RecentTask):
+        task = self._recent_task_from_item(item)
+        if task is not None:
             self.recent_task_clicked.emit(task)
 
     def _on_recent_task_item_double_clicked(self, item: QListWidgetItem) -> None:
-        task = item.data(Qt.UserRole) if item else None
-        if isinstance(task, RecentTask):
+        task = self._recent_task_from_item(item)
+        if task is not None:
             self.recent_task_double_clicked.emit(task)
-
-    def _add_nav_item(self, label: str, icon_name: str) -> None:
-        it = QListWidgetItem("")
-        it.setData(Qt.UserRole, label)
-        it.setSizeHint(QSize(0, 36))  # keep height locked
-        self._nav.addItem(it)
-
-        w = _SidebarNavItemWidget(label, icon_name, parent=self._nav)
-        self._nav.setItemWidget(it, w)
-        self._nav_widgets[label] = w
 
     def current_context(self) -> str:
         if self._footer_context is not None:
             return self._footer_context
         return self._scope_context
 
-    def set_current_context(self, context_name: str, *, force: bool = False) -> None:
+    def sync_nav_context(self, context_name: str, *, force: bool = False) -> None:
+        """Update filter panel for nav context without emitting navigation signals."""
         if not force and context_name == self.current_context():
             return
-        if context_name in (SidebarContext.PROJECTS.value, SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
+        if context_name in (SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
             self._footer_context = None
             self._scope_context = context_name
-            self._scope_pill.set_active_segment(context_name)
-            self._previous_context_text = getattr(self, "_last_context_text", None)
-            self._last_context_text = context_name
-            self._sync_nav_active_states()
-            if context_name == SidebarContext.PROJECTS.value:
-                self._filters.setVisible(False)
-            else:
-                self._filters.setVisible(True)
-                if context_name == SidebarContext.SHOTS.value:
-                    self._filters.set_mode("shots")
-                elif context_name == SidebarContext.ASSETS.value:
-                    self._filters.set_mode("assets")
-            self.context_changed.emit(context_name)
+            self._filters.setVisible(True)
+            if context_name == SidebarContext.SHOTS.value:
+                self._filters.set_mode("shots")
+            elif context_name == SidebarContext.ASSETS.value:
+                self._filters.set_mode("assets")
+            self._sync_filters_center_layout()
             return
         if context_name in (
             SidebarContext.DASHBOARD.value,
@@ -3214,10 +3802,6 @@ class Sidebar(QWidget):
             SidebarContext.TRASH.value,
         ):
             self._footer_context = context_name
-            self._nav.setCurrentRow(-1)
-            self._previous_context_text = getattr(self, "_last_context_text", None)
-            self._last_context_text = context_name
-            self._sync_nav_active_states()
             if context_name == SidebarContext.DASHBOARD.value:
                 self._filters.setVisible(True)
                 self._filters.set_mode("schedule")
@@ -3234,16 +3818,14 @@ class Sidebar(QWidget):
                 self._push_filter_counts()
             elif context_name == SidebarContext.OUTBOX.value:
                 self._filters.setVisible(True)
-                self._filters.set_mode("inbox")  # Source filter (Client/Freelancer) like Inbox
+                self._filters.set_mode("inbox")
             elif context_name == SidebarContext.TRASH.value:
                 self._filters.setVisible(False)
-            self.context_changed.emit(context_name)
+            self._sync_filters_center_layout()
             return
 
     def set_projects_count(self, value: int | None) -> None:
-        # Workspace discovery can feed this (no project scans).
-        self._projects_count = value
-        self._sync_nav_badges()
+        pass
 
     def set_project_index(self, project_index: ProjectIndex | None) -> None:
         """
@@ -3266,7 +3848,6 @@ class Sidebar(QWidget):
                     if name:
                         on_assets.add(name)
         self._filters.update_schedule_dept_scope_sets(on_shots=on_shots, on_assets=on_assets)
-        self._sync_nav_badges()
         self._push_filter_counts()
 
     def _compute_filter_counts(self) -> tuple[dict[str, int], dict[str, int]]:
@@ -3370,141 +3951,9 @@ class Sidebar(QWidget):
         self._filters.set_item_counts(count_by_type, count_by_department)
         self._filters.refresh_list_counts()
 
-    def _on_current_nav_item_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
-        if current is None:
-            return
-        self._footer_context = None
-        raw = current.data(Qt.UserRole)
-        context = self._scope_context if raw == _NAV_SCOPE_ITEM_ROLE else raw
-        if not isinstance(context, str) or not context:
-            return
-        self._previous_context_text = getattr(self, "_last_context_text", None)
-        self._last_context_text = context
-        self._sync_nav_active_states()
-        if context == SidebarContext.PROJECTS.value:
-            self._filters.setVisible(False)
-        else:
-            self._filters.setVisible(True)
-            if context == SidebarContext.SHOTS.value:
-                self._filters.set_mode("shots")
-            elif context == SidebarContext.ASSETS.value:
-                self._filters.set_mode("assets")
-            elif context == SidebarContext.SCHEDULE.value:
-                self._filters.set_mode("schedule")
-                self._push_filter_counts()
-            elif context == SidebarContext.OUTBOX.value:
-                self._filters.set_mode("inbox")  # Source (Client/Freelancer)
-        self.context_changed.emit(context)
-
-    def _on_scope_segment_clicked(self, context_name: str) -> None:
-        # Always clear nav page (footer) when a scope segment is chosen, so that
-        # current_context() reflects scope. Otherwise: Inbox -> click Assets (same segment)
-        # would leave _footer_context="Inbox", and clicking Inbox again would be treated as "already selected".
-        was_on_nav_page = self._footer_context is not None
-        self._footer_context = None
-        if context_name == self._scope_context:
-            self._sync_nav_active_states()
-            if was_on_nav_page:
-                # Was on Inbox/Project Guide/Outbox; now on scope — update filters visibility (e.g. hide DEPARTMENTS for Projects).
-                if self._scope_context == SidebarContext.PROJECTS.value:
-                    self._filters.setVisible(False)
-                else:
-                    self._filters.setVisible(True)
-                    if self._scope_context == SidebarContext.SHOTS.value:
-                        self._filters.set_mode("shots")
-                    elif self._scope_context == SidebarContext.ASSETS.value:
-                        self._filters.set_mode("assets")
-                self.context_changed.emit(context_name)
-            else:
-                self.context_clicked.emit(context_name)
-            return
-        self._scope_context = context_name
-        self._scope_pill.set_active_segment(context_name)
-        self._previous_context_text = getattr(self, "_last_context_text", None)
-        self._last_context_text = context_name
-        self._sync_nav_active_states()
-        if self._scope_context == SidebarContext.PROJECTS.value:
-            self._filters.setVisible(False)
-        else:
-            self._filters.setVisible(True)
-            if self._scope_context == SidebarContext.SHOTS.value:
-                self._filters.set_mode("shots")
-            elif self._scope_context == SidebarContext.ASSETS.value:
-                self._filters.set_mode("assets")
-        self.context_changed.emit(context_name)
-
-    def _on_footer_nav_clicked(self, context_name: str) -> None:
-        if context_name == self.current_context():
-            self.context_clicked.emit(context_name)
-            return
-        self.set_current_context(context_name)
-
-    def _on_nav_item_clicked(self, item: QListWidgetItem) -> None:
-        # Emit only when clicking the already-selected item (reload). When switching, currentItemChanged
-        # runs first and updates _last_context_text, so we must compare to _previous_context_text.
-        context = item.data(Qt.UserRole)
-        if context == _NAV_SCOPE_ITEM_ROLE:
-            context = self._scope_context
-        if not isinstance(context, str) or not context:
-            return
-        prev = getattr(self, "_previous_context_text", None)
-        if context == self._last_context_text and context == prev:
-            self.context_clicked.emit(context)
-
-    def _on_nav_context_menu_requested(self, pos) -> None:
-        item = self._nav.itemAt(pos)
-        if item is None:
-            return
-        raw = item.data(Qt.UserRole)
-        context = self._scope_context if raw == _NAV_SCOPE_ITEM_ROLE else raw
-        if not isinstance(context, str) or not context:
-            return
-        self.context_menu_requested.emit(context, self._nav.viewport().mapToGlobal(pos))
-
-    def _sync_nav_active_states(self) -> None:
-        # When a footer context (Inbox / Project Guide / Outbox) is active, clear scope pill and nav so only the footer button looks active.
-        if self._footer_context is not None:
-            self._scope_pill.set_active_segment(None)
-        else:
-            self._scope_pill.set_active_segment(self._scope_context)
-        for name, w in self._nav_widgets.items():
-            w.set_active(name == self.current_context())
-        self._sync_footer_active_states()
-
-    def _sync_footer_active_states(self) -> None:
-        ctx = self.current_context()
-        _icons = {
-            SidebarContext.INBOX.value: "inbox",
-            SidebarContext.PROJECT_GUIDE.value: "folder-open",
-            SidebarContext.OUTBOX.value: "send",
-            SidebarContext.TRASH.value: "trash-2",
-        }
-        for name, btn in self._footer_buttons.items():
-            active = name == ctx
-            btn.setProperty("active", "true" if active else "false")
-            color = MONOS_COLORS["blue_400"] if active else MONOS_COLORS["text_label"]
-            icon_name = _icons.get(name, "inbox")
-            ic = lucide_icon(icon_name, size=16, color_hex=color)
-            if not ic.isNull():
-                btn.setIcon(ic)
-                btn.setIconSize(QSize(16, 16))
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-
-    def _sync_nav_badges(self) -> None:
-        # Counts are UI-only, derived from already-loaded memory.
-        projects_count = self._projects_count
-        assets_count = len(self._project_index.assets) if self._project_index is not None else None
-        shots_count = len(self._project_index.shots) if self._project_index is not None else None
-        self._scope_pill.set_badges(projects_count, shots_count, assets_count)
-
-        for name, w in self._nav_widgets.items():
-            w.set_count_badge(None)
-
-
 # --- SidebarCompact: icon-only vertical sidebar for narrow windows ---
 
-_SIDEBAR_COMPACT_WIDTH = 56
+_SIDEBAR_COMPACT_WIDTH = 68
 
 
 def _sep_line(parent: QWidget, object_name: str = "SidebarNavSeparator") -> QFrame:
@@ -3566,7 +4015,7 @@ class SidebarCompact(QWidget):
         top_block_56.setFixedHeight(_TOP_BAR_HEIGHT)
         top_block_56.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         top_block_56_layout = QVBoxLayout(top_block_56)
-        top_block_56_layout.setContentsMargins(0, 8, 0, 0)
+        top_block_56_layout.setContentsMargins(0, 0, 0, 0)
         top_block_56_layout.setSpacing(0)
         self._project_switch = QToolButton(top_block_56)
         self._project_switch.setObjectName("SidebarCompactProjectSwitch")
@@ -3578,6 +4027,7 @@ class SidebarCompact(QWidget):
         self._project_switch.setToolTip("Switch project")
         self._project_switch.setPopupMode(QToolButton.InstantPopup)
         self._project_switch.clicked.connect(self._show_project_menu)
+        top_block_56_layout.addStretch(1)
         top_block_56_layout.addWidget(self._project_switch, 0, Qt.AlignmentFlag.AlignHCenter)
         top_block_56_layout.addStretch(1)
         top_block_56_layout.addWidget(_sep_line(top_block_56), 0)
@@ -3869,19 +4319,6 @@ class SidebarCompact(QWidget):
 
     def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
         self._recent_tasks = list(tasks) if tasks else []
-        if self._recent_tasks_list is not None:
-            self._recent_tasks_list.clear()
-            for t in self._recent_tasks:
-                it = QListWidgetItem("")
-                it.setData(Qt.UserRole, t)
-                it.setSizeHint(QSize(0, _TASK_ROW_HEIGHT))
-                base_tt = f"{t.item_name}\n{t.department}" + (f" · {t.dcc}" if t.dcc else "")
-                base_html = base_tt.replace("\n", "<br/>")
-                hint_html = '<span style="font-size:80%; color:#71717a;">Double-click to open</span>'
-                it.setToolTip(f"<html>{base_html}<br/><br/>{hint_html}</html>")
-                self._recent_tasks_list.addItem(it)
-            if self._recent_tasks_list.count():
-                self._recent_tasks_list.setCurrentRow(0)
 
     _POPUP_REOPEN_GRACE = 0.25
 
@@ -3917,47 +4354,49 @@ class SidebarCompact(QWidget):
         layout = QVBoxLayout(popup)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
-        lst = QListWidget(popup)
+        lst_container = _sidebar_filter_list_container(popup)
+        lst = QListWidget(lst_container)
+        lst_container.layout().addWidget(lst)
         lst.setObjectName("SidebarRecentTasksList")
         lst.setItemDelegate(_SidebarRecentTaskDelegate(lst))
         lst.setSelectionMode(QAbstractItemView.SingleSelection)
         lst.setFocusPolicy(Qt.NoFocus)
+        lst.setMouseTracking(True)
         lst.setSpacing(2)
-        max_h = 5 * _TASK_ROW_HEIGHT + 4 * 2
         lst.setMinimumWidth(220)
-        lst.setMaximumHeight(max_h)
-        for t in self._recent_tasks:
-            it = QListWidgetItem("")
-            it.setData(Qt.UserRole, t)
-            it.setSizeHint(QSize(0, _TASK_ROW_HEIGHT))
-            base_tt = f"{t.item_name}\n{t.department}" + (f" · {t.dcc}" if t.dcc else "")
-            base_html = base_tt.replace("\n", "<br/>")
-            hint_html = '<span style="font-size:80%; color:#71717a;">Double-click to open</span>'
-            it.setToolTip(f"<html>{base_html}<br/><br/>{hint_html}</html>")
-            lst.addItem(it)
+        anchor = self._recent_tasks_btn
+        max_popup_h = max_popup_height_for_anchor(anchor, gap=4)
+        list_max_h = max(80, max_popup_h - 56)
+        _populate_recent_tasks_flat(lst, self._recent_tasks)
+        Sidebar._apply_recent_tasks_list_height(lst, max_rows=10, max_height_px=list_max_h)
         if lst.count():
             lst.setCurrentRow(0)
         lst.itemClicked.connect(self._on_popup_task_clicked)
         lst.itemDoubleClicked.connect(self._on_popup_task_double_clicked)
         self._recent_tasks_list = lst
-        layout.addWidget(lst)
+        layout.addWidget(lst_container)
         clear_btn = QToolButton(popup)
         clear_btn.setText("Clear")
         clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.clicked.connect(lambda: (popup.close(), self.clear_recent_tasks_requested.emit()))
         layout.addWidget(clear_btn, 0, Qt.AlignmentFlag.AlignRight)
         self._recent_tasks_popup = popup
-        pos = self._recent_tasks_btn.mapToGlobal(self._recent_tasks_btn.rect().bottomLeft())
-        popup.move(pos.x(), pos.y() + 4)
+        position_popup_near_anchor(popup, anchor)
         popup.show()
 
     def _on_popup_task_clicked(self, item: QListWidgetItem) -> None:
-        task = item.data(Qt.UserRole) if item else None
-        if isinstance(task, RecentTask):
-            self.recent_task_clicked.emit(task)
+        data = item.data(Qt.UserRole) if item else None
+        if isinstance(data, dict):
+            task = data.get("task")
+            if isinstance(task, RecentTask):
+                self.recent_task_clicked.emit(task)
+                return
+        if isinstance(data, RecentTask):
+            self.recent_task_clicked.emit(data)
 
     def _on_popup_task_double_clicked(self, item: QListWidgetItem) -> None:
-        task = item.data(Qt.UserRole) if item else None
+        data = item.data(Qt.UserRole) if item else None
+        task = data.get("task") if isinstance(data, dict) else data
         if isinstance(task, RecentTask):
             self.recent_task_double_clicked.emit(task)
         if self._recent_tasks_popup:

@@ -44,6 +44,7 @@ class AppFooter(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("AppFooter")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFixedHeight(_APP_FOOTER_HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 

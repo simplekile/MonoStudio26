@@ -1,31 +1,17 @@
 """
-Project Guide page: header (MainView style) + tree by department under project_guide/ (reference, script, storyboard, guideline, concept).
-Inspector shows file preview when item selected in tree (same as Inbox).
-Supports: drag-drop onto page/tree, Import button, New folder, Delete, Open folder.
+Project Guide page: Inbox-style explorer (tile/list, path bar) per department under project_guide/.
+No date folders — sidebar DEPARTMENTS selects the root folder (like Inbox Client/Freelancer).
 """
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
-_log = logging.getLogger(__name__)
-# Debug: logging.getLogger("monostudio.ui_qt.reference_page_widget").setLevel(logging.DEBUG)
-
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
-from PySide6.QtWidgets import (
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from monostudio.core.project_guide_tags import read_all_tags
-from monostudio.ui_qt.inbox_split_view import ReferenceTreePane
-from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.notification import notify as notification_service
-from monostudio.ui_qt.style import MONOS_COLORS, monos_font
+from monostudio.ui_qt.inbox_page_widget import _header_tool_button
+from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, ProjectGuideTreePane
 
 PROJECT_GUIDE_DEPARTMENTS = ("reference", "script", "storyboard", "guideline", "concept")
 
@@ -35,173 +21,222 @@ def get_project_guide_root(project_root: Path | None) -> Path | None:
     if not project_root:
         return None
     from monostudio.core.structure_registry import StructureRegistry
+
     struct_reg = StructureRegistry.for_project(project_root)
     return Path(project_root) / struct_reg.get_folder("project_guide")
 
 
+def _normalize_department(department_id: str) -> str:
+    key = (department_id or PROJECT_GUIDE_DEPARTMENTS[0]).strip().lower()
+    return key if key in PROJECT_GUIDE_DEPARTMENTS else PROJECT_GUIDE_DEPARTMENTS[0]
+
+
+def _department_folder_path(project_root: Path | None, department_id: str) -> Path | None:
+    if project_root is None:
+        return None
+    guide_root = get_project_guide_root(project_root)
+    if guide_root is None:
+        return None
+    dept = _normalize_department(department_id)
+    candidate = guide_root / dept
+    if candidate.is_dir():
+        return candidate
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except OSError:
+        return guide_root if guide_root.is_dir() else None
+
+
 class ReferencePageWidget(QWidget):
-    """
-    Project Guide page: (1) Header like MainView (Project Guide + department badge + Import);
-    (2) Tree for selected department under project_guide/. Supports drag-drop, New folder, Delete, Import.
-    Emits tree_selection_changed(Path|None), drop_requested(list[Path]), import_requested(), open_folder_requested(Path).
-    """
+    """Project Guide: sidebar department + Inbox-style file explorer (no date folders)."""
 
     tree_selection_changed = Signal(object)  # Path | None
-    drop_requested = Signal(object)  # list[Path]
+    drop_requested = Signal(object, object, bool)  # list[Path], target folder, copy_only
     import_requested = Signal()
     open_folder_requested = Signal(object)  # Path
-    item_tags_changed = Signal()  # emitted when tags are assigned/removed (for sidebar count refresh)
+    item_tags_changed = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        # Don't accept drops here: frameless MainWindow receives drop on Windows; it forwards by position
         self.setAcceptDrops(False)
         self._project_root: Path | None = None
-        self._department: str = ""
+        self._department: str = PROJECT_GUIDE_DEPARTMENTS[0]
+        self._header_badge_label: str | None = None
+        self._header_badge_icon: str | None = None
+        self._tree_state_cache: dict[str, dict] = {}
+        self._tree_pane: ProjectGuideTreePane | None = None
+
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(0, 0, 0, 0)
         root_lay.setSpacing(0)
 
-        # Header (MainView style) + Import button
         header = QWidget(self)
         header.setObjectName("MainViewHeader")
         header.setAttribute(Qt.WA_StyledBackground, True)
-        hlay = QHBoxLayout(header)
-        hlay.setContentsMargins(12, 12, 12, 12)
-        hlay.setSpacing(12)
-        self._context_title = QLabel("Project Guide", header)
-        self._context_title.setObjectName("MainViewContextTitle")
-        self._context_title.setFont(monos_font("Inter", 16, QFont.Weight.Bold))
-        self._dept_badge = QWidget(header)
-        self._dept_badge.setObjectName("MainViewTypeBadge")
-        self._dept_badge.setAttribute(Qt.WA_StyledBackground, True)
-        badge_lay = QHBoxLayout(self._dept_badge)
-        badge_lay.setContentsMargins(8, 4, 10, 4)
-        badge_lay.setSpacing(6)
-        self._dept_icon = QLabel(self._dept_badge)
-        self._dept_icon.setFixedSize(16, 16)
-        self._dept_label = QLabel(self._dept_badge)
-        self._dept_label.setObjectName("MainViewTypeBadgeLabel")
-        self._dept_label.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-        badge_lay.addWidget(self._dept_icon, 0, Qt.AlignVCenter)
-        badge_lay.addWidget(self._dept_label, 0, Qt.AlignVCenter)
-        hlay.addWidget(self._context_title, 0, Qt.AlignVCenter)
-        hlay.addWidget(self._dept_badge, 0, Qt.AlignVCenter)
+        header_v = QVBoxLayout(header)
+        header_v.setContentsMargins(12, 12, 12, 10)
+        header_v.setSpacing(6)
+
+        top_row = QWidget(header)
+        hlay = QHBoxLayout(top_row)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(10)
+
+        self._title_row = InboxOutboxTitleRow("Project Guide", root_icon="folder-open", parent=top_row)
+        hlay.addWidget(self._title_row, 0, Qt.AlignmentFlag.AlignVCenter)
         hlay.addStretch(1)
-        import_btn = QPushButton("Import", header)
-        import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        import_icon = lucide_icon("upload", size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
-        if not import_icon.isNull():
-            import_btn.setIcon(import_icon)
-        import_btn.clicked.connect(self._on_import_clicked)
-        hlay.addWidget(import_btn, 0)
+
+        self._open_folder_btn = _header_tool_button(top_row, "Open folder", "folder-open")
+        self._open_folder_btn.clicked.connect(self._on_open_folder_clicked)
+        hlay.addWidget(self._open_folder_btn, 0)
+
+        self._import_btn = _header_tool_button(top_row, "Import", "upload", primary=True)
+        self._import_btn.clicked.connect(self._on_import_clicked)
+        hlay.addWidget(self._import_btn, 0)
+        header_v.addWidget(top_row, 0)
+
+        self._path_bar_row = QWidget(header)
+        self._path_bar_row.setObjectName("InboxPathBarRow")
+        self._path_bar_lay = QHBoxLayout(self._path_bar_row)
+        self._path_bar_lay.setContentsMargins(0, 0, 0, 0)
+        self._path_bar_lay.setSpacing(12)
+        self._path_bar_row.hide()
+        header_v.addWidget(self._path_bar_row, 0)
+
         root_lay.addWidget(header, 0)
 
-        # Tree (root = project_guide/<department>)
-        ref_root = get_project_guide_root(None)
-        dept_label = (self._department or "reference").replace("_", " ").title()
-        self._tree_pane = ReferenceTreePane(ref_root, dept_label, self)
-        self._tree_pane.tree_selection_changed.connect(self.tree_selection_changed.emit)
-        self._tree_pane.open_folder_requested.connect(self.open_folder_requested.emit)
-        self._tree_pane.import_requested.connect(self.import_requested.emit)
-        self._tree_pane.item_tags_changed.connect(self.item_tags_changed.emit)
-        root_lay.addWidget(self._tree_pane, 1)
+        self._content_host = QWidget(self)
+        self._content_lay = QVBoxLayout(self._content_host)
+        self._content_lay.setContentsMargins(0, 0, 0, 0)
+        self._content_lay.setSpacing(0)
+        root_lay.addWidget(self._content_host, 1)
+        self._refresh_chrome()
 
-        self._update_dept_badge()
+    def _mount_explorer_path_bar(self) -> None:
+        if self._tree_pane is None:
+            self._path_bar_row.hide()
+            return
+        bar = self._tree_pane.explorer_path_bar()
+        toolbar = self._tree_pane.explorer_toolbar()
+        if bar is None:
+            self._path_bar_row.hide()
+            return
+        if bar.parent() is not self._path_bar_row:
+            bar.setParent(self._path_bar_row)
+        if self._path_bar_lay.indexOf(bar) < 0:
+            self._path_bar_lay.addWidget(bar, 1)
+        if toolbar is not None:
+            toolbar.set_inline(True)
+            if toolbar.parent() is not self._path_bar_row:
+                toolbar.setParent(self._path_bar_row)
+            if self._path_bar_lay.indexOf(toolbar) < 0:
+                self._path_bar_lay.addWidget(toolbar, 0, Qt.AlignmentFlag.AlignVCenter)
+            toolbar.show()
+        self._path_bar_row.show()
+
+    def _refresh_chrome(self) -> None:
+        self._title_row.set_context(
+            type_filter=self._department,
+            date_path=None,
+            unified_tree=True,
+            badge_role="department",
+            badge_label=self._header_badge_label,
+            badge_icon=self._header_badge_icon,
+        )
+        self._mount_explorer_path_bar()
+
+    def set_header_badge_display(self, *, label: str | None = None, icon_name: str | None = None) -> None:
+        self._header_badge_label = (label or "").strip() or None
+        self._header_badge_icon = (icon_name or "").strip() or None
+        self._refresh_chrome()
+
+    def _tree_state_key(self, department_id: str) -> str:
+        return _normalize_department(department_id)
+
+    def _ensure_tree_pane(self) -> None:
+        root = _department_folder_path(self._project_root, self._department)
+        guide_root = get_project_guide_root(self._project_root)
+        if root is None:
+            return
+        if self._tree_pane is None:
+            self._tree_pane = ProjectGuideTreePane(
+                root,
+                self._content_host,
+                project_root=self._project_root,
+                project_guide_root=guide_root,
+                source_filter=self._department,
+            )
+            self._tree_pane.tree_selection_changed.connect(self._on_tree_selection)
+            self._tree_pane.open_folder_requested.connect(self.open_folder_requested.emit)
+            self._tree_pane.import_requested.connect(self.import_requested.emit)
+            self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
+            self._tree_pane.item_tags_changed.connect(self.item_tags_changed.emit)
+            self._content_lay.addWidget(self._tree_pane, 1)
+        else:
+            self._tree_pane.set_project_guide_root(guide_root, self._project_root)
+            if self._project_root:
+                self._tree_pane.set_tag_data(read_all_tags(self._project_root))
+                self._tree_pane.reload_tag_definitions()
+            self._tree_pane.set_date_folder_path(root)
+            self._tree_pane.set_chrome_context(self._department, None)
+        key = self._tree_state_key(self._department)
+        saved = self._tree_state_cache.get(key)
+        if saved:
+            self._tree_pane.set_tree_state(saved)
+        self._refresh_chrome()
+
+    def _on_tree_selection(self, path) -> None:
+        self.tree_selection_changed.emit(path)
+
+    def _on_open_folder_clicked(self) -> None:
+        if self._tree_pane is not None:
+            target = self._tree_pane.current_browse_path()
+        else:
+            target = _department_folder_path(self._project_root, self._department)
+        if target is not None:
+            self.open_folder_requested.emit(target)
 
     def _on_import_clicked(self) -> None:
         self.import_requested.emit()
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        _log.debug("Project Guide dragEnterEvent: hasUrls=%s", event.mimeData().hasUrls())
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        _log.debug("Project Guide dropEvent: received")
-        if not event.mimeData().hasUrls():
-            super().dropEvent(event)
-            return
-        paths = []
-        for url in event.mimeData().urls():
-            if url.isLocalFile():
-                p = Path(url.toLocalFile())
-                if p.exists():
-                    paths.append(p)
-        event.acceptProposedAction()
-        if not paths:
-            _log.debug("Project Guide dropEvent: no valid paths")
-            return
-        # Resolve drop target by position (like Inbox: page receives all drops)
-        pos_in_page = event.position().toPoint()
-        pos_in_pane = self._tree_pane.mapFrom(self, pos_in_page)
-        pane_rect = self._tree_pane.rect()
-        in_pane = pane_rect.contains(pos_in_pane)
-        _log.debug(
-            "Project Guide dropEvent: pos_page=%s,%s pos_in_pane=%s,%s pane_rect=%s in_pane=%s paths=%s",
-            pos_in_page.x(), pos_in_page.y(),
-            pos_in_pane.x(), pos_in_pane.y(),
-            (pane_rect.x(), pane_rect.y(), pane_rect.width(), pane_rect.height()),
-            in_pane,
-            [str(p) for p in paths],
-        )
-        if in_pane:
-            target = self._tree_pane.get_drop_target_folder(pos_in_pane)
-            _log.debug("Project Guide dropEvent: target=%s is_dir=%s", target, target.is_dir() if target else None)
-            if target and target.is_dir():
-                self._tree_pane.drop_files_to_folder(paths, target)
-                notification_service.success(f"Added {len(paths)} item{'s' if len(paths) != 1 else ''} to Project Guide.")
-                return
-        _log.debug("Project Guide dropEvent: emitting drop_requested (fallback to dept root)")
-        self.drop_requested.emit(paths)
-
-    def _update_dept_badge(self) -> None:
-        d = (self._department or "").strip()
-        if not d:
-            self._dept_badge.setVisible(False)
-            return
-        label = d.replace("_", " ").title()
-        icon = lucide_icon("folder", size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
-        self._dept_icon.setPixmap(icon.pixmap(16, 16))
-        self._dept_label.setText(label.upper())
-        self._dept_badge.setVisible(True)
-
     def set_project_root(self, path: Path | None) -> None:
         self._project_root = Path(path) if path else None
-        self._refresh_tree_root()
+        self._ensure_tree_pane()
+        if self._tree_pane is not None:
+            guide_root = get_project_guide_root(self._project_root)
+            self._tree_pane.set_project_guide_root(guide_root, self._project_root)
+            if self._project_root:
+                self._tree_pane.set_tag_data(read_all_tags(self._project_root))
+                self._tree_pane.reload_tag_definitions()
+            self._tree_pane.refresh_content()
 
     def set_department(self, department_id: str) -> None:
-        self._department = (department_id or "").strip().lower()
-        self._update_dept_badge()
-        self._refresh_tree_root()
-
-    def _refresh_tree_root(self) -> None:
-        root = get_project_guide_root(self._project_root)
-        dept = (self._department or "").strip()
-        if not dept or dept not in PROJECT_GUIDE_DEPARTMENTS:
-            dept = PROJECT_GUIDE_DEPARTMENTS[0]
-        label = dept.replace("_", " ").title()
-        if root and dept:
-            folder = root / dept
-            if not folder.is_dir():
-                folder = root
-        else:
-            folder = root
-        self._tree_pane.set_project_guide_root(root, self._project_root)
-        if self._project_root:
-            self._tree_pane.set_tag_data(read_all_tags(self._project_root))
-        self._tree_pane.set_root(folder, label)
+        new_dept = _normalize_department(department_id)
+        if new_dept == self._department and self._tree_pane is not None:
+            self._refresh_chrome()
+            return
+        if self._tree_pane is not None and self._department:
+            self._tree_state_cache[self._tree_state_key(self._department)] = self._tree_pane.get_tree_state()
+        self._department = new_dept
+        self._ensure_tree_pane()
+        self._refresh_chrome()
 
     def set_tag_filter(self, tag_id: str | None) -> None:
-        self._tree_pane.set_tag_filter(tag_id)
+        if self._tree_pane is not None:
+            self._tree_pane.set_tag_filter(tag_id)
 
     def get_item_tags(self) -> dict[str, list[str]]:
-        """Item tags for Project Guide (path -> tag_ids). Used e.g. for tag-filter toast count."""
-        return self._tree_pane.get_item_tags()
+        if self._tree_pane is not None:
+            return self._tree_pane.get_item_tags()
+        if self._project_root:
+            return read_all_tags(self._project_root)
+        return {}
 
     def reload_tag_definitions(self) -> None:
-        self._tree_pane.reload_tag_definitions()
+        if self._tree_pane is not None:
+            self._tree_pane.reload_tag_definitions()
 
-
+    def refresh_tree(self) -> None:
+        if self._tree_pane is not None:
+            self._tree_pane.refresh_content()

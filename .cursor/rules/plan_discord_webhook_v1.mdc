@@ -1,0 +1,309 @@
+---
+description: Plan Discord Webhook — đẩy sự kiện pipeline (mention, inbox, schedule…) ra kênh Discord, serverless từ desktop app.
+alwaysApply: false
+---
+
+# Plan: Discord Webhook (v1)
+
+Mục tiêu: cho phép studio nhận **thông báo pipeline trên Discord** (kênh team / project) mà **không cần server MONOS**. Mỗi máy chạy app gửi HTTP POST tới Discord Webhook URL khi có sự kiện được bật — phù hợp mô hình Dropbox + desktop hiện tại.
+
+> Discord webhook = secret URL. Ai có URL có thể gửi tin vào kênh. Plan này coi webhook như **credential studio nhỏ** (trust-based), không thay thế bảo mật thật.
+
+---
+
+## 1. Bối cảnh hiện tại
+
+| Thành phần | Vị trí | Ghi chú |
+|---|---|---|
+| In-app notification | `monostudio/ui_qt/notification/service.py` | Toast, bell, `important()` |
+| @mention inbox (sync) | `project_root/.monostudio/mention_inbox.json` | Dropbox-synced |
+| Mention tạo khi save note | `item_notes_dialog._dispatch_mentions_for_new_entries` → `append_mentions` | Chạy trên máy **author** |
+| Bell sync | `MainWindow._sync_mention_inbox_alerts` | Chỉ user đang đăng nhập |
+| Windows toast @mention | `monostudio/core/windows_toast.py` | Local preference |
+| User roster | `workspace_root/.monostudio/users.json` | Shared identity |
+| HTTP trong app | `urllib` (`update_checker.py`), optional `requests` | Chưa có outbound webhook |
+| Settings UI hook | Project → **Integrations** (placeholder) | `settings_dialog._build_project_page` |
+
+**Không có** Discord/webhook code. **Không có** server relay — mọi POST đi thẳng từ client tới Discord.
+
+---
+
+## 2. Nguyên tắc thiết kế
+
+1. **Fire at write time**: Gửi webhook khi sự kiện được **ghi** (vd author save @mention), không chờ máy target mở app. Tránh duplicate từ polling inbox trên nhiều máy.
+2. **Non-blocking**: POST trên **background thread** (`QThread` / `QRunnable` + pool), không block UI hay save note.
+3. **Fail silent + log**: Lỗi mạng/rate limit → log DEBUG/WARNING; **không** popup lỗi cho user trừ khi họ bấm "Send test".
+4. **Opt-in per scope**: Webhook tắt mặc định; admin/project lead bật trong Settings.
+5. **Rate limit aware**: Discord ~**30 req/phút/webhook**; queue + debounce + dedupe id sự kiện.
+6. **Không phụ thuộc Qt trong core**: Module gửi webhook nằm `monostudio/core/` (test headless).
+
+---
+
+## 3. Phạm vi cấu hình (workspace vs project)
+
+### 3.1 Workspace-level (khuyến nghị v1)
+
+**File**: `workspace_root/.monostudio/integrations.json` (sync Dropbox)
+
+```json
+{
+  "schema": 1,
+  "updated_at": "2026-06-07T12:00:00Z",
+  "discord": {
+    "enabled": true,
+    "webhooks": [
+      {
+        "id": "wh_a1b2c3",
+        "label": "#pipeline-general",
+        "url": "https://discord.com/api/webhooks/...",
+        "events": {
+          "mention": true,
+          "inbox_distributed": false,
+          "schedule_due": false
+        }
+      }
+    ],
+    "defaults": {
+      "username": "MONOS",
+      "avatar_url": ""
+    }
+  }
+}
+```
+
+- Một studio → một hoặc vài kênh Discord chung.
+- `url` là secret — **không** log full URL; mask trong UI (`••••••••/abc123`).
+
+### 3.2 Project-level override (v2, tùy chọn)
+
+**File**: `project_root/.monostudio/integrations.json`
+
+- Cùng schema; nếu tồn tại và `enabled`, **merge/override** workspace (project webhook bổ sung hoặc thay events).
+- Use case: mỗi project một kênh Discord riêng.
+
+**v1**: chỉ workspace-level để giảm phức tạp UI.
+
+---
+
+## 4. Event catalog
+
+| Event key | Trigger (code path) | v1 | Payload gợi ý |
+|---|---|:---:|---|
+| `mention` | `append_mentions` return > 0 | ✅ | from, targets, item, dept, snippet |
+| `inbox_distributed` | `append_inbox_distributed` | ⏳ v2 | source, destination, file count, actor |
+| `schedule_due` | timer / mở Schedule page | ⏳ v2 | milestone/allocation, due date |
+| `schedule_saved` | `write_project_schedule_to_disk` | ❌ | Quá noisy |
+| `publish` | (chưa có hook thống nhất) | ❌ v3 | asset/shot, version, dept |
+
+### 4.1 `mention` (v1)
+
+Sau khi `append_mentions` thành công trong `ItemNotesDialog._dispatch_mentions_for_new_entries`:
+
+```python
+dispatch_discord_event(
+    workspace_root,
+    project_root,
+    event="mention",
+    payload={
+        "from_user_id": from_uid,
+        "from_name": from_name,
+        "to_user_ids": [i.to_user_id for i in new_items],
+        "item_rel": rel,
+        "item_display": display,
+        "department": dept,
+        "snippet": snip,
+        "project_name": project_display_name,
+        "mention_ids": [i.id for i in new_items],
+    },
+)
+```
+
+- Gửi **một message** gom nhiều target trong cùng note (không 1 POST/user).
+- Optional: map `to_user_ids` → Discord `<@id>` nếu roster có field `discord_user_id` (v2).
+
+---
+
+## 5. Discord message format
+
+Dùng [Discord Execute Webhook](https://discord.com/developers/docs/resources/webhook#execute-webhook) — `POST {webhook.url}?wait=false`
+
+### 5.1 Embed mẫu (@mention)
+
+```json
+{
+  "username": "MONOS",
+  "allowed_mentions": { "parse": [] },
+  "embeds": [{
+    "title": "Tachi mentioned you",
+    "description": "char_hero_aya · Model\n> Can you check the UVs on the cape?",
+    "color": 5814783,
+    "fields": [
+      { "name": "Project", "value": "ProjectAlpha", "inline": true },
+      { "name": "Department", "value": "Model", "inline": true }
+    ],
+    "footer": { "text": "MONOS Pipeline" },
+    "timestamp": "2026-06-07T12:00:00.000Z"
+  }]
+}
+```
+
+- `color`: hex user `color_hex` từ roster (fallback `#3b82f6` → decimal).
+- **Không** deep link MONOS (desktop app) v1 — chỉ text path/display name (mono trong field nếu cần).
+- `allowed_mentions.parse: []` mặc định; bật `@everyone`/`roles` **không** cho phép từ app.
+
+### 5.2 Plain fallback
+
+Nếu embed build lỗi → `content` một dòng: `Tachi mentioned @you in char_hero_aya (Model)`.
+
+---
+
+## 6. Core module
+
+**Mới**: `monostudio/core/discord_webhook.py`
+
+| Hàm | Trách nhiệm |
+|---|---|
+| `load_integrations(workspace_root, project_root=None)` | Đọc + merge config |
+| `is_event_enabled(..., event: str)` | Check webhook + event flag |
+| `build_mention_payload(...)` | Dict → Discord JSON body |
+| `post_webhook(url, body, *, timeout=10)` | `urllib.request` POST; raise/log |
+| `dispatch_discord_event(...)` | Enqueue; không block caller |
+
+**Mới**: `monostudio/core/discord_webhook_queue.py` (hoặc gộp file trên)
+
+- In-memory queue + worker thread singleton.
+- Dedupe key: `f"{event}:{mention_id}"` TTL 60s (tránh double-save).
+- Rate limit: max 25/min/webhook (buffer dưới 30).
+- Retry: 1 lần sau 2s nếu 429/5xx.
+
+**Logging**: logger `monostudio.discord_webhook` — success DEBUG, failure WARNING (không log URL đầy đủ).
+
+---
+
+## 7. UI — Settings → Project → Integrations
+
+Thay placeholder trong `_build_project_page` bằng tab thật (hoặc tab con Discord trong Integrations).
+
+### 7.1 Layout
+
+```
+[ Card: Discord ]
+  Enable Discord notifications          [ toggle ]
+  Webhook URL                           [ password-style QLineEdit ]
+  Channel label (optional)              [ QLineEdit ]
+  ── Events ──
+  ☑ @mentions in notes
+  ☐ Inbox distributed        (disabled / coming v2)
+  ☐ Schedule due reminders   (disabled / coming v2)
+  [ Send test message ]  [ Save ]
+  Hint: Webhook URL is stored in workspace .monostudio/integrations.json (synced).
+```
+
+- **Send test**: POST embed "Test from MONOS on {machine} / {user}"; success/error `QMessageBox`.
+- Webhook URL: show masked khi đã lưu; nút "Replace" để paste URL mới.
+- Chỉ user có quyền admin pipeline (hoặc `access_control` dev) được sửa — reuse pattern settings nhạy cảm nếu có.
+
+### 7.2 Local vs shared
+
+- Config lưu **workspace** `integrations.json` (sync).
+- Toggle "Disable on this machine only" (optional v2): `QSettings` key `discord/disabled_locally` — không ghi file shared.
+
+---
+
+## 8. Bảo mật & vận hành
+
+| Rủi ro | Mitigation |
+|---|---|
+| URL lộ trong Dropbox | Mask UI; doc khuyên dùng kênh riêng + rotate webhook Discord |
+| Spam khi bulk mention | Debounce; 1 message/note; rate limit queue |
+| Ai cũng sửa integrations.json | Trust model studio; optional admin gate UI |
+| Offline author | Event vẫn queue local; flush khi có mạng (v1: drop nếu fail; v2: outbox file) |
+
+**Không** lưu webhook URL trong repo git / screenshot settings.
+
+---
+
+## 9. Roster mở rộng (v2 — Discord user ping)
+
+Thêm field tùy chọn vào `users.json`:
+
+```json
+"discord_user_id": "123456789012345678"
+```
+
+- Settings → Team: cột Discord ID (optional, mono font).
+- Khi gửi mention: `content` prefix `<@discord_user_id>` cho từng target có ID; vẫn `allowed_mentions: { "users": [ids] }`.
+- Không bắt buộc v1.
+
+---
+
+## 10. Thứ tự triển khai
+
+### Phase 1 — Foundation (v1.0)
+
+1. `integrations.json` schema + `load_integrations` / `atomic_write`.
+2. `discord_webhook.py`: build embed + POST urllib.
+3. Background queue + rate limit + dedupe.
+4. Wire `mention` tại `append_mentions` success path (1 call site).
+5. Settings UI: enable, URL, mention toggle, test, save.
+6. Manual test với Discord test channel.
+
+### Phase 2 — More events (v1.1)
+
+7. `inbox_distributed` hook tại `append_inbox_distributed`.
+8. `schedule_due`: daily check khi app mở + optional `QTimer` 1x/ngày; chỉ milestone quá hạn / due today.
+9. Project-level override file (nếu cần).
+
+### Phase 3 — Polish (v1.2)
+
+10. Roster `discord_user_id` + ping.
+11. Per-machine opt-out.
+12. Outbox file `workspace_root/.monostudio/discord_outbox.json` retry khi offline (optional).
+
+---
+
+## 11. Files cần chạm (tóm tắt)
+
+| Khu vực | File |
+|---|---|
+| Core config | Mới: `monostudio/core/integrations_config.py` |
+| Core send | Mới: `monostudio/core/discord_webhook.py` |
+| Mention hook | `monostudio/ui_qt/item_notes_dialog.py` (sau `append_mentions`) |
+| Settings UI | `monostudio/ui_qt/settings_dialog.py` (Integrations tab) |
+| Team (v2) | `monostudio/ui_qt/team_management_dialog.py`, `user_identity.py` schema |
+| Inbox (v2) | `monostudio/core/inbox_reader.py` |
+| Schedule (v2) | `monostudio/ui_qt/schedule_page_widget.py` hoặc timer trong `MainWindow` |
+
+**Không sửa** `notification_service` cho webhook — kênh Discord **song song** in-app bell/toast, không thay thế.
+
+---
+
+## 12. Test plan
+
+- [ ] Save note @mention → 1 message Discord đúng embed (project, item, snippet).
+- [ ] Webhook disabled → không POST.
+- [ ] Invalid URL → test button báo lỗi; save note không crash.
+- [ ] 10 mentions nhanh → queue không vượt rate limit; không duplicate.
+- [ ] Máy không mạng → save note OK; log warning.
+- [ ] `integrations.json` sync qua Dropbox → máy khác dùng cùng webhook.
+- [ ] URL masked trong Settings sau reload.
+
+---
+
+## 13. Không nằm trong phạm vi
+
+- Discord Bot (Gateway, slash commands, OAuth).
+- Server relay / webhook proxy MONOS-hosted.
+- Two-way sync (Discord → MONOS).
+- Gửi file đính kèm / thumbnail note qua webhook (Discord limit + privacy).
+- Slack/Teams (cùng pattern có thể thêm sau qua `integrations.json` provider key).
+
+---
+
+## 14. Tham chiếu
+
+- User/roster: `plan_user_system_dropbox_v1.mdc`
+- Mention flow: `mention_inbox.py`, `item_notes_dialog._dispatch_mentions_for_new_entries`
+- HTTP pattern: `update_checker.py` (`urllib.request`)
+- Settings slot: Project → Integrations placeholder trong `settings_dialog.py`
+- Discord API: [Execute Webhook](https://discord.com/developers/docs/resources/webhook#execute-webhook)

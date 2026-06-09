@@ -1,328 +1,262 @@
 """
-Outbox page: header (MainView style) + single column (list date folders | tree).
-Inspector: preview/metadata only (no distribute, no History).
+Outbox page: header + unified file tree (client/freelancer → date folders → files).
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtCore import QSize
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
+from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtWidgets import (
     QHBoxLayout,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from monostudio.core.outbox_reader import scan_outbox
-from monostudio.ui_qt.inbox_split_view import InboxTreePane
+from monostudio.core.outbox_reader import get_outbox_root
+from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, InboxTreePane
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS, monos_font
+from monostudio.ui_qt.outbox_history_dialog import OutboxHistoryDialog
+from monostudio.ui_qt.style import MONOS_COLORS
 
 
-class _OutboxDateFolderList(QWidget):
-    """List of date folders for outbox (client/freelancer). Emits date_folder_clicked(Path)."""
+def _header_tool_button(parent: QWidget, text: str, icon_name: str, *, primary: bool = False) -> QPushButton:
+    btn = QPushButton(text, parent)
+    btn.setObjectName("InboxPrimaryButton" if primary else "InboxHeaderButton")
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setIconSize(QSize(16, 16))
+    color = "#ffffff" if primary else MONOS_COLORS.get("text_label", "#a1a1aa")
+    ic = lucide_icon(icon_name, size=16, color_hex=color)
+    if not ic.isNull():
+        btn.setIcon(ic)
+    return btn
 
-    date_folder_clicked = Signal(object)  # Path
 
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self._project_root: Path | None = None
-        self._source_filter: str = ""
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        self._stack = QStackedWidget(self)
-        self._empty_widget = self._make_empty_placeholder()
-        self._stack.addWidget(self._empty_widget)
-        self._list = QListWidget(self)
-        self._list.setObjectName("InboxMappingList")
-        self._list.setIconSize(QSize(20, 20))
-        self._list.setSpacing(2)
-        self._list.itemClicked.connect(self._on_item_clicked)
-        self._stack.addWidget(self._list)
-        lay.addWidget(self._stack, 1)
+def _normalize_source_type(source_type: str) -> str:
+    key = (source_type or "client").strip().lower()
+    return key if key in ("client", "freelancer") else "client"
 
-    def _make_empty_placeholder(self) -> QWidget:
-        wrap = QWidget(self)
-        wrap.setObjectName("InboxDateListEmpty")
-        v = QVBoxLayout(wrap)
-        v.setContentsMargins(24, 48, 24, 48)
-        v.setSpacing(16)
-        v.addStretch(1)
-        icon = lucide_icon("send", size=64, color_hex=MONOS_COLORS.get("text_meta", "#71717a"))
-        icon_lb = QLabel(wrap)
-        if not icon.isNull():
-            icon_lb.setPixmap(icon.pixmap(64, 64))
-        icon_lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        v.addWidget(icon_lb, 0, Qt.AlignmentFlag.AlignHCenter)
-        line1 = QLabel("Drag and drop files or folders here", wrap)
-        line1.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        line1.setStyleSheet(f"color: {MONOS_COLORS.get('text_meta', '#71717a')}; font-size: 13px;")
-        line1.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
-        v.addWidget(line1, 0, Qt.AlignmentFlag.AlignHCenter)
-        line2 = QLabel("or use the Import button above", wrap)
-        line2.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        line2.setStyleSheet(f"color: {MONOS_COLORS.get('text_meta', '#71717a')}; font-size: 13px;")
-        line2.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
-        v.addWidget(line2, 0, Qt.AlignmentFlag.AlignHCenter)
-        v.addStretch(1)
-        return wrap
 
-    def set_content(self, project_root: Path | None, source_filter: str) -> None:
-        self._project_root = project_root
-        self._source_filter = (source_filter or "").strip().lower()
-        self._list.clear()
-        if not project_root or not project_root.is_dir():
-            self._stack.setCurrentWidget(self._empty_widget)
-            return
-        if not self._source_filter:
-            self._stack.setCurrentWidget(self._empty_widget)
-            return
-        try:
-            nodes = scan_outbox(project_root)
-        except Exception:
-            nodes = []
-        for node in nodes:
-            if (node.name or "").lower() != self._source_filter:
-                continue
-            if node.is_dir and node.children:
-                date_icon = lucide_icon("calendar", size=20, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
-                for child in node.children:
-                    if getattr(child, "is_dir", True) and getattr(child, "path", None):
-                        it = QListWidgetItem(child.name or str(child.path))
-                        it.setData(Qt.ItemDataRole.UserRole, str(child.path))
-                        it.setToolTip(str(child.path))
-                        if not date_icon.isNull():
-                            it.setIcon(date_icon)
-                        it.setSizeHint(QSize(0, 44))
-                        self._list.addItem(it)
-            break
-        if self._list.count() == 0:
-            self._stack.setCurrentWidget(self._empty_widget)
-        else:
-            self._stack.setCurrentWidget(self._list)
-
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
-        path_str = item.data(Qt.ItemDataRole.UserRole)
-        if not path_str:
-            return
-        try:
-            p = Path(path_str)
-            if p.is_dir():
-                self.date_folder_clicked.emit(p)
-        except (TypeError, ValueError):
-            pass
+def _source_folder_path(project_root: Path | None, source_type: str) -> Path | None:
+    if project_root is None:
+        return None
+    source = _normalize_source_type(source_type)
+    root = get_outbox_root(project_root)
+    candidate = root / source
+    if candidate.is_dir():
+        return candidate
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except OSError:
+        return root if root.is_dir() else None
 
 
 class OutboxPageWidget(QWidget):
-    """
-    Outbox page: (1) Header (Outbox + type badge + Import); (2) Single column: list | tree.
-    Inspector: selection → preview/metadata only (no distribute, no History).
-    Signals: tree_selection_changed(Path|None), open_folder_requested(Path), drop_requested(list[Path]).
-    """
+    """Outbox: sidebar Client/Freelancer + one explorer tree for that source."""
 
     tree_selection_changed = Signal(object)  # Path | None
+    tree_distribute_paths_changed = Signal(object)  # list[Path]
     open_folder_requested = Signal(object)  # Path
-    drop_requested = Signal(object)  # list[Path]
-    import_requested = Signal(object)  # Path | None (current date folder when in tree)
-    date_folder_entered = Signal(str, object)  # (type_filter: str, path: Path)
+    drop_requested = Signal(object, object, bool)  # list[Path], drop target, copy_only
+    import_requested = Signal(object)  # Path | None
+    date_folder_entered = Signal(str, object)  # (type_filter, browse path)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setAcceptDrops(True)
+        self.setAcceptDrops(False)
         self._project_root: Path | None = None
         self._type_filter: str = ""
-        self._current_date_path: Path | None = None
-        self._tree_state_cache: dict[str, dict] = {}  # key = (type, path) -> tree state when switching Client/Freelancer
+        self._tree_state_cache: dict[str, dict] = {}
+        self._history_dialog: OutboxHistoryDialog | None = None
+        self._tree_pane: InboxTreePane | None = None
+
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(0, 0, 0, 0)
         root_lay.setSpacing(0)
 
-        # Header (MainView style) — no History button
         header = QWidget(self)
         header.setObjectName("MainViewHeader")
         header.setAttribute(Qt.WA_StyledBackground, True)
-        hlay = QHBoxLayout(header)
-        hlay.setContentsMargins(12, 12, 12, 12)
-        hlay.setSpacing(12)
-        self._context_title = QLabel("Outbox", header)
-        self._context_title.setObjectName("MainViewContextTitle")
-        self._context_title.setFont(monos_font("Inter", 16, QFont.Weight.Bold))
-        self._type_badge = QWidget(header)
-        self._type_badge.setObjectName("MainViewTypeBadge")
-        self._type_badge.setAttribute(Qt.WA_StyledBackground, True)
-        badge_lay = QHBoxLayout(self._type_badge)
-        badge_lay.setContentsMargins(8, 4, 10, 4)
-        badge_lay.setSpacing(6)
-        self._type_icon = QLabel(self._type_badge)
-        self._type_icon.setFixedSize(16, 16)
-        self._type_label = QLabel(self._type_badge)
-        self._type_label.setObjectName("MainViewTypeBadgeLabel")
-        self._type_label.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
-        badge_lay.addWidget(self._type_icon, 0, Qt.AlignVCenter)
-        badge_lay.addWidget(self._type_label, 0, Qt.AlignVCenter)
-        hlay.addWidget(self._context_title, 0, Qt.AlignVCenter)
-        hlay.addWidget(self._type_badge, 0, Qt.AlignVCenter)
+        header_v = QVBoxLayout(header)
+        header_v.setContentsMargins(12, 12, 12, 10)
+        header_v.setSpacing(6)
+
+        top_row = QWidget(header)
+        hlay = QHBoxLayout(top_row)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(10)
+
+        self._title_row = InboxOutboxTitleRow("Outbox", root_icon="send", parent=top_row)
+        hlay.addWidget(self._title_row, 0, Qt.AlignmentFlag.AlignVCenter)
         hlay.addStretch(1)
-        import_btn = QPushButton("Import", header)
-        import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        import_icon = lucide_icon("upload", size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
-        if not import_icon.isNull():
-            import_btn.setIcon(import_icon)
-        import_btn.clicked.connect(self._on_import_clicked)
-        hlay.addWidget(import_btn, 0)
+
+        self._history_btn = _header_tool_button(top_row, "History", "layers")
+        self._history_btn.clicked.connect(self._on_history_clicked)
+        hlay.addWidget(self._history_btn, 0)
+
+        self._open_folder_btn = _header_tool_button(top_row, "Open folder", "folder-open")
+        self._open_folder_btn.clicked.connect(self._on_open_folder_clicked)
+        hlay.addWidget(self._open_folder_btn, 0)
+
+        self._import_btn = _header_tool_button(top_row, "Import", "upload", primary=True)
+        self._import_btn.clicked.connect(self._on_import_clicked)
+        hlay.addWidget(self._import_btn, 0)
+        header_v.addWidget(top_row, 0)
+
+        self._path_bar_row = QWidget(header)
+        self._path_bar_row.setObjectName("InboxPathBarRow")
+        self._path_bar_lay = QHBoxLayout(self._path_bar_row)
+        self._path_bar_lay.setContentsMargins(0, 0, 0, 0)
+        self._path_bar_lay.setSpacing(12)
+        self._path_bar_row.hide()
+        header_v.addWidget(self._path_bar_row, 0)
+
         root_lay.addWidget(header, 0)
 
-        # Breadcrumb bar
-        self._date_breadcrumb_bar = self._make_date_list_breadcrumb()
-        root_lay.addWidget(self._date_breadcrumb_bar, 0)
+        self._content_host = QWidget(self)
+        self._content_lay = QVBoxLayout(self._content_host)
+        self._content_lay.setContentsMargins(0, 0, 0, 0)
+        self._content_lay.setSpacing(0)
+        root_lay.addWidget(self._content_host, 1)
+        self._refresh_chrome()
 
-        # Single column: list | tree
-        self._left_stack = QStackedWidget(self)
-        self._date_list = _OutboxDateFolderList(self)
-        self._date_list.date_folder_clicked.connect(self._enter_date_folder)
-        self._left_stack.addWidget(self._date_list)
-        self._tree_pane: InboxTreePane | None = None
-        self._left_stack.addWidget(QWidget(self))
-        root_lay.addWidget(self._left_stack, 1)
-        self._update_type_badge()
-        self._refresh_date_breadcrumb_visibility()
-
-    def _on_import_clicked(self) -> None:
-        """Header Import button: emit import_requested with current date folder (None when on list view)."""
-        self.import_requested.emit(self._current_date_path)
-
-    def _on_tree_import_requested(self) -> None:
-        """Import from tree context menu: emit with current date folder."""
-        self.import_requested.emit(self._current_date_path)
-
-    def _make_date_list_breadcrumb(self) -> QWidget:
-        bar = QWidget(self)
-        bar.setObjectName("InboxDateBreadcrumbBar")
-        bar.setAttribute(Qt.WA_StyledBackground, True)
-        wlay = QHBoxLayout(bar)
-        wlay.setContentsMargins(12, 8, 12, 8)
-        wlay.setSpacing(3)
-        sep_style = "color: #71717a; font-size: 10px;"
-        label_style = "color: #a1a1aa; font-size: 11px;"
-        outbox_lb = QLabel("Outbox", bar)
-        outbox_lb.setStyleSheet(label_style)
-        outbox_lb.setFont(monos_font("Inter", 11))
-        wlay.addWidget(outbox_lb, 0)
-        self._date_breadcrumb_sep = QLabel("›", bar)
-        self._date_breadcrumb_sep.setStyleSheet(sep_style)
-        self._date_breadcrumb_sep.setFont(monos_font("Inter", 10))
-        wlay.addWidget(self._date_breadcrumb_sep, 0)
-        self._date_breadcrumb_type_label = QLabel("", bar)
-        self._date_breadcrumb_type_label.setStyleSheet(label_style)
-        self._date_breadcrumb_type_label.setFont(monos_font("Inter", 11))
-        wlay.addWidget(self._date_breadcrumb_type_label, 0)
-        wlay.addStretch(1)
-        return bar
-
-    def _refresh_date_breadcrumb_text(self) -> None:
-        t = (self._type_filter or "").strip()
-        if not t:
-            self._date_breadcrumb_type_label.setText("")
-            self._date_breadcrumb_sep.setVisible(False)
-        else:
-            label = (t.replace("_", " ").title() or t).strip()
-            self._date_breadcrumb_type_label.setText(label)
-            self._date_breadcrumb_sep.setVisible(True)
-
-    def _refresh_date_breadcrumb_visibility(self) -> None:
-        self._date_breadcrumb_bar.setVisible(self._left_stack.currentIndex() == 0)
-
-    def _update_type_badge(self) -> None:
-        t = (self._type_filter or "").strip()
-        self._refresh_date_breadcrumb_text()
-        if not t:
-            self._type_badge.setVisible(False)
-            return
-        label = t.replace("_", " ").title()
-        icon = lucide_icon("send", size=16, color_hex=MONOS_COLORS.get("text_label", "#a1a1aa"))
-        self._type_icon.setPixmap(icon.pixmap(16, 16))
-        self._type_label.setText(label.upper())
-        self._type_badge.setVisible(True)
-
-    def set_project_root(self, path: Path | None) -> None:
-        self._project_root = Path(path) if path else None
-        self._date_list.set_content(self._project_root, self._type_filter)
-
-    def _tree_state_key(self, source_type: str, path: Path) -> str:
-        t = (source_type or "").strip().lower() or "client"
-        return f"{t}/{path.resolve()}"
-
-    def set_type_filter(self, source_type: str) -> None:
-        new_type = (source_type or "").strip().lower()
-        type_changed = new_type != self._type_filter
-        if type_changed and self.is_showing_tree() and self._tree_pane is not None and self._current_date_path is not None:
-            key = self._tree_state_key(self._type_filter, self._current_date_path)
-            self._tree_state_cache[key] = self._tree_pane.get_tree_state()
-        self._type_filter = new_type
-        self._update_type_badge()
-        self._date_list.set_content(self._project_root, self._type_filter)
-        if type_changed and self.is_showing_tree():
-            self._back_to_list()
-
-    def _on_tree_selection(self, path) -> None:
-        """Outbox: only preview (no distribute)."""
-        self.tree_selection_changed.emit(path)
-
-    def _enter_date_folder(self, path: Path) -> None:
-        self._current_date_path = path
-        self.date_folder_entered.emit(self._type_filter or "", path)
+    def _mount_explorer_path_bar(self) -> None:
         if self._tree_pane is None:
-            self._tree_pane = InboxTreePane(path, self, breadcrumb_title="Outbox")
-            self._tree_pane.back_requested.connect(self._back_to_list)
+            self._path_bar_row.hide()
+            return
+        bar = self._tree_pane.explorer_path_bar()
+        toolbar = self._tree_pane.explorer_toolbar()
+        if bar is None:
+            self._path_bar_row.hide()
+            return
+        if bar.parent() is not self._path_bar_row:
+            bar.setParent(self._path_bar_row)
+        if self._path_bar_lay.indexOf(bar) < 0:
+            self._path_bar_lay.addWidget(bar, 1)
+        if toolbar is not None:
+            toolbar.set_inline(True)
+            if toolbar.parent() is not self._path_bar_row:
+                toolbar.setParent(self._path_bar_row)
+            if self._path_bar_lay.indexOf(toolbar) < 0:
+                self._path_bar_lay.addWidget(toolbar, 0, Qt.AlignmentFlag.AlignVCenter)
+            toolbar.show()
+        self._path_bar_row.show()
+
+    def _refresh_chrome(self) -> None:
+        self._title_row.set_context(
+            type_filter=self._type_filter,
+            date_path=None,
+            unified_tree=True,
+        )
+        self._history_btn.setVisible(True)
+        self._open_folder_btn.setVisible(True)
+        self._mount_explorer_path_bar()
+
+    def _tree_state_key(self, source_type: str) -> str:
+        return _normalize_source_type(source_type)
+
+    def _ensure_tree_pane(self) -> None:
+        root = _source_folder_path(self._project_root, self._type_filter)
+        if root is None:
+            return
+        if self._tree_pane is None:
+            self._tree_pane = InboxTreePane(
+                root,
+                self._content_host,
+                show_history_action=True,
+                show_toolbar=True,
+                view_settings_key="outbox/view_mode",
+                source_filter=self._type_filter,
+            )
             self._tree_pane.tree_selection_changed.connect(self._on_tree_selection)
             self._tree_pane.open_folder_requested.connect(self.open_folder_requested.emit)
             self._tree_pane.import_requested.connect(self._on_tree_import_requested)
-            self._left_stack.removeWidget(self._left_stack.widget(1))
-            self._left_stack.addWidget(self._tree_pane)
+            self._tree_pane.history_requested.connect(self._on_history_clicked)
+            self._tree_pane.browse_path_changed.connect(self._on_browse_path_changed)
+            self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
+            self._content_lay.addWidget(self._tree_pane, 1)
         else:
-            self._tree_pane.set_date_folder_path(path)
-        key = self._tree_state_key(self._type_filter or "client", path)
+            self._tree_pane.set_date_folder_path(root)
+            self._tree_pane.set_chrome_context(self._type_filter, None)
+        key = self._tree_state_key(self._type_filter)
         saved = self._tree_state_cache.get(key)
         if saved:
             self._tree_pane.set_tree_state(saved)
-        self._left_stack.setCurrentIndex(1)
-        self._refresh_date_breadcrumb_visibility()
+        self._refresh_chrome()
 
-    def _back_to_list(self) -> None:
-        self._current_date_path = None
-        self._left_stack.setCurrentIndex(0)
-        self._refresh_date_breadcrumb_visibility()
-        self.tree_selection_changed.emit(None)
+    def _on_browse_path_changed(self, path: Path) -> None:
+        self.date_folder_entered.emit(self._type_filter or "", path)
+
+    def _outbox_open_target(self) -> Path | None:
+        if self._tree_pane is not None:
+            return self._tree_pane.current_browse_path()
+        return _source_folder_path(self._project_root, self._type_filter)
+
+    def _on_open_folder_clicked(self) -> None:
+        target = self._outbox_open_target()
+        if target is not None:
+            self.open_folder_requested.emit(target)
+
+    def _on_import_clicked(self) -> None:
+        self.import_requested.emit(self.current_date_folder_path())
+
+    def _on_tree_import_requested(self) -> None:
+        self.import_requested.emit(self.current_date_folder_path())
+
+    def _on_history_clicked(self) -> None:
+        if self._history_dialog is None:
+            self._history_dialog = OutboxHistoryDialog(
+                self._project_root,
+                self._type_filter or "",
+                self.window(),
+            )
+        self._history_dialog.set_context(self._project_root, self._type_filter or "")
+        self._history_dialog.show()
+        self._history_dialog.raise_()
+        self._history_dialog.activateWindow()
+
+    def set_project_root(self, path: Path | None) -> None:
+        self._project_root = Path(path) if path else None
+        self._ensure_tree_pane()
+        if self._tree_pane is not None:
+            self._tree_pane.refresh_content()
+
+    def set_type_filter(self, source_type: str) -> None:
+        new_type = _normalize_source_type(source_type)
+        type_changed = new_type != self._type_filter
+        if type_changed and self._tree_pane is not None:
+            self._tree_state_cache[self._tree_state_key(self._type_filter)] = self._tree_pane.get_tree_state()
+        self._type_filter = new_type
+        self._ensure_tree_pane()
+        self._refresh_chrome()
+
+    def _on_tree_selection(self, path) -> None:
+        self.tree_selection_changed.emit(path)
+        paths = []
+        if self._tree_pane is not None:
+            paths = [p for p in self._tree_pane.get_selected_paths() if p.exists()]
+        self.tree_distribute_paths_changed.emit(paths)
+
+    def restore_browse_path(self, path: Path) -> None:
+        """Restore last browsed folder within the current source tree."""
+        self._ensure_tree_pane()
+        if self._tree_pane is not None:
+            self._tree_pane.navigate_to_path(path)
+
+    def refresh_tree(self) -> None:
+        if self._tree_pane is not None:
+            self._tree_pane.refresh_content()
+
+    def refresh_history_dialog_if_open(self) -> None:
+        if self._history_dialog is not None and self._history_dialog.isVisible():
+            self._history_dialog.set_context(self._project_root, self._type_filter or "")
 
     def is_showing_tree(self) -> bool:
-        return self._left_stack.currentIndex() == 1
+        return self._tree_pane is not None
 
     def current_date_folder_path(self) -> Path | None:
-        return self._current_date_path
+        if self._tree_pane is None:
+            return None
+        return self._tree_pane.current_browse_path()
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        if not event.mimeData().hasUrls():
-            super().dropEvent(event)
-            return
-        paths: list[Path] = []
-        for url in event.mimeData().urls():
-            if url.isLocalFile():
-                p = Path(url.toLocalFile())
-                if p.exists():
-                    paths.append(p)
-        event.acceptProposedAction()
-        if paths:
-            self.drop_requested.emit(paths)

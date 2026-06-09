@@ -38,7 +38,10 @@ class ScheduleAllocation:
     department: str | None
     start: str  # YYYY-MM-DD
     due: str
-    assignee: str = ""
+    assignee_ids: tuple[str, ...] = ()
+    assignees: tuple[str, ...] = ()  # cached display names at assignment time
+    assignee_id: str = ""  # legacy: first assignee
+    assignee: str = ""  # legacy: joined names
     note: str = ""
 
     def to_dict(self) -> dict:
@@ -49,9 +52,18 @@ class ScheduleAllocation:
             "department": self.department,
             "start": self.start,
             "due": self.due,
-            "assignee": self.assignee,
             "note": self.note,
         }
+        if self.assignee_ids:
+            d["assignee_ids"] = list(self.assignee_ids)
+        if self.assignees:
+            d["assignees"] = list(self.assignees)
+        aid = (self.assignee_id or "").strip()
+        if aid:
+            d["assignee_id"] = aid
+        name = (self.assignee or "").strip()
+        if name:
+            d["assignee"] = name
         return d
 
 
@@ -202,7 +214,12 @@ def _parse_allocation(raw: object) -> ScheduleAllocation | None:
         return None
     dept_raw = raw.get("department")
     dept = str(dept_raw).strip() if dept_raw not in (None, "") else None
-    assignee = str(raw.get("assignee") or "").strip()
+    from monostudio.core.user_identity import parse_assignee_ids_raw, parse_assignee_names_raw
+
+    assignee_ids = parse_assignee_ids_raw(raw)
+    assignees = parse_assignee_names_raw(raw, assignee_ids)
+    assignee_id = assignee_ids[0] if assignee_ids else str(raw.get("assignee_id") or "").strip()
+    assignee = ", ".join(assignees) if assignees else str(raw.get("assignee") or "").strip()
     note = str(raw.get("note") or "").strip()
     return ScheduleAllocation(
         id=aid,
@@ -211,6 +228,9 @@ def _parse_allocation(raw: object) -> ScheduleAllocation | None:
         department=dept,
         start=start[:10],
         due=due[:10],
+        assignee_ids=assignee_ids,
+        assignees=assignees,
+        assignee_id=assignee_id,
         assignee=assignee,
         note=note,
     )

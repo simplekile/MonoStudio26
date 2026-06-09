@@ -155,6 +155,13 @@ def _ensure_comtypes_on_windows() -> None:
 
 def main() -> int:
     launch_args = _parse_launch_args(sys.argv)
+    launch_deep_link = None
+    try:
+        from monostudio.core.deep_link import extract_deep_link_from_argv
+
+        launch_deep_link = extract_deep_link_from_argv(sys.argv)
+    except Exception:
+        pass
     startup_launch = bool(launch_args.startup or launch_args.minimized)
 
     install_crash_logging()
@@ -177,7 +184,13 @@ def main() -> int:
     # These application attributes are deprecated and emit warnings in Qt6.
 
     app = QApplication(sys.argv)
-    instance_guard = acquire_single_instance()
+    try:
+        from monostudio.core.url_protocol import register_monostudio_url_protocol
+
+        register_monostudio_url_protocol()
+    except Exception:
+        pass
+    instance_guard = acquire_single_instance(deep_link=launch_deep_link)
     if instance_guard is None:
         return 0
 
@@ -257,9 +270,18 @@ def main() -> int:
     _splash_step("Building interface…", 0.65)
     window = MainWindow()
     window.launch_hidden_to_tray = hide_to_tray_after_splash
+    if launch_deep_link:
+        window.set_pending_deep_link(launch_deep_link)
     if not _icon.isNull():
         window.setWindowIcon(_icon)
     instance_guard.set_on_raise(lambda: window.present())
+    instance_guard.set_on_deep_link(lambda url: window.handle_deep_link(url))
+    try:
+        from monostudio.core.deep_link_server import start_deep_link_server
+
+        start_deep_link_server(window.handle_deep_link)
+    except Exception:
+        pass
 
     _splash_step("Almost ready…", 0.90)
 

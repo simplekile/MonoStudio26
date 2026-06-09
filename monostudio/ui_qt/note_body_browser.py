@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QLabel, QSizePolicy, QTextBrowser
 
 from monostudio.core.item_comments import is_mention_note_href, user_id_from_mention_href
 from monostudio.ui_qt.note_compose_editor import (
+    NOTE_BODY_FONT,
     NOTE_RICH_TEXT_STYLESHEET,
     normalize_note_document_spacing,
     note_html_for_display,
@@ -27,8 +28,6 @@ from monostudio.ui_qt.note_image_frame import (
 )
 from monostudio.ui_qt.note_image_hit_test import image_href_at_widget_pos
 from monostudio.ui_qt.note_image_viewer_dialog import NoteImageViewerDialog
-from monostudio.ui_qt.style import monos_font
-
 
 def _open_note_image(item_root: Path, href: str, *, parent) -> bool:
     p = resolve_note_image_path(item_root, href)
@@ -45,7 +44,7 @@ class NoteBodyBrowser(QTextBrowser):
         self.setObjectName("ItemNotesBodyBrowser")
         self.setOpenExternalLinks(False)
         self.setOpenLinks(False)
-        self.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
+        self.setFont(NOTE_BODY_FONT)
         self.setFrameShape(self.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -54,6 +53,7 @@ class NoteBodyBrowser(QTextBrowser):
         self._workspace_root = Path(workspace_root) if workspace_root else None
         mono = self._item_root / ".monostudio"
         self.document().setBaseUrl(QUrl.fromLocalFile(str(mono) + os.sep))
+        self.document().setDefaultFont(NOTE_BODY_FONT)
         self.document().setDefaultStyleSheet(NOTE_RICH_TEXT_STYLESHEET)
         self.document().setDocumentMargin(4)
         self.anchorClicked.connect(self._on_anchor)
@@ -144,6 +144,10 @@ class NoteBodyBrowser(QTextBrowser):
         prime_framed_image_resources(
             self.document(), self._item_root, body, device_pixel_ratio=dpr
         )
+        stylesheet = NOTE_RICH_TEXT_STYLESHEET
+        if done:
+            stylesheet += " body, p, li, span, a { text-decoration: line-through; }"
+        self.document().setDefaultStyleSheet(stylesheet)
         self.setHtml(body)
         normalize_note_document_spacing(self.document())
         color = "#71717a" if done else "#d4d4d8"
@@ -177,7 +181,7 @@ class NoteListPreviewLabel(QLabel):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("ItemNotesPreviewLabel")
-        self.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
+        self.setFont(NOTE_BODY_FONT)
         self.setWordWrap(False)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -187,7 +191,10 @@ class NoteListPreviewLabel(QLabel):
         self._full_text = (text or "").replace("\n", " ").strip()
         color = "#71717a" if done else "#d4d4d8"
         self.setStyleSheet(f"color: {color}; background: transparent;")
-        fm = QFontMetrics(self.font())
+        f = QFont(NOTE_BODY_FONT)
+        f.setStrikeOut(done)
+        self.setFont(f)
+        fm = QFontMetrics(f)
         self.setMinimumHeight(fm.height() + 2)
         self._apply_elide()
 

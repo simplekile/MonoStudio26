@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtGui import (
     QColor,
     QDragEnterEvent,
+    QDragMoveEvent,
     QDropEvent,
     QPainter,
     QPen,
@@ -31,6 +32,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.ui_qt.external_drop_host import (
+    EXPLORER_DROP_ZONE_OBJECT_NAME,
+    set_explorer_drop_highlight,
+)
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog
 
@@ -99,6 +104,8 @@ class _DropZone(QWidget):
         super().__init__(parent)
         self._allowed_exts = _normalize_allowed_extensions(list(allowed_extensions or []))
         self.setAcceptDrops(True)
+        self.setObjectName(EXPLORER_DROP_ZONE_OBJECT_NAME)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMinimumSize(360, 140)
 
         lay = QVBoxLayout(self)
@@ -141,23 +148,44 @@ class _DropZone(QWidget):
             return True
         return Path(path).suffix.lower() in self._allowed_exts
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+    def _can_accept_drag(self, event: QDragEnterEvent | QDragMoveEvent) -> bool:
         md = event.mimeData()
         if md and md.hasUrls():
             for url in md.urls():
                 if url.isLocalFile() and self._is_valid(url.toLocalFile()):
-                    event.acceptProposedAction()
-                    return
-        event.ignore()
+                    return True
+        return False
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if not self._can_accept_drag(event):
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        set_explorer_drop_highlight(self, True)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        if not self._can_accept_drag(event):
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        set_explorer_drop_highlight(self, True)
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        set_explorer_drop_highlight(self, False)
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:
+        set_explorer_drop_highlight(self, False)
         md = event.mimeData()
         if md and md.hasUrls():
             for url in md.urls():
                 fp = url.toLocalFile()
                 if fp and self._is_valid(fp):
                     self.file_dropped.emit(fp)
-                    event.acceptProposedAction()
+                    event.setDropAction(Qt.DropAction.CopyAction)
+                    event.accept()
                     return
         event.ignore()
 

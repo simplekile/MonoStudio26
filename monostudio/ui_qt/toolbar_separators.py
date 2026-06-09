@@ -16,6 +16,25 @@ def vertical_icon_separator(parent: QWidget, *, height: int = 24) -> QFrame:
     return line
 
 
+def apply_pill_segment_positions(widgets: list[QWidget]) -> None:
+    """Assign segment position; inner edges (at divider) use small join radius via QSS."""
+    n = len(widgets)
+    for i, w in enumerate(widgets):
+        if n == 1:
+            pos = "solo"
+        elif i == 0:
+            pos = "left"
+        elif i == n - 1:
+            pos = "right"
+        else:
+            pos = "center"
+        w.setProperty("position", pos)
+        st = w.style()
+        if st is not None:
+            st.unpolish(w)
+            st.polish(w)
+
+
 def add_widgets_with_icon_separators(
     layout: QHBoxLayout,
     widgets: list[QWidget],
@@ -24,6 +43,7 @@ def add_widgets_with_icon_separators(
     sep_height: int = 24,
 ) -> None:
     """Append widgets to a horizontal layout with a vertical rule between each."""
+    apply_pill_segment_positions(widgets)
     align = Qt.AlignmentFlag.AlignVCenter
     for i, w in enumerate(widgets):
         if i > 0:

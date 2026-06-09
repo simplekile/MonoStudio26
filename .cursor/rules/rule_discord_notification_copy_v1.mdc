@@ -1,0 +1,56 @@
+---
+description: Thông báo Discord/pipeline — luôn song ngữ VI/EN, mặc định tiếng Việt
+globs: monostudio/core/discord_webhook.py,monostudio/core/notification_copy.py,monostudio/core/notification_preferences.py,monostudio/ui_qt/notification/**
+alwaysApply: false
+---
+
+# MONOS — Discord & notification copy (VI/EN) (v1)
+
+## Nguyên tắc
+
+- Mọi **chuỗi user-facing** trong thông báo pipeline (@mention popup, bell, **Discord webhook**) phải có **hai bản**: **tiếng Việt** và **tiếng Anh**.
+- **Mặc định hiển thị tiếng Việt** (`DEFAULT_NOTIFICATION_VIETNAMESE = True` trong `notification_preferences.py`).
+- User tắt trong **Settings → General → UI → Notifications** → checkbox **「Thông báo bằng tiếng Việt」** để chuyển sang EN.
+
+## Module chuẩn
+
+| Module | Vai trò |
+|--------|---------|
+| `monostudio/core/notification_copy.py` | `pick_copy(vi, en, *, vietnamese=None)` + helper (`copy_someone`, `copy_project_fallback`, …) |
+| `monostudio/core/notification_preferences.py` | `read_notification_vietnamese()` / `write_notification_vietnamese()` |
+| `monostudio/core/discord_webhook.py` | `build_*_body(..., vietnamese: bool \| None = None)` — mọi template Discord |
+
+## Khi thêm/sửa thông báo Discord
+
+1. **Không** hardcode một ngôn ngữ duy nhất trong `build_*_body`.
+2. **Luôn** dùng `pick_copy("…VI…", "…EN…", vietnamese=vietnamese)` hoặc helper trong `notification_copy.py`.
+3. Tham số `vietnamese`: để `None` → đọc preference; chỉ truyền `True`/`False` trong unit test.
+4. Giữ nguyên tên riêng pipeline (asset, user, department, path) — **không dịch** dữ liệu động.
+5. Discord markdown: vẫn escape user text qua `_discord_md()`; template tĩnh có thể dùng `**` / `_` như hiện tại.
+6. Thêm event webhook mới → thêm `build_<event>_body` + nhánh trong `_build_body_for_event` + checkbox event trong Settings nếu cần.
+
+## Mẫu
+
+```python
+from monostudio.core.notification_copy import pick_copy, copy_someone
+
+def build_example_body(payload: dict, *, vietnamese: bool | None = None) -> dict:
+    actor = (payload.get("actor_name") or "").strip() or copy_someone(vietnamese=vietnamese)
+    content = pick_copy(
+        f"**{actor}** đã cập nhật pipeline",
+        f"**{actor}** updated the pipeline",
+        vietnamese=vietnamese,
+    )
+    ...
+```
+
+## @mention in-app (không Discord)
+
+- Dùng cùng `pick_copy` / `copy_*` trong `mention_alert_format.py`.
+- Legacy message tiếng Anh trong inbox vẫn parse được (`mentioned you in`).
+
+## Không làm
+
+- Không thêm chuỗi Discord rải rác ở UI Qt (toast general / activity log) trừ khi là thông báo user-targeted cùng loại.
+- Không đổi default sang EN.
+- Không bỏ bản EN khi thêm bản VI.

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollA
 from monostudio.core.item_comments import ItemCommentEntry
 from monostudio.ui_qt.note_author_row import NoteAuthorRow
 from monostudio.ui_qt.note_body_browser import NoteBodyBrowser
+from monostudio.ui_qt.note_seen_by_label import note_seen_by_label
 from monostudio.ui_qt.style import MonosDialog, monos_font
 
 
@@ -102,6 +103,10 @@ class NoteViewDialog(MonosDialog):
         body.setMinimumHeight(max(120, body.document().size().height()))
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
+
+        seen_lab = note_seen_by_label(entry, workspace_root, self)
+        if seen_lab is not None:
+            root.addWidget(seen_lab, 0)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)

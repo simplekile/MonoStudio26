@@ -13,16 +13,117 @@ class DiscoveredProject:
 
 @dataclass(frozen=True)
 class ProjectQuickStats:
-    status: str  # READY | PROGRESS | WAITING | BLOCKED
+    status: str  # READY | PROGRESS | WAITING | BLOCKED | AT_RISK
     assets_count: int | None
     shots_count: int | None
     last_modified: str | None  # formatted timestamp
 
 
-def read_project_quick_stats(project_root: Path) -> ProjectQuickStats:
+_PROJECT_STATUS_LABELS: dict[str, str] = {
+    "READY": "Done",
+    "PROGRESS": "In progress",
+    "AT_RISK": "At risk",
+    "WAITING": "Waiting",
+    "BLOCKED": "Blocked",
+}
+
+_PROJECT_STATUS_COLORS: dict[str, str] = {
+    "READY": "#10b981",
+    "PROGRESS": "#f59e0b",
+    "AT_RISK": "#ef4444",
+    "WAITING": "#71717a",
+    "BLOCKED": "#ef4444",
+}
+
+
+def project_status_label(status: str) -> str:
+    key = (status or "WAITING").strip().upper()
+    return _PROJECT_STATUS_LABELS.get(key, "Waiting")
+
+
+def project_status_paint_key(status: str) -> str:
+    key = (status or "WAITING").strip().upper()
+    if key == "READY":
+        return "ready"
+    if key in ("AT_RISK", "BLOCKED"):
+        return "blocked"
+    if key == "PROGRESS":
+        return "progress"
+    return "waiting"
+
+
+def project_status_color_hex(status: str) -> str:
+    key = (status or "WAITING").strip().upper()
+    return _PROJECT_STATUS_COLORS.get(key, "#71717a")
+
+
+def project_status_display_labels() -> tuple[str, ...]:
+    """All user-facing project status pill labels (for column width layout)."""
+    return tuple(_PROJECT_STATUS_LABELS.values())
+
+
+def _derive_project_status_light(
+    *,
+    has_assets_dir: bool,
+    has_shots_dir: bool,
+    assets_count: int | None,
+    shots_count: int | None,
+) -> str:
+    """Fast heuristic from folder presence and counts only (safe for startup)."""
+    if not has_assets_dir or not has_shots_dir:
+        return "BLOCKED"
+    if (assets_count or 0) > 0 or (shots_count or 0) > 0:
+        return "PROGRESS"
+    return "WAITING"
+
+
+def _derive_project_status_schedule(project_root: Path) -> str | None:
+    """Schedule-aware status; returns None when deep scan fails or is inconclusive."""
+    try:
+        from monostudio.core.project_lifecycle import is_project_done_for_notifications
+
+        if is_project_done_for_notifications(project_root):
+            return "READY"
+    except Exception:
+        pass
+
+    try:
+        from monostudio.core.fs_reader import build_project_index
+        from monostudio.core.project_schedule import read_project_schedule
+        from monostudio.core.schedule_planner import (
+            STATUS_DONE,
+            STATUS_EXCLUDED,
+            build_planned_bars,
+            count_overdue_bars,
+        )
+
+        index = build_project_index(project_root)
+        schedule = read_project_schedule(project_root)
+        bars = build_planned_bars(
+            project_root,
+            index,
+            schedule,
+            include_shots=True,
+            include_assets=True,
+        )
+        in_scope = [b for b in bars.values() if b.status != STATUS_EXCLUDED]
+        if in_scope:
+            if count_overdue_bars(bars) > 0:
+                return "AT_RISK"
+            if all(b.status == STATUS_DONE for b in in_scope):
+                return "READY"
+            return "PROGRESS"
+    except Exception:
+        return None
+    return None
+
+
+def read_project_quick_stats(project_root: Path, *, schedule_aware: bool = False) -> ProjectQuickStats:
     """
-    Lightweight, read-only project stats for the Projects browser.
-    Avoid deep scans: counts only folder structure.
+    Read-only project stats for the Projects browser.
+
+    Default (``schedule_aware=False``): folder counts + light status — no deep index scan.
+    Use ``schedule_aware=True`` when the UI can afford a full pipeline read (project picker).
     """
     from monostudio.core.structure_registry import StructureRegistry
 
@@ -66,12 +167,16 @@ def read_project_quick_stats(project_root: Path) -> ProjectQuickStats:
     assets_count = _count_assets()
     shots_count = _count_shots()
 
-    if not has_assets_dir or not has_shots_dir:
-        status = "BLOCKED"
-    elif (assets_count or 0) > 0 or (shots_count or 0) > 0:
-        status = "PROGRESS"
+    light = _derive_project_status_light(
+        has_assets_dir=has_assets_dir,
+        has_shots_dir=has_shots_dir,
+        assets_count=assets_count,
+        shots_count=shots_count,
+    )
+    if schedule_aware:
+        status = _derive_project_status_schedule(project_root) or light
     else:
-        status = "WAITING"
+        status = light
 
     try:
         import datetime as _dt

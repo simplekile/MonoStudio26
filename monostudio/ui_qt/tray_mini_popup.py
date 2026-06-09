@@ -527,7 +527,7 @@ class TrayMiniPopup(QFrame):
         self._header.setText(title.upper())
 
         if self._list_mode in ("assets", "shots"):
-            filters = window._sidebar.filters()
+            filters = window._filter_panel.filters()
             if self._list_mode == "assets":
                 filters.set_mode("assets")
             else:
@@ -618,7 +618,7 @@ class TrayMiniPopup(QFrame):
     def _sidebar_filters(self):
         if self._window is None:
             return None
-        return self._window._sidebar.filters()
+        return self._window._filter_panel.filters()
 
     def _apply_tray_active_dcc(self, ent: _TrayListEntry, dcc_id: str) -> None:
         """Sync active DCC with grid card badge click + Inspector."""
@@ -656,7 +656,7 @@ class TrayMiniPopup(QFrame):
         from monostudio.ui_qt.sidebar import _title_case_label
 
         folder = (type_folder or "").strip()
-        filters = win._sidebar.filters()
+        filters = win._filter_panel.filters()
         type_id: str | None = folder or None
         pr = getattr(win, "_project_root", None)
         if pr is not None and folder:
@@ -680,7 +680,7 @@ class TrayMiniPopup(QFrame):
         did = (dept_id or "").strip()
         if not did:
             return ""
-        filters = win._sidebar.filters()
+        filters = win._filter_panel.filters()
         return _title_case_label(filters._dept_label_by_id.get(did, did))
 
     @staticmethod

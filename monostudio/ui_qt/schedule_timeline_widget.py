@@ -97,19 +97,32 @@ if TYPE_CHECKING:
     from monostudio.core.models import Asset, Shot
     from monostudio.ui_qt.thumbnails import ThumbnailManager
 
-_LABEL_W = 220
-_ROW_H = 34
-_HEADER_H = 64
-# Header rows below IN/OUT band (14px): milestone names → month → day numbers.
+_LABEL_W_DEFAULT = 220
+_LABEL_W_MIN = 160
+_LABEL_W_MAX = 420
+_LABEL_COL_RESIZE_W = 6
+_ROW_H = 42
+_ROW_TITLE_Y = 5
+_ROW_TITLE_H = 18
+_ROW_SUB_Y = 24
+_ROW_SUB_H = 14
+# Header rows below IN/OUT band (14px): milestone names → month → weekday + day numbers.
 _HEADER_RANGE_BAND_H = 14
 _HEADER_MILESTONE_TOP = 15
 _HEADER_MILESTONE_H = 11
 _HEADER_MONTH_TOP = 28
 _HEADER_MONTH_H = 12
-_HEADER_DAY_TOP = 42
-_HEADER_DAY_H = 18
+_HEADER_MONTH_DAY_GAP = 7
+_HEADER_DAY_TOP = _HEADER_MONTH_TOP + _HEADER_MONTH_H + _HEADER_MONTH_DAY_GAP
+_HEADER_WEEKDAY_H = 13  # fits Inter 9 without vertical clip
+_HEADER_DAY_GAP = 3
+_HEADER_DAY_NUM_H = 13  # fits JetBrains Mono 9 without vertical clip
+_HEADER_DAY_H = _HEADER_WEEKDAY_H + _HEADER_DAY_GAP + _HEADER_DAY_NUM_H
+_HEADER_BOTTOM_PAD = 4
+_HEADER_H = _HEADER_DAY_TOP + _HEADER_DAY_H + _HEADER_BOTTOM_PAD
 # Vertical marker lines in the header stop above the day-number row.
 _HEADER_MARKER_LINE_BOTTOM = _HEADER_DAY_TOP - 1
+_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _DAY_W = 28.0
 _BAR_H = 18
 _MINI_BAR_H = 6
@@ -499,6 +512,7 @@ class _GanttCanvas(QWidget):
         self._view_start = date.today()
         self._view_end = date.today() + timedelta(days=56)
         self._project_root: Path | None = None
+        self._workspace_root: Path | None = None
         self._drag: _BarHit | None = None
         self._drag_origin_x = 0
         self._drag_orig_start: date | None = None
@@ -522,6 +536,9 @@ class _GanttCanvas(QWidget):
         self._wave_drag_preview: dict[str, tuple[date, date]] = {}
         self._gantt: ScheduleGanttWidget | None = None
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _schedule_editable(self) -> bool:
+        return self._gantt is None or self._gantt._schedule_editable
 
     @staticmethod
     def _owns_mouse_grab(widget: QWidget) -> bool:
@@ -690,6 +707,7 @@ class _GanttCanvas(QWidget):
         self,
         *,
         project_root: Path | None,
+        workspace_root: Path | None = None,
         groups: list[TimelineEntityGroup],
         expanded: set[tuple[str, str]],
         bars: dict[tuple[str, str, str], PlannedBar],
@@ -702,6 +720,10 @@ class _GanttCanvas(QWidget):
         wave_rollups: list[DeptWaveRollup] | None = None,
     ) -> None:
         self._project_root = Path(project_root) if project_root else None
+        try:
+            self._workspace_root = Path(workspace_root).resolve() if workspace_root else None
+        except OSError:
+            self._workspace_root = None
         self._groups = list(groups)
         self._expanded = set(expanded)
         self._bars = dict(bars)
@@ -824,9 +846,15 @@ class _GanttCanvas(QWidget):
     def _body_row_y(self, visible_index: int) -> int:
         return visible_index * _ROW_H
 
+    def _label_col_w(self) -> int:
+        g = self._gantt
+        if g is not None:
+            return g.label_column_width()
+        return _LABEL_W_DEFAULT
+
     def _content_width(self) -> int:
         if self._pane in (_PANE_CORNER, _PANE_LABEL):
-            return _LABEL_W
+            return self._label_col_w()
         return int(self._num_days() * self._day_w)
 
     def _content_height(self) -> int:
@@ -882,6 +910,60 @@ class _GanttCanvas(QWidget):
             return None
         return int(self._date_to_x_end(pe))
 
+    def _show_weekday_in_day_header(self) -> bool:
+        """Weekday row stays until per-day numbers give way to W1/W2 week bands."""
+        return self._day_w > _DAY_W_WEEK_IN_MONTH_MAX
+
+    def _day_header_text_inset(self, col_w: int) -> tuple[int, int]:
+        pad = 3 if col_w >= 16 else 1
+        return pad, max(1, col_w - 2 * pad)
+
+    def _weekday_abbreviated_mode(self, col_w: int) -> bool:
+        """If any weekday abbr would clip, abbreviate all columns to one letter."""
+        _, text_w = self._day_header_text_inset(col_w)
+        fm = QFontMetrics(monos_font("Inter", 9))
+        widest = max(fm.horizontalAdvance(abbr) for abbr in _WEEKDAY_ABBR)
+        return widest > text_w
+
+    @staticmethod
+    def _weekday_header_label(d: date, *, abbreviated: bool) -> str:
+        full = _WEEKDAY_ABBR[d.weekday()]
+        return full[0] if abbreviated else full
+
+    def _paint_day_header_cell(
+        self,
+        p: QPainter,
+        x: int,
+        col_w: int,
+        d: date,
+        day_pen: QColor,
+        *,
+        abbrev_weekday: bool = False,
+        day_font: QFont | None = None,
+    ) -> None:
+        inset_x, text_w = self._day_header_text_inset(col_w)
+        tx = x + inset_x
+        if self._show_weekday_in_day_header():
+            p.setPen(QColor("#71717a"))
+            p.setFont(monos_font("Inter", 9))
+            p.drawText(
+                QRect(tx, _HEADER_DAY_TOP, text_w, _HEADER_WEEKDAY_H),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                self._weekday_header_label(d, abbreviated=abbrev_weekday),
+            )
+            num_top = _HEADER_DAY_TOP + _HEADER_WEEKDAY_H + _HEADER_DAY_GAP
+            num_h = _HEADER_DAY_NUM_H
+        else:
+            num_top = _HEADER_DAY_TOP
+            num_h = _HEADER_DAY_H
+        p.setPen(day_pen)
+        p.setFont(day_font or monos_font("JetBrains Mono", 9))
+        p.drawText(
+            QRect(tx, num_top, text_w, num_h),
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+            str(d.day),
+        )
+
     def _paint_header_column_line(
         self,
         p: QPainter,
@@ -915,12 +997,14 @@ class _GanttCanvas(QWidget):
         underline_y = _HEADER_DAY_TOP + _HEADER_DAY_H - 3
         p.setPen(QPen(blue, 2))
         p.drawLine(x + 3, underline_y, x + col_w - 3, underline_y)
-        p.setPen(blue)
-        p.setFont(monos_font("JetBrains Mono", 9, QFont.Weight.DemiBold))
-        p.drawText(
-            QRect(x, _HEADER_DAY_TOP, col_w, _HEADER_DAY_H),
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-            str(today.day),
+        self._paint_day_header_cell(
+            p,
+            x,
+            col_w,
+            today,
+            QColor(MONOS_COLORS.get("blue_400", "#60a5fa")),
+            abbrev_weekday=self._weekday_abbreviated_mode(col_w),
+            day_font=monos_font("JetBrains Mono", 9, QFont.Weight.DemiBold),
         )
 
     def _paint_deadline_marker(self, p: QPainter, h: int, *, header: bool) -> None:
@@ -1308,10 +1392,13 @@ class _GanttCanvas(QWidget):
                 p.setPen(major_pen if is_major else minor_pen)
                 p.drawLine(x, grid_top, x, _HEADER_H)
 
+        col_w_base = max(int(dw), 1)
+        abbrev_weekday = self._weekday_abbreviated_mode(col_w_base)
+
         for i in sorted(major):
             d = self._view_start + timedelta(days=i)
             x = int(i * dw)
-            col_w = max(int(dw), 1)
+            col_w = col_w_base
             is_deadline = pe is not None and d == pe
             day_pen = _DEADLINE_HEADER if is_deadline else QColor("#52525b")
             month_pen = _DEADLINE_HEADER if is_deadline else QColor("#71717a")
@@ -1326,12 +1413,8 @@ class _GanttCanvas(QWidget):
                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                         d.strftime("%b %Y"),
                     )
-                p.setPen(day_pen)
-                p.setFont(monos_font("JetBrains Mono", 9))
-                p.drawText(
-                    QRect(x, _HEADER_DAY_TOP, col_w, _HEADER_DAY_H),
-                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                    str(d.day),
+                self._paint_day_header_cell(
+                    p, x, col_w, d, day_pen, abbrev_weekday=abbrev_weekday
                 )
             elif dw >= 9:
                 if d.day == 1 or i == 0:
@@ -1344,12 +1427,8 @@ class _GanttCanvas(QWidget):
                         d.strftime("%b"),
                     )
                 if col_w >= 11 or d.weekday() < 5:
-                    p.setPen(day_pen)
-                    p.setFont(monos_font("JetBrains Mono", 9))
-                    p.drawText(
-                        QRect(x, _HEADER_DAY_TOP, col_w, _HEADER_DAY_H),
-                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                        str(d.day),
+                    self._paint_day_header_cell(
+                        p, x, col_w, d, day_pen, abbrev_weekday=abbrev_weekday
                     )
             elif dw >= 4:
                 month_w = self._month_label_span_px(i) if i == 0 else col_w
@@ -1790,10 +1869,14 @@ class _GanttCanvas(QWidget):
 
             if display.mode == "collapsed":
                 assert display.group is not None
-                self._paint_entity_label(p, fm, label_font, sub_font, vi, display, y, expanded=False)
+                self._paint_entity_label(
+                    p, fm, label_font, sub_font, vi, display, y, inner_w, expanded=False
+                )
             elif display.mode == "header":
                 assert display.group is not None
-                self._paint_entity_label(p, fm, label_font, sub_font, vi, display, y, expanded=True)
+                self._paint_entity_label(
+                    p, fm, label_font, sub_font, vi, display, y, inner_w, expanded=True
+                )
             elif display.mode == "scope_separator":
                 self._paint_scope_separator(p, y, display.lane_label, inner_w, display.count)
             elif display.mode == "dept_wave":
@@ -1838,7 +1921,7 @@ class _GanttCanvas(QWidget):
                 p.setFont(label_font)
                 p.setPen(QColor("#e4e4e7"))
                 p.drawText(
-                    QRect(_LABEL_TEXT_LEFT, y + 2, text_w, 16),
+                    QRect(_LABEL_TEXT_LEFT, y + _ROW_TITLE_Y, text_w, _ROW_TITLE_H),
                     Qt.AlignLeft | Qt.AlignVCenter,
                     fm.elidedText(dep_row.entity_name or "—", Qt.ElideRight, text_w),
                 )
@@ -1942,7 +2025,9 @@ class _GanttCanvas(QWidget):
                         overdue=row_overdue,
                     )
             elif display.mode == "scope_separator":
-                pass  # label column only — timeline stays normal grid
+                p.fillRect(0, y, w, _ROW_H, QColor(18, 18, 20))
+            elif display.mode == "dept_lane_header":
+                p.fillRect(0, y, w, _ROW_H, QColor(255, 255, 255, 4))
             elif display.mode == "dept_wave":
                 assert display.wave is not None
                 self._paint_wave_bar(p, vi, display.wave, y)
@@ -2023,7 +2108,7 @@ class _GanttCanvas(QWidget):
         p.setPen(QColor("#e4e4e7"))
         title = wave.department_label or wave.department
         p.drawText(
-            QRect(8, y + 2, inner_w - 16, 16),
+            QRect(8, y + _ROW_TITLE_Y, inner_w - 16, _ROW_TITLE_H),
             Qt.AlignLeft | Qt.AlignVCenter,
             fm.elidedText(title, Qt.ElideRight, inner_w - 20),
         )
@@ -2035,7 +2120,7 @@ class _GanttCanvas(QWidget):
         p.setFont(sub_font)
         p.setPen(QColor("#71717a"))
         p.drawText(
-            QRect(8, y + 17, inner_w - 16, 14),
+            QRect(8, y + _ROW_SUB_Y, inner_w - 16, _ROW_SUB_H),
             Qt.AlignLeft | Qt.AlignVCenter,
             fm.elidedText(" · ".join(parts), Qt.ElideRight, inner_w - 20),
         )
@@ -2096,6 +2181,7 @@ class _GanttCanvas(QWidget):
         visible_index: int,
         display: _DisplayRow,
         y: int,
+        inner_w: int,
         *,
         expanded: bool,
     ) -> None:
@@ -2113,11 +2199,11 @@ class _GanttCanvas(QWidget):
             entity_name=group.entity_name,
         )
 
-        text_w = _LABEL_W - _LABEL_TEXT_LEFT - 8
+        text_w = max(1, inner_w - _LABEL_TEXT_LEFT - 8)
         p.setFont(label_font)
         p.setPen(QColor("#e4e4e7"))
         p.drawText(
-            QRect(_LABEL_TEXT_LEFT, y + 2, text_w, 16),
+            QRect(_LABEL_TEXT_LEFT, y + _ROW_TITLE_Y, text_w, _ROW_TITLE_H),
             Qt.AlignLeft | Qt.AlignVCenter,
             fm.elidedText(group.entity_name or "—", Qt.ElideRight, text_w),
         )
@@ -2126,7 +2212,7 @@ class _GanttCanvas(QWidget):
         subtitle = self._group_subtitle(group) if not expanded else f"{len(group.departments)} departments"
         sub_fm = QFontMetrics(sub_font)
         p.drawText(
-            QRect(_LABEL_TEXT_LEFT, y + 17, text_w, 14),
+            QRect(_LABEL_TEXT_LEFT, y + _ROW_SUB_Y, text_w, _ROW_SUB_H),
             Qt.AlignLeft | Qt.AlignVCenter,
             sub_fm.elidedText(subtitle, Qt.ElideRight, text_w),
         )
@@ -2218,8 +2304,7 @@ class _GanttCanvas(QWidget):
         expanded_now = group_key not in self._expanded
         self.expand_toggled.emit(group_key, expanded_now)
 
-    @staticmethod
-    def _format_bar_tooltip(bar: PlannedBar) -> str:
+    def _format_bar_tooltip(self, bar: PlannedBar) -> str:
         src = {"auto": "Auto", "wave": "Wave", "override": "Pinned"}.get(bar.source, bar.source)
         st = {
             STATUS_DONE: "Done",
@@ -2235,6 +2320,18 @@ class _GanttCanvas(QWidget):
         ]
         if bar.overdue:
             lines.append("Overdue")
+        from monostudio.core.user_identity import resolve_assignee_display
+
+        assignee_name, _ = resolve_assignee_display(
+            self._workspace_root,
+            assignee_id=bar.assignee_id,
+            assignee_name=bar.assignee,
+            assignee_ids=bar.assignee_ids,
+        )
+        if assignee_name:
+            lines.append(f"Assignee: {assignee_name}")
+        if (bar.note or "").strip():
+            lines.append(f"Note: {bar.note.strip()}")
         return "\n".join(lines)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
@@ -2429,7 +2526,7 @@ class _GanttCanvas(QWidget):
             return
 
         if self._is_label_pane():
-            if self._tool == TOOL_DRAW and row is not None:
+            if self._tool == TOOL_DRAW and row is not None and self._schedule_editable():
                 dep = self._resolve_department_for_draw(row, pos.y())
                 if dep:
                     display = self._visible[row]
@@ -2475,7 +2572,7 @@ class _GanttCanvas(QWidget):
                     self.entity_row_selected.emit(kind, rel)
             return
 
-        if self._tool == TOOL_DRAW and row is not None:
+        if self._tool == TOOL_DRAW and row is not None and self._schedule_editable():
             dep = self._resolve_department_for_draw(row, pos.y())
             if dep:
                 display = self._visible[row]
@@ -2495,6 +2592,9 @@ class _GanttCanvas(QWidget):
             return
 
         if self._tool != TOOL_SELECT:
+            return
+
+        if not self._schedule_editable():
             return
 
         hit = self._hit_test(pos)
@@ -2556,6 +2656,10 @@ class _GanttCanvas(QWidget):
             return
 
         if self._draw_state is not None:
+            if not self._schedule_editable():
+                self._set_draw_state(None)
+                self._release_if_grabbed(self)
+                return
             state = self._draw_state
             self._set_draw_state(None)
             self._release_if_grabbed(self)
@@ -2578,6 +2682,14 @@ class _GanttCanvas(QWidget):
             return
 
         if self._drag is None:
+            return
+        if not self._schedule_editable():
+            self._drag = None
+            self._drag_dates.clear()
+            self._drag_collapsed_orig.clear()
+            self._wave_drag_preview.clear()
+            self._release_if_grabbed(self)
+            self.update()
             return
         drag = self._drag
         self._drag = None
@@ -2650,6 +2762,9 @@ class _GanttCanvas(QWidget):
         key = _row_key(display.group.entity_kind, display.group.entity_rel, department)
         existing = self._bars.get(key)
         aid = existing.allocation_id if (existing and existing.allocation_id) else new_allocation_id()
+        assignee_ids = existing.assignee_ids if existing else ()
+        assignees = existing.assignees if existing else ()
+        assignee_id = existing.assignee_id if existing else ""
         assignee = existing.assignee if existing else ""
         note = existing.note if existing else ""
         alloc = ScheduleAllocation(
@@ -2659,6 +2774,9 @@ class _GanttCanvas(QWidget):
             department=department,
             start=start.isoformat(),
             due=due.isoformat(),
+            assignee_ids=assignee_ids,
+            assignees=assignees,
+            assignee_id=assignee_id,
             assignee=assignee,
             note=note,
         )
@@ -2707,6 +2825,9 @@ class _GanttCanvas(QWidget):
                     department=dep,
                     start=seg_start.isoformat(),
                     due=seg_due.isoformat(),
+                    assignee_ids=existing.assignee_ids,
+                    assignees=existing.assignees,
+                    assignee_id=existing.assignee_id,
                     assignee=existing.assignee,
                     note=existing.note,
                 )
@@ -2760,6 +2881,9 @@ class _GanttCanvas(QWidget):
                 if existing and existing.allocation_id
                 else new_allocation_id()
             )
+            assignee_ids = existing.assignee_ids if existing else ()
+            assignees = existing.assignees if existing else ()
+            assignee_id = existing.assignee_id if existing else ""
             assignee = existing.assignee if existing else ""
             note = existing.note if existing else ""
             allocs.append(
@@ -2770,6 +2894,9 @@ class _GanttCanvas(QWidget):
                     department=dept_id,
                     start=seg_start.isoformat(),
                     due=seg_due.isoformat(),
+                    assignee_ids=assignee_ids,
+                    assignees=assignees,
+                    assignee_id=assignee_id,
                     assignee=assignee,
                     note=note,
                 )
@@ -2830,6 +2957,9 @@ class _GanttCanvas(QWidget):
                     department=dep,
                     start=seg_start.isoformat(),
                     due=seg_due.isoformat(),
+                    assignee_ids=existing.assignee_ids,
+                    assignees=existing.assignees,
+                    assignee_id=existing.assignee_id,
                     assignee=existing.assignee,
                     note=existing.note,
                 )
@@ -2907,9 +3037,10 @@ class _GanttCanvas(QWidget):
         if display.mode != "dept_wave" or display.wave is None:
             return False
         dep = (display.wave.department or "").strip()
+        editable = self._schedule_editable()
         menu = QMenu(self)
         delete_act = menu.addAction("Delete wave bar…")
-        delete_act.setEnabled(bool(dep) and self._wave_department_has_bars(dep))
+        delete_act.setEnabled(editable and bool(dep) and self._wave_department_has_bars(dep))
         drill = menu.addAction("Show shots in department…")
         chosen = menu.exec(global_pos)
         if chosen is delete_act and dep:
@@ -2958,7 +3089,9 @@ class _GanttCanvas(QWidget):
                 menu = QMenu(self)
                 plan_act = menu.addAction("Plan delivery…")
                 clear_act = menu.addAction("Clear plan…")
-                clear_act.setEnabled(has_plan)
+                editable = self._schedule_editable()
+                plan_act.setEnabled(editable)
+                clear_act.setEnabled(editable and has_plan)
                 chosen = menu.exec(event.globalPos())
                 if chosen is plan_act:
                     self.entity_plan_requested.emit(group.entity_kind, group.entity_rel)
@@ -2978,15 +3111,20 @@ class _GanttCanvas(QWidget):
                         )
                     )
                     menu = QMenu(self)
+                    editable = self._schedule_editable()
                     edit_act = menu.addAction("Edit…")
                     reset_act = menu.addAction("Reset to auto")
-                    reset_act.setEnabled(bar is not None and bar.source in ("override", "wave"))
+                    reset_act.setEnabled(
+                        editable and bar is not None and bar.source in ("override", "wave")
+                    )
                     is_skipped = bar is not None and (
                         bar.status == STATUS_EXCLUDED or bar.status_id == SKIPPED_STATUS_ID
                     )
                     skip_act = menu.addAction(
                         "Unskip department" if is_skipped else "Skip department (N/A)…"
                     )
+                    skip_act.setEnabled(editable and bar is not None)
+                    edit_act.setEnabled(editable)
                     menu.addSeparator()
                     chosen = menu.exec(event.globalPos())
                     if chosen is edit_act:
@@ -3059,6 +3197,67 @@ class _GanttCanvas(QWidget):
         super().leaveEvent(event)
 
 
+class _ScheduleLabelColResizeHandle(QWidget):
+    """Drag handle between the item column and the timeline."""
+
+    def __init__(self, gantt: ScheduleGanttWidget, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._gantt = gantt
+        self._dragging = False
+        self._drag_start_x = 0
+        self._drag_start_w = _LABEL_W_DEFAULT
+        self.setObjectName("ScheduleLabelColResizeHandle")
+        self.setFixedWidth(_LABEL_COL_RESIZE_W)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setMouseTracking(True)
+        self._hovered = False
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        x = self.width() // 2
+        color = QColor("#52525b") if self._hovered or self._dragging else QColor("#3f3f46")
+        p.setPen(QPen(color, 1))
+        p.drawLine(x, 8, x, max(8, self.height() - 8))
+        p.end()
+        super().paintEvent(event)
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_start_x = int(event.globalPosition().x())
+            self._drag_start_w = self._gantt.label_column_width()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._dragging:
+            delta = int(event.globalPosition().x()) - self._drag_start_x
+            self._gantt.set_label_column_width(self._drag_start_w + delta)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
+            self._dragging = False
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class ScheduleGanttWidget(QWidget):
     schedule_changed = Signal()
     edit_allocation_requested = Signal(object)
@@ -3075,6 +3274,7 @@ class ScheduleGanttWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._label_w = _LABEL_W_DEFAULT
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -3112,9 +3312,10 @@ class ScheduleGanttWidget(QWidget):
         body_host_lay = QHBoxLayout(self._body_host)
         body_host_lay.setContentsMargins(0, 0, 0, 0)
         body_host_lay.setSpacing(0)
+        body_host_lay.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         self._label_pane = _GanttCanvas(pane=_PANE_LABEL)
-        self._label_pane.setFixedWidth(_LABEL_W)
+        self._label_col_resize = _ScheduleLabelColResizeHandle(self, self._body_host)
         self._timeline_pane = _GanttCanvas(pane=_PANE_TIMELINE)
         self._label_pane._partner = self._timeline_pane
         self._timeline_pane._partner = self._label_pane
@@ -3124,6 +3325,7 @@ class ScheduleGanttWidget(QWidget):
         self._timeline_hscroll = QScrollArea(self._body_host)
         self._timeline_hscroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._timeline_hscroll.setWidgetResizable(False)
+        self._timeline_hscroll.setViewportMargins(0, 0, 0, 0)
         self._timeline_hscroll.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         # Native H bar is hidden — rows are as tall as the full list, so the bar would sit
         # below the last row. Use a sticky footer bar synced to the timeline instead.
@@ -3131,8 +3333,10 @@ class ScheduleGanttWidget(QWidget):
         self._timeline_hscroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._timeline_hscroll.setWidget(self._timeline_pane)
 
-        body_host_lay.addWidget(self._label_pane, 0)
-        body_host_lay.addWidget(self._timeline_hscroll, 1)
+        _row_top = Qt.AlignmentFlag.AlignTop
+        body_host_lay.addWidget(self._label_pane, 0, _row_top)
+        body_host_lay.addWidget(self._label_col_resize, 0, _row_top)
+        body_host_lay.addWidget(self._timeline_hscroll, 1, _row_top)
         self._body_vscroll.setWidget(self._body_host)
         root.addWidget(self._body_vscroll, 1)
 
@@ -3140,7 +3344,7 @@ class ScheduleGanttWidget(QWidget):
         footer_row.setContentsMargins(0, 0, 0, 0)
         footer_row.setSpacing(0)
         self._footer_hspacer = QWidget(self)
-        self._footer_hspacer.setFixedWidth(_LABEL_W)
+        self._footer_hspacer.setFixedWidth(self._label_left_width())
         self._footer_hspacer.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         footer_row.addWidget(self._footer_hspacer, 0)
         self._footer_hbar = QScrollBar(Qt.Orientation.Horizontal, self)
@@ -3170,6 +3374,7 @@ class ScheduleGanttWidget(QWidget):
         self._nav_zoom_start_day_w = _DAY_W
         self._nav_zoom_anchor_x = 0.0
         self._project_root: Path | None = None
+        self._workspace_root: Path | None = None
         self._project_index: ProjectIndex | None = None
         self._include_shots = True
         self._include_assets = False
@@ -3193,6 +3398,7 @@ class ScheduleGanttWidget(QWidget):
         self._allowed_departments: frozenset[str] | None = None
         self._thumbnail_manager: ThumbnailManager | None = None
         self._entity_refs: dict[tuple[str, str], Asset | Shot] = {}
+        self._schedule_editable = True
 
         for pane in (self._label_pane, self._timeline_pane):
             pane.row_activated.connect(self._on_row_activated)
@@ -3214,6 +3420,23 @@ class ScheduleGanttWidget(QWidget):
     @property
     def _canvas(self) -> _GanttCanvas:
         return self._timeline_pane
+
+    def label_column_width(self) -> int:
+        return self._label_w
+
+    def _label_left_width(self) -> int:
+        return self._label_w + _LABEL_COL_RESIZE_W
+
+    def set_label_column_width(self, width: int) -> None:
+        w = max(_LABEL_W_MIN, min(_LABEL_W_MAX, int(width)))
+        if w == self._label_w:
+            return
+        self._label_w = w
+        self._corner_pane.setFixedWidth(w)
+        self._footer_hspacer.setFixedWidth(self._label_left_width())
+        self._label_pane._update_minimum_size()
+        self._ensure_body_pane_heights()
+        self._label_pane.update()
 
     def _set_body_vscroll(self, value: int) -> None:
         bar = self._body_vscroll.verticalScrollBar()
@@ -3244,12 +3467,13 @@ class ScheduleGanttWidget(QWidget):
         """Width of the body row visible inside the vertical scroll area."""
         vp = self._body_vscroll.viewport()
         w = vp.width() if vp is not None else 0
-        if w < _LABEL_W + 32:
+        left_w = self._label_left_width()
+        if w < left_w + 32:
             w = max(w, self.width() - 8)
-        return max(_LABEL_W + 32, w)
+        return max(left_w + 32, w)
 
     def _timeline_viewport_width(self) -> int:
-        return max(32, self._body_visible_width() - _LABEL_W)
+        return max(32, self._body_visible_width() - self._label_left_width())
 
     def _body_content_height(self) -> int:
         """At least as tall as the visible body area so empty rows can show grid cells."""
@@ -3259,6 +3483,12 @@ class ScheduleGanttWidget(QWidget):
         if vp_h <= 0:
             return data_h
         return max(data_h, vp_h)
+
+    def _reset_timeline_vertical_scroll(self) -> None:
+        """Nested QScrollArea must never keep a vertical offset — body_vscroll owns Y."""
+        vbar = self._timeline_hscroll.verticalScrollBar()
+        if vbar.value() != 0:
+            vbar.setValue(0)
 
     def _ensure_body_pane_heights(self) -> None:
         """Label + timeline: one vertical scroll; timeline pans horizontally inside a fixed viewport."""
@@ -3271,17 +3501,24 @@ class ScheduleGanttWidget(QWidget):
         self._label_pane.setSizePolicy(fixed)
         self._timeline_hscroll.setSizePolicy(fixed)
 
-        if self._label_pane.width() != _LABEL_W or self._label_pane.height() != ch:
-            self._label_pane.setFixedSize(_LABEL_W, ch)
-        if self._timeline_pane.width() != tw or self._timeline_pane.height() != ch:
-            self._timeline_pane.resize(tw, ch)
-        if self._timeline_hscroll.width() != tl_vp_w or self._timeline_hscroll.height() != ch:
-            self._timeline_hscroll.setFixedSize(tl_vp_w, ch)
+        lw = self._label_w
+        if self._label_pane.width() != lw or self._label_pane.height() != ch:
+            self._label_pane.setFixedSize(lw, ch)
+
+        row_h = self._label_pane.height()
+        if self._timeline_hscroll.width() != tl_vp_w or self._timeline_hscroll.height() != row_h:
+            self._timeline_hscroll.setFixedSize(tl_vp_w, row_h)
+        self._reset_timeline_vertical_scroll()
+
+        # Canvas height must match the label column — never taller than the scroll viewport.
+        if self._timeline_pane.width() != tw or self._timeline_pane.height() != row_h:
+            self._timeline_pane.resize(tw, row_h)
+        self._reset_timeline_vertical_scroll()
 
         # Host matches the visible viewport — NOT full timeline width (that kills H-scroll range).
-        if self._body_host.width() != host_w or self._body_host.height() != ch:
-            self._body_host.setMinimumSize(host_w, ch)
-            self._body_host.resize(host_w, ch)
+        if self._body_host.width() != host_w or self._body_host.height() != row_h:
+            self._body_host.setMinimumSize(host_w, row_h)
+            self._body_host.resize(host_w, row_h)
         self._sync_footer_hbar_range()
 
     def _sync_footer_hbar_range(self) -> None:
@@ -3318,6 +3555,15 @@ class ScheduleGanttWidget(QWidget):
         self._label_pane.set_data(**kwargs)
         self._timeline_pane.set_data(**kwargs)
         self._ensure_body_pane_heights()
+        QTimer.singleShot(0, self._ensure_body_pane_heights)
+
+    def set_workspace_root(self, path: Path | None) -> None:
+        try:
+            self._workspace_root = Path(path).resolve() if path else None
+        except OSError:
+            self._workspace_root = None
+        for pane in (self._header_pane, self._label_pane, self._timeline_pane):
+            pane._workspace_root = self._workspace_root
 
     def set_include_assets(self, enabled: bool) -> None:
         self._include_assets = enabled
@@ -3740,6 +3986,13 @@ class ScheduleGanttWidget(QWidget):
         self._timeline_pane.set_tool(tool)
         self._apply_tool_cursors()
 
+    def set_schedule_editable(self, editable: bool) -> None:
+        self._schedule_editable = bool(editable)
+        if not editable:
+            self.set_tool(TOOL_SELECT)
+        self._label_pane.update()
+        self._timeline_pane.update()
+
     def _apply_tool_cursors(self) -> None:
         """Default pointer for the active tool (hover handlers may override)."""
         tool = self._timeline_pane._tool
@@ -3825,7 +4078,7 @@ class ScheduleGanttWidget(QWidget):
         container = QWidget(self)
         container.setObjectName("ScheduleCornerSearch")
         container.setAttribute(Qt.WA_StyledBackground, True)
-        container.setFixedSize(_LABEL_W, _HEADER_H)
+        container.setFixedSize(_LABEL_W_DEFAULT, _HEADER_H)
         lay = QHBoxLayout(container)
         lay.setContentsMargins(8, 0, 6, 0)
         lay.setSpacing(4)
@@ -4039,6 +4292,7 @@ class ScheduleGanttWidget(QWidget):
         )
         self._set_pane_data(
             project_root=self._project_root,
+            workspace_root=self._workspace_root,
             groups=self._groups,
             expanded=self._expanded,
             bars=display_bars,
@@ -4059,6 +4313,7 @@ class ScheduleGanttWidget(QWidget):
             self._entity_refs = {}
             self._set_pane_data(
                 project_root=None,
+                workspace_root=self._workspace_root,
                 groups=[],
                 expanded=set(),
                 bars={},
@@ -4186,6 +4441,8 @@ class ScheduleGanttWidget(QWidget):
         self.schedule_changed.emit()
 
     def _on_row_activated(self, visible_index: int) -> None:
+        if not self._schedule_editable:
+            return
         rollups = rollup_bars_by_department(
             self._bars,
             self._groups,

@@ -38,6 +38,7 @@ from monostudio.core.project_schedule import (
 )
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
+from monostudio.ui_qt.toolbar_separators import apply_pill_segment_positions
 
 
 def _section_title(text: str, parent: QWidget) -> QLabel:
@@ -152,6 +153,7 @@ class ScheduleMilestoneDialog(MonosDialog):
         self._section_group.idClicked.connect(self._on_section_changed)
         pills_lay.addWidget(self._pill_range)
         pills_lay.addWidget(self._pill_milestones)
+        apply_pill_segment_positions([self._pill_range, self._pill_milestones])
         nav_row.addWidget(self._section_pills, 0, Qt.AlignmentFlag.AlignLeft)
         nav_row.addStretch(1)
         root.addLayout(nav_row)

@@ -17,6 +17,9 @@ from PySide6.QtGui import (
     QCursor,
     QDesktopServices,
     QDrag,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
     QFont,
     QFontMetrics,
     QIcon,
@@ -422,6 +425,9 @@ class InspectorPanel(QWidget):
     inspector_hidden_departments_changed = Signal(set)
     item_notes_dialog_requested = Signal(object)  # ViewItem (asset / shot)
     open_schedule_requested = Signal()
+    edit_allocation_requested = Signal()
+    assignee_changed = Signal(str, str, str, object)
+    assignment_confirmed = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -464,6 +470,9 @@ class InspectorPanel(QWidget):
         self._dept_pipeline = _DepartmentPipeline()
         self._schedule_block = InspectorScheduleBlock()
         self._schedule_block.open_schedule_requested.connect(self.open_schedule_requested.emit)
+        self._schedule_block.edit_allocation_requested.connect(self.edit_allocation_requested.emit)
+        self._schedule_block.assignee_changed.connect(self.assignee_changed.emit)
+        self._schedule_block.assignment_confirmed.connect(self.assignment_confirmed.emit)
         self._tech = _TechnicalSpecs()
         self._stakeholders = _Stakeholders()
 
@@ -504,7 +513,6 @@ class InspectorPanel(QWidget):
             self._preview,
             self._asset_status,
             self._separator,
-            self._schedule_block,
             self._dept_pipeline,
             self._inbox_destination,
         ):
@@ -529,6 +537,7 @@ class InspectorPanel(QWidget):
         self._details_empty = _InspectorEmptyState()
         self._details_empty.set_message("Select an item to view details")
         details_l.addWidget(self._details_empty, 0)
+        details_l.addWidget(self._schedule_block, 0)
         details_l.addWidget(self._tech, 0)
         details_l.addWidget(self._stakeholders, 0)
         details_l.addStretch(1)
@@ -543,6 +552,9 @@ class InspectorPanel(QWidget):
         self._body_stack.addWidget(self._details_scroll)
 
         root.addWidget(self._body_stack, 1)
+        self.setAcceptDrops(True)
+        self._body_stack.setAcceptDrops(True)
+        self._ref_tab.setAcceptDrops(True)
 
         # ACTION card pinned below the scroll area (always visible at bottom when distributing)
         action_wrap = QWidget(self)
@@ -622,11 +634,21 @@ class InspectorPanel(QWidget):
         self._project_root = Path(path) if path else None
         self._schedule_block.set_project_root(self._project_root)
 
+    def set_workspace_root(self, path: Path | str | None) -> None:
+        self._schedule_block.set_workspace_root(path)
+        if self._current_item is not None:
+            self._refresh_schedule_block()
+
     def set_schedule_bars(self, bars: dict | None) -> None:
         self._schedule_bars = bars or {}
+        if self._current_item is not None:
+            self._refresh_schedule_block()
 
     def set_schedule_dept_labels(self, labels: dict[str, str]) -> None:
         self._schedule_block.set_dept_labels(labels)
+
+    def set_schedule_editable(self, editable: bool) -> None:
+        self._schedule_block.set_schedule_editable(editable)
 
     def set_app_settings(self, settings: QSettings) -> None:
         """Share MainWindow QSettings so Inspector reads the same keys as Settings dialog."""
@@ -728,7 +750,7 @@ class InspectorPanel(QWidget):
         is_asset_or_shot = has_item and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
         is_inbox_item = has_item and item.kind == ViewItemKind.INBOX_ITEM
         self._header.set_tabs_visible(True)
-        for w in (self._preview, self._asset_status, self._separator, self._schedule_block, self._dept_pipeline):
+        for w in (self._preview, self._asset_status, self._separator, self._dept_pipeline):
             w.setVisible(has_item and (is_asset_or_shot or is_inbox_item))
         self._schedule_block.setVisible(has_item and is_asset_or_shot)
         self._tech.setVisible(is_asset_or_shot)
@@ -882,6 +904,31 @@ class InspectorPanel(QWidget):
                 win._ensure_entity_special_folders_watched(Path(entity.path))  # type: ignore[attr-defined]
         except Exception:
             pass
+
+    def can_handle_ref_tab_external_drop(self) -> bool:
+        if self._body_stack.currentIndex() != 1:
+            return False
+        return self._ref_tab.can_accept_external_drop()
+
+    def try_handle_ref_tab_external_drop(self, paths: list[Path], global_pos: QPoint) -> bool:
+        if self._body_stack.currentIndex() != 1:
+            return False
+        return self._ref_tab.handle_external_drop(paths, global_pos)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if self._body_stack.currentIndex() == 1 and self._ref_tab.handle_explorer_drag(event):
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        if self._body_stack.currentIndex() == 1 and self._ref_tab.handle_explorer_drag(event):
+            return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        if self._body_stack.currentIndex() == 1 and self._ref_tab.handle_explorer_drop(event):
+            return
+        event.ignore()
 
     def _on_ref_file_count_changed(self, count: int) -> None:
         self._header.set_ref_tab_badge(count)
@@ -1321,7 +1368,7 @@ class _InspectorHeader(QWidget):
             f.setLetterSpacing(QFont.PercentageSpacing, 97)
             btn.setFont(f)
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-            ic = lucide_icon(icon_name, size=15, color_hex=MONOS_COLORS["text_label"])
+            ic = lucide_icon(icon_name, size=15, color_hex=MONOS_COLORS["pill_segment_inactive_fg"])
             if not ic.isNull():
                 btn.setIcon(ic)
                 btn.setIconSize(QSize(15, 15))
@@ -1373,7 +1420,7 @@ class _InspectorHeader(QWidget):
             is_active = i == index
             btn.setProperty("active", "true" if is_active else "false")
             icon_name = self._tab_icon_names[i] if i < len(self._tab_icon_names) else "layers"
-            color = MONOS_COLORS["blue_400"] if is_active else MONOS_COLORS["text_label"]
+            color = MONOS_COLORS["pill_segment_active_fg"] if is_active else MONOS_COLORS["pill_segment_inactive_fg"]
             ic = lucide_icon(icon_name, size=15, color_hex=color)
             if not ic.isNull():
                 btn.setIcon(ic)

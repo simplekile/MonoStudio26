@@ -4,7 +4,7 @@ client/freelancer, existing or new date folder, and optional description.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QDate
@@ -27,6 +27,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.inbox_date_folder import (
+    date_folder_sort_key,
+    default_date_folder_suffix,
+    format_date_folder_name,
+    sanitize_date_folder_suffix,
+)
 from monostudio.core.inbox_reader import scan_inbox
 from monostudio.core.outbox_reader import scan_outbox
 from monostudio.ui_qt.calendar_date_picker import run_date_picker_dialog
@@ -51,8 +57,8 @@ def _get_date_folders_for_source(
             for child in node.children:
                 if getattr(child, "is_dir", True) and getattr(child, "path", None) and getattr(child, "name", None):
                     out.append((child.name, child.path))
-            # Sort by date descending (newest first)
-            out.sort(key=lambda x: x[0], reverse=True)
+            # Sort by parsed date descending (newest first); legacy YYYY-MM-DD still works.
+            out.sort(key=lambda x: date_folder_sort_key(x[0]), reverse=True)
             return out
     return []
 
@@ -72,6 +78,8 @@ class InboxDropDialog(MonosDialog):
         parent: QWidget | None = None,
         *,
         target: str = "inbox",
+        initial_date_str: str | None = None,
+        prefer_existing_date: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("InboxDropDialog")
@@ -83,6 +91,8 @@ class InboxDropDialog(MonosDialog):
         self._target = (target or "inbox").strip().lower() if target else "inbox"
         if self._target not in ("inbox", "outbox"):
             self._target = "inbox"
+        self._initial_date_str = (initial_date_str or "").strip() or None
+        self._prefer_existing_date = bool(prefer_existing_date and self._initial_date_str)
 
         self.setWindowTitle("Add to Outbox" if self._target == "outbox" else "Add to Inbox")
         self.setModal(True)
@@ -167,8 +177,8 @@ class InboxDropDialog(MonosDialog):
         new_date_row = QHBoxLayout()
         self._new_date_edit = QLineEdit(self)
         self._new_date_edit.setObjectName("InboxDropNewDateEdit")
-        self._new_date_edit.setPlaceholderText("yyyy-mm-dd")
-        self._new_date_edit.setMinimumWidth(140)
+        self._new_date_edit.setPlaceholderText("Pick date below")
+        self._new_date_edit.setReadOnly(True)
         today_str = QDate.currentDate().toString("yyyy-MM-dd")
         self._new_date_edit.setText(today_str)
         new_date_row.addWidget(self._new_date_edit, 1)
@@ -182,10 +192,34 @@ class InboxDropDialog(MonosDialog):
         self._calendar_btn.clicked.connect(self._on_open_calendar_popup)
         new_date_row.addWidget(self._calendar_btn, 0)
         form_layout.addLayout(new_date_row, 0)
+        suffix_row = QHBoxLayout()
+        suffix_label = QLabel("Tag", self)
+        suffix_label.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
+        suffix_label.setFixedWidth(36)
+        suffix_row.addWidget(suffix_label, 0)
+        self._suffix_edit = QLineEdit(self)
+        self._suffix_edit.setObjectName("InboxDropSuffixEdit")
+        self._suffix_edit.setPlaceholderText("Stb")
+        self._suffix_edit.setMaxLength(6)
+        self._suffix_edit.setText(default_date_folder_suffix(self._project_root))
+        suffix_row.addWidget(self._suffix_edit, 1)
+        form_layout.addLayout(suffix_row, 0)
+        self._folder_preview = QLabel(self)
+        self._folder_preview.setObjectName("DialogHint")
+        self._folder_preview.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Normal))
+        form_layout.addWidget(self._folder_preview, 0)
+        self._new_date_edit.textChanged.connect(self._update_folder_preview)
+        self._suffix_edit.textChanged.connect(self._update_folder_preview)
+        self._update_folder_preview()
         self._radio_existing.toggled.connect(self._on_date_mode_changed)
         self._radio_new.toggled.connect(self._on_date_mode_changed)
         self._on_source_changed()
         self._on_date_mode_changed()
+        if self._prefer_existing_date and self._initial_date_str:
+            self._radio_existing.setChecked(True)
+            idx = self._existing_combo.findText(self._initial_date_str)
+            if idx >= 0:
+                self._existing_combo.setCurrentIndex(idx)
 
         # Description
         desc_label = QLabel("Description (optional)", self)
@@ -193,7 +227,9 @@ class InboxDropDialog(MonosDialog):
         desc_label.setFont(monos_font("Inter", 11, QFont.Weight.Bold))
         form_layout.addWidget(desc_label, 0)
         self._description_edit = QLineEdit(self)
-        self._description_edit.setPlaceholderText("e.g. Batch from client review")
+        self._description_edit.setPlaceholderText(
+            "e.g. Batch review nhân vật A — applies to whole folder and files inside"
+        )
         self._description_edit.setObjectName("InboxDropDescription")
         form_layout.addWidget(self._description_edit, 0)
         form_layout.addStretch(1)
@@ -256,6 +292,18 @@ class InboxDropDialog(MonosDialog):
         self._calendar_btn.setEnabled(not use_existing)
         self._new_date_edit.setVisible(not use_existing)
         self._calendar_btn.setVisible(not use_existing)
+        self._suffix_edit.setEnabled(not use_existing)
+        self._suffix_edit.setVisible(not use_existing)
+        self._folder_preview.setVisible(not use_existing)
+
+    def _update_folder_preview(self) -> None:
+        picked = self._parse_new_date_edit()
+        if picked is None or not picked.isValid():
+            self._folder_preview.setText("")
+            return
+        py_date = date(picked.year(), picked.month(), picked.day())
+        tag = sanitize_date_folder_suffix(self._suffix_edit.text())
+        self._folder_preview.setText(f"Folder: {format_date_folder_name(py_date, tag)}")
 
     def _parse_new_date_edit(self) -> QDate | None:
         text = (self._new_date_edit.text() or "").strip()
@@ -278,11 +326,14 @@ class InboxDropDialog(MonosDialog):
 
     def _get_date_str(self) -> str | None:
         if self._radio_new.isChecked():
-            text = (self._new_date_edit.text() or "").strip()
-            if not text:
+            picked = self._parse_new_date_edit()
+            if picked is None or not picked.isValid():
                 return None
-            d = self._parse_new_date_edit()
-            return d.toString("yyyy-MM-dd") if d and d.isValid() else None
+            py_date = date(picked.year(), picked.month(), picked.day())
+            tag = sanitize_date_folder_suffix(self._suffix_edit.text())
+            if not (self._suffix_edit.text() or "").strip():
+                return None
+            return format_date_folder_name(py_date, tag)
         idx = self._existing_combo.currentIndex()
         if idx >= 0:
             return self._existing_combo.itemText(idx) or None
@@ -300,11 +351,24 @@ class InboxDropDialog(MonosDialog):
                     "No existing date folders for this source. Choose \"New date folder\" and enter or pick a date.",
                 )
             elif self._radio_new.isChecked():
-                QMessageBox.warning(
-                    self,
-                    title,
-                    "Enter a date (yyyy-mm-dd) or click the calendar icon to pick a date.",
-                )
+                if not self._parse_new_date_edit():
+                    QMessageBox.warning(
+                        self,
+                        title,
+                        "Pick a date using the calendar icon.",
+                    )
+                elif not (self._suffix_edit.text() or "").strip():
+                    QMessageBox.warning(
+                        self,
+                        title,
+                        "Enter a short tag for the folder name (e.g. Stb).",
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        title,
+                        "Could not build folder name. Check date and tag.",
+                    )
             return
         self._result_source = source
         self._result_date_str = date_str.strip()

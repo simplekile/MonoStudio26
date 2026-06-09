@@ -8,13 +8,14 @@ from typing import TYPE_CHECKING
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, Qt
+from PySide6.QtCore import QObject, Qt
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from monostudio.core.tray_preferences import read_tray_enabled
 from monostudio.ui_qt.notification import notify as notification_service
 from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.popup_position import position_popup_above_rect
 from monostudio.ui_qt.recent_tasks_store import RecentTask
 from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu
 from monostudio.ui_qt.tray_icon_badges import compose_tray_icon
@@ -205,33 +206,16 @@ class TrayManager(QObject):
         tray = self._tray
         if popup is None or tray is None:
             return
-        popup.adjustSize()
         geo = tray.geometry()
-        app = QApplication.instance()
-        screen = None
         if geo.isValid() and geo.width() > 0 and geo.height() > 0:
-            screen = QApplication.screenAt(geo.center())
-        if screen is None and app is not None:
-            screen = app.primaryScreen()
-        margin = 8
-        gap = 6
-        w = popup.width()
-        h = popup.height()
-        if geo.isValid() and geo.width() > 0:
-            cx = geo.center().x()
-            x = cx - w // 2
-            y = geo.top() - h - gap
-        elif screen is not None:
-            ag = screen.availableGeometry()
-            x = ag.right() - w - margin
-            y = ag.bottom() - h - gap
-        else:
-            x, y = 100, 100
+            position_popup_above_rect(popup, geo)
+            return
+        app = QApplication.instance()
+        screen = app.primaryScreen() if app is not None else None
         if screen is not None:
-            ag = screen.availableGeometry()
-            x = max(ag.left() + margin, min(x, ag.right() - w - margin))
-            y = max(ag.top() + margin, min(y, ag.bottom() - h - margin))
-        popup.move(QPoint(x, y))
+            position_popup_above_rect(popup, screen.availableGeometry(), h_align="left")
+        else:
+            popup.move(100, 100)
 
     def _on_mini_task_selected(self, task: object) -> None:
         if isinstance(task, RecentTask):
@@ -362,9 +346,9 @@ class TrayManager(QObject):
     def _navigate_context(self, context: str) -> None:
         self._hide_mini_popup()
         self._window.present()
-        sidebar = getattr(self._window, "_sidebar", None)
-        compact = getattr(self._window, "_sidebar_compact", None)
-        if sidebar is not None:
-            sidebar.set_current_context(context)
-        if compact is not None:
-            compact.set_current_context(context)
+        nav_rail = getattr(self._window, "_nav_rail", None)
+        filter_panel = getattr(self._window, "_filter_panel", None)
+        if nav_rail is not None:
+            nav_rail.set_current_context(context)
+        if filter_panel is not None and hasattr(filter_panel, "sync_nav_context"):
+            filter_panel.sync_nav_context(context)

@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     QAbstractListModel,
     QEvent,
+    QMimeData,
     QModelIndex,
     QObject,
     QPoint,
@@ -35,6 +36,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
     QFrame,
@@ -61,6 +63,7 @@ from monostudio.core.entity_folders import (
 )
 from monostudio.core.models import Asset, Shot
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
+from monostudio.ui_qt.external_drop import paths_from_mime
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, monos_font
 from monostudio.ui_qt.thumbnails import (
@@ -79,6 +82,14 @@ _REF_THUMB_DECODE_MIN = 256
 _REF_THUMB_DECODE_MAX = 512
 _REF_THUMB_PREFETCH_CHUNK = 8
 _REF_THUMB_PREFETCH_ALL_MAX_ROWS = 32
+
+
+def _explorer_mime_has_files(mime: QMimeData | None) -> bool:
+    if mime is None:
+        return False
+    if mime.hasUrls():
+        return True
+    return mime.hasFormat("text/uri-list")
 
 
 def ref_thumb_decode_max_side(*, dpr: float) -> int:
@@ -426,6 +437,8 @@ class _InspectorRefSection(QWidget):
         self._list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
         self._list.setSelectionMode(QListView.SelectionMode.SingleSelection)
+        self._list.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self._list.setDefaultDropAction(Qt.DropAction.CopyAction)
         self._list.setMouseTracking(True)
         self._list.setFrameShape(QFrame.Shape.NoFrame)
         self._list.setModel(self._model)
@@ -486,6 +499,14 @@ class _InspectorRefSection(QWidget):
     def container(self) -> QWidget:
         return self._container
 
+    def _owner_ref_tab(self) -> InspectorRefTab | None:
+        w: QWidget | None = self
+        while w is not None:
+            if isinstance(w, InspectorRefTab):
+                return w
+            w = w.parentWidget()
+        return None
+
     def _pointer_over_section(self) -> bool:
         if self._container.underMouse() or self.underMouse():
             return True
@@ -532,16 +553,13 @@ class _InspectorRefSection(QWidget):
                 self._sync_container_hover()
             elif t in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
                 QTimer.singleShot(0, self._sync_container_hover)
-            if t == QEvent.Type.DragEnter and isinstance(event, QDragEnterEvent):
+            elif t == QEvent.Type.DragEnter and isinstance(event, QDragEnterEvent):
                 self.dragEnterEvent(event)
                 return True
-            if t == QEvent.Type.DragMove and isinstance(event, QDragMoveEvent):
+            elif t == QEvent.Type.DragMove and isinstance(event, QDragMoveEvent):
                 self.dragMoveEvent(event)
                 return True
-            if t == QEvent.Type.DragLeave:
-                self.dragLeaveEvent(event)  # type: ignore[arg-type]
-                return True
-            if t == QEvent.Type.Drop and isinstance(event, QDropEvent):
+            elif t == QEvent.Type.Drop and isinstance(event, QDropEvent):
                 self.dropEvent(event)
                 return True
         return super().eventFilter(obj, event)
@@ -562,75 +580,71 @@ class _InspectorRefSection(QWidget):
 
     @staticmethod
     def _paths_from_drop_event(event: QDropEvent | QDragEnterEvent | QDragMoveEvent) -> list[Path]:
-        mime = event.mimeData()
-        if mime is None or not mime.hasUrls():
-            return []
-        out: list[Path] = []
-        for url in mime.urls():
-            if not url.isLocalFile():
-                continue
-            try:
-                p = Path(url.toLocalFile())
-            except (OSError, ValueError):
-                continue
-            if p.exists():
-                out.append(p)
-        return out
+        return paths_from_mime(event.mimeData())
 
     def _can_accept_drag(self, event: QDragEnterEvent | QDragMoveEvent) -> bool:
-        return bool(self._drop_enabled and self._paths_from_drop_event(event))
+        return bool(self._drop_enabled and _explorer_mime_has_files(event.mimeData()))
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
         if not self._can_accept_drag(event):
             event.ignore()
             return
-        event.acceptProposedAction()
-        self._drag_over_depth += 1
-        self._set_drop_highlight(True)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        tab = self._owner_ref_tab()
+        if tab is not None:
+            tab._set_drop_highlight_section(self)
+        else:
+            self._set_drop_highlight(True)
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # type: ignore[override]
         if not self._can_accept_drag(event):
             event.ignore()
-            self._clear_drop_highlight_if_idle()
             return
-        event.acceptProposedAction()
-        self._set_drop_highlight(True)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        tab = self._owner_ref_tab()
+        if tab is not None:
+            tab._set_drop_highlight_section(self)
+        else:
+            self._set_drop_highlight(True)
 
     def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
-        self._drag_over_depth = max(0, self._drag_over_depth - 1)
-        self._clear_drop_highlight_if_idle()
         super().dragLeaveEvent(event)
 
-    def _clear_drop_highlight_if_idle(self) -> None:
-        if self._drag_over_depth == 0:
-            self._set_drop_highlight(False)
-
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
-        self._drag_over_depth = 0
-        self._set_drop_highlight(False)
-        if not self._drop_enabled:
+        tab = self._owner_ref_tab()
+        if tab is not None:
+            tab._set_drop_highlight_section(None)
+        else:
+            self._set_drop_highlight(False)
+        paths = self._paths_from_drop_event(event)
+        if not paths:
             event.ignore()
             return
-        sources = self._paths_from_drop_event(event)
-        if not sources:
+        if self.import_dropped_paths(paths):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
             event.ignore()
-            return
+
+    def import_dropped_paths(self, sources: list[Path]) -> bool:
+        if not self._drop_enabled or not sources:
+            return False
         folder = self._folder_path
         if folder is None:
-            event.ignore()
-            return
+            return False
         if not ensure_entity_special_folder(folder):
-            event.ignore()
-            return
+            return False
         n = import_paths_into_special_folder(folder, sources)
-        event.acceptProposedAction()
         if n > 0:
             self.set_expanded(True)
             self.files_imported.emit(self._section_id)
-        else:
-            from monostudio.ui_qt.notification import notify as notification_service
+            return True
+        from monostudio.ui_qt.notification import notify as notification_service
 
-            notification_service.warning("Could not add files to this folder.")
+        notification_service.warning("Could not add files to this folder.")
+        return False
 
     def _set_hovered_row(self, row: int | None) -> None:
         if self._hovered_row == row:
@@ -1113,10 +1127,118 @@ class InspectorRefTab(QWidget):
         self._content_lay.addWidget(self._reference.container, 0)
         self._content_lay.addStretch(1)
         self._ref_scroll.setWidget(content)
-        self._ref_scroll.viewport().installEventFilter(self)
         sb = self._ref_scroll.verticalScrollBar()
         sb.valueChanged.connect(self._on_ref_scroll_moved)
         outer.addWidget(self._ref_scroll, 1)
+        self._install_explorer_drop_hosts()
+
+    def _scroll_drop_host_widgets(self) -> list[QWidget]:
+        """Scroll/content hosts only — section widgets keep their own drag handlers."""
+        return [
+            self,
+            self._ref_scroll,
+            self._ref_scroll.viewport(),
+            self._ref_content,
+        ]
+
+    def _install_explorer_drop_hosts(self) -> None:
+        self.setAcceptDrops(True)
+        for widget in self._scroll_drop_host_widgets():
+            widget.setAcceptDrops(True)
+            widget.installEventFilter(self)
+
+    def can_accept_external_drop(self) -> bool:
+        return self._entity is not None and not self._placeholder_block.isVisible()
+
+    def _set_drop_highlight_section(self, active: _InspectorRefSection | None) -> None:
+        """Only one section shows drop highlight at a time (viewport routing vs nested widgets)."""
+        for sec in (self._concept, self._reference):
+            sec._set_drop_highlight(sec is active)
+
+    def _section_for_widget(self, widget: QWidget) -> _InspectorRefSection | None:
+        for sec in (self._concept, self._reference):
+            p: QWidget | None = widget
+            while p is not None:
+                if p is sec or p is sec.container:
+                    return sec
+                p = p.parentWidget()
+        return None
+
+    def section_at_global_pos(self, global_pos: QPoint) -> _InspectorRefSection | None:
+        for sec in (self._concept, self._reference):
+            container = sec.container
+            if not container.isVisible():
+                continue
+            top_left = container.mapToGlobal(QPoint(0, 0))
+            if QRect(top_left, container.size()).contains(global_pos):
+                return sec
+        content_top = self._ref_content.mapToGlobal(QPoint(0, 0))
+        content_rect = QRect(content_top, self._ref_content.size())
+        if not content_rect.contains(global_pos):
+            return None
+        concept_rect = QRect(
+            self._concept.container.mapToGlobal(QPoint(0, 0)),
+            self._concept.container.size(),
+        )
+        if concept_rect.contains(global_pos):
+            return self._concept
+        return self._reference
+
+    def _section_for_drop_event(
+        self,
+        event: QDragEnterEvent | QDragMoveEvent | QDropEvent,
+        widget: QWidget,
+    ) -> _InspectorRefSection | None:
+        sec = self._section_for_widget(widget)
+        if sec is not None:
+            return sec
+        return self.section_at_global_pos(self._event_global_pos(event, widget))
+
+    def handle_external_drop(self, paths: list[Path], global_pos: QPoint) -> bool:
+        if not paths or not self.can_accept_external_drop():
+            return False
+        section = self.section_at_global_pos(global_pos) or self._reference
+        return section.import_dropped_paths(paths)
+
+    def handle_explorer_drag(
+        self,
+        event: QDragEnterEvent | QDragMoveEvent,
+        widget: QWidget | None = None,
+    ) -> bool:
+        if not self.can_accept_external_drop():
+            return False
+        if not _explorer_mime_has_files(event.mimeData()):
+            return False
+        host = widget or self
+        section = self._section_for_drop_event(event, host) or self._reference
+        if not section._drop_enabled:
+            return False
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        self._set_drop_highlight_section(section)
+        return True
+
+    def handle_explorer_drop(self, event: QDropEvent, widget: QWidget | None = None) -> bool:
+        paths = paths_from_mime(event.mimeData())
+        if not paths:
+            return False
+        host = widget or self
+        section = self._section_for_drop_event(event, host) or self._reference
+        self._set_drop_highlight_section(None)
+        if section.import_dropped_paths(paths):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return True
+        event.ignore()
+        return False
+
+    @staticmethod
+    def _event_global_pos(event: QDragEnterEvent | QDragMoveEvent | QDropEvent, widget: QWidget) -> QPoint:
+        if hasattr(event, "globalPosition"):
+            return event.globalPosition().toPoint()
+        if hasattr(event, "position"):
+            return widget.mapToGlobal(event.position().toPoint())
+        return widget.mapToGlobal(event.pos())
 
     def _on_ref_scroll_moved(self, _value: int) -> None:
         self._concept._schedule_thumb_prefetch()
@@ -1137,6 +1259,16 @@ class InspectorRefTab(QWidget):
         QTimer.singleShot(0, self._sync_all_sections)
 
     def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        if obj in self._scroll_drop_host_widgets():
+            et = event.type()
+            if et in (QEvent.Type.DragEnter, QEvent.Type.DragMove) and isinstance(
+                event, (QDragEnterEvent, QDragMoveEvent)
+            ):
+                if self.handle_explorer_drag(event, obj):
+                    return True
+            elif et == QEvent.Type.Drop and isinstance(event, QDropEvent):
+                if self.handle_explorer_drop(event, obj):
+                    return True
         if obj is self._ref_scroll.viewport():
             if event.type() == QEvent.Type.Resize:
                 self._schedule_sync_all()
@@ -1144,6 +1276,18 @@ class InspectorRefTab(QWidget):
                 self._concept._schedule_thumb_prefetch(force=True)
                 self._reference._schedule_thumb_prefetch(force=True)
         return super().eventFilter(obj, event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+        if not self.handle_explorer_drag(event):
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # type: ignore[override]
+        if not self.handle_explorer_drag(event):
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
+        if not self.handle_explorer_drop(event):
+            super().dropEvent(event)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -1184,7 +1328,10 @@ class InspectorRefTab(QWidget):
         if key != self._scanned_key:
             self._scanned_key = None
         for sec, fid in ((self._concept, "concept"), (self._reference, "reference")):
-            sec.set_folder_path(paths.get(fid))
+            folder = paths.get(fid)
+            if folder is not None:
+                ensure_entity_special_folder(folder)
+            sec.set_folder_path(folder)
 
     def notify_tab_visible(self) -> None:
         self._visible_once = True

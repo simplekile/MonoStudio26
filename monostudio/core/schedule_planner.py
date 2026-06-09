@@ -54,6 +54,9 @@ class PlannedBar:
     status_id: str
     color_hex: str
     overdue: bool
+    assignee_ids: tuple[str, ...] = ()
+    assignees: tuple[str, ...] = ()
+    assignee_id: str = ""
     assignee: str = ""
     note: str = ""
     allocation_id: str | None = None  # set when this bar comes from a stored override
@@ -306,6 +309,9 @@ def build_planned_bars(
             status_id=sid,
             color_hex=color,
             overdue=overdue,
+            assignee_ids=alloc.assignee_ids,
+            assignees=alloc.assignees,
+            assignee_id=alloc.assignee_id,
             assignee=alloc.assignee,
             note=alloc.note,
             allocation_id=alloc.id,
@@ -338,6 +344,31 @@ def compute_view_date_range_from_bars(
 
 def count_overdue_bars(bars: dict[tuple[str, str, str], PlannedBar]) -> int:
     return sum(1 for b in bars.values() if b.overdue)
+
+
+def collect_overdue_entity_keys(
+    bars: dict[tuple[str, str, str], PlannedBar],
+) -> list[tuple[str, str]]:
+    """Unique (entity_kind, entity_rel) with at least one overdue bar. Assets first."""
+    asset_keys: list[tuple[str, str]] = []
+    shot_keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for bar in bars.values():
+        if not bar.overdue:
+            continue
+        kind = (bar.entity_kind or "").strip().lower()
+        rel = (bar.entity_rel or "").replace("\\", "/").strip()
+        if not kind or not rel:
+            continue
+        key = (kind, rel)
+        if key in seen:
+            continue
+        seen.add(key)
+        if kind == "asset":
+            asset_keys.append(key)
+        else:
+            shot_keys.append(key)
+    return asset_keys + shot_keys
 
 
 @dataclass(frozen=True)

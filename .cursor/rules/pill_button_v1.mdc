@@ -1,0 +1,84 @@
+---
+description: Segmented pill buttons (Tier3Pill, SidebarScopePill) — layout, QSS, hover, corner radius
+globs: monostudio/ui_qt/**/*.py
+alwaysApply: false
+---
+
+# MONOS — Pill Button (v1)
+
+## Nguyên tắc
+- Pill là **segmented control**: nhiều segment trong **một container**, không phải nút rời lẻ.
+- **Luôn** style bằng **global QSS** trong `monostudio/ui_qt/style.py` — không inline `setStyleSheet()` cho pill.
+- Màu lấy từ `MONOS_COLORS` (`pill_*` tokens); đồng bộ với Published / primary blue.
+
+## Hai họ pill (dùng lại, không tạo objectName mới)
+
+| Họ | Widget | Container | Active state |
+|----|--------|-----------|--------------|
+| **Scope / icon nav** | `QToolButton#SidebarScopePillSegment` | `QWidget#SidebarScopePill` | property `active="true"` |
+| **Text / toggle** | `QPushButton#Tier3Pill` | `QWidget#Tier3Container` | `:checked` (QButtonGroup) |
+
+**Reuse:** title bar Dashboard/Schedule (`IconPillWidget`), sidebar Asset/Shot + footer Inbox/Guide/Outbox/Trash, Inspector tabs, Grid/List, Settings segmented, Schedule Items/Lanes/Wave.
+
+## Layout segment
+
+- Container: `#1c1e22`, viền `rgba(255,255,255,0.04)`, `border-radius: 12px`, padding ~4–6px.
+- Giữa các segment: **`vertical_icon_separator`** (`ToolbarIconSeparator`) qua `add_widgets_with_icon_separators()`.
+- **Bắt buộc** gán `position` cho mỗi segment: `left` | `center` | `right` | `solo`.
+  - Dùng `apply_pill_segment_positions(widgets)` từ `monostudio/ui_qt/toolbar_separators.py`.
+  - Hàm này tự gọi khi dùng `add_widgets_with_icon_separators`; gọi thủ công nếu segment nằm sát nhau không qua helper đó.
+
+## Bo góc (cạnh chạm vạch = round nhỏ)
+
+| position | Bo góc |
+|----------|--------|
+| `left` | trái **8px**, phải (sát vạch) **2px** |
+| `center` | **2px** cả bốn góc |
+| `right` | trái (sát vạch) **2px**, phải **8px** |
+| `solo` | **8px** cả bốn góc |
+
+Token: `pill_segment_outer_radius_px` (8), `pill_segment_join_radius_px` (2). Cạnh trong không vuông hẳn — chỉ bo rất nhẹ.
+
+## Màu & hover
+
+| State | Nền | Chữ |
+|-------|-----|-----|
+| Inactive | transparent | `#71717a` |
+| Inactive hover | `rgba(255,255,255,0.08)` | `#d4d4d8` |
+| Active / checked | `#2563eb` | `#fafafa` |
+| Active hover | `#3b82f6` | `#fafafa` |
+
+Hover **phải** đổi cả nền lẫn chữ — không chỉ sáng chữ.
+
+## Code mẫu
+
+```python
+# ✅ Scope / icon pill
+btn.setObjectName("SidebarScopePillSegment")
+btn.setProperty("position", "left")  # hoặc apply_pill_segment_positions([...])
+btn.setAutoRaise(True)
+
+# ✅ Text toggle pill
+btn.setObjectName("Tier3Pill")
+btn.setCheckable(True)
+btn.setFlat(True)
+apply_pill_segment_positions([btn_a, btn_b])
+```
+
+```python
+# ❌ BAD — QSS rải rác, bo tròn cả segment giữa, thiếu position
+btn.setStyleSheet("border-radius: 8px; background: #333;")
+```
+
+## Inspector override
+- `QWidget#InspectorPanel QToolButton#SidebarScopePillSegment` giữ cùng token hover/active; không dùng generic `QToolButton:hover` (border xám) lên pill segment.
+
+## Không thuộc rule này
+- `InboxScopeButton`, `TrayMiniFilterPill`, `WorkPublishPill`, `SettingsPillTabs` (QTabBar) — pattern riêng, không đổi sang Tier3/Scope pill trừ khi refactor có chủ đích.
+
+## Checklist khi thêm pill mới
+- [ ] Dùng `SidebarScopePill` + `SidebarScopePillSegment` **hoặc** `Tier3Container` + `Tier3Pill`.
+- [ ] QSS chỉ trong `style.py`; token `pill_*` nếu cần màu mới.
+- [ ] `apply_pill_segment_positions` trên mọi nhóm segment.
+- [ ] Separator giữa segment (nếu layout horizontal có vạch).
+- [ ] Active hover: nền `#3b82f6`; inactive hover: nền `rgba(255,255,255,0.08)`.

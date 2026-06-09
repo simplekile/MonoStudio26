@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from monostudio.core.app_paths import get_app_base_path
+from monostudio.core.inbox_date_folder import resolve_date_folder_name
 from monostudio.core.models import Asset, InboxItem, Shot
 from monostudio.core.structure_registry import StructureRegistry
 
@@ -19,6 +20,10 @@ _INBOX_DEFAULT_FOLDER = "inbox"
 META_KEY_SOURCE = "source"
 META_KEY_ADDED_AT = "added_at"
 META_KEY_DESCRIPTION = "description"
+
+
+def _meta_added_at_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def get_inbox_root(project_root: Path) -> Path:
@@ -74,6 +79,7 @@ def _build_inbox_item(
     meta: dict,
     *,
     recurse: bool = True,
+    inherited_description: str | None = None,
 ) -> InboxItem:
     try:
         rel = full_path.relative_to(inbox_root)
@@ -85,7 +91,9 @@ def _build_inbox_item(
     entry_meta = meta.get(relative_path) if isinstance(meta.get(relative_path), dict) else {}
     source = entry_meta.get(META_KEY_SOURCE) or _infer_source_from_relative_path(relative_path)
     added_at = entry_meta.get(META_KEY_ADDED_AT)
-    description = entry_meta.get(META_KEY_DESCRIPTION)
+    own_description = (entry_meta.get(META_KEY_DESCRIPTION) or "").strip() or None
+    description = own_description or ((inherited_description or "").strip() or None)
+    desc_for_children = description
 
     children: list[InboxItem] = []
     if is_dir and recurse:
@@ -93,7 +101,15 @@ def _build_inbox_item(
             for p in sorted(full_path.iterdir()):
                 if p.name.startswith("."):
                     continue
-                children.append(_build_inbox_item(p, inbox_root, meta, recurse=True))
+                children.append(
+                    _build_inbox_item(
+                        p,
+                        inbox_root,
+                        meta,
+                        recurse=True,
+                        inherited_description=desc_for_children,
+                    )
+                )
         except OSError:
             pass
 
@@ -107,6 +123,69 @@ def _build_inbox_item(
         description=description,
         children=children,
     )
+
+
+def resolve_inbox_location(project_root: Path, path: Path) -> tuple[str, Path] | None:
+    """Return (source client|freelancer, date_folder_path) for an inbox path."""
+    root = get_inbox_root(project_root)
+    try:
+        rel = Path(path).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    parts = rel.parts
+    if len(parts) < 2:
+        return None
+    source = (parts[0] or "").strip().lower()
+    if source not in ("client", "freelancer"):
+        return None
+    date_folder = (root / parts[0] / parts[1]).resolve()
+    if not date_folder.is_dir():
+        return None
+    return source, date_folder
+
+
+def flatten_inbox_for_palette(project_root: Path) -> list[dict[str, Any]]:
+    """
+    Flat search rows for command palette.
+    Searchable: studio description (inherited from parent folder on import), filename,
+    relative path, source, date folder, added_at.
+    Display: prefer description as title when set (foreign filenames stay in subtitle).
+    """
+    rows: list[dict[str, Any]] = []
+
+    def walk(node: InboxItem) -> None:
+        rel = (node.relative_path or "").replace("\\", "/")
+        parts = rel.split("/") if rel else []
+        date_folder = parts[1] if len(parts) >= 2 else ""
+        source = (node.source or (parts[0] if parts else "") or "").strip().lower()
+        name = (node.name or "").strip()
+        desc = (node.description or "").strip()
+        if not name and not desc:
+            for child in node.children:
+                walk(child)
+            return
+        title = desc or name
+        name_bit = name if desc and name else ""
+        subtitle_parts = ["Inbox", source or "?", date_folder or "?"]
+        if name_bit:
+            subtitle_parts.append(name_bit)
+        subtitle = " · ".join(p for p in subtitle_parts if p)
+        search_bits = [name, desc, rel, source, date_folder, node.added_at or ""]
+        rows.append(
+            {
+                "path": str(node.path),
+                "source": source,
+                "title": title,
+                "subtitle": subtitle,
+                "search_text": " ".join(b for b in search_bits if b).casefold(),
+            }
+        )
+        for child in node.children:
+            walk(child)
+
+    for top in scan_inbox(project_root):
+        walk(top)
+    return rows
 
 
 def scan_inbox(project_root: Path) -> list[InboxItem]:
@@ -129,6 +208,102 @@ def scan_inbox(project_root: Path) -> list[InboxItem]:
     return out
 
 
+def _relocate_meta_keys(meta: dict, old_rel: str, new_rel: str) -> None:
+    old_rel = old_rel.replace("\\", "/").rstrip("/")
+    new_rel = new_rel.replace("\\", "/").rstrip("/")
+    to_write: list[tuple[str, Any]] = []
+    for key in list(meta.keys()):
+        kn = key.replace("\\", "/")
+        if kn == old_rel or kn.startswith(old_rel + "/"):
+            suffix = kn[len(old_rel) :]
+            to_write.append((new_rel + suffix, meta.pop(key)))
+    for new_key, value in to_write:
+        meta[new_key] = value
+
+
+def move_into_inbox_folder(
+    project_root: Path,
+    source_path: Path,
+    dest_dir: Path,
+) -> bool:
+    """Move a file/folder into another inbox directory; relocate meta keys."""
+    inbox_root = get_inbox_root(project_root)
+    try:
+        inbox_res = inbox_root.resolve()
+        dest_dir = Path(dest_dir).resolve()
+        dest_dir.relative_to(inbox_res)
+        source_path = Path(source_path).resolve()
+        source_path.relative_to(inbox_res)
+    except (ValueError, OSError):
+        return False
+    if not dest_dir.is_dir() or not source_path.exists():
+        return False
+    if source_path.is_dir():
+        try:
+            dest_dir.relative_to(source_path)
+            return False
+        except ValueError:
+            pass
+    dest_path = dest_dir / source_path.name
+    if dest_path == source_path or dest_path.exists():
+        return False
+    try:
+        shutil.move(str(source_path), str(dest_path))
+    except OSError:
+        return False
+    old_rel = source_path.relative_to(inbox_res).as_posix()
+    new_rel = dest_path.relative_to(inbox_res).as_posix()
+    meta = read_inbox_meta(project_root)
+    _relocate_meta_keys(meta, old_rel, new_rel)
+    write_inbox_meta(project_root, meta)
+    return True
+
+
+def copy_into_inbox_folder(
+    project_root: Path,
+    source_path: Path,
+    dest_dir: Path,
+    *,
+    description: str | None = None,
+) -> bool:
+    """Copy a file/folder into an existing inbox directory; write meta for the new item."""
+    inbox_root = get_inbox_root(project_root)
+    try:
+        dest_dir = Path(dest_dir).resolve()
+        dest_dir.relative_to(inbox_root.resolve())
+    except (ValueError, OSError):
+        return False
+    if not dest_dir.is_dir():
+        return False
+    source_path = Path(source_path)
+    if not source_path.exists():
+        return False
+    dest_path = dest_dir / source_path.name
+    if dest_path.exists():
+        return False
+    try:
+        if source_path.is_dir():
+            shutil.copytree(source_path, dest_path)
+        else:
+            shutil.copy2(source_path, dest_path)
+    except OSError:
+        return False
+    try:
+        rel_parts = dest_dir.relative_to(inbox_root.resolve()).parts
+        source_label = rel_parts[0] if rel_parts else ""
+    except ValueError:
+        source_label = ""
+    relative_path = dest_path.relative_to(inbox_root).as_posix()
+    meta = read_inbox_meta(project_root)
+    meta[relative_path] = {
+        META_KEY_SOURCE: source_label,
+        META_KEY_ADDED_AT: _meta_added_at_iso(),
+        META_KEY_DESCRIPTION: (description or "").strip() or None,
+    }
+    write_inbox_meta(project_root, meta)
+    return True
+
+
 def add_to_inbox(
     project_root: Path,
     source_path: Path,
@@ -137,17 +312,15 @@ def add_to_inbox(
     description: str | None,
 ) -> InboxItem | None:
     """
-    Copy source_path (file or folder) into inbox under <source_label>/<date_str>/.
-    date_str default: today YYYY-MM-DD. Writes meta for the copied root.
+    Copy source_path (file or folder) into inbox under <source_label>/<date_folder>/.
+    date_str: folder name (DDMMYY_suffix, e.g. 260515_Stb) or legacy YYYY-MM-DD.
+    Default: today with project suffix. Writes meta for the copied root.
     Returns InboxItem for the new root node, or None on failure.
     """
     root = get_inbox_root(project_root)
     root.mkdir(parents=True, exist_ok=True)
-    if not date_str or not date_str.strip():
-        date_str = datetime.now().strftime("%Y-%m-%d")
-    else:
-        date_str = date_str.strip()
-    dest_dir = root / source_label / date_str
+    folder_name = resolve_date_folder_name(date_str, project_root=project_root)
+    dest_dir = root / source_label / folder_name
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / source_path.name
     if dest_path.exists():
@@ -163,7 +336,7 @@ def add_to_inbox(
     meta = read_inbox_meta(project_root)
     meta[relative_path] = {
         META_KEY_SOURCE: source_label,
-        META_KEY_ADDED_AT: datetime.now().isoformat(),
+        META_KEY_ADDED_AT: _meta_added_at_iso(),
         META_KEY_DESCRIPTION: (description or "").strip() or None,
     }
     write_inbox_meta(project_root, meta)

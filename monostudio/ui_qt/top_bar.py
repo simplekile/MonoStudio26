@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -26,14 +26,10 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.nav_pill_widgets import (
-    DASH_SCHED_PILL_SEGMENTS,
-    DASH_SCHED_PILL_W,
-    IconPillWidget,
-)
 from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators
 from monostudio.ui_qt.notification.notification_dropdown import NotificationDropdown
 from monostudio.ui_qt.notification.notification_list_dialog import NotificationListDialog
+from monostudio.ui_qt.popup_position import position_popup_near_anchor
 from monostudio.ui_qt.style import monos_font
 from monostudio.ui_qt.user_avatar import avatar_pixmap, effective_device_pixel_ratio
 
@@ -222,7 +218,6 @@ class TopBar(QWidget):
     layout_sidebar_clicked = Signal()
     layout_inspector_clicked = Signal()
     always_on_top_toggled = Signal(bool)
-    nav_page_clicked = Signal(str)  # Dashboard | Schedule
     switch_user_requested = Signal()
     edit_profile_requested = Signal()
     clear_identity_requested = Signal()
@@ -353,7 +348,7 @@ class TopBar(QWidget):
         self._btn_layout_auto.setToolTip("Auto layout — hide sidebar and Inspector when the window is narrow")
         self._btn_layout_auto.clicked.connect(self._on_layout_auto_clicked)
         self._btn_layout_sidebar = _PanelLayoutGlyphButton("sidebar", self._panel_group)
-        self._btn_layout_sidebar.setToolTip("Full sidebar or compact rail (56px)")
+        self._btn_layout_sidebar.setToolTip("Full sidebar or compact rail (68px)")
         self._btn_layout_sidebar.clicked.connect(self.layout_sidebar_clicked.emit)
         self._btn_layout_inspector = _PanelLayoutGlyphButton("inspector", self._panel_group)
         self._btn_layout_inspector.setToolTip("Show or hide Inspector")
@@ -368,17 +363,9 @@ class TopBar(QWidget):
         # Keep visuals in sync with current layout mode (sizes stay fixed).
         self._panel_compact = False
 
-        # Dashboard | Schedule — centered in title bar
-        self._nav_center_pill = IconPillWidget(DASH_SCHED_PILL_SEGMENTS, parent=self)
-        self._nav_center_pill.setMaximumWidth(DASH_SCHED_PILL_W)
-        self._nav_center_pill.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self._nav_center_pill.segment_clicked.connect(self.nav_page_clicked.emit)
-
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 10, 8, 10)
         layout.setSpacing(0)
-        layout.addStretch(1)
-        layout.addWidget(self._nav_center_pill, 0, Qt.AlignCenter)
         layout.addStretch(1)
         layout.addWidget(self._panel_group, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addSpacing(10)
@@ -483,13 +470,6 @@ class TopBar(QWidget):
         """Always re-enter auto layout (segment stays active until user uses sidebar/inspector toggles)."""
         self.layout_auto_clicked.emit()
 
-    def set_nav_page_active(self, context_name: str | None) -> None:
-        """Highlight Dashboard or Schedule in the centered title-bar pill."""
-        if context_name in ("Dashboard", "Schedule"):
-            self._nav_center_pill.set_active_segment(context_name)
-        else:
-            self._nav_center_pill.set_active_segment(None)
-
     def set_panel_layout_controls(self, *, auto: bool, sidebar_on: bool, inspector_on: bool) -> None:
         """Sync TopBar panel controls from MainWindow (block signals while updating)."""
         # Auto on: still allow Sidebar/Inspector clicks (exits Auto → manual) — only visuals are muted.
@@ -544,25 +524,9 @@ class TopBar(QWidget):
         btn.update()
 
     def _position_noti_dropdown(self) -> None:
-        btn = self._btn_noti
-        pos = btn.mapToGlobal(btn.rect().bottomLeft())
         win = self.window()
-        frame = win.frameGeometry()
-        dw = self._noti_dropdown.width()
-        dh = self._noti_dropdown.height()
-        gap = 4
-        margin = 8
-        x = pos.x()
-        y = pos.y() + gap
-        if x + dw > frame.right() - margin:
-            x = frame.right() - margin - dw
-        if x < frame.left() + margin:
-            x = frame.left() + margin
-        if y + dh > frame.bottom() - margin:
-            y = pos.y() - gap - dh
-        if y < frame.top() + margin:
-            y = frame.top() + margin
-        self._noti_dropdown.move(x, y)
+        bounds = win.frameGeometry() if win is not None else None
+        position_popup_near_anchor(self._noti_dropdown, self._btn_noti, bounds=bounds)
 
     def open_noti_dropdown(self) -> None:
         """Open the bell dropdown (e.g. from a Windows toast); does not toggle closed."""
@@ -704,8 +668,7 @@ class TopBar(QWidget):
 
     def _is_on_window_buttons(self, pos: QPoint) -> bool:
         return (
-            self._nav_center_pill.geometry().contains(pos)
-            or self._panel_group.geometry().contains(pos)
+            self._panel_group.geometry().contains(pos)
             or self._action_strip.geometry().contains(pos)
             or self._btn_min.geometry().contains(pos)
             or self._btn_max.geometry().contains(pos)

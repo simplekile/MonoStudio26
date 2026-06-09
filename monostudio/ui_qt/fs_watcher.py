@@ -365,6 +365,7 @@ class FsEventCollector(QObject):
         notes_entities: set[str] = set()
         special_folder_entities: set[str] = set()
         mention_inbox_stale = False
+        assign_inbox_stale = False
         project_root = self._project_root
         type_reg = self._type_registry
         if project_root is None or type_reg is None:
@@ -407,6 +408,12 @@ class FsEventCollector(QObject):
                 try:
                     if project_root and p.parent == (project_root / ".monostudio").resolve():
                         mention_inbox_stale = True
+                except OSError:
+                    pass
+            if p.is_file() and p.name == "assign_inbox.json":
+                try:
+                    if project_root and p.parent == (project_root / ".monostudio").resolve():
+                        assign_inbox_stale = True
                 except OSError:
                     pass
             ent_special = _entity_path_if_special_folder_touch(
@@ -452,6 +459,6 @@ class FsEventCollector(QObject):
             s_list = list(special_folder_entities)
             _watcher_log.debug("watcher entity special folders stale count=%d", len(s_list))
             self.entitySpecialFoldersStale.emit(s_list)
-        if mention_inbox_stale:
-            _watcher_log.debug("watcher mention inbox stale")
+        if mention_inbox_stale or assign_inbox_stale:
+            _watcher_log.debug("watcher user inbox stale mention=%s assign=%s", mention_inbox_stale, assign_inbox_stale)
             self.mentionInboxStale.emit()

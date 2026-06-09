@@ -84,6 +84,7 @@ class StudioUser:
     devices: tuple[DeviceBinding, ...] = field(default_factory=tuple)
     pwd_hash: str = ""
     avatar: str = ""  # filename under <ws>/.monostudio/avatars/
+    discord_user_id: str = ""  # numeric Discord snowflake for webhook @ping
 
     @property
     def initials(self) -> str:
@@ -95,7 +96,7 @@ class StudioUser:
         return (parts[0][0] + parts[-1][0]).upper()
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "id": self.id,
             "name": self.name,
             "email": self.email,
@@ -104,10 +105,15 @@ class StudioUser:
             "departments": list(self.departments),
             "active": bool(self.active),
             "created_at": self.created_at,
-            "devices": [d.to_dict() for d in self.devices],
+            "devices": [dev.to_dict() for dev in self.devices],
             "pwd_hash": self.pwd_hash,
-            "avatar": self.avatar,
         }
+        if self.avatar.strip():
+            d["avatar"] = self.avatar
+        did = (self.discord_user_id or "").strip()
+        if did:
+            d["discord_user_id"] = did
+        return d
 
 
 def _user_from_dict(raw: dict) -> StudioUser | None:
@@ -143,6 +149,7 @@ def _user_from_dict(raw: dict) -> StudioUser | None:
         devices=tuple(devices),
         pwd_hash=str(raw.get("pwd_hash") or "").strip(),
         avatar=str(raw.get("avatar") or "").strip(),
+        discord_user_id=normalize_discord_user_id(str(raw.get("discord_user_id") or "")),
     )
 
 
@@ -152,6 +159,7 @@ def _replace_user(u: StudioUser, **changes) -> StudioUser:
         "role": u.role, "departments": u.departments, "active": u.active,
         "created_at": u.created_at, "devices": u.devices,
         "pwd_hash": u.pwd_hash, "avatar": u.avatar,
+        "discord_user_id": u.discord_user_id,
     }
     data.update(changes)
     return StudioUser(**data)
@@ -606,6 +614,129 @@ def resolve_user_name(
     return (fallback or "").strip() or _os_user_name() or "Artist"
 
 
+_LEGACY_ASSIGNEE_COLOR = "#71717a"
+
+
+def match_roster_user_by_name(
+    workspace_root: Path | None,
+    name: str,
+) -> StudioUser | None:
+    """Match a legacy assignee text field to a roster user (case-insensitive)."""
+    needle = (name or "").strip().casefold()
+    if not needle:
+        return None
+    for user in read_roster(workspace_root):
+        if not user.active:
+            continue
+        if (user.name or "").strip().casefold() == needle:
+            return user
+    return None
+
+
+def parse_assignee_ids_raw(raw: dict) -> tuple[str, ...]:
+    """Read assignee_ids array with legacy assignee_id fallback."""
+    seen: list[str] = []
+    raw_list = raw.get("assignee_ids")
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            uid = str(item or "").strip()
+            if uid and uid not in seen:
+                seen.append(uid)
+    legacy = str(raw.get("assignee_id") or "").strip()
+    if legacy and legacy not in seen:
+        seen.insert(0, legacy)
+    return tuple(seen)
+
+
+def normalize_assignee_ids(ids: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    seen: list[str] = []
+    for item in ids or ():
+        uid = str(item or "").strip()
+        if uid and uid not in seen:
+            seen.append(uid)
+    return tuple(seen)
+
+
+def parse_assignee_names_raw(raw: dict, ids: tuple[str, ...]) -> tuple[str, ...]:
+    raw_names = raw.get("assignees")
+    if isinstance(raw_names, list):
+        names = [str(n or "").strip() for n in raw_names if str(n or "").strip()]
+        if len(names) == len(ids):
+            return tuple(names)
+    legacy = str(raw.get("assignee") or "").strip()
+    if legacy and len(ids) == 1:
+        return (legacy,)
+    return tuple(ids)
+
+
+def resolve_assignee_names(
+    workspace_root: Path | None,
+    ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    names: list[str] = []
+    for uid in ids:
+        name = resolve_user_name(workspace_root, uid, fallback=uid)
+        if name:
+            names.append(name)
+    return tuple(names)
+
+
+def format_assignees_label(
+    names: tuple[str, ...] | list[str],
+    *,
+    max_shown: int = 2,
+) -> str:
+    clean = [(n or "").strip() for n in names if (n or "").strip()]
+    if not clean:
+        return ""
+    if len(clean) <= max_shown:
+        return ", ".join(clean)
+    return f"{clean[0]} +{len(clean) - 1}"
+
+
+def build_schedule_assignee_fields(
+    workspace_root: Path | None,
+    ids: list[str] | tuple[str, ...] | None,
+) -> tuple[tuple[str, ...], tuple[str, ...], str, str]:
+    """Return (assignee_ids, assignees, legacy assignee_id, legacy assignee label)."""
+    norm = normalize_assignee_ids(ids)
+    names = resolve_assignee_names(workspace_root, norm)
+    legacy_id = norm[0] if norm else ""
+    legacy_label = ", ".join(names) if names else ""
+    return norm, names, legacy_id, legacy_label
+
+
+def resolve_assignee_display(
+    workspace_root: Path | None,
+    *,
+    assignee_id: str = "",
+    assignee_name: str = "",
+    assignee_ids: tuple[str, ...] | list[str] | None = None,
+) -> tuple[str, str]:
+    """Return (display_name, color_hex) for schedule assignee fields."""
+    ids = normalize_assignee_ids(assignee_ids)
+    if not ids and (assignee_id or "").strip():
+        ids = ((assignee_id or "").strip(),)
+    if ids:
+        names: list[str] = []
+        color = _LEGACY_ASSIGNEE_COLOR
+        for uid in ids:
+            u = get_user(workspace_root, uid)
+            if u is not None and (u.name or "").strip():
+                names.append(u.name.strip())
+                if len(ids) == 1 or not names[:-1]:
+                    color = (u.color_hex or "#3b82f6").strip() or "#3b82f6"
+            elif uid:
+                names.append(uid)
+        label = format_assignees_label(names)
+        if label:
+            return label, color
+    cached = (assignee_name or "").strip()
+    if cached:
+        return cached, _LEGACY_ASSIGNEE_COLOR
+    return "", ""
+
+
 # --------------------------------------------------------------------------- #
 # Passwords (PBKDF2-HMAC-SHA256, stdlib only). Soft gate, not real security.
 # --------------------------------------------------------------------------- #
@@ -680,6 +811,24 @@ def normalize_studio_role(role: str | None) -> str:
     return raw or "artist"
 
 
+def normalize_discord_user_id(raw: str) -> str:
+    """Return a Discord snowflake user id, or empty if invalid."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("<@") and s.endswith(">"):
+        s = s[2:-1].strip()
+    if s.startswith("@"):
+        s = s[1:].strip()
+    if not s.isdigit() or not (17 <= len(s) <= 20):
+        return ""
+    return s
+
+
+def is_valid_discord_user_id(raw: str) -> bool:
+    return bool(normalize_discord_user_id(raw))
+
+
 def studio_role_label(role: str) -> str:
     """Human label for UI (Artist, Lead, …)."""
     r = normalize_studio_role(role)
@@ -692,6 +841,24 @@ def set_user_role(workspace_root: Path, user_id: str, role: str) -> StudioUser |
     if user is None:
         return None
     updated = _replace_user(user, role=normalize_studio_role(role))
+    upsert_user(workspace_root, updated)
+    return updated
+
+
+def set_user_discord_id(
+    workspace_root: Path,
+    user_id: str,
+    discord_user_id: str,
+) -> StudioUser | None:
+    """Set Discord snowflake for webhook @ping. Caller should validate non-empty ids."""
+    user = get_user(workspace_root, user_id)
+    if user is None:
+        return None
+    raw = (discord_user_id or "").strip()
+    normalized = normalize_discord_user_id(raw) if raw else ""
+    if raw and not normalized:
+        return None
+    updated = _replace_user(user, discord_user_id=normalized)
     upsert_user(workspace_root, updated)
     return updated
 

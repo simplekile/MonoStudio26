@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeyEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -64,10 +64,19 @@ class _MentionRowWidget(QWidget):
 class NoteMentionPopup(QFrame):
     user_selected = Signal(object)  # StudioUser
 
-    def __init__(self, parent=None, *, workspace_root: Path | None = None) -> None:
-        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+    def __init__(
+        self,
+        parent=None,
+        *,
+        workspace_root: Path | None = None,
+        compose_editor=None,
+    ) -> None:
+        super().__init__(parent)
         self.setObjectName("NoteMentionPopup")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self._workspace_root = Path(workspace_root) if workspace_root else None
+        self._compose_editor = compose_editor
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -75,6 +84,7 @@ class NoteMentionPopup(QFrame):
 
         self._list = QListWidget(self)
         self._list.setObjectName("NoteMentionList")
+        self._list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._list.setUniformItemSizes(True)
@@ -85,6 +95,7 @@ class NoteMentionPopup(QFrame):
 
         self._users: list[StudioUser] = []
         self.setFixedWidth(232)
+        self.hide()
 
     def set_users(self, users: list[StudioUser]) -> None:
         self._users = [u for u in users if u.active]
@@ -92,7 +103,12 @@ class NoteMentionPopup(QFrame):
     def reload_users(self) -> None:
         self.set_users(read_roster(self._workspace_root))
 
-    def show_filtered(self, global_pos, *, query: str) -> None:
+    def hide(self) -> None:  # type: ignore[override]
+        self._list.clear()
+        self._list.setFixedHeight(0)
+        super().hide()
+
+    def show_filtered(self, *, query: str) -> bool:
         q = (query or "").strip().lower()
         self._list.clear()
         matched = 0
@@ -113,15 +129,46 @@ class NoteMentionPopup(QFrame):
                 break
         if matched == 0:
             self.hide()
-            return
+            return False
         list_h = min(matched, _MAX_ROWS) * _ROW_H + 8
         self._list.setFixedHeight(list_h)
         self.adjustSize()
-        self.move(global_pos)
         self.show()
-        self.raise_()
         if self._list.count() > 0:
             self._list.setCurrentRow(0)
+            self._list.scrollToItem(self._list.item(0))
+        return True
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        editor = self._compose_editor
+        if editor is not None and hasattr(editor, "_try_handle_mention_key"):
+            if editor._try_handle_mention_key(event):  # type: ignore[attr-defined]
+                return
+        super().keyPressEvent(event)
+
+    def selected_user(self) -> StudioUser | None:
+        if not self.isVisible() or self._list.count() == 0:
+            return None
+        item = self._list.currentItem()
+        if item is None:
+            row = self._list.currentRow()
+            if row >= 0:
+                item = self._list.item(row)
+        if item is None:
+            item = self._list.item(0)
+        if item is None:
+            return None
+        user = item.data(Qt.ItemDataRole.UserRole)
+        return user if isinstance(user, StudioUser) else None
+
+    def move_selection(self, delta: int) -> None:
+        if not self.isVisible() or self._list.count() == 0:
+            return
+        row = self._list.currentRow()
+        if row < 0:
+            row = 0
+        row = max(0, min(self._list.count() - 1, row + delta))
+        self._list.setCurrentRow(row)
 
     def _on_item(self, item: QListWidgetItem) -> None:
         user = item.data(Qt.ItemDataRole.UserRole)

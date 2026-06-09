@@ -1,0 +1,83 @@
+---
+description: MONOS — Popover/popup positioning via popup_position (flip + clamp, không cắt mép màn hình)
+alwaysApply: true
+---
+
+# MONOS — Popover Position (v1)
+
+## Mục đích
+
+Mọi **popover / popup tự định vị** (QFrame + `Qt.Popup`, dropdown panel, picker…) phải **flip + clamp** để không bị cắt khi chạm mép màn hình hoặc cửa sổ.
+
+**Module duy nhất:** [`monostudio/ui_qt/popup_position.py`](monostudio/ui_qt/popup_position.py)
+
+| Tình huống | Hàm |
+|------------|-----|
+| Popup dưới nút / badge / nav item | `position_popup_near_anchor(popup, anchor, …)` |
+| Anchor là điểm global (picker row, …) | `position_popup_near_global_point(popup, global_anchor, anchor_rect_global=…)` |
+| Popup con trong parent ( @mention trong editor ) | `position_child_popup_near_global_point(popup, parent, global_anchor, bounds=…)` |
+| Popup phía trên rect (tray icon) | `position_popup_above_rect(popup, anchor_rect_global, …)` |
+| Chỉ cần tọa độ (hiếm) | `clamp_popup_global_pos(popup, global_anchor, …)` |
+| List cao — giới hạn trước khi show | `max_popup_height_for_anchor(anchor)` + scroll |
+
+**Mặc định:** `gap=4`, `margin=8` (`DEFAULT_POPUP_GAP`, `DEFAULT_POPUP_MARGIN`).
+
+---
+
+## Bắt buộc
+
+- **Luôn** gọi helper trên **sau khi** layout xong (`adjustSize` nằm trong helper) và **trước** `show()`.
+- **Không** copy logic clamp/flip sang file khác.
+- **Không** dùng `popup.move(anchor.mapToGlobal(...))` trực tiếp cho popover mới.
+
+```python
+# ❌ BAD
+pos = btn.mapToGlobal(btn.rect().bottomLeft())
+popup.move(pos.x(), pos.y() + 4)
+
+# ✅ GOOD
+from monostudio.ui_qt.popup_position import position_popup_near_anchor
+position_popup_near_anchor(popup, btn)
+popup.show()
+```
+
+---
+
+## Chọn `bounds` (vùng clamp)
+
+| Ngữ cảnh | `bounds` |
+|----------|----------|
+| Nav rail, sidebar, main view, inspector | `None` → màn hình (`availableGeometry`) |
+| Top bar notification (trong cửa sổ app) | `anchor.window().frameGeometry()` |
+| @mention / inline trong widget | `QRect(widget.mapToGlobal(QPoint(0,0)), widget.size())` |
+| Tray mini popup | `position_popup_above_rect` + rect tray |
+
+Nav rail popover mở sang phải rail: `x_offset=ICON_INSET_X` (từ `nav_rail_expand_item`).
+
+---
+
+## Nội dung cao
+
+- Gọi `max_popup_height_for_anchor(anchor)` → `popup.setMaximumHeight(...)` hoặc cap chiều cao list.
+- Bọc nội dung dài trong `QScrollArea` nếu panel không tự scroll.
+- List: `setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)` khi vượt cap.
+
+---
+
+## Không thuộc rule này
+
+- **`QMenu.popup()`** — context menu, project switch; Qt tự xử lý vị trí.
+- **Nav rail hover flyout** (`NavRailFlyout`) — expand inline, không phải dropdown.
+- **Tooltip** — xem `tooltip_qss_v1.mdc`.
+- **Bo góc popup** — xem `round_corner_standard_v1.mdc` nếu cần mask/paint.
+
+---
+
+## Checklist popover mới
+
+- [ ] `Qt.Popup | Qt.FramelessWindowHint` (hoặc pattern MonosMenu cho menu).
+- [ ] Style QSS global (`style.py`) + `objectName` riêng nếu cần.
+- [ ] Toggle + reopen grace (`_POPUP_REOPEN_GRACE`) nếu gắn nút toolbar/nav.
+- [ ] `position_popup_*` từ `popup_position.py` — **không** `move()` thô.
+- [ ] Cap chiều cao / scroll nếu list hoặc panel dài.
+- [ ] `hideEvent` / callback: clear stuck hover trên anchor (pattern TopBar / nav rail).

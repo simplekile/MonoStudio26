@@ -25,6 +25,10 @@ alwaysApply: true
 - **8px grid**
 - **Default line-height**: 1.5
 
+## Production UI (see `production_ui_v1.mdc`)
+- Inspector **cards**: padding 16px, content indent 12px, card BG brighter than panel, border `rgba(255,255,255,0.06)`.
+- **In-card field labels** (Delivery, Assignee): 12px Medium, `text_label` — not block-title size.
+
 ## Enforcement in code
 - Default QApp font: Inter
 - Any path/ID/log value fields must be styled/marked as monospace (JetBrains Mono)

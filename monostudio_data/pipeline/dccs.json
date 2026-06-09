@@ -92,6 +92,15 @@
       "brand_icon_slug": "substancepainter",
       "brand_color_hex": "#eeeeee"
     },
+    "affinity": {
+      "label": "Affinity",
+      "executable": "Affinity.exe",
+      "folder": "affinity",
+      "departments": ["surfacing", "baking", "lookdev", "texturing"],
+      "workfile_extensions": [".af", ".afphoto"],
+      "brand_icon_slug": "affinity",
+      "brand_color_hex": "#a7f175"
+    },
     "rizomuv": {
       "label": "RizomUV",
       "executable": "rizomuv",

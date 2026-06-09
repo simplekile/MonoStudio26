@@ -125,8 +125,10 @@ def _brand_icon_cached(slug: str, size: int, color_hex: str | None, _token: tupl
         pm_2x.setDevicePixelRatio(2.0)
         out.addPixmap(pm_2x)
         return out
-    color = (color_hex or MONOS_COLORS["text_primary"]).strip()
-    svg = _apply_fill(svg, color)
+    # Multi-color marks (e.g. Affinity app logo) ship embedded fills; do not tint via root fill.
+    if 'data-monos-preserve-colors="true"' not in svg:
+        color = (color_hex or MONOS_COLORS["text_primary"]).strip()
+        svg = _apply_fill(svg, color)
 
     renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
     if not renderer.isValid():

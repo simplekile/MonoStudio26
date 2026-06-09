@@ -7,7 +7,7 @@ import re
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QUrl
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QUrl
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -20,7 +20,7 @@ from PySide6.QtGui import (
     QTextDocument,
     QTextImageFormat,
 )
-from PySide6.QtWidgets import QSizePolicy, QTextEdit
+from PySide6.QtWidgets import QApplication, QSizePolicy, QTextEdit
 
 from monostudio.ui_qt.note_image_frame import (
     NOTE_IMG_BOX_SIZE,
@@ -41,14 +41,20 @@ from monostudio.core.user_identity import StudioUser, read_roster
 from monostudio.ui_qt.note_mention_popup import NoteMentionPopup
 from monostudio.ui_qt.note_image_hit_test import image_href_at_widget_pos
 from monostudio.ui_qt.note_image_viewer_dialog import NoteImageViewerDialog
+from monostudio.ui_qt.popup_position import position_child_popup_near_global_point
 from monostudio.ui_qt.style import monos_font
 
 _FULL_IMG_MAX_PX = 1920
 NOTE_LINE_MIN_H = NOTE_IMG_BOX_SIZE + 6
 NOTE_BLOCK_BOTTOM_MARGIN = 6
+NOTE_BODY_FONT_SIZE = 11
+NOTE_BODY_FONT = monos_font("Inter", NOTE_BODY_FONT_SIZE, QFont.Weight.Normal)
+NOTE_BODY_COLOR = "#e4e4e7"
 _LH_MINIMUM = QTextBlockFormat.LineHeightTypes.MinimumHeight.value
 NOTE_RICH_TEXT_STYLESHEET = (
-    "body, p, li { margin-top: 0px; margin-bottom: 6px; line-height: 1.5; }"
+    f"body, p, li, a, span {{ font-family: Inter; font-size: {NOTE_BODY_FONT_SIZE}pt; }}"
+    f"body, p, li {{ margin-top: 0px; margin-bottom: 6px; line-height: 1.5; color: {NOTE_BODY_COLOR}; }}"
+    "a { text-decoration: none; }"
     "img { vertical-align: top; }"
 )
 
@@ -132,7 +138,7 @@ class NoteComposeEditor(QTextEdit):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("ItemNotesAddEditor")
-        self.setFont(monos_font("Inter", 13))
+        self.setFont(NOTE_BODY_FONT)
         self.setAcceptRichText(True)
         self.setMinimumHeight(200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -142,13 +148,23 @@ class NoteComposeEditor(QTextEdit):
         self._entry_id = uuid.uuid4().hex[:16]
         self._monostudio_dir = self._item_root / ".monostudio"
         self._media_dir = note_media_entry_dir(self._item_root, self._entry_id)
-        self._mention_popup = NoteMentionPopup(self, workspace_root=self._workspace_root)
+        self._mention_popup = NoteMentionPopup(
+            self,
+            workspace_root=self._workspace_root,
+            compose_editor=self,
+        )
+        self._sync_mention_popup_host()
+        self._mention_popup.hide()
         self._mention_popup.user_selected.connect(self._insert_mention)
         self._mention_popup.set_users(read_roster(self._workspace_root))
         self._mention_start = -1
+        self._mention_key_capture_host: QObject | None = None
+        self.installEventFilter(self)
         self.document().setBaseUrl(QUrl.fromLocalFile(str(self._monostudio_dir) + os.sep))
+        self.document().setDefaultFont(NOTE_BODY_FONT)
         self.document().setDefaultStyleSheet(NOTE_RICH_TEXT_STYLESHEET)
         self.document().setDocumentMargin(4)
+        self._apply_default_cursor_format()
         self.viewport().setMouseTracking(True)
         self._hover_img_href: str | None = None
 
@@ -210,8 +226,24 @@ class NoteComposeEditor(QTextEdit):
                         return True
         return super().viewportEvent(event)
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        self._sync_mention_popup_host()
+        super().showEvent(event)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._ensure_mention_key_capture(False)
+        super().closeEvent(event)
+
+    def _sync_mention_popup_host(self) -> None:
+        host = self.window()
+        if host is None or self._mention_popup.parentWidget() is host:
+            return
+        self._mention_popup.setParent(host)
+        self._mention_popup.hide()
+
     def reset_draft(self) -> None:
         self.clear()
+        self._apply_default_cursor_format()
         self._entry_id = uuid.uuid4().hex[:16]
         self._media_dir = note_media_entry_dir(self._item_root, self._entry_id)
 
@@ -223,11 +255,13 @@ class NoteComposeEditor(QTextEdit):
         self._entry_id = eid
         self._media_dir = note_media_entry_dir(self._item_root, self._entry_id)
         self.clear()
+        self._apply_default_cursor_format()
         html = (body_html or "").strip()
         if not html and plain_fallback:
             html = f"<p>{plain_fallback.replace(chr(10), '<br>')}</p>"
         if html:
             self.setHtml(note_html_for_display(html))
+            self._apply_default_cursor_format()
 
     @property
     def draft_entry_id(self) -> str:
@@ -252,7 +286,10 @@ class NoteComposeEditor(QTextEdit):
                 self._insert_image(img)
                 return
         if source.hasText():
-            self.textCursor().insertText(source.text())
+            cursor = self.textCursor()
+            cursor.setCharFormat(self._body_char_format())
+            cursor.insertText(source.text())
+            self.setTextCursor(cursor)
             return
 
     def _insert_image(self, img: QImage) -> None:
@@ -275,28 +312,123 @@ class NoteComposeEditor(QTextEdit):
         fmt.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignTop)
         cursor = self.textCursor()
         cursor.insertImage(fmt)
+        cursor.setCharFormat(self._body_char_format())
         cursor.insertText(" ")
         self.setTextCursor(cursor)
         normalize_note_document_spacing(self.document())
 
-    def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
-        if self._mention_popup.isVisible():
-            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
-                row = self._mention_popup._list.currentRow()
-                if row >= 0:
-                    item = self._mention_popup._list.item(row)
-                    if item is not None:
-                        user = item.data(Qt.ItemDataRole.UserRole)
-                        if isinstance(user, StudioUser):
-                            self._insert_mention(user)
-                            event.accept()
-                            return
-            if event.key() == Qt.Key.Key_Escape:
-                self._mention_popup.hide()
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and self._mention_popup.isVisible()
+        ):
+            fw = QApplication.focusWidget()
+            if fw is not None and (fw is self or self.isAncestorOf(fw)):
+                if self._try_handle_mention_key(event):
+                    return True
+        if (
+            watched is self
+            and event.type() == QEvent.Type.ShortcutOverride
+            and isinstance(event, QKeyEvent)
+            and self._mention_popup.isVisible()
+            and event.key()
+            in (
+                Qt.Key.Key_Return,
+                Qt.Key.Key_Enter,
+                Qt.Key.Key_Tab,
+                Qt.Key.Key_Up,
+                Qt.Key.Key_Down,
+                Qt.Key.Key_Escape,
+            )
+        ):
+            event.accept()
+        return super().eventFilter(watched, event)
+
+    def event(self, event: QEvent) -> bool:  # type: ignore[override]
+        if (
+            event.type() == QEvent.Type.ShortcutOverride
+            and self._mention_popup.isVisible()
+            and isinstance(event, QKeyEvent)
+            and event.key()
+            in (
+                Qt.Key.Key_Return,
+                Qt.Key.Key_Enter,
+                Qt.Key.Key_Tab,
+                Qt.Key.Key_Up,
+                Qt.Key.Key_Down,
+                Qt.Key.Key_Escape,
+            )
+        ):
+            event.accept()
+        return super().event(event)
+
+    def _try_handle_mention_key(self, event: QKeyEvent) -> bool:
+        if not self._mention_popup.isVisible():
+            return False
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
+            user = self._mention_popup.selected_user()
+            if user is not None:
+                self._insert_mention(user)
                 event.accept()
-                return
+                return True
+        if key == Qt.Key.Key_Up:
+            self._mention_popup.move_selection(-1)
+            event.accept()
+            return True
+        if key == Qt.Key.Key_Down:
+            self._mention_popup.move_selection(1)
+            event.accept()
+            return True
+        if key == Qt.Key.Key_Escape:
+            self._hide_mention_popup()
+            event.accept()
+            return True
+        return False
+
+    def _ensure_mention_key_capture(self, active: bool) -> None:
+        app = QApplication.instance()
+        if not isinstance(app, QApplication):
+            return
+        if active:
+            if self._mention_key_capture_host is not app:
+                if self._mention_key_capture_host is not None:
+                    self._mention_key_capture_host.removeEventFilter(self)
+                app.installEventFilter(self)
+                self._mention_key_capture_host = app
+        elif self._mention_key_capture_host is not None:
+            self._mention_key_capture_host.removeEventFilter(self)
+            self._mention_key_capture_host = None
+
+    def _hide_mention_popup(self) -> None:
+        self._mention_popup.hide()
+        self._ensure_mention_key_capture(False)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if self._try_handle_mention_key(event):
+            return
+        if event.text() and event.text().isprintable():
+            cursor = self.textCursor()
+            if not cursor.charFormat().isAnchor():
+                cursor.mergeCharFormat(self._body_char_format())
+                self.setTextCursor(cursor)
         super().keyPressEvent(event)
         self._maybe_show_mention_popup()
+
+    def _body_char_format(self, *, weight: QFont.Weight = QFont.Weight.Normal) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        font = QFont(NOTE_BODY_FONT)
+        font.setWeight(weight)
+        fmt.setFont(font)
+        fmt.setForeground(QColor(NOTE_BODY_COLOR))
+        fmt.setAnchor(False)
+        return fmt
+
+    def _apply_default_cursor_format(self) -> None:
+        cursor = self.textCursor()
+        cursor.setCharFormat(self._body_char_format())
+        self.setTextCursor(cursor)
 
     def _maybe_show_mention_popup(self) -> None:
         cursor = self.textCursor()
@@ -304,19 +436,42 @@ class NoteComposeEditor(QTextEdit):
         text_before = block.text()[: cursor.positionInBlock()]
         at_idx = text_before.rfind("@")
         if at_idx < 0:
-            self._mention_popup.hide()
+            self._hide_mention_popup()
             return
         query = text_before[at_idx + 1 :]
         if " " in query or "\n" in query:
-            self._mention_popup.hide()
+            self._hide_mention_popup()
             return
         self._mention_start = block.position() + at_idx
         cr = self.cursorRect()
-        global_pos = self.mapToGlobal(cr.bottomLeft())
-        self._mention_popup.show_filtered(global_pos, query=query)
+        global_anchor = self.viewport().mapToGlobal(cr.bottomLeft())
+        if self._mention_popup.show_filtered(query=query):
+            self._place_mention_popup(global_anchor)
+            self._ensure_mention_key_capture(True)
+        else:
+            self._ensure_mention_key_capture(False)
+
+    def _place_mention_popup(self, global_anchor: QPoint) -> None:
+        popup = self._mention_popup
+        parent = popup.parentWidget()
+        if parent is None:
+            return
+        editor_rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
+        cr = self.cursorRect()
+        cursor_global = self.viewport().mapToGlobal(cr.topLeft())
+        anchor_rect = QRect(cursor_global, cr.size())
+        position_child_popup_near_global_point(
+            popup,
+            parent,
+            QPoint(global_anchor.x(), global_anchor.y() + 2),
+            anchor_rect_global=anchor_rect,
+            bounds=editor_rect,
+            gap=2,
+        )
+        popup.raise_()
 
     def _insert_mention(self, user: StudioUser) -> None:
-        self._mention_popup.hide()
+        self._hide_mention_popup()
         cursor = self.textCursor()
         end = cursor.position()
         if self._mention_start >= 0:
@@ -324,11 +479,12 @@ class NoteComposeEditor(QTextEdit):
             cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
             cursor.removeSelectedText()
         name = user.name or user.id
-        fmt = QTextCharFormat()
+        fmt = self._body_char_format(weight=QFont.Weight.DemiBold)
         fmt.setAnchor(True)
         fmt.setAnchorHref(mention_href_for_user(user.id))
         fmt.setForeground(QColor(user.color_hex or "#60a5fa"))
-        fmt.setFontWeight(QFont.Weight.DemiBold)
-        cursor.insertText(f"@{name} ", fmt)
+        cursor.insertText(f"@{name}", fmt)
+        cursor.setCharFormat(self._body_char_format())
+        cursor.insertText(" ")
         self.setTextCursor(cursor)
         self._mention_start = -1

@@ -1,0 +1,58 @@
+---
+description: Production Management UI — hierarchy, spacing, status, cards (Inspector & pipeline views)
+globs: monostudio/ui_qt/**
+alwaysApply: false
+---
+
+# Production Management UI (v1)
+
+## Philosophy
+Information first. Status readable in ~3s. Low noise. 8+ hour daily use. No heavy gradients, shadows, glass, or decorative animation.
+
+## Reconcile with `typography_font_stack_v1`
+| Role | Size | Weight | Case | Color |
+|------|------|--------|------|-------|
+| **Block title** (SCHEDULE, DEPARTMENTS) | 10–11px | 800 | UPPERCASE optional | Zinc-500 (`text_meta`) |
+| **In-card field label** (Delivery, Assignee, Modelling group) | **12px** | 500–600 | Title case | `#a1a1aa` (`text_label`) |
+| **Body / values** | 13–14px | 500 | — | Zinc-200/300 |
+| **Metadata** (dates, version, hints) | 12px mono or sans | 500 | — | `#71717a` (`text_meta`) |
+
+Use **max 3 visual sizes** per card: block title · body · metadata.
+
+## Containers (Rules 02–04)
+- **Page BG**: `#121214` (`content_bg`)
+- **Panel BG**: `#18181b` (`panel`)
+- **Card BG**: **brighter than panel** — e.g. `#1e2124` (+4–8% brightness). Never same as panel.
+- **Nested sub-card** (inside card): brighter again — e.g. `#25282c`, padding **12px**, radius **6px**, same border token.
+- **Card border**: `1px solid rgba(255,255,255,0.06)` — not heavy shadow.
+- **Card padding**: **16px**
+- **Sub-card content indent**: **8px**; card content indent: **12px**
+- **Spacing**: 8pt grid only — `4, 8, 16, 24, 32` (no 6, 10, 13, 19…)
+
+## Status (Rules 07–08)
+One color = one meaning. **Status visible before** task name / dept chip in compact rows.
+
+| Meaning | Color |
+|---------|-------|
+| Approved / Done | Green `#10b981` |
+| Published | Cyan (pipeline token) |
+| Working / In progress | Orange / Blue (pipeline token — pick one per surface) |
+| Waiting | Gray `#71717a` |
+| Review | Blue |
+| Blocked / Overdue | Red `#ef4444` |
+
+## Cards & actions (Rules 09–10, 15–16)
+- One card = one purpose (Status · Schedule · Files · Notes — separate).
+- Card header weight > content weight.
+- **Most-used action first** in header (e.g. Open before Edit).
+- **One primary button** per context; rest secondary (`DialogSecondaryButton`).
+
+## Progress (Rule 18)
+Prefer bar + percentage over number alone (`_ScheduleTimelineBar` pattern).
+
+## Thumbnail (Rule 17)
+Inspector identity: target **25–30%** height for preview, **70–75%** data (future pass on `_IdentityBlock`).
+
+## Enforcement
+- Global QSS in `monostudio/ui_qt/style.py` — object names e.g. `InspectorScheduleCard`, `InspectorFieldLabel`.
+- Layout constants in widget modules (`_CARD_PAD = 16`, `_CONTENT_INDENT = 12`).

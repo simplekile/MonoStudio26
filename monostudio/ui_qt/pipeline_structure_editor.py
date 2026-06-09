@@ -8,8 +8,8 @@ from __future__ import annotations
 from enum import IntEnum
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QSize, QModelIndex, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QPainter
+from PySide6.QtCore import Qt, Signal, QSize, QModelIndex, QTimer, QRect
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStyleOptionViewItem,
     QAbstractItemView,
+    QStyledItemDelegate,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -63,7 +64,7 @@ from monostudio.core.project_create_defaults import (
 )
 from monostudio.core.structure_registry import StructureRegistry, save_project_structure
 from monostudio.core.type_registry import TypeRegistry, get_default_type_mapping, save_project_types
-from monostudio.ui_qt.inbox_split_view import _InboxTreeDelegate
+from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 
 
@@ -96,8 +97,11 @@ KIND_COLORS_HEX = {
 }
 
 
-class _PipelineStructureTreeDelegate(_InboxTreeDelegate):
-    """Full-row selection, Lucide chevron branches (same as Inbox); label color by node kind."""
+_BRANCH_ICON_SIZE = 14
+
+
+class _PipelineStructureTreeDelegate(QStyledItemDelegate):
+    """Pipeline settings tree: kind-colored labels + branch chevrons (QStandardItemModel)."""
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
         opt = QStyleOptionViewItem(option)
@@ -110,7 +114,25 @@ class _PipelineStructureTreeDelegate(_InboxTreeDelegate):
                     opt.palette.setColor(opt.palette.ColorRole.Text, QColor(c))
             except (TypeError, ValueError):
                 pass
-        super().paint(painter, opt, index)
+
+        view = option.widget
+        model = index.model()
+        QStyledItemDelegate.paint(self, painter, opt, index)
+
+        if (
+            view is not None
+            and index.isValid()
+            and model is not None
+            and model.hasChildren(index)
+        ):
+            row_rect = option.rect
+            ind = view.indentation()
+            branch_rect = QRect(row_rect.x() - ind, row_rect.y(), ind, row_rect.height())
+            icon_name = "chevron-down" if view.isExpanded(index) else "chevron-right"
+            chevron = lucide_icon(icon_name, size=_BRANCH_ICON_SIZE, color_hex=MONOS_COLORS["text_label"])
+            painter.save()
+            chevron.paint(painter, branch_rect, Qt.AlignmentFlag.AlignCenter, QIcon.Mode.Normal)
+            painter.restore()
 
 
 def _is_shot_type_id(type_id: str) -> bool:

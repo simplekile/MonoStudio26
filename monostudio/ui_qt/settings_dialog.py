@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.dcc_affinity import resolve_affinity_executable
 from monostudio.core.dcc_blender import resolve_blender_executable
 from monostudio.core.dcc_houdini import resolve_houdini_executable
 from monostudio.core.dcc_maya import resolve_maya_executable
@@ -342,6 +343,7 @@ class SettingsDialog(MonosDialog):
     workspace_root_selected = Signal(str)
     project_root_selected = Signal(str)
     access_session_changed = Signal()
+    nav_quick_slots_changed = Signal()
 
     def __init__(
         self,
@@ -374,6 +376,7 @@ class SettingsDialog(MonosDialog):
         self._houdini_exe_field: QLineEdit | None = None
         self._houdini_workfile_ext_combo: QComboBox | None = None
         self._substance_painter_exe_field: QLineEdit | None = None
+        self._affinity_exe_field: QLineEdit | None = None
         self._rizomuv_exe_field: QLineEdit | None = None
         self._pipeline_editor: PipelineStructureEditorWidget | None = None
         self._create_default_combos: dict[str, QComboBox] = {}
@@ -381,6 +384,8 @@ class SettingsDialog(MonosDialog):
         self._use_dcc_folders_cb: QCheckBox | None = None
         self._notification_max_visible_combo: QComboBox | None = None
         self._mention_delivery_combo: QComboBox | None = None
+        self._notification_vietnamese_cb: QCheckBox | None = None
+        self._discord_disabled_locally_cb: QCheckBox | None = None
         self._publish_ignore_ext_field: QLineEdit | None = None
         self._inspector_thumb_segment_asset: SettingsSegmentedControl | None = None
         self._inspector_thumb_segment_shot: SettingsSegmentedControl | None = None
@@ -398,6 +403,20 @@ class SettingsDialog(MonosDialog):
         self._access_keys_info_label: QLabel | None = None
         self._access_debug_cb: QCheckBox | None = None
         self._access_splash_spin: QSpinBox | None = None
+
+        self._discord_integrations_banner: QLabel | None = None
+        self._discord_enabled_cb: QCheckBox | None = None
+        self._discord_webhook_field: QLineEdit | None = None
+        self._discord_url_replace_btn: QPushButton | None = None
+        self._discord_label_field: QLineEdit | None = None
+        self._discord_mention_cb: QCheckBox | None = None
+        self._discord_note_done_cb: QCheckBox | None = None
+        self._discord_inbox_cb: QCheckBox | None = None
+        self._discord_schedule_cb: QCheckBox | None = None
+        self._discord_schedule_assigned_cb: QCheckBox | None = None
+        self._discord_test_btn: QPushButton | None = None
+        self._discord_stored_url: str = ""
+        self._discord_url_editing: bool = False
 
         # Tier 1: left nav — General | Pipeline | DCCs | Project
         self._content_stack = QStackedWidget(self)
@@ -676,6 +695,40 @@ class SettingsDialog(MonosDialog):
             self._refresh_windows_noti_status
         )
 
+        from monostudio.core.notification_preferences import read_notification_vietnamese
+
+        self._notification_vietnamese_cb = QCheckBox(
+            "Thông báo bằng tiếng Việt (@mention, Discord webhook)",
+            noti_card,
+        )
+        self._notification_vietnamese_cb.setToolTip(
+            "Bật mặc định. Bỏ chọn để dùng bản tiếng Anh."
+        )
+        try:
+            if self._settings is not None:
+                self._notification_vietnamese_cb.setChecked(read_notification_vietnamese(self._settings))
+        except Exception:
+            pass
+        noti_l.addWidget(self._notification_vietnamese_cb)
+
+        from monostudio.core.notification_preferences import read_discord_disabled_locally
+
+        self._discord_disabled_locally_cb = QCheckBox(
+            "Disable Discord webhooks on this machine only",
+            noti_card,
+        )
+        self._discord_disabled_locally_cb.setToolTip(
+            "Workspace webhook settings stay synced; this machine will not POST to Discord."
+        )
+        try:
+            if self._settings is not None:
+                self._discord_disabled_locally_cb.setChecked(
+                    read_discord_disabled_locally(self._settings)
+                )
+        except Exception:
+            pass
+        noti_l.addWidget(self._discord_disabled_locally_cb)
+
         self._windows_noti_status = QLabel("", noti_card)
         self._windows_noti_status.setWordWrap(True)
         self._windows_noti_status.setObjectName("DialogHelper")
@@ -695,6 +748,55 @@ class SettingsDialog(MonosDialog):
         noti_l.addWidget(test_row)
         self._refresh_windows_noti_status()
         layout.addWidget(noti_card)
+
+        qv_card, qv_l = add_settings_section(
+            inner,
+            "Quick view",
+            "Houdini-style page bookmarks: Ctrl+1–9 assigns the current page and filters; "
+            "press 1–9 to return. Slots are stored per machine.",
+        )
+        from monostudio.ui_qt.nav_quick_view import SLOT_COUNT
+
+        self._nav_quick_slot_labels: list[QLabel] = []
+        slots_grid = QWidget(qv_card)
+        slots_grid_l = QVBoxLayout(slots_grid)
+        slots_grid_l.setContentsMargins(0, 0, 0, 0)
+        slots_grid_l.setSpacing(4)
+        for slot in range(1, SLOT_COUNT + 1):
+            row = QWidget(slots_grid)
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            row_l.setSpacing(8)
+            num = QLabel(f"{slot}", row)
+            num.setObjectName("SettingsMonoValue")
+            num.setFixedWidth(20)
+            num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            summary = QLabel("", row)
+            summary.setObjectName("DialogHelper")
+            summary.setWordWrap(True)
+            self._nav_quick_slot_labels.append(summary)
+            clear_btn = QPushButton("Clear", row)
+            clear_btn.setObjectName("DialogSecondaryButton")
+            clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            clear_btn.clicked.connect(lambda _checked=False, s=slot: self._on_clear_nav_quick_slot(s))
+            row_l.addWidget(num, 0)
+            row_l.addWidget(summary, 1)
+            row_l.addWidget(clear_btn, 0)
+            slots_grid_l.addWidget(row)
+        qv_l.addWidget(slots_grid)
+
+        clear_all_row = QWidget(qv_card)
+        clear_all_l = QHBoxLayout(clear_all_row)
+        clear_all_l.setContentsMargins(0, 8, 0, 0)
+        clear_all_btn = QPushButton("Clear all slots", clear_all_row)
+        clear_all_btn.setObjectName("DialogSecondaryButton")
+        clear_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_all_btn.clicked.connect(self._on_clear_all_nav_quick_slots)
+        clear_all_l.addWidget(clear_all_btn, 0)
+        clear_all_l.addStretch(1)
+        qv_l.addWidget(clear_all_row)
+        self._refresh_nav_quick_slot_labels()
+        layout.addWidget(qv_card)
 
         insp_card, insp_l = add_settings_section(
             inner,
@@ -920,7 +1022,37 @@ class SettingsDialog(MonosDialog):
         _ready, msg = toast_readiness()
         label.setText(msg)
 
+    def _refresh_nav_quick_slot_labels(self) -> None:
+        from monostudio.ui_qt.nav_quick_view import describe_nav_quick_slot, load_nav_quick_slot
+
+        labels = getattr(self, "_nav_quick_slot_labels", None)
+        if not labels or self._settings is None:
+            return
+        for idx, summary in enumerate(labels, start=1):
+            payload = load_nav_quick_slot(self._settings, idx)
+            summary.setText(describe_nav_quick_slot(payload))
+
+    def _on_clear_nav_quick_slot(self, slot: int) -> None:
+        from monostudio.ui_qt.nav_quick_view import clear_nav_quick_slot
+
+        if self._settings is None:
+            return
+        clear_nav_quick_slot(self._settings, slot)
+        self._refresh_nav_quick_slot_labels()
+        self.nav_quick_slots_changed.emit()
+
+    def _on_clear_all_nav_quick_slots(self) -> None:
+        from monostudio.ui_qt.nav_quick_view import clear_all_nav_quick_slots
+
+        if self._settings is None:
+            return
+        clear_all_nav_quick_slots(self._settings)
+        self._refresh_nav_quick_slot_labels()
+        self.nav_quick_slots_changed.emit()
+
     def _on_test_windows_notification(self) -> None:
+        from monostudio.core.notification_copy import pick_copy
+        from monostudio.core.notification_preferences import read_notification_vietnamese
         from monostudio.core.windows_toast import show_mention_toast, toast_readiness
 
         ready, msg = toast_readiness()
@@ -928,7 +1060,9 @@ class SettingsDialog(MonosDialog):
             QMessageBox.warning(self, "Windows notification", msg)
             self._refresh_windows_noti_status()
             return
-        if show_mention_toast("MONOS", "Test notification from MONOS."):
+        vi = read_notification_vietnamese(self._settings)
+        body = pick_copy("Thông báo thử từ MONOS.", "Test notification from MONOS.", vietnamese=vi)
+        if show_mention_toast("MONOS", body):
             QMessageBox.information(
                 self,
                 "Windows notification",
@@ -1096,11 +1230,15 @@ class SettingsDialog(MonosDialog):
         self._content_stack.setCurrentIndex(row)
         if row == 1:
             self._refresh_pipeline_access_lock()
+        if row == 3:
+            self._refresh_integrations_access_lock()
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
         self._refresh_access_tab_state()
         self._refresh_pipeline_access_lock()
+        self._refresh_discord_integrations_ui()
+        self._refresh_integrations_access_lock()
 
     def _refresh_access_tab_state(self) -> None:
         if self._access_status_label is None:
@@ -1159,6 +1297,194 @@ class SettingsDialog(MonosDialog):
             else:
                 self._pipeline_access_banner.setVisible(False)
 
+    def _refresh_integrations_access_lock(self) -> None:
+        admin_ok = is_admin_capable()
+        widgets = (
+            self._discord_enabled_cb,
+            self._discord_webhook_field,
+            self._discord_url_replace_btn,
+            self._discord_label_field,
+            self._discord_mention_cb,
+            self._discord_note_done_cb,
+            self._discord_inbox_cb,
+            self._discord_schedule_cb,
+            self._discord_schedule_assigned_cb,
+            self._discord_test_btn,
+        )
+        for w in widgets:
+            if w is not None:
+                w.setEnabled(admin_ok)
+        if self._discord_integrations_banner is not None:
+            if has_access_restrictions() and not admin_ok:
+                self._discord_integrations_banner.setText(
+                    "Discord integration is locked. Unlock in General → Access with an administrator or developer key."
+                )
+                self._discord_integrations_banner.setVisible(True)
+            else:
+                self._discord_integrations_banner.setVisible(False)
+
+    def _refresh_discord_integrations_ui(self) -> None:
+        from monostudio.core.integrations_config import (
+            get_primary_webhook,
+            is_event_enabled,
+            load_integrations,
+            mask_webhook_url,
+        )
+
+        if self._discord_enabled_cb is None:
+            return
+        if self._workspace_root is None:
+            self._discord_stored_url = ""
+            self._discord_url_editing = False
+            self._discord_enabled_cb.setChecked(False)
+            if self._discord_mention_cb is not None:
+                self._discord_mention_cb.setChecked(True)
+            if self._discord_note_done_cb is not None:
+                self._discord_note_done_cb.setChecked(False)
+            if self._discord_inbox_cb is not None:
+                self._discord_inbox_cb.setChecked(False)
+            if self._discord_schedule_cb is not None:
+                self._discord_schedule_cb.setChecked(False)
+            if self._discord_schedule_assigned_cb is not None:
+                self._discord_schedule_assigned_cb.setChecked(False)
+            if self._discord_label_field is not None:
+                self._discord_label_field.clear()
+            if self._discord_webhook_field is not None:
+                self._discord_webhook_field.clear()
+                self._discord_webhook_field.setReadOnly(True)
+                self._discord_webhook_field.setPlaceholderText("Select a workspace first")
+            return
+
+        config = load_integrations(self._workspace_root)
+        discord = config.get("discord") if isinstance(config.get("discord"), dict) else {}
+        wh = get_primary_webhook(config)
+        self._discord_stored_url = str(wh.get("url") or "").strip() if wh else ""
+        self._discord_url_editing = False
+        self._discord_enabled_cb.setChecked(bool(discord.get("enabled")))
+        if self._discord_mention_cb is not None:
+            self._discord_mention_cb.setChecked(is_event_enabled(config, "mention"))
+        if self._discord_note_done_cb is not None:
+            self._discord_note_done_cb.setChecked(is_event_enabled(config, "note_done"))
+        if self._discord_inbox_cb is not None:
+            self._discord_inbox_cb.setChecked(
+                is_event_enabled(config, "inbox_received")
+                or is_event_enabled(config, "inbox_distributed")
+                or is_event_enabled(config, "outbox_received")
+            )
+        if self._discord_schedule_cb is not None:
+            self._discord_schedule_cb.setChecked(is_event_enabled(config, "schedule_due"))
+        if self._discord_schedule_assigned_cb is not None:
+            self._discord_schedule_assigned_cb.setChecked(is_event_enabled(config, "schedule_assigned"))
+        if self._discord_label_field is not None:
+            self._discord_label_field.setText(str(wh.get("label") or "").strip() if wh else "")
+        if self._discord_webhook_field is not None:
+            if self._discord_stored_url:
+                self._discord_webhook_field.setText(mask_webhook_url(self._discord_stored_url))
+                self._discord_webhook_field.setReadOnly(True)
+                self._discord_webhook_field.setPlaceholderText("")
+            else:
+                self._discord_webhook_field.clear()
+                self._discord_webhook_field.setReadOnly(False)
+                self._discord_webhook_field.setPlaceholderText(
+                    "https://discord.com/api/webhooks/…"
+                )
+
+    def _discord_effective_webhook_url(self) -> str:
+        from monostudio.core.integrations_config import is_valid_discord_webhook_url
+
+        if self._discord_url_editing and self._discord_webhook_field is not None:
+            candidate = (self._discord_webhook_field.text() or "").strip()
+            if is_valid_discord_webhook_url(candidate):
+                return candidate
+        if self._discord_stored_url:
+            return self._discord_stored_url
+        if self._discord_webhook_field is not None:
+            candidate = (self._discord_webhook_field.text() or "").strip()
+            if is_valid_discord_webhook_url(candidate):
+                return candidate
+        return ""
+
+    def _on_discord_replace_url(self) -> None:
+        if self._discord_webhook_field is None:
+            return
+        self._discord_url_editing = True
+        self._discord_webhook_field.setReadOnly(False)
+        self._discord_webhook_field.clear()
+        self._discord_webhook_field.setPlaceholderText("https://discord.com/api/webhooks/…")
+        self._discord_webhook_field.setFocus()
+
+    def _on_discord_send_test(self) -> None:
+        from monostudio.core.discord_webhook import send_test_webhook
+        from monostudio.core.user_identity import get_current_user_display_name
+
+        url = self._discord_effective_webhook_url()
+        ok, err = send_test_webhook(
+            self._workspace_root,
+            user_name=get_current_user_display_name(self._workspace_root),
+            url_override=url,
+        )
+        if ok:
+            QMessageBox.information(self, "Discord", "Test message sent.")
+        else:
+            QMessageBox.warning(self, "Discord", err or "Could not send test message.")
+
+    def _persist_discord_integrations(self) -> bool:
+        from monostudio.core.integrations_config import (
+            build_integrations_from_ui,
+            is_valid_discord_webhook_url,
+            load_integrations,
+            write_integrations,
+        )
+
+        if self._workspace_root is None or self._discord_enabled_cb is None:
+            return True
+        enabled = self._discord_enabled_cb.isChecked()
+        url = self._discord_effective_webhook_url()
+        label = (self._discord_label_field.text() or "").strip() if self._discord_label_field else ""
+        mention = bool(self._discord_mention_cb and self._discord_mention_cb.isChecked())
+        note_done = bool(self._discord_note_done_cb and self._discord_note_done_cb.isChecked())
+        inbox_enabled = bool(self._discord_inbox_cb and self._discord_inbox_cb.isChecked())
+        schedule_due = bool(self._discord_schedule_cb and self._discord_schedule_cb.isChecked())
+        schedule_assigned = bool(
+            self._discord_schedule_assigned_cb and self._discord_schedule_assigned_cb.isChecked()
+        )
+        if enabled and not is_valid_discord_webhook_url(url):
+            QMessageBox.warning(
+                self,
+                "Discord",
+                "Enable Discord requires a valid webhook URL.\n"
+                "Create an Incoming Webhook in Discord channel settings, then paste the URL here.",
+            )
+            return False
+        existing = load_integrations(self._workspace_root)
+        config = build_integrations_from_ui(
+            enabled=enabled,
+            webhook_url=url,
+            label=label,
+            mention_enabled=mention,
+            inbox_enabled=inbox_enabled,
+            schedule_due_enabled=schedule_due,
+            schedule_assigned_enabled=schedule_assigned,
+            note_done_enabled=note_done,
+            existing=existing,
+        )
+        try:
+            write_integrations(self._workspace_root, config, require_admin=True)
+        except PermissionError:
+            QMessageBox.warning(
+                self,
+                "Discord",
+                "Administrator access is required to save Discord integration settings.",
+            )
+            return False
+        except OSError as ex:
+            QMessageBox.warning(self, "Discord", str(ex) or "Could not save integrations.")
+            return False
+        self._discord_stored_url = url
+        self._discord_url_editing = False
+        self._refresh_discord_integrations_ui()
+        return True
+
     def _on_access_unlock_clicked(self) -> None:
         if self._access_unlock_field is None:
             return
@@ -1175,6 +1501,7 @@ class SettingsDialog(MonosDialog):
         self.access_session_changed.emit()
         self._refresh_access_tab_state()
         self._refresh_pipeline_access_lock()
+        self._refresh_integrations_access_lock()
 
     def _on_access_lock_clicked(self) -> None:
         clear_session()
@@ -1182,6 +1509,7 @@ class SettingsDialog(MonosDialog):
         self.access_session_changed.emit()
         self._refresh_access_tab_state()
         self._refresh_pipeline_access_lock()
+        self._refresh_integrations_access_lock()
 
     def _build_updates_tab(self) -> QWidget:
         """General → Updates: one list (MonoStudio + other products), each row: icon, name, version, View release notes, action button."""
@@ -2062,7 +2390,7 @@ class SettingsDialog(MonosDialog):
         """Tier 2: Project → Overview | Integrations | Advanced (nút page ngang)."""
         return self._build_tier2_page_buttons([
             ("Overview", self._placeholder("Project → Overview (placeholder)")),
-            ("Integrations", self._placeholder("Project → Integrations (placeholder)")),
+            ("Integrations", self._build_workspace_discord_integrations_tab()),
             ("Advanced", self._build_project_advanced_tab()),
         ])
 
@@ -2563,6 +2891,58 @@ class SettingsDialog(MonosDialog):
         row_sp_l.addWidget(btn_browse_sp, 0)
         form.addRow("Substance Painter Executable", row_sp)
 
+        # Affinity by Canva
+        field_affinity = QLineEdit(self)
+        field_affinity.setPlaceholderText("Auto-detect Affinity by Canva (MSIX), or browse to Affinity.exe")
+        field_affinity.setProperty("mono", True)
+        self._affinity_exe_field = field_affinity
+        if self._settings is not None:
+            cur_affinity = (self._settings.value("integrations/affinity_exe", "", str) or "").strip()
+            if not cur_affinity:
+                cur_affinity = (self._settings.value("integrations/affinity_photo_exe", "", str) or "").strip()
+            field_affinity.setText(cur_affinity)
+        else:
+            field_affinity.setEnabled(False)
+        btn_browse_affinity = QPushButton("Browse…", self)
+        btn_auto_affinity = QPushButton("Auto Detect", self)
+        if self._settings is None:
+            btn_browse_affinity.setEnabled(False)
+            btn_auto_affinity.setEnabled(False)
+
+        def on_browse_affinity() -> None:
+            start = field_affinity.text().strip()
+            start_dir = str(Path(start).parent) if start else ""
+            path, _flt = QFileDialog.getOpenFileName(
+                self,
+                "Select Affinity Executable",
+                start_dir,
+                "Affinity (Affinity.exe Photo.exe);;Executables (*.exe);;All files (*.*)",
+            )
+            if path:
+                field_affinity.setText(path)
+
+        def on_auto_detect_affinity() -> None:
+            found = resolve_affinity_executable(field_affinity.text().strip() or "Affinity.exe")
+            if not found:
+                QMessageBox.information(
+                    self,
+                    "Auto Detect",
+                    "Affinity was not found. Install Affinity by Canva, or browse to Affinity.exe.",
+                )
+                return
+            field_affinity.setText(found)
+
+        btn_browse_affinity.clicked.connect(on_browse_affinity)
+        btn_auto_affinity.clicked.connect(on_auto_detect_affinity)
+        row_affinity = QWidget(self)
+        row_affinity_l = QHBoxLayout(row_affinity)
+        row_affinity_l.setContentsMargins(0, 0, 0, 0)
+        row_affinity_l.setSpacing(8)
+        row_affinity_l.addWidget(field_affinity, 1)
+        row_affinity_l.addWidget(btn_auto_affinity, 0)
+        row_affinity_l.addWidget(btn_browse_affinity, 0)
+        form.addRow("Affinity Executable", row_affinity)
+
         # RizomUV
         field_rz = QLineEdit(self)
         field_rz.setPlaceholderText("Auto-detect, or browse to rizomuv_vs.exe")
@@ -2614,8 +2994,9 @@ class SettingsDialog(MonosDialog):
         form.addRow("RizomUV Executable", row_rz)
 
         hint = QLabel(
-            "If empty, MonoStudio will try to auto-detect Blender, Maya, Houdini, Substance Painter, and RizomUV.\n"
-            "Env vars: MONOSTUDIO_BLENDER_EXE, MONOSTUDIO_MAYA_EXE, MONOSTUDIO_HOUDINI_EXE, MONOSTUDIO_SUBSTANCE_PAINTER_EXE, MONOSTUDIO_RIZOMUV_EXE (or HFS for Houdini)."
+            "If empty, MonoStudio will try to auto-detect Blender, Maya, Houdini, Substance Painter, Affinity, and RizomUV.\n"
+            "Env vars: MONOSTUDIO_BLENDER_EXE, MONOSTUDIO_MAYA_EXE, MONOSTUDIO_HOUDINI_EXE, "
+            "MONOSTUDIO_SUBSTANCE_PAINTER_EXE, MONOSTUDIO_AFFINITY_EXE, MONOSTUDIO_RIZOMUV_EXE (or HFS for Houdini)."
         )
         hint.setWordWrap(True)
         hint.setObjectName("DialogHint")
@@ -2624,6 +3005,88 @@ class SettingsDialog(MonosDialog):
         layout.addWidget(hint, 0)
         layout.addStretch(1)
         return root
+
+    def _build_workspace_discord_integrations_tab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsPageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(4, 4, 4, 16)
+        layout.setSpacing(12)
+
+        self._discord_integrations_banner = QLabel(inner)
+        self._discord_integrations_banner.setWordWrap(True)
+        self._discord_integrations_banner.setObjectName("DialogHelper")
+        self._discord_integrations_banner.setVisible(False)
+        layout.addWidget(self._discord_integrations_banner)
+
+        card, card_l = add_settings_section(
+            inner,
+            "Discord",
+            "Post pipeline alerts to a Discord channel via Incoming Webhook. "
+            "URL is stored in workspace .monostudio/integrations.json (synced).",
+        )
+
+        self._discord_enabled_cb = QCheckBox("Enable Discord notifications", card)
+        card_l.addWidget(self._discord_enabled_cb)
+
+        self._discord_webhook_field = QLineEdit(card)
+        self._discord_webhook_field.setProperty("mono", True)
+        style_settings_line_edit(self._discord_webhook_field, min_width=320)
+        self._discord_url_replace_btn = QPushButton("Replace…", card)
+        self._discord_url_replace_btn.setObjectName("SettingsInlineActionButton")
+        self._discord_url_replace_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._discord_url_replace_btn.clicked.connect(self._on_discord_replace_url)
+        url_row = QWidget(card)
+        url_row_l = QHBoxLayout(url_row)
+        url_row_l.setContentsMargins(0, 0, 0, 0)
+        url_row_l.setSpacing(8)
+        url_row_l.addWidget(self._discord_webhook_field, 1)
+        url_row_l.addWidget(self._discord_url_replace_btn, 0)
+        add_settings_field_row(card_l, "Webhook URL", url_row)
+
+        self._discord_label_field = QLineEdit(card)
+        self._discord_label_field.setPlaceholderText("#pipeline-general")
+        style_settings_line_edit(self._discord_label_field, min_width=200)
+        add_settings_field_row(card_l, "Channel label", self._discord_label_field)
+
+        add_settings_subsection_title(card_l, "Events")
+        self._discord_mention_cb = QCheckBox("@mentions in notes", card)
+        self._discord_mention_cb.setChecked(True)
+        card_l.addWidget(self._discord_mention_cb)
+
+        self._discord_note_done_cb = QCheckBox("Note marked done", card)
+        card_l.addWidget(self._discord_note_done_cb)
+
+        self._discord_inbox_cb = QCheckBox("Inbox & Outbox (drop & distribute)", card)
+        card_l.addWidget(self._discord_inbox_cb)
+
+        self._discord_schedule_cb = QCheckBox("Schedule due reminders (daily)", card)
+        card_l.addWidget(self._discord_schedule_cb)
+
+        self._discord_schedule_assigned_cb = QCheckBox("Schedule assignments", card)
+        card_l.addWidget(self._discord_schedule_assigned_cb)
+
+        test_row = QWidget(card)
+        test_row_l = QHBoxLayout(test_row)
+        test_row_l.setContentsMargins(0, 4, 0, 0)
+        self._discord_test_btn = QPushButton("Send test message", test_row)
+        self._discord_test_btn.setObjectName("SettingsInlineActionButton")
+        self._discord_test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._discord_test_btn.clicked.connect(self._on_discord_send_test)
+        test_row_l.addWidget(self._discord_test_btn, 0)
+        test_row_l.addStretch(1)
+        card_l.addWidget(test_row)
+
+        layout.addWidget(card)
+        layout.addStretch(1)
+        scroll.setWidget(inner)
+        self._refresh_discord_integrations_ui()
+        return scroll
 
     def _build_project_advanced_tab(self) -> QWidget:
         root = QWidget()
@@ -2776,7 +3239,10 @@ class SettingsDialog(MonosDialog):
                 idx = self._notification_max_visible_combo.currentIndex()
                 self._settings.setValue("notification/max_visible", idx + 1)
             if self._settings is not None and self._mention_delivery_combo is not None:
-                from monostudio.core.notification_preferences import write_mention_delivery
+                from monostudio.core.notification_preferences import (
+                    write_mention_delivery,
+                    write_notification_vietnamese,
+                )
 
                 idx = self._mention_delivery_combo.currentIndex()
                 mode = "windows" if idx == 1 else "builtin"
@@ -2784,6 +3250,21 @@ class SettingsDialog(MonosDialog):
                 if data in ("builtin", "windows"):
                     mode = data
                 write_mention_delivery(self._settings, mode)
+            if self._settings is not None and self._notification_vietnamese_cb is not None:
+                from monostudio.core.notification_preferences import (
+                    write_discord_disabled_locally,
+                    write_notification_vietnamese,
+                )
+
+                write_notification_vietnamese(
+                    self._settings,
+                    self._notification_vietnamese_cb.isChecked(),
+                )
+                if self._discord_disabled_locally_cb is not None:
+                    write_discord_disabled_locally(
+                        self._settings,
+                        self._discord_disabled_locally_cb.isChecked(),
+                    )
         except Exception:
             pass
 
@@ -2801,6 +3282,11 @@ class SettingsDialog(MonosDialog):
                 )
         except Exception:
             pass
+
+        # Workspace Discord integrations (admin only).
+        if _admin_save:
+            if not self._persist_discord_integrations():
+                return
 
         # Persist global pipeline behavior (create work/publish subfolders).
         try:
@@ -2867,6 +3353,11 @@ class SettingsDialog(MonosDialog):
                 self._settings.setValue(
                     "integrations/substance_painter_exe",
                     (self._substance_painter_exe_field.text() or "").strip(),
+                )
+            if self._settings is not None and self._affinity_exe_field is not None:
+                self._settings.setValue(
+                    "integrations/affinity_exe",
+                    (self._affinity_exe_field.text() or "").strip(),
                 )
             if self._settings is not None and self._rizomuv_exe_field is not None:
                 self._settings.setValue("integrations/rizomuv_exe", (self._rizomuv_exe_field.text() or "").strip())

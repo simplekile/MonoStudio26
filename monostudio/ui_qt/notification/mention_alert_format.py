@@ -8,6 +8,7 @@ import re
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QLabel
 
+from monostudio.core.notification_copy import copy_item_fallback, copy_someone, pick_copy
 from monostudio.ui_qt.notification.store import NotificationEntry, UserAlertPayload
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 from PySide6.QtGui import QFont
@@ -30,17 +31,21 @@ def department_display_label(department_id: str, department_label: str = "") -> 
     return did.replace("_", " ").title()
 
 
-def aggregated_mention_popup_message(senders: list[str]) -> str:
+def aggregated_mention_popup_message(senders: list[str], *, vietnamese: bool | None = None) -> str:
     """
     Short popup copy when multiple @mentions arrive together.
     +N = additional mentions (2 total → +1). Same person only: no "and others".
     """
-    names = [(s or "").strip() or "Someone" for s in senders]
+    names = [(s or "").strip() or copy_someone(vietnamese=vietnamese) for s in senders]
     n = len(names)
     if n == 0:
-        return "New mentions"
+        return pick_copy("Mention mới", "New mentions", vietnamese=vietnamese)
     if n == 1:
-        return f"{names[0]} mentioned you"
+        return pick_copy(
+            f"{names[0]} đã nhắc bạn",
+            f"{names[0]} mentioned you",
+            vietnamese=vietnamese,
+        )
 
     seen: set[str] = set()
     unique: list[str] = []
@@ -51,9 +56,17 @@ def aggregated_mention_popup_message(senders: list[str]) -> str:
 
     extra = n - 1
     if len(unique) == 1:
-        return f"{unique[0]} mentioned you +{extra}"
+        return pick_copy(
+            f"{unique[0]} đã nhắc bạn +{extra}",
+            f"{unique[0]} mentioned you +{extra}",
+            vietnamese=vietnamese,
+        )
 
-    return f"{unique[0]} and others mentioned you +{extra}"
+    return pick_copy(
+        f"{unique[0]} và người khác đã nhắc bạn +{extra}",
+        f"{unique[0]} and others mentioned you +{extra}",
+        vietnamese=vietnamese,
+    )
 
 
 def mention_alert_plain_message(
@@ -62,11 +75,16 @@ def mention_alert_plain_message(
     item_display: str,
     department_id: str = "",
     department_label: str = "",
+    vietnamese: bool | None = None,
 ) -> str:
-    sender = (from_name or "").strip() or "Someone"
-    asset = (item_display or "").strip() or "an item"
+    sender = (from_name or "").strip() or copy_someone(vietnamese=vietnamese)
+    asset = (item_display or "").strip() or copy_item_fallback(vietnamese=vietnamese)
     dept = department_display_label(department_id, department_label)
-    msg = f"{sender} mentioned you in {asset}"
+    msg = pick_copy(
+        f"{sender} đã nhắc bạn trong {asset}",
+        f"{sender} mentioned you in {asset}",
+        vietnamese=vietnamese,
+    )
     if dept:
         msg += f" · {dept}"
     return msg
@@ -78,9 +96,10 @@ def mention_alert_rich_html(
     item_display: str,
     department_id: str = "",
     department_label: str = "",
+    vietnamese: bool | None = None,
 ) -> str:
-    sender = _esc(from_name or "Someone")
-    asset = _esc(item_display or "an item")
+    sender = _esc(from_name or copy_someone(vietnamese=vietnamese))
+    asset = _esc(item_display or copy_item_fallback(vietnamese=vietnamese))
     dept = _esc(department_display_label(department_id, department_label))
     accent = MONOS_COLORS.get("text_primary_highlight", "#60a5fa")
     body = MONOS_COLORS.get("text_primary", "#d4d4d8")
@@ -88,9 +107,16 @@ def mention_alert_rich_html(
     asset_html = f'<span style="color:{body};font-weight:600">{asset}</span>'
     if dept:
         asset_html += f' <span style="color:{meta};font-weight:500">· {dept}</span>'
-    return (
-        f'<span style="color:{body};font-weight:600">{sender}</span> '
-        f'mentioned <span style="color:{accent};font-weight:600">you</span> in {asset_html}'
+    return pick_copy(
+        (
+            f'<span style="color:{body};font-weight:600">{sender}</span> '
+            f'đã nhắc <span style="color:{accent};font-weight:600">bạn</span> trong {asset_html}'
+        ),
+        (
+            f'<span style="color:{body};font-weight:600">{sender}</span> '
+            f'mentioned <span style="color:{accent};font-weight:600">you</span> in {asset_html}'
+        ),
+        vietnamese=vietnamese,
     )
 
 
@@ -150,6 +176,15 @@ def mention_alert_html_for_entry(entry: NotificationEntry) -> str | None:
 
 
 def apply_notification_message_label(label: QLabel, entry: NotificationEntry) -> None:
+    from monostudio.ui_qt.notification.assign_alert_format import (
+        apply_assign_notification_message_label,
+    )
+
+    p = entry.payload
+    if isinstance(p, dict):
+        p = UserAlertPayload.from_dict(p)
+    if (p.assign_inbox_id or "").strip() and apply_assign_notification_message_label(label, entry):
+        return
     rich = mention_alert_html_for_entry(entry)
     label.setFont(monos_font("Inter", 15, QFont.Weight.Normal))
     if rich:

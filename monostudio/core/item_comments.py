@@ -84,6 +84,23 @@ class NoteEditRevision:
 
 
 _MAX_EDIT_HISTORY = 30
+_MAX_SEEN_BY = 50
+
+
+@dataclass(frozen=True)
+class NoteSeenBy:
+    """Read receipt: a signed-in user opened the full note."""
+
+    user_id: str
+    at: str
+    name: str = ""
+
+    def to_dict(self) -> dict:
+        d = {"user_id": self.user_id, "at": self.at}
+        n = (self.name or "").strip()
+        if n:
+            d["name"] = n[:200]
+        return d
 
 
 @dataclass(frozen=True)
@@ -99,6 +116,7 @@ class ItemCommentEntry:
     mentions: tuple[str, ...] = ()
     department: str = ""  # department id (sidebar); empty = legacy / general
     edit_history: tuple[NoteEditRevision, ...] = ()
+    seen_by: tuple[NoteSeenBy, ...] = ()
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -121,6 +139,8 @@ class ItemCommentEntry:
             d["department"] = dept
         if self.edit_history:
             d["edit_history"] = [r.to_dict() for r in self.edit_history]
+        if self.seen_by:
+            d["seen_by"] = [s.to_dict() for s in self.seen_by]
         return d
 
 
@@ -250,6 +270,91 @@ def entry_author_visual(
     )
 
 
+def _parse_seen_by(raw: object) -> NoteSeenBy | None:
+    if not isinstance(raw, dict):
+        return None
+    uid = str(raw.get("user_id") or "").strip()
+    at = str(raw.get("at") or "").strip()
+    if not uid or not at:
+        return None
+    return NoteSeenBy(
+        user_id=uid,
+        at=at,
+        name=str(raw.get("name") or "").strip()[:200],
+    )
+
+
+def seen_by_display_name(
+    seen: NoteSeenBy,
+    workspace_root: Path | None = None,
+    *,
+    unknown: str = "Someone",
+) -> str:
+    uid = (seen.user_id or "").strip()
+    if uid and workspace_root is not None:
+        from monostudio.core.user_identity import get_user
+
+        u = get_user(workspace_root, uid)
+        if u is not None and u.name.strip():
+            return u.name.strip()
+    stored = (seen.name or "").strip()
+    if stored:
+        return stored
+    return unknown
+
+
+def seen_by_visual(
+    seen: NoteSeenBy,
+    workspace_root: Path | None = None,
+    *,
+    unknown: str = "Someone",
+) -> NoteAuthorVisual:
+    """Avatar + label data for a read-receipt row."""
+    uid = (seen.user_id or "").strip()
+    if uid and workspace_root is not None:
+        from monostudio.core.user_identity import avatar_path, get_user
+
+        u = get_user(workspace_root, uid)
+        if u is not None:
+            name = u.name.strip() or seen_by_display_name(seen, workspace_root, unknown=unknown)
+            return NoteAuthorVisual(
+                name=name,
+                initials=u.initials,
+                color_hex=u.color_hex or "#3b82f6",
+                image_path=avatar_path(workspace_root, u),
+                user_id=uid,
+            )
+    name = seen_by_display_name(seen, workspace_root, unknown=unknown)
+    return NoteAuthorVisual(
+        name=name,
+        initials=_initials_from_display_name(name),
+        color_hex="#52525b",
+        image_path=None,
+        user_id=uid or None,
+    )
+
+
+def format_seen_by_line(
+    entry: ItemCommentEntry,
+    workspace_root: Path | None = None,
+) -> str:
+    """Human-readable read receipt, e.g. ``Seen by Alice and Bob``."""
+    if not entry.seen_by:
+        return ""
+    names = [
+        seen_by_display_name(s, workspace_root)
+        for s in entry.seen_by
+        if (s.user_id or "").strip()
+    ]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return f"Seen by {names[0]}"
+    if len(names) == 2:
+        return f"Seen by {names[0]} and {names[1]}"
+    return f"Seen by {', '.join(names[:-1])}, and {names[-1]}"
+
+
 def entry_preview_text(entry: ItemCommentEntry, *, max_chars: int = _MAX_TEXT_LEN) -> str:
     """Human-readable one-line preview for cards, dashboard, list metadata."""
     if (entry.body_html or "").strip():
@@ -356,6 +461,16 @@ def _parse_entry(raw: object) -> ItemCommentEntry | None:
                 revs.append(r)
         if revs:
             edit_history = tuple(revs[:_MAX_EDIT_HISTORY])
+    seen_raw = raw.get("seen_by")
+    seen_by: tuple[NoteSeenBy, ...] = ()
+    if isinstance(seen_raw, list):
+        seen_rows: list[NoteSeenBy] = []
+        for s in seen_raw:
+            p = _parse_seen_by(s)
+            if p is not None:
+                seen_rows.append(p)
+        if seen_rows:
+            seen_by = tuple(seen_rows[:_MAX_SEEN_BY])
     return ItemCommentEntry(
         id=eid,
         at=at,
@@ -368,6 +483,7 @@ def _parse_entry(raw: object) -> ItemCommentEntry | None:
         mentions=mentions,
         department=department,
         edit_history=edit_history,
+        seen_by=seen_by,
     )
 
 
@@ -484,17 +600,18 @@ def latest_note_preview_line(
     *,
     max_chars: int = 96,
 ) -> tuple[str, bool]:
+    """Preview for main-view tile meta: most recent open note only (skips completed)."""
     entries = _entries_for_department_view(Path(item_root), department_id)
-    if not entries:
+    open_entries = [e for e in entries if not e.done]
+    if not open_entries:
         return ("", False)
-    last = entries[-1]
-    done = bool(last.done)
+    last = open_entries[-1]
     text = entry_preview_text(last, max_chars=max_chars)
     if not text:
-        return ("", done)
+        return ("", False)
     if len(text) > max_chars:
         text = text[: max_chars - 1].rstrip() + "…"
-    return (text, done)
+    return (text, False)
 
 
 def new_comment_entry(
@@ -590,6 +707,58 @@ def delete_item_comment(item_root: Path, comment_id: str) -> None:
         return [e for e in cur if e.id != cid]
 
     _atomic_update(root, updater)
+
+
+def record_note_seen(
+    item_root: Path,
+    comment_id: str,
+    *,
+    user_id: str,
+    user_name: str = "",
+) -> ItemCommentEntry | None:
+    """Persist a read receipt when a signed-in user opens the full note."""
+    cid = (comment_id or "").strip()
+    uid = (user_id or "").strip()
+    if not cid or not uid:
+        return None
+    root = Path(item_root)
+    updated: ItemCommentEntry | None = None
+
+    def updater(cur: list[ItemCommentEntry]) -> list[ItemCommentEntry]:
+        nonlocal updated
+        out: list[ItemCommentEntry] = []
+        changed = False
+        for e in cur:
+            if e.id != cid:
+                out.append(e)
+                continue
+            author_id = (e.author_id or "").strip()
+            if author_id and author_id == uid:
+                out.append(e)
+                continue
+            if any(s.user_id == uid for s in e.seen_by):
+                out.append(e)
+                continue
+            new_seen = e.seen_by + (
+                NoteSeenBy(
+                    user_id=uid,
+                    at=_utc_now_iso(),
+                    name=(user_name or "").strip()[:200],
+                ),
+            )
+            if len(new_seen) > _MAX_SEEN_BY:
+                new_seen = new_seen[-_MAX_SEEN_BY:]
+            entry = replace(e, seen_by=new_seen)
+            updated = entry
+            out.append(entry)
+            changed = True
+        return out if changed else cur
+
+    try:
+        _atomic_update(root, updater)
+    except OSError:
+        return None
+    return updated
 
 
 def set_item_comment_done(item_root: Path, comment_id: str, done: bool) -> None:

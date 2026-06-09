@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import monos_font
+from monostudio.ui_qt.toolbar_separators import apply_pill_segment_positions
+from monostudio.ui_qt.toolbar_separators import apply_pill_segment_positions
 
 
 @lru_cache(maxsize=48)
@@ -240,6 +242,8 @@ class SettingsSegmentedControl(QWidget):
             self._buttons.append(btn)
             bar_l.addWidget(btn, 0)
             btn.toggled.connect(self._on_toggled)
+
+        apply_pill_segment_positions(self._buttons)
 
         outer.addWidget(bar, 0, Qt.AlignmentFlag.AlignLeft)
         outer.addStretch(1)
