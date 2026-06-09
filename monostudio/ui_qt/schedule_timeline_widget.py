@@ -100,12 +100,13 @@ if TYPE_CHECKING:
 _LABEL_W_DEFAULT = 220
 _LABEL_W_MIN = 160
 _LABEL_W_MAX = 420
-_LABEL_COL_RESIZE_W = 6
-_ROW_H = 42
-_ROW_TITLE_Y = 5
+_LABEL_COL_RESIZE_W = 10
+_LABEL_COL_EDGE_GRAB = 10
+_ROW_H = 50
+_ROW_TITLE_Y = 7
 _ROW_TITLE_H = 18
-_ROW_SUB_Y = 24
-_ROW_SUB_H = 14
+_ROW_SUB_Y = 28
+_ROW_SUB_H = 16
 # Header rows below IN/OUT band (14px): milestone names → month → weekday + day numbers.
 _HEADER_RANGE_BAND_H = 14
 _HEADER_MILESTONE_TOP = 15
@@ -131,7 +132,7 @@ _EDGE_GRAB = 7
 # Hover/drag key for collapsed entity row (whole block, not a single dept mini-bar).
 _COLLAPSED_GROUP_HOVER = "__group__"
 _CHEVRON_W = 20
-_LABEL_THUMB = 26
+_LABEL_THUMB = 28
 _LABEL_TEXT_LEFT = _CHEVRON_W + _LABEL_THUMB + 6
 _DEPT_INDENT = 16
 # Expanded entity → department sub-rows (label column).
@@ -675,33 +676,6 @@ class _GanttCanvas(QWidget):
         p.drawRoundedRect(pill, 4, 4)
         p.setPen(QColor("#18181b"))
         p.drawText(pill, Qt.AlignmentFlag.AlignCenter, elided)
-
-    def _paint_collapsed_row_label(
-        self,
-        p: QPainter,
-        visible_index: int,
-        start: date,
-        due: date,
-        *,
-        entity_name: str,
-        status: str,
-        overdue: bool,
-    ) -> None:
-        """One label across the collapsed entity row (mini bars are too thin for text)."""
-        if self._bar_label_mode == BAR_LABEL_OFF:
-            return
-        rect = self._full_bar_rect(visible_index, start, due)
-        if rect is None:
-            return
-        mode = self._bar_label_mode
-        if mode == BAR_LABEL_ENTITY_NAME:
-            text = (entity_name or "").strip()
-        elif mode == BAR_LABEL_DEPARTMENT:
-            return
-        else:
-            text = self._bar_label_text(start=start, due=due)
-        if text:
-            self._paint_bar_label_text(p, rect, text, status=status, overdue=overdue)
 
     def set_data(
         self,
@@ -1984,8 +1958,6 @@ class _GanttCanvas(QWidget):
                 )
                 if span[0] is not None and span[1] is not None:
                     self._paint_row_span_markers(p, y, span[0], span[1])
-                row_status = STATUS_WAITING
-                row_overdue = False
                 for slot, dept_row in enumerate(dept_rows):
                     dep = (dept_row.department or "").strip()
                     if dep:
@@ -1995,15 +1967,8 @@ class _GanttCanvas(QWidget):
                             dep,
                         )
                         b = self._bars.get(key)
-                        if b is not None:
-                            if b.status == STATUS_EXCLUDED:
-                                continue
-                            if b.overdue:
-                                row_overdue = True
-                            if b.status == STATUS_DONE:
-                                row_status = STATUS_DONE
-                            elif b.status == STATUS_PROGRESS and row_status != STATUS_DONE:
-                                row_status = STATUS_PROGRESS
+                        if b is not None and b.status == STATUS_EXCLUDED:
+                            continue
                         self._paint_bar(
                             p,
                             vi,
@@ -2014,16 +1979,6 @@ class _GanttCanvas(QWidget):
                             slot=slot,
                             slot_count=len(dept_rows),
                         )
-                if span[0] is not None and span[1] is not None:
-                    self._paint_collapsed_row_label(
-                        p,
-                        vi,
-                        span[0],
-                        span[1],
-                        entity_name=display.group.entity_name,
-                        status=row_status,
-                        overdue=row_overdue,
-                    )
             elif display.mode == "scope_separator":
                 p.fillRect(0, y, w, _ROW_H, QColor(18, 18, 20))
             elif display.mode == "dept_lane_header":
@@ -2285,13 +2240,6 @@ class _GanttCanvas(QWidget):
             self._paint_bar_label_text(
                 p, rect, label, status=status, overdue=overdue
             )
-        elif collapsed and bar is not None and self._bar_label_mode == BAR_LABEL_DEPARTMENT:
-            label = self._bar_label_text(start=start, due=due, bar=bar)
-            full = self._full_bar_rect(visible_index, start, due)
-            if full is not None and label:
-                self._paint_bar_label_text(
-                    p, full, label, status=status, overdue=overdue
-                )
 
     @staticmethod
     def _parse(d: str) -> date | None:
@@ -2339,9 +2287,20 @@ class _GanttCanvas(QWidget):
             return
 
         if self._is_label_pane():
+            if self._gantt is not None and self._gantt.is_label_column_resizing():
+                self._gantt.update_label_column_resize(int(event.globalPosition().x()))
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+            edge_x = self.width() - _LABEL_COL_EDGE_GRAB
+            on_resize_edge = event.position().x() >= edge_x
             row = self._row_at_y(event.position().y())
             self._hover_row = row
             self._sync_hover_row(row)
+            if on_resize_edge:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                self.setToolTip("Drag to resize item column")
+                self.update()
+                return
             if self._tool == TOOL_DRAW:
                 if row is not None and self._resolve_department_for_draw(
                     row, event.position().y()
@@ -2526,6 +2485,12 @@ class _GanttCanvas(QWidget):
             return
 
         if self._is_label_pane():
+            if event.position().x() >= self.width() - _LABEL_COL_EDGE_GRAB:
+                if self._gantt is not None:
+                    self._gantt.begin_label_column_resize(int(event.globalPosition().x()))
+                    self.grabMouse()
+                    event.accept()
+                    return
             if self._tool == TOOL_DRAW and row is not None and self._schedule_editable():
                 dep = self._resolve_department_for_draw(row, pos.y())
                 if dep:
@@ -2653,6 +2618,12 @@ class _GanttCanvas(QWidget):
             return
 
         if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        if self._gantt is not None and self._gantt.is_label_column_resizing():
+            self._gantt.end_label_column_resize()
+            self._release_if_grabbed(self)
+            event.accept()
             return
 
         if self._draw_state is not None:
@@ -3208,17 +3179,19 @@ class _ScheduleLabelColResizeHandle(QWidget):
         self._drag_start_w = _LABEL_W_DEFAULT
         self.setObjectName("ScheduleLabelColResizeHandle")
         self.setFixedWidth(_LABEL_COL_RESIZE_W)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.SizeHorCursor)
         self.setMouseTracking(True)
+        self.setToolTip("Drag to resize item column")
         self._hovered = False
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         p = QPainter(self)
+        p.fillRect(self.rect(), QColor(255, 255, 255, 10 if self._hovered or self._dragging else 4))
         x = self.width() // 2
-        color = QColor("#52525b") if self._hovered or self._dragging else QColor("#3f3f46")
+        color = QColor("#71717a") if self._hovered or self._dragging else QColor("#52525b")
         p.setPen(QPen(color, 1))
-        p.drawLine(x, 8, x, max(8, self.height() - 8))
+        p.drawLine(x, 6, x, max(6, self.height() - 6))
         p.end()
         super().paintEvent(event)
 
@@ -3234,17 +3207,16 @@ class _ScheduleLabelColResizeHandle(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            self._gantt.begin_label_column_resize(int(event.globalPosition().x()))
             self._dragging = True
-            self._drag_start_x = int(event.globalPosition().x())
-            self._drag_start_w = self._gantt.label_column_width()
+            self.grabMouse()
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._dragging:
-            delta = int(event.globalPosition().x()) - self._drag_start_x
-            self._gantt.set_label_column_width(self._drag_start_w + delta)
+            self._gantt.update_label_column_resize(int(event.globalPosition().x()))
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -3252,6 +3224,8 @@ class _ScheduleLabelColResizeHandle(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._dragging:
             self._dragging = False
+            self._gantt.end_label_column_resize()
+            self.releaseMouse()
             self.update()
             event.accept()
             return
@@ -3275,6 +3249,9 @@ class ScheduleGanttWidget(QWidget):
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._label_w = _LABEL_W_DEFAULT
+        self._col_resizing = False
+        self._col_resize_start_x = 0
+        self._col_resize_start_w = _LABEL_W_DEFAULT
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -3296,7 +3273,10 @@ class ScheduleGanttWidget(QWidget):
         self._header_pane._gantt = self
         self._header_scroll.setWidget(self._header_pane)
 
+        self._header_col_resize = _ScheduleLabelColResizeHandle(self, self)
+        self._header_col_resize.setFixedSize(_LABEL_COL_RESIZE_W, _HEADER_H)
         top_row.addWidget(self._corner_pane)
+        top_row.addWidget(self._header_col_resize)
         top_row.addWidget(self._header_scroll, 1)
         root.addLayout(top_row)
 
@@ -3438,6 +3418,23 @@ class ScheduleGanttWidget(QWidget):
         self._ensure_body_pane_heights()
         self._label_pane.update()
 
+    def is_label_column_resizing(self) -> bool:
+        return self._col_resizing
+
+    def begin_label_column_resize(self, global_x: int) -> None:
+        self._col_resizing = True
+        self._col_resize_start_x = int(global_x)
+        self._col_resize_start_w = self._label_w
+
+    def update_label_column_resize(self, global_x: int) -> None:
+        if not self._col_resizing:
+            return
+        delta = int(global_x) - self._col_resize_start_x
+        self.set_label_column_width(self._col_resize_start_w + delta)
+
+    def end_label_column_resize(self) -> None:
+        self._col_resizing = False
+
     def _set_body_vscroll(self, value: int) -> None:
         bar = self._body_vscroll.verticalScrollBar()
         v = max(bar.minimum(), min(int(value), bar.maximum()))
@@ -3506,6 +3503,11 @@ class ScheduleGanttWidget(QWidget):
             self._label_pane.setFixedSize(lw, ch)
 
         row_h = self._label_pane.height()
+        if (
+            self._label_col_resize.width() != _LABEL_COL_RESIZE_W
+            or self._label_col_resize.height() != row_h
+        ):
+            self._label_col_resize.setFixedSize(_LABEL_COL_RESIZE_W, row_h)
         if self._timeline_hscroll.width() != tl_vp_w or self._timeline_hscroll.height() != row_h:
             self._timeline_hscroll.setFixedSize(tl_vp_w, row_h)
         self._reset_timeline_vertical_scroll()
