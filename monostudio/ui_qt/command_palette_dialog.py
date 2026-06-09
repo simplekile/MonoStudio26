@@ -1,4 +1,4 @@
-"""Ctrl+K command palette — jump to pages and quick-view slots."""
+"""Ctrl+K command palette — jump to pages, quick-view slots, assets, and shots."""
 
 from __future__ import annotations
 
@@ -6,15 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import Qt, QSettings, Signal
-from PySide6.QtWidgets import (
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QLabel, QLineEdit, QListWidget, QListWidgetItem, QVBoxLayout
 
 from monostudio.ui_qt.nav_quick_view import (
     SLOT_COUNT,
@@ -29,21 +21,28 @@ from monostudio.ui_qt.style import MonosDialog
 class _PaletteRow:
     title: str
     subtitle: str
-    kind: str  # "page" | "quick"
+    kind: str  # page | quick | entity
     payload: dict[str, Any]
 
 
 class CommandPaletteDialog(MonosDialog):
-    """Filterable jump list: nav pages + assigned quick-view slots."""
+    """Filterable jump list: pages, quick views, project assets/shots."""
 
     page_selected = Signal(str)
     quick_slot_selected = Signal(object)
+    entity_selected = Signal(object)
 
-    def __init__(self, *, settings: QSettings, parent=None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: QSettings,
+        entities: list[dict[str, Any]] | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Go to…")
         self._settings = settings
-        self._rows = self._build_rows()
+        self._rows = self._build_rows(entities or [])
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -51,7 +50,7 @@ class CommandPaletteDialog(MonosDialog):
 
         self._search = QLineEdit(self)
         self._search.setObjectName("CommandPaletteSearch")
-        self._search.setPlaceholderText("Search pages and quick views…")
+        self._search.setPlaceholderText("Search pages, assets, shots…")
         self._search.textChanged.connect(self._apply_filter)
         root.addWidget(self._search)
 
@@ -67,9 +66,9 @@ class CommandPaletteDialog(MonosDialog):
         self._populate_list(self._rows)
         self._search.setFocus(Qt.FocusReason.PopupFocusReason)
         self._list.itemActivated.connect(self._on_item_activated)
-        self.resize(520, 400)
+        self.resize(560, 440)
 
-    def _build_rows(self) -> list[_PaletteRow]:
+    def _build_rows(self, entities: list[dict[str, Any]]) -> list[_PaletteRow]:
         rows: list[_PaletteRow] = []
         for ctx in (
             "Dashboard",
@@ -94,6 +93,21 @@ class CommandPaletteDialog(MonosDialog):
                     subtitle=summary,
                     kind="quick",
                     payload=payload,
+                )
+            )
+        for ent in entities:
+            title = (ent.get("title") or "").strip()
+            path = (ent.get("path") or "").strip()
+            ctx = (ent.get("context") or "").strip()
+            if not title or not path or ctx not in ("Assets", "Shots"):
+                continue
+            subtitle = (ent.get("subtitle") or ctx).strip()
+            rows.append(
+                _PaletteRow(
+                    title=title,
+                    subtitle=subtitle,
+                    kind="entity",
+                    payload={"context": ctx, "path": path},
                 )
             )
         return rows
@@ -129,4 +143,6 @@ class CommandPaletteDialog(MonosDialog):
                 self.page_selected.emit(ctx)
         elif row.kind == "quick":
             self.quick_slot_selected.emit(row.payload)
+        elif row.kind == "entity":
+            self.entity_selected.emit(dict(row.payload))
         self.accept()
