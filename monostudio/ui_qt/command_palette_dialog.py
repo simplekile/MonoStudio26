@@ -1,0 +1,132 @@
+"""Ctrl+K command palette — jump to pages and quick-view slots."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from PySide6.QtCore import Qt, QSettings, Signal
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from monostudio.ui_qt.nav_quick_view import (
+    SLOT_COUNT,
+    VALID_NAV_CONTEXTS,
+    describe_nav_quick_slot,
+    load_nav_quick_slot,
+)
+from monostudio.ui_qt.style import MonosDialog
+
+
+@dataclass(frozen=True)
+class _PaletteRow:
+    title: str
+    subtitle: str
+    kind: str  # "page" | "quick"
+    payload: dict[str, Any]
+
+
+class CommandPaletteDialog(MonosDialog):
+    """Filterable jump list: nav pages + assigned quick-view slots."""
+
+    page_selected = Signal(str)
+    quick_slot_selected = Signal(object)
+
+    def __init__(self, *, settings: QSettings, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Go to…")
+        self._settings = settings
+        self._rows = self._build_rows()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        self._search = QLineEdit(self)
+        self._search.setObjectName("CommandPaletteSearch")
+        self._search.setPlaceholderText("Search pages and quick views…")
+        self._search.textChanged.connect(self._apply_filter)
+        root.addWidget(self._search)
+
+        self._list = QListWidget(self)
+        self._list.setObjectName("CommandPaletteList")
+        self._list.setSpacing(2)
+        root.addWidget(self._list, 1)
+
+        hint = QLabel("↑↓ navigate · Enter open · Esc close", self)
+        hint.setObjectName("DialogHint")
+        root.addWidget(hint)
+
+        self._populate_list(self._rows)
+        self._search.setFocus(Qt.FocusReason.PopupFocusReason)
+        self._list.itemActivated.connect(self._on_item_activated)
+        self.resize(520, 400)
+
+    def _build_rows(self) -> list[_PaletteRow]:
+        rows: list[_PaletteRow] = []
+        for ctx in (
+            "Dashboard",
+            "Assets",
+            "Shots",
+            "Inbox",
+            "Project Guide",
+            "Schedule",
+            "Outbox",
+            "Trash",
+        ):
+            if ctx in VALID_NAV_CONTEXTS:
+                rows.append(_PaletteRow(title=ctx, subtitle="Page", kind="page", payload={"context": ctx}))
+        for slot in range(1, SLOT_COUNT + 1):
+            payload = load_nav_quick_slot(self._settings, slot)
+            if payload is None:
+                continue
+            summary = describe_nav_quick_slot(payload)
+            rows.append(
+                _PaletteRow(
+                    title=f"Quick view {slot}",
+                    subtitle=summary,
+                    kind="quick",
+                    payload=payload,
+                )
+            )
+        return rows
+
+    def _populate_list(self, rows: list[_PaletteRow]) -> None:
+        self._list.clear()
+        for row in rows:
+            item = QListWidgetItem(f"{row.title}  —  {row.subtitle}")
+            item.setData(Qt.ItemDataRole.UserRole, row)
+            self._list.addItem(item)
+        if self._list.count() > 0:
+            self._list.setCurrentRow(0)
+
+    def _apply_filter(self, text: str) -> None:
+        q = (text or "").strip().casefold()
+        if not q:
+            self._populate_list(self._rows)
+            return
+        filtered = [
+            row
+            for row in self._rows
+            if q in row.title.casefold() or q in row.subtitle.casefold()
+        ]
+        self._populate_list(filtered)
+
+    def _on_item_activated(self, item: QListWidgetItem) -> None:
+        row = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row, _PaletteRow):
+            return
+        if row.kind == "page":
+            ctx = (row.payload.get("context") or "").strip()
+            if ctx:
+                self.page_selected.emit(ctx)
+        elif row.kind == "quick":
+            self.quick_slot_selected.emit(row.payload)
+        self.accept()
