@@ -38,53 +38,36 @@ _FLYOUT_RADIUS = 8
 
 _PILL_ACTIVE_FG = MONOS_COLORS["pill_segment_active_fg"]
 
-# Per-group rail pill colors: inactive tinted rounded BG + brighter icons.
+# Nav rail: unified Electric Blue for primary nav; neutral group shell for utility/footer;
+# trash keeps red (destructive). Matches sidebar + pill_segment_active tokens.
+_NAV_ICON_COLORS: dict[str, str] = {
+    "inactive_icon": "#d4d4d8",
+    "hover_icon": "#e4e4e7",
+    "active_icon": "#fafafa",
+}
+
+_NAV_BLUE_STYLE: dict[str, object] = {
+    "inactive_bg": (37, 99, 235, 40),
+    "hover_bg": "#1e3a8a",
+    "active_bg": MONOS_COLORS["blue_600"],
+    "active_hover_bg": MONOS_COLORS["blue_500"],
+    **_NAV_ICON_COLORS,
+}
+
+_NAV_UTILITY_STYLE: dict[str, object] = {
+    "inactive_bg": (255, 255, 255, 16),
+    "hover_bg": "#1e3a8a",
+    "active_bg": MONOS_COLORS["blue_600"],
+    "active_hover_bg": MONOS_COLORS["blue_500"],
+    **_NAV_ICON_COLORS,
+}
+
 _NAV_GROUP_STYLES: dict[str, dict[str, object]] = {
-    "home": {
-        "inactive_bg": (37, 99, 235, 40),
-        "hover_bg": "#1e3a8a",
-        "active_bg": "#2563eb",
-        "active_hover_bg": "#3b82f6",
-        "inactive_icon": "#d4d4d8",
-        "hover_icon": "#e4e4e7",
-        "active_icon": "#fafafa",
-    },
-    "scope": {
-        "inactive_bg": (139, 92, 246, 40),
-        "hover_bg": "#5b21b6",
-        "active_bg": "#7c3aed",
-        "active_hover_bg": "#8b5cf6",
-        "inactive_icon": "#d4d4d8",
-        "hover_icon": "#e4e4e7",
-        "active_icon": "#fafafa",
-    },
-    "workflow": {
-        "inactive_bg": (16, 185, 129, 34),
-        "hover_bg": "#047857",
-        "active_bg": "#059669",
-        "active_hover_bg": "#10b981",
-        "inactive_icon": "#d4d4d8",
-        "hover_icon": "#e4e4e7",
-        "active_icon": "#fafafa",
-    },
-    "utility": {
-        "inactive_bg": (255, 255, 255, 16),
-        "hover_bg": "#27272a",
-        "active_bg": "#3f3f46",
-        "active_hover_bg": "#52525b",
-        "inactive_icon": "#d4d4d8",
-        "hover_icon": "#e4e4e7",
-        "active_icon": "#fafafa",
-    },
-    "bottom": {
-        "inactive_bg": (255, 255, 255, 14),
-        "hover_bg": "#27272a",
-        "active_bg": "#3f3f46",
-        "active_hover_bg": "#52525b",
-        "inactive_icon": "#d4d4d8",
-        "hover_icon": "#e4e4e7",
-        "active_icon": "#fafafa",
-    },
+    "home": _NAV_BLUE_STYLE,
+    "scope": _NAV_BLUE_STYLE,
+    "workflow": _NAV_BLUE_STYLE,
+    "utility": _NAV_UTILITY_STYLE,
+    "bottom": {**_NAV_UTILITY_STYLE, "inactive_bg": (255, 255, 255, 14)},
     "trash": {
         "inactive_bg": (239, 68, 68, 32),
         "hover_bg": "#7f1d1d",
