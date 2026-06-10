@@ -6,7 +6,7 @@ Stored at <project_root>/.monostudio/schedule.json
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -15,7 +15,7 @@ from monostudio.core.atomic_write import atomic_write_text
 from monostudio.core.models import ProjectIndex
 
 SCHEDULE_FILENAME = "schedule.json"
-SCHEDULE_SCHEMA = 2
+SCHEDULE_SCHEMA = 3
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,7 @@ class ScheduleAllocation:
     assignee_id: str = ""  # legacy: first assignee
     assignee: str = ""  # legacy: joined names
     note: str = ""
+    target_status_id: str = ""  # schedule goal: reach this dept status by due
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -54,6 +55,9 @@ class ScheduleAllocation:
             "due": self.due,
             "note": self.note,
         }
+        tid = (self.target_status_id or "").strip()
+        if tid:
+            d["target_status_id"] = tid
         if self.assignee_ids:
             d["assignee_ids"] = list(self.assignee_ids)
         if self.assignees:
@@ -221,6 +225,7 @@ def _parse_allocation(raw: object) -> ScheduleAllocation | None:
     assignee_id = assignee_ids[0] if assignee_ids else str(raw.get("assignee_id") or "").strip()
     assignee = ", ".join(assignees) if assignees else str(raw.get("assignee") or "").strip()
     note = str(raw.get("note") or "").strip()
+    target_status_id = str(raw.get("target_status_id") or "").strip()
     return ScheduleAllocation(
         id=aid,
         entity_kind=kind,
@@ -233,6 +238,7 @@ def _parse_allocation(raw: object) -> ScheduleAllocation | None:
         assignee_id=assignee_id,
         assignee=assignee,
         note=note,
+        target_status_id=target_status_id,
     )
 
 
@@ -314,6 +320,12 @@ def load_schedule_from_disk(project_root: Path) -> ProjectSchedule:
     if not isinstance(data, dict):
         return ProjectSchedule()
 
+    schema_raw = data.get("schema")
+    try:
+        file_schema = int(schema_raw) if schema_raw is not None else 2
+    except (TypeError, ValueError):
+        file_schema = 2
+
     milestones: list[ScheduleMilestone] = []
     for raw in data.get("milestones") or []:
         m = _parse_milestone(raw)
@@ -325,6 +337,33 @@ def load_schedule_from_disk(project_root: Path) -> ProjectSchedule:
         a = _parse_allocation(raw)
         if a:
             allocations.append(a)
+
+    if file_schema < 3:
+        from monostudio.core.department_status_registry import default_target_status_for_department
+
+        migrated: list[ScheduleAllocation] = []
+        for a in allocations:
+            tid = (a.target_status_id or "").strip()
+            if not tid:
+                dep = (a.department or "").strip()
+                tid = default_target_status_for_department(project_root, dep) if dep else "working"
+            migrated.append(
+                ScheduleAllocation(
+                    id=a.id,
+                    entity_kind=a.entity_kind,
+                    entity_rel=a.entity_rel,
+                    department=a.department,
+                    start=a.start,
+                    due=a.due,
+                    assignee_ids=a.assignee_ids,
+                    assignees=a.assignees,
+                    assignee_id=a.assignee_id,
+                    assignee=a.assignee,
+                    note=a.note,
+                    target_status_id=tid,
+                )
+            )
+        allocations = migrated
 
     ps = data.get("project_start")
     pe = data.get("project_end")
@@ -446,7 +485,7 @@ def count_overdue_allocations(schedule: ProjectSchedule, *, today: date | None =
 
 
 def entity_has_planned_bars(
-    bars: dict[tuple[str, str, str], object],
+    bars: object,
     *,
     entity_kind: str,
     entity_rel: str,
@@ -456,9 +495,16 @@ def entity_has_planned_bars(
     rel = (entity_rel or "").replace("\\", "/").strip()
     if not kind or not rel:
         return False
+    values = getattr(bars, "values", None)
+    if callable(values):
+        return any(
+            (getattr(b, "entity_kind", "") or "").strip().lower() == kind
+            and (getattr(b, "entity_rel", "") or "").replace("\\", "/").strip() == rel
+            for b in values()
+        )
     return any(
         (k[0] or "").strip().lower() == kind and (k[1] or "").replace("\\", "/").strip() == rel
-        for k in bars
+        for k in bars  # type: ignore[union-attr]
     )
 
 
@@ -467,7 +513,7 @@ def entity_is_unscheduled(
     *,
     entity_kind: str,
     entity_rel: str,
-    bars: dict[tuple[str, str, str], object] | None = None,
+    bars: object | None = None,
 ) -> bool:
     """
     Unscheduled = no planned bars on the timeline.
@@ -584,35 +630,28 @@ def _row_key(kind: str, rel: str, department: str | None) -> tuple[str, str, str
 
 
 def upsert_allocation_for_row(project_root: Path, allocation: ScheduleAllocation) -> None:
-    """Replace allocation matching entity + department (one bar per row)."""
-    schedule = read_project_schedule(project_root)
-    key = _row_key(allocation.entity_kind, allocation.entity_rel, allocation.department)
-    kept = [
-        a
-        for a in schedule.allocations
-        if _row_key(a.entity_kind, a.entity_rel, a.department) != key
-    ]
-    kept.append(allocation)
-    schedule.allocations = kept
+    """Upsert one goal allocation and clear auto suppression for its department."""
     dep = (allocation.department or "").strip()
     if dep:
+        schedule = read_project_schedule(project_root)
         schedule.auto_bar_suppressions.discard(
             _auto_suppress_key(allocation.entity_kind, allocation.entity_rel, dep)
         )
-    write_project_schedule(project_root, schedule)
+        write_project_schedule(project_root, schedule)
+    upsert_allocation(project_root, allocation)
 
 
 def bulk_upsert_allocations(project_root: Path, allocations: Iterable[ScheduleAllocation]) -> None:
     schedule = read_project_schedule(project_root)
-    by_row = {_row_key(a.entity_kind, a.entity_rel, a.department): a for a in schedule.allocations}
+    by_id = {a.id: a for a in schedule.allocations}
     for alloc in allocations:
-        by_row[_row_key(alloc.entity_kind, alloc.entity_rel, alloc.department)] = alloc
+        by_id[alloc.id] = alloc
         dep = (alloc.department or "").strip()
         if dep:
             schedule.auto_bar_suppressions.discard(
                 _auto_suppress_key(alloc.entity_kind, alloc.entity_rel, dep)
             )
-    schedule.allocations = list(by_row.values())
+    schedule.allocations = list(by_id.values())
     write_project_schedule(project_root, schedule)
 
 
@@ -902,16 +941,14 @@ def replace_entity_department_allocations(
         if suppress_auto_on_clear:
             for key in triples:
                 schedule.auto_bar_suppressions.add(key)
-    by_row = {
-        _row_key(a.entity_kind, a.entity_rel, a.department): a for a in schedule.allocations
-    }
+    by_id = {a.id: a for a in schedule.allocations}
     for alloc in allocations:
         row = _normalize_entity_row(alloc.entity_kind, alloc.entity_rel, alloc.department)
         if row is None:
             continue
-        by_row[_row_key(alloc.entity_kind, alloc.entity_rel, alloc.department)] = alloc
+        by_id[alloc.id] = alloc
         schedule.auto_bar_suppressions.discard(row)
-    schedule.allocations = list(by_row.values())
+    schedule.allocations = list(by_id.values())
     write_project_schedule(project_root, schedule)
 
 
@@ -1006,6 +1043,185 @@ def allocation_for_row(
         if a_dept == dept:
             return a
     return None
+
+
+def allocations_for_row(
+    schedule: ProjectSchedule,
+    *,
+    entity_kind: str,
+    entity_rel: str,
+    department: str,
+) -> list[ScheduleAllocation]:
+    """All goal allocations for one entity + department row."""
+    return allocations_for_entities_department(
+        schedule,
+        entity_keys=[(entity_kind, entity_rel)],
+        department=department,
+    )
+
+
+def merged_assignee_ids_for_row(
+    schedule: ProjectSchedule,
+    *,
+    entity_kind: str,
+    entity_rel: str,
+    department: str,
+) -> tuple[str, ...]:
+    """Union of assignee ids across every goal in an entity department row."""
+    from monostudio.core.user_identity import normalize_assignee_ids
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for alloc in allocations_for_row(
+        schedule,
+        entity_kind=entity_kind,
+        entity_rel=entity_rel,
+        department=department,
+    ):
+        raw: list[str] = list(alloc.assignee_ids)
+        if not raw and (alloc.assignee_id or "").strip():
+            raw = [(alloc.assignee_id or "").strip()]
+        for uid in normalize_assignee_ids(raw):
+            if uid not in seen:
+                seen.add(uid)
+                merged.append(uid)
+    return tuple(merged)
+
+
+def expand_allocation_ids_to_rows(
+    schedule: ProjectSchedule,
+    allocation_ids: Iterable[str],
+) -> list[str]:
+    """Include every allocation sharing entity+department with any selected id."""
+    seeds = {str(i).strip() for i in allocation_ids if str(i).strip()}
+    if not seeds:
+        return []
+    expanded: set[str] = set()
+    for a in schedule.allocations:
+        if a.id not in seeds:
+            continue
+        dep = (a.department or "").strip()
+        if not dep:
+            expanded.add(a.id)
+            continue
+        for sibling in allocations_for_row(
+            schedule,
+            entity_kind=a.entity_kind,
+            entity_rel=a.entity_rel,
+            department=dep,
+        ):
+            expanded.add(sibling.id)
+    return sorted(expanded)
+
+
+def allocations_for_entities_department(
+    schedule: ProjectSchedule,
+    *,
+    entity_keys: Iterable[tuple[str, str]],
+    department: str,
+) -> list[ScheduleAllocation]:
+    """All goal allocations for the given entities in one department."""
+    dep = (department or "").strip()
+    if not dep:
+        return []
+    keys = {_target_key(kind, rel) for kind, rel in entity_keys}
+    out: list[ScheduleAllocation] = []
+    for a in schedule.allocations:
+        if (a.department or "").strip() != dep:
+            continue
+        if _target_key(a.entity_kind, a.entity_rel) in keys:
+            out.append(a)
+    return out
+
+
+def bulk_update_allocation_target_status(
+    project_root: Path,
+    *,
+    allocation_ids: Iterable[str],
+    target_status_id: str,
+) -> int:
+    """Update target_status_id on matching allocations; returns count updated."""
+    ids = {str(i).strip() for i in allocation_ids if str(i).strip()}
+    tid = (target_status_id or "").strip()
+    if not ids or not tid:
+        return 0
+    schedule = read_project_schedule(project_root)
+    updated = 0
+    out: list[ScheduleAllocation] = []
+    for a in schedule.allocations:
+        if a.id in ids:
+            out.append(replace(a, target_status_id=tid))
+            updated += 1
+        else:
+            out.append(a)
+    if updated:
+        schedule.allocations = out
+        write_project_schedule(project_root, schedule)
+    return updated
+
+
+@dataclass
+class AllocationBulkPatch:
+    """Fields to apply to many allocations; unset fields are left unchanged."""
+
+    start: str | None = None
+    due: str | None = None
+    target_status_id: str | None = None
+    note: str | None = None
+    assignee_ids: tuple[str, ...] | None = None
+    assignees: tuple[str, ...] | None = None
+    assignee_id: str | None = None
+    assignee: str | None = None
+
+
+def bulk_patch_allocations(
+    project_root: Path,
+    allocation_ids: Iterable[str],
+    patch: AllocationBulkPatch,
+) -> int:
+    """Patch matching allocations in one write; returns count updated."""
+    ids = {str(i).strip() for i in allocation_ids if str(i).strip()}
+    if not ids:
+        return 0
+    schedule = read_project_schedule(project_root)
+    updated = 0
+    out: list[ScheduleAllocation] = []
+    for a in schedule.allocations:
+        if a.id not in ids:
+            out.append(a)
+            continue
+        kw: dict = {}
+        if patch.start is not None:
+            kw["start"] = patch.start[:10]
+        if patch.due is not None:
+            kw["due"] = patch.due[:10]
+        if patch.target_status_id is not None:
+            kw["target_status_id"] = patch.target_status_id.strip()
+        if patch.note is not None:
+            kw["note"] = patch.note
+        if patch.assignee_ids is not None:
+            kw["assignee_ids"] = patch.assignee_ids
+            kw["assignees"] = patch.assignees or ()
+            kw["assignee_id"] = (patch.assignee_id or "").strip()
+            kw["assignee"] = (patch.assignee or "").strip()
+        if kw:
+            out.append(replace(a, **kw))
+            updated += 1
+        else:
+            out.append(a)
+    if updated:
+        schedule.allocations = out
+        write_project_schedule(project_root, schedule)
+    return updated
+
+
+def allocations_by_ids(
+    schedule: ProjectSchedule, allocation_ids: Iterable[str]
+) -> list[ScheduleAllocation]:
+    ids = {str(i).strip() for i in allocation_ids if str(i).strip()}
+    if not ids:
+        return []
+    return [a for a in schedule.allocations if a.id in ids]
 
 
 @dataclass(frozen=True)

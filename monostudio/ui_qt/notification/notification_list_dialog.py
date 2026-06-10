@@ -20,8 +20,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from monostudio.core.notification_copy import pick_copy
+from monostudio.core.notification_preferences import read_notification_vietnamese
 from monostudio.ui_qt.notification.notification_row_widget import NotificationAlertRow
-from monostudio.ui_qt.notification.store import NotificationEntry, all_entries
+from monostudio.ui_qt.notification.store import NotificationEntry, all_entries, unread_count
 from monostudio.ui_qt.style import MonosDialog, monos_font
 
 
@@ -48,10 +50,21 @@ class NotificationListDialog(MonosDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
+        header_row = QHBoxLayout()
         title = QLabel("Notifications", self)
         title.setObjectName("DialogSectionTitle")
         title.setFont(monos_font("Inter", 14, QFont.Weight.DemiBold))
-        root.addWidget(title, 0)
+        header_row.addWidget(title, 0)
+        header_row.addStretch(1)
+        self._mark_all_btn = QPushButton(
+            pick_copy("Đã xem tất cả", "Mark all read", vietnamese=read_notification_vietnamese()),
+            self,
+        )
+        self._mark_all_btn.setObjectName("SettingsInlineActionButton")
+        self._mark_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mark_all_btn.clicked.connect(self._on_mark_all_read)
+        header_row.addWidget(self._mark_all_btn, 0)
+        root.addLayout(header_row, 0)
 
         self._list = QListWidget(self)
         self._list.setObjectName("NotificationList")
@@ -94,6 +107,22 @@ class NotificationListDialog(MonosDialog):
         self._project_root = project_root
         self._current_user_id = (user_id or "").strip()
 
+    def _update_mark_all_enabled(self) -> None:
+        n = unread_count(
+            user_id=self._current_user_id,
+            project_root=self._project_root,
+        )
+        self._mark_all_btn.setEnabled(n > 0)
+
+    def _on_mark_all_read(self) -> None:
+        from monostudio.ui_qt.notification.service import notify
+
+        notify.mark_all_read(
+            user_id=self._current_user_id,
+            project_root=self._project_root,
+        )
+        self._load()
+
     def _load(self) -> None:
         self._list.clear()
         for entry in all_entries(
@@ -111,3 +140,4 @@ class NotificationListDialog(MonosDialog):
             item.setSizeHint(row.sizeHint())
             self._list.addItem(item)
             self._list.setItemWidget(item, row)
+        self._update_mark_all_enabled()

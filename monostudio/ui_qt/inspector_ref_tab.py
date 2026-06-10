@@ -30,6 +30,7 @@ from PySide6.QtGui import (
     QDropEvent,
     QFont,
     QImage,
+    QMouseEvent,
     QPainter,
     QPainterPath,
     QPen,
@@ -61,6 +62,12 @@ from monostudio.core.entity_folders import (
     is_ref_preview_image,
     list_special_folder_files,
 )
+from monostudio.core.entity_ref_pins import (
+    is_ref_file_pinned,
+    pinned_file_names,
+    sort_files_with_pins,
+    toggle_ref_file_pin,
+)
 from monostudio.core.models import Asset, Shot
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.external_drop import paths_from_mime
@@ -82,6 +89,8 @@ _REF_THUMB_DECODE_MIN = 256
 _REF_THUMB_DECODE_MAX = 512
 _REF_THUMB_PREFETCH_CHUNK = 8
 _REF_THUMB_PREFETCH_ALL_MAX_ROWS = 32
+_REF_STAR_BADGE_SIZE = 16
+_REF_STAR_BADGE_INSET = 6
 
 
 def _explorer_mime_has_files(mime: QMimeData | None) -> bool:
@@ -140,6 +149,7 @@ def _ref_grid_columns_for_width(available_w: int) -> int:
 class _RefThumbEntry:
     path: Path
     placeholder_ext: str = ""
+    starred: bool = False
 
 
 def _draw_ref_thumb_pixmap(p: QPainter, thumb: QRect, pixmap: QPixmap, dpr: float) -> None:
@@ -162,6 +172,12 @@ def _draw_ref_thumb_pixmap(p: QPainter, thumb: QRect, pixmap: QPixmap, dpr: floa
     p.drawPixmap(thumb, px)
 
 
+def _ref_star_hit_rect(outer: QRect) -> QRect:
+    size = _REF_STAR_BADGE_SIZE
+    inset = _REF_STAR_BADGE_INSET
+    return QRect(outer.right() - size - inset, outer.top() + inset, size, size)
+
+
 def _paint_ref_thumb_cell(
     p: QPainter,
     rect: QRect,
@@ -170,6 +186,7 @@ def _paint_ref_thumb_cell(
     placeholder_ext: str,
     selected: bool,
     hovered: bool,
+    starred: bool = False,
     dpr: float = 1.0,
 ) -> None:
     g = _REF_GRID_GAP
@@ -213,6 +230,19 @@ def _paint_ref_thumb_cell(
     p.setPen(QPen(border_color, border_px))
     p.setBrush(Qt.BrushStyle.NoBrush)
     p.drawRoundedRect(border_rect, radius, radius)
+
+    if starred or hovered:
+        star_rect = _ref_star_hit_rect(outer)
+        star_color = "#fbbf24" if starred else "#52525b"
+        star_pm = lucide_icon("star", size=_REF_STAR_BADGE_SIZE, color_hex=star_color).pixmap(
+            _REF_STAR_BADGE_SIZE, _REF_STAR_BADGE_SIZE
+        )
+        if not star_pm.isNull():
+            bg = QRect(star_rect.x() - 2, star_rect.y() - 2, star_rect.width() + 4, star_rect.height() + 4)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 140 if starred else 90))
+            p.drawRoundedRect(bg, 4, 4)
+            p.drawPixmap(star_rect, star_pm)
 
 
 class _RefThumbDecodeBridge(QObject):
@@ -297,6 +327,7 @@ class _RefThumbDelegate(QStyledItemDelegate):
                 placeholder_ext=entry.placeholder_ext if pm is None or pm.isNull() else "",
                 selected=selected,
                 hovered=hovered,
+                starred=entry.starred,
                 dpr=dpr,
             )
         finally:
@@ -342,6 +373,7 @@ class _InspectorRefSection(QWidget):
         card_lay.addWidget(self, 0)
 
         self._section_id = section_id
+        self._entity_root: Path | None = None
         self._folder_path: Path | None = None
         self._files: list[Path] = []
         self._expanded = True
@@ -458,14 +490,6 @@ class _InspectorRefSection(QWidget):
         body_l.addWidget(self._list, 0)
         self._ref_scroll_area: QScrollArea | None = None
 
-        self._other_link = QToolButton(self._body)
-        self._other_link.setAutoRaise(True)
-        self._other_link.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._other_link.setStyleSheet(f"color: {MONOS_COLORS.get('text_muted', '#71717a')}; text-align: left;")
-        self._other_link.setVisible(False)
-        self._other_link.clicked.connect(lambda: self.open_folder_clicked.emit(self._section_id))
-        body_l.addWidget(self._other_link, 0)
-
         lay.addWidget(self._body, 0)
         self._body.setMouseTracking(True)
         for w in (self, self._hdr, self._body, self._empty_block, self._list, self._list.viewport()):
@@ -562,6 +586,25 @@ class _InspectorRefSection(QWidget):
             elif t == QEvent.Type.Drop and isinstance(event, QDropEvent):
                 self.dropEvent(event)
                 return True
+            elif (
+                obj is self._list.viewport()
+                and t == QEvent.Type.MouseButtonPress
+                and isinstance(event, QMouseEvent)
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                pos = (
+                    event.position().toPoint()
+                    if hasattr(event, "position")
+                    else event.pos()
+                )
+                index = self._list.indexAt(pos)
+                if index.isValid():
+                    star_rect = self._star_hit_rect_for_index(index)
+                    if star_rect.contains(pos):
+                        entry = self._model.entry_at(index.row())
+                        if entry is not None:
+                            self._toggle_star_for_path(entry.path)
+                            return True
         return super().eventFilter(obj, event)
 
     def set_drop_enabled(self, enabled: bool) -> None:
@@ -777,9 +820,23 @@ class _InspectorRefSection(QWidget):
                     del self._thumb_pixmaps[key]
             self._thumb_missing = {k for k in self._thumb_missing if k not in keep_paths}
 
+    def set_entity_root(self, path: Path | None) -> None:
+        self._entity_root = path.resolve() if path is not None else None
+
     def set_folder_path(self, path: Path | None) -> None:
         self._folder_path = path
         self.set_drop_enabled(path is not None)
+
+    def _pinned_names(self) -> list[str]:
+        if self._entity_root is None:
+            return []
+        return pinned_file_names(self._entity_root, self._section_id)
+
+    def _toggle_star_for_path(self, path: Path) -> None:
+        if self._entity_root is None or not path.is_file():
+            return
+        toggle_ref_file_pin(self._entity_root, self._section_id, path.name)
+        self._rebuild_entries()
 
     def apply_scan(self, files: list[Path], *, expanded: bool | None = None) -> int:
         self._files = list(files)
@@ -832,30 +889,36 @@ class _InspectorRefSection(QWidget):
             self._schedule_thumb_prefetch()
 
     def _rebuild_entries(self) -> None:
-        self._other_link.setVisible(False)
         self._empty_block.setVisible(self._expanded and not self._files)
         entries: list[_RefThumbEntry] = []
         if self._files and self._expanded:
-            images = [p for p in self._files if is_ref_preview_image(p)]
-            others = [p for p in self._files if not is_ref_preview_image(p)]
-            keep_keys = {_ref_path_key(p) for p in images}
+            ordered = sort_files_with_pins(self._files, self._pinned_names())
+            keep_keys = {_ref_path_key(p) for p in ordered if is_ref_preview_image(p)}
             self._reset_thumb_load_state(keep_keys)
-            for path in images:
+            entity = self._entity_root
+            for path in ordered:
                 key = _ref_path_key(path)
-                pm = self._thumb_pixmaps.get(key) or self._thumb_cache.peek_thumbnail_pixmap(path)
-                if pm is not None and not pm.isNull():
-                    self._thumb_pixmaps[key] = pm
+                is_image = is_ref_preview_image(path)
+                pm = None
+                if is_image:
+                    pm = self._thumb_pixmaps.get(key) or self._thumb_cache.peek_thumbnail_pixmap(path)
+                    if pm is not None and not pm.isNull():
+                        self._thumb_pixmaps[key] = pm
+                starred = (
+                    is_ref_file_pinned(entity, self._section_id, path.name)
+                    if entity is not None
+                    else False
+                )
+                placeholder = ""
+                if not is_image or pm is None or pm.isNull():
+                    placeholder = path.suffix or "file"
                 entries.append(
                     _RefThumbEntry(
                         path=path,
-                        placeholder_ext="" if key in self._thumb_pixmaps else path.suffix,
+                        placeholder_ext=placeholder,
+                        starred=starred,
                     )
                 )
-            if others:
-                self._other_link.setText(
-                    f"+{len(others)} other file{'s' if len(others) != 1 else ''} — open folder"
-                )
-                self._other_link.setVisible(True)
         self._model.reset_entries(entries)
         self._grid_last = None
         self._schedule_grid_sync()
@@ -868,6 +931,12 @@ class _InspectorRefSection(QWidget):
                     break
             else:
                 self._selected_path = None
+
+    def _star_hit_rect_for_index(self, index: QModelIndex) -> QRect:
+        rect = self._list.visualRect(index)
+        g = _REF_GRID_GAP
+        outer = rect.adjusted(0, 0, -g, -g)
+        return _ref_star_hit_rect(outer)
 
     def _on_list_clicked(self, index: QModelIndex) -> None:
         entry = self._model.entry_at(index.row())
@@ -1014,11 +1083,17 @@ class _InspectorRefSection(QWidget):
         icon = lambda name: lucide_icon(name, size=16, color_hex=MONOS_COLORS["text_label"])
         icon_red = lambda name: lucide_icon(name, size=16, color_hex=MONOS_COLORS.get("destructive", "#ef4444"))
 
-        open_act = open_folder_act = copy_act = delete_act = delete_all_act = None
+        open_act = open_folder_act = copy_act = star_act = delete_act = delete_all_act = None
         if entry is not None:
             open_act = menu.addAction(icon("file"), "Open")
             open_folder_act = menu.addAction(icon("folder-open"), "Open folder")
             copy_act = menu.addAction(icon("copy"), "Copy file path")
+            starred = entry.starred
+            star_label = "Unstar" if starred else "Star — pin to top"
+            star_act = menu.addAction(
+                icon("star"),
+                star_label,
+            )
             menu.addSeparator()
         else:
             open_folder_act = menu.addAction(icon("folder-open"), "Open folder")
@@ -1044,6 +1119,8 @@ class _InspectorRefSection(QWidget):
             cb = QApplication.clipboard()
             if cb is not None:
                 cb.setText(str(entry.path.resolve()))  # type: ignore[union-attr]
+        elif chosen is star_act and entry is not None:
+            self._toggle_star_for_path(entry.path)
         elif chosen is open_folder_act:
             self.open_folder_clicked.emit(self._section_id)
         elif chosen is add_act:
@@ -1108,14 +1185,14 @@ class InspectorRefTab(QWidget):
             "concept",
             title="CONCEPT",
             icon_name="lightbulb",
-            empty_hint="No concept art yet.\nDrop files here to import.",
+            empty_hint="No concept files yet.\nDrop files here to import.",
             parent=content,
         )
         self._reference = _InspectorRefSection(
             "reference",
             title="REFERENCE",
             icon_name="eye",
-            empty_hint="No reference images yet.\nDrop files here to import.",
+            empty_hint="No reference files yet.\nDrop files here to import.",
             parent=content,
         )
         for sec in (self._concept, self._reference):
@@ -1313,6 +1390,7 @@ class InspectorRefTab(QWidget):
         self._paths = {}
         self._scanned_key = None
         for sec in (self._concept, self._reference):
+            sec.set_entity_root(None)
             sec.set_drop_enabled(False)
             sec.set_folder_path(None)
             sec.apply_scan([], expanded=False)
@@ -1327,7 +1405,9 @@ class InspectorRefTab(QWidget):
         key = str(entity.path)
         if key != self._scanned_key:
             self._scanned_key = None
+        entity_root = Path(entity.path)
         for sec, fid in ((self._concept, "concept"), (self._reference, "reference")):
+            sec.set_entity_root(entity_root)
             folder = paths.get(fid)
             if folder is not None:
                 ensure_entity_special_folder(folder)

@@ -334,5 +334,37 @@ class _NotificationService(QObject):
         cls._important_banner.show()
         cls._important_banner.raise_()
 
+    @classmethod
+    def mark_all_read(
+        cls,
+        *,
+        user_id: str = "",
+        project_root: Path | str | None = None,
+    ) -> None:
+        """Mark all in-app bell notifications read for the current user (+ inbox rows)."""
+        from pathlib import Path as PathCls
+
+        from monostudio.ui_qt.notification.store import mark_all_read as store_mark_all
+
+        uid = (user_id or "").strip()
+        pr = PathCls(project_root) if project_root is not None else None
+        store_mark_all(user_id=uid, project_root=pr)
+        if uid and pr is not None:
+            try:
+                from monostudio.core.mention_inbox import mark_all_read as mention_mark_all
+
+                mention_mark_all(pr, uid)
+            except OSError:
+                pass
+            try:
+                from monostudio.core.assign_inbox import items_for_user, mark_read as assign_mark_read
+
+                for item in items_for_user(pr, uid):
+                    if not item.read:
+                        assign_mark_read(pr, item.id)
+            except OSError:
+                pass
+        cls._emit_unread()
+
 
 notify = _NotificationService()

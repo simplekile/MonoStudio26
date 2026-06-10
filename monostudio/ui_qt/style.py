@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, QEvent, QObject
+from PySide6.QtCore import QPointF, QRectF, Qt, QEvent, QObject
 
 from monostudio.core.app_paths import get_app_base_path
 from PySide6.QtGui import (
     QBitmap,
     QBrush,
     QColor,
+    QCursor,
     QFont,
     QFontDatabase,
+    QMouseEvent,
     QPainter,
     QPalette,
     QPainterPath,
@@ -36,6 +38,23 @@ _MONOS_DIALOG_BORDER = "#3f3f46"
 # Overlay behind modal dialog: white 15% opacity
 _MONOS_DIALOG_OVERLAY_CSS = "background: rgba(0, 0, 0, 0.55);"
 
+
+class _DialogDismissOverlay(QWidget):
+    """Dimmed backdrop; left-click closes the owning MonosDialog."""
+
+    def __init__(self, host: QWidget, dismiss) -> None:
+        super().__init__(host)
+        self._dismiss = dismiss
+        self.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dismiss()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 # Menu popup: same round-corner standard (radius 12, border lighter than bg)
 _MONOS_MENU_BG = "#1c1c1f"
 _MONOS_MENU_RADIUS = 12
@@ -56,6 +75,74 @@ def clear_stuck_widget_hover(widget: QWidget | None) -> None:
     except Exception:
         pass
     widget.update()
+
+
+def release_stuck_mouse_grab(*, force: bool = False) -> None:
+    """Release a lingering Qt mouse grab (e.g. after Popup dismiss) so hover works again."""
+    app = QApplication.instance()
+    if app is not None and not force and app.mouseButtons() != Qt.MouseButton.NoButton:
+        return
+    for _ in range(8):
+        grabber = QWidget.mouseGrabber()
+        if grabber is None:
+            break
+        try:
+            grabber.releaseMouse()
+        except Exception:
+            break
+
+
+def _clear_stale_under_mouse(active: QWidget | None) -> None:
+    """Drop :hover / enter state on widgets no longer under the cursor."""
+    app = QApplication.instance()
+    if app is None:
+        return
+    keep: set[int] = set()
+    w = active
+    while w is not None:
+        keep.add(id(w))
+        w = w.parentWidget()
+    for w in app.allWidgets():
+        try:
+            if not w.underMouse():
+                continue
+            if id(w) in keep:
+                continue
+            clear_stuck_widget_hover(w)
+        except RuntimeError:
+            pass
+
+
+def resync_hover_at_cursor() -> None:
+    """Ask Qt to re-evaluate :hover / enter-leave for the widget under the cursor."""
+    app = QApplication.instance()
+    if app is None:
+        return
+    pos = QCursor.pos()
+    widget = app.widgetAt(pos)
+    _clear_stale_under_mouse(widget)
+    if widget is None:
+        return
+    chain: list[QWidget] = []
+    w: QWidget | None = widget
+    while w is not None:
+        chain.append(w)
+        w = w.parentWidget()
+    gp = QPointF(pos)
+    for target in chain:
+        try:
+            local = target.mapFromGlobal(pos)
+            ev = QMouseEvent(
+                QEvent.Type.MouseMove,
+                local,
+                gp,
+                Qt.MouseButton.NoButton,
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            app.sendEvent(target, ev)
+        except Exception:
+            pass
 
 
 class _DialogBorderOverlay(QWidget):
@@ -182,6 +269,8 @@ class MonosDialog(QDialog):
         self._overlay: QWidget | None = None
         self._overlay_host: QWidget | None = None
         self._border_overlay: _DialogBorderOverlay | None = None
+        self._dismiss_on_overlay_click = False
+        self._host_dim_overlay_enabled = True
         flags = self.windowFlags()
         self.setWindowFlags(
             (flags | Qt.FramelessWindowHint) & ~Qt.WindowContextHelpButtonHint
@@ -195,6 +284,17 @@ class MonosDialog(QDialog):
         self.setPalette(pal)
         self.setAutoFillBackground(False)
         self.finished.connect(self._hide_overlay)
+
+    def set_host_dim_overlay_enabled(self, enabled: bool = True) -> None:
+        """When False, skip the dim layer on the parent window (Spotlight uses its own backdrop)."""
+        self._host_dim_overlay_enabled = enabled
+
+    def set_dismiss_on_overlay_click(self, enabled: bool = True) -> None:
+        """When True, clicking the dimmed backdrop closes the dialog (Spotlight-style)."""
+        self._dismiss_on_overlay_click = enabled
+        if enabled:
+            # WindowModal blocks mouse events to the parent overlay during exec().
+            self.setWindowModality(Qt.WindowModality.NonModal)
 
     def paintEvent(self, event) -> None:
         # 1) Fill rounded background (antialiased).
@@ -252,6 +352,18 @@ class MonosDialog(QDialog):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if watched is self._overlay_host and event.type() == QEvent.Type.Resize:
             self._sync_overlay_geometry()
+        if (
+            self._dismiss_on_overlay_click
+            and event.type() == QEvent.Type.MouseButtonPress
+            and isinstance(event, QMouseEvent)
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            if watched is self._overlay:
+                self.reject()
+                return True
+            if not self.frameGeometry().contains(event.globalPosition().toPoint()):
+                self.reject()
+                return True
         return super().eventFilter(watched, event)
 
     def resizeEvent(self, event) -> None:
@@ -272,23 +384,37 @@ class MonosDialog(QDialog):
         self._border_overlay.show()
         host = self._resolve_overlay_host()
         self._overlay_host = host
-        if host is not None:
+        if self._host_dim_overlay_enabled and host is not None:
             if self._overlay is None:
-                self._overlay = QWidget(host)
-                self._overlay.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
-                self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+                if self._dismiss_on_overlay_click:
+                    self._overlay = _DialogDismissOverlay(host, self.reject)
+                else:
+                    self._overlay = QWidget(host)
+                    self._overlay.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
+                    self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
             host.installEventFilter(self)
             self._sync_overlay_geometry()
             self._overlay.show()
             self._overlay.raise_()
+            if self._dismiss_on_overlay_click:
+                self._overlay.installEventFilter(self)
         self.raise_()
         self.activateWindow()
+        if self._dismiss_on_overlay_click:
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
 
     def _hide_overlay(self) -> None:
+        if self._dismiss_on_overlay_click:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
         if self._overlay_host is not None:
             self._overlay_host.removeEventFilter(self)
             self._overlay_host = None
         if self._overlay is not None:
+            self._overlay.removeEventFilter(self)
             self._overlay.hide()
             self._overlay.deleteLater()
             self._overlay = None
@@ -1113,19 +1239,23 @@ def apply_dark_theme(app: QApplication) -> None:
         QTableView#MainViewList {
             background: #151618;
             solid #27272a;
-
+            selection-background-color: transparent;
         }
         QTableView#MainViewList::item {
-            background: #191b1e;
+            background: transparent;
             color: #a1a1aa;
+            border: none;
         }
         QTableView#MainViewList::item:hover {
-            background: #1d1f23;
+            background: transparent;
             color: #fafafa;
         }
         QTableView#MainViewList::item:selected {
-            background: rgba(59, 130, 246, 0.10);
+            background: transparent;
             color: #60a5fa;
+        }
+        QTableView#MainViewList::item:selected:!active {
+            color: #a1a1aa;
         }
 
         /* --- Inbox tree pane: file tree (modern flat look, full-row selection) --- */
@@ -1634,6 +1764,11 @@ def apply_dark_theme(app: QApplication) -> None:
         QListWidget#TrayMiniPopupList::item:selected {
             background-color: rgba(37, 99, 235, 0.22);
             color: #fafafa;
+        }
+        QWidget#CommandPalettePanel {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 12px;
         }
         QLineEdit#CommandPaletteSearch {
             background-color: #1c1c1f;
@@ -2293,6 +2428,31 @@ def apply_dark_theme(app: QApplication) -> None:
             border-color: #ef4444;
             color: #fca5a5;
         }
+        QWidget#ProjectPickerDialogTitleBar {
+            background-color: #151618;
+            border-bottom: 1px solid rgba(39, 39, 42, 0.50);
+            border-top-left-radius: 12px;
+            border-top-right-radius: 12px;
+        }
+        QLabel#ProjectPickerDialogTitle {
+            color: #71717a;
+            font-family: "Inter";
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+        }
+        QToolButton#ProjectPickerDialogCloseBtn {
+            padding: 0px;
+            border: none;
+            border-radius: 8px;
+            background: #ef4444;
+            color: #fafafa;
+        }
+        QToolButton#ProjectPickerDialogCloseBtn:hover {
+            background: #dc2626;
+            border: none;
+            color: #ffffff;
+        }
         QLabel#ItemNotesPreviewLabel {
             background: transparent;
             border: none;
@@ -2882,6 +3042,10 @@ def apply_dark_theme(app: QApplication) -> None:
         QProgressBar#UpdateDownloadProgress::chunk {
             background-color: #6366f1;
             border-radius: 4px;
+        }
+        /* Main content: project / page loading strip (4px top edge only) */
+        QWidget#PageLoadingBar {
+            background-color: transparent;
         }
         QToolButton#UpdateDownloadCancelBtn {
             background: transparent;
@@ -3771,7 +3935,15 @@ def apply_dark_theme(app: QApplication) -> None:
 
         /* --- MONOS Sidebar (fixed 256px) --- */
         QWidget#SidebarContainer,
-        QWidget#SidebarFilterPanel {
+        QWidget#SidebarFilterPanel,
+        QWidget#SidebarFiltersCenter {
+            background-color: #181a1d;
+        }
+        QScrollArea#SidebarCompactFilterScroll {
+            background-color: #181a1d;
+            border: none;
+        }
+        QScrollArea#SidebarCompactFilterScroll::viewport {
             background-color: #181a1d;
         }
         QLabel#SidebarProjectNameLabel {
@@ -4284,7 +4456,7 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 8px;
         }
         QFrame#SidebarCompactFilterPopup {
-            background-color: #18181b;
+            background-color: #181a1d;
             border: 1px solid #3f3f46;
             border-radius: 8px;
         }

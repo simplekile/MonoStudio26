@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QPoint, Qt, QRect, QSettings, Signal, QThread, QTimer, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDragMoveEvent, QDropEvent, QMouseEvent
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QMenu, QMessageBox, QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QToolTip, QVBoxLayout, QWidget
 from qframelesswindow import FramelessMainWindow
@@ -87,12 +87,12 @@ from monostudio.ui_qt.settings_dialog import SettingsDialog
 from monostudio.ui_qt.project_picker_dialog import ProjectPickerDialog
 from monostudio.ui_qt.sidebar import Sidebar
 from monostudio.ui_qt.sidebar_nav_rail import SidebarNavRail
-from monostudio.ui_qt.nav_rail_expand_item import ICON_INSET_X
-from monostudio.ui_qt.popup_position import max_popup_height_for_anchor, position_popup_near_anchor
+from monostudio.ui_qt.popup_position import max_popup_height_in_widget
 from monostudio.ui_qt.top_bar import TopBar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog, ask_delete_folder
 from monostudio.ui_qt.rename_asset_dialog import RenameAssetDialog
+from monostudio.ui_qt.page_loading_bar import PageLoadingBar, SCANNING_EMPTY_MESSAGE
 from monostudio.ui_qt.app_controller import AppController
 from monostudio.ui_qt.app_state import AppState
 from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
@@ -266,7 +266,6 @@ class MainWindow(FramelessMainWindow):
         except Exception:
             pass
         self._restore_workspace_root()
-        self._restore_project_root()
         self._restore_window_geometry()
 
         # L1: Main layout (horizontal) -> [Sidebar] + [Right container]
@@ -289,6 +288,10 @@ class MainWindow(FramelessMainWindow):
         self._content_splitter.setStretchFactor(1, 30)
         self._content_splitter.setSizes([800, 320])
         right_layout.addWidget(self._content_splitter, 1)
+        self._right_container = right_container
+        self._page_loading_bar = PageLoadingBar(self._content_stack)
+        self._page_loading_visible = False
+        self._project_load_save_on_complete = False
 
         self._main_splitter = QSplitter(Qt.Horizontal)
         self._main_splitter.setObjectName("MainSplitter")
@@ -310,6 +313,10 @@ class MainWindow(FramelessMainWindow):
         _central.installEventFilter(self)
         self._content_stack.installEventFilter(self)
         self._inspector.installEventFilter(self)
+        self._main_view.installEventFilter(self)
+        self._main_view._tile_view.viewport().installEventFilter(self)
+        self._main_view._list_view.viewport().installEventFilter(self)
+        self._restore_project_root()
         self._restore_splitter_sizes()
         # Store sizes to restore when showing panels again after narrow resize.
         self._content_splitter_sizes_restore: list[int] = [800, 320]
@@ -320,6 +327,7 @@ class MainWindow(FramelessMainWindow):
         self._manual_inspector_visible: bool = True
         self._load_panel_layout_prefs()
         self._compact_filter_popup: QFrame | None = None
+        self._compact_filter_scroll: QScrollArea | None = None
         self._compact_filter_popup_closed_at = 0.0
         self._POPUP_REOPEN_GRACE = 0.25
         # Frameless window on Windows: accept drops at window + page level (see external_drop.py).
@@ -683,12 +691,82 @@ class MainWindow(FramelessMainWindow):
             inspector_on=self._inspector.isVisible(),
         )
 
+    def _restore_compact_filter_widget(self) -> None:
+        """Return detached filter lists from compact popup scroll area into the sidebar layout."""
+        scroll = self._compact_filter_scroll
+        if scroll is not None:
+            w = scroll.takeWidget()
+            if w is not None:
+                self._filter_panel.restore_filters_center(w)
+            self._compact_filter_scroll = None
+        self._filter_panel.ensure_filters_center_attached()
+
+    def _finalize_compact_filter_popup(self) -> None:
+        """Single cleanup path after compact filter popup closes."""
+        popup = self._compact_filter_popup
+        self._compact_filter_popup = None
+        self._restore_compact_filter_widget()
+        self._compact_filter_popup_closed_at = time.monotonic()
+        self._nav_rail.set_filter_popup_active(False)
+        if popup is not None:
+            popup.deleteLater()
+        from monostudio.ui_qt.style import release_stuck_mouse_grab
+
+        release_stuck_mouse_grab(force=True)
+
+    def _dismiss_compact_filter_popup(self) -> None:
+        """Close compact filter popup and ensure filter lists return to the sidebar layout."""
+        popup = self._compact_filter_popup
+        if popup is not None and popup.isVisible():
+            popup.hide()
+            return
+        if popup is not None:
+            self._finalize_compact_filter_popup()
+            return
+        self._restore_compact_filter_widget()
+        self._nav_rail.set_filter_popup_active(False)
+
+    def _dismiss_chrome_popups_on_main_view_press(self) -> None:
+        if self._compact_filter_popup is not None and self._compact_filter_popup.isVisible():
+            self._dismiss_compact_filter_popup()
+
+    def _finish_main_view_mouse_gestures(self) -> None:
+        """Drop viewport mouse grabs left after main-view clicks (restores chrome hover)."""
+        mv = self._main_view
+        for view in (mv._tile_view, mv._list_view):
+            cleanup = getattr(view, "_rb_force_cleanup", None)
+            if callable(cleanup):
+                cleanup()
+
+    def _reset_pointer_hover_state(self) -> None:
+        """Release popup grab / viewport grab after click on main content."""
+        from monostudio.ui_qt.style import release_stuck_mouse_grab
+
+        self._finish_main_view_mouse_gestures()
+        release_stuck_mouse_grab()
+
+    def _is_main_view_descendant(self, obj: object) -> bool:
+        if not isinstance(obj, QWidget):
+            return False
+        w: QWidget | None = obj
+        while w is not None:
+            if w is self._main_view:
+                return True
+            w = w.parentWidget()
+        return False
+
     def _set_sidebar_panel_visible(self, visible: bool) -> None:
+        if visible:
+            self._dismiss_compact_filter_popup()
         self._sidebar_panel_visible = bool(visible)
         self._filter_panel.setVisible(visible)
         if visible:
             self._filter_panel.setMinimumWidth(self.SIDEBAR_PANEL_W)
             self._filter_panel.setMaximumWidth(self.SIDEBAR_PANEL_W)
+            lay = self._sidebar_container.layout()
+            if lay is not None:
+                lay.activate()
+            self._sidebar_container.updateGeometry()
         else:
             self._filter_panel.setMinimumWidth(0)
             self._filter_panel.setMaximumWidth(0)
@@ -938,6 +1016,20 @@ class MainWindow(FramelessMainWindow):
 
     def eventFilter(self, obj, event) -> bool:
         et = event.type()
+        if (
+            et == QEvent.Type.MouseButtonPress
+            and isinstance(event, QMouseEvent)
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._is_main_view_descendant(obj)
+        ):
+            self._dismiss_chrome_popups_on_main_view_press()
+        elif (
+            et == QEvent.Type.MouseButtonRelease
+            and isinstance(event, QMouseEvent)
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._is_main_view_descendant(obj)
+        ):
+            QTimer.singleShot(0, self._finish_main_view_mouse_gestures)
         if et not in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
             return super().eventFilter(obj, event)
         if not self._external_drop_watch_widget(obj):
@@ -1413,6 +1505,18 @@ class MainWindow(FramelessMainWindow):
         self._refresh_schedule_cache()
         self._refresh_inspector_selection()
 
+    def _on_schedule_jump_to_entity(
+        self, entity_kind: str, entity_rel: str, department: str
+    ) -> None:
+        item = self._view_item_for_schedule_entity(entity_kind, entity_rel)
+        name = (item.name if item is not None else "") or ""
+        self._navigate_dashboard_to_entity(
+            entity_kind=entity_kind,
+            entity_name=name,
+            department=department or "",
+            entity_rel=entity_rel,
+        )
+
     def _on_schedule_entity_row_cleared(self) -> None:
         if self._nav_rail.current_context() != "Schedule":
             return
@@ -1622,6 +1726,34 @@ class MainWindow(FramelessMainWindow):
             self._workspace_project_quick_stats = stats
         self._sync_top_bar()
 
+    def _on_project_browser_status_chosen(self, project_path: object, status: object) -> None:
+        from monostudio.core.workspace_reader import (
+            PROJECT_BROWSER_STATUS_KEYS,
+            read_project_quick_stats,
+            write_project_status_override,
+        )
+
+        try:
+            root = Path(project_path)
+        except (TypeError, OSError):
+            return
+        if status is None:
+            sid = None
+        else:
+            sid = str(status).strip().upper()
+            if sid and sid not in PROJECT_BROWSER_STATUS_KEYS:
+                return
+        if not write_project_status_override(root, sid):
+            return
+        key = str(root)
+        try:
+            stats = read_project_quick_stats(root, schedule_aware=True)
+        except Exception:
+            return
+        self._workspace_project_status[key] = stats.status
+        self._workspace_project_quick_stats[key] = stats
+        self._sync_top_bar()
+
     def _open_project_picker(self) -> None:
         self._schedule_workspace_stats_refresh_async()
         dlg = ProjectPickerDialog(
@@ -1630,6 +1762,7 @@ class MainWindow(FramelessMainWindow):
             quick_stats_by_root=self._workspace_project_quick_stats,
             status_by_root=self._workspace_project_status,
             current_project_root=self._project_root,
+            thumbnail_manager=self._thumbnail_manager,
             parent=self,
         )
         dlg.project_selected.connect(self._switch_project)
@@ -2050,14 +2183,24 @@ class MainWindow(FramelessMainWindow):
             return
         if self._project_root is None:
             return
+        from dataclasses import replace
+
         from monostudio.core.project_schedule import (
+            AllocationBulkPatch,
             ScheduleAllocation,
+            allocations_for_row,
             allocation_for_row,
+            bulk_patch_allocations,
+            merged_assignee_ids_for_row,
             new_allocation_id,
             read_project_schedule,
             upsert_allocation_for_row,
         )
-        from monostudio.core.schedule_planner import build_planned_bars
+        from monostudio.core.schedule_planner import (
+            bars_for_row,
+            build_planned_bars,
+            next_unmet_goal_in_row,
+        )
         from monostudio.core.user_identity import build_schedule_assignee_fields, normalize_assignee_ids
 
         kind = (entity_kind or "").strip().lower()
@@ -2067,12 +2210,6 @@ class MainWindow(FramelessMainWindow):
             return
 
         schedule = read_project_schedule(self._project_root)
-        existing = allocation_for_row(
-            schedule,
-            entity_kind=kind,
-            entity_rel=rel,
-            department=dept,
-        )
         bar = None
         if self._project_index is not None:
             bars = build_planned_bars(
@@ -2082,7 +2219,20 @@ class MainWindow(FramelessMainWindow):
                 include_shots=True,
                 include_assets=True,
             )
-            bar = bars.get((kind, rel, dept))
+            dept_goals = bars_for_row(bars, kind, rel, dept)
+            bar = next_unmet_goal_in_row(dept_goals) or (dept_goals[0] if dept_goals else None)
+
+        existing = None
+        bar_alloc_id = (bar.allocation_id if bar is not None else "") or ""
+        if bar_alloc_id:
+            existing = next((a for a in schedule.allocations if a.id == bar_alloc_id), None)
+        if existing is None:
+            existing = allocation_for_row(
+                schedule,
+                entity_kind=kind,
+                entity_rel=rel,
+                department=dept,
+            )
 
         if existing is not None:
             start_s, due_s = existing.start, existing.due
@@ -2099,34 +2249,83 @@ class MainWindow(FramelessMainWindow):
             self._workspace_root,
             normalize_assignee_ids(assignee_ids),
         )
-        alloc = ScheduleAllocation(
-            id=aid,
+        row_allocs = allocations_for_row(
+            schedule,
             entity_kind=kind,
             entity_rel=rel,
             department=dept,
-            start=start_s,
-            due=due_s,
-            assignee_ids=ids,
-            assignees=names,
-            assignee_id=legacy_id,
-            assignee=legacy_name,
-            note=note,
         )
-        try:
-            upsert_allocation_for_row(self._project_root, alloc)
-        except OSError:
-            return
+        from monostudio.core.department_status_registry import default_target_status_for_department
         from monostudio.core.schedule_assign_notify import (
             collect_previous_assignee_ids,
             notify_new_schedule_assignments,
         )
 
         entity_name = rel.rsplit("/", 1)[-1] if rel else ""
-        prev_assignee_ids = collect_previous_assignee_ids(
-            existing,
-            bar_assignee_ids=bar.assignee_ids if bar is not None else None,
-            bar_assignee_id=(bar.assignee_id if bar is not None else "") or "",
+        prev_assignee_ids = merged_assignee_ids_for_row(
+            schedule,
+            entity_kind=kind,
+            entity_rel=rel,
+            department=dept,
         )
+        if not prev_assignee_ids:
+            prev_assignee_ids = collect_previous_assignee_ids(
+                existing,
+                bar_assignee_ids=bar.assignee_ids if bar is not None else None,
+                bar_assignee_id=(bar.assignee_id if bar is not None else "") or "",
+            )
+
+        if row_allocs:
+            row_ids = [a.id for a in row_allocs]
+            try:
+                updated = bulk_patch_allocations(
+                    self._project_root,
+                    row_ids,
+                    AllocationBulkPatch(
+                        assignee_ids=ids,
+                        assignees=names,
+                        assignee_id=legacy_id,
+                        assignee=legacy_name,
+                    ),
+                )
+            except OSError:
+                return
+            if not updated:
+                return
+            alloc = replace(
+                row_allocs[0],
+                assignee_ids=ids,
+                assignees=names,
+                assignee_id=legacy_id,
+                assignee=legacy_name,
+            )
+        else:
+            target_status_id = (
+                (bar.target_status_id if bar is not None else "")
+                or (existing.target_status_id if existing is not None else "")
+                or ""
+            )
+            if not target_status_id:
+                target_status_id = default_target_status_for_department(self._project_root, dept)
+            alloc = ScheduleAllocation(
+                id=aid,
+                entity_kind=kind,
+                entity_rel=rel,
+                department=dept,
+                start=start_s,
+                due=due_s,
+                assignee_ids=ids,
+                assignees=names,
+                assignee_id=legacy_id,
+                assignee=legacy_name,
+                note=note,
+                target_status_id=target_status_id,
+            )
+            try:
+                upsert_allocation_for_row(self._project_root, alloc)
+            except OSError:
+                return
+
         try:
             notify_new_schedule_assignments(
                 self._project_root,
@@ -2787,11 +2986,15 @@ class MainWindow(FramelessMainWindow):
         self._sync_assign_inbox_alerts()
 
     def _sync_assign_inbox_alerts(self) -> None:
-        from monostudio.core.assign_inbox import items_for_user, resolve_assign_entity_path
+        from monostudio.core.assign_inbox import AssignInboxItem, items_for_user, resolve_assign_entity_path
         from monostudio.core.user_identity import get_current_user
-        from monostudio.ui_qt.notification.assign_alert_format import assign_alert_plain_message
+        from monostudio.ui_qt.notification.assign_alert_format import (
+            assign_alert_bulk_plain_message,
+            assign_alert_plain_message,
+        )
         from monostudio.ui_qt.notification.store import (
             UserAlertPayload,
+            has_assign_batch_id,
             has_assign_inbox_id,
             prune_mention_alerts_not_for_user,
         )
@@ -2802,25 +3005,62 @@ class MainWindow(FramelessMainWindow):
         if user is None:
             return
         prune_mention_alerts_not_for_user(user.id, self._project_root)
-        popup_batch: list[tuple[str, str]] = []
-        for item in items_for_user(self._project_root, user.id):
+
+        all_items = list(items_for_user(self._project_root, user.id))
+        pending = [i for i in all_items if not has_assign_inbox_id(i.id)]
+        batch_groups: dict[str, list[AssignInboxItem]] = {}
+        singles: list[AssignInboxItem] = []
+        for item in pending:
+            bid = (item.batch_id or "").strip()
+            if bid:
+                batch_groups.setdefault(bid, []).append(item)
+            else:
+                singles.append(item)
+
+        for bid, group in batch_groups.items():
+            if has_assign_batch_id(bid):
+                continue
+            if len(group) == 1:
+                singles.append(group[0])
+                continue
+            first = group[0]
+            from_name = (first.from_name or "").strip() or "Someone"
+            inbox_ids = tuple(i.id for i in group if (i.id or "").strip())
+            entity = resolve_assign_entity_path(self._project_root, item_rel=first.item_rel)
+            item_path_str = str(entity) if entity is not None else ""
+            notification_service.user_alert(
+                assign_alert_bulk_plain_message(from_name=from_name, count=len(group)),
+                payload=UserAlertPayload(
+                    item_path=item_path_str,
+                    item_rel=first.item_rel,
+                    item_display=str(len(group)),
+                    assign_inbox_id=first.id,
+                    assign_inbox_ids=inbox_ids,
+                    assign_batch_id=bid,
+                    department=first.department,
+                    from_name=from_name,
+                    from_user_id=first.from_user_id,
+                    department_label=self._department_label_for_id(first.department),
+                    to_user_id=user.id,
+                ),
+                toast_type="info",
+                read=all(i.read for i in group),
+                show_popup=False,
+            )
+
+        for item in singles:
             entity = resolve_assign_entity_path(self._project_root, item_rel=item.item_rel)
             item_path_str = str(entity) if entity is not None else ""
             from_name = (item.from_name or "").strip() or "Someone"
             item_display = item.item_display or item.item_rel or "an item"
             dept_label = self._department_label_for_id(item.department)
-            msg = assign_alert_plain_message(
-                from_name=from_name,
-                item_display=item_display,
-                department_id=item.department,
-                department_label=dept_label,
-            )
-            if has_assign_inbox_id(item.id):
-                if not item.read:
-                    popup_batch.append((item.id, from_name))
-                continue
             notification_service.user_alert(
-                msg,
+                assign_alert_plain_message(
+                    from_name=from_name,
+                    item_display=item_display,
+                    department_id=item.department,
+                    department_label=dept_label,
+                ),
                 payload=UserAlertPayload(
                     item_path=item_path_str,
                     item_rel=item.item_rel,
@@ -2836,8 +3076,19 @@ class MainWindow(FramelessMainWindow):
                 read=item.read,
                 show_popup=False,
             )
-            if not item.read:
-                popup_batch.append((item.id, from_name))
+
+        popup_batch: list[tuple[str, str]] = []
+        popup_keys: set[str] = set()
+        for item in all_items:
+            if item.read:
+                continue
+            from_name = (item.from_name or "").strip() or "Someone"
+            bid = (item.batch_id or "").strip()
+            popup_key = f"batch:{bid}" if bid else item.id
+            if popup_key in popup_keys:
+                continue
+            popup_keys.add(popup_key)
+            popup_batch.append((item.id, from_name))
         if popup_batch:
             notification_service.deliver_assign_popup_batch(popup_batch)
         self._refresh_noti_unread_badge()
@@ -2912,10 +3163,21 @@ class MainWindow(FramelessMainWindow):
         if not isinstance(entry, NotificationEntry):
             return
         payload = entry.payload
-        if payload.assign_inbox_id and self._project_root is not None:
+        raw_assign_ids = list(payload.assign_inbox_ids or ())
+        if (payload.assign_inbox_id or "").strip():
+            raw_assign_ids.append(payload.assign_inbox_id)
+        assign_inbox_ids: list[str] = []
+        seen_inbox: set[str] = set()
+        for aid in raw_assign_ids:
+            iid = (aid or "").strip()
+            if not iid or iid in seen_inbox:
+                continue
+            seen_inbox.add(iid)
+            assign_inbox_ids.append(iid)
+        if assign_inbox_ids and self._project_root is not None:
             from monostudio.core.assign_inbox import get_inbox_item
 
-            inbox_item = get_inbox_item(self._project_root, payload.assign_inbox_id)
+            inbox_item = get_inbox_item(self._project_root, assign_inbox_ids[0])
             entity = resolve_assign_entity_path(
                 self._project_root,
                 item_rel=payload.item_rel,
@@ -2936,11 +3198,12 @@ class MainWindow(FramelessMainWindow):
             if inbox_item is not None and not inbox_item.confirmed:
                 self._prompt_assign_confirm(inbox_item, payload)
             else:
-                try:
-                    assign_inbox_mark_read(self._project_root, payload.assign_inbox_id)
-                except OSError:
-                    pass
-                store_mark_read(payload.assign_inbox_id)
+                for aid in assign_inbox_ids:
+                    try:
+                        assign_inbox_mark_read(self._project_root, aid)
+                    except OSError:
+                        pass
+                    store_mark_read(aid)
                 self._refresh_noti_unread_badge()
             return
         if payload.mention_inbox_id and self._project_root is not None:
@@ -3569,6 +3832,10 @@ class MainWindow(FramelessMainWindow):
                         self._on_schedule_department_skip_toggle,
                         Qt.ConnectionType.UniqueConnection,
                     )
+                    self._schedule_page_widget.jump_to_entity_requested.connect(
+                        self._on_schedule_jump_to_entity,
+                        Qt.ConnectionType.UniqueConnection,
+                    )
                     self._schedule_page_widget.back_to_dashboard_requested.connect(
                         self._on_schedule_back_to_dashboard
                     )
@@ -3593,6 +3860,7 @@ class MainWindow(FramelessMainWindow):
             self._active_nav_context = context_name
         finally:
             self._context_switch_in_progress = False
+            self._raise_page_loading_if_visible()
             if self._nav_quick_pending_filters is not None:
                 snap = self._nav_quick_pending_filters
                 self._nav_quick_pending_filters = None
@@ -3755,7 +4023,12 @@ class MainWindow(FramelessMainWindow):
         if not ctx:
             return
         filters = payload.get("filters")
-        self._nav_quick_pending_filters = dict(filters) if isinstance(filters, dict) and filters else None
+        snap = dict(filters) if isinstance(filters, dict) and filters else None
+        if self._nav_rail.current_context() == ctx:
+            if snap is not None:
+                self._apply_nav_quick_filter_snapshot(snap)
+            return
+        self._nav_quick_pending_filters = snap
         self._nav_rail.set_current_context(ctx)
 
     def _apply_nav_quick_filter_snapshot(self, filters: dict[str, object]) -> None:
@@ -3965,6 +4238,10 @@ class MainWindow(FramelessMainWindow):
         self._main_view.apply_assets_diff_from_assets(
             added_assets, removed, updated_assets, view_item_builder
         )
+        try:
+            self._inspector.refresh_last_modified_display()
+        except Exception:
+            pass
         def _restore():
             self._app_state.set_selection(_sid)
         QTimer.singleShot(0, _restore)
@@ -3988,6 +4265,10 @@ class MainWindow(FramelessMainWindow):
 
         _sid = self._app_state.selection_id()
         self._main_view.apply_shots_diff(added, removed, updated, resolver)
+        try:
+            self._inspector.refresh_last_modified_display()
+        except Exception:
+            pass
         def _restore():
             self._app_state.set_selection(_sid)
         QTimer.singleShot(0, _restore)
@@ -4039,6 +4320,30 @@ class MainWindow(FramelessMainWindow):
             _dcc_log.debug("worker taskFinished category=%s error=%s", category, error)
             if category == "inspector_preview_thumb":
                 self._inspector.clear_preview_loading()
+            elif category == "project_load":
+                failed_path = str(self._project_root) if self._project_root is not None else ""
+                self._handle_project_load_failed(
+                    failed_path,
+                    error,
+                    save=bool(getattr(self, "_project_load_save_on_complete", False)),
+                )
+            return
+        if category == "project_load" and isinstance(result, tuple) and len(result) == 2:
+            expected_root, index = result[0], result[1]
+            if self._project_root is None:
+                self._hide_page_loading()
+                return
+            try:
+                current_root = self._project_root.resolve()
+            except OSError:
+                current_root = self._project_root
+            try:
+                loaded_root = expected_root.resolve()
+            except OSError:
+                loaded_root = expected_root
+            if current_root != loaded_root or not isinstance(index, ProjectIndex):
+                return
+            self._complete_project_load(index)
             return
         if category == self._WORKSPACE_STATS_WORKER:
             self._apply_workspace_stats_worker_result(result)
@@ -4179,9 +4484,106 @@ class MainWindow(FramelessMainWindow):
             ctx = self._nav_rail.current_context()
             if ctx not in ("Assets", "Shots", "Trash"):
                 self._reload_main_view()
-            QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
+            def _repaint_after_scan() -> None:
+                self._main_view.repaint_tile_and_list_views()
+                try:
+                    self._inspector.refresh_last_modified_display()
+                except Exception:
+                    pass
+
+            QTimer.singleShot(0, _repaint_after_scan)
             self._sync_primary_action()
             self._sync_top_bar()
+
+    def _show_page_loading(self, message: str | None = None) -> None:
+        bar = getattr(self, "_page_loading_bar", None)
+        if bar is None:
+            return
+        self._page_loading_visible = True
+        bar.show_loading(message)
+        QApplication.processEvents()
+
+    def _hide_page_loading(self) -> None:
+        self._page_loading_visible = False
+        bar = getattr(self, "_page_loading_bar", None)
+        if bar is not None:
+            bar.hide_loading()
+
+    def _raise_page_loading_if_visible(self) -> None:
+        if not getattr(self, "_page_loading_visible", False):
+            return
+        bar = getattr(self, "_page_loading_bar", None)
+        if bar is not None and bar.isVisible():
+            bar.raise_()
+
+    def _handle_project_load_failed(self, failed_path: str, error: str, *, save: bool) -> None:
+        logging.error("Failed to load project at %s: %s", failed_path, error)
+        self._hide_page_loading()
+        self._project_index = None
+        self._project_root = None
+        self._app_state.clear_project_data()
+        pending_clear_all()
+        self._entered_parent = None
+        self._main_view.clear()
+        self._filter_panel.filters().set_project_root(None)
+        self._sync_pipeline_preset_metadata_ui()
+        self._filter_panel.set_project_index(None)
+        self._inspector.set_department_registry(None)
+        self._inspector.set_department_icon_map({})
+        self._inspector.set_type_short_name_map({})
+        self._update_fs_watcher_paths()
+        self._inspector.set_item(None)
+        self._sync_primary_action()
+        self._sync_top_bar()
+        if save:
+            self._settings.setValue("project/root", "")
+        QMessageBox.warning(
+            self,
+            "Project load failed",
+            f"Could not open project:\n{failed_path}\n\n{error}\n\nOpen Settings to choose another project.",
+        )
+
+    def _complete_project_load(self, index: ProjectIndex) -> None:
+        self._hide_page_loading()
+        self._project_index = index
+        self._entered_parent = None
+        self._app_state.update_assets(list(index.assets))
+        self._app_state.update_shots(list(index.shots))
+        self._app_state.commit_immediate()
+        self._filter_panel.set_project_index(index)
+        self._update_fs_watcher_paths()
+        self._reload_main_view()
+        self._refresh_schedule_cache()
+        self._sync_user_inbox_alerts()
+        self._inspector.set_item(None)
+        self._refresh_recent_tasks()
+        self._sync_primary_action()
+        self._sync_top_bar()
+        if self._project_root is not None:
+            QTimer.singleShot(2500, self._maybe_discord_schedule_due)
+        if self._tray_manager is not None:
+            self._tray_manager.refresh_tooltip()
+
+    def _submit_project_load_task(self) -> None:
+        root = self._project_root
+        if root is None:
+            return
+        try:
+            expected_root = root.resolve()
+        except OSError:
+            expected_root = root
+
+        def run() -> tuple[Path, ProjectIndex]:
+            index = build_project_index(expected_root)
+            try:
+                nd = retention_days_from_settings(self._settings)
+                purge_expired(expected_root, nd)
+            except Exception:
+                logging.getLogger(__name__).debug("trash retention purge skipped", exc_info=True)
+            return expected_root, index
+
+        task = WorkerTask("project_load", run, manager=self._worker_manager)
+        self._worker_manager.submit_task(task, category="project_load", replace_existing=True)
 
     def _apply_project_root(self, folder: str | None, *, save: bool) -> None:
         # No validation (per rules). Store path and reload UI.
@@ -4195,6 +4597,9 @@ class MainWindow(FramelessMainWindow):
 
         if self._schedule_page_widget is not None:
             self._schedule_page_widget.flush_schedule_document()
+
+        self._worker_manager.cancel_category("project_load")
+        self._hide_page_loading()
 
         self._project_root = Path(folder) if folder else None
         self._controller.set_project_root(self._project_root)
@@ -4219,67 +4624,42 @@ class MainWindow(FramelessMainWindow):
             self._inspector.set_department_icon_map({})
             self._inspector.set_type_short_name_map({})
 
-        # Reload index if root set; otherwise clear.
         if self._project_root is None:
             self._project_index = None
             self._app_state.clear_project_data()
             pending_clear_all()
             self._entered_parent = None
             self._main_view.clear()
-        else:
-            try:
-                self._project_index = build_project_index(self._project_root)
-                self._entered_parent = None
-                self._app_state.update_assets(list(self._project_index.assets))
-                self._app_state.update_shots(list(self._project_index.shots))
-                self._app_state.commit_immediate()
-                try:
-                    nd = retention_days_from_settings(self._settings)
-                    purge_expired(self._project_root, nd)
-                except Exception:
-                    logging.getLogger(__name__).debug("trash retention purge skipped", exc_info=True)
-                self._reload_main_view()
-                self._refresh_schedule_cache()
-            except Exception as e:
-                failed_path = str(self._project_root)
-                logging.exception("Failed to load project at %s", failed_path)
-                self._project_index = None
-                self._project_root = None
-                self._app_state.clear_project_data()
-                self._entered_parent = None
-                self._main_view.clear()
-                self._filter_panel.filters().set_project_root(None)
-                self._sync_pipeline_preset_metadata_ui()
-                self._filter_panel.set_project_index(None)
-                self._inspector.set_department_registry(None)
-                self._inspector.set_department_icon_map({})
-                self._inspector.set_type_short_name_map({})
-                self._update_fs_watcher_paths()
-                self._inspector.set_item(None)
-                self._sync_primary_action()
-                self._sync_top_bar()
-                if save:
-                    self._settings.setValue("project/root", "")
-                QMessageBox.warning(
-                    self,
-                    "Project load failed",
-                    f"Could not open project:\n{failed_path}\n\n{e}\n\nOpen Settings to choose another project.",
-                )
-                return
-        self._filter_panel.set_project_index(self._project_index)
+            self._filter_panel.set_project_index(None)
+            self._update_fs_watcher_paths()
+            self._sync_user_inbox_alerts()
+            self._inspector.set_item(None)
+            self._refresh_recent_tasks()
+            self._sync_primary_action()
+            self._sync_top_bar()
+            if self._tray_manager is not None:
+                self._tray_manager.refresh_tooltip()
+            return
+
+        self._project_load_save_on_complete = save
+        self._entered_parent = None
+        self._project_index = None
+        self._app_state.clear_project_data()
+        pending_clear_all()
+        self._filter_panel.set_project_index(None)
         self._update_fs_watcher_paths()
-        self._sync_user_inbox_alerts()
 
-        # After selecting a folder: keep layout stable, show neutral empty-state.
+        project_name = self._project_root.name or "project"
+        self._show_page_loading(f"Loading {project_name}…")
+        self._main_view.set_empty_override(SCANNING_EMPTY_MESSAGE)
+        self._reload_main_view()
         self._inspector.set_item(None)
-
         self._refresh_recent_tasks()
         self._sync_primary_action()
         self._sync_top_bar()
-        if self._project_root is not None and self._project_index is not None:
-            QTimer.singleShot(2500, self._maybe_discord_schedule_due)
         if self._tray_manager is not None:
             self._tray_manager.refresh_tooltip()
+        self._submit_project_load_task()
 
     def _refresh_recent_tasks(self) -> None:
         tasks = self._recent_tasks_store.get_for_project(self._project_root) if self._project_root else []
@@ -4935,7 +5315,7 @@ class MainWindow(FramelessMainWindow):
 
         if self._project_index is None:
             # Keep whatever is currently shown (avoid "click -> empty list") while scan/index is pending.
-            self._main_view.set_empty_override("Scanning project…")
+            self._main_view.set_empty_override(SCANNING_EMPTY_MESSAGE)
             if context in ("Assets", "Shots"):
                 self._sync_main_view_header()
             return
@@ -6267,37 +6647,45 @@ class MainWindow(FramelessMainWindow):
                 super().hideEvent(event)
 
         def _on_filter_popup_hidden():
-            self._filter_panel.restore_filters_center(filter_widget)
-            self._compact_filter_popup_closed_at = time.monotonic()
-            self._compact_filter_popup = None
+            self._finalize_compact_filter_popup()
             btn = getattr(self._nav_rail, "_filter_btn", None)
             if btn is not None:
                 QTimer.singleShot(0, lambda: self._nav_rail._clear_tool_button_hover(btn))
 
-        popup = _FilterPopupFrame(self, _on_filter_popup_hidden)
+        popup = _FilterPopupFrame(None, _on_filter_popup_hidden)
         popup.setObjectName("SidebarCompactFilterPopup")
         popup.setWindowFlags(Qt.WindowType.Popup | Qt.FramelessWindowHint)
         popup.setAttribute(Qt.WA_TranslucentBackground, False)
         lay = QVBoxLayout(popup)
-        lay.setContentsMargins(8, 8, 8, 8)
-        btn = getattr(self._nav_rail, "_filter_btn", None)
-        max_h = max_popup_height_for_anchor(btn, gap=4) if btn is not None else 480
+        lay.setContentsMargins(0, 0, 0, 0)
+        _TOP_BAR_HEIGHT = 56
+        _POPUP_BOTTOM_MARGIN = 8
+        max_h = max_popup_height_in_widget(
+            self._sidebar_container,
+            top_offset=_TOP_BAR_HEIGHT,
+            margin=_POPUP_BOTTOM_MARGIN,
+        )
         scroll = QScrollArea(popup)
+        scroll.setObjectName("SidebarCompactFilterScroll")
+        scroll.setAttribute(Qt.WA_StyledBackground, True)
         scroll.setWidget(filter_widget)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.viewport().setAttribute(Qt.WA_StyledBackground, True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         lay.addWidget(scroll, 1)
-        popup.setMinimumWidth(260)
-        popup.setMaximumHeight(max_h)
-        popup.setMinimumHeight(min(280, max_h))
+        popup.setFixedWidth(self.SIDEBAR_PANEL_W)
+        popup.setFixedHeight(max_h)
         self._compact_filter_popup = popup
-        if btn is not None:
-            position_popup_near_anchor(popup, btn, gap=4, x_offset=ICON_INSET_X)
-        else:
-            popup.move(self._sidebar_container.mapToGlobal(self._sidebar_container.rect().topRight()).x() + 4, 80)
+        self._compact_filter_scroll = scroll
+        # Align with the filter column slot (right of nav rail), not the filter button flyout.
+        panel_origin = self._sidebar_container.mapToGlobal(
+            QPoint(self.SIDEBAR_RAIL_W, _TOP_BAR_HEIGHT)
+        )
+        popup.move(panel_origin)
         popup.show()
+        self._nav_rail.set_filter_popup_active(True)
 
     def _new_project(self) -> None:
         if self._workspace_root is None:

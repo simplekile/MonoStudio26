@@ -36,6 +36,7 @@ class AssignInboxItem:
     confirmed_at: str = ""
     confirmed_by_name: str = ""
     discord_message_id: str = ""
+    batch_id: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -69,6 +70,9 @@ class AssignInboxItem:
         dmid = (self.discord_message_id or "").strip()
         if dmid:
             d["discord_message_id"] = dmid
+        bid = (self.batch_id or "").strip()
+        if bid:
+            d["batch_id"] = bid
         return d
 
 
@@ -106,6 +110,7 @@ def _parse_item(raw: object) -> AssignInboxItem | None:
         confirmed_at=str(raw.get("confirmed_at") or "").strip(),
         confirmed_by_name=str(raw.get("confirmed_by_name") or "").strip(),
         discord_message_id=str(raw.get("discord_message_id") or "").strip(),
+        batch_id=str(raw.get("batch_id") or "").strip(),
     )
 
 
@@ -202,6 +207,7 @@ def append_assignments(
     due: str = "",
     start: str = "",
     discord_message_id: str = "",
+    batch_id: str = "",
 ) -> list[AssignInboxItem]:
     """Append unread assign items for each target user (excluding assigner)."""
     author_id = (from_user_id or "").strip()
@@ -216,6 +222,7 @@ def append_assignments(
     due_s = (due or "").strip()
     start_s = (start or "").strip()
     dmid = (discord_message_id or "").strip()
+    bid = (batch_id or "").strip()
     now = _utc_now_iso()
     new_items: list[AssignInboxItem] = []
     for uid in targets:
@@ -236,6 +243,7 @@ def append_assignments(
                 due=due_s,
                 start=start_s,
                 discord_message_id=dmid,
+                batch_id=bid,
             )
         )
 

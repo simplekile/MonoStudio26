@@ -38,8 +38,10 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QIcon,
+    QKeySequence,
     QPainter,
     QPixmap,
+    QShortcut,
 )
 from PySide6.QtGui import QDrag, QDragEnterEvent, QDragMoveEvent, QDropEvent, QMouseEvent
 from PySide6.QtWidgets import (
@@ -487,7 +489,7 @@ class InboxOutboxTitleRow(QWidget):
         self._root_static_icon = QLabel(self._root_static)
         self._root_static_icon.setFixedSize(16, 16)
         self._root_static_icon.setScaledContents(False)
-        self._root_label = QLabel(self._root_title, self._root_static)
+        self._root_label = QLabel(self._root_title.upper(), self._root_static)
         self._root_label.setObjectName("MainViewContextTitle")
         self._root_label.setFont(monos_font("Inter", 16, QFont.Weight.Bold))
         root_static_l.addWidget(self._root_static_icon, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -1085,6 +1087,10 @@ class InboxTreePane(QWidget):
 
     def _on_view_mode_changed(self, mode: str) -> None:
         self._apply_view_mode(mode, save=True)
+
+    def cycle_view_mode(self) -> None:
+        next_mode = "list" if self._view_mode == "tile" else "tile"
+        self._apply_view_mode(next_mode, save=True)
 
     def _apply_view_mode(self, mode: str, *, save: bool) -> None:
         if mode not in ("tile", "list"):

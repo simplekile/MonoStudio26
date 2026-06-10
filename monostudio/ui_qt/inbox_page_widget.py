@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.inbox_reader import get_inbox_root, resolve_inbox_location
 from monostudio.ui_qt.inbox_history_dialog import InboxHistoryDialog
+from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
 from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, InboxTreePane
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS
@@ -120,6 +121,7 @@ class InboxPageWidget(QWidget):
         self._content_lay.setSpacing(0)
         root_lay.addWidget(self._content_host, 1)
         self._refresh_chrome()
+        bind_explorer_view_mode_tab_shortcut(self, lambda: self._tree_pane)
 
     def _mount_explorer_path_bar(self) -> None:
         if self._tree_pane is None:

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from monostudio.core.project_guide_tags import read_all_tags
 from monostudio.ui_qt.inbox_page_widget import _header_tool_button
+from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
 from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, ProjectGuideTreePane
 
 PROJECT_GUIDE_DEPARTMENTS = ("reference", "script", "storyboard", "guideline", "concept")
@@ -112,6 +113,7 @@ class ReferencePageWidget(QWidget):
         self._content_lay.setSpacing(0)
         root_lay.addWidget(self._content_host, 1)
         self._refresh_chrome()
+        bind_explorer_view_mode_tab_shortcut(self, lambda: self._tree_pane)
 
     def _mount_explorer_path_bar(self) -> None:
         if self._tree_pane is None:

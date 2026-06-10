@@ -23,6 +23,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.department_status_registry import (
+    default_target_status_for_department,
+    load_status_registry_for_department,
+)
 from monostudio.core.project_schedule import ScheduleAllocation, bulk_upsert_allocations, new_allocation_id
 from monostudio.ui_qt.calendar_date_picker import MonosDateEdit
 from monostudio.ui_qt.schedule_allocate_dialog import _EntityOption
@@ -37,11 +41,17 @@ class ScheduleBulkAllocateDialog(MonosDialog):
         project_root: Path,
         entities: list[_EntityOption],
         dept_labels: dict[str, str],
+        preselected: list[tuple[str, str]] | None = None,
     ) -> None:
         super().__init__(parent)
         self._project_root = Path(project_root)
         self._entities = entities
         self._dept_labels = dept_labels
+        self._preselected = {
+            ((k or "").strip().lower(), (r or "").replace("\\", "/").strip())
+            for k, r in (preselected or [])
+            if (k or "").strip() and (r or "").strip()
+        }
         self._saved_count = 0
 
         self.setWindowTitle("Bulk allocate")
@@ -77,7 +87,11 @@ class ScheduleBulkAllocateDialog(MonosDialog):
             prefix = "Shot" if ent.kind == "shot" else "Asset"
             item = QListWidgetItem(f"{prefix} · {ent.name}")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
+            key = (ent.kind.strip().lower(), ent.rel.replace("\\", "/").strip())
+            checked = key in self._preselected if self._preselected else False
+            item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
             item.setData(Qt.ItemDataRole.UserRole, ent)
             self._entity_list.addItem(item)
         sel_l.addWidget(self._entity_list, 1)
@@ -91,6 +105,10 @@ class ScheduleBulkAllocateDialog(MonosDialog):
         for dep in sorted(dept_ids):
             self._dept.addItem(dept_labels.get(dep, dep), dep)
         form.addRow("Department", self._dept)
+
+        self._target_status = QComboBox(self)
+        form.addRow("Target status", self._target_status)
+        self._dept.currentIndexChanged.connect(self._rebuild_target_statuses)
 
         self._start = MonosDateEdit(self)
         self._due = MonosDateEdit(self)
@@ -127,6 +145,30 @@ class ScheduleBulkAllocateDialog(MonosDialog):
         buttons.accepted.connect(self._on_apply)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+        self._rebuild_target_statuses()
+
+    def _rebuild_target_statuses(self) -> None:
+        dep = self._dept.currentData()
+        dep_s = str(dep).strip() if dep is not None else ""
+        prev = self._target_status.currentData()
+        self._target_status.clear()
+        if not dep_s:
+            return
+        reg = load_status_registry_for_department(self._project_root, dep_s)
+        default_id = default_target_status_for_department(self._project_root, dep_s)
+        pick_ix = 0
+        for _cat, sids in reg.statuses_grouped_for_menu():
+            for sid in sids:
+                self._target_status.addItem(reg.label_for(sid), sid)
+                if sid == default_id:
+                    pick_ix = self._target_status.count() - 1
+        if self._target_status.count():
+            self._target_status.setCurrentIndex(pick_ix)
+        if prev is not None:
+            ix = self._target_status.findData(prev)
+            if ix >= 0:
+                self._target_status.setCurrentIndex(ix)
 
     def saved_count(self) -> int:
         return self._saved_count
@@ -176,6 +218,10 @@ class ScheduleBulkAllocateDialog(MonosDialog):
         step = int(self._step_days.value())
         spread = self._mode_spread.isChecked()
 
+        target_data = self._target_status.currentData()
+        target_status_id = str(target_data).strip() if target_data is not None else ""
+        if not target_status_id:
+            target_status_id = default_target_status_for_department(self._project_root, dep_s)
         allocations: list[ScheduleAllocation] = []
         for idx, ent in enumerate(selected):
             if dep_s not in ent.departments:
@@ -191,6 +237,7 @@ class ScheduleBulkAllocateDialog(MonosDialog):
                     department=dep_s,
                     start=s.isoformat(),
                     due=d.isoformat(),
+                    target_status_id=target_status_id,
                 )
             )
 

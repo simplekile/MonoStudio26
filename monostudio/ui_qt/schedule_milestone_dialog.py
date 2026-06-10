@@ -122,7 +122,8 @@ class ScheduleMilestoneDialog(MonosDialog):
         root.addWidget(header)
         root.addWidget(
             _hint(
-                "Green IN and amber OUT frame the schedule. Milestones appear as purple lines.",
+                "Unlock markers on the Schedule toolbar to drag IN, OUT, and milestones on the "
+                "timeline. Use this dialog to manage the full list.",
                 self,
             )
         )

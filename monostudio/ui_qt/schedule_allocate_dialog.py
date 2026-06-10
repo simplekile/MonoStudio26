@@ -24,11 +24,19 @@ from monostudio.core.user_identity import (
     match_roster_user_by_name,
 )
 from monostudio.ui_qt.calendar_date_picker import MonosDateEdit
+from monostudio.core.department_status_registry import (
+    default_target_status_for_department,
+    load_status_registry_for_department,
+)
 from monostudio.core.project_schedule import (
+    AllocationBulkPatch,
     ScheduleAllocation,
+    allocations_for_row,
+    bulk_patch_allocations,
     delete_allocation,
     new_allocation_id,
-    upsert_allocation_for_row,
+    read_project_schedule,
+    upsert_allocation,
 )
 from monostudio.ui_qt.assignee_picker_widget import AssigneePickerWidget
 from monostudio.ui_qt.style import MonosDialog
@@ -104,6 +112,9 @@ class ScheduleAllocateDialog(MonosDialog):
         self._note.setPlaceholderText("Optional")
         form.addRow("Note", self._note)
 
+        self._target_status = QComboBox(self)
+        form.addRow("Target status", self._target_status)
+
         root.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
@@ -123,8 +134,9 @@ class ScheduleAllocateDialog(MonosDialog):
         self._delete_btn.clicked.connect(self._on_delete)
         root.addWidget(buttons)
 
-        self._entity_combo.currentIndexChanged.connect(self._rebuild_departments)
-        self._rebuild_departments()
+        self._entity_combo.currentIndexChanged.connect(self._on_entity_changed)
+        self._dept_combo.currentIndexChanged.connect(self._rebuild_target_statuses)
+        self._on_entity_changed()
 
         if existing is not None:
             self._load_existing(existing)
@@ -164,6 +176,10 @@ class ScheduleAllocateDialog(MonosDialog):
             return None
         return self._entities[i]
 
+    def _on_entity_changed(self) -> None:
+        self._rebuild_departments()
+        self._rebuild_target_statuses()
+
     def _rebuild_departments(self) -> None:
         ent = self._current_entity()
         prev = self._dept_combo.currentData()
@@ -178,6 +194,28 @@ class ScheduleAllocateDialog(MonosDialog):
             if ix >= 0:
                 self._dept_combo.setCurrentIndex(ix)
 
+    def _rebuild_target_statuses(self) -> None:
+        dep = self._dept_combo.currentData()
+        dep_s = str(dep).strip() if dep is not None else ""
+        prev = self._target_status.currentData()
+        self._target_status.clear()
+        if not dep_s:
+            return
+        reg = load_status_registry_for_department(self._project_root, dep_s)
+        default_id = default_target_status_for_department(self._project_root, dep_s)
+        pick_ix = 0
+        for _cat, sids in reg.statuses_grouped_for_menu():
+            for sid in sids:
+                self._target_status.addItem(reg.label_for(sid), sid)
+                if sid == default_id:
+                    pick_ix = self._target_status.count() - 1
+        if self._target_status.count():
+            self._target_status.setCurrentIndex(pick_ix)
+        if prev is not None:
+            ix = self._target_status.findData(prev)
+            if ix >= 0:
+                self._target_status.setCurrentIndex(ix)
+
     def _select_entity(self, kind: str, rel: str, department: str | None) -> None:
         rel_n = rel.replace("\\", "/")
         for i, ent in enumerate(self._entities):
@@ -189,6 +227,7 @@ class ScheduleAllocateDialog(MonosDialog):
             ix = self._dept_combo.findData(department)
             if ix >= 0:
                 self._dept_combo.setCurrentIndex(ix)
+        self._rebuild_target_statuses()
 
     def _load_existing(self, alloc: ScheduleAllocation) -> None:
         self._select_entity(alloc.entity_kind, alloc.entity_rel, alloc.department)
@@ -208,6 +247,11 @@ class ScheduleAllocateDialog(MonosDialog):
         else:
             self._assignee.set_user_ids([])
         self._note.setText(alloc.note or "")
+        tid = (alloc.target_status_id or "").strip()
+        if tid:
+            ix = self._target_status.findData(tid)
+            if ix >= 0:
+                self._target_status.setCurrentIndex(ix)
 
     def _on_save(self) -> None:
         ent = self._current_entity()
@@ -222,6 +266,11 @@ class ScheduleAllocateDialog(MonosDialog):
             return
         if due_d < start_d:
             QMessageBox.warning(self, "Schedule", "Due date must be on or after start date.")
+            return
+        target_data = self._target_status.currentData()
+        target_status_id = str(target_data).strip() if target_data is not None else ""
+        if not target_status_id:
+            QMessageBox.warning(self, "Schedule", "Choose a target status for this goal.")
             return
         aid = self._existing.id if self._existing else new_allocation_id()
         ids, names, legacy_id, legacy_label = build_schedule_assignee_fields(
@@ -240,12 +289,40 @@ class ScheduleAllocateDialog(MonosDialog):
             assignee_id=legacy_id,
             assignee=legacy_label,
             note=self._note.text().strip(),
+            target_status_id=target_status_id,
         )
         try:
-            upsert_allocation_for_row(self._project_root, alloc)
+            upsert_allocation(self._project_root, alloc)
         except OSError as ex:
             QMessageBox.critical(self, "Schedule", f"Failed to save allocation:\n{ex}")
             return
+        dep_s = str(dep).strip() if dep else ""
+        if dep_s:
+            schedule = read_project_schedule(self._project_root)
+            row_ids = [a.id for a in allocations_for_row(
+                schedule,
+                entity_kind=ent.kind,
+                entity_rel=ent.rel,
+                department=dep_s,
+            )]
+            if len(row_ids) > 1:
+                try:
+                    bulk_patch_allocations(
+                        self._project_root,
+                        row_ids,
+                        AllocationBulkPatch(
+                            assignee_ids=ids,
+                            assignees=names,
+                            assignee_id=legacy_id,
+                            assignee=legacy_label,
+                        ),
+                    )
+                except OSError as ex:
+                    QMessageBox.critical(self, "Schedule", f"Failed to sync assignees:\n{ex}")
+                    return
+        from monostudio.ui_qt.schedule_target_status_memory import remember_target_status
+
+        remember_target_status(target_status_id)
         from monostudio.core.schedule_assign_notify import (
             collect_previous_assignee_ids,
             notify_new_schedule_assignments,

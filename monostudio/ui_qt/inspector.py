@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.core.models import Asset, Department, Shot, ProjectIndex
+from monostudio.core.department_status_registry import load_status_registry_for_department
 from monostudio.core.production_status import (
     aggregate_status_id_for_item,
     color_hex_for_status_id,
@@ -101,6 +102,7 @@ from monostudio.ui_qt.thumbnail_source_resolve import (
     resolve_entity_thumbnail_source_path,
 )
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
+from monostudio.ui_qt.view_item_mtime import view_item_last_updated_display
 from monostudio.core.fs_reader import work_file_prefix
 from monostudio.ui_qt.main_view import (
     ItemHealth,
@@ -716,6 +718,17 @@ class InspectorPanel(QWidget):
         self._inbox_action_wrapper.setVisible(True)
         self._set_inspector_tab(0, persist=False)
 
+    def clear_transient_hover_states(self) -> None:
+        """Clear stuck inspector hover when pointer moves to main content."""
+        from monostudio.ui_qt.style import clear_stuck_widget_hover
+
+        self._preview.clear_transient_hover_states()
+        for btn in self.findChildren(QToolButton):
+            clear_stuck_widget_hover(btn)
+        for btn in self.findChildren(QPushButton):
+            clear_stuck_widget_hover(btn)
+        clear_stuck_widget_hover(self._scroll.viewport())
+
     def set_inbox_tree_preview(self, path: Path | None) -> None:
         """Inbox/Reference: khi chọn file trong tree → hiện thumb + metadata, ẩn block distribute."""
         self._inbox_destination.setVisible(False)
@@ -806,6 +819,7 @@ class InspectorPanel(QWidget):
             self._tech.set_item(item)
             self._stakeholders.set_item(item)
             self._refresh_schedule_block(item)
+            self._sync_tech_last_modified()
         else:
             if diff.get("departments"):
                 self._dept_pipeline.set_item(item)
@@ -820,6 +834,8 @@ class InspectorPanel(QWidget):
                 self._preview.update_thumbnail_only()
             if diff.get("name") or diff.get("type"):
                 self._tech.set_item(item)
+            if is_asset_or_shot and (diff.get("departments") or diff.get("name") or diff.get("type")):
+                self._sync_tech_last_modified()
 
         if isinstance(ref, (Asset, Shot)):
             self._refresh_schedule_block(item)
@@ -1132,6 +1148,26 @@ class InspectorPanel(QWidget):
             )
             # Preview resolve uses primary work file for (dept, active DCC); refresh sequence + thumb.
             self._preview.update_thumbnail_only(active_dcc_hint=dcc_id)
+            self._sync_tech_last_modified()
+
+    def refresh_last_modified_display(self) -> None:
+        """Refresh Last Modified row after filesystem scan (same source as grid/list)."""
+        self._sync_tech_last_modified()
+
+    def _sync_tech_last_modified(self) -> None:
+        item = self._current_item
+        if item is None or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        dep = self._last_focused_department
+        dcc = _inspector_get_active_dcc(getattr(item, "path", None), dep) if item else None
+        self._tech.set_last_modified(
+            view_item_last_updated_display(
+                item,
+                show_publish=self._show_publish,
+                active_department=dep,
+                active_dcc_id=dcc,
+            )
+        )
 
     def _on_department_focused(self, department_name: str) -> None:
         """Update Tech row, status pill, and preview thumbnail with the clicked department."""
@@ -1154,6 +1190,7 @@ class InspectorPanel(QWidget):
         dep = self._last_focused_department
         if not dep:
             self._tech.set_resolved_path(None)
+            self._sync_tech_last_modified()
             return
         ref = getattr(item, "ref", None)
         if isinstance(ref, (Asset, Shot)):
@@ -1165,6 +1202,7 @@ class InspectorPanel(QWidget):
                 self._tech.set_resolved_path(None)
         else:
             self._tech.set_resolved_path(None)
+        self._sync_tech_last_modified()
 
     def set_show_publish(self, show_publish: bool) -> None:
         if self._show_publish == show_publish:
@@ -1176,6 +1214,8 @@ class InspectorPanel(QWidget):
             self._asset_status.set_item(self._current_item, self._show_publish, active_department=_ad, active_dcc_id=_ac)
         if self._last_focused_department and self._current_item is not None:
             self._on_department_focused(self._last_focused_department)
+        else:
+            self._sync_tech_last_modified()
 
     # Backward compatibility (legacy call sites)
     def set_empty_state(self, _message: str | None = None) -> None:
@@ -1260,14 +1300,6 @@ def _description_from_work_path(path: Path | None) -> str:
     if m:
         return m.group(1).strip()
     return ""
-
-
-def _format_mtime(path: Path) -> str:
-    try:
-        ts = path.stat().st_mtime
-    except OSError:
-        return "—"
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
 def _infer_latest_version_from_departments(depts: tuple[Department, ...]) -> str:
@@ -1931,12 +1963,18 @@ class _PreviewWidget(QWidget):
         return super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
-        if self._health_hovered or self._notes_hovered:
-            self._health_hovered = False
-            self._notes_hovered = False
-            self.unsetCursor()
-            self.update()
+        self.clear_transient_hover_states()
         super().leaveEvent(event)
+
+    def clear_transient_hover_states(self) -> None:
+        if not (self._health_hovered or self._notes_hovered):
+            return
+        self._health_hovered = False
+        self._notes_hovered = False
+        self.unsetCursor()
+        if self.toolTip():
+            self.setToolTip("")
+        self.update()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2443,6 +2481,9 @@ class _InspectorPreview(QWidget):
         self._last_thumb_use_fit = False
         self._seq_decode_bucket: int | None = None
         self._seq_live_display = False
+
+    def clear_transient_hover_states(self) -> None:
+        self._container.clear_transient_hover_states()
 
     def _inspector_preview_decode_max_side(self) -> int:
         """Decode / scale thumbs to match preview cell (DPR), capped for memory."""
@@ -4274,7 +4315,11 @@ class _DeptCard(QFrame):
         self._pill.setCursor(Qt.PointingHandCursor if show_menu else Qt.ArrowCursor)
 
         try:
-            reg = load_production_status_registry(project_root)
+            dep_key = (self._dept_name_key or "").strip()
+            if dep_key:
+                reg = load_status_registry_for_department(project_root, dep_key)
+            else:
+                reg = load_production_status_registry(project_root)
             oid = (
                 override_status_id_for_department(ref, self._dept_name_key)
                 if ref is not None and self._dept_name_key
@@ -4309,7 +4354,12 @@ class _DeptCard(QFrame):
     def _show_status_menu(self) -> None:
         if self._asset_shot_ref is None or not self._dept_name_key:
             return
-        res = pick_production_status_at(self, self._project_root, QCursor.pos())
+        res = pick_production_status_at(
+            self,
+            self._project_root,
+            QCursor.pos(),
+            department_id=self._dept_name_key,
+        )
         if res is False:
             return
         self.production_status_override_requested.emit(self._dept_name_key, res)
@@ -4880,17 +4930,17 @@ class _TechnicalSpecs(QWidget):
         self._fps.set_value("—")
         self._res.set_value("—")
         self._src.setText(str(item.path))
-        self._modified.set_value(_format_mtime(item.path))
+
+    def set_last_modified(self, text: str) -> None:
+        self._modified.set_value(text or "—")
 
     def set_resolved_path(self, path: Path | None) -> None:
         """Update displayed path to a department work path (or reset to item path when None)."""
         self._resolved_path = path
         if path is not None:
             self._src.setText(str(path))
-            self._modified.set_value(_format_mtime(path))
         elif self._last_item is not None:
             self._src.setText(str(self._last_item.path))
-            self._modified.set_value(_format_mtime(self._last_item.path))
 
     @staticmethod
     def _copy_text(text: str) -> None:

@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "category_order": [
+    "not_started",
+    "in_progress",
+    "review",
+    "done",
+    "hold",
+    "blocked",
+    "na"
+  ],
+  "menu_category_order": [
+    "not_started",
+    "in_progress",
+    "review",
+    "done",
+    "hold",
+    "blocked",
+    "na"
+  ],
+  "statuses": [
+    {
+      "id": "anim_waiting",
+      "label": "Waiting",
+      "category": "not_started",
+      "order": 0,
+      "tooltip": "Not started or waiting for handoff."
+    },
+    {
+      "id": "anim_layout",
+      "label": "Layout",
+      "category": "in_progress",
+      "order": 10,
+      "tooltip": "Blocking and timing pass."
+    },
+    {
+      "id": "anim_block",
+      "label": "Block",
+      "category": "in_progress",
+      "order": 20,
+      "tooltip": "Blocking animation pass."
+    },
+    {
+      "id": "anim_spline",
+      "label": "Spline",
+      "category": "in_progress",
+      "order": 30,
+      "tooltip": "Spline polish and breakdown."
+    },
+    {
+      "id": "anim_polish",
+      "label": "Polish",
+      "category": "review",
+      "order": 40,
+      "tooltip": "Final polish before sign-off."
+    },
+    {
+      "id": "anim_approved",
+      "label": "Approved",
+      "category": "done",
+      "order": 50,
+      "tooltip": "Animation signed off."
+    },
+    {
+      "id": "omitted",
+      "label": "Skipped / N/A",
+      "category": "na",
+      "order": 99,
+      "tooltip": "Not applicable for this department."
+    }
+  ]
+}

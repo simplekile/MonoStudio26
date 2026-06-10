@@ -1,13 +1,18 @@
-# MonoStudio 26 — Release v26.15.4
+# MonoStudio 26 — Release v26.15.5
 
 ## Highlights
 
-- **Schedule timeline**: Hover highlight theo cột ngày (header + Gantt); click vùng timeline chọn entity → Inspector; today/milestone underline căn đúng.
+- **Schedule target / goal status**: Trạng thái mục tiêu theo department trên timeline; menu đổi status, goal dialog, bulk bar actions; quick milestone popup; planner tính goal-met.
+- **Department status presets**: Registry theo department (`department_status_registry`, presets trong pipeline); Inspector/Main View dùng workflow đúng từng dept.
+- **Schedule timeline**: Cải thiện lớn — bulk dialogs, target status memory, tương tác bar/row.
+- **Discord**: Test webhook từ Settings; copy/assign notify mở rộng.
+- **UI**: Page loading bar; project status menu; entity ref pins; project picker; Main View refresh.
 
 ## Changes in this release
 
-- feat: `schedule_timeline_widget.py` — `_hover_col`, `_try_select_visible_row`, timeline `entity_row_selected` wiring.
-- fix: header day underline Y; chọn row trên timeline pane (không chỉ label).
+- feat: `department_status_registry.py`, `schedule_target_status_*`, `schedule_goal_status_dialog.py`, `schedule_bar_bulk_dialogs.py`, `schedule_quick_milestone_popup.py`.
+- feat: `entity_ref_pins.py`, `discord_webhook_test.py`, `discord_notification_test_dialog.py`, `page_loading_bar.py`, `project_status_menu.py`, `view_item_mtime.py`.
+- feat: `project_schedule.py`, `schedule_planner.py`, `schedule_assign_notify.py`, `schedule_timeline_widget.py`, `schedule_page_widget.py`, `main_view.py`, `main_window.py`.
 
 ## Install
 

@@ -42,6 +42,8 @@ class UserAlertPayload:
     from_user_id: str = ""
     department_label: str = ""
     to_user_id: str = ""
+    assign_batch_id: str = ""
+    assign_inbox_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, str]:
         d = {
@@ -56,7 +58,10 @@ class UserAlertPayload:
             "from_user_id": self.from_user_id,
             "department_label": self.department_label,
             "to_user_id": self.to_user_id,
+            "assign_batch_id": self.assign_batch_id,
         }
+        if self.assign_inbox_ids:
+            d["assign_inbox_ids"] = list(self.assign_inbox_ids)
         return d
 
     @classmethod
@@ -75,6 +80,12 @@ class UserAlertPayload:
             from_user_id=str(data.get("from_user_id") or ""),
             department_label=str(data.get("department_label") or ""),
             to_user_id=str(data.get("to_user_id") or ""),
+            assign_batch_id=str(data.get("assign_batch_id") or ""),
+            assign_inbox_ids=tuple(
+                str(i).strip()
+                for i in (data.get("assign_inbox_ids") or [])
+                if str(i).strip()
+            ),
         )
 
 
@@ -304,7 +315,21 @@ def has_assign_inbox_id(assign_inbox_id: str) -> bool:
     if not aid:
         return False
     return any(
-        e.kind == "user" and e.payload.assign_inbox_id == aid
+        e.kind == "user"
+        and (
+            e.payload.assign_inbox_id == aid
+            or aid in (e.payload.assign_inbox_ids or ())
+        )
+        for e in _history
+    )
+
+
+def has_assign_batch_id(assign_batch_id: str) -> bool:
+    bid = (assign_batch_id or "").strip()
+    if not bid:
+        return False
+    return any(
+        e.kind == "user" and (e.payload.assign_batch_id or "").strip() == bid
         for e in _history
     )
 
@@ -366,7 +391,11 @@ def mark_read(inbox_id: str) -> None:
         if e.kind != "user" or e.read:
             continue
         p = e.payload
-        if p.mention_inbox_id != iid and p.assign_inbox_id != iid:
+        if (
+            p.mention_inbox_id != iid
+            and p.assign_inbox_id != iid
+            and iid not in (p.assign_inbox_ids or ())
+        ):
             continue
         if e.kind == "user" and not e.read:
             _history[i] = NotificationEntry(
@@ -382,11 +411,20 @@ def mark_read(inbox_id: str) -> None:
         _save_to_settings()
 
 
-def mark_all_read() -> None:
+def mark_all_read(
+    *,
+    user_id: str = "",
+    project_root: Path | None = None,
+) -> None:
+    """Mark user notification rows read; scoped to *user_id* when set."""
+    uid = (user_id or "").strip()
     changed = False
     new_hist: deque[NotificationEntry] = deque(maxlen=MAX_HISTORY)
     for e in _history:
         if e.kind == "user" and not e.read:
+            if uid and not entry_belongs_to_user(e, uid, project_root):
+                new_hist.append(e)
+                continue
             new_hist.append(
                 NotificationEntry(
                     toast_type=e.toast_type,

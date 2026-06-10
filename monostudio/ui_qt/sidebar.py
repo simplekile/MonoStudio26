@@ -3345,6 +3345,8 @@ class Sidebar(QWidget):
         # --- Block 2: Filters (dept/type lists scroll individually; no common scroll)
         self._filters_center = QWidget(self)
         self._filters_center.setObjectName("SidebarFiltersCenter")
+        self._filters_center.setAttribute(Qt.WA_StyledBackground, True)
+        self._filters_center.setAutoFillBackground(False)
         self._filters_center.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         scroll_layout = QVBoxLayout(self._filters_center)
         scroll_layout.setContentsMargins(16, 8, 16, 16)  # 8px top so content doesn’t sit under nav pill
@@ -3614,8 +3616,34 @@ class Sidebar(QWidget):
     def restore_filters_center(self, widget: QWidget) -> None:
         """Put the filter panel back into sidebar layout."""
         lay = self.layout()
-        if lay is not None:
+        if lay is None:
+            return
+        if lay.indexOf(widget) < 0:
+            widget.setParent(self)
             lay.insertWidget(self._FILTERS_CENTER_LAYOUT_INDEX, widget)
+        widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        widget.setMinimumWidth(0)
+        widget.setMaximumWidth(16777215)
+        widget.setAttribute(Qt.WA_StyledBackground, True)
+        widget.setAutoFillBackground(False)
+        widget.show()
+        lay.activate()
+        self._sync_filters_center_layout()
+        self._repolish_widget_style(widget)
+        self._repolish_widget_style(self)
+        self.updateGeometry()
+
+    @staticmethod
+    def _repolish_widget_style(widget: QWidget) -> None:
+        st = widget.style()
+        if st is not None:
+            st.unpolish(widget)
+            st.polish(widget)
+        widget.update()
+
+    def ensure_filters_center_attached(self) -> None:
+        """Re-insert filters block if detached (e.g. compact popup without a clean close)."""
+        self.restore_filters_center(self._filters_center)
 
     def _sidebar_settings(self) -> QSettings:
         return QSettings(self._APP_SETTINGS_ORG, self._APP_SETTINGS_APP)

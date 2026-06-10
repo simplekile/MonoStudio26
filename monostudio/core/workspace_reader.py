@@ -35,6 +35,64 @@ _PROJECT_STATUS_COLORS: dict[str, str] = {
     "BLOCKED": "#ef4444",
 }
 
+PROJECT_BROWSER_STATUS_KEYS: tuple[str, ...] = ("WAITING", "PROGRESS", "AT_RISK", "BLOCKED", "READY")
+_BROWSER_STATUS_JSON_KEY = "browser_status"
+
+
+def _project_manifest_path(project_root: Path) -> Path:
+    return Path(project_root) / ".monostudio" / "project.json"
+
+
+def read_project_status_override(project_root: Path) -> str | None:
+    """Manual project browser status from project.json, or None for automatic."""
+    path = _project_manifest_path(project_root)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw = str(data.get(_BROWSER_STATUS_JSON_KEY) or "").strip().upper()
+    if raw in PROJECT_BROWSER_STATUS_KEYS:
+        return raw
+    return None
+
+
+def write_project_status_override(project_root: Path, status: str | None) -> bool:
+    """
+    Set or clear manual project browser status in project.json.
+    ``None`` removes the override (automatic derived status).
+    """
+    root = Path(project_root)
+    path = _project_manifest_path(root)
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if status is None:
+        data.pop(_BROWSER_STATUS_JSON_KEY, None)
+    else:
+        key = str(status).strip().upper()
+        if key not in PROJECT_BROWSER_STATUS_KEYS:
+            return False
+        data[_BROWSER_STATUS_JSON_KEY] = key
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def project_status_menu_entries() -> tuple[tuple[str, str], ...]:
+    """(status_key, label) pairs for the project browser status menu."""
+    return tuple((key, _PROJECT_STATUS_LABELS[key]) for key in PROJECT_BROWSER_STATUS_KEYS)
+
 
 def project_status_label(status: str) -> str:
     key = (status or "WAITING").strip().upper()
@@ -166,6 +224,21 @@ def read_project_quick_stats(project_root: Path, *, schedule_aware: bool = False
 
     assets_count = _count_assets()
     shots_count = _count_shots()
+
+    override = read_project_status_override(project_root)
+    if override is not None:
+        try:
+            import datetime as _dt
+
+            last_modified = _dt.datetime.fromtimestamp(project_root.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            last_modified = None
+        return ProjectQuickStats(
+            status=override,
+            assets_count=assets_count,
+            shots_count=shots_count,
+            last_modified=last_modified,
+        )
 
     light = _derive_project_status_light(
         has_assets_dir=has_assets_dir,

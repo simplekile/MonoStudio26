@@ -1,7 +1,8 @@
 """Gantt-style timeline for the project schedule.
 
-Entity rows are grouped (one row per shot/asset) with stacked mini-bars when
-collapsed. Click the chevron to expand into per-department rows.
+Entity rows are grouped (one row per shot/asset) with stacked mini-bars per
+department when collapsed. Expanded dept rows place multiple goals on one
+horizontal track (Resolve-style). Click the chevron to expand.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QScrollBar,
     QSizePolicy,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -42,16 +44,19 @@ from monostudio.core.fs_reader import ProjectIndex
 from monostudio.core.project_schedule import (
     ProjectSchedule,
     ScheduleAllocation,
+    ScheduleMilestone,
     TimelineEntityGroup,
     TimelineRow,
     allocation_for_row,
     build_timeline_entity_groups,
     delete_allocation,
+    delete_milestone,
     bulk_upsert_allocations,
     clear_auto_bar_suppression_for_row,
     clear_department_schedule_for_entities,
     clear_entity_department_schedules,
     delete_wave_for_row,
+    new_milestone_id,
     replace_entity_department_allocations,
     entity_has_schedule,
     entity_is_unscheduled,
@@ -59,8 +64,11 @@ from monostudio.core.project_schedule import (
     new_allocation_id,
     read_project_schedule,
     resolve_schedule_project_start,
+    set_project_range,
     target_for_entity,
+    upsert_allocation,
     upsert_allocation_for_row,
+    upsert_milestone,
 )
 from monostudio.core.schedule_date_display import (
     format_schedule_date_span,
@@ -79,16 +87,28 @@ from monostudio.core.schedule_dept_filter import (
     normalize_bar_label_mode,
 )
 from monostudio.core.production_status import SKIPPED_STATUS_ID
+from monostudio.core.department_status_registry import default_target_status_for_department
 from monostudio.core.schedule_planner import (
+    AUTO_BAR_ID,
     STATUS_DONE,
     STATUS_EXCLUDED,
     STATUS_PROGRESS,
     STATUS_WAITING,
+    BarStore,
+    BarStoreKey,
     DeptWaveRollup,
     PlannedBar,
+    bar_store_key,
+    bars_for_row,
     build_planned_bars,
     compute_view_date_range_from_bars,
+    primary_bar_for_row,
     rollup_bars_by_department,
+)
+from monostudio.ui_qt.schedule_goal_status_dialog import ScheduleGoalStatusDialog
+from monostudio.ui_qt.schedule_target_status_memory import (
+    remember_target_status,
+    resolve_target_status_for_new_goal,
 )
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -171,6 +191,9 @@ _PANE_TIMELINE = "timeline"
 _PANE_HEADER = "header"
 _PANE_CORNER = "corner"
 _DRAW_PREVIEW = QColor(MONOS_COLORS.get("blue_400", "#60a5fa"))
+_MARKER_GRIP_DIAM = 8
+_MARKER_GRIP_HIT = 12
+_MILESTONE_MARKER = QColor("#a855f7")
 
 
 def _row_key(kind: str, rel: str, dept: str | None) -> tuple[str, str, str]:
@@ -196,6 +219,7 @@ class _BarHit:
     mode: str  # move | resize_start | resize_end
     is_wave_row: bool = False
     is_collapsed_group: bool = False
+    bar_id: str = ""
 
 
 @dataclass
@@ -206,6 +230,13 @@ class _DrawState:
     start: date
     due: date
     is_wave_row: bool = False
+
+
+@dataclass
+class _MarkerDrag:
+    kind: str  # in | out | milestone
+    milestone_id: str | None = None
+    preview_date: date | None = None
 
 
 def _scope_sections(
@@ -488,6 +519,7 @@ def _build_visible_rows(
 _ScheduleHighlight = tuple[str, str, str | None]
 
 _SELECTABLE_ROW_MODES = frozenset({"collapsed", "header", "dept", "dept_lane"})
+_MARQUEE_THRESHOLD = 4
 
 _HIGHLIGHT_FILL = QColor(37, 99, 235, 42)
 _HIGHLIGHT_EDGE = QColor("#60a5fa")
@@ -503,6 +535,13 @@ class _GanttCanvas(QWidget):
     entity_row_selected = Signal(str, str)  # entity_kind, entity_rel
     entity_row_cleared = Signal()  # Ctrl+click or empty-area click — clear highlight / Inspector
     department_skip_toggle_requested = Signal(str, str, str, bool)  # kind, rel, dep, skip
+    bars_bulk_dates_requested = Signal(list)  # allocation ids
+    bars_bulk_assign_requested = Signal(list)
+    bars_bulk_note_requested = Signal(list)
+    bars_bulk_target_status_requested = Signal(str, str, list)  # dept, status_id, allocation ids
+    bar_edit_allocation_requested = Signal(str)  # allocation_id
+    allocation_target_status_requested = Signal(str, str)  # allocation_id, status_id
+    jump_to_entity_requested = Signal(str, str, str)  # entity_kind, entity_rel, department
 
     def __init__(self, parent=None, *, pane: str = _PANE_TIMELINE) -> None:
         super().__init__(parent)
@@ -513,7 +552,7 @@ class _GanttCanvas(QWidget):
         self._groups: list[TimelineEntityGroup] = []
         self._visible: list[_DisplayRow] = []
         self._expanded: set[tuple[str, str]] = set()
-        self._bars: dict[tuple[str, str, str], PlannedBar] = {}
+        self._bars: BarStore = {}
         self._schedule = ProjectSchedule()
         self._view_start = date.today()
         self._view_end = date.today() + timedelta(days=56)
@@ -523,13 +562,23 @@ class _GanttCanvas(QWidget):
         self._drag_origin_x = 0
         self._drag_orig_start: date | None = None
         self._drag_orig_due: date | None = None
-        self._drag_dates: dict[tuple[str, str, str], tuple[date, date]] = {}
-        self._drag_collapsed_orig: dict[tuple[str, str, str], tuple[date, date]] = {}
+        self._drag_dates: dict[BarStoreKey, tuple[date, date]] = {}
+        self._drag_collapsed_orig: dict[BarStoreKey, tuple[date, date]] = {}
+        self._drag_selection_orig: dict[BarStoreKey, tuple[date, date]] = {}
         self._hover_row: int | None = None
         self._hover_col: int | None = None  # day index in view
-        self._hover_bar: tuple[int, str] | None = None  # (visible_index, dept)
+        self._hover_bar: tuple[int, str, str] | None = None  # (visible_index, dept, bar_id)
         self._highlight: _ScheduleHighlight | None = None
         self._highlight_entities: frozenset[tuple[str, str]] | None = None
+        self._highlight_bars: frozenset[BarStoreKey] = frozenset()
+        self._marquee_origin: QPoint | None = None
+        self._marquee_current: QPoint | None = None
+        self._marquee_dragging = False
+        self._marquee_additive = False
+        self._pending_click_row: int | None = None
+        self._pending_bar_hit: _BarHit | None = None
+        self._marquee_bar_select = False
+        self._selection_anchor_row: int | None = None
         self._tool = TOOL_SELECT
         self._draw_state: _DrawState | None = None
         self._view_mode = VIEW_ENTITY
@@ -541,11 +590,407 @@ class _GanttCanvas(QWidget):
         self._bar_label_mode: str = BAR_LABEL_DAYS
         self._date_display_format: str = normalize_date_display_format(None)
         self._wave_drag_preview: dict[str, tuple[date, date]] = {}
+        self._marker_drag: _MarkerDrag | None = None
+        self._hover_marker: tuple[str, str | None] | None = None  # kind, milestone_id
         self._gantt: ScheduleGanttWidget | None = None
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def _schedule_editable(self) -> bool:
         return self._gantt is None or self._gantt._schedule_editable
+
+    def _markers_editable(self) -> bool:
+        return (
+            self._schedule_editable()
+            and self._gantt is not None
+            and self._gantt.markers_unlocked()
+        )
+
+    def _marker_grip_rect(self, x: int) -> QRect:
+        half = _MARKER_GRIP_HIT // 2
+        return QRect(x - half, 0, _MARKER_GRIP_HIT, _MARKER_GRIP_HIT)
+
+    def _in_marker_x(self) -> int | None:
+        ps, _pe = self._project_range()
+        if ps is None or ps < self._view_start or ps > self._view_end:
+            return None
+        return int(self._date_to_x_start(ps))
+
+    def _out_marker_x(self) -> int | None:
+        return self._deadline_x()
+
+    def _milestone_line_x(self, milestone_id: str) -> int | None:
+        for m in self._schedule.milestones:
+            if m.id != milestone_id:
+                continue
+            md = self._parse(m.date)
+            if md is None or md < self._view_start or md > self._view_end:
+                return None
+            return int(self._date_to_x(md))
+        return None
+
+    def _hit_marker_grip(self, pos: QPoint) -> tuple[str, str | None] | None:
+        if self._pane != _PANE_HEADER:
+            return None
+        candidates: list[tuple[int, str, str | None]] = []
+        ix = self._in_marker_x()
+        if ix is not None and self._marker_grip_rect(ix).contains(pos):
+            candidates.append((abs(pos.x() - ix), "in", None))
+        ox = self._out_marker_x()
+        if ox is not None and self._marker_grip_rect(ox).contains(pos):
+            candidates.append((abs(pos.x() - ox), "out", None))
+        for m in self._schedule.milestones:
+            md = self._parse(m.date)
+            if md is None or md < self._view_start or md > self._view_end:
+                continue
+            mx = int(self._date_to_x(md))
+            if self._marker_grip_rect(mx).contains(pos):
+                candidates.append((abs(pos.x() - mx), "milestone", m.id))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        _dist, kind, mid = candidates[0]
+        return (kind, mid)
+
+    def _paint_marker_grip(
+        self,
+        p: QPainter,
+        x: int,
+        color: QColor,
+        *,
+        hovered: bool = False,
+        dragging: bool = False,
+    ) -> None:
+        locked = not self._markers_editable()
+        d = float(_MARKER_GRIP_DIAM + (1 if hovered or dragging else 0))
+        r = d / 2.0
+        cx = float(x)
+        fill = QColor(color)
+        if locked:
+            fill.setAlpha(100)
+        elif hovered or dragging:
+            fill = fill.lighter(120)
+        else:
+            fill.setAlpha(220)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QPen(QColor(255, 255, 255, 70 if locked else 110), 1))
+        p.setBrush(fill)
+        p.drawEllipse(QRectF(cx - r, 0.0, d, d))
+        p.restore()
+
+    def _paint_all_marker_grips(self, p: QPainter) -> None:
+        if self._pane != _PANE_HEADER:
+            return
+        hover = self._hover_marker
+        drag = self._marker_drag
+
+        ix = self._in_marker_x()
+        if ix is not None:
+            if drag is not None and drag.kind == "in" and drag.preview_date is not None:
+                ix = int(self._date_to_x_start(drag.preview_date))
+            self._paint_marker_grip(
+                p,
+                ix,
+                QColor(_RANGE_IN_HEX),
+                hovered=hover == ("in", None),
+                dragging=drag is not None and drag.kind == "in",
+            )
+
+        ox = self._out_marker_x()
+        if ox is not None:
+            if drag is not None and drag.kind == "out" and drag.preview_date is not None:
+                ox = int(self._date_to_x_end(drag.preview_date))
+            self._paint_marker_grip(
+                p,
+                ox,
+                _DEADLINE_HEADER,
+                hovered=hover == ("out", None),
+                dragging=drag is not None and drag.kind == "out",
+            )
+
+        painted_ms: set[str] = set()
+        for m in self._schedule.milestones:
+            if m.id in painted_ms:
+                continue
+            mx = self._milestone_line_x(m.id)
+            if mx is None:
+                continue
+            painted_ms.add(m.id)
+            if (
+                drag is not None
+                and drag.kind == "milestone"
+                and drag.milestone_id == m.id
+                and drag.preview_date is not None
+            ):
+                mx = int(self._date_to_x(drag.preview_date))
+            self._paint_marker_grip(
+                p,
+                mx,
+                _MILESTONE_MARKER,
+                hovered=hover == ("milestone", m.id),
+                dragging=drag is not None
+                and drag.kind == "milestone"
+                and drag.milestone_id == m.id,
+            )
+
+    def _commit_range_partial(
+        self,
+        *,
+        new_start: date | None = None,
+        new_end: date | None = None,
+        clear_start: bool = False,
+        clear_end: bool = False,
+    ) -> bool:
+        root = self._project_root
+        if root is None:
+            return False
+        ps, pe = self._project_range()
+        if clear_start:
+            ps = None
+        elif new_start is not None:
+            ps = new_start
+        if clear_end:
+            pe = None
+        elif new_end is not None:
+            pe = new_end
+        if ps is not None and pe is not None and ps > pe:
+            return False
+        try:
+            set_project_range(
+                root,
+                project_start=ps.isoformat() if ps else None,
+                project_end=pe.isoformat() if pe else None,
+            )
+        except OSError:
+            return False
+        if self._gantt is not None:
+            self._gantt._after_markers_changed()
+        return True
+
+    def _commit_milestone_date(self, milestone_id: str, d: date) -> bool:
+        root = self._project_root
+        if root is None:
+            return False
+        ms: ScheduleMilestone | None = None
+        for m in self._schedule.milestones:
+            if m.id == milestone_id:
+                ms = ScheduleMilestone(id=m.id, label=m.label, date=d.isoformat())
+                break
+        if ms is None:
+            return False
+        try:
+            upsert_milestone(root, ms)
+        except OSError:
+            return False
+        if self._gantt is not None:
+            self._gantt._after_markers_changed()
+        return True
+
+    def _add_milestone_at(self, d: date, label: str) -> bool:
+        root = self._project_root
+        if root is None or not label.strip():
+            return False
+        ms = ScheduleMilestone(id=new_milestone_id(), label=label.strip(), date=d.isoformat())
+        try:
+            upsert_milestone(root, ms)
+        except OSError:
+            return False
+        if self._gantt is not None:
+            self._gantt._after_markers_changed()
+        return True
+
+    def _delete_milestone_by_id(self, milestone_id: str) -> bool:
+        root = self._project_root
+        if root is None:
+            return False
+        try:
+            delete_milestone(root, milestone_id)
+        except OSError:
+            return False
+        if self._gantt is not None:
+            self._gantt._after_markers_changed()
+        return True
+
+    def _rename_milestone(self, milestone_id: str, label: str) -> bool:
+        root = self._project_root
+        if root is None or not label.strip():
+            return False
+        for m in self._schedule.milestones:
+            if m.id != milestone_id:
+                continue
+            try:
+                upsert_milestone(
+                    root,
+                    ScheduleMilestone(id=m.id, label=label.strip(), date=m.date),
+                )
+            except OSError:
+                return False
+            if self._gantt is not None:
+                self._gantt._after_markers_changed()
+            return True
+        return False
+
+    def _begin_marker_drag(self, kind: str, milestone_id: str | None = None) -> None:
+        preview: date | None = None
+        if kind == "in":
+            preview = self._project_range()[0]
+        elif kind == "out":
+            preview = self._project_range()[1]
+        elif kind == "milestone" and milestone_id:
+            for m in self._schedule.milestones:
+                if m.id == milestone_id:
+                    preview = self._parse(m.date)
+                    break
+        self._marker_drag = _MarkerDrag(
+            kind=kind, milestone_id=milestone_id, preview_date=preview
+        )
+        self.grabMouse()
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+
+    def _update_marker_drag(self, event: QMouseEvent) -> None:
+        if self._marker_drag is None:
+            return
+        self._marker_drag.preview_date = self._x_to_date(event.position().x())
+        self.update()
+        if self._partner is not None:
+            self._partner._marker_drag = self._marker_drag
+            self._partner.update()
+
+    def _finish_marker_drag(self) -> None:
+        drag = self._marker_drag
+        self._marker_drag = None
+        if self._partner is not None:
+            self._partner._marker_drag = None
+        self._release_if_grabbed(self)
+        if drag is None or drag.preview_date is None:
+            self.update()
+            if self._partner is not None:
+                self._partner.update()
+            return
+        pd = drag.preview_date
+        if drag.kind == "in":
+            self._commit_range_partial(new_start=pd)
+        elif drag.kind == "out":
+            self._commit_range_partial(new_end=pd)
+        elif drag.kind == "milestone" and drag.milestone_id:
+            self._commit_milestone_date(drag.milestone_id, pd)
+        self.setCursor(self._tool_idle_cursor(self._tool))
+        self.update()
+        if self._partner is not None:
+            self._partner.update()
+
+    def _cancel_marker_drag(self) -> None:
+        self._marker_drag = None
+        if self._partner is not None:
+            self._partner._marker_drag = None
+        self._release_if_grabbed(self)
+        self.update()
+        if self._partner is not None:
+            self._partner.update()
+
+    def _is_day_month_header_pos(self, pos: QPoint) -> bool:
+        """True when *pos* is on the month/day header rows (not IN/OUT band or timeline body)."""
+        if self._pane != _PANE_HEADER:
+            return False
+        return _HEADER_MONTH_TOP <= pos.y() < _HEADER_H
+
+    def _marker_context_col_date(self, pos: QPoint) -> date | None:
+        if not self._is_day_month_header_pos(pos):
+            return None
+        col = self._col_at_x(pos.x())
+        if col is None:
+            return None
+        return self._view_start + timedelta(days=col)
+
+    def _exec_marker_context_menu(self, pos: QPoint, global_pos) -> bool:
+        if not self._is_day_month_header_pos(pos):
+            return False
+        col_date = self._marker_context_col_date(pos)
+        if col_date is None:
+            return False
+
+        menu = QMenu(self)
+        unlocked = self._markers_editable()
+        ps, pe = self._project_range()
+
+        if not unlocked:
+            unlock_act = menu.addAction("Unlock markers to edit on timeline…")
+            unlock_act.setEnabled(self._schedule_editable())
+            chosen = menu.exec(global_pos)
+            if chosen is unlock_act and self._gantt is not None:
+                self._gantt.set_markers_unlocked(True)
+            return chosen is not None
+
+        set_in = menu.addAction("Set start (IN) here")
+        set_out = menu.addAction("Set deadline (OUT) here")
+        set_in.setEnabled(unlocked)
+        set_out.setEnabled(unlocked)
+        menu.addSeparator()
+        add_ms = menu.addAction("Add milestone here…")
+        add_ms.setEnabled(unlocked)
+        if ps is not None:
+            clear_in = menu.addAction("Clear start (IN)")
+            clear_in.setEnabled(unlocked)
+        else:
+            clear_in = None
+        if pe is not None:
+            clear_out = menu.addAction("Clear deadline (OUT)")
+            clear_out.setEnabled(unlocked)
+        else:
+            clear_out = None
+
+        hit = self._hit_marker_grip(pos)
+        rename_act = None
+        delete_act = None
+        if hit is not None and hit[0] == "milestone" and hit[1]:
+            menu.addSeparator()
+            rename_act = menu.addAction("Rename milestone…")
+            delete_act = menu.addAction("Delete milestone")
+            rename_act.setEnabled(unlocked)
+            delete_act.setEnabled(unlocked)
+
+        chosen = menu.exec(global_pos)
+        if chosen is set_in:
+            self._commit_range_partial(new_start=col_date)
+            return True
+        if chosen is set_out:
+            self._commit_range_partial(new_end=col_date)
+            return True
+        if chosen is add_ms:
+            from monostudio.ui_qt.schedule_quick_milestone_popup import show_milestone_name_popup
+
+            show_milestone_name_popup(
+                self.window(),
+                anchor_global=global_pos,
+                milestone_date=col_date,
+                on_accept=lambda name: self._add_milestone_at(col_date, name),
+            )
+            return True
+        if clear_in is not None and chosen is clear_in:
+            self._commit_range_partial(clear_start=True)
+            return True
+        if clear_out is not None and chosen is clear_out:
+            self._commit_range_partial(clear_end=True)
+            return True
+        if rename_act is not None and chosen is rename_act and hit and hit[1]:
+            from PySide6.QtWidgets import QInputDialog
+
+            mid = hit[1]
+            current = ""
+            for m in self._schedule.milestones:
+                if m.id == mid:
+                    current = m.label
+                    break
+            name, ok = QInputDialog.getText(
+                self, "Rename milestone", "Name:", text=current
+            )
+            if ok and name.strip():
+                self._rename_milestone(mid, name.strip())
+            return True
+        if delete_act is not None and chosen is delete_act and hit and hit[1]:
+            self._delete_milestone_by_id(hit[1])
+            return True
+        return False
 
     @staticmethod
     def _owns_mouse_grab(widget: QWidget) -> bool:
@@ -573,6 +1018,7 @@ class _GanttCanvas(QWidget):
         self._drag = None
         self._drag_dates.clear()
         self._drag_collapsed_orig.clear()
+        self._drag_selection_orig.clear()
         self._wave_drag_preview.clear()
         if self._gantt is not None:
             self._gantt._apply_tool_cursors()
@@ -581,15 +1027,28 @@ class _GanttCanvas(QWidget):
         self.update()
 
     def _set_draw_state(self, state: _DrawState | None) -> None:
+        prev_vi = self._draw_state.visible_index if self._draw_state is not None else None
         self._draw_state = state
         if self._gantt is None:
-            self.update()
+            if state is None:
+                self.update()
+            else:
+                rows = {state.visible_index}
+                if prev_vi is not None:
+                    rows.add(prev_vi)
+                self._repaint_body_rows(rows)
             return
         for pane in (self._gantt._label_pane, self._gantt._timeline_pane):
             if pane is not self:
                 pane._draw_state = state
-                pane.update()
-        self.update()
+        timeline = self._gantt._timeline_pane
+        if state is None:
+            timeline.update()
+            return
+        rows = {state.visible_index}
+        if prev_vi is not None:
+            rows.add(prev_vi)
+        timeline._repaint_body_rows(rows)
 
     def set_wave_draw_apply_mode(self, mode: str) -> None:
         if mode in (WAVE_DRAW_SAME_DAYS, WAVE_DRAW_DISTRIBUTE, WAVE_DRAW_FIRST_ONLY):
@@ -634,6 +1093,8 @@ class _GanttCanvas(QWidget):
             return ""
         if mode == BAR_LABEL_DEPARTMENT:
             if bar is not None:
+                if (bar.target_status_label or "").strip():
+                    return bar.target_status_label.strip()
                 return (bar.department_label or bar.department or "").strip()
             if wave is not None:
                 return (wave.department_label or wave.department or "").strip()
@@ -690,7 +1151,7 @@ class _GanttCanvas(QWidget):
         workspace_root: Path | None = None,
         groups: list[TimelineEntityGroup],
         expanded: set[tuple[str, str]],
-        bars: dict[tuple[str, str, str], PlannedBar],
+        bars: BarStore,
         schedule: ProjectSchedule,
         view_start: date,
         view_end: date,
@@ -724,6 +1185,7 @@ class _GanttCanvas(QWidget):
         )
         self._drag_dates.clear()
         self._drag_collapsed_orig.clear()
+        self._drag_selection_orig.clear()
         self._wave_drag_preview.clear()
         self._update_minimum_size()
         self.update()
@@ -767,16 +1229,16 @@ class _GanttCanvas(QWidget):
         out.sort(key=lambda x: (x[2].casefold(), x[1].casefold()))
         return out
 
-    def _wave_bar_keys(self, wave: DeptWaveRollup | None) -> list[tuple[str, str, str]]:
-        keys: list[tuple[str, str, str]] = []
-        seen: set[tuple[str, str, str]] = set()
+    def _wave_bar_keys(self, wave: DeptWaveRollup | None) -> list[BarStoreKey]:
+        keys: list[BarStoreKey] = []
+        seen: set[BarStoreKey] = set()
         if wave is None:
             return keys
         for kind, rel, dept_id in self._wave_draw_targets(wave):
-            key = _row_key(kind, rel, dept_id)
-            if key in self._bars and key not in seen:
-                seen.add(key)
-                keys.append(key)
+            for key, _bar in self._bars.items():
+                if key[0] == kind and key[1] == rel and key[2] == dept_id and key not in seen:
+                    seen.add(key)
+                    keys.append(key)
         return keys
 
     def _wave_department_has_bars(
@@ -819,6 +1281,16 @@ class _GanttCanvas(QWidget):
 
     def _is_label_pane(self) -> bool:
         return self._pane == _PANE_LABEL
+
+    def _set_hover_tooltip(self, text: str) -> None:
+        """Update hover tooltip; force-hide when clearing (Qt keeps stale tooltips otherwise)."""
+        new = (text or "").strip()
+        prev = self.toolTip()
+        if new == prev:
+            return
+        self.setToolTip(new)
+        if not new and prev:
+            QToolTip.hideText()
 
     def _is_body_pane(self) -> bool:
         return self._pane in (_PANE_LABEL, _PANE_TIMELINE)
@@ -1083,14 +1555,35 @@ class _GanttCanvas(QWidget):
         y = self._body_row_y(visible_index)
         return QRect(4, y + (_ROW_H - 16) // 2, _CHEVRON_W, 16)
 
-    def _bar_dates(self, entity_kind: str, entity_rel: str, department: str) -> tuple[date, date] | None:
-        key = _row_key(entity_kind, entity_rel, department)
-        if key in self._drag_dates:
-            return self._drag_dates[key]
-        bar = self._bars.get(key)
-        if bar is None:
-            return None
-        return bar.start, bar.due
+    def _bar_dates(
+        self,
+        entity_kind: str,
+        entity_rel: str,
+        department: str,
+        *,
+        bar_id: str | None = None,
+    ) -> tuple[date, date] | None:
+        bid = (bar_id or "").strip()
+        if bid:
+            sk = bar_store_key(entity_kind, entity_rel, department, bid)
+            if sk in self._drag_dates:
+                return self._drag_dates[sk]
+            bar = self._bars.get(sk)
+            if bar is None:
+                return None
+            return bar.start, bar.due
+        row = bars_for_row(self._bars, entity_kind, entity_rel, department)
+        if not row:
+            bar = primary_bar_for_row(self._bars, entity_kind, entity_rel, department)
+            if bar is None:
+                return None
+            sk = bar.store_key
+            if sk in self._drag_dates:
+                return self._drag_dates[sk]
+            return bar.start, bar.due
+        starts = [b.start for b in row]
+        ends = [b.due for b in row]
+        return min(starts), max(ends)
 
     def _bar_x_range(self, start: date, due: date) -> tuple[float, float]:
         x0 = (start - self._view_start).days * self._day_w + 2
@@ -1114,6 +1607,97 @@ class _GanttCanvas(QWidget):
         y = self._body_row_y(visible_index) + 2
         return QRectF(x0, y, width, _ROW_H - 4)
 
+    def _row_body_rect(self, visible_index: int) -> QRect:
+        y = self._body_row_y(visible_index)
+        return QRect(0, y, max(1, self.width()), _ROW_H)
+
+    def _repaint_body_rows(self, row_indices: Iterable[int]) -> None:
+        dirty: QRect | None = None
+        for vi in row_indices:
+            r = self._row_body_rect(vi)
+            dirty = r if dirty is None else dirty.united(r)
+        if dirty is not None:
+            self.update(dirty)
+        else:
+            self.update()
+
+    def _notify_inspector_for_bar_selection(self) -> None:
+        if not self._highlight_bars:
+            return
+        sk = next(iter(self._highlight_bars))
+        bar = self._bars.get(sk)
+        if bar is not None:
+            self.entity_row_selected.emit(bar.entity_kind, bar.entity_rel)
+
+    def _visible_indices_for_bar_keys(self, keys: Iterable[BarStoreKey]) -> set[int]:
+        wanted = frozenset(keys)
+        if not wanted:
+            return set()
+        indices: set[int] = set()
+        for vi, display in enumerate(self._visible):
+            for dept_row in self._dept_rows_for_visible(vi):
+                dep = (dept_row.department or "").strip()
+                if not dep:
+                    continue
+                for goal_bar in bars_for_row(
+                    self._bars, dept_row.entity_kind, dept_row.entity_rel, dep
+                ):
+                    if goal_bar.store_key in wanted:
+                        indices.add(vi)
+                bar = primary_bar_for_row(
+                    self._bars, dept_row.entity_kind, dept_row.entity_rel, dep
+                )
+                if bar is not None and bar.store_key in wanted:
+                    indices.add(vi)
+        return indices
+
+    def _try_init_multi_bar_drag(self, hit: _BarHit) -> bool:
+        """When dragging a bar in a multi-selection, snapshot all pinned goals to move together."""
+        self._drag_selection_orig.clear()
+        if hit.mode != "move" or hit.is_wave_row or hit.is_collapsed_group:
+            return False
+        sk = self._bar_key_from_hit(hit)
+        if sk is None or len(self._highlight_bars) < 2 or sk not in self._highlight_bars:
+            return False
+        for key in self._highlight_bars:
+            bar = self._bars.get(key)
+            if bar is None or not (bar.allocation_id or "").strip():
+                continue
+            dates = self._bar_dates(
+                bar.entity_kind,
+                bar.entity_rel,
+                bar.department,
+                bar_id=bar.bar_id,
+            )
+            if dates is not None:
+                self._drag_selection_orig[key] = dates
+        if len(self._drag_selection_orig) < 2:
+            self._drag_selection_orig.clear()
+            return False
+        return True
+
+    def _update_multi_bar_drag(self, delta: int) -> None:
+        for key, (orig_start, orig_due) in self._drag_selection_orig.items():
+            duration = (orig_due - orig_start).days
+            new_start = orig_start + timedelta(days=delta)
+            new_due = new_start + timedelta(days=duration)
+            self._drag_dates[key] = (new_start, new_due)
+
+    @staticmethod
+    def _collapsed_slot_metrics(slot_count: int) -> tuple[int, int]:
+        """Mini-bar height and gap so ``slot_count`` bars fit inside a collapsed row."""
+        if slot_count <= 1:
+            return min(_MINI_BAR_H, _ROW_H - 4), _MINI_BAR_GAP
+        available = _ROW_H - 4
+        gap = _MINI_BAR_GAP
+        while gap >= 1:
+            mini_h = (available - (slot_count - 1) * gap) // slot_count
+            if mini_h >= 2:
+                return min(_MINI_BAR_H, mini_h), gap
+            gap -= 1
+        mini_h = max(1, available // slot_count)
+        return min(_MINI_BAR_H, mini_h), 0
+
     def _mini_bar_rect(
         self, visible_index: int, slot: int, slot_count: int, start: date, due: date
     ) -> QRectF | None:
@@ -1121,8 +1705,8 @@ class _GanttCanvas(QWidget):
         if x0 + width < 0 or x0 > self._content_width():
             return None
         row_y = self._body_row_y(visible_index)
-        mini_h = min(_MINI_BAR_H, max(4, (_ROW_H - 4 - (slot_count - 1) * _MINI_BAR_GAP) // max(1, slot_count)))
-        slot_y = row_y + 2 + slot * (mini_h + _MINI_BAR_GAP)
+        mini_h, gap = self._collapsed_slot_metrics(slot_count)
+        slot_y = row_y + 2 + slot * (mini_h + gap)
         return QRectF(x0, slot_y, width, mini_h)
 
     def _dept_rows_for_visible(self, visible_index: int) -> list[TimelineRow]:
@@ -1160,9 +1744,9 @@ class _GanttCanvas(QWidget):
             return None
         row_y = self._body_row_y(visible_index)
         n = len(dept_rows)
-        mini_h = min(_MINI_BAR_H, max(4, (_ROW_H - 4 - (n - 1) * _MINI_BAR_GAP) // max(1, n)))
+        mini_h, gap = self._collapsed_slot_metrics(n)
         rel_y = y - row_y
-        slot = int((rel_y - 2) // (mini_h + _MINI_BAR_GAP))
+        slot = int((rel_y - 2) // (mini_h + gap))
         slot = max(0, min(slot, n - 1))
         dep = (dept_rows[slot].department or "").strip()
         return dep or None
@@ -1174,8 +1758,10 @@ class _GanttCanvas(QWidget):
         collapsed = display.mode == "collapsed"
         dept_rows = self._dept_rows_for_visible(state.visible_index)
         slot = 0
+        group = display.group
+        dep = (state.department or "").strip()
         for i, row in enumerate(dept_rows):
-            if (row.department or "").strip() == state.department:
+            if (row.department or "").strip() == dep:
                 slot = i
                 break
         if collapsed:
@@ -1240,22 +1826,80 @@ class _GanttCanvas(QWidget):
                     )
             return None
         dept_rows = self._dept_rows_for_visible(visible_index)
-        for slot, dept_row in enumerate(dept_rows):
+        for dept_row in dept_rows:
             dep = (dept_row.department or "").strip()
             if not dep:
                 continue
-            dates = self._bar_dates(dept_row.entity_kind, dept_row.entity_rel, dep)
-            if dates is None:
+            goals = bars_for_row(
+                self._bars, dept_row.entity_kind, dept_row.entity_rel, dep
+            )
+            if not goals:
+                goals = []
+                dates = self._bar_dates(dept_row.entity_kind, dept_row.entity_rel, dep)
+                if dates is None:
+                    continue
+                bar = primary_bar_for_row(
+                    self._bars, dept_row.entity_kind, dept_row.entity_rel, dep
+                )
+                bid = (bar.bar_id if bar else AUTO_BAR_ID) or AUTO_BAR_ID
+                hit = self._hit_test_goal_rect(
+                    visible_index, pos, dep, dates[0], dates[1], bid, stack=False
+                )
+                if hit is not None:
+                    return hit
                 continue
-            rect = self._full_bar_rect(visible_index, dates[0], dates[1])
-            if rect is None or not rect.contains(QPointF(pos)):
-                continue
-            if abs(pos.x() - rect.left()) <= _EDGE_GRAB:
-                return _BarHit(visible_index, dep, "resize_start")
-            if abs(pos.x() - rect.right()) <= _EDGE_GRAB:
-                return _BarHit(visible_index, dep, "resize_end")
-            return _BarHit(visible_index, dep, "move")
+            # Multiple goals on one dept row share the same horizontal track (Resolve-style).
+            stack = display.mode == "collapsed" and len(goals) > 1
+            goal_count = len(goals)
+            goal_iter = reversed(list(enumerate(goals))) if not stack else enumerate(goals)
+            for gi, goal_bar in goal_iter:
+                dates = self._bar_dates(
+                    dept_row.entity_kind,
+                    dept_row.entity_rel,
+                    dep,
+                    bar_id=goal_bar.bar_id,
+                )
+                if dates is None:
+                    continue
+                hit = self._hit_test_goal_rect(
+                    visible_index,
+                    pos,
+                    dep,
+                    dates[0],
+                    dates[1],
+                    goal_bar.bar_id,
+                    stack=stack,
+                    slot=gi,
+                    slot_count=goal_count,
+                )
+                if hit is not None:
+                    return hit
         return None
+
+    def _hit_test_goal_rect(
+        self,
+        visible_index: int,
+        pos: QPoint,
+        department: str,
+        start: date,
+        due: date,
+        bar_id: str,
+        *,
+        stack: bool,
+        slot: int = 0,
+        slot_count: int = 1,
+    ) -> _BarHit | None:
+        if stack:
+            rect = self._mini_bar_rect(visible_index, slot, slot_count, start, due)
+        else:
+            rect = self._full_bar_rect(visible_index, start, due)
+        if rect is None or not rect.contains(QPointF(pos)):
+            return None
+        if abs(pos.x() - rect.left()) <= _EDGE_GRAB:
+            return _BarHit(visible_index, department, "resize_start", bar_id=bar_id)
+        if abs(pos.x() - rect.right()) <= _EDGE_GRAB:
+            return _BarHit(visible_index, department, "resize_end", bar_id=bar_id)
+        return _BarHit(visible_index, department, "move", bar_id=bar_id)
 
     def _group_subtitle(self, group: TimelineEntityGroup) -> str:
         target = target_for_entity(
@@ -1481,30 +2125,37 @@ class _GanttCanvas(QWidget):
             y += _ROW_H
             row_idx += 1
 
-    def _paint_timeline_body_grid(self, p: QPainter, w: int, h: int) -> None:
+    def _paint_timeline_body_grid(
+        self, p: QPainter, w: int, h: int, *, clip: QRect | None = None
+    ) -> None:
         num_days = self._num_days()
         dw = self._day_w
         major = set(self._grid_day_indices())
-        _ps, pe = self._project_range()
+        if clip is not None:
+            i0 = max(0, int(clip.left() / dw) - 1)
+            i1 = min(num_days, int(clip.right() / dw) + 2)
+        else:
+            i0, i1 = 0, num_days
 
         if dw >= 7:
-            for i in range(num_days):
+            y0 = clip.top() if clip is not None else 1
+            y1 = clip.bottom() if clip is not None else h - 1
+            for i in range(i0, i1):
                 d = self._view_start + timedelta(days=i)
                 if d.weekday() >= 5:
                     x = int(i * dw)
                     p.fillRect(
                         x + 1,
-                        1,
+                        y0,
                         max(1, int(dw) - 1),
-                        h - 1,
+                        max(1, y1 - y0),
                         QColor(255, 255, 255, 4),
                     )
 
         minor_pen = QPen(QColor("#18181b"), 1)
         major_pen = QPen(QColor("#1e1e20"), 1)
 
-        for i in range(num_days):
-            d = self._view_start + timedelta(days=i)
+        for i in range(i0, i1):
             x = int(i * dw)
             is_major = i in major
             if is_major or (4 <= dw < 7):
@@ -1520,6 +2171,8 @@ class _GanttCanvas(QWidget):
             self._partner.update()
 
     def _set_hover_col(self, col: int | None) -> None:
+        if self._drag is not None or self._draw_state is not None:
+            return
         panes: list[_GanttCanvas] = [self]
         if self._gantt is not None:
             panes.extend([self._gantt._timeline_pane, self._gantt._header_pane])
@@ -1538,20 +2191,42 @@ class _GanttCanvas(QWidget):
     def _sync_highlight(self, highlight: _ScheduleHighlight | None) -> None:
         self._highlight = highlight
         self._highlight_entities = None
+        self._highlight_bars = frozenset()
         if self._partner is not None:
             self._partner._highlight = highlight
             self._partner._highlight_entities = None
+            self._partner._highlight_bars = frozenset()
             self._partner.update()
         self.update()
 
     def _sync_highlight_entities(self, keys: frozenset[tuple[str, str]] | None) -> None:
         self._highlight_entities = keys
         self._highlight = None
+        self._highlight_bars = frozenset()
         if self._partner is not None:
             self._partner._highlight_entities = keys
             self._partner._highlight = None
+            self._partner._highlight_bars = frozenset()
             self._partner.update()
         self.update()
+
+    def _sync_highlight_bars(self, keys: frozenset[BarStoreKey] | None) -> None:
+        bars = keys or frozenset()
+        if bars == self._highlight_bars:
+            return
+        self._highlight_bars = bars
+        self._highlight = None
+        self._highlight_entities = None
+        if self._partner is not None:
+            self._partner._highlight_bars = bars
+            self._partner._highlight = None
+            self._partner._highlight_entities = None
+        timeline = self
+        if self._gantt is not None:
+            timeline = self._gantt._timeline_pane
+        elif self._partner is not None and self._partner._pane == _PANE_TIMELINE:
+            timeline = self._partner
+        timeline.update()
 
     def _deselect_entity_row(self) -> None:
         if self._gantt is None:
@@ -1560,8 +2235,10 @@ class _GanttCanvas(QWidget):
         self.entity_row_cleared.emit()
 
     def _click_should_clear_selection(self, row: int | None, pos: QPoint, *, ctrl: bool) -> bool:
+        if self._is_label_pane() and self._tool == TOOL_SELECT:
+            return False
         if ctrl:
-            return True
+            return False
         if row is None:
             return True
         if row < 0 or row >= len(self._visible):
@@ -1592,6 +2269,7 @@ class _GanttCanvas(QWidget):
         if display.dept is not None:
             dep_h = (display.dept.department or "").strip() or None
         if self._gantt is not None:
+            self._gantt.clear_bar_selection()
             self._gantt.set_entity_highlight(group.entity_kind, group.entity_rel, dep_h)
         kind = group.entity_kind
         rel = group.entity_rel
@@ -1612,8 +2290,368 @@ class _GanttCanvas(QWidget):
             return self._norm_entity_key(display.group.entity_kind, display.group.entity_rel)
         return None
 
+    def _bar_key_from_hit(self, hit: _BarHit) -> BarStoreKey | None:
+        if hit.is_collapsed_group or hit.is_wave_row:
+            return None
+        display = self._visible[hit.visible_index]
+        group = display.group
+        if group is None:
+            return None
+        bid = (hit.bar_id or AUTO_BAR_ID).strip() or AUTO_BAR_ID
+        return bar_store_key(
+            group.entity_kind,
+            group.entity_rel,
+            hit.department,
+            bid,
+        )
+
+    def _bar_keys_for_visible_row(self, vi: int) -> set[BarStoreKey]:
+        keys: set[BarStoreKey] = set()
+        if vi < 0 or vi >= len(self._visible):
+            return keys
+        display = self._visible[vi]
+        if display.mode in ("scope_separator", "dept_lane_header"):
+            return keys
+        for dept_row in self._dept_rows_for_visible(vi):
+            dep = (dept_row.department or "").strip()
+            if not dep:
+                continue
+            goals = bars_for_row(
+                self._bars, dept_row.entity_kind, dept_row.entity_rel, dep
+            )
+            if goals:
+                for goal_bar in goals:
+                    if goal_bar is not None:
+                        keys.add(goal_bar.store_key)
+                continue
+            bar = primary_bar_for_row(
+                self._bars, dept_row.entity_kind, dept_row.entity_rel, dep
+            )
+            if bar is not None:
+                keys.add(bar.store_key)
+        return keys
+
+    def _current_bar_selection(self) -> set[BarStoreKey]:
+        return set(self._highlight_bars)
+
+    def _clear_bar_selection(self) -> None:
+        if self._gantt is not None:
+            self._gantt.clear_bar_selection()
+
+    def _apply_bar_selection(
+        self, keys: set[BarStoreKey], *, notify_inspector: bool = True
+    ) -> None:
+        if self._gantt is None:
+            return
+        if not keys:
+            self._clear_bar_selection()
+            return
+        self._gantt.set_bar_selection(frozenset(keys))
+        if notify_inspector and not self._marquee_dragging:
+            self._notify_inspector_for_bar_selection()
+
+    def _toggle_bar_selection(self, key: BarStoreKey) -> None:
+        current = self._current_bar_selection()
+        if key in current:
+            current.discard(key)
+        else:
+            current.add(key)
+        self._apply_bar_selection(current)
+
+    def _bar_keys_in_y_range(self, y0: int, y1: int) -> set[BarStoreKey]:
+        top, bot = min(y0, y1), max(y0, y1)
+        keys: set[BarStoreKey] = set()
+        for vi, display in enumerate(self._visible):
+            row_y = self._body_row_y(vi)
+            if row_y + _ROW_H < top or row_y > bot:
+                continue
+            if display.mode in ("scope_separator", "dept_lane_header"):
+                continue
+            keys |= self._bar_keys_for_visible_row(vi)
+        return keys
+
+    def _marquee_selection_rect(self) -> QRect | None:
+        if self._marquee_origin is None or self._marquee_current is None:
+            return None
+        rect = QRect(self._marquee_origin, self._marquee_current).normalized()
+        if self._is_label_pane():
+            rect.setLeft(0)
+            rect.setRight(max(1, self.width()))
+        return rect
+
+    def _timeline_pane_for_marquee(self) -> _GanttCanvas | None:
+        if self._pane == _PANE_TIMELINE:
+            return self
+        if self._gantt is not None:
+            return self._gantt._timeline_pane
+        if self._partner is not None and self._partner._pane == _PANE_TIMELINE:
+            return self._partner
+        return None
+
+    def _sync_marquee_to_timeline(self) -> None:
+        """Project label-pane marquee Y onto timeline coords for bar hit-testing."""
+        if not self._is_label_pane() or self._gantt is None:
+            return
+        if self._marquee_origin is None or self._marquee_current is None:
+            return
+        tl = self._gantt._timeline_pane
+        y0 = min(self._marquee_origin.y(), self._marquee_current.y())
+        y1 = max(self._marquee_origin.y(), self._marquee_current.y())
+        tl._marquee_dragging = self._marquee_dragging
+        tl._marquee_additive = self._marquee_additive
+        tl._marquee_bar_select = True
+        if (
+            tl._marquee_origin is not None
+            and tl._marquee_current is not None
+            and (
+                abs(tl._marquee_origin.x() - tl._marquee_current.x()) > _MARQUEE_THRESHOLD
+                or self._marquee_dragging
+            )
+        ):
+            x0 = min(tl._marquee_origin.x(), tl._marquee_current.x())
+            x1 = max(tl._marquee_origin.x(), tl._marquee_current.x())
+            tl._marquee_origin = QPoint(x0, y0)
+            tl._marquee_current = QPoint(x1, y1)
+        else:
+            tl._marquee_origin = QPoint(0, y0)
+            tl._marquee_current = QPoint(max(1, int(tl._content_width())), y1)
+
+    def _marquee_timeline_selection_rect(self) -> QRect | None:
+        """Marquee rect in timeline coordinates — used for bar intersection."""
+        if self._is_label_pane():
+            self._sync_marquee_to_timeline()
+            tl = self._timeline_pane_for_marquee()
+            if tl is not None:
+                return tl._marquee_timeline_selection_rect()
+            return None
+        if self._marquee_origin is None or self._marquee_current is None:
+            return None
+        return QRect(self._marquee_origin, self._marquee_current).normalized()
+
+    def _bar_keys_intersecting_marquee(self, rect: QRect) -> set[BarStoreKey]:
+        keys: set[BarStoreKey] = set()
+        marquee = QRectF(rect)
+        for vi, display in enumerate(self._visible):
+            for dept_row in self._dept_rows_for_visible(vi):
+                dep = (dept_row.department or "").strip()
+                if not dep:
+                    continue
+                goals = bars_for_row(
+                    self._bars, dept_row.entity_kind, dept_row.entity_rel, dep
+                )
+                if not goals:
+                    dates = self._bar_dates(dept_row.entity_kind, dept_row.entity_rel, dep)
+                    if dates is None:
+                        continue
+                    bar = primary_bar_for_row(
+                        self._bars, dept_row.entity_kind, dept_row.entity_rel, dep
+                    )
+                    if bar is None:
+                        continue
+                    if display.mode == "collapsed":
+                        dept_rows = self._dept_rows_for_visible(vi)
+                        collapsed_slot = 0
+                        for si, dr in enumerate(dept_rows):
+                            if (dr.department or "").strip() == dep:
+                                collapsed_slot = si
+                                break
+                        bar_rect = self._mini_bar_rect(
+                            vi, collapsed_slot, len(dept_rows), dates[0], dates[1]
+                        )
+                    else:
+                        bar_rect = self._full_bar_rect(vi, dates[0], dates[1])
+                    if bar_rect is not None and marquee.intersects(bar_rect):
+                        keys.add(bar.store_key)
+                    continue
+                dept_rows = self._dept_rows_for_visible(vi)
+                collapsed_slot = 0
+                for si, dr in enumerate(dept_rows):
+                    if (dr.department or "").strip() == dep:
+                        collapsed_slot = si
+                        break
+                for gi, goal_bar in enumerate(goals):
+                    if goal_bar is None:
+                        continue
+                    dates = self._bar_dates(
+                        dept_row.entity_kind,
+                        dept_row.entity_rel,
+                        dep,
+                        bar_id=goal_bar.bar_id,
+                    )
+                    if dates is None:
+                        continue
+                    if display.mode == "collapsed" and len(goals) > 1:
+                        bar_rect = self._mini_bar_rect(
+                            vi, collapsed_slot, len(dept_rows), dates[0], dates[1]
+                        )
+                    else:
+                        bar_rect = self._full_bar_rect(vi, dates[0], dates[1])
+                    if bar_rect is not None and marquee.intersects(bar_rect):
+                        keys.add(goal_bar.store_key)
+        return keys
+
+    def _update_marquee_selection(self) -> None:
+        rect = self._marquee_timeline_selection_rect()
+        if rect is None:
+            return
+        keys = self._bar_keys_intersecting_marquee(rect)
+        if self._marquee_additive:
+            keys |= self._current_bar_selection()
+        self._apply_bar_selection(keys, notify_inspector=not self._marquee_dragging)
+
+    def _reset_marquee_state(self) -> None:
+        partner = self._partner
+        self._marquee_origin = None
+        self._marquee_current = None
+        self._marquee_dragging = False
+        self._marquee_additive = False
+        self._marquee_bar_select = False
+        self._pending_click_row = None
+        self._pending_bar_hit = None
+        if partner is not None and (
+            partner._marquee_origin is not None
+            or partner._marquee_dragging
+            or partner._marquee_current is not None
+        ):
+            partner._marquee_origin = None
+            partner._marquee_current = None
+            partner._marquee_dragging = False
+            partner._marquee_additive = False
+            partner._marquee_bar_select = False
+
+    def _select_row_range(self, anchor_row: int, end_row: int) -> None:
+        lo, hi = min(anchor_row, end_row), max(anchor_row, end_row)
+        keys: set[BarStoreKey] = set()
+        for vi in range(lo, hi + 1):
+            keys |= self._bar_keys_for_visible_row(vi)
+        self._apply_bar_selection(keys)
+
+    def _department_for_context_row(self, row: int | None) -> str | None:
+        dep = (self._dept_filter or "").strip() or None
+        if row is None or row < 0 or row >= len(self._visible):
+            return dep
+        display = self._visible[row]
+        if display.dept is not None:
+            row_dep = (display.dept.department or "").strip()
+            if row_dep:
+                return row_dep
+        return dep
+
+    def _finish_marquee_or_pending_click(self) -> bool:
+        """End marquee drag or apply deferred single click; returns True if handled."""
+        if (
+            self._marquee_origin is None
+            and self._pending_click_row is None
+            and self._pending_bar_hit is None
+        ):
+            return False
+        origin = self._marquee_origin
+        pending = self._pending_click_row
+        pending_hit = self._pending_bar_hit
+        dragging = self._marquee_dragging
+        additive = self._marquee_additive
+        self._reset_marquee_state()
+        self._release_if_grabbed(self)
+        if dragging:
+            self._notify_inspector_for_bar_selection()
+            return True
+        if pending_hit is not None:
+            sk = self._bar_key_from_hit(pending_hit)
+            if sk is not None:
+                self._apply_bar_selection({sk})
+                self._selection_anchor_row = pending_hit.visible_index
+            return True
+        if pending is not None:
+            if self._try_select_visible_row(pending):
+                self._clear_bar_selection()
+                self._selection_anchor_row = pending
+            return True
+        if origin is not None and not additive:
+            self._clear_bar_selection()
+            return True
+        return False
+
+    def _begin_bar_drag_from_hit(self, hit: _BarHit, event: QMouseEvent) -> bool:
+        if not self._schedule_editable():
+            return False
+        if hit.is_wave_row:
+            display = self._visible[hit.visible_index]
+            if display.wave is None:
+                return False
+            dates = self._wave_row_dates(display.wave)
+        elif hit.is_collapsed_group:
+            display = self._visible[hit.visible_index]
+            if display.group is None:
+                return False
+            span = self._entity_span_dates(
+                display.group.entity_kind,
+                display.group.entity_rel,
+                list(display.group.departments),
+            )
+            if span[0] is None or span[1] is None:
+                return False
+            dates = span
+            self._drag_collapsed_orig.clear()
+            for dept_row in display.group.departments:
+                dep = (dept_row.department or "").strip()
+                if not dep:
+                    continue
+                for goal_bar in bars_for_row(
+                    self._bars,
+                    display.group.entity_kind,
+                    display.group.entity_rel,
+                    dep,
+                ):
+                    bar_dates = self._bar_dates(
+                        display.group.entity_kind,
+                        display.group.entity_rel,
+                        dep,
+                        bar_id=goal_bar.bar_id,
+                    )
+                    if bar_dates is not None:
+                        self._drag_collapsed_orig[goal_bar.store_key] = bar_dates
+            if not self._drag_collapsed_orig:
+                return False
+        else:
+            display = self._visible[hit.visible_index]
+            if display.group is None:
+                return False
+            dates = self._bar_dates(
+                display.group.entity_kind,
+                display.group.entity_rel,
+                hit.department,
+                bar_id=hit.bar_id or None,
+            )
+            if dates is None:
+                return False
+            self._try_init_multi_bar_drag(hit)
+        self._drag = hit
+        self._drag_origin_x = event.position().x()
+        self._drag_orig_start, self._drag_orig_due = dates
+        if hit.mode == "move":
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.grabMouse()
+        return True
+
+    def _paint_marquee_rect(self, p: QPainter) -> None:
+        src = self
+        if not src._marquee_dragging and self._partner is not None:
+            src = self._partner
+        if (
+            not src._marquee_dragging
+            or src._marquee_origin is None
+            or src._marquee_current is None
+        ):
+            return
+        rect = QRect(src._marquee_origin, src._marquee_current).normalized()
+        p.fillRect(rect, QColor(96, 165, 250, 40))
+        p.setPen(QPen(QColor("#60a5fa"), 1, Qt.PenStyle.DashLine))
+        p.drawRect(rect)
+
     def _row_matches_highlight(self, display: _DisplayRow) -> bool:
         if display.mode in ("scope_separator", "dept_lane_header"):
+            return False
+        if self._highlight_bars:
             return False
         multi = self._highlight_entities
         if multi:
@@ -1894,6 +2932,8 @@ class _GanttCanvas(QWidget):
         if self._hover_col is not None:
             self._paint_col_highlight(p, self._hover_col, h)
 
+        self._paint_all_marker_grips(p)
+
     def _paint_label_pane(self, p: QPainter, w: int, h: int) -> None:
         p.fillRect(self.rect(), QColor("#141416"))
         inner_w = max(1, w - 1)  # keep column right edge for continuous border
@@ -1976,12 +3016,19 @@ class _GanttCanvas(QWidget):
                 )
 
         self._paint_filler_rows(p, w, h, inner_w=inner_w)
+        self._paint_marquee_rect(p)
         p.setPen(QPen(QColor("#3f3f46"), 1))
         p.drawLine(w - 1, 0, w - 1, h)
 
-    def _paint_timeline_body(self, p: QPainter, w: int, h: int) -> None:
-        p.fillRect(self.rect(), QColor(MONOS_COLORS.get("content_bg", "#121214")))
-        self._paint_timeline_body_grid(p, w, h)
+    def _paint_timeline_body(
+        self, p: QPainter, w: int, h: int, *, clip: QRect | None = None
+    ) -> None:
+        bg = QColor(MONOS_COLORS.get("content_bg", "#121214"))
+        if clip is not None:
+            p.fillRect(clip, bg)
+        else:
+            p.fillRect(self.rect(), bg)
+        self._paint_timeline_body_grid(p, w, h, clip=clip)
         self._paint_outside_production_range(p, w, h)
         self._paint_project_range_body(p, w, h)
         self._paint_deadline_marker(p, h, header=False)
@@ -2018,6 +3065,8 @@ class _GanttCanvas(QWidget):
 
         for vi, display in enumerate(self._visible):
             y = self._body_row_y(vi)
+            if clip is not None and not QRect(0, y, w, _ROW_H).intersects(clip):
+                continue
             p.setPen(QPen(QColor("#1e1e20"), 1))
             p.drawLine(0, y + _ROW_H, w, y + _ROW_H)
             if self._row_matches_highlight(display):
@@ -2033,27 +3082,52 @@ class _GanttCanvas(QWidget):
                 )
                 if span[0] is not None and span[1] is not None:
                     self._paint_row_span_markers(p, y, span[0], span[1])
+                slot_count = len(dept_rows)
                 for slot, dept_row in enumerate(dept_rows):
                     dep = (dept_row.department or "").strip()
-                    if dep:
-                        key = _row_key(
-                            display.group.entity_kind,
-                            display.group.entity_rel,
-                            dep,
+                    if not dep:
+                        continue
+                    kind = display.group.entity_kind
+                    rel = display.group.entity_rel
+                    goals = bars_for_row(self._bars, kind, rel, dep)
+                    visible_goals = [g for g in goals if g.status != STATUS_EXCLUDED]
+                    if goals and not visible_goals:
+                        continue
+                    dates = self._bar_dates(kind, rel, dep)
+                    if dates is None:
+                        if not goals:
+                            self._paint_bar(
+                                p,
+                                vi,
+                                kind,
+                                rel,
+                                dep,
+                                collapsed=True,
+                                slot=slot,
+                                slot_count=slot_count,
+                            )
+                        continue
+                    style_bar: PlannedBar | None
+                    if visible_goals:
+                        style_bar = next(
+                            (g for g in visible_goals if not g.goal_met),
+                            visible_goals[0],
                         )
-                        b = self._bars.get(key)
-                        if b is not None and b.status == STATUS_EXCLUDED:
-                            continue
-                        self._paint_bar(
-                            p,
-                            vi,
-                            display.group.entity_kind,
-                            display.group.entity_rel,
-                            dep,
-                            collapsed=True,
-                            slot=slot,
-                            slot_count=len(dept_rows),
-                        )
+                    else:
+                        style_bar = primary_bar_for_row(self._bars, kind, rel, dep)
+                    self._paint_bar(
+                        p,
+                        vi,
+                        kind,
+                        rel,
+                        dep,
+                        collapsed=True,
+                        slot=slot,
+                        slot_count=slot_count,
+                        bar=style_bar,
+                        start_override=dates[0],
+                        due_override=dates[1],
+                    )
             elif display.mode == "scope_separator":
                 p.fillRect(0, y, w, _ROW_H, QColor(18, 18, 20))
             elif display.mode == "dept_lane_header":
@@ -2066,14 +3140,31 @@ class _GanttCanvas(QWidget):
                 dep_row = display.dept
                 dep = (dep_row.department or "").strip()
                 if dep:
-                    self._paint_bar(
-                        p,
-                        vi,
-                        dep_row.entity_kind,
-                        dep_row.entity_rel,
-                        dep,
-                        collapsed=False,
+                    goals = bars_for_row(
+                        self._bars, dep_row.entity_kind, dep_row.entity_rel, dep
                     )
+                    if not goals:
+                        self._paint_bar(
+                            p,
+                            vi,
+                            dep_row.entity_kind,
+                            dep_row.entity_rel,
+                            dep,
+                            collapsed=False,
+                        )
+                    else:
+                        for goal_bar in goals:
+                            if goal_bar.status == STATUS_EXCLUDED:
+                                continue
+                            self._paint_bar(
+                                p,
+                                vi,
+                                dep_row.entity_kind,
+                                dep_row.entity_rel,
+                                dep,
+                                collapsed=False,
+                                bar=goal_bar,
+                            )
 
         self._paint_filler_rows(p, w, h)
 
@@ -2089,6 +3180,8 @@ class _GanttCanvas(QWidget):
                 p.setBrush(fill)
                 p.drawRoundedRect(preview, 4, 4)
 
+        self._paint_marquee_rect(p)
+
     def paintEvent(self, event) -> None:  # type: ignore[override]
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
@@ -2101,7 +3194,7 @@ class _GanttCanvas(QWidget):
         elif self._pane == _PANE_LABEL:
             self._paint_label_pane(p, w, h)
         else:
-            self._paint_timeline_body(p, w, h)
+            self._paint_timeline_body(p, w, h, clip=event.rect())
         p.end()
 
     def _paint_scope_separator(
@@ -2261,13 +3354,26 @@ class _GanttCanvas(QWidget):
         collapsed: bool,
         slot: int = 0,
         slot_count: int = 1,
+        bar: PlannedBar | None = None,
+        start_override: date | None = None,
+        due_override: date | None = None,
     ) -> None:
-        key = _row_key(entity_kind, entity_rel, department)
-        bar = self._bars.get(key)
-        dates = self._drag_dates.get(key)
-        if bar is None and dates is None:
+        if bar is None:
+            bar = primary_bar_for_row(self._bars, entity_kind, entity_rel, department)
+        sk = (
+            bar.store_key
+            if bar is not None
+            else bar_store_key(entity_kind, entity_rel, department, AUTO_BAR_ID)
+        )
+        dates = self._drag_dates.get(sk)
+        if bar is None and dates is None and start_override is None:
             return
-        start, due = dates if dates is not None else (bar.start, bar.due)  # type: ignore[union-attr]
+        if dates is not None:
+            start, due = dates
+        elif start_override is not None and due_override is not None:
+            start, due = start_override, due_override
+        else:
+            start, due = bar.start, bar.due  # type: ignore[union-attr]
         if collapsed:
             rect = self._mini_bar_rect(visible_index, slot, slot_count, start, due)
         else:
@@ -2278,14 +3384,15 @@ class _GanttCanvas(QWidget):
         status = bar.status if bar is not None else "waiting"
         overdue = bar.overdue if bar is not None else False
         is_override = bar is not None and bar.source == "override"
+        goal_met = bar.goal_met if bar is not None else False
 
-        if overdue:
+        if goal_met or status == STATUS_DONE:
+            fill = QColor("#10b981")
+        elif overdue:
             fill = QColor(_OVERDUE_HEX)
         elif status == STATUS_EXCLUDED:
             fill = QColor("#52525b")
             fill.setAlpha(110)
-        elif status == STATUS_DONE:
-            fill = QColor("#10b981")
         elif status == STATUS_PROGRESS:
             fill = QColor("#f59e0b")
         else:
@@ -2293,13 +3400,20 @@ class _GanttCanvas(QWidget):
             base.setAlpha(150)
             fill = base
 
+        hover_id = (bar.bar_id or "") if bar is not None else ""
         hover_group = (
             collapsed
             and self._hover_bar is not None
             and self._hover_bar[0] == visible_index
             and self._hover_bar[1] == _COLLAPSED_GROUP_HOVER
         )
-        if self._hover_bar == (visible_index, department) or hover_group:
+        hover_goal = (
+            self._hover_bar is not None
+            and self._hover_bar[0] == visible_index
+            and self._hover_bar[1] == department
+            and (len(self._hover_bar) < 3 or self._hover_bar[2] == hover_id)
+        )
+        if hover_goal or hover_group:
             fill = fill.lighter(118)
 
         p.setPen(Qt.PenStyle.NoPen)
@@ -2313,7 +3427,17 @@ class _GanttCanvas(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
 
-        if not collapsed and bar is not None:
+        if sk in self._highlight_bars:
+            p.setPen(QPen(QColor("#60a5fa"), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect.adjusted(-0.5, -0.5, 0.5, 0.5), radius, radius)
+
+        if (
+            not collapsed
+            and bar is not None
+            and self._drag is None
+            and self._draw_state is None
+        ):
             label = self._bar_label_text(start=start, due=due, bar=bar)
             self._paint_bar_label_text(
                 p, rect, label, status=status, overdue=overdue
@@ -2356,6 +3480,10 @@ class _GanttCanvas(QWidget):
         )
         if assignee_name:
             lines.append(f"Assignee: {assignee_name}")
+        if (bar.target_status_label or bar.target_status_id).strip():
+            label = bar.target_status_label or bar.target_status_id
+            met = "met" if bar.goal_met else "open"
+            lines.append(f"Goal: {label} ({met})")
         if (bar.note or "").strip():
             lines.append(f"Note: {bar.note.strip()}")
         return "\n".join(lines)
@@ -2364,11 +3492,44 @@ class _GanttCanvas(QWidget):
         if self._gantt is not None and self._gantt._forward_nav_mouse_move(event):
             return
 
+        if self._marker_drag is not None:
+            self._update_marker_drag(event)
+            return
+
         if self._pane == _PANE_HEADER:
             self._set_hover_col(self._col_at_x(event.position().x()))
+            if self._markers_editable():
+                self._hover_marker = self._hit_marker_grip(event.position().toPoint())
+                if self._hover_marker:
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                else:
+                    self.setCursor(self._tool_idle_cursor(self._tool))
+            else:
+                self._hover_marker = None
+            self.update()
             return
 
         if self._is_label_pane():
+            if self._marquee_origin is not None and self._tool == TOOL_SELECT:
+                pos = event.position().toPoint()
+                if not self._marquee_dragging:
+                    delta = pos - self._marquee_origin
+                    if (
+                        abs(delta.x()) > _MARQUEE_THRESHOLD
+                        or abs(delta.y()) > _MARQUEE_THRESHOLD
+                    ):
+                        self._marquee_dragging = True
+                        self._pending_click_row = None
+                if self._marquee_dragging:
+                    self._marquee_current = pos
+                    self._update_marquee_selection()
+                    if not self._owns_mouse_grab(self):
+                        self.grabMouse()
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+                    self.update()
+                    if self._partner is not None:
+                        self._partner.update()
+                    return
             if self._gantt is not None and self._gantt.is_label_column_resizing():
                 self._gantt.update_label_column_resize(int(event.globalPosition().x()))
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -2379,11 +3540,14 @@ class _GanttCanvas(QWidget):
             self._hover_row = row
             self._sync_hover_row(row)
             self._set_hover_col(None)
+            if self._partner is not None and self._partner._pane == _PANE_TIMELINE:
+                self._partner._set_hover_tooltip("")
             if on_resize_edge:
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
-                self.setToolTip("Drag to resize item column")
+                self._set_hover_tooltip("Drag to resize item column")
                 self.update()
                 return
+            self._set_hover_tooltip("")
             if self._tool == TOOL_DRAW:
                 if row is not None and self._resolve_department_for_draw(
                     row, event.position().y()
@@ -2404,6 +3568,44 @@ class _GanttCanvas(QWidget):
             self.update()
             return
 
+        if self._pane == _PANE_TIMELINE and self._tool == TOOL_SELECT:
+            if self._pending_bar_hit is not None and self._marquee_origin is not None:
+                pos = event.position().toPoint()
+                delta = pos - self._marquee_origin
+                if (
+                    abs(delta.x()) > _MARQUEE_THRESHOLD
+                    or abs(delta.y()) > _MARQUEE_THRESHOLD
+                ):
+                    hit = self._pending_bar_hit
+                    self._pending_bar_hit = None
+                    self._marquee_origin = None
+                    self._marquee_current = None
+                    self._marquee_dragging = False
+                    self._marquee_bar_select = False
+                    if self._begin_bar_drag_from_hit(hit, event):
+                        return
+            if self._marquee_origin is not None:
+                pos = event.position().toPoint()
+                if not self._marquee_dragging:
+                    delta = pos - self._marquee_origin
+                    if (
+                        abs(delta.x()) > _MARQUEE_THRESHOLD
+                        or abs(delta.y()) > _MARQUEE_THRESHOLD
+                    ):
+                        self._marquee_dragging = True
+                        self._pending_click_row = None
+                        self._pending_bar_hit = None
+                if self._marquee_dragging:
+                    self._marquee_current = pos
+                    self._update_marquee_selection()
+                    if not self._owns_mouse_grab(self):
+                        self.grabMouse()
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+                    self.update()
+                    if self._partner is not None:
+                        self._partner.update()
+                    return
+
         if self._draw_state is not None:
             current = self._pointer_to_date(event)
             anchor = self._draw_state.anchor
@@ -2423,13 +3625,22 @@ class _GanttCanvas(QWidget):
             return
 
         if self._drag is not None:
-            self._set_hover_col(self._col_at_x(event.position().x()))
             if self._drag_orig_start is None or self._drag_orig_due is None:
                 return
             delta = int(round((event.position().x() - self._drag_origin_x) / self._day_w))
+            drag_vi = self._drag.visible_index
             if self._drag.is_collapsed_group:
                 self._update_collapsed_group_drag(delta)
-                self.update()
+                self._repaint_body_rows([drag_vi])
+                return
+            if self._drag_selection_orig and self._drag.mode == "move":
+                if delta == 0:
+                    return
+                self._update_multi_bar_drag(delta)
+                rows = self._visible_indices_for_bar_keys(self._drag_selection_orig)
+                if drag_vi not in rows:
+                    rows.add(drag_vi)
+                self._repaint_body_rows(rows)
                 return
             ds = self._drag_orig_start
             dd = self._drag_orig_due
@@ -2447,7 +3658,10 @@ class _GanttCanvas(QWidget):
                     dd = ds
             if self._drag.is_wave_row:
                 dep = self._drag.department
-                self._wave_drag_preview[dep] = (ds, dd)
+                preview = (ds, dd)
+                if self._wave_drag_preview.get(dep) == preview:
+                    return
+                self._wave_drag_preview[dep] = preview
                 wave = self._wave_for_department(dep)
                 for key in self._wave_bar_keys(wave):
                     bar = self._bars.get(key)
@@ -2468,18 +3682,23 @@ class _GanttCanvas(QWidget):
                         if child_due < child_start:
                             child_due = child_start
                     self._drag_dates[key] = (child_start, child_due)
-            else:
-                display = self._visible[self._drag.visible_index]
-                if display.group is None:
-                    return
-                self._drag_dates[
-                    _row_key(
-                        display.group.entity_kind,
-                        display.group.entity_rel,
-                        self._drag.department,
-                    )
-                ] = (ds, dd)
-            self.update()
+                self._repaint_body_rows([drag_vi])
+                return
+            display = self._visible[drag_vi]
+            if display.group is None:
+                return
+            bid = (self._drag.bar_id or AUTO_BAR_ID).strip() or AUTO_BAR_ID
+            sk = bar_store_key(
+                display.group.entity_kind,
+                display.group.entity_rel,
+                self._drag.department,
+                bid,
+            )
+            new_dates = (ds, dd)
+            if self._drag_dates.get(sk) == new_dates:
+                return
+            self._drag_dates[sk] = new_dates
+            self._repaint_body_rows([drag_vi])
             return
 
         row = self._row_at_y(event.position().y())
@@ -2487,7 +3706,11 @@ class _GanttCanvas(QWidget):
         self._sync_hover_row(row)
         self._set_hover_col(self._col_at_x(event.position().x()))
         hit = self._hit_test(event.position().toPoint())
-        self._hover_bar = (hit.visible_index, hit.department) if hit else None
+        self._hover_bar = (
+            (hit.visible_index, hit.department, hit.bar_id or "")
+            if hit
+            else None
+        )
         if hit:
             self.setCursor(
                 Qt.CursorShape.SizeHorCursor if hit.mode != "move" else Qt.CursorShape.OpenHandCursor
@@ -2510,49 +3733,62 @@ class _GanttCanvas(QWidget):
                             (d.department or "").strip(),
                         )
                     )
-                    self.setToolTip(
+                    self._set_hover_tooltip(
                         f"{display.group.entity_name}: {span[0].isoformat()} → "
                         f"{span[1].isoformat()} ({n} departments)"
                     )
                 else:
-                    self.setToolTip(display.group.entity_name)
+                    self._set_hover_tooltip(display.group.entity_name)
             elif display.group is not None and hit.department != _COLLAPSED_GROUP_HOVER:
-                bar = self._bars.get(
-                    _row_key(display.group.entity_kind, display.group.entity_rel, hit.department)
+                sk = bar_store_key(
+                    display.group.entity_kind,
+                    display.group.entity_rel,
+                    hit.department,
+                    hit.bar_id or AUTO_BAR_ID,
                 )
+                bar = self._bars.get(sk)
+                if bar is None and not hit.bar_id:
+                    bar = primary_bar_for_row(
+                        self._bars,
+                        display.group.entity_kind,
+                        display.group.entity_rel,
+                        hit.department,
+                    )
                 if bar is not None:
-                    self.setToolTip(self._format_bar_tooltip(bar))
+                    self._set_hover_tooltip(self._format_bar_tooltip(bar))
                 else:
-                    self.setToolTip("")
+                    self._set_hover_tooltip("")
             else:
-                self.setToolTip("")
+                self._set_hover_tooltip("")
         elif row is not None and self._visible[row].mode == "dept_wave":
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             wave = self._visible[row].wave
             if wave is not None:
-                self.setToolTip(
+                self._set_hover_tooltip(
                     f"{wave.department_label}: {wave.start.isoformat()} → {wave.due.isoformat()} "
                     f"({wave.entity_count} items, {wave.duration_days} days)"
                 )
             else:
-                self.setToolTip("")
+                self._set_hover_tooltip("")
         elif self._tool == TOOL_DRAW and row is not None:
             display = self._visible[row]
             if display.mode == "dept_wave" and display.wave is not None:
                 dep = (display.wave.department or "").strip()
                 if dep and display.wave.entity_keys:
                     self.setCursor(Qt.CursorShape.CrossCursor)
-                    self.setToolTip("")
+                    self._set_hover_tooltip("")
                 else:
                     self.setCursor(Qt.CursorShape.ForbiddenCursor)
-                    self.setToolTip("No shots/assets in this department for the current filters.")
+                    self._set_hover_tooltip(
+                        "No shots/assets in this department for the current filters."
+                    )
             elif display.mode != "header":
                 self.setCursor(Qt.CursorShape.CrossCursor)
             else:
                 self.setCursor(self._tool_idle_cursor(self._tool))
         else:
             self.setCursor(self._tool_idle_cursor(self._tool))
-            self.setToolTip("")
+            self._set_hover_tooltip("")
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
@@ -2569,6 +3805,17 @@ class _GanttCanvas(QWidget):
         if self._click_should_clear_selection(row, pos, ctrl=ctrl):
             self._deselect_entity_row()
             return
+
+        if (
+            self._pane == _PANE_HEADER
+            and self._tool == TOOL_SELECT
+            and self._markers_editable()
+        ):
+            grip = self._hit_marker_grip(pos)
+            if grip is not None:
+                self._begin_marker_drag(grip[0], grip[1])
+                event.accept()
+                return
 
         if self._is_label_pane():
             if event.position().x() >= self.width() - _LABEL_COL_EDGE_GRAB:
@@ -2595,6 +3842,50 @@ class _GanttCanvas(QWidget):
                     self.grabMouse()
                     self.setFocus()
                     return
+            if self._tool == TOOL_SELECT:
+                shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                if row is not None:
+                    display = self._visible[row]
+                    group = display.group
+                    if group is not None and display.mode in ("collapsed", "header"):
+                        if self._chevron_rect(row).contains(pos):
+                            self._toggle_expand(group.key)
+                            return
+                    if display.mode in _SELECTABLE_ROW_MODES:
+                        if (
+                            shift
+                            and self._selection_anchor_row is not None
+                            and display.mode in _SELECTABLE_ROW_MODES
+                        ):
+                            self._select_row_range(self._selection_anchor_row, row)
+                            event.accept()
+                            return
+                        self._pending_click_row = row
+                        self._marquee_origin = pos
+                        self._marquee_current = pos
+                        self._marquee_additive = ctrl
+                        self._marquee_bar_select = True
+                        if self._gantt is not None:
+                            tl = self._gantt._timeline_pane
+                            tl._marquee_origin = QPoint(0, pos.y())
+                            tl._marquee_current = QPoint(0, pos.y())
+                            tl._marquee_additive = ctrl
+                            tl._marquee_bar_select = True
+                        event.accept()
+                        return
+                self._marquee_origin = pos
+                self._marquee_current = pos
+                self._marquee_additive = ctrl
+                self._marquee_bar_select = True
+                self._pending_click_row = None
+                if self._gantt is not None:
+                    tl = self._gantt._timeline_pane
+                    tl._marquee_origin = QPoint(0, pos.y())
+                    tl._marquee_current = QPoint(0, pos.y())
+                    tl._marquee_additive = ctrl
+                    tl._marquee_bar_select = True
+                event.accept()
+                return
             if row is not None:
                 display = self._visible[row]
                 group = display.group
@@ -2624,64 +3915,42 @@ class _GanttCanvas(QWidget):
                 self.setFocus()
             return
 
+        if self._pane == _PANE_TIMELINE and self._tool == TOOL_SELECT:
+            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            hit = self._hit_test(pos) if self._schedule_editable() else None
+            if hit is not None:
+                sk = self._bar_key_from_hit(hit)
+                if ctrl and sk is not None:
+                    self._toggle_bar_selection(sk)
+                    self._selection_anchor_row = hit.visible_index
+                    event.accept()
+                    return
+                self._pending_bar_hit = hit
+                self._marquee_origin = pos
+                self._marquee_current = pos
+                self._marquee_bar_select = True
+                self._marquee_additive = ctrl
+                self._pending_click_row = None
+                event.accept()
+                return
+            if row is not None:
+                display = self._visible[row]
+                if display.mode in _SELECTABLE_ROW_MODES:
+                    if shift and self._selection_anchor_row is not None:
+                        self._select_row_range(self._selection_anchor_row, row)
+                        event.accept()
+                        return
+            self._marquee_origin = pos
+            self._marquee_current = pos
+            self._marquee_bar_select = True
+            self._marquee_additive = ctrl
+            self._pending_click_row = row
+            self._pending_bar_hit = None
+            event.accept()
+            return
+
         if self._tool != TOOL_SELECT:
             return
-
-        if row is not None:
-            self._try_select_visible_row(row)
-
-        if not self._schedule_editable():
-            return
-
-        hit = self._hit_test(pos)
-        if hit is None:
-            return
-        if hit.is_wave_row:
-            display = self._visible[hit.visible_index]
-            if display.wave is None:
-                return
-            dates = self._wave_row_dates(display.wave)
-        elif hit.is_collapsed_group:
-            display = self._visible[hit.visible_index]
-            if display.group is None:
-                return
-            span = self._entity_span_dates(
-                display.group.entity_kind,
-                display.group.entity_rel,
-                list(display.group.departments),
-            )
-            if span[0] is None or span[1] is None:
-                return
-            dates = span
-            self._drag_collapsed_orig.clear()
-            for dept_row in display.group.departments:
-                dep = (dept_row.department or "").strip()
-                if not dep:
-                    continue
-                bar_dates = self._bar_dates(
-                    display.group.entity_kind, display.group.entity_rel, dep
-                )
-                if bar_dates is not None:
-                    self._drag_collapsed_orig[
-                        _row_key(display.group.entity_kind, display.group.entity_rel, dep)
-                    ] = bar_dates
-            if not self._drag_collapsed_orig:
-                return
-        else:
-            display = self._visible[hit.visible_index]
-            if display.group is None:
-                return
-            dates = self._bar_dates(
-                display.group.entity_kind, display.group.entity_rel, hit.department
-            )
-            if dates is None:
-                return
-        self._drag = hit
-        self._drag_origin_x = event.position().x()
-        self._drag_orig_start, self._drag_orig_due = dates
-        if hit.mode == "move":
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-        self.grabMouse()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         if self._gantt is not None and self._gantt._forward_nav_mouse_release(event):
@@ -2691,9 +3960,21 @@ class _GanttCanvas(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
+        if self._is_body_pane() and self._tool == TOOL_SELECT:
+            if self._finish_marquee_or_pending_click():
+                event.accept()
+                if self._partner is not None:
+                    self._partner.update()
+                return
+
         if self._gantt is not None and self._gantt.is_label_column_resizing():
             self._gantt.end_label_column_resize()
             self._release_if_grabbed(self)
+            event.accept()
+            return
+
+        if self._marker_drag is not None:
+            self._finish_marker_drag()
             event.accept()
             return
 
@@ -2720,7 +4001,13 @@ class _GanttCanvas(QWidget):
                 self._commit_wave_draw(wave_dep, state.start, state.due, wave=display.wave)
             else:
                 display = self._visible[state.visible_index]
-                self._commit_override(display, state.department, state.start, state.due)
+                self._commit_override(
+                    display,
+                    state.department,
+                    state.start,
+                    state.due,
+                    is_new_goal=True,
+                )
             return
 
         if self._drag is None:
@@ -2729,6 +4016,7 @@ class _GanttCanvas(QWidget):
             self._drag = None
             self._drag_dates.clear()
             self._drag_collapsed_orig.clear()
+            self._drag_selection_orig.clear()
             self._wave_drag_preview.clear()
             self._release_if_grabbed(self)
             self.update()
@@ -2775,40 +4063,127 @@ class _GanttCanvas(QWidget):
                 return
             self._commit_collapsed_group_move(display, changed)
             return
+        if self._drag_selection_orig:
+            changed = {
+                key: dates
+                for key, dates in self._drag_dates.items()
+                if key in self._drag_selection_orig
+                and dates != self._drag_selection_orig[key]
+            }
+            self._drag_dates.clear()
+            self._drag_selection_orig.clear()
+            if changed and self._project_root is not None:
+                self._commit_multi_bar_move(changed)
+            self.update()
+            return
         display = self._visible[drag.visible_index]
         if display.group is None:
             return
-        key = _row_key(display.group.entity_kind, display.group.entity_rel, drag.department)
-        new_dates = self._drag_dates.get(key)
+        bid = (drag.bar_id or AUTO_BAR_ID).strip() or AUTO_BAR_ID
+        sk = bar_store_key(
+            display.group.entity_kind, display.group.entity_rel, drag.department, bid
+        )
+        new_dates = self._drag_dates.get(sk)
         if (
             new_dates is None
             or self._project_root is None
             or self._drag_orig_start is None
             or self._drag_orig_due is None
         ):
-            self._drag_dates.pop(key, None)
+            self._drag_dates.pop(sk, None)
             self.update()
             return
         ds, dd = new_dates
         if ds == self._drag_orig_start and dd == self._drag_orig_due:
-            self._drag_dates.pop(key, None)
+            self._drag_dates.pop(sk, None)
             self.update()
             return
-        self._commit_override(display, drag.department, ds, dd)
+        self._commit_override(
+            display, drag.department, ds, dd, bar_id=drag.bar_id, is_new_goal=False
+        )
 
     def _commit_override(
-        self, display: _DisplayRow, department: str, start: date, due: date
+        self,
+        display: _DisplayRow,
+        department: str,
+        start: date,
+        due: date,
+        *,
+        bar_id: str = "",
+        is_new_goal: bool = False,
     ) -> None:
-        if display.group is None:
+        if display.group is None or self._project_root is None:
             return
-        key = _row_key(display.group.entity_kind, display.group.entity_rel, department)
-        existing = self._bars.get(key)
-        aid = existing.allocation_id if (existing and existing.allocation_id) else new_allocation_id()
-        assignee_ids = existing.assignee_ids if existing else ()
-        assignees = existing.assignees if existing else ()
-        assignee_id = existing.assignee_id if existing else ""
-        assignee = existing.assignee if existing else ""
-        note = existing.note if existing else ""
+        root = self._project_root
+        bid = (bar_id or "").strip()
+        sk = bar_store_key(
+            display.group.entity_kind, display.group.entity_rel, department, bid or AUTO_BAR_ID
+        )
+        existing = self._bars.get(sk)
+        if existing is None and bid:
+            for key, bar in self._bars.items():
+                if (
+                    key[0] == display.group.entity_kind
+                    and key[1] == display.group.entity_rel.replace("\\", "/")
+                    and key[2] == department
+                    and bar.bar_id == bid
+                ):
+                    existing = bar
+                    sk = key
+                    break
+        target_status_id = (existing.target_status_id if existing else "") or ""
+        if is_new_goal:
+            assignee_ids: tuple[str, ...] = ()
+            assignees: tuple[str, ...] = ()
+            assignee_id = ""
+            assignee = ""
+            note = ""
+        else:
+            assignee_ids = existing.assignee_ids if existing else ()
+            assignees = existing.assignees if existing else ()
+            assignee_id = existing.assignee_id if existing else ""
+            assignee = existing.assignee if existing else ""
+            note = existing.note if existing else ""
+        if is_new_goal:
+            target_status_id = resolve_target_status_for_new_goal(root, department)
+        elif not (existing and existing.allocation_id):
+            dlg = ScheduleGoalStatusDialog(
+                parent=self,
+                project_root=root,
+                department_id=department,
+            )
+            if dlg.exec() != dlg.DialogCode.Accepted:
+                self._drag_dates.pop(sk, None)
+                self.update()
+                return
+            target_status_id = dlg.chosen_status_id()
+            if not target_status_id:
+                self._drag_dates.pop(sk, None)
+                self.update()
+                return
+            remember_target_status(target_status_id)
+        elif not target_status_id:
+            target_status_id = default_target_status_for_department(root, department)
+        if is_new_goal:
+            aid = new_allocation_id()
+        else:
+            aid = (
+                existing.allocation_id
+                if existing and existing.allocation_id
+                else new_allocation_id()
+            )
+        if existing and existing.source == "wave" and not existing.allocation_id:
+            try:
+                delete_wave_for_row(
+                    root,
+                    entity_kind=display.group.entity_kind,
+                    entity_rel=display.group.entity_rel,
+                    department=department,
+                )
+            except OSError:
+                self._drag_dates.pop(sk, None)
+                self.update()
+                return
         alloc = ScheduleAllocation(
             id=aid,
             entity_kind=display.group.entity_kind,
@@ -2821,26 +4196,29 @@ class _GanttCanvas(QWidget):
             assignee_id=assignee_id,
             assignee=assignee,
             note=note,
+            target_status_id=target_status_id,
         )
         try:
-            upsert_allocation_for_row(self._project_root, alloc)  # type: ignore[arg-type]
+            upsert_allocation_for_row(root, alloc)
         except OSError:
-            self._drag_dates.pop(key, None)
+            self._drag_dates.pop(sk, None)
             self.update()
             return
+        remember_target_status(target_status_id)
+        self._drag_dates.pop(sk, None)
         self.override_committed.emit()
 
     def _commit_collapsed_group_move(
         self,
         display: _DisplayRow,
-        child_dates: dict[tuple[str, str, str], tuple[date, date]],
+        child_dates: dict[BarStoreKey, tuple[date, date]],
     ) -> None:
         root = self._project_root
         if root is None or display.group is None:
             return
         allocs: list[ScheduleAllocation] = []
         for key, (seg_start, seg_due) in child_dates.items():
-            kind, rel, dep = key
+            kind, rel, dep, _bid = key
             if kind != display.group.entity_kind or rel != display.group.entity_rel:
                 continue
             existing = self._bars.get(key)
@@ -2849,7 +4227,7 @@ class _GanttCanvas(QWidget):
             if seg_start > seg_due:
                 seg_start, seg_due = seg_due, seg_start
             aid = existing.allocation_id or new_allocation_id()
-            if existing.source == "wave":
+            if existing.source == "wave" and not existing.allocation_id:
                 try:
                     delete_wave_for_row(
                         root,
@@ -2859,6 +4237,9 @@ class _GanttCanvas(QWidget):
                     )
                 except OSError:
                     return
+            target_status_id = (existing.target_status_id or "").strip()
+            if not target_status_id:
+                target_status_id = default_target_status_for_department(root, dep)
             allocs.append(
                 ScheduleAllocation(
                     id=aid,
@@ -2872,6 +4253,50 @@ class _GanttCanvas(QWidget):
                     assignee_id=existing.assignee_id,
                     assignee=existing.assignee,
                     note=existing.note,
+                    target_status_id=target_status_id,
+                )
+            )
+        if not allocs:
+            return
+        try:
+            bulk_upsert_allocations(root, allocs)
+        except OSError:
+            return
+        self._drag_dates.clear()
+        self.override_committed.emit()
+
+    def _commit_multi_bar_move(
+        self,
+        child_dates: dict[BarStoreKey, tuple[date, date]],
+    ) -> None:
+        root = self._project_root
+        if root is None or not child_dates:
+            return
+        allocs: list[ScheduleAllocation] = []
+        for key, (seg_start, seg_due) in child_dates.items():
+            existing = self._bars.get(key)
+            if existing is None or not (existing.allocation_id or "").strip():
+                continue
+            if seg_start > seg_due:
+                seg_start, seg_due = seg_due, seg_start
+            kind, rel, dep, _bid = key
+            target_status_id = (existing.target_status_id or "").strip()
+            if not target_status_id:
+                target_status_id = default_target_status_for_department(root, dep)
+            allocs.append(
+                ScheduleAllocation(
+                    id=existing.allocation_id,
+                    entity_kind=kind,
+                    entity_rel=rel,
+                    department=dep,
+                    start=seg_start.isoformat(),
+                    due=seg_due.isoformat(),
+                    assignee_ids=existing.assignee_ids,
+                    assignees=existing.assignees,
+                    assignee_id=existing.assignee_id,
+                    assignee=existing.assignee,
+                    note=existing.note,
+                    target_status_id=target_status_id,
                 )
             )
         if not allocs:
@@ -2917,7 +4342,7 @@ class _GanttCanvas(QWidget):
                 seg_start, seg_due = spans[i]
             else:
                 seg_start, seg_due = start, due
-            existing = self._bars.get(_row_key(kind, rel, dept_id))
+            existing = primary_bar_for_row(self._bars, kind, rel, dept_id)
             aid = (
                 existing.allocation_id
                 if existing and existing.allocation_id
@@ -2928,6 +4353,9 @@ class _GanttCanvas(QWidget):
             assignee_id = existing.assignee_id if existing else ""
             assignee = existing.assignee if existing else ""
             note = existing.note if existing else ""
+            target_status_id = (existing.target_status_id if existing else "") or ""
+            if not target_status_id:
+                target_status_id = default_target_status_for_department(root, dept_id)
             allocs.append(
                 ScheduleAllocation(
                     id=aid,
@@ -2941,6 +4369,7 @@ class _GanttCanvas(QWidget):
                     assignee_id=assignee_id,
                     assignee=assignee,
                     note=note,
+                    target_status_id=target_status_id,
                 )
             )
         try:
@@ -2958,7 +4387,7 @@ class _GanttCanvas(QWidget):
     def _commit_wave_move(
         self,
         department: str,
-        child_dates: dict[tuple[str, str, str], tuple[date, date]],
+        child_dates: dict[BarStoreKey, tuple[date, date]],
         *,
         wave: DeptWaveRollup | None = None,
     ) -> None:
@@ -2974,29 +4403,32 @@ class _GanttCanvas(QWidget):
         for key, (seg_start, seg_due) in child_dates.items():
             if key not in allowed:
                 continue
-            kind, rel, row_dep = key
+            kind, rel, row_dep, _bid = key
             existing = self._bars.get(key)
             if existing is None:
                 continue
             if seg_start > seg_due:
                 seg_start, seg_due = seg_due, seg_start
             aid = existing.allocation_id or new_allocation_id()
-            if existing.source == "wave":
+            if existing.source == "wave" and not existing.allocation_id:
                 try:
                     delete_wave_for_row(
                         root,
                         entity_kind=kind,
                         entity_rel=rel,
-                        department=dep,
+                        department=row_dep or dep,
                     )
                 except OSError:
                     return
+            target_status_id = (existing.target_status_id or "").strip()
+            if not target_status_id:
+                target_status_id = default_target_status_for_department(root, row_dep or dep)
             allocs.append(
                 ScheduleAllocation(
                     id=aid,
                     entity_kind=kind,
                     entity_rel=rel,
-                    department=dep,
+                    department=row_dep or dep,
                     start=seg_start.isoformat(),
                     due=seg_due.isoformat(),
                     assignee_ids=existing.assignee_ids,
@@ -3004,6 +4436,7 @@ class _GanttCanvas(QWidget):
                     assignee_id=existing.assignee_id,
                     assignee=existing.assignee,
                     note=existing.note,
+                    target_status_id=target_status_id,
                 )
             )
         if not allocs:
@@ -3096,6 +4529,102 @@ class _GanttCanvas(QWidget):
         if self._gantt is not None:
             self._gantt.tools_menu_requested.emit(global_pos)
 
+    def _selected_goal_allocation_ids(self) -> list[str]:
+        ids: list[str] = []
+        seen: set[str] = set()
+        for sk in self._highlight_bars:
+            bar = self._bars.get(sk)
+            if bar is None or not bar.allocation_id:
+                continue
+            aid = bar.allocation_id.strip()
+            if aid and aid not in seen:
+                seen.add(aid)
+                ids.append(aid)
+        return ids
+
+    def _departments_for_selected_bars(self) -> list[str]:
+        deps: set[str] = set()
+        for sk in self._highlight_bars:
+            bar = self._bars.get(sk)
+            if bar is None:
+                continue
+            dep = (bar.department or "").strip()
+            if dep:
+                deps.add(dep)
+        return sorted(deps)
+
+    def _exec_selected_bars_context_menu(self, row: int | None, global_pos) -> bool:
+        if not self._highlight_bars:
+            return False
+        alloc_ids = self._selected_goal_allocation_ids()
+        count = len(self._highlight_bars)
+        menu = QMenu(self)
+        editable = self._schedule_editable() and bool(alloc_ids)
+        edit_act = None
+        if count == 1 and alloc_ids:
+            edit_act = menu.addAction("Edit goal…")
+            edit_act.setEnabled(editable)
+        dates_act = menu.addAction(f"Set dates… ({count} bars)")
+        dates_act.setEnabled(editable)
+        assign_act = menu.addAction(f"Set assignees… ({count} bars)")
+        assign_act.setEnabled(editable)
+        note_act = menu.addAction(f"Set note… ({count} bars)")
+        note_act.setEnabled(editable)
+        dept = self._department_for_context_row(row)
+        goal_depts = self._departments_for_selected_bars()
+        if not dept and len(goal_depts) == 1:
+            dept = goal_depts[0]
+        if self._project_root is not None and alloc_ids:
+            from monostudio.ui_qt.schedule_target_status_menu import add_target_status_submenu
+
+            if dept:
+                status_sub = add_target_status_submenu(
+                    menu,
+                    project_root=self._project_root,
+                    department_id=dept,
+                )
+                status_sub.setEnabled(editable)
+            elif goal_depts:
+                for dep_id in goal_depts:
+                    label = dep_id
+                    if self._gantt is not None and self._gantt._dept_reg is not None:
+                        label = (
+                            self._gantt._dept_reg.get_department_label(dep_id) or dep_id
+                        )
+                    sub = add_target_status_submenu(
+                        menu,
+                        project_root=self._project_root,
+                        department_id=dep_id,
+                        title=label,
+                    )
+                    sub.setEnabled(editable)
+        menu.addSeparator()
+        clear_act = menu.addAction("Clear selection")
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return True
+        if chosen == clear_act:
+            self._clear_bar_selection()
+            return True
+        if edit_act is not None and chosen == edit_act and alloc_ids:
+            self.bar_edit_allocation_requested.emit(alloc_ids[0])
+            return True
+        if chosen == dates_act and alloc_ids:
+            self.bars_bulk_dates_requested.emit(alloc_ids)
+            return True
+        if chosen == assign_act and alloc_ids:
+            self.bars_bulk_assign_requested.emit(alloc_ids)
+            return True
+        if chosen == note_act and alloc_ids:
+            self.bars_bulk_note_requested.emit(alloc_ids)
+            return True
+        dep_prop = chosen.property("schedule_target_dep")
+        sid_data = chosen.data()
+        sid = str(sid_data).strip() if sid_data is not None else ""
+        if dep_prop and sid and alloc_ids:
+            self.bars_bulk_target_status_requested.emit(str(dep_prop), sid, alloc_ids)
+        return True
+
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         if event.modifiers() & Qt.KeyboardModifier.AltModifier:
             return
@@ -3103,6 +4632,11 @@ class _GanttCanvas(QWidget):
         row = self._row_at_y(pos.y())
         if row is not None and 0 <= row < len(self._visible) and self._visible[row].mode == "dept_wave":
             if self._exec_dept_wave_context_menu(row, event.globalPos()):
+                return
+
+        # Selected goal bars — bulk edit on pinned allocations only.
+        if self._tool == TOOL_SELECT and self._is_body_pane() and self._highlight_bars:
+            if self._exec_selected_bars_context_menu(row, event.globalPos()):
                 return
 
         # Entity label menu (Plan / Clear) — Select tool, label pane, on a real row.
@@ -3147,12 +4681,29 @@ class _GanttCanvas(QWidget):
             if hit is not None:
                 display = self._visible[hit.visible_index]
                 if display.mode not in ("header", "dept_lane_header") and display.group is not None:
-                    bar = self._bars.get(
-                        _row_key(
-                            display.group.entity_kind, display.group.entity_rel, hit.department
-                        )
+                    sk = bar_store_key(
+                        display.group.entity_kind,
+                        display.group.entity_rel,
+                        hit.department,
+                        hit.bar_id or AUTO_BAR_ID,
                     )
+                    bar = self._bars.get(sk)
+                    if bar is None and not hit.bar_id:
+                        bar = primary_bar_for_row(
+                            self._bars,
+                            display.group.entity_kind,
+                            display.group.entity_rel,
+                            hit.department,
+                        )
                     menu = QMenu(self)
+                    group = display.group
+                    kind = (group.entity_kind or "").strip().lower()
+                    dep = (hit.department or "").strip()
+                    jump_label = (
+                        "Jump to shot…" if kind == "shot" else "Jump to asset…"
+                    )
+                    jump_act = menu.addAction(jump_label)
+                    menu.addSeparator()
                     editable = self._schedule_editable()
                     edit_act = menu.addAction("Edit…")
                     reset_act = menu.addAction("Reset to auto")
@@ -3167,9 +4718,25 @@ class _GanttCanvas(QWidget):
                     )
                     skip_act.setEnabled(editable and bar is not None)
                     edit_act.setEnabled(editable)
+                    status_submenu: QMenu | None = None
+                    if dep and bar is not None and bar.allocation_id and self._project_root is not None:
+                        from monostudio.ui_qt.schedule_target_status_menu import (
+                            add_target_status_submenu,
+                        )
+
+                        status_submenu = add_target_status_submenu(
+                            menu,
+                            project_root=self._project_root,
+                            department_id=dep,
+                        )
+                        status_submenu.setEnabled(editable)
                     menu.addSeparator()
                     chosen = menu.exec(event.globalPos())
-                    if chosen is edit_act:
+                    if chosen is jump_act:
+                        self.jump_to_entity_requested.emit(
+                            group.entity_kind, group.entity_rel, dep
+                        )
+                    elif chosen is edit_act:
                         self.row_activated.emit(hit.visible_index)
                     elif chosen is reset_act and bar is not None and self._project_root is not None:
                         self._reset_bar_to_auto(display, hit.department, bar)
@@ -3180,7 +4747,22 @@ class _GanttCanvas(QWidget):
                             hit.department,
                             not is_skipped,
                         )
+                    elif (
+                        status_submenu is not None
+                        and bar is not None
+                        and bar.allocation_id
+                    ):
+                        data = chosen.data()
+                        sid = str(data).strip() if data is not None else ""
+                        if sid:
+                            self.allocation_target_status_requested.emit(
+                                bar.allocation_id, sid
+                            )
                     return
+
+        if self._pane == _PANE_HEADER and self._tool == TOOL_SELECT:
+            if self._exec_marker_context_menu(pos, event.globalPos()):
+                return
 
         # Empty timeline / header / draw-tool right-click → tools & planning menu.
         self._request_tools_menu(event.globalPos())
@@ -3228,10 +4810,12 @@ class _GanttCanvas(QWidget):
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         self._hover_row = None
+        self._hover_marker = None
         if not self._is_label_pane():
             self._hover_bar = None
         self._sync_hover_row(None)
         self._set_hover_col(None)
+        self._set_hover_tooltip("")
         if self._gantt is not None:
             self._gantt._apply_tool_cursors()
         else:
@@ -3314,12 +4898,21 @@ class ScheduleGanttWidget(QWidget):
     entity_row_selected = Signal(str, str)
     entity_row_cleared = Signal()
     department_skip_toggle_requested = Signal(str, str, str, bool)
+    bars_bulk_dates_requested = Signal(list)
+    bars_bulk_assign_requested = Signal(list)
+    bars_bulk_note_requested = Signal(list)
+    bars_bulk_target_status_requested = Signal(str, str, list)
+    bar_edit_allocation_requested = Signal(str)
+    allocation_target_status_requested = Signal(str, str)  # allocation_id, status_id
+    jump_to_entity_requested = Signal(str, str, str)  # entity_kind, entity_rel, department
     search_filter_requested = Signal()  # corner gear icon → page view-options popup
     tools_menu_requested = Signal(object)  # right-click empty area → page tools/planning menu
+    markers_unlock_changed = Signal(bool)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._markers_unlocked = False
         self._label_w = _LABEL_W_DEFAULT
         self._col_resizing = False
         self._col_resize_start_x = 0
@@ -3432,7 +5025,7 @@ class ScheduleGanttWidget(QWidget):
         self._include_assets = False
         self._groups: list[TimelineEntityGroup] = []
         self._expanded: set[tuple[str, str]] = set()
-        self._bars: dict[tuple[str, str, str], PlannedBar] = {}
+        self._bars: BarStore = {}
         self._schedule = ProjectSchedule()
         self._view_mode = VIEW_ENTITY
         self._dept_filter: str | None = None
@@ -3467,6 +5060,22 @@ class ScheduleGanttWidget(QWidget):
         self._timeline_pane.entity_row_cleared.connect(self.entity_row_cleared.emit)
         self._timeline_pane.department_skip_toggle_requested.connect(
             self.department_skip_toggle_requested.emit
+        )
+        for pane in (self._label_pane, self._timeline_pane):
+            pane.bars_bulk_dates_requested.connect(self.bars_bulk_dates_requested.emit)
+            pane.bars_bulk_assign_requested.connect(self.bars_bulk_assign_requested.emit)
+            pane.bars_bulk_note_requested.connect(self.bars_bulk_note_requested.emit)
+            pane.bars_bulk_target_status_requested.connect(
+                self.bars_bulk_target_status_requested.emit
+            )
+            pane.bar_edit_allocation_requested.connect(
+                self.bar_edit_allocation_requested.emit
+            )
+        self._timeline_pane.allocation_target_status_requested.connect(
+            self.allocation_target_status_requested.emit
+        )
+        self._timeline_pane.jump_to_entity_requested.connect(
+            self.jump_to_entity_requested.emit
         )
         self._apply_tool_cursors()
 
@@ -3669,6 +5278,27 @@ class ScheduleGanttWidget(QWidget):
         self._label_pane._sync_highlight(highlight)
         self._timeline_pane._sync_highlight(highlight)
 
+    def set_bar_selection(self, keys: frozenset[BarStoreKey]) -> None:
+        self._label_pane._sync_highlight_bars(keys)
+        self._timeline_pane._sync_highlight_bars(keys)
+
+    def clear_bar_selection(self) -> None:
+        self._label_pane._sync_highlight_bars(None)
+        self._timeline_pane._sync_highlight_bars(None)
+
+    def selected_bar_allocation_ids(self) -> list[str]:
+        ids: list[str] = []
+        seen: set[str] = set()
+        for sk in self._timeline_pane._highlight_bars:
+            bar = self._bars.get(sk)
+            if bar is None or not bar.allocation_id:
+                continue
+            aid = bar.allocation_id.strip()
+            if aid and aid not in seen:
+                seen.add(aid)
+                ids.append(aid)
+        return ids
+
     def highlight_entities(
         self,
         entities: list[tuple[str, str]],
@@ -3693,8 +5323,19 @@ class ScheduleGanttWidget(QWidget):
         self._timeline_pane._sync_highlight_entities(keys)
 
     def clear_entity_highlight(self) -> None:
+        self.clear_bar_selection()
         self._label_pane._sync_highlight(None)
         self._timeline_pane._sync_highlight(None)
+
+    def selected_entity_keys(self) -> list[tuple[str, str]]:
+        """Normalized (entity_kind, entity_rel) keys for current timeline selection."""
+        multi = self._label_pane._highlight_entities
+        if multi:
+            return list(multi)
+        h = self._label_pane._highlight
+        if h is not None:
+            return [(h[0], h[1])]
+        return []
 
     def scroll_to_entity_keys(self, entities: list[tuple[str, str]]) -> int | None:
         """Scroll so the first visible row among entities is in view; return that row index."""
@@ -3798,7 +5439,7 @@ class ScheduleGanttWidget(QWidget):
         self._scroll_to_visible_row(row)
         scroll_date = due
         if scroll_date is None and dep:
-            bar = self._bars.get((kind, rel, dep))
+            bar = primary_bar_for_row(self._bars, kind, rel, dep)
             if bar is not None:
                 scroll_date = bar.due
         if scroll_date is not None:
@@ -4061,10 +5702,29 @@ class ScheduleGanttWidget(QWidget):
         self._timeline_pane.set_tool(tool)
         self._apply_tool_cursors()
 
+    def markers_unlocked(self) -> bool:
+        return self._markers_unlocked
+
+    def set_markers_unlocked(self, unlocked: bool) -> None:
+        unlocked = bool(unlocked) and self._schedule_editable
+        if unlocked == self._markers_unlocked:
+            return
+        self._markers_unlocked = unlocked
+        if not unlocked:
+            self._header_pane._cancel_marker_drag()
+            self._timeline_pane._cancel_marker_drag()
+        self._header_pane.update()
+        self._timeline_pane.update()
+        self.markers_unlock_changed.emit(self._markers_unlocked)
+
+    def _after_markers_changed(self) -> None:
+        self._on_override_committed()
+
     def set_schedule_editable(self, editable: bool) -> None:
         self._schedule_editable = bool(editable)
         if not editable:
             self.set_tool(TOOL_SELECT)
+            self.set_markers_unlocked(False)
         self._label_pane.update()
         self._timeline_pane.update()
 
@@ -4280,7 +5940,7 @@ class ScheduleGanttWidget(QWidget):
             )
         return filter_groups_by_allowed_departments(groups, self._allowed_departments)
 
-    def _bars_for_display(self) -> dict[tuple[str, str, str], PlannedBar]:
+    def _bars_for_display(self) -> BarStore:
         allowed = self._allowed_departments
         if allowed is None:
             return self._bars
@@ -4491,6 +6151,7 @@ class ScheduleGanttWidget(QWidget):
     def set_project(self, project_root: Path | None, project_index: ProjectIndex | None) -> None:
         self._project_root = Path(project_root) if project_root else None
         self._project_index = project_index
+        self.set_markers_unlocked(False)
         self.reload()
 
     def _on_expand_toggled(self, group_key: tuple, expanded: bool) -> None:
@@ -4568,8 +6229,10 @@ class ScheduleGanttWidget(QWidget):
             self.new_allocation_requested.emit(dept_row)
 
     def planned_dates_for_row(self, row: TimelineRow) -> tuple[str, str] | None:
-        key = _row_key(row.entity_kind, row.entity_rel, row.department)
-        bar = self._bars.get(key)
+        dep = (row.department or "").strip()
+        if not dep:
+            return None
+        bar = primary_bar_for_row(self._bars, row.entity_kind, row.entity_rel, dep)
         if bar is None:
             return None
         return bar.start.isoformat(), bar.due.isoformat()

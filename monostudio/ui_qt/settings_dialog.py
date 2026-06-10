@@ -415,6 +415,7 @@ class SettingsDialog(MonosDialog):
         self._discord_schedule_cb: QCheckBox | None = None
         self._discord_schedule_assigned_cb: QCheckBox | None = None
         self._discord_test_btn: QPushButton | None = None
+        self._discord_test_notifications_btn: QPushButton | None = None
         self._discord_stored_url: str = ""
         self._discord_url_editing: bool = False
 
@@ -1310,6 +1311,7 @@ class SettingsDialog(MonosDialog):
             self._discord_schedule_cb,
             self._discord_schedule_assigned_cb,
             self._discord_test_btn,
+            self._discord_test_notifications_btn,
         )
         for w in widgets:
             if w is not None:
@@ -1427,6 +1429,18 @@ class SettingsDialog(MonosDialog):
             QMessageBox.information(self, "Discord", "Test message sent.")
         else:
             QMessageBox.warning(self, "Discord", err or "Could not send test message.")
+
+    def _on_discord_test_notifications(self) -> None:
+        from monostudio.core.user_identity import get_current_user_display_name
+        from monostudio.ui_qt.discord_notification_test_dialog import DiscordNotificationTestDialog
+
+        dlg = DiscordNotificationTestDialog(
+            self._workspace_root,
+            url_resolver=self._discord_effective_webhook_url,
+            user_name=get_current_user_display_name(self._workspace_root),
+            parent=self,
+        )
+        dlg.exec()
 
     def _persist_discord_integrations(self) -> bool:
         from monostudio.core.integrations_config import (
@@ -3079,6 +3093,11 @@ class SettingsDialog(MonosDialog):
         self._discord_test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._discord_test_btn.clicked.connect(self._on_discord_send_test)
         test_row_l.addWidget(self._discord_test_btn, 0)
+        self._discord_test_notifications_btn = QPushButton("Test notifications…", test_row)
+        self._discord_test_notifications_btn.setObjectName("SettingsInlineActionButton")
+        self._discord_test_notifications_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._discord_test_notifications_btn.clicked.connect(self._on_discord_test_notifications)
+        test_row_l.addWidget(self._discord_test_notifications_btn, 0)
         test_row_l.addStretch(1)
         card_l.addWidget(test_row)
 

@@ -14,6 +14,11 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from monostudio.core.models import Asset, ProjectIndex, Shot
+from monostudio.core.department_status_registry import (
+    goal_is_met,
+    load_status_registry_for_department,
+    status_workflow_order,
+)
 from monostudio.core.production_status import (
     CATEGORY_COLOR_HEX,
     SKIPPED_STATUS_ID,
@@ -39,6 +44,12 @@ STATUS_PROGRESS = "progress"
 STATUS_WAITING = "waiting"
 STATUS_EXCLUDED = "excluded"  # na / Skipped — out of completion & overdue rollups
 
+AUTO_BAR_ID = "__auto__"
+WAVE_BAR_ID = "__wave__"
+
+BarStoreKey = tuple[str, str, str, str]
+BarStore = dict[BarStoreKey, "PlannedBar"]
+
 
 @dataclass(frozen=True)
 class PlannedBar:
@@ -49,8 +60,8 @@ class PlannedBar:
     department_label: str
     start: date
     due: date
-    source: str  # "auto" | "override"
-    status: str  # done | progress | waiting
+    source: str  # "auto" | "wave" | "override"
+    status: str  # done | progress | waiting | excluded
     status_id: str
     color_hex: str
     overdue: bool
@@ -60,10 +71,99 @@ class PlannedBar:
     assignee: str = ""
     note: str = ""
     allocation_id: str | None = None  # set when this bar comes from a stored override
+    target_status_id: str = ""
+    target_status_label: str = ""
+    goal_met: bool = False
+    target_workflow_order: int = 0
+    bar_id: str = ""
 
     @property
     def row_key(self) -> tuple[str, str, str]:
         return (self.entity_kind, self.entity_rel.replace("\\", "/"), self.department)
+
+    @property
+    def store_key(self) -> BarStoreKey:
+        bid = (self.bar_id or self.allocation_id or AUTO_BAR_ID).strip() or AUTO_BAR_ID
+        return bar_store_key(self.entity_kind, self.entity_rel, self.department, bid)
+
+
+def bar_store_key(
+    entity_kind: str,
+    entity_rel: str,
+    department: str,
+    bar_id: str,
+) -> BarStoreKey:
+    return (
+        _norm_entity_kind(entity_kind),
+        _norm_entity_rel(entity_rel),
+        (department or "").strip(),
+        (bar_id or "").strip() or AUTO_BAR_ID,
+    )
+
+
+def bars_for_row(
+    bars: BarStore,
+    entity_kind: str,
+    entity_rel: str,
+    department: str,
+) -> list[PlannedBar]:
+    kind = _norm_entity_kind(entity_kind)
+    rel = _norm_entity_rel(entity_rel)
+    dep = (department or "").strip()
+    found = [
+        b
+        for key, b in bars.items()
+        if key[0] == kind and key[1] == rel and key[2] == dep
+    ]
+    found.sort(key=lambda b: (b.target_workflow_order, b.due, b.start, b.bar_id))
+    return found
+
+
+def merged_row_assignee_ids_from_bars(
+    bars: BarStore,
+    entity_kind: str,
+    entity_rel: str,
+    department: str,
+) -> tuple[str, ...]:
+    """Union of assignee ids across every planned bar in an entity department row."""
+    from monostudio.core.user_identity import normalize_assignee_ids
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for bar in bars_for_row(bars, entity_kind, entity_rel, department):
+        raw: list[str] = list(bar.assignee_ids)
+        if not raw and (bar.assignee_id or "").strip():
+            raw = [(bar.assignee_id or "").strip()]
+        for uid in normalize_assignee_ids(raw):
+            if uid not in seen:
+                seen.add(uid)
+                merged.append(uid)
+    return tuple(merged)
+
+
+def primary_bar_for_row(
+    bars: BarStore,
+    entity_kind: str,
+    entity_rel: str,
+    department: str,
+) -> PlannedBar | None:
+    row = bars_for_row(bars, entity_kind, entity_rel, department)
+    if not row:
+        return None
+    unmet = [b for b in row if not b.goal_met and b.status != STATUS_EXCLUDED]
+    if unmet:
+        return unmet[0]
+    return row[0]
+
+
+def get_bar(
+    bars: BarStore,
+    entity_kind: str,
+    entity_rel: str,
+    department: str,
+    bar_id: str = AUTO_BAR_ID,
+) -> PlannedBar | None:
+    return bars.get(bar_store_key(entity_kind, entity_rel, department, bar_id))
 
 
 def _bucket_for_category(category: str) -> str:
@@ -148,18 +248,24 @@ def build_planned_bars(
     include_shots: bool = True,
     include_assets: bool = False,
     today: date | None = None,
-) -> dict[tuple[str, str, str], PlannedBar]:
-    """Return computed bars keyed by (entity_kind, entity_rel, department)."""
+) -> BarStore:
+    """Return computed bars keyed by (entity_kind, entity_rel, department, bar_id)."""
     from monostudio.core.department_registry import DepartmentRegistry
 
     root = Path(project_root)
     today = today or date.today()
     dept_reg = DepartmentRegistry.for_project(root)
-    status_reg = load_production_status_registry(root)
     entities = _entity_index(project_index, root)
 
-    bars: dict[tuple[str, str, str], PlannedBar] = {}
+    bars: BarStore = {}
     suppressed_auto = set(schedule.auto_bar_suppressions or ())
+
+    manual_goal_rows: set[tuple[str, str, str]] = set()
+    for alloc in schedule.allocations:
+        kind = _norm_entity_kind(alloc.entity_kind)
+        dep_id = (alloc.department or "").strip()
+        if dep_id:
+            manual_goal_rows.add((kind, _norm_entity_rel(alloc.entity_rel), dep_id))
 
     def dept_label(dep_id: str) -> str:
         return dept_reg.get_department_label(dep_id) or dep_id
@@ -168,22 +274,54 @@ def build_planned_bars(
         k = _norm_entity_kind(kind)
         return (k == "shot" and include_shots) or (k == "asset" and include_assets)
 
-    def _status_for(ref: Asset | Shot | None, dep_id: str) -> tuple[str, str, str]:
-        """Return (bucket, status_id, color_hex)."""
+    def _dept_status_reg(dep_id: str):
+        return load_status_registry_for_department(root, dep_id)
+
+    def _status_for(
+        ref: Asset | Shot | None, dep_id: str
+    ) -> tuple[str, str, str, object]:
+        """Return (bucket, status_id, color_hex, registry)."""
+        reg = _dept_status_reg(dep_id)
         if ref is None:
-            return STATUS_WAITING, "waiting", CATEGORY_COLOR_HEX["unknown"]
+            return STATUS_WAITING, "waiting", CATEGORY_COLOR_HEX["unknown"], reg
         dep = None
         for d in ref.departments:
             if (d.name or "").strip() == dep_id:
                 dep = d
                 break
         if dep is None:
-            return STATUS_WAITING, "waiting", CATEGORY_COLOR_HEX["unknown"]
+            return STATUS_WAITING, "waiting", CATEGORY_COLOR_HEX["unknown"], reg
         override = override_status_id_for_department(ref, dep_id)
-        sid = effective_status_id_for_department(dep, override, status_reg)
-        category = status_reg.category_for(sid)
+        sid = effective_status_id_for_department(dep, override, reg)
+        category = reg.category_for(sid)
         bucket = _bucket_for_category(category)
-        return bucket, sid, CATEGORY_COLOR_HEX.get(category, CATEGORY_COLOR_HEX["unknown"])
+        return bucket, sid, CATEGORY_COLOR_HEX.get(category, CATEGORY_COLOR_HEX["unknown"]), reg
+
+    def _goal_bar_fields(
+        ref: Asset | Shot | None,
+        dep_id: str,
+        target_status_id: str,
+    ) -> tuple[bool, str, str, str, int]:
+        bucket, current_sid, _, reg = _status_for(ref, dep_id)
+        target = (target_status_id or "").strip()
+        if not target:
+            met = bucket == STATUS_DONE
+            label = ""
+            order = 0
+            tcat = reg.category_for(current_sid)
+            tcolor = CATEGORY_COLOR_HEX.get(tcat, CATEGORY_COLOR_HEX["unknown"])
+            return met, label, tcolor, current_sid, order
+        met = goal_is_met(current_sid, target, reg)
+        label = reg.label_for(target)
+        order = status_workflow_order(reg, target)
+        tcat = reg.category_for(target)
+        tcolor = CATEGORY_COLOR_HEX.get(tcat, CATEGORY_COLOR_HEX["unknown"])
+        if met:
+            bucket = STATUS_DONE
+        return met, label, tcolor, current_sid, order
+
+    def _store_bar(bar: PlannedBar) -> None:
+        bars[bar.store_key] = bar
 
     # 1) Auto bars from delivery targets, backward-scheduled along the template.
     for target in schedule.targets:
@@ -204,8 +342,6 @@ def build_planned_bars(
         steps = _ordered_template_steps(schedule, target.template, root)
         active_steps = _active_template_steps_for_entity(steps, entity_depts, dept_reg)
 
-        # Backward chain: last step ends at delivery; each earlier step ends the day
-        # before the next one starts.
         end_cursor = delivery
         for step in reversed(active_steps):
             dep_step = (step.dept or "").strip()
@@ -213,29 +349,33 @@ def build_planned_bars(
             due = end_cursor
             start = due - timedelta(days=days - 1)
             if dep_step and (kind, rel, dep_step) in suppressed_auto:
-                # Keep backward chain spacing without drawing a bar.
                 end_cursor = start - timedelta(days=1)
                 continue
-            bucket, sid, color = _status_for(ref, step.dept)
+            if dep_step and (kind, rel, dep_step) in manual_goal_rows:
+                end_cursor = start - timedelta(days=1)
+                continue
+            bucket, sid, color, _ = _status_for(ref, step.dept)
             if _bar_is_excluded(bucket, sid):
                 end_cursor = start - timedelta(days=1)
                 continue
             overdue = due < today and bucket != STATUS_DONE
-            bar = PlannedBar(
-                entity_kind=kind,
-                entity_rel=rel,
-                entity_name=entity_name,
-                department=step.dept,
-                department_label=dept_label(step.dept),
-                start=start,
-                due=due,
-                source="auto",
-                status=bucket,
-                status_id=sid,
-                color_hex=color,
-                overdue=overdue,
+            _store_bar(
+                PlannedBar(
+                    entity_kind=kind,
+                    entity_rel=rel,
+                    entity_name=entity_name,
+                    department=step.dept,
+                    department_label=dept_label(step.dept),
+                    start=start,
+                    due=due,
+                    source="auto",
+                    status=bucket,
+                    status_id=sid,
+                    color_hex=color,
+                    overdue=overdue,
+                    bar_id=AUTO_BAR_ID,
+                )
             )
-            bars[bar.row_key] = bar
             end_cursor = start - timedelta(days=1)
 
     # 2) Department waves — replace auto bars for that entity + dept.
@@ -246,10 +386,12 @@ def build_planned_bars(
         dep_id = (wave.department or "").strip()
         if not dep_id:
             continue
+        rel = _norm_entity_rel(wave.entity_rel)
+        if (kind, rel, dep_id) in manual_goal_rows:
+            continue
         due = _parse_date(wave.due)
         if not due:
             continue
-        rel = _norm_entity_rel(wave.entity_rel)
         ref = entities.get((kind, rel))
         entity_name = getattr(ref, "name", rel.rsplit("/", 1)[-1])
         start, due_d = bar_dates_for_wave_due(
@@ -259,26 +401,28 @@ def build_planned_bars(
             due=due,
             project_root=root,
         )
-        bucket, sid, color = _status_for(ref, dep_id)
+        bucket, sid, color, _ = _status_for(ref, dep_id)
         excluded = _bar_is_excluded(bucket, sid)
         overdue = not excluded and due_d < today and bucket != STATUS_DONE
-        bar = PlannedBar(
-            entity_kind=kind,
-            entity_rel=rel,
-            entity_name=entity_name,
-            department=dep_id,
-            department_label=dept_label(dep_id),
-            start=start,
-            due=due_d,
-            source="wave",
-            status=bucket,
-            status_id=sid,
-            color_hex=color,
-            overdue=overdue,
+        _store_bar(
+            PlannedBar(
+                entity_kind=kind,
+                entity_rel=rel,
+                entity_name=entity_name,
+                department=dep_id,
+                department_label=dept_label(dep_id),
+                start=start,
+                due=due_d,
+                source="wave",
+                status=bucket,
+                status_id=sid,
+                color_hex=color,
+                overdue=overdue,
+                bar_id=WAVE_BAR_ID,
+            )
         )
-        bars[bar.row_key] = bar
 
-    # 3) Overrides win: replace (or add) bars for fixed allocations.
+    # 3) Manual goal allocations (multiple per entity + department).
     for alloc in schedule.allocations:
         kind = _norm_entity_kind(alloc.entity_kind)
         if not _kind_allowed(kind):
@@ -293,36 +437,49 @@ def build_planned_bars(
         rel = _norm_entity_rel(alloc.entity_rel)
         ref = entities.get((kind, rel))
         entity_name = getattr(ref, "name", rel.rsplit("/", 1)[-1])
-        bucket, sid, color = _status_for(ref, dep_id)
-        excluded = _bar_is_excluded(bucket, sid)
-        overdue = not excluded and due < today and bucket != STATUS_DONE
-        bar = PlannedBar(
-            entity_kind=kind,
-            entity_rel=rel,
-            entity_name=entity_name,
-            department=dep_id,
-            department_label=dept_label(dep_id),
-            start=start,
-            due=due,
-            source="override",
-            status=bucket,
-            status_id=sid,
-            color_hex=color,
-            overdue=overdue,
-            assignee_ids=alloc.assignee_ids,
-            assignees=alloc.assignees,
-            assignee_id=alloc.assignee_id,
-            assignee=alloc.assignee,
-            note=alloc.note,
-            allocation_id=alloc.id,
+        target_id = (alloc.target_status_id or "").strip()
+        met, target_label, target_color, current_sid, order = _goal_bar_fields(
+            ref, dep_id, target_id
         )
-        bars[bar.row_key] = bar
+        bucket, _, _, _ = _status_for(ref, dep_id)
+        if met:
+            bucket = STATUS_DONE
+        excluded = _bar_is_excluded(bucket, current_sid)
+        overdue = not excluded and not met and due < today
+        color = "#10b981" if met else ("#ef4444" if overdue else target_color)
+        _store_bar(
+            PlannedBar(
+                entity_kind=kind,
+                entity_rel=rel,
+                entity_name=entity_name,
+                department=dep_id,
+                department_label=dept_label(dep_id),
+                start=start,
+                due=due,
+                source="override",
+                status=STATUS_DONE if met else bucket,
+                status_id=current_sid,
+                color_hex=color,
+                overdue=overdue,
+                assignee_ids=alloc.assignee_ids,
+                assignees=alloc.assignees,
+                assignee_id=alloc.assignee_id,
+                assignee=alloc.assignee,
+                note=alloc.note,
+                allocation_id=alloc.id,
+                target_status_id=target_id,
+                target_status_label=target_label,
+                goal_met=met,
+                target_workflow_order=order,
+                bar_id=alloc.id,
+            )
+        )
 
     return bars
 
 
 def compute_view_date_range_from_bars(
-    bars: dict[tuple[str, str, str], PlannedBar],
+    bars: BarStore,
     schedule: ProjectSchedule,
     *,
     project_root: Path | None = None,
@@ -342,12 +499,12 @@ def compute_view_date_range_from_bars(
     )
 
 
-def count_overdue_bars(bars: dict[tuple[str, str, str], PlannedBar]) -> int:
+def count_overdue_bars(bars: BarStore) -> int:
     return sum(1 for b in bars.values() if b.overdue)
 
 
 def collect_overdue_entity_keys(
-    bars: dict[tuple[str, str, str], PlannedBar],
+    bars: BarStore,
 ) -> list[tuple[str, str]]:
     """Unique (entity_kind, entity_rel) with at least one overdue bar. Assets first."""
     asset_keys: list[tuple[str, str]] = []
@@ -393,7 +550,7 @@ class DeptWaveRollup:
 
 
 def rollup_bars_by_department(
-    bars: dict[tuple[str, str, str], PlannedBar],
+    bars: BarStore,
     groups: list,
     dept_order: list[str],
     *,
@@ -459,11 +616,12 @@ def rollup_bars_by_department(
             _register_rollup_dep(rollup_dep, ek, row_label or rollup_dep)
 
     by_dept: dict[str, list[PlannedBar]] = {}
-    for key, bar in bars.items():
-        kind, rel, dep = key
+    for bar in bars.values():
+        kind = bar.entity_kind
+        rel = bar.entity_rel.replace("\\", "/")
+        dep = (bar.department or "").strip()
         if (kind, rel) not in entity_keys:
             continue
-        dep = (dep or "").strip()
         if not dep:
             continue
         if respect_hidden and dep in hidden:
@@ -507,8 +665,12 @@ def rollup_bars_by_department(
                 entity_keys=entity_tuple,
             )
         overdue_count = sum(1 for b in dept_bars if b.overdue)
-        done_count = sum(1 for b in dept_bars if b.status == STATUS_DONE)
-        in_progress_count = sum(1 for b in dept_bars if b.status == STATUS_PROGRESS)
+        done_count = sum(1 for b in dept_bars if b.goal_met or b.status == STATUS_DONE)
+        in_progress_count = sum(
+            1
+            for b in dept_bars
+            if not b.goal_met and b.status == STATUS_PROGRESS
+        )
         starts = [b.start for b in dept_bars]
         dues = [b.due for b in dept_bars]
         scheduled_entities = {
@@ -586,17 +748,38 @@ class UpcomingDueRow:
 
 
 def _entity_bars(
-    bars: dict[tuple[str, str, str], PlannedBar],
+    bars: BarStore,
     *,
     entity_kind: str,
     entity_rel: str,
 ) -> list[PlannedBar]:
-    rel = entity_rel.replace("\\", "/")
-    return [b for k, b in bars.items() if k[0] == entity_kind and k[1] == rel]
+    kind = _norm_entity_kind(entity_kind)
+    rel = _norm_entity_rel(entity_rel)
+    return [b for b in bars.values() if b.entity_kind == kind and b.entity_rel == rel]
+
+
+def next_unmet_goal_in_row(bars: list[PlannedBar]) -> PlannedBar | None:
+    open_goals = [
+        b
+        for b in bars
+        if not b.goal_met and b.status != STATUS_EXCLUDED and b.source == "override"
+    ]
+    if not open_goals:
+        open_legacy = [
+            b
+            for b in bars
+            if b.status not in (STATUS_DONE, STATUS_EXCLUDED) and b.source != "override"
+        ]
+        if not open_legacy:
+            return None
+        open_legacy.sort(key=lambda b: (b.due, b.target_workflow_order))
+        return open_legacy[0]
+    open_goals.sort(key=lambda b: (b.target_workflow_order, b.due, b.start))
+    return open_goals[0]
 
 
 def summarize_entity_schedule(
-    bars: dict[tuple[str, str, str], PlannedBar],
+    bars: BarStore,
     schedule: ProjectSchedule,
     *,
     entity_kind: str,
@@ -617,15 +800,21 @@ def summarize_entity_schedule(
     focus_overdue = False
     dep = (active_department or "").strip()
     if dep:
-        focus_bar = bars.get((entity_kind, rel, dep))
-        if focus_bar is not None:
-            focus_due = focus_bar.due
-            focus_overdue = focus_bar.overdue
+        row_bars = bars_for_row(bars, entity_kind, rel, dep)
+        focus_goal = next_unmet_goal_in_row(row_bars)
+        if focus_goal is not None:
+            focus_due = focus_goal.due
+            focus_overdue = focus_goal.overdue
+        else:
+            primary = primary_bar_for_row(bars, entity_kind, rel, dep)
+            if primary is not None:
+                focus_due = primary.due
+                focus_overdue = primary.overdue
 
     open_bars = [
         b
         for b in entity_bars
-        if b.status not in (STATUS_DONE, STATUS_EXCLUDED)
+        if not b.goal_met and b.status not in (STATUS_DONE, STATUS_EXCLUDED)
     ]
     nearest_open_due = min((b.due for b in open_bars), default=None)
     any_overdue = any(b.overdue for b in entity_bars)
@@ -645,7 +834,7 @@ def summarize_entity_schedule(
 
 
 def collect_upcoming_due_rows(
-    bars: dict[tuple[str, str, str], PlannedBar],
+    bars: BarStore,
     *,
     today: date | None = None,
     within_days: int = 7,
@@ -656,7 +845,7 @@ def collect_upcoming_due_rows(
     horizon = ref + timedelta(days=max(1, within_days))
     rows: list[UpcomingDueRow] = []
     for bar in bars.values():
-        if bar.status in (STATUS_DONE, STATUS_EXCLUDED):
+        if bar.goal_met or bar.status in (STATUS_DONE, STATUS_EXCLUDED):
             continue
         if not bar.overdue and (bar.due < ref or bar.due > horizon):
             continue

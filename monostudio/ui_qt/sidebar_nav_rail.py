@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QSettings, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -77,6 +77,7 @@ class SidebarNavRail(QWidget):
         self._scope_buttons: dict[str, NavRailExpandItem] = {}
         self._footer_buttons: dict[str, NavRailExpandItem] = {}
         self._filter_btn: NavRailExpandItem | None = None
+        self._filter_popup_active = False
         self._recent_tasks_btn: NavRailExpandItem | None = None
         self._trash_btn: NavRailExpandItem | None = None
         self._last_context_text: str | None = None
@@ -124,6 +125,16 @@ class SidebarNavRail(QWidget):
         self._project_switch.setToolTip("Switch project")
         self._project_switch.setPopupMode(QToolButton.InstantPopup)
         self._project_switch.clicked.connect(self._show_project_menu)
+        self._project_switch.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._project_switch.customContextMenuRequested.connect(self._on_project_switch_context_menu)
+
+        self._project_context_menu = MonosMenu(self)
+        browse_act = QAction("Browse all projects…", self._project_context_menu)
+        browse_act.triggered.connect(self.browse_projects_requested.emit)
+        self._project_context_menu.addAction(browse_act)
+        new_act = QAction("New project…", self._project_context_menu)
+        new_act.triggered.connect(self.new_project_requested.emit)
+        self._project_context_menu.addAction(new_act)
         # Center in the 55px band above the 1px separator (aligned with top bar).
         top_block_56_layout.addStretch(1)
         top_block_56_layout.addWidget(self._project_switch, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -290,6 +301,32 @@ class SidebarNavRail(QWidget):
             owner._icon.show()
         self._flyout_owner = None
 
+    def resync_pointer_hover(self) -> None:
+        """Rebuild nav-rail hover after main-view click (flyout + manual item highlight)."""
+        pos = QCursor.pos()
+        self._flyout_hide_timer.stop()
+        flyout = self._nav_flyout
+        owner = self._flyout_owner
+        if flyout is not None and flyout.isVisible():
+            try:
+                over_flyout = flyout.rect().contains(flyout.mapFromGlobal(pos))
+            except Exception:
+                over_flyout = False
+            over_owner = False
+            if owner is not None:
+                try:
+                    over_owner = owner.rect().contains(owner.mapFromGlobal(pos))
+                except Exception:
+                    over_owner = False
+            if not over_flyout and not over_owner:
+                flyout._width_anim.stop()
+                flyout.hide()
+                if owner is not None:
+                    owner._icon.show()
+                self._flyout_owner = None
+        for item in self.findChildren(NavRailExpandItem):
+            item.sync_hover_from_global(pos)
+
     def _on_flyout_clicked(self) -> None:
         owner = self._flyout_owner
         if owner is not None:
@@ -439,9 +476,15 @@ class SidebarNavRail(QWidget):
         if self._trash_btn is not None:
             self._trash_btn.set_active(ctx == SidebarContext.TRASH.value)
         if self._filter_btn is not None:
-            self._filter_btn.set_active(False)
+            self._filter_btn.set_active(self._filter_popup_active)
         if self._recent_tasks_btn is not None:
             self._recent_tasks_btn.set_active(False)
+
+    def set_filter_popup_active(self, active: bool) -> None:
+        """Highlight Filters nav item while the compact filter popup is open."""
+        self._filter_popup_active = bool(active)
+        if self._filter_btn is not None:
+            self._filter_btn.set_active(self._filter_popup_active)
 
     def _on_home_clicked(self) -> None:
         ctx = self.current_context()
@@ -497,6 +540,11 @@ class SidebarNavRail(QWidget):
         self._project_menu_closed_at = time.monotonic()
         QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._project_switch))
 
+    def _on_project_switch_context_menu(self, pos) -> None:
+        if not self._project_switch.isEnabled():
+            return
+        self._project_context_menu.popup(self._project_switch.mapToGlobal(pos))
+
     def set_projects(
         self,
         projects: list[DiscoveredProject],
@@ -544,14 +592,6 @@ class SidebarNavRail(QWidget):
             act.triggered.connect(lambda checked=False, p=str(proj.root): self.project_switch_requested.emit(p))
             group.addAction(act)
             self._project_menu.addAction(act)
-
-        self._project_menu.addSeparator()
-        browse_act = QAction("Browse all projects…", self._project_menu)
-        browse_act.triggered.connect(self.browse_projects_requested.emit)
-        self._project_menu.addAction(browse_act)
-        new_act = QAction("New project…", self._project_menu)
-        new_act.triggered.connect(self.new_project_requested.emit)
-        self._project_menu.addAction(new_act)
 
     def set_recent_tasks(self, tasks: list[RecentTask]) -> None:
         self._recent_tasks = list(tasks) if tasks else []

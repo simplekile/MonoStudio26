@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import QRect, QSize, Qt, QSettings, Signal
-from PySide6.QtGui import QColor, QFont, QKeyEvent, QPainter
+from PySide6.QtGui import QColor, QFont, QKeyEvent, QMouseEvent, QPainter
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -171,6 +173,38 @@ class _CommandPaletteDelegate(QStyledItemDelegate):
             painter.restore()
 
 
+class _SpotlightBackdrop(QWidget):
+    """Fullscreen dim layer; left-click outside the panel closes the palette."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._panel: QWidget | None = None
+        self._dismiss = None
+
+    def set_panel(self, panel: QWidget) -> None:
+        self._panel = panel
+
+    def set_dismiss(self, dismiss) -> None:
+        self._dismiss = dismiss
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 140))
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._panel is not None
+            and self._dismiss is not None
+            and not self._panel.geometry().contains(event.pos())
+        ):
+            self._dismiss()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class CommandPaletteDialog(MonosDialog):
     """Spotlight-style jump search: type to filter, max 5 results, dynamic height."""
 
@@ -191,26 +225,34 @@ class CommandPaletteDialog(MonosDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Go to…")
+        self.set_host_dim_overlay_enabled(False)
         self._settings = settings
         self._rows = self._build_rows(entities or [], projects or [], inbox_items or [])
 
-        root = QVBoxLayout(self)
+        self._backdrop = _SpotlightBackdrop(self)
+        self._panel = QWidget(self._backdrop)
+        self._panel.setObjectName("CommandPalettePanel")
+        self._panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._backdrop.set_panel(self._panel)
+        self._backdrop.set_dismiss(self.reject)
+
+        root = QVBoxLayout(self._panel)
         root.setContentsMargins(_MARGIN, _MARGIN, _MARGIN, _MARGIN)
         root.setSpacing(_LAYOUT_SPACING)
 
-        self._search = QLineEdit(self)
+        self._search = QLineEdit(self._panel)
         self._search.setObjectName("CommandPaletteSearch")
         self._search.setPlaceholderText("Search pages, projects, assets, inbox…")
         self._search.textChanged.connect(self._apply_filter)
         root.addWidget(self._search)
 
-        self._empty = QLabel("No matches", self)
+        self._empty = QLabel("No matches", self._panel)
         self._empty.setObjectName("CommandPaletteEmpty")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty.hide()
         root.addWidget(self._empty)
 
-        self._list = QListWidget(self)
+        self._list = QListWidget(self._panel)
         self._list.setObjectName("CommandPaletteList")
         self._list.setItemDelegate(_CommandPaletteDelegate(self._list))
         self._list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -219,13 +261,46 @@ class CommandPaletteDialog(MonosDialog):
         self._list.hide()
         root.addWidget(self._list)
 
-        self._hint = QLabel("↑↓ navigate · Enter open · Esc close", self)
+        self._hint = QLabel("↑↓ navigate · Enter open · Esc close", self._panel)
         self._hint.setObjectName("DialogHint")
         root.addWidget(self._hint)
 
         self._list.itemActivated.connect(self._on_item_activated)
         self._search.setFocus(Qt.FocusReason.PopupFocusReason)
         self._apply_filter("")
+
+    def _top_level_host(self) -> QWidget | None:
+        w: QWidget | None = self.parentWidget()
+        top: QWidget | None = w
+        while w is not None:
+            top = w
+            w = w.parentWidget()
+        return top
+
+    def _sync_spotlight_layout(self) -> None:
+        self._backdrop.setGeometry(self.rect())
+        pw = self._panel.width()
+        ph = self._panel.height()
+        x = max(0, (self.width() - pw) // 2)
+        y = max(48, min(self.height() // 5, self.height() - ph - 48))
+        self._panel.setGeometry(x, y, pw, ph)
+        self._backdrop.lower()
+        self._panel.raise_()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        host = self._top_level_host()
+        if host is not None:
+            self.setGeometry(host.frameGeometry())
+        QDialog.showEvent(self, event)
+        self._sync_spotlight_layout()
+        self._search.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        QDialog.resizeEvent(self, event)
+        self._sync_spotlight_layout()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        QDialog.paintEvent(self, event)
 
     def _build_rows(
         self,
@@ -406,7 +481,9 @@ class CommandPaletteDialog(MonosDialog):
             + (_LAYOUT_SPACING if has_query and footer_h else 0)
             + footer_h
         )
-        self.setFixedSize(_PALETTE_WIDTH, max(total_h, _MARGIN * 2 + search_h + 8))
+        self._panel.setFixedSize(_PALETTE_WIDTH, max(total_h, _MARGIN * 2 + search_h + 8))
+        if self.isVisible():
+            self._sync_spotlight_layout()
 
     def _apply_filter(self, text: str) -> None:
         q = (text or "").strip()

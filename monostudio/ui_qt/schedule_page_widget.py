@@ -29,15 +29,26 @@ from monostudio.core.schedule_document import (
 )
 from monostudio.core.fs_reader import ProjectIndex
 from monostudio.core.project_schedule import (
+    AllocationBulkPatch,
     ProjectSchedule,
     ScheduleAllocation,
     TimelineRow,
     allocation_for_row,
+    allocations_by_ids,
+    bulk_patch_allocations,
+    expand_allocation_ids_to_rows,
+    bulk_update_allocation_target_status,
     clear_entity_schedule,
     read_project_schedule,
 )
 from monostudio.core.schedule_planner import build_planned_bars, count_overdue_bars
 from monostudio.ui_qt.schedule_allocate_dialog import ScheduleAllocateDialog, _EntityOption
+from monostudio.ui_qt.schedule_target_status_memory import remember_target_status
+from monostudio.ui_qt.schedule_bar_bulk_dialogs import (
+    ScheduleBulkAssignDialog,
+    ScheduleBulkDatesDialog,
+    ScheduleBulkNoteDialog,
+)
 from monostudio.ui_qt.schedule_autoplan_dialog import ScheduleAutoPlanDialog
 from monostudio.core.schedule_history import set_history_workspace
 from monostudio.ui_qt.schedule_history_dialog import ScheduleHistoryDialog
@@ -98,6 +109,7 @@ class SchedulePageWidget(QWidget):
     entity_row_selected = Signal(str, str)  # entity_kind, entity_rel → Inspector
     entity_row_cleared = Signal()  # deselect timeline row / Inspector
     department_skip_toggle_requested = Signal(str, str, str, bool)  # kind, rel, dep, skip
+    jump_to_entity_requested = Signal(str, str, str)  # entity_kind, entity_rel, department
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -196,6 +208,19 @@ class SchedulePageWidget(QWidget):
         )
         header.addWidget(layout_toggle, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        self._btn_marker_lock = QToolButton(self)
+        self._btn_marker_lock.setObjectName("ScheduleMarkerLockBtn")
+        self._btn_marker_lock.setCheckable(True)
+        self._btn_marker_lock.setChecked(False)
+        self._btn_marker_lock.setAutoRaise(True)
+        self._btn_marker_lock.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_marker_lock.setFixedSize(32, 32)
+        self._btn_marker_lock.setToolTip(
+            "Markers locked — click to unlock IN, OUT, and milestones on the timeline"
+        )
+        self._btn_marker_lock.toggled.connect(self._on_marker_lock_toggled)
+        header.addWidget(self._btn_marker_lock, 0, Qt.AlignmentFlag.AlignVCenter)
+
         root.addLayout(header)
 
         # Active timeline tool (Select / Draw) — shown via right-click tools menu.
@@ -258,9 +283,22 @@ class SchedulePageWidget(QWidget):
         self._gantt.department_skip_toggle_requested.connect(
             self.department_skip_toggle_requested.emit
         )
+        self._gantt.jump_to_entity_requested.connect(self.jump_to_entity_requested.emit)
         self._gantt.search_filter_requested.connect(self._toggle_view_options_popup)
         self._gantt.tools_menu_requested.connect(self._show_tools_menu)
+        self._gantt.bars_bulk_dates_requested.connect(self._on_bars_bulk_dates)
+        self._gantt.bars_bulk_assign_requested.connect(self._on_bars_bulk_assign)
+        self._gantt.bars_bulk_note_requested.connect(self._on_bars_bulk_note)
+        self._gantt.bars_bulk_target_status_requested.connect(
+            self._on_bars_bulk_target_status
+        )
+        self._gantt.allocation_target_status_requested.connect(
+            self._on_allocation_target_status_requested
+        )
+        self._gantt.bar_edit_allocation_requested.connect(self._on_bar_edit_allocation)
+        self._gantt.markers_unlock_changed.connect(self._on_markers_unlock_changed)
         root.addWidget(self._gantt, 1)
+        self._sync_marker_lock_button()
         self._install_schedule_shortcuts()
 
         self._load_view_options_settings()
@@ -379,7 +417,7 @@ class SchedulePageWidget(QWidget):
         tpl.setEnabled(editable)
         auto = act(menu, "sparkles", "Auto-plan…")
         auto.setEnabled(editable)
-        mile = act(menu, "pin", "Project milestones…")
+        mile = act(menu, "pin", "Manage timeline markers…")
         mile.setEnabled(editable)
         hist = act(menu, "layers", "Schedule history…")
 
@@ -478,6 +516,34 @@ class SchedulePageWidget(QWidget):
         self._gantt.set_schedule_editable(editable)
         if not editable and self._current_tool != TOOL_SELECT:
             self._activate_select_tool()
+        self._btn_marker_lock.setEnabled(editable)
+        self._sync_marker_lock_button()
+
+    def _sync_marker_lock_button(self) -> None:
+        unlocked = self._gantt.markers_unlocked()
+        self._btn_marker_lock.blockSignals(True)
+        self._btn_marker_lock.setChecked(unlocked)
+        self._btn_marker_lock.blockSignals(False)
+        icon_name = "lock-open" if unlocked else "lock"
+        color = MONOS_COLORS.get("blue_400", "#60a5fa") if unlocked else "#a1a1aa"
+        ic = lucide_icon(icon_name, size=16, color_hex=color)
+        if not ic.isNull():
+            self._btn_marker_lock.setIcon(ic)
+            self._btn_marker_lock.setIconSize(QSize(16, 16))
+        if unlocked:
+            self._btn_marker_lock.setToolTip(
+                "Markers unlocked — drag grips on the timeline to edit IN, OUT, and milestones"
+            )
+        else:
+            self._btn_marker_lock.setToolTip(
+                "Markers locked — click to unlock IN, OUT, and milestones on the timeline"
+            )
+
+    def _on_marker_lock_toggled(self, checked: bool) -> None:
+        self._gantt.set_markers_unlocked(checked)
+
+    def _on_markers_unlock_changed(self, unlocked: bool) -> None:
+        self._sync_marker_lock_button()
 
     def set_project_root(self, path: Path | None) -> None:
         new_root = Path(path) if path else None
@@ -891,6 +957,198 @@ class SchedulePageWidget(QWidget):
             return
         self._on_schedule_changed()
         self._gantt.reload()
+
+    def _on_bars_bulk_dates(self, allocation_ids: list) -> None:
+        if not self._schedule_editable or self._project_root is None:
+            return
+        ids = [str(i).strip() for i in allocation_ids if str(i).strip()]
+        if not ids:
+            return
+        schedule = read_project_schedule(self._project_root)
+        allocs = allocations_by_ids(schedule, ids)
+        preset_start = None
+        preset_due = None
+        if len(allocs) == 1:
+            from datetime import date as date_cls
+
+            try:
+                preset_start = date_cls.fromisoformat(allocs[0].start[:10])
+                preset_due = date_cls.fromisoformat(allocs[0].due[:10])
+            except ValueError:
+                pass
+        dlg = ScheduleBulkDatesDialog(
+            parent=self,
+            count=len(ids),
+            preset_start=preset_start,
+            preset_due=preset_due,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        dates = dlg.dates()
+        if dates is None:
+            return
+        start_d, due_d = dates
+        try:
+            updated = bulk_patch_allocations(
+                self._project_root,
+                ids,
+                AllocationBulkPatch(start=start_d.isoformat(), due=due_d.isoformat()),
+            )
+        except OSError as ex:
+            QMessageBox.critical(self, "Set dates", f"Failed to save:\n{ex}")
+            return
+        if updated:
+            self._on_schedule_changed()
+            self._gantt.reload()
+
+    def _on_bars_bulk_assign(self, allocation_ids: list) -> None:
+        if not self._schedule_editable or self._project_root is None:
+            return
+        ids = [str(i).strip() for i in allocation_ids if str(i).strip()]
+        if not ids:
+            return
+        schedule = read_project_schedule(self._project_root)
+        ids = expand_allocation_ids_to_rows(schedule, ids)
+        allocs = allocations_by_ids(schedule, ids)
+        preset: list[str] = []
+        if len(allocs) == 1 and allocs[0].assignee_ids:
+            preset = list(allocs[0].assignee_ids)
+        dlg = ScheduleBulkAssignDialog(
+            parent=self,
+            workspace_root=self._workspace_root,
+            count=len(ids),
+            preset_user_ids=preset or None,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        a_ids, a_names, legacy_id, legacy_label = dlg.assignee_fields()
+        try:
+            updated = bulk_patch_allocations(
+                self._project_root,
+                ids,
+                AllocationBulkPatch(
+                    assignee_ids=a_ids,
+                    assignees=a_names,
+                    assignee_id=legacy_id,
+                    assignee=legacy_label,
+                ),
+            )
+        except OSError as ex:
+            QMessageBox.critical(self, "Set assignees", f"Failed to save:\n{ex}")
+            return
+        if updated:
+            from monostudio.core.schedule_assign_notify import notify_bulk_schedule_assignee_patch
+
+            schedule_after = read_project_schedule(self._project_root)
+            patched = allocations_by_ids(schedule_after, ids)
+            try:
+                notify_bulk_schedule_assignee_patch(
+                    self._project_root,
+                    self._workspace_root,
+                    schedule_before=schedule,
+                    patched_allocations=patched,
+                )
+            except OSError:
+                pass
+            self._on_schedule_changed()
+            self._gantt.reload()
+
+    def _on_bars_bulk_note(self, allocation_ids: list) -> None:
+        if not self._schedule_editable or self._project_root is None:
+            return
+        ids = [str(i).strip() for i in allocation_ids if str(i).strip()]
+        if not ids:
+            return
+        schedule = read_project_schedule(self._project_root)
+        allocs = allocations_by_ids(schedule, ids)
+        preset = allocs[0].note if len(allocs) == 1 else ""
+        dlg = ScheduleBulkNoteDialog(parent=self, count=len(ids), preset=preset or "")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            updated = bulk_patch_allocations(
+                self._project_root,
+                ids,
+                AllocationBulkPatch(note=dlg.note()),
+            )
+        except OSError as ex:
+            QMessageBox.critical(self, "Set note", f"Failed to save:\n{ex}")
+            return
+        if updated:
+            self._on_schedule_changed()
+            self._gantt.reload()
+
+    def _on_bars_bulk_target_status(
+        self, department: str, status_id: str, allocation_ids: list
+    ) -> None:
+        if not self._schedule_editable or self._project_root is None:
+            return
+        dep = (department or "").strip()
+        sid = (status_id or "").strip()
+        ids = [str(i).strip() for i in allocation_ids if str(i).strip()]
+        if not dep or not sid or not ids:
+            return
+        schedule = read_project_schedule(self._project_root)
+        filtered = [
+            a.id
+            for a in schedule.allocations
+            if a.id in ids and (a.department or "").strip() == dep
+        ]
+        if not filtered:
+            QMessageBox.information(
+                self,
+                "Target status",
+                "No selected goals match this department.",
+            )
+            return
+        try:
+            updated = bulk_update_allocation_target_status(
+                self._project_root,
+                allocation_ids=filtered,
+                target_status_id=sid,
+            )
+        except OSError as ex:
+            QMessageBox.critical(self, "Target status", f"Failed to save:\n{ex}")
+            return
+        if updated:
+            remember_target_status(sid)
+            self._on_schedule_changed()
+            self._gantt.reload()
+
+    def _on_bar_edit_allocation(self, allocation_id: str) -> None:
+        if not self._schedule_editable or self._project_root is None:
+            return
+        aid = (allocation_id or "").strip()
+        if not aid:
+            return
+        schedule = read_project_schedule(self._project_root)
+        for alloc in schedule.allocations:
+            if alloc.id == aid:
+                self._open_allocate_for_existing(alloc)
+                return
+
+    def _on_allocation_target_status_requested(
+        self, allocation_id: str, status_id: str
+    ) -> None:
+        if not self._schedule_editable or self._project_root is None:
+            return
+        aid = (allocation_id or "").strip()
+        sid = (status_id or "").strip()
+        if not aid or not sid:
+            return
+        try:
+            updated = bulk_update_allocation_target_status(
+                self._project_root,
+                allocation_ids=[aid],
+                target_status_id=sid,
+            )
+        except OSError as ex:
+            QMessageBox.critical(self, "Target status", f"Failed to save:\n{ex}")
+            return
+        if updated:
+            remember_target_status(sid)
+            self._on_schedule_changed()
+            self._gantt.reload()
 
     def _on_entity_clear_plan(self, entity_kind: str, entity_rel: str) -> None:
         if not self._schedule_editable or self._project_root is None:

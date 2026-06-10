@@ -27,11 +27,13 @@ from monostudio.core.notification_copy import (
     copy_item_fallback,
     copy_more_suffix,
     copy_project_fallback,
-    copy_someone,
+    copy_schedule_due_footer,
     copy_schedule_due_headline,
+    copy_someone,
     copy_source_label,
     copy_team_label,
     pick_copy,
+    schedule_due_line_prefix,
 )
 from monostudio.core.notification_preferences import (
     read_discord_disabled_locally,
@@ -554,9 +556,9 @@ def build_schedule_due_body(
         due_today_count=due_today_count,
         vietnamese=vietnamese,
     )
-    footer = pick_copy(
-        "Lịch · hôm nay & quá hạn",
-        "Schedule · due today & overdue",
+    footer = copy_schedule_due_footer(
+        overdue_count=overdue_count,
+        due_today_count=due_today_count,
         vietnamese=vietnamese,
     )
 
@@ -565,7 +567,7 @@ def build_schedule_due_body(
         name = (item.get("entity_name") or "?").strip()
         dept = (item.get("department_label") or item.get("department") or "").strip()
         due = (item.get("due") or "").strip()
-        prefix = "⚠ " if item.get("overdue") else "• "
+        prefix = schedule_due_line_prefix(overdue=bool(item.get("overdue")))
         line = f"{prefix}**{_discord_md(name)}**"
         if dept:
             line += f" · {_discord_md(dept)}"
@@ -692,6 +694,152 @@ def _append_assign_action_links(
     return content, embed, components
 
 
+def _build_schedule_assigned_bulk_body(
+    payload: dict[str, Any],
+    defaults: dict[str, str] | None,
+    *,
+    workspace_root: Path | str | None = None,
+    vietnamese: bool | None = None,
+    confirmed: bool = False,
+    confirmer_name: str = "",
+    include_components: bool = True,
+) -> dict[str, Any]:
+    """One embed listing multiple schedule assignments for the same recipient."""
+    d = defaults or {"username": "MONOS", "avatar_url": ""}
+    from_name = (payload.get("from_name") or "").strip() or copy_someone(vietnamese=vietnamese)
+    from_uid = str(payload.get("from_user_id") or "").strip()
+    project_name = (payload.get("project_name") or "").strip() or copy_project_fallback(vietnamese=vietnamese)
+    items_raw = payload.get("items")
+    items: list[dict[str, Any]] = (
+        [i for i in items_raw if isinstance(i, dict)] if isinstance(items_raw, list) else []
+    )
+    count = len(items)
+    ping_ids = _discord_ping_ids(workspace_root, payload.get("to_user_ids"))
+    confirmer = (confirmer_name or "").strip()
+
+    if confirmed and confirmer:
+        status_value = pick_copy(
+            f"✅ Đã xác nhận bởi **{_discord_md(confirmer)}**",
+            f"✅ Confirmed by **{_discord_md(confirmer)}**",
+            vietnamese=vietnamese,
+        )
+        embed_color = _hex_color_to_int("#10b981")
+    else:
+        status_value = pick_copy(
+            "⏳ **Chờ xác nhận** — mở MONOS để xác nhận từng mục",
+            "⏳ **Pending** — open MONOS to confirm each item",
+            vietnamese=vietnamese,
+        )
+        embed_color = _sender_embed_color(
+            workspace_root,
+            from_uid,
+            str(payload.get("color_hex") or ""),
+        )
+
+    summary = pick_copy(
+        f"**{_discord_md(from_name)}** giao **{count}** công việc cho bạn",
+        f"**{_discord_md(from_name)}** assigned **{count}** tasks to you",
+        vietnamese=vietnamese,
+    )
+
+    lines: list[str] = []
+    for item in items[:12]:
+        name = (item.get("item_display") or copy_item_fallback(vietnamese=vietnamese)).strip()
+        dept = _department_label(
+            str(item.get("department") or ""),
+            str(item.get("department_label") or ""),
+        )
+        dates_label = format_schedule_dates(
+            str(item.get("start") or ""),
+            str(item.get("due") or ""),
+            vietnamese=vietnamese,
+        )
+        line = f"• **{_discord_md(name)}**"
+        if dept:
+            line += f" · {_discord_md(dept)}"
+        line += f" · `{dates_label}`"
+        lines.append(line)
+    extra = count - 12
+    if extra > 0:
+        lines.append(copy_more_suffix(extra, vietnamese=vietnamese))
+
+    fields: list[dict[str, Any]] = [
+        {
+            "name": pick_copy("Dự án", "Project", vietnamese=vietnamese),
+            "value": _discord_md(project_name),
+            "inline": False,
+        },
+        {
+            "name": pick_copy("Trạng thái", "Status", vietnamese=vietnamese),
+            "value": status_value,
+            "inline": False,
+        },
+    ]
+
+    embed: dict[str, Any] = {
+        "author": {
+            "name": pick_copy("MONOS · Giao việc", "MONOS · Assignment", vietnamese=vietnamese),
+        },
+        "title": pick_copy(
+            f"Bạn được giao {count} công việc",
+            f"You were assigned {count} tasks",
+            vietnamese=vietnamese,
+        ),
+        "description": summary,
+        "fields": fields,
+        "color": embed_color,
+        "footer": {"text": _truncate(from_name, 64)},
+        "timestamp": _utc_now_iso(),
+    }
+    if lines:
+        embed["fields"].insert(
+            0,
+            {
+                "name": pick_copy("Danh sách", "Items", vietnamese=vietnamese),
+                "value": _truncate("\n".join(lines), 1024),
+                "inline": False,
+            },
+        )
+
+    if ping_ids:
+        content = " ".join(f"<@{did}>" for did in ping_ids)
+        allowed: dict[str, Any] = {"parse": [], "users": ping_ids}
+    else:
+        content = ""
+        allowed = {"parse": []}
+
+    body: dict[str, Any] = {
+        "username": d.get("username") or "MONOS",
+        "allowed_mentions": allowed,
+        "embeds": [embed],
+    }
+    if content:
+        body["content"] = content
+
+    inbox_id = _resolve_assign_inbox_id(payload)
+    if not confirmed and inbox_id:
+        content, embed, components = _append_assign_action_links(
+            content=content,
+            embed=embed,
+            fields=embed["fields"],
+            inbox_id=inbox_id,
+            vietnamese=vietnamese,
+            include_components=include_components,
+        )
+        body["embeds"] = [embed]
+        if content:
+            body["content"] = content
+        elif "content" in body:
+            del body["content"]
+        if components:
+            body["components"] = components
+
+    avatar = (d.get("avatar_url") or "").strip()
+    if avatar:
+        body["avatar_url"] = avatar
+    return body
+
+
 def build_schedule_assigned_body(
     payload: dict[str, Any],
     defaults: dict[str, str] | None = None,
@@ -702,6 +850,19 @@ def build_schedule_assigned_body(
     confirmer_name: str = "",
     include_components: bool = True,
 ) -> dict[str, Any]:
+    items_raw = payload.get("items")
+    items = [i for i in items_raw if isinstance(i, dict)] if isinstance(items_raw, list) else []
+    if len(items) > 1:
+        return _build_schedule_assigned_bulk_body(
+            payload,
+            defaults,
+            workspace_root=workspace_root,
+            vietnamese=vietnamese,
+            confirmed=confirmed,
+            confirmer_name=confirmer_name,
+            include_components=include_components,
+        )
+
     d = defaults or {"username": "MONOS", "avatar_url": ""}
     from_name = (payload.get("from_name") or "").strip() or copy_someone(vietnamese=vietnamese)
     from_uid = str(payload.get("from_user_id") or "").strip()

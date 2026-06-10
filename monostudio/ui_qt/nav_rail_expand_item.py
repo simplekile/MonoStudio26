@@ -412,6 +412,23 @@ class NavRailExpandItem(QWidget):
         self._refresh_icon()
         self.update()
 
+    def clear_hover_state(self) -> None:
+        """Drop manual hover highlight (e.g. pointer moved to main content)."""
+        self.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, False)
+        if self._hovered:
+            self._hovered = False
+            self._refresh_icon()
+            self.update()
+
+    def sync_hover_from_global(self, global_pos) -> None:
+        """Reconcile manual hover with the current cursor (after main-view steals events)."""
+        try:
+            local = self.mapFromGlobal(global_pos)
+            hovered = self.rect().contains(local)
+        except Exception:
+            hovered = False
+        self._set_hovered(hovered)
+
     def enterEvent(self, event) -> None:  # noqa: N802
         self._set_hovered(True)
         show = getattr(self._rail, "_show_nav_flyout", None)

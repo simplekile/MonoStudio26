@@ -18,12 +18,15 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.core.models import Asset, Shot
-from monostudio.core.project_schedule import read_project_schedule
+from monostudio.core.project_schedule import merged_assignee_ids_for_row, read_project_schedule
 from monostudio.core.schedule_planner import (
     STATUS_DONE,
     STATUS_EXCLUDED,
     STATUS_PROGRESS,
+    BarStore,
     PlannedBar,
+    bars_for_row,
+    next_unmet_goal_in_row,
     summarize_entity_from_ref,
 )
 from monostudio.ui_qt.assignee_picker_widget import AssigneePickerWidget
@@ -82,8 +85,12 @@ def _status_badge_props(bar: PlannedBar) -> tuple[str, str, str]:
     """Return (status_key, label, color_hex) for progress color mapping."""
     if bar.status == STATUS_EXCLUDED:
         return ("waiting", "SKIPPED", _COLOR_WAITING)
-    if bar.overdue and bar.status != STATUS_DONE:
+    if bar.goal_met or bar.status == STATUS_DONE:
+        return ("ready", "DONE", _COLOR_DONE)
+    if bar.overdue:
         return ("blocked", "OVERDUE", _RED)
+    if (bar.target_status_label or bar.target_status_id).strip():
+        return ("progress", (bar.target_status_label or bar.target_status_id).upper(), _COLOR_PROGRESS)
     if bar.status == STATUS_DONE:
         return ("ready", "DONE", _COLOR_DONE)
     if bar.status == STATUS_PROGRESS:
@@ -171,7 +178,7 @@ class _DeptStatusPanel(QFrame):
     def apply(self, bar: PlannedBar, today: date) -> None:
         total_days = max(1, (bar.due - bar.start).days)
         elapsed = (today - bar.start).days
-        if bar.status == STATUS_DONE:
+        if bar.goal_met or bar.status == STATUS_DONE:
             ratio = 1.0
             bar_color = _COLOR_DONE
         elif bar.overdue:
@@ -435,9 +442,18 @@ class InspectorScheduleBlock(QWidget):
         user = get_current_user(self._workspace_root)
         if user is None:
             return
-        ids = list(bar.assignee_ids)
-        if not ids and (bar.assignee_id or "").strip():
-            ids = [(bar.assignee_id or "").strip()]
+        ids = list(
+            merged_assignee_ids_for_row(
+                read_project_schedule(self._project_root),
+                entity_kind=bar.entity_kind,
+                entity_rel=bar.entity_rel,
+                department=bar.department,
+            )
+        )
+        if not ids:
+            ids = list(bar.assignee_ids)
+            if not ids and (bar.assignee_id or "").strip():
+                ids = [(bar.assignee_id or "").strip()]
         if user.id not in normalize_assignee_ids(ids):
             return
         pending = find_pending_for_user(
@@ -463,7 +479,7 @@ class InspectorScheduleBlock(QWidget):
     def set_active_department(self, department: str | None) -> None:
         self._active_department = (department or "").strip() or None
 
-    def set_item(self, item: ViewItem | None, *, bars: dict[tuple[str, str, str], PlannedBar] | None = None) -> None:
+    def set_item(self, item: ViewItem | None, *, bars: BarStore | None = None) -> None:
         if item is None or self._project_root is None:
             self._clear()
             return
@@ -503,7 +519,10 @@ class InspectorScheduleBlock(QWidget):
             return
 
         self._dept_hint_block.setVisible(False)
-        focus_bar = next((b for b in entity_bars if b.department == dep), None)
+        dept_goals = [b for b in entity_bars if b.department == dep]
+        focus_bar = next_unmet_goal_in_row(dept_goals) or (
+            dept_goals[0] if dept_goals else None
+        )
         if focus_bar is None:
             label = self._dept_labels.get(dep, dep)
             self._dept_subcard.setVisible(False)
@@ -522,14 +541,14 @@ class InspectorScheduleBlock(QWidget):
         self,
         kind: str,
         rel: str,
-        bars: dict[tuple[str, str, str], PlannedBar] | None,
+        bars: BarStore | None,
         schedule,
         ref: Asset | Shot,
     ) -> list[PlannedBar]:
         rel_norm = rel.replace("\\", "/")
         entity_bars = sorted(
-            [b for k, b in (bars or {}).items() if k[0] == kind and k[1] == rel_norm],
-            key=lambda b: b.due,
+            [b for b in (bars or {}).values() if b.entity_kind == kind and b.entity_rel == rel_norm],
+            key=lambda b: (b.target_workflow_order, b.due),
         )
         if entity_bars or bars is not None:
             return entity_bars
@@ -549,8 +568,8 @@ class InspectorScheduleBlock(QWidget):
             include_assets=kind == "asset",
         )
         return sorted(
-            [b for k, b in built.items() if k[0] == kind and k[1] == rel_norm],
-            key=lambda b: b.due,
+            [b for b in built.values() if b.entity_kind == kind and b.entity_rel == rel_norm],
+            key=lambda b: (b.target_workflow_order, b.due),
         )
 
     def _render_dept_bar(self, bar: PlannedBar, today: date) -> None:
@@ -567,13 +586,22 @@ class InspectorScheduleBlock(QWidget):
             self._assignee_picker.set_workspace_root(self._workspace_root)
             from monostudio.core.user_identity import match_roster_user_by_name, normalize_assignee_ids
 
-            ids = list(bar.assignee_ids)
-            if not ids and (bar.assignee_id or "").strip():
-                ids = [(bar.assignee_id or "").strip()]
-            elif not ids and (bar.assignee or "").strip():
-                matched = match_roster_user_by_name(self._workspace_root, bar.assignee)
-                if matched:
-                    ids = [matched.id]
+            ids = list(
+                merged_assignee_ids_for_row(
+                    read_project_schedule(self._project_root),
+                    entity_kind=bar.entity_kind,
+                    entity_rel=bar.entity_rel,
+                    department=bar.department,
+                )
+            )
+            if not ids:
+                ids = list(bar.assignee_ids)
+                if not ids and (bar.assignee_id or "").strip():
+                    ids = [(bar.assignee_id or "").strip()]
+                elif not ids and (bar.assignee or "").strip():
+                    matched = match_roster_user_by_name(self._workspace_root, bar.assignee)
+                    if matched:
+                        ids = [matched.id]
             self._assignee_picker.set_user_ids(normalize_assignee_ids(ids))
         finally:
             self._assignee_sync = False

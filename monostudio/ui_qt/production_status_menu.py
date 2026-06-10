@@ -7,6 +7,7 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget, QWidgetAction
 
+from monostudio.core.department_status_registry import load_status_registry_for_department
 from monostudio.core.production_status import (
     ProductionStatusRegistry,
     color_hex_for_status_id,
@@ -116,6 +117,8 @@ def pick_production_status_at(
     parent: QWidget | None,
     project_root: Path | None,
     global_pos: QPoint,
+    *,
+    department_id: str | None = None,
 ) -> object:
     """
     Exec menu at global_pos.
@@ -124,7 +127,11 @@ def pick_production_status_at(
       None — Automatic (clear override)
       str — chosen status id
     """
-    reg = load_production_status_registry(project_root)
+    dep = (department_id or "").strip()
+    if dep:
+        reg = load_status_registry_for_department(project_root, dep)
+    else:
+        reg = load_production_status_registry(project_root)
     menu = MonosMenu(parent)
     menu.setObjectName("ProductionStatusMenu")
     # Qt menus often ignore QAction.toolTip unless explicitly enabled.

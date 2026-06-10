@@ -13,6 +13,7 @@ from PySide6.QtCore import (
     QItemSelection,
     QItemSelectionModel,
     QPersistentModelIndex,
+    QModelIndex,
     QMimeData,
     QPoint,
     QRect,
@@ -27,6 +28,7 @@ from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
+    QCursor,
     QDesktopServices,
     QFont,
     QFontMetrics,
@@ -36,6 +38,7 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPainter,
     QPainterPath,
+    QPaintEvent,
     QPen,
     QPixmap,
     QShortcut,
@@ -55,6 +58,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QPushButton,
     QRadioButton,
+    QRubberBand,
     QSizePolicy,
     QStyle,
     QStyledItemDelegate,
@@ -74,6 +78,14 @@ from monostudio.ui_qt.pipeline_view_models import (
     PipelineTileModel,
 )
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
+from monostudio.ui_qt.view_item_mtime import (
+    format_mtime_ts as _format_mtime,
+    latest_work_mtime_for_department as _latest_work_mtime_for_department,
+    mtime_display_for_path as _mtime_display_for_path,
+    mtime_display_for_publish_version_folder as _mtime_display_for_publish_version_folder,
+    view_item_last_updated_display as _view_item_last_updated_display,
+    view_item_last_updated_ts as _view_item_mtime_sort_ts,
+)
 from monostudio.ui_qt.thumbnails import ThumbnailCache
 from monostudio.ui_qt.inspector_preview_settings import (
     THUMB_SOURCE_RENDER_SEQUENCE,
@@ -82,6 +94,8 @@ from monostudio.ui_qt.inspector_preview_settings import (
     read_inspector_thumbnail_source,
     write_inspector_thumbnail_source,
 )
+from monostudio.ui_qt.inbox_list_row_paint import paint_inbox_list_row_chrome
+from monostudio.ui_qt.page_loading_bar import MainViewLoadingPlaceholder, is_scanning_empty_message
 from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, THUMB_TAG_STYLE, clear_stuck_widget_hover, monos_font
 from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators, vertical_icon_separator
 from monostudio.ui_qt.production_status_menu import _menu_status_dot_icon
@@ -113,7 +127,14 @@ from monostudio.core.entity_folders import (
 )
 from monostudio.core.models import Asset, Department, Shot
 from monostudio.core.project_schedule import ProjectSchedule, entity_rel_path, read_project_schedule
-from monostudio.core.schedule_planner import PlannedBar, list_due_display, summarize_entity_schedule
+from monostudio.core.schedule_planner import (
+    BarStore,
+    PlannedBar,
+    list_due_display,
+    merged_row_assignee_ids_from_bars,
+    primary_bar_for_row,
+    summarize_entity_schedule,
+)
 from monostudio.core.user_identity import resolve_assignee_display
 from monostudio.core.production_status import (
     ProductionStatusRegistry,
@@ -706,34 +727,6 @@ def _houdini_backup_folder_paths_for_department(
     return tuple(paths)
 
 
-def _latest_work_mtime_for_department(
-    ref: Asset | Shot,
-    active_department: str,
-    *,
-    active_dcc_id: str | None = None,
-) -> float | None:
-    dep_cf = (active_department or "").strip().casefold()
-    if not dep_cf:
-        return None
-    best: float | None = None
-    dcc_cf = (active_dcc_id or "").strip().casefold() if active_dcc_id else None
-    for (dept_id, dcc_id), state in getattr(ref, "dcc_work_states", ()) or ():
-        if (dept_id or "").strip().casefold() != dep_cf:
-            continue
-        if dcc_cf and (dcc_id or "").strip().casefold() != dcc_cf:
-            continue
-        wp = getattr(state, "work_file_path", None)
-        if not isinstance(wp, Path) or not wp.is_file():
-            continue
-        try:
-            ts = wp.stat().st_mtime
-        except OSError:
-            continue
-        if best is None or ts > best:
-            best = ts
-    return best
-
-
 def _latest_publish_mtime_for_department(ref: Asset | Shot, active_department: str) -> float | None:
     pub = _resolve_latest_publish_folder(ref, active_department)
     if pub is None or not pub.exists():
@@ -1100,98 +1093,6 @@ def _resolve_latest_publish_folder(ref: Asset | Shot, active_department: str | N
     return Path(dept.publish_path) / ver
 
 
-def _format_mtime(ts: float) -> str:
-    try:
-        from datetime import datetime
-
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return "—"
-
-
-def _mtime_display_for_path(path: Path) -> str:
-    try:
-        if path.is_dir() or path.is_file():
-            mtime = path.stat().st_mtime
-        else:
-            return "—"
-    except OSError:
-        return "—"
-    return _format_mtime(mtime)
-
-
-def _mtime_display_for_publish_version_folder(folder: Path) -> str:
-    """Use folder and immediate children mtimes so updates inside the publish drop show."""
-    try:
-        best = folder.stat().st_mtime
-    except OSError:
-        return "—"
-    try:
-        for ch in folder.iterdir():
-            try:
-                t = ch.stat().st_mtime
-                if t > best:
-                    best = t
-            except OSError:
-                continue
-    except OSError:
-        pass
-    return _format_mtime(best)
-
-
-def _view_item_mtime_sort_ts(
-    item: ViewItem,
-    *,
-    show_publish: bool,
-    active_department: str | None,
-) -> float:
-    """Numeric mtime for sort-by-date (same sources as last-updated display)."""
-    ref = item.ref
-    if show_publish and isinstance(ref, (Asset, Shot)):
-        pub = _resolve_latest_publish_folder(ref, active_department)
-        if pub is None or not pub.exists():
-            return 0.0
-        try:
-            best = pub.stat().st_mtime
-        except OSError:
-            return 0.0
-        try:
-            for ch in pub.iterdir():
-                try:
-                    best = max(best, ch.stat().st_mtime)
-                except OSError:
-                    continue
-        except OSError:
-            pass
-        return best
-    path = getattr(item, "path", None)
-    if not path or not isinstance(path, Path):
-        return 0.0
-    try:
-        return path.stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def _view_item_last_updated_display(
-    item: ViewItem,
-    *,
-    show_publish: bool,
-    active_department: str | None,
-) -> str:
-    """Last updated for list/tile meta: asset/shot root in Work mode, latest publish version folder in Published."""
-    ref = item.ref
-    if show_publish and isinstance(ref, (Asset, Shot)):
-        pub = _resolve_latest_publish_folder(ref, active_department)
-        if pub is None or not pub.exists():
-            return "—"
-        return _mtime_display_for_publish_version_folder(pub)
-    path = getattr(item, "path", None)
-    if not path or not isinstance(path, Path):
-        return "—"
-    return _mtime_display_for_path(path)
-
-
 def _resolve_publish_root_folder(ref: Asset | Shot, active_department: str | None) -> Path | None:
     """Path to the publish root folder (e.g. <dept>/publish/). Only returns a department that has publish versions."""
     dept = _resolve_publish_department(ref, active_department)
@@ -1400,6 +1301,16 @@ def _list_health_chip_rect(cell_rect: QRect) -> QRect:
         chip,
         chip,
     )
+
+
+def _list_header_column_width(header_label: str, *, min_content_px: int = 0) -> int:
+    """Width for a fixed list column — fits uppercase header text (global QHeaderView QSS)."""
+    font = monos_font("Inter", 12, QFont.Weight.ExtraBold)
+    fm = QFontMetrics(font)
+    text = header_label.upper()
+    text_w = fm.horizontalAdvance(text) + max(0, len(text) - 1)  # letter-spacing: 1px
+    # QHeaderView::section uses padding 10px 15px; +6 for section edge/grip.
+    return max(min_content_px, text_w + 30 + 6)
 
 
 _LIST_SPECIAL_FOLDER_ICON_PX = 16
@@ -1863,6 +1774,41 @@ def _grid_status_pill_department_at(
     return None
 
 
+def _grid_project_status_pill_rect(
+    cell_rect: QRect,
+    gap_px: int,
+    pos: QPoint,
+    *,
+    selected: bool,
+    line: str,
+) -> QRect | None:
+    """Rect for project card status pill when pos hits it (project browser grid)."""
+    g = max(0, int(gap_px))
+    r = cell_rect.adjusted(0, 0, -g, -g)
+    if not r.contains(pos):
+        return None
+    border_px = 2 if selected else 1
+    inner = r.adjusted(border_px, border_px, -border_px, -border_px)
+    thumb_w = inner.width()
+    thumb_h = max(1, int(thumb_w * 9 / 16))
+    thumb = QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
+    y_meta = thumb.bottom() + _grid_asset_shot_meta_head_to_first_line()
+    y_pills = y_meta + _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+    if pos.y() < y_pills:
+        return None
+    x = inner.left() + 16
+    w = inner.width() - 32
+    chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
+    fm = QFontMetrics(chip_font)
+    chip_h = _grid_status_pill_line_height(fm)
+    chip_pad_x = 8
+    dot_r = 3
+    tw = fm.horizontalAdvance(line) + chip_pad_x * 2 + dot_r * 2 + 6
+    tw = min(tw, w)
+    chip_rect = QRect(x, y_pills, tw, chip_h)
+    return chip_rect if chip_rect.contains(pos) else None
+
+
 def _list_status_pill_natural_width(line: str, fm: QFontMetrics) -> int:
     """Full pill width (text + dot + padding) before fitting to cell."""
     chip_pad_x = 8
@@ -1887,12 +1833,14 @@ def _paint_status_pill_chip(
     color_hex: str,
     *,
     fm: QFontMetrics,
+    font: QFont | None = None,
     hovered: bool = False,
 ) -> None:
     """Shared production-style status pill (dot + tinted chip), list + grid."""
     chip_pad_x = 8
     dot_r = 3
-    painter.setFont(fm)
+    if font is not None:
+        painter.setFont(font)
     painter.setPen(Qt.NoPen)
     qc = QColor(color_hex)
     bg = QColor(qc)
@@ -1970,45 +1918,414 @@ def _write_active_dcc(item_path: Path, active_department: str, dcc_id: str) -> N
         pass
 
 
-class _ClearOnEmptyClickListView(QListView):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._middle_drag_start_pos: QPoint | None = None
-        self._shift_anchor_index: QPersistentModelIndex | None = None
+_RUBBER_BAND_THRESHOLD = 4
 
-    def _select_shift_range_rows(
-        self,
-        *,
-        anchor,
-        target,
-        add: bool,
-    ) -> None:
-        """
-        Reliable shift-range selection for QListView IconMode.
-        Selecting with QItemSelection(topLeft,bottomRight) can behave inconsistently for icon layouts,
-        so we select rows explicitly.
-        """
+
+def _try_set_minimal_viewport_update(view) -> None:
+    """Best-effort: reduce repaint area during selection/drag (not available on all Qt builds)."""
+    enum_cls = getattr(QAbstractItemView, "ViewportUpdateMode", None)
+    if enum_cls is None:
+        return
+    mode = getattr(enum_cls, "MinimalViewportUpdate", None)
+    if mode is None:
+        return
+    for name in ("setViewportUpdateMode", "set_viewport_update_mode"):
+        fn = getattr(view, name, None)
+        if callable(fn):
+            fn(mode)
+            return
+    base_fn = getattr(QAbstractItemView, "setViewportUpdateMode", None) or getattr(
+        QAbstractItemView, "set_viewport_update_mode", None
+    )
+    if callable(base_fn):
+        try:
+            base_fn(view, mode)
+        except Exception:
+            pass
+
+
+class _RubberBandSelectMixin:
+    """Track drag-marquee so MainView can defer Inspector updates until release."""
+
+    def _rb_init(self) -> None:
+        self._left_press_pos: QPoint | None = None
+        self._rb_selecting = False
+        self._rb_gesture = False
+        self._on_rubber_band_finished: Callable[[], None] | None = None
+        self._rb_press_modifiers = Qt.KeyboardModifier.NoModifier
+        self._rubber_band_widget: QRubberBand | None = None
+        self._last_click_index: QPersistentModelIndex | None = None
+        self._last_click_time: float = 0.0
+        self._rb_skip_release_click = False
+        self._shift_click_pending = False
+        self._rb_empty_press = False
+
+    def _rb_acquire_mouse(self) -> None:
+        vp = self._rb_viewport()
+        if vp is None:
+            return
+        try:
+            vp.grabMouse()
+        except Exception:
+            pass
+
+    def _rb_release_mouse(self) -> None:
+        vp = self._rb_viewport()
+        if vp is None:
+            return
+        try:
+            if QWidget.mouseGrabber() is vp:
+                vp.releaseMouse()
+        except Exception:
+            pass
+
+    def _rb_force_cleanup(self) -> None:
+        """Always drop marquee state and viewport mouse grab (hover breaks if grab leaks)."""
+        self._rb_hide_rubber_band()
+        self._rb_release_mouse()
+        self._left_press_pos = None
+        self._rb_selecting = False
+        self._rb_empty_press = False
+        self._rb_gesture = False
+
+    def _shift_anchor_model_index(self):
+        anchor = getattr(self, "_shift_anchor_index", None)
+        if anchor is not None and anchor.isValid():
+            return anchor
+        sm = self.selectionModel()
+        if sm is not None:
+            cur = sm.currentIndex()
+            if cur.isValid():
+                return cur
+        return QModelIndex()
+
+    def _row_passes_selection_filter(self, idx) -> bool:
+        m = self.model()
+        if m is None or not idx.isValid():
+            return False
+        mv = m.parent()
+        is_dimmed = getattr(mv, "_is_item_dimmed", None) if mv is not None else None
+        if not callable(is_dimmed):
+            return True
+        item = idx.data(Qt.UserRole)
+        return not (isinstance(item, ViewItem) and is_dimmed(item))
+
+    def _select_shift_range_rows(self, *, anchor, target, add: bool) -> None:
+        """Row range for IconMode grid / list — skips dimmed pipeline items."""
         sm = self.selectionModel()
         m = self.model()
         if sm is None or m is None or not (anchor.isValid() and target.isValid()):
             return
-        a = anchor.row()
-        b = target.row()
-        lo = min(a, b)
-        hi = max(a, b)
-        flags = (
-            QItemSelectionModel.SelectionFlag.Select
-            if add
-            else QItemSelectionModel.SelectionFlag.ClearAndSelect
-        )
+        lo = min(anchor.row(), target.row())
+        hi = max(anchor.row(), target.row())
         if not add:
             sm.clearSelection()
         for r in range(lo, hi + 1):
             idx = m.index(r, 0)
-            if idx.isValid():
+            if idx.isValid() and self._row_passes_selection_filter(idx):
                 sm.select(idx, QItemSelectionModel.SelectionFlag.Select)
+        sm.setCurrentIndex(target, QItemSelectionModel.SelectionFlag.NoUpdate)
+
+    def _apply_shift_range_to_pos(self, pos: QPoint, *, add: bool | None = None) -> None:
+        target = self.indexAt(pos)
+        if not target.isValid():
+            return
+        if add is None:
+            add = bool(self._rb_press_modifiers & Qt.KeyboardModifier.ControlModifier)
+        self._select_shift_range_rows(
+            anchor=self._shift_anchor_model_index(),
+            target=target,
+            add=add,
+        )
+
+    def _handle_shift_left_release(self, event: QMouseEvent) -> None:
+        self._rb_promote_to_marquee(event.pos())
+        if self._rb_selecting:
+            self._rb_update_rubber_band(event.pos())
+            self._apply_rubber_band_row_selection(event.pos())
+        else:
+            self._apply_shift_range_to_pos(
+                event.pos(),
+                add=bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier),
+            )
+        self._shift_click_pending = False
+        self._rb_on_left_release()
+        sm = self.selectionModel()
+        if sm is not None and sm.currentIndex().isValid():
+            self._shift_anchor_index = QPersistentModelIndex(sm.currentIndex())
+
+    def _apply_plain_left_click(self, event: QMouseEvent) -> None:
+        idx = self.indexAt(event.pos())
+        sm = self.selectionModel()
+        if sm is None or not idx.isValid():
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if sm.isSelected(idx):
+                sm.select(idx, QItemSelectionModel.SelectionFlag.Deselect)
+            else:
+                sm.select(idx, QItemSelectionModel.SelectionFlag.Select)
+            sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+        else:
+            sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            sm.select(idx, QItemSelectionModel.SelectionFlag.Select)
+
+    def _finish_left_button_release(self, event: QMouseEvent) -> None:
+        """Rubber-band end, double-click, or plain click — never delegate to Qt (avoids undoing selection)."""
+        if getattr(self, "_rb_skip_release_click", False):
+            self._rb_skip_release_click = False
+            self._rb_on_left_release()
+            return
+        self._rb_promote_to_marquee(event.pos())
+        if self._rb_selecting:
+            self._rb_update_rubber_band(event.pos())
+            self._apply_rubber_band_row_selection(event.pos())
+            self._rb_on_left_release()
+            return
+        now = time.monotonic()
+        idx = self.indexAt(event.pos())
+        if getattr(self, "_rb_empty_press", False) and not idx.isValid():
+            if not bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self.clearSelection()
+                self._shift_anchor_index = None
+            self._rb_on_left_release()
+            return
+        dbl_ms = float(QApplication.doubleClickInterval())
+        last = self._last_click_index
+        if (
+            idx.isValid()
+            and last is not None
+            and last.isValid()
+            and idx.row() == last.row()
+            and (now - self._last_click_time) * 1000.0 <= dbl_ms
+        ):
+            self._last_click_index = None
+            self._last_click_time = 0.0
+            self._rb_on_left_release()
+            self.doubleClicked.emit(idx)
+            return
+        self._apply_plain_left_click(event)
+        if idx.isValid():
+            self._last_click_index = QPersistentModelIndex(idx)
+            self._last_click_time = now
+        else:
+            self._last_click_index = None
+        self._rb_on_left_release()
+
+    def rubber_band_selecting(self) -> bool:
+        return bool(self._rb_selecting)
+
+    def _rb_viewport(self):
+        fn = getattr(self, "viewport", None)
+        return fn() if callable(fn) else None
+
+    @staticmethod
+    def _rb_marquee_threshold() -> int:
+        # Do not use startDragDistance() (often 10px) — that caused “must drag twice”.
+        return _RUBBER_BAND_THRESHOLD
+
+    def _rb_promote_to_marquee(self, pos: QPoint) -> None:
+        if self._rb_selecting or self._left_press_pos is None:
+            return
+        delta = pos - self._left_press_pos
+        if delta.manhattanLength() >= self._rb_marquee_threshold():
+            try:
+                self.doItemsLayout()
+            except Exception:
+                pass
+            self._rb_selecting = True
+
+    def _ensure_rubber_band_widget(self) -> QRubberBand:
+        if self._rubber_band_widget is None:
+            self._rubber_band_widget = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
+        return self._rubber_band_widget
+
+    def _rb_on_left_press(self, pos: QPoint, modifiers=Qt.KeyboardModifier.NoModifier) -> None:
+        self._rb_release_mouse()
+        self._left_press_pos = pos
+        self._rb_selecting = False
+        self._rb_gesture = True
+        self._rb_press_modifiers = modifiers
+        self._rb_skip_release_click = False
+        self._rb_empty_press = not self.indexAt(pos).isValid()
+        self._rb_acquire_mouse()
+
+    def _rb_is_icon_grid(self) -> bool:
+        return isinstance(self, QListView) and self.viewMode() == QListView.IconMode
+
+    def _marquee_rect(self, current_pos: QPoint) -> QRect:
+        if self._left_press_pos is None:
+            return QRect()
+        norm = QRect(self._left_press_pos, current_pos).normalized()
+        if norm.isNull():
+            return norm
+        return norm.adjusted(-1, -1, 1, 1)
+
+    def _row_visual_rect(self, row: int) -> QRect:
+        """Visible row bounds for marquee hit-testing (table rows span viewport width)."""
+        m = self.model()
+        if m is None or row < 0 or row >= m.rowCount():
+            return QRect()
+        if isinstance(self, QTableView):
+            try:
+                y = self.rowViewportPosition(row)
+                h = self.rowHeight(row)
+            except Exception:
+                return QRect()
+            if h <= 0:
+                return QRect()
+            vp = self.viewport()
+            vw = vp.width() if vp is not None else 0
+            if vw <= 0:
+                idx = m.index(row, 0)
+                return self.visualRect(idx) if idx.isValid() else QRect()
+            return QRect(0, y, vw, h)
+        idx = m.index(row, 0)
+        if not idx.isValid():
+            return QRect()
+        return self.visualRect(idx)
+
+    def _rows_in_marquee_rect(self, norm: QRect) -> list[int]:
+        """Model rows whose visual cell intersects the marquee (geometry only)."""
+        m = self.model()
+        if m is None or norm.isNull():
+            return []
+        rows: set[int] = set()
+
+        def _add_row(row: int) -> None:
+            if row < 0 or row >= m.rowCount():
+                return
+            idx = m.index(row, 0)
+            if idx.isValid() and self._row_passes_selection_filter(idx):
+                rows.add(row)
+
+        def _add_at(pt: QPoint) -> None:
+            idx = self.indexAt(pt)
+            if idx.isValid():
+                _add_row(idx.row())
+
+        for pt in (
+            norm.topLeft(),
+            norm.topRight(),
+            norm.bottomLeft(),
+            norm.bottomRight(),
+            norm.center(),
+        ):
+            _add_at(pt)
+
+        if self._rb_is_icon_grid():
+            gs = self.gridSize()
+            gw = int(gs.width())
+            gh = int(gs.height())
+            if gw > 1 and gh > 1:
+                step_x = max(1, gw // 3)
+                step_y = max(1, gh // 3)
+                y = norm.top()
+                while y <= norm.bottom():
+                    x = norm.left()
+                    while x <= norm.right():
+                        _add_at(QPoint(x, y))
+                        x += step_x
+                    y += step_y
+
+        for row in range(m.rowCount()):
+            idx = m.index(row, 0)
+            if not idx.isValid():
+                continue
+            if not self._row_passes_selection_filter(idx):
+                continue
+            vr = self._row_visual_rect(row)
+            if vr.isValid() and not vr.isEmpty() and norm.intersects(vr):
+                rows.add(row)
+
+        return sorted(rows)
+
+    def _rb_on_move(self, event: QMouseEvent) -> None:
+        if self._left_press_pos is None:
+            return
+        if not bool(event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        self._rb_promote_to_marquee(event.pos())
+
+    def _rb_update_rubber_band(self, current_pos: QPoint) -> None:
+        if self._left_press_pos is None or not self._rb_selecting:
+            return
+        rect = QRect(self._left_press_pos, current_pos).normalized()
+        rb = self._ensure_rubber_band_widget()
+        rb.setGeometry(rect)
+        rb.show()
+
+    def _rb_hide_rubber_band(self) -> None:
+        rb = self._rubber_band_widget
+        if rb is None:
+            return
+        rb.hide()
+        rb.setGeometry(QRect())
+        vp = self._rb_viewport()
+        if vp is not None:
+            vp.update()
+
+    def _apply_rubber_band_row_selection(self, current_pos: QPoint) -> None:
+        """Marquee selection = items intersecting the current press→cursor rect."""
+        sm = self.selectionModel()
+        m = self.model()
+        if sm is None or m is None or self._left_press_pos is None:
+            return
+        shift = bool(self._rb_press_modifiers & Qt.KeyboardModifier.ShiftModifier)
+        ctrl = bool(self._rb_press_modifiers & Qt.KeyboardModifier.ControlModifier)
+        norm = self._marquee_rect(current_pos)
+        if norm.isNull():
+            return
+        rows_in_rect = self._rows_in_marquee_rect(norm)
+
+        if shift:
+            lo = min(rows_in_rect) if rows_in_rect else None
+            hi = max(rows_in_rect) if rows_in_rect else None
+            anchor = self._shift_anchor_model_index()
+            if anchor.isValid():
+                lo = min(lo, anchor.row()) if lo is not None else anchor.row()
+                hi = max(hi, anchor.row()) if hi is not None else anchor.row()
+            elif lo is None or hi is None:
+                return
+            if not ctrl:
+                sm.clearSelection()
+            for r in range(lo, hi + 1):
+                idx = m.index(r, 0)
+                if idx.isValid() and self._row_passes_selection_filter(idx):
+                    sm.select(idx, QItemSelectionModel.SelectionFlag.Select)
+            return
+
+        selection = QItemSelection()
+        for row in rows_in_rect:
+            idx = m.index(row, 0)
+            if idx.isValid():
+                selection.select(idx, idx)
+        if ctrl:
+            sm.select(selection, QItemSelectionModel.SelectionFlag.Select)
+        else:
+            sm.select(selection, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        if rows_in_rect:
+            last_idx = m.index(rows_in_rect[-1], 0)
+            if last_idx.isValid():
+                sm.setCurrentIndex(last_idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+
+    def _rb_on_left_release(self) -> bool:
+        was_rubber = bool(self._rb_selecting)
+        self._rb_force_cleanup()
+        if was_rubber and self._on_rubber_band_finished is not None:
+            self._on_rubber_band_finished()
+        return was_rubber
+
+
+class _ClearOnEmptyClickListView(_RubberBandSelectMixin, QListView):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._rb_init()
+        self._middle_drag_start_pos: QPoint | None = None
+        self._shift_anchor_index: QPersistentModelIndex | None = None
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._rb_on_left_press(event.pos(), event.modifiers())
         if event.button() == Qt.MouseButton.MiddleButton:
             # Middle button: drag gesture only (do not alter selection).
             idx = self.indexAt(event.pos())
@@ -2019,37 +2336,21 @@ class _ClearOnEmptyClickListView(QListView):
             self._middle_drag_start_pos = event.pos()
             event.accept()
             return
-        # Fix: shift-click should select a range in both directions (up or down).
+        # Shift+click/drag: defer range until release or live update while dragging.
         if event.button() == Qt.MouseButton.LeftButton and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
-            idx = self.indexAt(event.pos())
-            sm = self.selectionModel()
-            if idx.isValid() and sm is not None:
-                # Use a stable anchor like Explorer: last non-modified click becomes anchor.
-                anchor = self._shift_anchor_index
-                if anchor is None or not anchor.isValid():
-                    anchor = sm.currentIndex()
-                if not anchor.isValid():
-                    anchor = idx
-
-                sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
-                add = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
-                self._select_shift_range_rows(anchor=anchor, target=idx, add=add)
+            if self.indexAt(event.pos()).isValid():
+                self._shift_click_pending = True
                 event.accept()
                 return
-        # Clear selection only on primary click on empty area.
+        # Clear selection only on primary click on empty area (defer until release — not marquee).
         if event.button() == Qt.MouseButton.LeftButton and not self.indexAt(event.pos()).isValid():
-            self.clearSelection()
             self._shift_anchor_index = None
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
         super().mousePressEvent(event)
-        # Update anchor on plain left-clicks (no modifiers), after default selection logic runs.
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and event.modifiers() == Qt.KeyboardModifier.NoModifier
-            and self.indexAt(event.pos()).isValid()
-        ):
-            sm = self.selectionModel()
-            if sm is not None and sm.currentIndex().isValid():
-                self._shift_anchor_index = QPersistentModelIndex(sm.currentIndex())
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         if bool(event.buttons() & Qt.MouseButton.MiddleButton) and self._middle_drag_start_pos is not None:
@@ -2059,11 +2360,38 @@ class _ClearOnEmptyClickListView(QListView):
                 self._middle_drag_start_pos = None
             event.accept()
             return
+        self._rb_on_move(event)
+        if bool(event.buttons() & Qt.MouseButton.LeftButton) and self._left_press_pos is not None:
+            if self._shift_click_pending:
+                if self._rb_selecting:
+                    self._apply_shift_range_to_pos(event.pos())
+                event.accept()
+                return
+            if self._rb_selecting:
+                self._rb_update_rubber_band(event.pos())
+                self._apply_rubber_band_row_selection(event.pos())
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.MiddleButton:
             self._middle_drag_start_pos = None
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._shift_click_pending:
+                self._handle_shift_left_release(event)
+                event.accept()
+                return
+            self._rb_promote_to_marquee(event.pos())
+            was_rubber = bool(self._rb_selecting)
+            skip_click = bool(getattr(self, "_rb_skip_release_click", False))
+            self._finish_left_button_release(event)
+            if not was_rubber and not skip_click:
+                sm = self.selectionModel()
+                if sm is not None and sm.currentIndex().isValid():
+                    self._shift_anchor_index = QPersistentModelIndex(sm.currentIndex())
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -2231,17 +2559,126 @@ class _ClearOnEmptyClickListView(QListView):
         drag.setMimeData(mime)
         drag.setPixmap(out)
         drag.setHotSpot(QPoint(24, 24))
-        drag.exec(supportedActions)
+        delegate = self.itemDelegate()
+        if hasattr(delegate, "set_fast_paint"):
+            delegate.set_fast_paint(True)
+        try:
+            drag.exec(supportedActions)
+        finally:
+            if hasattr(delegate, "set_fast_paint"):
+                delegate.set_fast_paint(False)
 
 
-class _ClearOnEmptyClickTableView(QTableView):
+class _ClearOnEmptyClickTableView(_RubberBandSelectMixin, QTableView):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._rb_init()
+        self._shift_anchor_index: QPersistentModelIndex | None = None
+
+    def _list_row_bg_option(self, row: int) -> QStyleOptionViewItem:
+        m = self.model()
+        vp = self.viewport()
+        y = self.rowViewportPosition(row)
+        h = self.rowHeight(row)
+        opt = QStyleOptionViewItem()
+        opt.rect = QRect(0, y, vp.width(), h)
+        opt.state = QStyle.StateFlag.State_Enabled
+        sm = self.selectionModel()
+        idx0 = m.index(row, 0) if m is not None else QModelIndex()
+        if sm is not None and idx0.isValid() and sm.isSelected(idx0):
+            opt.state |= QStyle.StateFlag.State_Selected
+        hover = self.indexAt(vp.mapFromGlobal(QCursor.pos()))
+        if hover.isValid() and hover.row() == row:
+            opt.state |= QStyle.StateFlag.State_MouseOver
+        return opt
+
+    def _paint_list_row_backgrounds(self, painter: QPainter, exposed: QRect) -> None:
+        m = self.model()
+        if m is None or m.rowCount() <= 0:
+            return
+        top = self.rowAt(exposed.top())
+        if top < 0:
+            top = 0
+        bottom = self.rowAt(exposed.bottom())
+        if bottom < 0:
+            bottom = m.rowCount() - 1
+        vp_w = self.viewport().width()
+        painter.save()
+        try:
+            painter.setClipping(False)
+            for row in range(top, bottom + 1):
+                y = self.rowViewportPosition(row)
+                h = self.rowHeight(row)
+                if h <= 0 or y + h < exposed.top() or y > exposed.bottom():
+                    continue
+                opt = self._list_row_bg_option(row)
+                paint_inbox_list_row_chrome(painter, opt, viewport_width=vp_w)
+                if opt.state & QStyle.StateFlag.State_Selected:
+                    accent = QColor(MONOS_COLORS["blue_600"])
+                    painter.fillRect(0, y, 2, h, accent)
+        finally:
+            painter.restore()
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
+        vp = self.viewport()
+        painter = QPainter(vp)
+        try:
+            self._paint_list_row_backgrounds(painter, event.rect())
+        finally:
+            painter.end()
+        super().paintEvent(event)
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._rb_on_left_press(event.pos(), event.modifiers())
         if event.button() == Qt.MouseButton.MiddleButton:
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            if self.indexAt(event.pos()).isValid():
+                self._shift_click_pending = True
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.LeftButton and not self.indexAt(event.pos()).isValid():
-            self.clearSelection()
+            self._shift_anchor_index = None
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        self._rb_on_move(event)
+        if bool(event.buttons() & Qt.MouseButton.LeftButton) and self._left_press_pos is not None:
+            if self._shift_click_pending:
+                if self._rb_selecting:
+                    self._apply_shift_range_to_pos(event.pos())
+                event.accept()
+                return
+            if self._rb_selecting:
+                self._rb_update_rubber_band(event.pos())
+                self._apply_rubber_band_row_selection(event.pos())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._shift_click_pending:
+                self._handle_shift_left_release(event)
+                event.accept()
+                return
+            self._rb_promote_to_marquee(event.pos())
+            was_rubber = bool(self._rb_selecting)
+            self._finish_left_button_release(event)
+            if not was_rubber:
+                sm = self.selectionModel()
+                if sm is not None and sm.currentIndex().isValid():
+                    self._shift_anchor_index = QPersistentModelIndex(sm.currentIndex())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class _ListRowDelegate(QStyledItemDelegate):
@@ -2342,6 +2779,12 @@ class _ListRowDelegate(QStyledItemDelegate):
             base = super().sizeHint(option, index)
             return QSize(max(base.width(), chip + 12), max(base.height(), chip + 8))
         return super().sizeHint(option, index)
+
+    def _paint_default_cell(self, painter: QPainter, option, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.showDecorationSelected = False
+        super().paint(painter, opt, index)
 
     def paint(self, painter: QPainter, option, index) -> None:
         item = index.data(Qt.UserRole)
@@ -2448,7 +2891,7 @@ class _ListRowDelegate(QStyledItemDelegate):
             item = index.data(Qt.UserRole)
             if painted_pix:
                 return
-            super().paint(painter, option, index)
+            self._paint_default_cell(painter, option, index)
             return
 
         list_col_notes = main._list_col_notes() if hasattr(main, "_list_col_notes") else -1
@@ -2472,13 +2915,6 @@ class _ListRowDelegate(QStyledItemDelegate):
                 painter.save()
                 try:
                     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                    opt = QStyleOptionViewItem(option)
-                    self.initStyleOption(opt, index)
-                    opt.text = ""
-                    opt.icon = QIcon()
-                    self._view.style().drawControl(
-                        QStyle.ControlElement.CE_ItemViewItem, opt, painter, self._view
-                    )
                     chip_rect = _list_health_chip_rect(option.rect)
                     _paint_note_icon_chip(
                         painter,
@@ -2511,13 +2947,6 @@ class _ListRowDelegate(QStyledItemDelegate):
                     painter.save()
                     try:
                         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                        opt = QStyleOptionViewItem(option)
-                        self.initStyleOption(opt, index)
-                        opt.text = ""
-                        opt.icon = QIcon()
-                        self._view.style().drawControl(
-                            QStyle.ControlElement.CE_ItemViewItem, opt, painter, self._view
-                        )
                         chip_rect = _list_health_chip_rect(option.rect)
                         health_hover = self._hovered_health_row == index.row()
                         _paint_health_icon_chip(
@@ -2549,13 +2978,6 @@ class _ListRowDelegate(QStyledItemDelegate):
             painter.save()
             try:
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                opt = QStyleOptionViewItem(option)
-                self.initStyleOption(opt, index)
-                opt.text = ""
-                opt.icon = QIcon()
-                self._view.style().drawControl(
-                    QStyle.ControlElement.CE_ItemViewItem, opt, painter, self._view
-                )
                 _paint_list_special_folder_icon(
                     painter,
                     _list_special_folder_chip_rect(option.rect),
@@ -2582,13 +3004,6 @@ class _ListRowDelegate(QStyledItemDelegate):
             painter.save()
             try:
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                opt = QStyleOptionViewItem(option)
-                self.initStyleOption(opt, index)
-                opt.text = ""
-                opt.icon = QIcon()
-                self._view.style().drawControl(
-                    QStyle.ControlElement.CE_ItemViewItem, opt, painter, self._view
-                )
                 chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
                 fm = QFontMetrics(chip_font)
                 pill_rect = _list_status_pill_rect_for_cell(option.rect, line, fm)
@@ -2599,6 +3014,7 @@ class _ListRowDelegate(QStyledItemDelegate):
                     line,
                     color_hex,
                     fm=fm,
+                    font=chip_font,
                     hovered=pill_hover,
                 )
             finally:
@@ -2621,11 +3037,6 @@ class _ListRowDelegate(QStyledItemDelegate):
                 painter.save()
                 try:
                     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                    opt = QStyleOptionViewItem(option)
-                    self.initStyleOption(opt, index)
-                    opt.text = ""
-                    opt.icon = QIcon()
-                    self._view.style().drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, self._view)
                     reg = main._production_status_registry_cached()
                     hidden = set(getattr(main, "_inspector_hidden_departments", set()) or ())
                     sid = aggregate_status_id_for_item(
@@ -2645,16 +3056,17 @@ class _ListRowDelegate(QStyledItemDelegate):
                         line,
                         color_hex_for_status_id(sid, reg),
                         fm=fm,
+                        font=chip_font,
                         hovered=pill_hover,
                     )
                 except Exception:
                     painter.restore()
-                    super().paint(painter, option, index)
+                    self._paint_default_cell(painter, option, index)
                     return
                 painter.restore()
                 return
 
-        super().paint(painter, option, index)
+        self._paint_default_cell(painter, option, index)
 
 
 class _GridCardDelegate(QStyledItemDelegate):
@@ -2725,38 +3137,132 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._icon_calendar_meta = lucide_icon("calendar", size=12, color_hex=MONOS_COLORS["text_meta"])
         self._icon_hash_meta = lucide_icon("hash", size=12, color_hex=MONOS_COLORS["text_meta"])
 
+        self._fast_paint = False
+        self._thumb_cache: dict[tuple[int, int, int, bool], QPixmap] = {}
+        self._thumb_cache_max = 320
+        self._production_reg_root: str | None = None
+        self._production_reg_cache = None
+
     @staticmethod
     def _norm(s: str | None) -> str:
         return (s or "").strip().casefold()
 
+    def set_fast_paint(self, enabled: bool) -> None:
+        if self._fast_paint == bool(enabled):
+            return
+        self._fast_paint = bool(enabled)
+        self._view.viewport().update()
+
+    def _should_fast_paint(self) -> bool:
+        if self._fast_paint:
+            return True
+        view = self._view
+        if hasattr(view, "rubber_band_selecting") and view.rubber_band_selecting():
+            return True
+        return False
+
+    def _interaction_busy(self) -> bool:
+        if self._should_fast_paint():
+            return True
+        buttons = QApplication.mouseButtons()
+        return bool(buttons & (Qt.MouseButton.LeftButton | Qt.MouseButton.MiddleButton))
+
+    def _clear_thumb_cache(self) -> None:
+        self._thumb_cache.clear()
+
+    def _repaint_delegate_rows(self, *rows: int | None) -> None:
+        m = self._view.model()
+        if m is None:
+            self._view.viewport().update()
+            return
+        seen: set[int] = set()
+        for row in rows:
+            if row is None or row in seen:
+                continue
+            seen.add(int(row))
+            idx = m.index(int(row), 0)
+            if idx.isValid():
+                self._view.update(idx)
+        if not seen:
+            self._view.viewport().update()
+
+    def _production_status_registry(self):
+        root = self._active_project_root
+        if root == self._production_reg_root:
+            return self._production_reg_cache
+        self._production_reg_root = root
+        if not root:
+            self._production_reg_cache = None
+            return None
+        try:
+            self._production_reg_cache = load_production_status_registry(Path(root))
+        except Exception:
+            self._production_reg_cache = None
+        return self._production_reg_cache
+
+    def _cached_thumb_crop(self, icon: QIcon, thumb: QRect, *, fast: bool) -> QPixmap | None:
+        if thumb.width() <= 0 or thumb.height() <= 0:
+            return None
+        key = (thumb.width(), thumb.height(), int(icon.cacheKey()), bool(fast))
+        cached = self._thumb_cache.get(key)
+        if cached is not None and not cached.isNull():
+            return cached
+        src = icon.pixmap(256, 256)
+        if src.isNull():
+            return None
+        mode = Qt.FastTransformation if fast else Qt.SmoothTransformation
+        scaled = src.scaled(thumb.size(), Qt.KeepAspectRatioByExpanding, mode)
+        sx = max(0, (scaled.width() - thumb.width()) // 2)
+        sy = max(0, (scaled.height() - thumb.height()) // 2)
+        crop = scaled.copy(QRect(QPoint(sx, sy), thumb.size()))
+        if crop.isNull():
+            return None
+        if len(self._thumb_cache) >= self._thumb_cache_max:
+            self._thumb_cache.clear()
+        self._thumb_cache[key] = crop
+        return crop
+
     def set_hovered_index(self, index) -> None:
+        if self._interaction_busy():
+            return
         row = index.row() if index and index.isValid() else None
         if self._hovered_row == row:
             return
+        old_row = self._hovered_row
         self._hovered_row = row
-        self._view.viewport().update()
+        self._repaint_delegate_rows(old_row, row)
 
     def set_hovered_pill_row(self, row: int | None) -> None:
+        if self._interaction_busy():
+            return
         if self._hovered_pill_row == row:
             return
+        old_row = self._hovered_pill_row
         self._hovered_pill_row = row
-        self._view.viewport().update()
+        self._repaint_delegate_rows(old_row, row)
 
     def set_hovered_health_row(self, row: int | None) -> None:
+        if self._interaction_busy():
+            return
         if self._hovered_health_row == row:
             return
+        old_row = self._hovered_health_row
         self._hovered_health_row = row
-        self._view.viewport().update()
+        self._repaint_delegate_rows(old_row, row)
 
     def set_hovered_notes_row(self, row: int | None) -> None:
+        if self._interaction_busy():
+            return
         if self._hovered_notes_row == row:
             return
+        old_row = self._hovered_notes_row
         self._hovered_notes_row = row
-        self._view.viewport().update()
+        self._repaint_delegate_rows(old_row, row)
 
     def set_card_size(self, size: QSize) -> None:
         if size.isValid() and size != self._card_size:
             self._card_size = size
+            self._clear_thumb_cache()
             self._view.viewport().update()
 
     def set_gap_px(self, gap_px: int) -> None:
@@ -2781,6 +3287,8 @@ class _GridCardDelegate(QStyledItemDelegate):
         if p == self._active_project_root:
             return
         self._active_project_root = p
+        self._production_reg_root = None
+        self._production_reg_cache = None
         self._view.viewport().update()
 
     def set_dept_registry(self, registry: DepartmentRegistry | None) -> None:
@@ -2901,9 +3409,11 @@ class _GridCardDelegate(QStyledItemDelegate):
             p.setRenderHint(QPainter.Antialiasing, True)
             p.setRenderHint(QPainter.TextAntialiasing, True)
 
+            fast = self._should_fast_paint()
+
             # Card background
             bg = self._c_card_bg
-            hover = bool(self._hovered_row == index.row())
+            hover = bool(self._hovered_row == index.row()) and not fast
             if hover:
                 bg = self._c_card_hover
 
@@ -2917,7 +3427,8 @@ class _GridCardDelegate(QStyledItemDelegate):
             # Dim card when showing Published mode but item has no publish (strong dim, no selection)
             _dim_card = False
             if (
-                self._show_publish
+                not fast
+                and self._show_publish
                 and isinstance(item.ref, (Asset, Shot))
                 and not _item_has_publish_for_department(item.ref, self._active_department)
             ):
@@ -2932,7 +3443,8 @@ class _GridCardDelegate(QStyledItemDelegate):
             # Work mode: lighter dim when item has no work file (card still selectable)
             _dim_card_work = False
             if (
-                not self._show_publish
+                not fast
+                and not self._show_publish
                 and isinstance(item.ref, (Asset, Shot))
                 and not _item_has_work_for_department(item.ref, self._active_department)
             ):
@@ -2972,17 +3484,28 @@ class _GridCardDelegate(QStyledItemDelegate):
             # Draw thumbnail from icon (center-crop)
             icon = index.data(Qt.DecorationRole)
             if isinstance(icon, QIcon):
-                src = icon.pixmap(256, 256)
-                if not src.isNull():
-                    scaled = src.scaled(
-                        thumb.size(),
-                        Qt.KeepAspectRatioByExpanding,
-                        Qt.SmoothTransformation,
-                    )
-                    sx = max(0, (scaled.width() - thumb.width()) // 2)
-                    sy = max(0, (scaled.height() - thumb.height()) // 2)
-                    crop = scaled.copy(QRect(QPoint(sx, sy), thumb.size()))
+                crop = self._cached_thumb_crop(icon, thumb, fast=fast)
+                if crop is not None and not crop.isNull():
                     p.drawPixmap(thumb, crop)
+
+            if fast:
+                p.setClipping(False)
+                y = thumb.bottom() + _GRID_META_PAD_TOP
+                x = inner.left() + 16
+                w = inner.width() - 32
+                p.setFont(self._font_name)
+                if selected:
+                    p.setPen(self._c_text_primary_selected)
+                else:
+                    p.setPen(self._c_text_primary)
+                name_rect = QRect(x, y, w, _GRID_NAME_LINE_H)
+                p.drawText(name_rect, Qt.AlignLeft | Qt.AlignVCenter, display_name_for_item(item))
+                p.setPen(border_pen)
+                p.setBrush(Qt.NoBrush)
+                stroke_inset = 1
+                border_rect = outer.adjusted(stroke_inset, stroke_inset, -stroke_inset, -stroke_inset)
+                p.drawRoundedRect(border_rect, 12, 12)
+                return
 
             def status_key() -> str:
                 return _overall_status_paint_key_for_item(
@@ -3420,11 +3943,19 @@ class _GridCardDelegate(QStyledItemDelegate):
                         )
                     cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
                 if self._tile_meta_show_last_updated:
+                    active_dcc = (
+                        self.get_active_dcc(getattr(item, "path", None), self._active_department)
+                        if isinstance(item, ViewItem)
+                        and getattr(item, "path", None)
+                        and self._active_department
+                        else None
+                    )
                     lu = (
                         _view_item_last_updated_display(
                             item,
                             show_publish=self._show_publish,
                             active_department=self._active_department,
+                            active_dcc_id=active_dcc,
                         )
                         if isinstance(item, ViewItem)
                         else "—"
@@ -3509,8 +4040,9 @@ class _GridCardDelegate(QStyledItemDelegate):
                 )
                 y_pills = thumb.bottom() + _grid_asset_shot_y_pills_offset_from_thumb_bottom(n_meta_lines=n_lines)
                 try:
-                    pr = Path(self._active_project_root)
-                    reg = load_production_status_registry(pr)
+                    reg = self._production_status_registry()
+                    if reg is None:
+                        raise ValueError("no production registry")
                     sid = aggregate_status_id_for_item(
                         item.ref,
                         active_department=ad_focus,
@@ -3738,6 +4270,7 @@ class MainView(QWidget):
     dcc_open_version_requested = Signal(object, str, str, object)  # (ViewItem, dcc_id, department, file_path: Path)
     active_dcc_changed = Signal(object, str, str)  # (path, department, dcc_id) — đồng bộ Inspector
     production_status_override_chosen = Signal(object, str, object)  # (Path | list[Path], department, status_id | None)
+    project_status_chosen = Signal(object, object)  # Path, status_key | None (None = automatic)
     type_badge_clicked = Signal()
     department_badge_clicked = Signal()
 
@@ -3845,7 +4378,7 @@ class MainView(QWidget):
         self._entity_concept_cache: dict[str, bool] = {}
         # Precomputed list Status column width (pill); avoids resizeColumnToContents × N rows.
         self._list_status_pill_layout_width: int = 0
-        self._schedule_bars: dict[tuple[str, str, str], PlannedBar] = {}
+        self._schedule_bars: BarStore = {}
         self._schedule_data: ProjectSchedule | None = None
         self._workspace_root: Path | None = None
 
@@ -4382,6 +4915,7 @@ class MainView(QWidget):
         self._tile_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._tile_view.setAcceptDrops(False)
         self._tile_view.setDropIndicatorShown(False)
+        _try_set_minimal_viewport_update(self._tile_view)
         self._sync_tile_drag_mode()
         self._tile_view.setIconSize(QSize(self._THUMBNAIL_SIZE_PX, self._THUMBNAIL_SIZE_PX))
         self._tile_view.setModel(self._tile_model)
@@ -4401,17 +4935,13 @@ class MainView(QWidget):
         self._grid_delegate.set_show_dept_chips(self._show_dept_status_chips)
         self._apply_tile_meta_to_delegate()
         self._tile_view.setItemDelegate(self._grid_delegate)
-        self._tile_view.entered.connect(self._grid_delegate.set_hovered_index)
-        self._tile_view.viewportEntered.connect(lambda: self._grid_delegate.set_hovered_index(None))
+        self._tile_view.entered.connect(self._on_tile_entered)
+        self._tile_view.viewportEntered.connect(self._on_tile_viewport_left)
         self._grid_sync_scheduled = False
         self._grid_last: tuple[int, int, int] | None = None  # (cols, card_w, card_h)
         self._schedule_grid_layout_sync()
 
-        self._tile_placeholder = QLabel("")
-        self._tile_placeholder.setAlignment(Qt.AlignCenter)
-        self._tile_placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # Empty state background must match content surface (not app_bg).
-        self._tile_placeholder.setStyleSheet(f"background: {MONOS_COLORS['content_bg']}; color: #A9ABB0;")
+        self._tile_placeholder = MainViewLoadingPlaceholder()
         self._tile_placeholder.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tile_placeholder.customContextMenuRequested.connect(
             lambda p: self.root_context_menu_requested.emit(self._tile_placeholder.mapToGlobal(p))
@@ -4436,6 +4966,7 @@ class MainView(QWidget):
         self._list_view.setAcceptDrops(False)
         self._list_view.setDropIndicatorShown(False)
         self._list_view.setDragDropMode(QAbstractItemView.NoDragDrop)
+        _try_set_minimal_viewport_update(self._list_view)
         self._list_view.horizontalHeader().setStretchLastSection(True)
         self._list_view.setSortingEnabled(False)
         self._list_view.verticalHeader().setVisible(False)
@@ -4451,11 +4982,7 @@ class MainView(QWidget):
         self._list_view.viewport().installEventFilter(self)
         self._list_view.verticalScrollBar().valueChanged.connect(self._schedule_thumbnail_prefetch)
 
-        self._list_placeholder = QLabel("")
-        self._list_placeholder.setAlignment(Qt.AlignCenter)
-        self._list_placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # Empty state background must match content surface (not app_bg).
-        self._list_placeholder.setStyleSheet(f"background: {MONOS_COLORS['content_bg']}; color: #A9ABB0;")
+        self._list_placeholder = MainViewLoadingPlaceholder()
         self._list_placeholder.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_placeholder.customContextMenuRequested.connect(
             lambda p: self.root_context_menu_requested.emit(self._list_placeholder.mapToGlobal(p))
@@ -4491,6 +5018,9 @@ class MainView(QWidget):
         self.set_selected_asset_type(None)
         self._work_publish_switch.setVisible(self._browser_context in ("asset", "shot"))
 
+        self._selection_notify_pending = False
+        self._tile_view._on_rubber_band_finished = self._flush_deferred_selection_notify
+        self._list_view._on_rubber_band_finished = self._flush_deferred_selection_notify
         self._tile_view.selectionModel().selectionChanged.connect(self._on_any_selection_changed)
         self._list_view.selectionModel().selectionChanged.connect(self._on_any_selection_changed)
 
@@ -4670,6 +5200,30 @@ class MainView(QWidget):
             return item, dep
         return None, None
 
+    def _grid_project_status_pill_hit(self, pos: QPoint) -> ViewItem | None:
+        if self._view_mode != "tile" or self._browser_context != "project":
+            return None
+        index = self._tile_view.indexAt(pos)
+        if not index.isValid():
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or item.kind != ViewItemKind.PROJECT:
+            return None
+        stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
+        status = getattr(stats, "status", None) or "WAITING"
+        line = project_status_label(status)
+        sm = self._tile_view.selectionModel()
+        selected = sm is not None and sm.isSelected(index)
+        cell_rect = self._tile_view.visualRect(index)
+        hit = _grid_project_status_pill_rect(
+            cell_rect,
+            self._GRID_GAP_PX,
+            pos,
+            selected=selected,
+            line=line,
+        )
+        return item if hit is not None else None
+
     def _list_status_hit(self, pos: QPoint) -> ViewItem | None:
         if self._view_mode != "list" or not self._project_root:
             return None
@@ -4682,6 +5236,23 @@ class MainView(QWidget):
         if isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
             return item
         return None
+
+    def _list_project_status_hit(self, pos: QPoint) -> ViewItem | None:
+        if self._view_mode != "list" or self._browser_context != "project":
+            return None
+        index = self._list_view.indexAt(pos)
+        if not index.isValid() or index.column() != self._list_col_status():
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or item.kind != ViewItemKind.PROJECT:
+            return None
+        stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
+        status = getattr(stats, "status", None) or "WAITING"
+        line = project_status_label(status)
+        chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
+        fm = QFontMetrics(chip_font)
+        pill_rect = _list_status_pill_rect_for_cell(self._list_view.visualRect(index), line, fm)
+        return item if pill_rect.contains(pos) else None
 
     def _selected_asset_shot_paths_for_batch(self) -> list[Path]:
         """Non-dimmed Asset/Shot paths from current multi-selection (grid or list)."""
@@ -4739,11 +5310,42 @@ class MainView(QWidget):
 
     def _run_production_status_menu_for(self, entity_path: Path, department: str, global_pos: QPoint) -> None:
         pr = Path(self._project_root) if self._project_root else None
-        res = pick_production_status_at(self, pr, global_pos)
+        res = pick_production_status_at(self, pr, global_pos, department_id=department)
         if res is False:
             return
         targets = self._production_status_target_paths(entity_path)
         self.production_status_override_chosen.emit(targets, department, res)
+
+    def _run_project_status_menu_for(self, project_path: Path, global_pos: QPoint) -> None:
+        from monostudio.ui_qt.project_status_menu import pick_project_status_at
+
+        stats = self._workspace_project_stats_for_path(project_path)
+        current = getattr(stats, "status", None) or "WAITING" if stats else "WAITING"
+        res = pick_project_status_at(
+            self,
+            global_pos,
+            project_root=project_path,
+            current_status=current,
+        )
+        if res is False:
+            return
+        self.project_status_chosen.emit(project_path, res)
+
+    def _workspace_project_stats_for_path(self, project_path: Path) -> ProjectQuickStats | None:
+        for row in range(self._tile_model.rowCount()):
+            idx = self._tile_model.index(row, 0)
+            if not idx.isValid():
+                continue
+            item = idx.data(Qt.UserRole)
+            if (
+                isinstance(item, ViewItem)
+                and item.kind == ViewItemKind.PROJECT
+                and item.path
+                and self._paths_equal(item.path, project_path)
+            ):
+                ref = item.ref
+                return ref if isinstance(ref, ProjectQuickStats) else None
+        return None
 
     def _grid_health_hit_row(self, pos) -> int | None:
         """Row index if pos is over the thumb health icon; else None."""
@@ -4854,16 +5456,34 @@ class MainView(QWidget):
         )
         dlg.exec()
 
+    def _on_tile_entered(self, index) -> None:
+        if self._tile_view.rubber_band_selecting():
+            return
+        if QApplication.mouseButtons() & (Qt.MouseButton.LeftButton | Qt.MouseButton.MiddleButton):
+            return
+        self._grid_delegate.set_hovered_index(index)
+
+    def _on_tile_viewport_left(self) -> None:
+        if self._tile_view.rubber_band_selecting():
+            return
+        self._grid_delegate.set_hovered_index(None)
+
     def _update_grid_thumb_interactive_hover(self, pos) -> None:
         """Track hover for production status pill, health icon, and notes chip (grid)."""
         if self._view_mode != "tile":
             return
         pill_row: int | None = None
-        hit_item, hit_dep = self._grid_status_pill_hit(pos)
-        if hit_item and hit_dep:
-            idx = self._tile_view.indexAt(pos)
-            if idx.isValid():
-                pill_row = idx.row()
+        if self._browser_context == "project":
+            if self._grid_project_status_pill_hit(pos) is not None:
+                idx = self._tile_view.indexAt(pos)
+                if idx.isValid():
+                    pill_row = idx.row()
+        else:
+            hit_item, hit_dep = self._grid_status_pill_hit(pos)
+            if hit_item and hit_dep:
+                idx = self._tile_view.indexAt(pos)
+                if idx.isValid():
+                    pill_row = idx.row()
         self._grid_delegate.set_hovered_pill_row(pill_row)
         health_row = self._grid_health_hit_row(pos)
         self._grid_delegate.set_hovered_health_row(health_row)
@@ -4880,7 +5500,15 @@ class MainView(QWidget):
 
     def _list_status_pill_hit_row(self, pos: QPoint) -> int | None:
         """Row index if pos is over list production status pill; else None."""
-        if self._view_mode != "list" or not self._project_root:
+        if self._view_mode != "list":
+            return None
+        if self._browser_context == "project":
+            hit = self._list_project_status_hit(pos)
+            if hit is None or not hit.path:
+                return None
+            index = self._list_view.indexAt(pos)
+            return index.row() if index.isValid() else None
+        if not self._project_root:
             return None
         if self._browser_context not in ("asset", "shot"):
             return None
@@ -5034,7 +5662,38 @@ class MainView(QWidget):
         else:
             vp.unsetCursor()
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._grid_last = None
+        self._schedule_grid_layout_sync()
+        if self._browser_context == "project":
+            self._refresh_list_status_column()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+
+    def _complete_active_view_mouse_gesture(self) -> None:
+        """Finish rubber-band state when viewport filter swallowed the release event."""
+        view = self._tile_view if self._view_mode == "tile" else self._list_view
+        finish = getattr(view, "_rb_on_left_release", None)
+        if callable(finish):
+            finish()
+        other = self._list_view if view is self._tile_view else self._tile_view
+        other_cleanup = getattr(other, "_rb_force_cleanup", None)
+        if callable(other_cleanup):
+            other_cleanup()
+
+    def _release_grid_mouse_grabs(self) -> None:
+        for view in (self._tile_view, self._list_view):
+            cleanup = getattr(view, "_rb_force_cleanup", None)
+            if callable(cleanup):
+                cleanup()
+
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if watched in (self._tile_view.viewport(), self._list_view.viewport()):
+            et = event.type()
+            if et == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._release_grid_mouse_grabs()
         if (
             watched in (self._type_badge, self._department_badge)
             and event.type() == QEvent.Type.MouseButtonPress
@@ -5057,7 +5716,8 @@ class MainView(QWidget):
         if watched is self._tile_view.viewport() and self._view_mode == "tile":
             et = event.type()
             if et == QEvent.MouseMove:
-                self._update_grid_thumb_interactive_hover(event.pos())
+                if not (event.buttons() & (Qt.MouseButton.LeftButton | Qt.MouseButton.MiddleButton)):
+                    self._update_grid_thumb_interactive_hover(event.pos())
             elif et == QEvent.Leave:
                 self._grid_delegate.set_hovered_pill_row(None)
                 self._grid_delegate.set_hovered_health_row(None)
@@ -5073,12 +5733,19 @@ class MainView(QWidget):
         ):
             hit_sv_item, hit_sv_dep = self._grid_status_pill_hit(event.pos())
             if hit_sv_item and hit_sv_dep:
+                self._complete_active_view_mouse_gesture()
+                event.accept()
+                return True
+            if self._browser_context == "project" and self._grid_project_status_pill_hit(event.pos()) is not None:
+                self._complete_active_view_mouse_gesture()
                 event.accept()
                 return True
             if self._grid_health_hit_row(event.pos()) is not None:
+                self._complete_active_view_mouse_gesture()
                 event.accept()
                 return True
             if self._grid_note_hit_row(event.pos()) is not None:
+                self._complete_active_view_mouse_gesture()
                 event.accept()
                 return True
 
@@ -5090,6 +5757,16 @@ class MainView(QWidget):
         ):
             if event.button() == Qt.MouseButton.LeftButton:
                 idx = self._tile_view.indexAt(event.pos())
+                hit_proj = self._grid_project_status_pill_hit(event.pos())
+                if hit_proj and hit_proj.path:
+                    if idx.isValid():
+                        sm = self._tile_view.selectionModel()
+                        if sm is not None:
+                            sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+                    gp = self._tile_view.viewport().mapToGlobal(event.pos())
+                    self._run_project_status_menu_for(Path(hit_proj.path), gp)
+                    event.accept()
+                    return True
                 hit_sv_item, hit_sv_dep = self._grid_status_pill_hit(event.pos())
                 if hit_sv_item and hit_sv_dep and hit_sv_item.path:
                     if idx.isValid():
@@ -5251,7 +5928,8 @@ class MainView(QWidget):
             if self._view_mode == "list":
                 let = event.type()
                 if let == QEvent.MouseMove:
-                    self._update_list_interactive_hover(event.pos())
+                    if not (event.buttons() & (Qt.MouseButton.LeftButton | Qt.MouseButton.MiddleButton)):
+                        self._update_list_interactive_hover(event.pos())
                 elif let == QEvent.Leave:
                     self._list_row_delegate.set_hovered_status_row(None)
                     self._list_row_delegate.set_hovered_health_row(None)
@@ -5261,20 +5939,29 @@ class MainView(QWidget):
                     list_view.viewport().unsetCursor()
             if event.type() == QEvent.MouseButtonRelease and self._view_mode == "list":
                 if event.button() == Qt.MouseButton.LeftButton:
+                    if self._browser_context == "project" and self._list_project_status_hit(event.pos()) is not None:
+                        self._complete_active_view_mouse_gesture()
+                        event.accept()
+                        return True
                     dep = (self._active_department or "").strip()
                     if dep and self._list_status_hit(event.pos()):
+                        self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
                     if self._list_health_hit_row(event.pos()) is not None:
+                        self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
                     if self._list_thumb_note_hit_row(event.pos()) is not None:
+                        self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
                     if self._list_ref_hit_row(event.pos()) is not None:
+                        self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
                     if self._list_concept_hit_row(event.pos()) is not None:
+                        self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
             if event.type() == QEvent.MouseButtonPress and self._view_mode == "list":
@@ -5320,6 +6007,17 @@ class MainView(QWidget):
                         except Exception:
                             pass
                         list_view.viewport().update()
+                        event.accept()
+                        return True
+                    hit_proj = self._list_project_status_hit(event.pos())
+                    if hit_proj and hit_proj.path:
+                        idx = list_view.indexAt(event.pos())
+                        if idx.isValid():
+                            sm = list_view.selectionModel()
+                            if sm is not None:
+                                sm.setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+                        gpos = list_view.viewport().mapToGlobal(event.pos())
+                        self._run_project_status_menu_for(Path(hit_proj.path), gpos)
                         event.accept()
                         return True
                     hit_st = self._list_status_hit(event.pos())
@@ -5468,7 +6166,12 @@ class MainView(QWidget):
         except Exception:
             return
         if vw <= 0:
+            retries = int(getattr(self, "_grid_sync_layout_retries", 0) or 0)
+            if retries < 8:
+                self._grid_sync_layout_retries = retries + 1
+                QTimer.singleShot(0, self._schedule_grid_layout_sync)
             return
+        self._grid_sync_layout_retries = 0
 
         gap = self._GRID_GAP_PX
         inner_w = max(1, vw - 24)
@@ -5580,6 +6283,7 @@ class MainView(QWidget):
             self.invalidate_thumbnail(item_path, (department or "").strip() or None)
         except Exception:
             pass
+        self._refresh_list_last_updated_column()
         self._list_view.viewport().update()
 
     def invalidate_entity_reference_cache(self, entity_path: Path | str | None = None) -> None:
@@ -5746,7 +6450,9 @@ class MainView(QWidget):
         show_type = self._type_badge.isVisible()
         show_dept = self._department_badge.isVisible()
         self._title_chevron.setVisible(show_type)
-        self._title_chevron_dept.setVisible(show_type and show_dept)
+        # Shots have no type badge — chevron sits between title and department instead.
+        show_dept_chevron = show_dept and (show_type or self._browser_context == "shot")
+        self._title_chevron_dept.setVisible(show_dept_chevron)
         self._sync_filter_badge_clickability()
 
     def _sync_filter_badge_clickability(self) -> None:
@@ -5942,7 +6648,7 @@ class MainView(QWidget):
 
     def set_planned_schedule_bars(
         self,
-        bars: dict[tuple[str, str, str], PlannedBar] | None,
+        bars: BarStore | None,
         schedule: ProjectSchedule | None = None,
     ) -> None:
         self._schedule_bars = dict(bars or {})
@@ -6006,14 +6712,19 @@ class MainView(QWidget):
             rel = entity_rel_path(Path(self._project_root), ref.path).replace("\\", "/")
         except (OSError, ValueError):
             rel = ref.path.as_posix()
-        bar = self._schedule_bars.get((kind, rel, dep))
-        if bar is None:
+        if self._schedule_bars is None:
             return "—", None
+        row_ids = merged_row_assignee_ids_from_bars(self._schedule_bars, kind, rel, dep)
+        if not row_ids:
+            bar = primary_bar_for_row(self._schedule_bars, kind, rel, dep)
+            if bar is None:
+                return "—", None
+            row_ids = tuple(bar.assignee_ids) or (
+                ((bar.assignee_id or "").strip(),) if (bar.assignee_id or "").strip() else ()
+            )
         name, color_hex = resolve_assignee_display(
             self._workspace_root,
-            assignee_id=bar.assignee_id,
-            assignee_name=bar.assignee,
-            assignee_ids=bar.assignee_ids,
+            assignee_ids=row_ids,
         )
         if not name:
             return "—", None
@@ -6314,11 +7025,17 @@ class MainView(QWidget):
     def _view_item_sort_key(self, vi: ViewItem) -> tuple:
         field = self._sort_field
         if field == self._SORT_FIELD_DATE:
-            return (_view_item_mtime_sort_ts(
-                vi,
-                show_publish=self._show_publish,
-                active_department=self._active_department,
-            ), str(vi.path))
+            dep = (self._active_department or "").strip() or None
+            active_dcc = self.get_active_dcc(vi.path, dep) if vi.path and dep else None
+            return (
+                _view_item_mtime_sort_ts(
+                    vi,
+                    show_publish=self._show_publish,
+                    active_department=dep,
+                    active_dcc_id=active_dcc,
+                ),
+                str(vi.path),
+            )
         if field == self._SORT_FIELD_STATUS:
             if not isinstance(vi.ref, (Asset, Shot)):
                 return (999, 999, "", str(vi.path))
@@ -6451,6 +7168,9 @@ class MainView(QWidget):
         def _reenable_and_update():
             self.setUpdatesEnabled(True)
             self._update_empty_states()
+            self._schedule_grid_layout_sync()
+            if self._browser_context == "project":
+                self._refresh_list_status_column()
             # Schedule thumbnail prefetch after stack has switched to tile view (fixes missing thumbnails on type/department toggle).
             self._schedule_thumbnail_prefetch()
 
@@ -6473,13 +7193,24 @@ class MainView(QWidget):
         """Select the row whose item has the given path; returns True if found and selected."""
         path = Path(path)
         for row in range(self._tile_model.rowCount()):
-            idx = self._tile_model.index(row, 0)
-            if not idx.isValid():
+            tile_idx = self._tile_model.index(row, 0)
+            if not tile_idx.isValid():
                 continue
-            item = idx.data(Qt.UserRole)
+            item = tile_idx.data(Qt.UserRole)
             if isinstance(item, ViewItem) and self._paths_equal(item.path, path):
-                self._tile_view.setCurrentIndex(idx)
-                self._list_view.setCurrentIndex(self._list_model.index(row, 0))
+                list_idx = self._list_model.index(row, 0)
+                for view, model_idx in (
+                    (self._tile_view, tile_idx),
+                    (self._list_view, list_idx),
+                ):
+                    sm = view.selectionModel()
+                    if sm is None or not model_idx.isValid():
+                        continue
+                    sm.setCurrentIndex(model_idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    sm.select(model_idx, QItemSelectionModel.SelectionFlag.Select)
+                self._tile_view.viewport().update()
+                self._list_view.viewport().update()
+                self.valid_selection_changed.emit(self.has_valid_selection())
                 return True
         return False
 
@@ -6570,6 +7301,7 @@ class MainView(QWidget):
             br = self._tile_model.index(rc - 1, 0)
             self._tile_model.dataChanged.emit(tl, br, [Qt.UserRole])
             self._list_model.emit_all_user_role_changed()
+        self._refresh_list_last_updated_column()
         self._tile_view.viewport().update()
         self._list_view.viewport().update()
 
@@ -6659,6 +7391,10 @@ class MainView(QWidget):
         """Drive selection from AppState only; does not emit selection_id_changed back."""
         self._selection_driven_by_state = True
         try:
+            active = self._active_select_view()
+            sm = active.selectionModel()
+            if sm is not None and len(sm.selectedIndexes()) > 1:
+                return
             if not selection_id or not selection_id.strip():
                 self._tile_view.clearSelection()
                 self._list_view.clearSelection()
@@ -7340,11 +8076,14 @@ class MainView(QWidget):
         return ver if ver else "—"
 
     def _list_last_updated(self, item: ViewItem) -> str:
-        """Last updated for list/tile: work folder or latest publish version folder (Published mode)."""
+        """Last updated for list/tile: work file or latest publish version folder (Published mode)."""
+        dep = (self._active_department or "").strip() or None
+        active_dcc = self.get_active_dcc(item.path, dep) if item.path and dep else None
         return _view_item_last_updated_display(
             item,
             show_publish=self._show_publish,
-            active_department=self._active_department,
+            active_department=dep,
+            active_dcc_id=active_dcc,
         )
 
     @staticmethod
@@ -7396,7 +8135,11 @@ class MainView(QWidget):
                 h.setSectionResizeMode(notes_col, QHeaderView.ResizeMode.Fixed)
             health_col = self._list_col_health()
             if health_col >= 0 and h:
-                h.resizeSection(health_col, 44)
+                chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
+                h.resizeSection(
+                    health_col,
+                    _list_header_column_width("Health", min_content_px=chip + 16),
+                )
                 h.setSectionResizeMode(health_col, QHeaderView.ResizeMode.Fixed)
             ref_col = self._list_col_ref()
             if ref_col >= 0 and h:
@@ -7534,17 +8277,68 @@ class MainView(QWidget):
             return False
         return not _item_has_publish_for_department(item.ref, self._active_department)
 
+    def _active_select_view(self) -> _ClearOnEmptyClickListView | _ClearOnEmptyClickTableView:
+        return self._tile_view if self._view_mode == "tile" else self._list_view
+
+    def _deferring_selection_notify(self) -> bool:
+        return self._active_select_view().rubber_band_selecting()
+
+    def _selected_index_count(self) -> int:
+        view = self._active_select_view()
+        sm = view.selectionModel()
+        if sm is None:
+            return 0
+        return len(sm.selectedIndexes())
+
+    def _emit_selection_notify(self) -> None:
+        item = self.selected_view_item()
+        if self._is_item_dimmed(item):
+            view = self._active_select_view()
+            view.clearSelection()
+            return
+        n = self._selected_index_count()
+        # AppState is single-select — syncing one id while the view has multi-select would
+        # collapse marquee/Ctrl selections via set_selection_from_state → select_item_by_path.
+        if n <= 1:
+            sid = str(item.path) if item is not None else None
+            self.selection_id_changed.emit(sid)
+        self.valid_selection_changed.emit(self.has_valid_selection())
+
+    def _flush_deferred_selection_notify(self) -> None:
+        if getattr(self, "_selection_driven_by_state", False):
+            self._selection_notify_pending = False
+            return
+        self._selection_notify_pending = False
+        self._emit_selection_notify()
+        self._repaint_tile_after_marquee()
+
+    def _repaint_tile_after_marquee(self) -> None:
+        """Full card paint after marquee (fast-paint is only active while dragging)."""
+        if self._view_mode != "tile":
+            return
+        sm = self._tile_view.selectionModel()
+        if sm is None:
+            self._tile_view.viewport().update()
+            return
+        rows = sorted({idx.row() for idx in sm.selectedIndexes()})
+        for row in rows:
+            idx = self._tile_model.index(row, 0)
+            if idx.isValid():
+                self._tile_view.update(idx)
+        self._tile_view.viewport().update()
+
     def _on_any_selection_changed(self, *_args) -> None:
         if getattr(self, "_selection_driven_by_state", False):
             return
+        if self._deferring_selection_notify():
+            self._selection_notify_pending = True
+            return
         item = self.selected_view_item()
         if self._is_item_dimmed(item):
-            view = self._tile_view if self._view_mode == "tile" else self._list_view
+            view = self._active_select_view()
             view.clearSelection()
             return
-        sid = str(item.path) if item is not None else None
-        self.selection_id_changed.emit(sid)
-        self.valid_selection_changed.emit(self.has_valid_selection())
+        self._emit_selection_notify()
 
     def _update_empty_states(self) -> None:
         # Spec: empty states use placeholders; no popup.
@@ -7555,8 +8349,9 @@ class MainView(QWidget):
         else:
             empty_text = "Select a project root to begin"
 
-        self._tile_placeholder.setText(empty_text)
-        self._list_placeholder.setText(empty_text)
+        loading = is_scanning_empty_message(empty_text)
+        self._tile_placeholder.set_content(empty_text, loading=loading)
+        self._list_placeholder.set_content(empty_text, loading=loading)
 
         # During set_items (clear then populate), do not switch stack to placeholder or we get "all items disappear then reappear".
         if getattr(self, "_in_batch_set_items", False):

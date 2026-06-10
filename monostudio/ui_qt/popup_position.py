@@ -175,6 +175,18 @@ def position_popup_above_rect(
     popup.move(int(x), int(y))
 
 
+def max_popup_height_in_widget(
+    host: QWidget,
+    *,
+    top_offset: int = 0,
+    margin: int = DEFAULT_POPUP_MARGIN,
+) -> int:
+    """Largest popup height from *top_offset* to the bottom of *host* (column / panel)."""
+    if host is None or host.height() <= top_offset:
+        return 480
+    return max(120, host.height() - top_offset - margin)
+
+
 def max_popup_height_for_anchor(
     anchor: QWidget,
     *,

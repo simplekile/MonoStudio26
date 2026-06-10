@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from monostudio.core.assign_inbox import (
@@ -83,6 +85,205 @@ def _assign_discord_payload(
         "allocation_id": allocation.id or "",
         "assign_inbox_ids": assign_inbox_ids,
     }
+
+
+def _row_key_from_allocation(alloc: ScheduleAllocation) -> tuple[str, str, str] | None:
+    kind = (alloc.entity_kind or "").strip().lower()
+    rel = (alloc.entity_rel or "").replace("\\", "/").strip()
+    dept = (alloc.department or "").strip()
+    if not kind or not rel or not dept:
+        return None
+    return kind, rel, dept
+
+
+@dataclass(frozen=True)
+class _BulkAssignEntry:
+    allocation: ScheduleAllocation
+    display: str
+    dept_label: str
+
+
+def _assign_discord_bulk_payload(
+    project_root: Path,
+    *,
+    from_id: str,
+    from_name: str,
+    to_user_id: str,
+    entries: list[_BulkAssignEntry],
+    assign_inbox_ids: list[str],
+    batch_id: str,
+) -> dict:
+    items = []
+    for entry in entries:
+        alloc = entry.allocation
+        rel = (alloc.entity_rel or "").replace("\\", "/").strip()
+        dept = (alloc.department or "").strip()
+        items.append(
+            {
+                "item_rel": rel,
+                "item_display": entry.display,
+                "entity_kind": alloc.entity_kind or "",
+                "department": dept,
+                "department_label": entry.dept_label,
+                "due": alloc.due or "",
+                "start": alloc.start or "",
+                "allocation_id": alloc.id or "",
+            }
+        )
+    return {
+        "from_user_id": from_id,
+        "from_name": from_name,
+        "to_user_ids": [to_user_id],
+        "project_name": project_root.name,
+        "items": items,
+        "assign_inbox_ids": assign_inbox_ids,
+        "batch_id": batch_id,
+    }
+
+
+def _dept_label_for(project_root: Path, dept: str) -> str:
+    try:
+        from monostudio.core.department_registry import DepartmentRegistry
+
+        return DepartmentRegistry.for_project(project_root).get_department_label(dept) or dept
+    except OSError:
+        return dept
+
+
+def notify_bulk_schedule_assignee_patch(
+    project_root: Path,
+    workspace_root: Path | None,
+    *,
+    schedule_before,
+    patched_allocations: list[ScheduleAllocation],
+) -> None:
+    """Assign inbox per row; one grouped Discord message per newly assigned user."""
+    from monostudio.core.project_schedule import (
+        ProjectSchedule,
+        merged_assignee_ids_for_row,
+    )
+
+    if not isinstance(schedule_before, ProjectSchedule):
+        return
+
+    from_id = ""
+    from_name = ""
+    if workspace_root is not None:
+        user = get_current_user(workspace_root)
+        if user is not None:
+            from_id = user.id
+        from_name = get_current_user_display_name(workspace_root)
+
+    pending_by_user: dict[str, list[_BulkAssignEntry]] = {}
+    seen_rows: set[tuple[str, str, str]] = set()
+
+    for alloc in patched_allocations:
+        row_key = _row_key_from_allocation(alloc)
+        if row_key is None or row_key in seen_rows:
+            continue
+        seen_rows.add(row_key)
+        kind, rel, dept = row_key
+        prev_ids = set(
+            merged_assignee_ids_for_row(
+                schedule_before,
+                entity_kind=kind,
+                entity_rel=rel,
+                department=dept,
+            )
+        )
+        new_ids = normalize_assignee_ids(list(alloc.assignee_ids or []))
+        added = [
+            uid
+            for uid in new_ids
+            if uid not in prev_ids and uid.strip() and uid.strip() != from_id
+        ]
+        if not added:
+            continue
+        display = rel.rsplit("/", 1)[-1] if rel else ""
+        dept_label = _dept_label_for(project_root, dept)
+        entry = _BulkAssignEntry(allocation=alloc, display=display, dept_label=dept_label)
+        for uid in added:
+            pending_by_user.setdefault(uid, []).append(entry)
+
+    if not pending_by_user:
+        return
+
+    batch_id = uuid.uuid4().hex[:12]
+    from monostudio.core.discord_webhook import post_schedule_assigned_discord
+
+    for uid, entries in pending_by_user.items():
+        inbox_items = []
+        for entry in entries:
+            alloc = entry.allocation
+            rel = (alloc.entity_rel or "").replace("\\", "/").strip()
+            dept = (alloc.department or "").strip()
+            try:
+                new_items = append_assignments(
+                    project_root,
+                    from_user_id=from_id,
+                    from_name=from_name,
+                    to_user_ids=[uid],
+                    entity_kind=alloc.entity_kind or "",
+                    item_rel=rel,
+                    item_display=entry.display,
+                    department=dept,
+                    allocation_id=alloc.id or "",
+                    due=alloc.due or "",
+                    start=alloc.start or "",
+                    batch_id=batch_id if len(entries) > 1 else "",
+                )
+            except OSError:
+                continue
+            inbox_items.extend(new_items)
+
+        if not inbox_items:
+            continue
+
+        inbox_ids = [i.id for i in inbox_items]
+        if len(entries) == 1:
+            entry = entries[0]
+            alloc = entry.allocation
+            rel = (alloc.entity_rel or "").replace("\\", "/").strip()
+            dept = (alloc.department or "").strip()
+            payload = _assign_discord_payload(
+                project_root,
+                from_id=from_id,
+                from_name=from_name,
+                added=[uid],
+                allocation=alloc,
+                display=entry.display,
+                rel=rel,
+                dept=dept,
+                dept_label=entry.dept_label,
+                assign_inbox_ids=inbox_ids,
+            )
+            dedupe_key = f"schedule_assigned:{inbox_ids[0]}"
+        else:
+            payload = _assign_discord_bulk_payload(
+                project_root,
+                from_id=from_id,
+                from_name=from_name,
+                to_user_id=uid,
+                entries=entries,
+                assign_inbox_ids=inbox_ids,
+                batch_id=batch_id,
+            )
+            dedupe_key = f"schedule_assigned_batch:{batch_id}:{uid}"
+
+        if workspace_root is None:
+            continue
+
+        message_id = post_schedule_assigned_discord(
+            workspace_root,
+            payload,
+            dedupe_key=dedupe_key,
+            project_root=project_root,
+        )
+        if message_id and message_id != "sent":
+            try:
+                attach_discord_message_id(project_root, inbox_ids, message_id)
+            except OSError:
+                pass
 
 
 def notify_new_schedule_assignments(

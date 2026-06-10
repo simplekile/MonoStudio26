@@ -18,8 +18,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.notification_copy import pick_copy
+from monostudio.core.notification_preferences import read_notification_vietnamese
 from monostudio.ui_qt.notification.notification_row_widget import NotificationAlertRow
-from monostudio.ui_qt.notification.store import recent
+from monostudio.ui_qt.notification.store import recent, unread_count
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 
 RECENT_COUNT = 10
@@ -89,16 +91,36 @@ class NotificationDropdown(QFrame):
         )
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(0, 0, 0, 0)
+        _footer_btn_qss = (
+            "QPushButton { background: transparent; border: none; padding: 12px 16px; }"
+            "QPushButton:disabled { color: #52525b; }"
+        )
+        self._mark_all_btn = QPushButton(
+            pick_copy("Đã xem tất cả", "Mark all read", vietnamese=read_notification_vietnamese()),
+            footer,
+        )
+        self._mark_all_btn.setObjectName("NotificationDropdownMarkAll")
+        self._mark_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mark_all_btn.setFont(monos_font("Inter", 12, QFont.Weight.Medium))
+        self._mark_all_btn.setStyleSheet(
+            _footer_btn_qss
+            + "QPushButton { color: #a1a1aa; }"
+            + "QPushButton:hover:enabled { background: rgba(255, 255, 255, 0.06); color: #e4e4e7; }"
+        )
+        self._mark_all_btn.clicked.connect(self._on_mark_all_read)
+        footer_layout.addWidget(self._mark_all_btn, 0)
+        footer_layout.addStretch(1)
         show_all_btn = QPushButton("Show all", footer)
         show_all_btn.setObjectName("NotificationDropdownShowAll")
         show_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         show_all_btn.setFont(monos_font("Inter", 12, QFont.Weight.Medium))
         show_all_btn.setStyleSheet(
-            "QPushButton { background: transparent; color: #60a5fa; border: none; padding: 12px 16px; }"
-            "QPushButton:hover { background: rgba(96, 165, 250, 0.12); color: #93c5fd; }"
+            _footer_btn_qss
+            + "QPushButton { color: #60a5fa; }"
+            + "QPushButton:hover { background: rgba(96, 165, 250, 0.12); color: #93c5fd; }"
         )
         show_all_btn.clicked.connect(self._on_show_all)
-        footer_layout.addWidget(show_all_btn)
+        footer_layout.addWidget(show_all_btn, 0)
         layout.addWidget(footer, 0)
 
         self.setFixedWidth(380)
@@ -117,6 +139,13 @@ class NotificationDropdown(QFrame):
         self._workspace_root = workspace_root
         self._project_root = project_root
         self._current_user_id = (user_id or "").strip()
+
+    def _update_mark_all_enabled(self) -> None:
+        n = unread_count(
+            user_id=self._current_user_id,
+            project_root=self._project_root,
+        )
+        self._mark_all_btn.setEnabled(n > 0)
 
     def _fill(self) -> None:
         while self._content_layout.count():
@@ -148,6 +177,16 @@ class NotificationDropdown(QFrame):
                 row.clicked.connect(self.user_alert_clicked.emit)
                 self._content_layout.addWidget(row)
             self._adjust_popup_size(len(entries))
+        self._update_mark_all_enabled()
+
+    def _on_mark_all_read(self) -> None:
+        from monostudio.ui_qt.notification.service import notify
+
+        notify.mark_all_read(
+            user_id=self._current_user_id,
+            project_root=self._project_root,
+        )
+        self._fill()
 
     def _adjust_popup_size(self, entry_count: int) -> None:
         """Viewport scrolls when content exceeds max; footer stays below the list."""

@@ -183,7 +183,10 @@ def apply_notification_message_label(label: QLabel, entry: NotificationEntry) ->
     p = entry.payload
     if isinstance(p, dict):
         p = UserAlertPayload.from_dict(p)
-    if (p.assign_inbox_id or "").strip() and apply_assign_notification_message_label(label, entry):
+    assign_ids = [i for i in (p.assign_inbox_ids or ()) if (i or "").strip()]
+    if (
+        (p.assign_inbox_id or "").strip() or len(assign_ids) > 1
+    ) and apply_assign_notification_message_label(label, entry):
         return
     rich = mention_alert_html_for_entry(entry)
     label.setFont(monos_font("Inter", 15, QFont.Weight.Normal))

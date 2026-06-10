@@ -1,7 +1,10 @@
 """Shared content toolbar for Inbox/Outbox pages (date folders + file tree)."""
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -12,6 +15,20 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators
+
+
+def bind_explorer_view_mode_tab_shortcut(host: QWidget, get_pane: Callable[[], object | None]) -> None:
+    """Tab cycles grid/list on Inbox / Outbox / Project Guide explorer pages."""
+
+    def _cycle() -> None:
+        pane = get_pane()
+        cycle = getattr(pane, "cycle_view_mode", None)
+        if callable(cycle):
+            cycle()
+
+    tab_sc = QShortcut(QKeySequence(Qt.Key.Key_Tab), host, _cycle)
+    tab_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+    tab_sc.setAutoRepeat(False)
 
 
 class InboxContentToolbar(QWidget):

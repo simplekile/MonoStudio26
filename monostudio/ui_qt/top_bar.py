@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
+    QPushButton,
     QSizePolicy,
     QToolButton,
     QWidget,
@@ -185,6 +186,8 @@ class _UpdateBadge(QWidget):
 class _NotiCountBadge(QLabel):
     """Unread count badge on the notification bell."""
 
+    _PAD_X = 8
+
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -195,15 +198,32 @@ class _NotiCountBadge(QLabel):
         )
         self.hide()
 
+    def _reposition(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        # Keep the pill inside the bell button so Qt does not clip trailing digits.
+        x = max(0, parent.width() - self.width() - 1)
+        self.move(x, 2)
+
     def set_count(self, n: int) -> None:
         if n <= 0:
             self.hide()
             return
         label = str(n) if n < 100 else "99+"
         self.setText(label)
-        w = max(14, 8 + len(label) * 7)
-        self.setFixedSize(w, 14)
+        fm = self.fontMetrics()
+        w = max(14, fm.horizontalAdvance(label) + self._PAD_X)
+        h = max(14, fm.height() + 4)
+        self.setFixedSize(w, h)
+        radius = h // 2
+        self.setStyleSheet(
+            "background-color: #2563eb; color: #fafafa;"
+            f"border-radius: {radius}px; padding: 0 4px;"
+        )
+        self._reposition()
         self.show()
+        self.raise_()
 
 
 class TopBar(QWidget):
@@ -328,8 +348,6 @@ class TopBar(QWidget):
         self._noti_dropdown.closed.connect(self._on_noti_dropdown_closed)
         self._btn_noti.clicked.connect(self._show_noti_dropdown)
         self._noti_badge = _NotiCountBadge(self._btn_noti)
-        self._noti_badge.move(_action_icon_w - 14, 2)
-        self._noti_badge.raise_()
         self._notification_list_dialog: NotificationListDialog | None = None
 
         # Panel layout: Auto (responsive) + sidebar + inspector toggles (Cursor-style)
@@ -522,6 +540,15 @@ class TopBar(QWidget):
         except Exception:
             pass
         btn.update()
+
+    def clear_transient_hover_states(self) -> None:
+        """Clear stuck top-bar button hover when pointer moves to main content."""
+        from monostudio.ui_qt.style import clear_stuck_widget_hover
+
+        for btn in self.findChildren(QToolButton):
+            self._clear_tool_button_hover(btn)
+        for btn in self.findChildren(QPushButton):
+            clear_stuck_widget_hover(btn)
 
     def _position_noti_dropdown(self) -> None:
         win = self.window()
