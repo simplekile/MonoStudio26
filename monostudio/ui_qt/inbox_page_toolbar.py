@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QSettings, Signal
+from PySide6.QtGui import QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -14,10 +14,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.ui_qt.app_hotkeys import bind_hotkey, register_hotkey_tooltip
 from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators
 
 
-def bind_explorer_view_mode_tab_shortcut(host: QWidget, get_pane: Callable[[], object | None]) -> None:
+def bind_explorer_view_mode_tab_shortcut(
+    host: QWidget,
+    get_pane: Callable[[], object | None],
+    settings: QSettings | None = None,
+) -> list[QShortcut]:
     """Tab cycles grid/list on Inbox / Outbox / Project Guide explorer pages."""
 
     def _cycle() -> None:
@@ -26,9 +31,19 @@ def bind_explorer_view_mode_tab_shortcut(host: QWidget, get_pane: Callable[[], o
         if callable(cycle):
             cycle()
 
-    tab_sc = QShortcut(QKeySequence(Qt.Key.Key_Tab), host, _cycle)
-    tab_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-    tab_sc.setAutoRepeat(False)
+    if settings is None:
+        settings = QSettings("MonoStudio26", "MonoStudio26")
+
+    return [
+        bind_hotkey(
+            settings,
+            "explorer.cycle_view_mode",
+            host,
+            _cycle,
+            context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
+            auto_repeat=False,
+        )
+    ]
 
 
 class InboxContentToolbar(QWidget):
@@ -77,6 +92,24 @@ class InboxContentToolbar(QWidget):
         self._view_toggle = toggle
         lay.addWidget(toggle, 0, Qt.AlignmentFlag.AlignVCenter)
         self._inline = False
+        self._settings = QSettings("MonoStudio26", "MonoStudio26")
+        self.sync_hotkey_tooltips(self._settings)
+
+    def sync_hotkey_tooltips(self, settings: QSettings | None) -> None:
+        if settings is not None:
+            self._settings = settings
+        register_hotkey_tooltip(
+            self._btn_grid,
+            "Grid view — Tab cycles Grid / List",
+            self._settings,
+            "explorer.cycle_view_mode",
+        )
+        register_hotkey_tooltip(
+            self._btn_list,
+            "List view — Tab cycles Grid / List",
+            self._settings,
+            "explorer.cycle_view_mode",
+        )
 
     def set_inline(self, inline: bool) -> None:
         """Path-bar row: transparent, no extra vertical padding."""

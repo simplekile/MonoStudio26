@@ -67,7 +67,7 @@ class ToastWidget(QFrame):
         self._entered_y: int = 0  # target Y for layout
         self._on_dismiss = on_dismiss
 
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
 
         accent_hex, text_hex = TOAST_COLORS[toast_type]
@@ -101,7 +101,8 @@ class ToastWidget(QFrame):
         msg_label.setFont(monos_font(point_size=13, weight=QFont.Weight.Medium))
         msg_label.setStyleSheet(f"color: {text_hex}; background: transparent; border: none;")
         msg_label.setWordWrap(False)
-        layout.addWidget(msg_label, 1)
+        msg_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+        layout.addWidget(msg_label, 0)
 
         self._close_btn: QPushButton | None = None
         # Show explicit close button for error and important toasts,
@@ -129,6 +130,7 @@ class ToastWidget(QFrame):
         self._auto_close_timer = QTimer(self)
         self._auto_close_timer.setSingleShot(True)
         self._auto_close_timer.timeout.connect(self.dismiss)
+        self.adjustSize()
 
     def set_entered_y(self, y: int) -> None:
         self._entered_y = y

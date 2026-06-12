@@ -24,7 +24,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.core.dashboard_layout import load_dashboard_layout, save_dashboard_layout
+from monostudio.core.dashboard_layout import (
+    DashboardWidgetSlot,
+    load_dashboard_layout,
+    save_dashboard_layout,
+)
 from monostudio.core.fs_reader import ProjectIndex
 from monostudio.core.item_comments import ItemCommentEntry
 from monostudio.core.production_status import CATEGORY_COLOR_HEX
@@ -578,9 +582,12 @@ class DashboardPageWidget(QWidget):
     note_go_to_department_requested = Signal(object)  # DashboardNoteRow
     dashboard_entity_nav_requested = Signal(str, str, str, str)  # kind, rel, dept, name
     open_scope_requested = Signal(str)  # "Assets" | "Shots"
+    customize_mode_changed = Signal(bool)
+    dashboard_layout_changed = Signal(object)  # list[DashboardWidgetSlot]
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("DashboardPage")
         self._project_root: Path | None = None
         self._workspace_root: Path | None = None
         self._snapshot: DashboardSnapshot | None = None
@@ -598,9 +605,11 @@ class DashboardPageWidget(QWidget):
         outer.setSpacing(0)
 
         self._scroll = QScrollArea(self)
+        self._scroll.setObjectName("DashboardScroll")
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setAttribute(Qt.WA_StyledBackground, True)
         outer.addWidget(self._scroll, 1)
 
         body = QWidget(self._scroll)
@@ -642,6 +651,7 @@ class DashboardPageWidget(QWidget):
         )
         grid_outer.addWidget(self._bento)
         self._bento.layout_committed.connect(self._persist_bento_layout)
+        self._bento.layout_changed.connect(self._on_bento_layout_changed)
         self._bento.edit_mode_changed.connect(self._on_bento_edit_mode_changed)
 
     # --- card construction -------------------------------------------------
@@ -675,7 +685,9 @@ class DashboardPageWidget(QWidget):
         self._btn_customize.setObjectName("DashboardGhostButton")
         self._btn_customize.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_customize.setIcon(lucide_icon("layout-dashboard", size=14, color_hex="#a1a1aa"))
-        self._btn_customize.setToolTip("Rearrange and show or hide dashboard widgets")
+        self._btn_customize.setToolTip(
+            "Open the widget sidebar to add, remove, and rearrange dashboard cards"
+        )
         self._btn_customize.clicked.connect(self._enter_customize_mode)
 
         actions_col = QVBoxLayout()
@@ -747,7 +759,7 @@ class DashboardPageWidget(QWidget):
         self._next_list_host = QWidget(self._next_card)
         self._next_list = QVBoxLayout(self._next_list_host)
         self._next_list.setContentsMargins(0, 0, 0, 0)
-        self._next_list.setSpacing(2)
+        self._next_list.setSpacing(4)
         nxb.addWidget(self._next_list_host)
         nxb.addStretch(1)
 
@@ -771,7 +783,7 @@ class DashboardPageWidget(QWidget):
         self._notes_list_host = QWidget(self._notes_card)
         self._notes_list = QVBoxLayout(self._notes_list_host)
         self._notes_list.setContentsMargins(0, 0, 0, 0)
-        self._notes_list.setSpacing(2)
+        self._notes_list.setSpacing(4)
         ntb.addWidget(self._notes_list_host)
         ntb.addStretch(1)
 
@@ -783,6 +795,25 @@ class DashboardPageWidget(QWidget):
 
     def _on_bento_edit_mode_changed(self, enabled: bool) -> None:
         self._btn_customize.setVisible(not enabled)
+        self.customize_mode_changed.emit(enabled)
+
+    def _on_bento_layout_changed(self, slots: object) -> None:
+        self.dashboard_layout_changed.emit(slots)
+
+    def is_customize_mode(self) -> bool:
+        return self._bento.is_edit_mode()
+
+    def exit_customize_mode(self) -> None:
+        self._bento.exit_edit_mode()
+
+    def dashboard_slots(self) -> list[DashboardWidgetSlot]:
+        return self._bento.slots()
+
+    def set_dashboard_widget_visible(self, widget_id: str, visible: bool) -> None:
+        if visible:
+            self._bento.show_widget(widget_id)
+        else:
+            self._bento.hide_widget(widget_id)
 
     def _build_notes_filter_bar(self) -> QWidget:
         host = QWidget()
@@ -861,7 +892,7 @@ class DashboardPageWidget(QWidget):
         row.open_notes.connect(lambda n=note: self.open_notes_entity_requested.emit(n))
         row.go_to_department.connect(lambda n=note: self.note_go_to_department_requested.emit(n))
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(6, 5, 6, 5)
+        rl.setContentsMargins(8, 6, 8, 6)
         rl.setSpacing(8)
         entity_block = _DashboardEntityBlock(
             entity_kind=note.entity_kind,
@@ -1075,7 +1106,7 @@ class DashboardPageWidget(QWidget):
             )
         )
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(6, 5, 6, 5)
+        rl.setContentsMargins(8, 6, 8, 6)
         rl.setSpacing(8)
         rl.addWidget(_dot(s.color_hex, 9), 0, Qt.AlignVCenter)
         name = QLabel(s.department_label, row)
@@ -1132,7 +1163,7 @@ class DashboardPageWidget(QWidget):
             )
         )
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(6, 5, 6, 5)
+        rl.setContentsMargins(8, 6, 8, 6)
         rl.setSpacing(8)
         entity_block = _DashboardEntityBlock(
             entity_kind=item.entity_kind,
@@ -1212,7 +1243,7 @@ class DashboardPageWidget(QWidget):
             else:
                 row.clicked.connect(self.open_schedule_requested.emit)
             rl = QHBoxLayout(row)
-            rl.setContentsMargins(6, 6, 6, 6)
+            rl.setContentsMargins(8, 6, 8, 6)
             rl.setSpacing(10)
             ic = QLabel(row)
             icon = lucide_icon(icon_name, size=16, color_hex=color)

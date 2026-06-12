@@ -10,7 +10,6 @@ from monostudio.core.item_comments import (
     normalize_note_department_id,
     read_item_comments,
 )
-from monostudio.core.production_status import CATEGORY_COLOR_HEX
 from monostudio.core.project_schedule import (
     ProjectSchedule,
     collect_unscheduled_entity_keys,
@@ -20,6 +19,7 @@ from monostudio.core.schedule_planner import (
     STATUS_DONE,
     STATUS_EXCLUDED,
     STATUS_PROGRESS,
+    bar_has_blocked_status,
     build_planned_bars,
     collect_overdue_entity_keys,
     collect_upcoming_due_rows,
@@ -267,7 +267,7 @@ def build_dashboard_snapshot(
             blocked_count,
             completion_pct,
             dept_stats,
-        ) = _summarize_bars(bars)
+        ) = _summarize_bars(bars, root)
 
     return DashboardSnapshot(
         assets_count=len(assets),
@@ -300,15 +300,14 @@ def build_dashboard_snapshot(
     )
 
 
-_BLOCKED_COLOR = CATEGORY_COLOR_HEX.get("blocked", "#ef4444")
-
-
 def _summarize_bars(
     bars: dict,
+    project_root: Path,
 ) -> tuple[int, int, int, int, int, float, tuple[DashboardDeptStat, ...]]:
     """Derive pipeline-health counts + per-department roll-ups from planned bars."""
     done = in_progress = waiting = blocked = 0
     in_scope = 0
+    status_regs: dict[str, object] = {}
     # dept_id -> [label, total, done, in_progress, overdue, color_hex]
     by_dept: dict[str, list] = {}
     for bar in bars.values():
@@ -321,7 +320,7 @@ def _summarize_bars(
             in_progress += 1
         else:
             waiting += 1
-        if bar.color_hex == _BLOCKED_COLOR:
+        if bar_has_blocked_status(bar, project_root, reg_cache=status_regs):
             blocked += 1
         dep = (bar.department or "").strip() or "unknown"
         slot = by_dept.get(dep)

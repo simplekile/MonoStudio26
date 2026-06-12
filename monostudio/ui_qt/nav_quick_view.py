@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QWidget,
 )
+
+from monostudio.ui_qt.app_hotkeys import bind_hotkey
 
 VALID_NAV_CONTEXTS = frozenset(
     {
@@ -156,23 +158,43 @@ class NavQuickViewController:
         self._export_filters = export_filters
         self._recall_slot = recall_slot
         self._on_assigned = on_assigned
+        self._bound_hotkeys: list[QShortcut] = []
         self._bind_shortcuts()
+
+    def bound_shortcuts(self) -> list[QShortcut]:
+        return self._bound_hotkeys
 
     def _bind_shortcuts(self) -> None:
         for slot in range(1, _SLOT_COUNT + 1):
-            sc_assign = QShortcut(QKeySequence(f"Ctrl+{slot}"), self._parent)
-            sc_assign.setContext(Qt.ShortcutContext.WindowShortcut)
-            sc_assign.activated.connect(lambda s=slot: self._assign(s))
-
-            sc_recall = QShortcut(QKeySequence(str(slot)), self._parent)
-            sc_recall.setContext(Qt.ShortcutContext.WindowShortcut)
-            sc_recall.setAutoRepeat(False)
-            sc_recall.activated.connect(lambda s=slot: self._recall(s))
-
-            sc_numpad = QShortcut(QKeySequence(f"Num+{slot}"), self._parent)
-            sc_numpad.setContext(Qt.ShortcutContext.WindowShortcut)
-            sc_numpad.setAutoRepeat(False)
-            sc_numpad.activated.connect(lambda s=slot: self._recall(s))
+            self._bound_hotkeys.append(
+                bind_hotkey(
+                    self._settings,
+                    f"nav_quick.assign.{slot}",
+                    self._parent,
+                    lambda s=slot: self._assign(s),
+                    context=Qt.ShortcutContext.WindowShortcut,
+                )
+            )
+            self._bound_hotkeys.append(
+                bind_hotkey(
+                    self._settings,
+                    f"nav_quick.recall.{slot}",
+                    self._parent,
+                    lambda s=slot: self._recall(s),
+                    context=Qt.ShortcutContext.WindowShortcut,
+                    auto_repeat=False,
+                )
+            )
+            self._bound_hotkeys.append(
+                bind_hotkey(
+                    self._settings,
+                    f"nav_quick.recall_numpad.{slot}",
+                    self._parent,
+                    lambda s=slot: self._recall(s),
+                    context=Qt.ShortcutContext.WindowShortcut,
+                    auto_repeat=False,
+                )
+            )
 
     def _assign(self, slot: int) -> None:
         if keyboard_input_blocks_shortcuts():

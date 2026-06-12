@@ -446,7 +446,8 @@ def build_planned_bars(
             bucket = STATUS_DONE
         excluded = _bar_is_excluded(bucket, current_sid)
         overdue = not excluded and not met and due < today
-        color = "#10b981" if met else ("#ef4444" if overdue else target_color)
+        # Timeline paints overdue via bar.overdue; keep production/target color here.
+        color = "#10b981" if met else target_color
         _store_bar(
             PlannedBar(
                 entity_kind=kind,
@@ -501,6 +502,35 @@ def compute_view_date_range_from_bars(
 
 def count_overdue_bars(bars: BarStore) -> int:
     return sum(1 for b in bars.values() if b.overdue)
+
+
+def bar_has_blocked_status(
+    bar: PlannedBar,
+    project_root: Path,
+    *,
+    reg_cache: dict[str, object] | None = None,
+) -> bool:
+    """True when the department's current production status category is blocked."""
+    if bar.status == STATUS_EXCLUDED:
+        return False
+    dep = (bar.department or "").strip()
+    sid = (bar.status_id or "").strip()
+    if not dep or not sid:
+        return False
+    cache = reg_cache if reg_cache is not None else {}
+    if dep not in cache:
+        cache[dep] = load_status_registry_for_department(project_root, dep)
+    reg = cache[dep]
+    return reg.category_for(sid) == "blocked"
+
+
+def count_blocked_bars(bars: BarStore, project_root: Path) -> int:
+    cache: dict[str, object] = {}
+    return sum(
+        1
+        for b in bars.values()
+        if bar_has_blocked_status(b, project_root, reg_cache=cache)
+    )
 
 
 def collect_overdue_entity_keys(

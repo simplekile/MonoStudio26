@@ -57,10 +57,12 @@ from monostudio.core.project_guide_tags import (
     build_color_map,
     build_label_map,
     delete_tag_definition,
+    normalize_tag_department_id,
     paths_with_tag,
     read_tag_definitions,
     recolor_tag_definition,
     rename_tag_definition,
+    save_tag_definitions,
 )
 from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.department_registry import DepartmentRegistry
@@ -76,6 +78,7 @@ from monostudio.core.workspace_reader import DiscoveredProject
 from monostudio.ui_qt.brand_icons import brand_icon
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.popup_position import max_popup_height_for_anchor, position_popup_near_anchor
+from monostudio.ui_qt.dashboard_widget_palette import DashboardWidgetPalette
 from monostudio.ui_qt.recent_tasks_store import RecentTask
 from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators, apply_pill_segment_positions
 from monostudio.ui_qt.style import (
@@ -111,6 +114,24 @@ TAG_COUNT_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 def _is_shot_type(type_id: str) -> bool:
     # Pipeline convention: shot types are "shot" or prefixed "shot_".
     return bool(type_id == "shot" or type_id.startswith("shot_"))
+
+
+def _filter_mode_for_nav_context(context_name: str) -> str | None:
+    """SidebarWidget mode expected for a nav page (None = filters hidden, e.g. Trash)."""
+    ctx = (context_name or "").strip()
+    if ctx == SidebarContext.ASSETS.value:
+        return "assets"
+    if ctx == SidebarContext.SHOTS.value:
+        return "shots"
+    if ctx == SidebarContext.SCHEDULE.value:
+        return "schedule"
+    if ctx == SidebarContext.DASHBOARD.value:
+        return None
+    if ctx in (SidebarContext.INBOX.value, SidebarContext.OUTBOX.value):
+        return "inbox"
+    if ctx == SidebarContext.PROJECT_GUIDE.value:
+        return "reference"
+    return None
 
 
 def _title_case_label(value: str) -> str:
@@ -406,10 +427,11 @@ class _SidebarFilterTreeDelegate(QStyledItemDelegate):
         finally:
             painter.restore()
 
-    def _row_metrics(self) -> tuple[int, int, QFont]:
+    def _row_metrics(self, *, selected: bool = False) -> tuple[int, int, QFont]:
         row_px = int(SIDEBAR_DEPT_LIST_STYLE.get("row_font_size_px", 11))
         icon_px = int(SIDEBAR_DEPT_LIST_STYLE.get("row_icon_size_px", 14))
-        body_font = monos_font("Inter", row_px, QFont.Weight.Medium)
+        weight = QFont.Weight.DemiBold if selected else QFont.Weight.Medium
+        body_font = monos_font("Inter", row_px, weight)
         return row_px, icon_px, body_font
 
     def _paint_group_row(self, painter: QPainter, opt: QStyleOptionViewItem, data: dict) -> None:
@@ -484,7 +506,7 @@ class _SidebarFilterTreeDelegate(QStyledItemDelegate):
             if indent > 0:
                 x += 16
             x = _paint_filter_lead_dot(painter, x=x, cy=cy, selected=is_selected)
-            _, icon_px, body_font = self._row_metrics()
+            _, icon_px, body_font = self._row_metrics(selected=is_selected)
             if not opt.icon.isNull():
                 ir = QRect(x, cy - icon_px // 2, icon_px, icon_px)
                 opt.icon.paint(painter, ir, Qt.AlignCenter, QIcon.Selected if is_selected else QIcon.Normal)
@@ -816,6 +838,7 @@ class _SidebarScopePillWidget(QWidget):
 
 _SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX = int(SIDEBAR_DEPT_LIST_STYLE.get("max_list_height_px", 280))
 _SIDEBAR_DEPT_LIST_MAX_HEIGHT_PX = _SIDEBAR_TYPE_LIST_MAX_HEIGHT_PX
+_SIDEBAR_TAG_LIST_MAX_HEIGHT_PX = _SIDEBAR_DEPT_LIST_MAX_HEIGHT_PX
 
 
 class SidebarWidget(QWidget):
@@ -832,7 +855,7 @@ class SidebarWidget(QWidget):
     departmentClicked = Signal(object)  # str | None
     typeClicked = Signal(object)  # str | None
     entityScopeChanged = Signal(bool, bool)  # include_shots, include_assets (schedule)
-    tagClicked = Signal(object)  # str | None  (tag_id or None for "All")
+    tagClicked = Signal(object)  # list[str] — active tag ids (empty = clear)
     tagsDefinitionsChanged = Signal()  # emitted when user modifies tag definitions
 
     def __init__(self, parent=None) -> None:
@@ -843,7 +866,7 @@ class SidebarWidget(QWidget):
 
         self._active_department: str | None = None
         self._active_type: str | None = None
-        self._active_tag: str | None = None
+        self._active_tags: list[str] = []
 
         self._mode: str = "assets"  # assets | shots | schedule | inbox | reference
         self._include_shots: bool = True
@@ -875,6 +898,7 @@ class SidebarWidget(QWidget):
         self._type_section_expanded = True
         self._dept_list_max_height_px: int | None = None
         self._type_list_max_height_px: int | None = None
+        self._tag_list_max_height_px: int = _SIDEBAR_TAG_LIST_MAX_HEIGHT_PX
         self._filters_dept_stretch_callback = None
         self._filters_layout_callback = None
         # Schedule: which dept ids apply to shot vs asset entities (index + pipeline types).
@@ -1098,7 +1122,7 @@ class SidebarWidget(QWidget):
         self._tag_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tag_list.setFocusPolicy(Qt.NoFocus)
         self._tag_list.setIconSize(QSize(20, 16))
-        self._tag_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._tag_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._tag_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._tag_list.setItemDelegate(_TagListDelegate(self._tag_list))
         self._tag_list.itemClicked.connect(self._on_tag_clicked)
@@ -1107,6 +1131,9 @@ class SidebarWidget(QWidget):
         self._tag_color_map: dict[str, str] = dict(TAG_COLOR_BY_ID)
         self._tag_label_map: dict[str, str] = dict(TAG_LABEL_BY_ID)
         self._visible_tags: list[str] = list(ALL_TAG_IDS)
+        self._visible_tags_by_department: dict[str, list[str]] = {}
+        self._active_tags_by_department: dict[str, list[str]] = {}
+        self._tag_department: str | None = None
         self._tag_item_tags: dict[str, list[str]] = {}  # path -> tag_ids (from Project Guide tree)
         self._project_root: Path | None = None
         self._rebuild_tag_list()
@@ -1204,7 +1231,7 @@ class SidebarWidget(QWidget):
             self._type_section.setVisible(False)
             self._scope_section.setVisible(False)
             self._tag_section.setVisible(True)
-            self._sync_tag_selection()
+            self.sync_tags_for_department(self._active_department, emit_filter=False)
             self._notify_filters_layout()
             return
 
@@ -1346,8 +1373,11 @@ class SidebarWidget(QWidget):
     def current_type(self) -> str | None:
         return self._active_type
 
+    def current_tags(self) -> list[str]:
+        return list(self._active_tags)
+
     def current_tag(self) -> str | None:
-        return self._active_tag
+        return self._active_tags[0] if self._active_tags else None
 
     def get_department_display(self, dept_id: str | None) -> tuple[str | None, str | None]:
         """Return (label, icon_name) for pipeline display (header + thumb badge). Subdepartment-safe."""
@@ -1369,18 +1399,65 @@ class SidebarWidget(QWidget):
             return None
         return self._tag_label_map.get(tag_id) or tag_id
 
+    def get_tag_color(self, tag_id: str | None) -> str | None:
+        if not tag_id:
+            return None
+        return self._tag_color_map.get(tag_id)
+
+    def clear_active_tag(self) -> None:
+        """Clear sidebar tag filter and emit tagClicked([])."""
+        if not self._active_tags:
+            return
+        self._active_tags = []
+        if self._mode == "reference" and self._tag_department:
+            self._active_tags_by_department[self._tag_department] = []
+        self._sync_tag_selection()
+        self.tagClicked.emit([])
+
     def set_tag_item_tags(self, item_tags: dict[str, list[str]]) -> None:
         """Set item->tag_ids map from Project Guide tree (for tag count badges)."""
         self._tag_item_tags = dict(item_tags) if item_tags else {}
+        dept = self._tag_department or self._active_department
         for i in range(self._tag_list.count()):
             item = self._tag_list.item(i)
             if item is None:
                 continue
             tid = item.data(Qt.ItemDataRole.UserRole)
             if isinstance(tid, str):
-                count = len(paths_with_tag(self._tag_item_tags, tid))
+                count = len(paths_with_tag(self._tag_item_tags, tid, department_id=dept))
                 item.setData(TAG_COUNT_ROLE, count)
         self._tag_list.viewport().update()
+
+    def sync_tags_for_department(self, department_id: str | None, *, emit_filter: bool = False) -> None:
+        """Load per-department tag slots and restore that department's active tag filter."""
+        if self._mode != "reference":
+            return
+        prev_dept = self._tag_department
+        dept = normalize_tag_department_id(department_id or self._active_department)
+        if prev_dept and prev_dept != dept:
+            self._active_tags_by_department[prev_dept] = list(self._active_tags)
+        self._load_department_tag_defs(dept)
+        restored = self._active_tags_by_department.get(dept, [])
+        valid_ids = {d["id"] for d in self._tag_definitions}
+        self._active_tags = [t for t in restored if t in valid_ids]
+        if len(self._active_tags) != len(restored):
+            self._active_tags_by_department[dept] = list(self._active_tags)
+        self._rebuild_tag_list()
+        if emit_filter:
+            self.tagClicked.emit(list(self._active_tags))
+
+    def _load_department_tag_defs(self, department_id: str) -> None:
+        dept = normalize_tag_department_id(department_id)
+        self._tag_department = dept
+        if self._project_root:
+            self._tag_definitions = read_tag_definitions(self._project_root, dept)
+        else:
+            self._tag_definitions = list(DEFAULT_TAG_DEFINITIONS)
+        if dept not in self._visible_tags_by_department:
+            self._visible_tags_by_department[dept] = [d["id"] for d in self._tag_definitions]
+        self._visible_tags = list(self._visible_tags_by_department[dept])
+        self._tag_color_map = build_color_map(self._tag_definitions)
+        self._tag_label_map = build_label_map(self._tag_definitions)
 
     def set_settings(self, settings: QSettings) -> None:
         """
@@ -1499,6 +1576,10 @@ class SidebarWidget(QWidget):
         if m not in ("assets", "shots", "schedule", "inbox", "reference"):
             return
         if self._mode == m:
+            # Re-apply stored page state — mode may already match after a stray set_mode()
+            # while nav context was elsewhere (tray, entity jump, metadata reload).
+            self._apply_state(self._state_by_mode.get(self._mode))
+            self.reload_from_pipeline_metadata()
             self._notify_filters_layout()
             return
         # Snapshot outgoing mode state.
@@ -1529,6 +1610,10 @@ class SidebarWidget(QWidget):
             self._department_by_type = {}
             self._visible_departments = None
             self._visible_types = None
+            if self._mode == "schedule":
+                self._include_shots = True
+                self._include_assets = False
+                self._rebuild_scope_list()
             return
         self._active_type = state.get("active_type") if isinstance(state.get("active_type"), str) else None
         dbt = state.get("department_by_type")
@@ -2245,6 +2330,8 @@ class SidebarWidget(QWidget):
             self._department_by_type[self._active_type] = clicked
         self._sync_selection()
         self.departmentClicked.emit(clicked)
+        if self._mode == "reference":
+            self.sync_tags_for_department(clicked, emit_filter=True)
         self._state_by_mode[self._mode] = self._snapshot_state()
         self._save_state_for_mode(self._mode)
 
@@ -2302,25 +2389,30 @@ class SidebarWidget(QWidget):
 
     def _on_tag_clicked(self, item: QListWidgetItem) -> None:
         tag_id = item.data(Qt.ItemDataRole.UserRole)  # str | None
-        if tag_id == self._active_tag:
-            self._active_tag = None
-            self._sync_tag_selection()
-            self.tagClicked.emit(None)
+        if not isinstance(tag_id, str) or not tag_id:
             return
-        self._active_tag = tag_id
+        if tag_id in self._active_tags:
+            self._active_tags = [t for t in self._active_tags if t != tag_id]
+        else:
+            self._active_tags = [*self._active_tags, tag_id]
         self._sync_tag_selection()
-        self.tagClicked.emit(tag_id)
+        if self._mode == "reference" and self._tag_department:
+            self._active_tags_by_department[self._tag_department] = list(self._active_tags)
+        self.tagClicked.emit(list(self._active_tags))
 
     def _sync_tag_selection(self) -> None:
-        if self._active_tag is None:
-            self._tag_list.clearSelection()
-            self._tag_list.setCurrentRow(-1)
+        active = set(self._active_tags)
+        row_px = int(SIDEBAR_DEPT_LIST_STYLE.get("row_font_size_px", 11))
+        self._tag_list.clearSelection()
+        self._tag_list.setCurrentRow(-1)
         for i in range(self._tag_list.count()):
             item = self._tag_list.item(i)
             if item is None:
                 continue
             tid = item.data(Qt.ItemDataRole.UserRole)
-            is_active = tid == self._active_tag
+            is_active = isinstance(tid, str) and tid in active
+            weight = QFont.Weight.DemiBold if is_active else QFont.Weight.Medium
+            item.setFont(monos_font("Inter", row_px, weight))
             if is_active:
                 item.setForeground(QColor(MONOS_COLORS.get("blue_400", "#60a5fa")))
             else:
@@ -2328,37 +2420,46 @@ class SidebarWidget(QWidget):
 
     def set_project_root(self, project_root: Path | None) -> None:
         self._project_root = project_root
-        if project_root is not None:
-            self._tag_definitions = read_tag_definitions(project_root)
+        if self._mode == "reference":
+            self.sync_tags_for_department(self._active_department, emit_filter=False)
+        elif project_root is not None:
+            dept = normalize_tag_department_id(self._active_department)
+            self._load_department_tag_defs(dept)
+            self._rebuild_tag_list()
         else:
             self._tag_definitions = list(DEFAULT_TAG_DEFINITIONS)
-        self._tag_color_map = build_color_map(self._tag_definitions)
-        self._tag_label_map = build_label_map(self._tag_definitions)
-        all_ids = [d["id"] for d in self._tag_definitions]
-        self._visible_tags = [tid for tid in self._visible_tags if tid in set(all_ids)]
-        for tid in all_ids:
-            if tid not in self._visible_tags:
-                self._visible_tags.append(tid)
-        self._rebuild_tag_list()
+            self._tag_color_map = build_color_map(self._tag_definitions)
+            self._tag_label_map = build_label_map(self._tag_definitions)
+            self._rebuild_tag_list()
+
+    def _fit_tag_list(self) -> None:
+        self._fit_list_height(
+            self._tag_list,
+            max_height_px=self._tag_list_max_height_px,
+            allow_shrink=False,
+        )
+        self._sync_list_container_height(self._tag_list, self._tag_list_container)
+        self._notify_filters_layout()
 
     def _rebuild_tag_list(self) -> None:
         self._tag_list.clear()
-        f_tag = monos_font("Inter", 10, QFont.Weight.Normal)
+        row_px = int(SIDEBAR_DEPT_LIST_STYLE.get("row_font_size_px", 11))
+        f_tag = monos_font("Inter", row_px, QFont.Weight.Medium)
         visible_set = set(self._visible_tags)
+        dept = self._tag_department or self._active_department
         for tdef in self._tag_definitions:
             tid = tdef["id"]
             if tid not in visible_set:
                 continue
             item = QListWidgetItem(tdef["label"])
             item.setData(Qt.ItemDataRole.UserRole, tid)
-            count = len(paths_with_tag(self._tag_item_tags, tid))
+            count = len(paths_with_tag(self._tag_item_tags, tid, department_id=dept))
             item.setData(TAG_COUNT_ROLE, count)
             item.setFont(f_tag)
             item.setForeground(QColor(MONOS_COLORS.get("text_body", "#d4d4d8")))
             item.setIcon(self._tag_dot_icon(tdef["color"]))
             self._tag_list.addItem(item)
-        row_h = self._tag_list.sizeHintForRow(0) if self._tag_list.count() > 0 else 26
-        self._tag_list.setFixedHeight(row_h * self._tag_list.count() + 4)
+        self._fit_tag_list()
         self._sync_tag_selection()
 
     @staticmethod
@@ -2374,11 +2475,14 @@ class SidebarWidget(QWidget):
         return QIcon(canvas)
 
     def _open_tag_picker(self) -> None:
+        dept = self._tag_department or normalize_tag_department_id(self._active_department)
         # Use top-level window as parent so dialog survives when filter is in compact popup (reparent).
         dlg = _TagPickerDialog(
             tag_definitions=self._tag_definitions,
             visible_tags=list(self._visible_tags),
             project_root=self._project_root,
+            department_id=dept,
+            item_tags=self._tag_item_tags,
             parent=self.window(),
         )
         if dlg.exec() != QDialog.Accepted:
@@ -2387,9 +2491,15 @@ class SidebarWidget(QWidget):
         self._tag_color_map = build_color_map(self._tag_definitions)
         self._tag_label_map = build_label_map(self._tag_definitions)
         self._visible_tags = dlg.visible_tag_ids()
-        if self._active_tag and self._active_tag not in {d["id"] for d in self._tag_definitions}:
-            self._active_tag = None
-            self.tagClicked.emit(None)
+        self._visible_tags_by_department[dept] = list(self._visible_tags)
+        if self._project_root:
+            save_tag_definitions(self._project_root, dept, self._tag_definitions)
+        valid_ids = {d["id"] for d in self._tag_definitions}
+        pruned = [t for t in self._active_tags if t in valid_ids]
+        if pruned != self._active_tags:
+            self._active_tags = pruned
+            self._active_tags_by_department[dept] = list(self._active_tags)
+            self.tagClicked.emit(list(self._active_tags))
         self._rebuild_tag_list()
         self.tagsDefinitionsChanged.emit()
 
@@ -2929,6 +3039,8 @@ class _TagPickerDialog(MonosDialog):
         tag_definitions: list[dict[str, str]],
         visible_tags: list[str],
         project_root: Path | None,
+        department_id: str,
+        item_tags: dict[str, list[str]],
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -2940,6 +3052,8 @@ class _TagPickerDialog(MonosDialog):
         self._defs = [dict(d) for d in tag_definitions]
         self._visible = set(visible_tags)
         self._project_root = project_root
+        self._department_id = normalize_tag_department_id(department_id)
+        self._item_tags = item_tags
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -3045,7 +3159,7 @@ class _TagPickerDialog(MonosDialog):
                 break
         item.setText(new_label.strip())
         if self._project_root:
-            rename_tag_definition(self._project_root, tag_id, new_label.strip())
+            rename_tag_definition(self._project_root, self._department_id, tag_id, new_label.strip())
 
     def _recolor_tag(self, tag_id: str, new_color: str, item: QListWidgetItem) -> None:
         for d in self._defs:
@@ -3054,10 +3168,15 @@ class _TagPickerDialog(MonosDialog):
                 break
         item.setIcon(self._dot_icon(new_color))
         if self._project_root:
-            recolor_tag_definition(self._project_root, tag_id, new_color)
+            recolor_tag_definition(self._project_root, self._department_id, tag_id, new_color)
 
     def _delete_tag(self, tag_id: str) -> None:
-        self._defs = [d for d in self._defs if d["id"] != tag_id]
+        if self._project_root:
+            _, self._defs = delete_tag_definition(
+                self._project_root, self._department_id, tag_id, self._item_tags,
+            )
+        else:
+            self._defs = [d for d in self._defs if d["id"] != tag_id]
         self._visible.discard(tag_id)
         self._populate()
 
@@ -3069,7 +3188,9 @@ class _TagPickerDialog(MonosDialog):
             return
         color = TAG_COLOR_PALETTE[len(self._defs) % len(TAG_COLOR_PALETTE)]
         if self._project_root:
-            _, self._defs = add_tag_definition(self._project_root, label.strip(), color)
+            _, self._defs = add_tag_definition(
+                self._project_root, self._department_id, label.strip(), color,
+            )
         else:
             import uuid as _uuid
             new_id = f"tag_{_uuid.uuid4().hex[:8]}"
@@ -3274,11 +3395,13 @@ class Sidebar(QWidget):
     """
     Filter panel (256px): project name, department/type filters, recent tasks.
     Primary navigation lives in SidebarNavRail.
+    On Dashboard customize, the filter block is replaced by a widget palette.
     """
 
     recent_task_clicked = Signal(object)  # RecentTask
     recent_task_double_clicked = Signal(object)  # RecentTask
     clear_recent_tasks_requested = Signal()
+    dashboard_widget_visibility_toggled = Signal(str, bool)  # widget_id, visible
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3373,6 +3496,29 @@ class Sidebar(QWidget):
         self._filters.setFixedSize(0, 0)
         self._filters.hide()
 
+        self._dashboard_widgets_center = QWidget(self)
+        self._dashboard_widgets_center.setObjectName("SidebarDashboardWidgetsCenter")
+        self._dashboard_widgets_center.setAttribute(Qt.WA_StyledBackground, True)
+        self._dashboard_widgets_center.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+        )
+        palette_layout = QVBoxLayout(self._dashboard_widgets_center)
+        palette_layout.setContentsMargins(0, 0, 0, 0)
+        palette_layout.setSpacing(0)
+        self._dashboard_palette = DashboardWidgetPalette(self._dashboard_widgets_center)
+        palette_layout.addWidget(self._dashboard_palette, 1)
+        self._dashboard_palette.widget_visibility_toggled.connect(
+            self.dashboard_widget_visibility_toggled.emit
+        )
+        self._dashboard_customize_mode = False
+
+        self._center_stack = QStackedWidget(self)
+        self._center_stack.setObjectName("SidebarCenterStack")
+        self._center_stack.setAttribute(Qt.WA_StyledBackground, True)
+        self._center_stack.addWidget(self._filters_center)
+        self._center_stack.addWidget(self._dashboard_widgets_center)
+        self._center_stack.setCurrentWidget(self._filters_center)
+
         self._sep_above_tasks = QFrame(self)
         self._sep_above_tasks.setObjectName("SidebarNavSeparator")
         self._sep_above_tasks.setFrameShape(QFrame.Shape.HLine)
@@ -3443,7 +3589,7 @@ class Sidebar(QWidget):
         tasks_layout.addWidget(self._tasks_stacked, 0)
 
         root.addWidget(top_block_56, 0)
-        root.addWidget(self._filters_center, 1)
+        root.addWidget(self._center_stack, 1)
         root.addWidget(self._sep_above_tasks, 0)
         root.addWidget(self._tasks_block, 0)
 
@@ -3603,32 +3749,56 @@ class Sidebar(QWidget):
         ):
             self._push_filter_counts()
 
-    _FILTERS_CENTER_LAYOUT_INDEX = 1  # index in root layout for filters_center
+    _CENTER_STACK_LAYOUT_INDEX = 1  # index in root layout for center stack
+
+    def _apply_center_stack_page(self) -> None:
+        """QStackedWidget owns page visibility — never show() a non-current page."""
+        if self._dashboard_customize_mode:
+            self._center_stack.setCurrentWidget(self._dashboard_widgets_center)
+        else:
+            self._center_stack.setCurrentWidget(self._filters_center)
+
+    def set_dashboard_customize_mode(self, enabled: bool) -> None:
+        """Show widget palette (not filters) while dashboard customize is active."""
+        self._dashboard_customize_mode = bool(enabled)
+        self._apply_center_stack_page()
+        # Give the widget list the full center column (hide recent tasks while customizing).
+        show_tasks = not enabled
+        self._sep_above_tasks.setVisible(show_tasks)
+        self._tasks_block.setVisible(show_tasks)
+        self.updateGeometry()
+
+    def sync_dashboard_widget_slots(self, slots: object) -> None:
+        self._dashboard_palette.sync_slots(slots)  # type: ignore[arg-type]
 
     def take_filters_center(self) -> QWidget | None:
         """Remove the filter panel from sidebar layout and return it (for compact filter popup)."""
         w = self._filters_center
-        lay = self.layout()
-        if lay is not None:
-            lay.removeWidget(w)
+        if self._center_stack.indexOf(w) >= 0:
+            self._center_stack.removeWidget(w)
+        else:
+            lay = self.layout()
+            if lay is not None:
+                lay.removeWidget(w)
         return w
 
     def restore_filters_center(self, widget: QWidget) -> None:
         """Put the filter panel back into sidebar layout."""
-        lay = self.layout()
-        if lay is None:
-            return
-        if lay.indexOf(widget) < 0:
-            widget.setParent(self)
-            lay.insertWidget(self._FILTERS_CENTER_LAYOUT_INDEX, widget)
+        if self._center_stack.indexOf(widget) < 0:
+            widget.setParent(self._center_stack)
+            self._center_stack.insertWidget(0, widget)
         widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         widget.setMinimumWidth(0)
         widget.setMaximumWidth(16777215)
         widget.setAttribute(Qt.WA_StyledBackground, True)
         widget.setAutoFillBackground(False)
-        widget.show()
-        lay.activate()
-        self._sync_filters_center_layout()
+        # Do not call widget.show() — that leaks the filter page over the dashboard palette.
+        self._apply_center_stack_page()
+        parent = self._center_stack.parentWidget()
+        if parent is not None and parent.layout() is not None:
+            parent.layout().activate()
+        if not self._dashboard_customize_mode:
+            self._sync_filters_center_layout()
         self._repolish_widget_style(widget)
         self._repolish_widget_style(self)
         self.updateGeometry()
@@ -3809,7 +3979,9 @@ class Sidebar(QWidget):
 
     def sync_nav_context(self, context_name: str, *, force: bool = False) -> None:
         """Update filter panel for nav context without emitting navigation signals."""
-        if not force and context_name == self.current_context():
+        expected_mode = _filter_mode_for_nav_context(context_name)
+        mode_aligned = expected_mode is None or self._filters._mode == expected_mode
+        if not force and context_name == self.current_context() and mode_aligned:
             return
         if context_name in (SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
             self._footer_context = None
@@ -3831,9 +4003,9 @@ class Sidebar(QWidget):
         ):
             self._footer_context = context_name
             if context_name == SidebarContext.DASHBOARD.value:
-                self._filters.setVisible(True)
-                self._filters.set_mode("schedule")
-                self._push_filter_counts()
+                self._filters.setVisible(False)
+                self._dashboard_customize_mode = False
+                self._apply_center_stack_page()
             elif context_name == SidebarContext.INBOX.value:
                 self._filters.setVisible(True)
                 self._filters.set_mode("inbox")
@@ -3930,7 +4102,7 @@ class Sidebar(QWidget):
                         by_dept_norm[dn] = by_dept_norm.get(dn, 0) + 1
             for did in filter_depts:
                 count_by_department[did] = by_dept_norm.get(norm(did), 0)
-        elif ctx == SidebarContext.SCHEDULE.value:
+        elif ctx in (SidebarContext.SCHEDULE.value, SidebarContext.DASHBOARD.value):
             include_shots, include_assets = self._filters.entity_scope()
             active_type = self._filters.current_type()
             active_type_norm = norm(active_type or "")

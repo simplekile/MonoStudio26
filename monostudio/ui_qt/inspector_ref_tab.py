@@ -11,12 +11,9 @@ from PySide6.QtCore import (
     QEvent,
     QMimeData,
     QModelIndex,
-    QObject,
     QPoint,
     QRect,
-    QRunnable,
     QSize,
-    QThreadPool,
     QTimer,
     QUrl,
     Qt,
@@ -29,11 +26,11 @@ from PySide6.QtGui import (
     QDragMoveEvent,
     QDropEvent,
     QFont,
-    QImage,
+    QFontMetrics,
+    QIcon,
     QMouseEvent,
     QPainter,
     QPainterPath,
-    QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -59,7 +56,6 @@ from monostudio.core.entity_folders import (
     count_special_folder_files,
     ensure_entity_special_folder,
     import_paths_into_special_folder,
-    is_ref_preview_image,
     list_special_folder_files,
 )
 from monostudio.core.entity_ref_pins import (
@@ -71,13 +67,17 @@ from monostudio.core.entity_ref_pins import (
 from monostudio.core.models import Asset, Shot
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.external_drop import paths_from_mime
-from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, monos_font
-from monostudio.ui_qt.thumbnails import (
-    REF_PREVIEW_DISK_CACHE_VARIANT,
-    ThumbnailCache,
-    decode_ref_preview_qimage_worker,
+from monostudio.ui_qt.explorer_thumbnail_loader import ExplorerThumbnailLoader
+from monostudio.ui_qt.inbox_grid_card_paint import (
+    grid_card_fallback_icon_px,
+    paint_grid_card_border,
+    paint_grid_card_icon_band,
+    paint_grid_card_labels,
 )
+from monostudio.ui_qt.inbox_list_row_paint import paint_explorer_thumb_loading_spinner
+from monostudio.ui_qt.lucide_icons import lucide_icon
+from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, file_icon_spec_for_path, monos_font
+from monostudio.ui_qt.thumbnails import is_direct_media_preview_path
 
 # Fixed square thumbs; QListView IconMode wraps columns like Main View grid.
 _REF_GRID_GAP = 12
@@ -85,12 +85,22 @@ _REF_THUMB_SIZE = 120
 _REF_GRID_SYNC_DEBOUNCE_MS = 0  # singleShot(0) like MainView._schedule_grid_layout_sync
 _REF_CONTENT_H_MARGIN = 24
 _REF_MAX_GRID_COLUMNS = 6
-_REF_THUMB_DECODE_MIN = 256
-_REF_THUMB_DECODE_MAX = 512
 _REF_THUMB_PREFETCH_CHUNK = 8
 _REF_THUMB_PREFETCH_ALL_MAX_ROWS = 32
 _REF_STAR_BADGE_SIZE = 16
 _REF_STAR_BADGE_INSET = 6
+_REF_LABEL_GAP = 4
+_REF_LABEL_PX = 11
+_REF_LABEL_LINES = 2
+
+
+def _ref_label_band_height() -> int:
+    fm = QFontMetrics(monos_font("Inter", _REF_LABEL_PX, QFont.Weight.DemiBold))
+    return _REF_LABEL_GAP + fm.height() * _REF_LABEL_LINES
+
+
+def _ref_cell_height() -> int:
+    return _REF_THUMB_SIZE + _ref_label_band_height() + _REF_GRID_GAP
 
 
 def _explorer_mime_has_files(mime: QMimeData | None) -> bool:
@@ -101,12 +111,16 @@ def _explorer_mime_has_files(mime: QMimeData | None) -> bool:
     return mime.hasFormat("text/uri-list")
 
 
-def ref_thumb_decode_max_side(*, dpr: float) -> int:
-    """Square decode size in device pixels for ref grid (inner cell × DPR)."""
-    dpr = max(1.0, float(dpr))
-    inner = _REF_THUMB_SIZE - 2  # 1px border each side when not selected
-    side = int(inner * dpr)
-    return max(_REF_THUMB_DECODE_MIN, min(_REF_THUMB_DECODE_MAX, side))
+def _ref_file_icon(name: str, color: str, *, size: int) -> QIcon:
+    """Lucide or brand icon for ref grid fallback (aligned with Project Guide explorer)."""
+    px = max(12, int(size))
+    if name.startswith("brand:"):
+        from monostudio.ui_qt.brand_icons import brand_icon
+
+        slug = name[6:]
+        ic = brand_icon(slug, size=px, color_hex=color)
+        return ic if not ic.isNull() else lucide_icon("box", size=px, color_hex=color)
+    return lucide_icon(name, size=px, color_hex=color)
 
 
 def _ref_path_key(path: Path) -> str:
@@ -148,7 +162,6 @@ def _ref_grid_columns_for_width(available_w: int) -> int:
 @dataclass(frozen=True)
 class _RefThumbEntry:
     path: Path
-    placeholder_ext: str = ""
     starred: bool = False
 
 
@@ -182,15 +195,21 @@ def _paint_ref_thumb_cell(
     p: QPainter,
     rect: QRect,
     *,
+    file_name: str,
     pixmap: QPixmap | None,
-    placeholder_ext: str,
+    file_icon: QIcon | None,
+    thumb_loading: bool,
+    loading_angle: float,
     selected: bool,
     hovered: bool,
     starred: bool = False,
     dpr: float = 1.0,
 ) -> None:
     g = _REF_GRID_GAP
-    outer = rect.adjusted(0, 0, -g, -g)
+    cell = rect.adjusted(0, 0, -g, -g)
+    if cell.width() <= 0 or cell.height() <= 0:
+        return
+    outer = QRect(cell.left(), cell.top(), cell.width(), _REF_THUMB_SIZE)
     if outer.width() <= 0 or outer.height() <= 0:
         return
     radius = 8
@@ -211,25 +230,15 @@ def _paint_ref_thumb_cell(
     clip.addRoundedRect(inner, inner_radius, inner_radius)
     p.setClipPath(clip)
     thumb = inner
+    p.fillRect(thumb, QColor("#27272a"))
     if pixmap is not None and not pixmap.isNull():
         _draw_ref_thumb_pixmap(p, thumb, pixmap, dpr)
-    elif placeholder_ext:
-        p.setPen(QColor(MONOS_COLORS.get("text_muted", "#71717a")))
-        p.setFont(monos_font("JetBrains Mono", 10))
-        p.drawText(thumb, Qt.AlignmentFlag.AlignCenter, placeholder_ext.upper())
+    elif thumb_loading:
+        paint_explorer_thumb_loading_spinner(p, thumb, angle=loading_angle)
+    elif file_icon is not None and not file_icon.isNull():
+        icon_px = grid_card_fallback_icon_px(thumb)
+        paint_grid_card_icon_band(p, thumb, file_icon, icon_px=icon_px)
     p.setClipping(False)
-
-    if selected:
-        border_color = QColor("#60a5fa")
-    elif hovered:
-        border_color = QColor("#3f3f46")
-    else:
-        border_color = QColor("#27272a")
-    inset = border_px // 2
-    border_rect = outer.adjusted(inset, inset, -inset, -inset)
-    p.setPen(QPen(border_color, border_px))
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    p.drawRoundedRect(border_rect, radius, radius)
 
     if starred or hovered:
         star_rect = _ref_star_hit_rect(outer)
@@ -244,26 +253,44 @@ def _paint_ref_thumb_cell(
             p.drawRoundedRect(bg, 4, 4)
             p.drawPixmap(star_rect, star_pm)
 
+    label_top = outer.bottom() + _REF_LABEL_GAP
+    label_h = max(0, cell.bottom() - label_top)
+    if label_h > 0 and file_name:
+        title_color = QColor(
+            MONOS_COLORS.get("zinc_200", "#e4e4e7")
+            if selected or hovered
+            else MONOS_COLORS.get("text_body", "#d4d4d8")
+        )
+        label_rect = QRect(cell.left(), label_top, cell.width(), label_h)
+        paint_grid_card_labels(
+            p,
+            label_rect,
+            title=file_name,
+            meta="",
+            title_color=title_color,
+            meta_color=title_color,
+            icon_band_h=0,
+            title_px=_REF_LABEL_PX,
+            max_title_lines=_REF_LABEL_LINES,
+            band_from_card_top=True,
+            band_gap_after=0,
+            label_pad_h=0,
+            label_pad_bottom=0,
+        )
 
-class _RefThumbDecodeBridge(QObject):
-    """Cross-thread delivery of decoded QImage (converted to QPixmap on GUI thread)."""
-
-    decoded = Signal(str, int, object)  # path key, generation, QImage | None
-
-
-class _RefThumbDecodeRunnable(QRunnable):
-    def __init__(self, path_key: str, size_px: int, gen: int, bridge: _RefThumbDecodeBridge) -> None:
-        super().__init__()
-        self.setAutoDelete(True)
-        self._path_key = path_key
-        self._size_px = size_px
-        self._gen = gen
-        self._bridge = bridge
-
-    def run(self) -> None:
-        result = decode_ref_preview_qimage_worker(self._path_key, self._size_px)
-        image: QImage | None = result[1] if result else None
-        self._bridge.decoded.emit(self._path_key, self._gen, image)
+    if selected:
+        border_color = QColor("#60a5fa")
+    elif hovered:
+        border_color = QColor("#3f3f46")
+    else:
+        border_color = QColor("#27272a")
+    paint_grid_card_border(
+        p,
+        outer,
+        border=border_color,
+        radius=radius,
+        width=border_px,
+    )
 
 
 class _RefThumbListModel(QAbstractListModel):
@@ -279,8 +306,11 @@ class _RefThumbListModel(QAbstractListModel):
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # type: ignore[override]
         if not index.isValid() or index.row() < 0 or index.row() >= len(self._entries):
             return None
+        entry = self._entries[index.row()]
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return entry.path.name
         if role == Qt.ItemDataRole.UserRole:
-            return self._entries[index.row()]
+            return entry
         return None
 
     def reset_entries(self, entries: list[_RefThumbEntry]) -> None:
@@ -304,17 +334,26 @@ class _RefThumbDelegate(QStyledItemDelegate):
         if not isinstance(entry, _RefThumbEntry):
             super().paint(painter, option, index)
             return
-        pm = None
-        key = _ref_path_key(entry.path)
-        if is_ref_preview_image(entry.path):
-            pm = self._section._thumb_pixmaps.get(key)
-            if (
-                (pm is None or pm.isNull())
-                and key not in self._section._thumb_pending
-                and key not in self._section._thumb_missing
-            ):
-                self._section._request_thumb_for_path(entry.path, self._section._thumb_prefetch_gen)
-        selected = self._section._selected_path == entry.path
+        loader = self._section._explorer_thumb_loader
+        is_media = is_direct_media_preview_path(entry.path)
+        pm = loader.get_or_request(entry.path) if is_media else None
+        thumb_loading = bool(
+            is_media
+            and (pm is None or pm.isNull())
+            and loader.is_pending(entry.path)
+        )
+        g = _REF_GRID_GAP
+        cell = option.rect.adjusted(0, 0, -g, -g)
+        card = QRect(cell.left(), cell.top(), cell.width(), _REF_THUMB_SIZE)
+        selected = False
+        tab = self._section._owner_ref_tab()
+        if tab is not None:
+            selected = tab.is_path_selected(entry.path)
+        border_px = 2 if selected else 1
+        thumb = card.adjusted(border_px, border_px, -border_px, -border_px)
+        icon_name, icon_color = file_icon_spec_for_path(entry.path)
+        fallback_icon_px = grid_card_fallback_icon_px(thumb)
+        file_icon = _ref_file_icon(icon_name, icon_color, size=fallback_icon_px)
         hovered = self._section._hovered_row == index.row()
         dpr = self._section._list_dpr()
         painter.save()
@@ -323,8 +362,11 @@ class _RefThumbDelegate(QStyledItemDelegate):
             _paint_ref_thumb_cell(
                 painter,
                 option.rect,
+                file_name=entry.path.name,
                 pixmap=pm,
-                placeholder_ext=entry.placeholder_ext if pm is None or pm.isNull() else "",
+                file_icon=file_icon,
+                thumb_loading=thumb_loading,
+                loading_angle=loader.loading_angle,
                 selected=selected,
                 hovered=hovered,
                 starred=entry.starred,
@@ -334,8 +376,8 @@ class _RefThumbDelegate(QStyledItemDelegate):
             painter.restore()
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:  # type: ignore[override]
-        cell = _REF_THUMB_SIZE + _REF_GRID_GAP
-        return QSize(cell, cell)
+        cell_w = _REF_THUMB_SIZE + _REF_GRID_GAP
+        return QSize(cell_w, _ref_cell_height())
 
 
 class _RefSectionHeader(QWidget):
@@ -377,19 +419,8 @@ class _InspectorRefSection(QWidget):
         self._folder_path: Path | None = None
         self._files: list[Path] = []
         self._expanded = True
-        self._thumb_decode_bucket = 0
-        self._thumb_cache = ThumbnailCache(
-            size_px=_REF_THUMB_DECODE_MIN,
-            cache_variant=REF_PREVIEW_DISK_CACHE_VARIANT,
-        )
-        self._thumb_bridge = _RefThumbDecodeBridge(self)
-        self._thumb_bridge.decoded.connect(self._on_thumb_decoded)
-        self._thumb_pixmaps: dict[str, QPixmap] = {}
-        self._thumb_pending: set[str] = set()
-        self._thumb_missing: set[str] = set()
-        self._thumb_prefetch_gen = 0
+        self._explorer_thumb_loader = ExplorerThumbnailLoader(self)
         self._thumb_prefetch_scheduled = False
-        self._selected_path: Path | None = None
         self._hovered_row: int | None = None
         self._grid_last: tuple[int, int] | None = None  # (cols, list_height)
         self._grid_sync_scheduled = False
@@ -468,7 +499,7 @@ class _InspectorRefSection(QWidget):
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
-        self._list.setSelectionMode(QListView.SelectionMode.SingleSelection)
+        self._list.setSelectionMode(QListView.SelectionMode.NoSelection)
         self._list.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self._list.setDefaultDropAction(Qt.DropAction.CopyAction)
         self._list.setMouseTracking(True)
@@ -476,6 +507,7 @@ class _InspectorRefSection(QWidget):
         self._list.setModel(self._model)
         self._delegate = _RefThumbDelegate(self)
         self._list.setItemDelegate(self._delegate)
+        self._explorer_thumb_loader.register_view(self._list)
         self._list.clicked.connect(self._on_list_clicked)
         self._list.doubleClicked.connect(self._on_list_double_clicked)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -495,29 +527,8 @@ class _InspectorRefSection(QWidget):
         for w in (self, self._hdr, self._body, self._empty_block, self._list, self._list.viewport()):
             w.setAcceptDrops(True)
             w.installEventFilter(self)
-        self._sync_thumb_decode_bucket()
-
     def _list_dpr(self) -> float:
         return max(1.0, float(self._list.devicePixelRatioF()))
-
-    def _sync_thumb_decode_bucket(self) -> int:
-        """Align disk/memory decode size with list DPR; invalidate thumbs when bucket changes."""
-        side = ref_thumb_decode_max_side(dpr=self._list_dpr())
-        if side != self._thumb_decode_bucket:
-            self._thumb_decode_bucket = side
-            self._thumb_cache = ThumbnailCache(
-                size_px=side,
-                cache_variant=REF_PREVIEW_DISK_CACHE_VARIANT,
-            )
-            self._reset_thumb_load_state()
-        return side
-
-    def _on_thumb_display_metrics_changed(self) -> None:
-        prev = self._thumb_decode_bucket
-        self._sync_thumb_decode_bucket()
-        if prev != self._thumb_decode_bucket:
-            self._schedule_thumb_prefetch(force=True)
-        self._list.viewport().update()
 
     @property
     def container(self) -> QWidget:
@@ -568,11 +579,6 @@ class _InspectorRefSection(QWidget):
             self._list.viewport(),
         ):
             t = event.type()
-            if obj is self._list and t in (
-                QEvent.Type.Show,
-                QEvent.Type.DevicePixelRatioChange,
-            ):
-                self._on_thumb_display_metrics_changed()
             if t in (QEvent.Type.Enter, QEvent.Type.MouseMove):
                 self._sync_container_hover()
             elif t in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
@@ -747,10 +753,10 @@ class _InspectorRefSection(QWidget):
 
     def _prefetch_visible_thumbnails(self) -> None:
         self._thumb_prefetch_scheduled = False
-        self._prefetch_thumbs_chunk(self._thumb_prefetch_gen, 0)
+        self._prefetch_thumbs_chunk(0)
 
-    def _prefetch_thumbs_chunk(self, gen: int, start_row: int) -> None:
-        if gen != self._thumb_prefetch_gen or not self._expanded:
+    def _prefetch_thumbs_chunk(self, start_row: int) -> None:
+        if not self._expanded:
             return
         rc = self._model.rowCount()
         chunk = max(1, _REF_THUMB_PREFETCH_CHUNK)
@@ -761,64 +767,11 @@ class _InspectorRefSection(QWidget):
             if not prefetch_all and not ref_thumb_row_visible_in_scroll(self._list, scroll, row, self._model):
                 continue
             entry = self._model.entry_at(row)
-            if entry is None or not is_ref_preview_image(entry.path):
+            if entry is None or not is_direct_media_preview_path(entry.path):
                 continue
-            self._request_thumb_for_path(entry.path, gen)
+            self._explorer_thumb_loader.request(entry.path)
         if end < rc:
-            QTimer.singleShot(0, lambda g=gen, nxt=end: self._prefetch_thumbs_chunk(g, nxt))
-
-    def _request_thumb_for_path(self, path: Path, gen: int) -> None:
-        key = _ref_path_key(path)
-        if gen != self._thumb_prefetch_gen:
-            return
-        if key in self._thumb_pixmaps or key in self._thumb_pending:
-            return
-        pm = self._thumb_cache.peek_thumbnail_pixmap(path)
-        if pm is not None and not pm.isNull():
-            self._thumb_pixmaps[key] = pm
-            self._repaint_row_for_path(path)
-            return
-        self._thumb_pending.add(key)
-        decode_side = self._sync_thumb_decode_bucket()
-        QThreadPool.globalInstance().start(
-            _RefThumbDecodeRunnable(key, decode_side, gen, self._thumb_bridge)
-        )
-
-    def _on_thumb_decoded(self, path_key: str, gen: int, image: object) -> None:
-        if gen != self._thumb_prefetch_gen:
-            return
-        self._thumb_pending.discard(path_key)
-        path = Path(path_key)
-        pm: QPixmap | None = None
-        if isinstance(image, QImage) and not image.isNull():
-            pm = self._thumb_cache.adopt_decoded_thumbnail(path, image)
-        if pm is not None and not pm.isNull():
-            self._thumb_pixmaps[path_key] = pm
-            self._thumb_missing.discard(path_key)
-        else:
-            self._thumb_missing.add(path_key)
-        self._repaint_row_for_path(path)
-
-    def _repaint_row_for_path(self, path: Path | str) -> None:
-        target = _ref_path_key(path) if isinstance(path, Path) else path
-        for row in range(self._model.rowCount()):
-            ent = self._model.entry_at(row)
-            if ent is not None and _ref_path_key(ent.path) == target:
-                ix = self._model.index(row, 0)
-                self._list.viewport().update(self._list.visualRect(ix))
-                break
-
-    def _reset_thumb_load_state(self, keep_paths: set[str] | None = None) -> None:
-        self._thumb_prefetch_gen += 1
-        self._thumb_pending.clear()
-        if keep_paths is None:
-            self._thumb_pixmaps.clear()
-            self._thumb_missing.clear()
-        else:
-            for key in list(self._thumb_pixmaps.keys()):
-                if key not in keep_paths:
-                    del self._thumb_pixmaps[key]
-            self._thumb_missing = {k for k in self._thumb_missing if k not in keep_paths}
+            QTimer.singleShot(0, lambda nxt=end: self._prefetch_thumbs_chunk(nxt))
 
     def set_entity_root(self, path: Path | None) -> None:
         self._entity_root = path.resolve() if path is not None else None
@@ -874,15 +827,16 @@ class _InspectorRefSection(QWidget):
         inner_w = max(1, self._content_inner_width())
         gap = _REF_GRID_GAP
         cell_w = _REF_THUMB_SIZE + gap
+        cell_h = _ref_cell_height()
         cols = _ref_grid_columns_for_width(inner_w)
         row_count = self._model.rowCount()
         rows = max(1, (row_count + cols - 1) // cols) if row_count else 0
-        list_h = rows * cell_w if row_count else 0
+        list_h = rows * cell_h if row_count else 0
         sig = (cols, list_h)
         if self._grid_last == sig:
             return
         self._grid_last = sig
-        self._list.setGridSize(QSize(cell_w, cell_w))
+        self._list.setGridSize(QSize(cell_w, cell_h))
         self._list.setFixedHeight(list_h)
         self._list.setVisible(self._expanded and row_count > 0)
         if row_count > 0:
@@ -893,63 +847,46 @@ class _InspectorRefSection(QWidget):
         entries: list[_RefThumbEntry] = []
         if self._files and self._expanded:
             ordered = sort_files_with_pins(self._files, self._pinned_names())
-            keep_keys = {_ref_path_key(p) for p in ordered if is_ref_preview_image(p)}
-            self._reset_thumb_load_state(keep_keys)
             entity = self._entity_root
             for path in ordered:
-                key = _ref_path_key(path)
-                is_image = is_ref_preview_image(path)
-                pm = None
-                if is_image:
-                    pm = self._thumb_pixmaps.get(key) or self._thumb_cache.peek_thumbnail_pixmap(path)
-                    if pm is not None and not pm.isNull():
-                        self._thumb_pixmaps[key] = pm
                 starred = (
                     is_ref_file_pinned(entity, self._section_id, path.name)
                     if entity is not None
                     else False
                 )
-                placeholder = ""
-                if not is_image or pm is None or pm.isNull():
-                    placeholder = path.suffix or "file"
-                entries.append(
-                    _RefThumbEntry(
-                        path=path,
-                        placeholder_ext=placeholder,
-                        starred=starred,
-                    )
-                )
+                entries.append(_RefThumbEntry(path=path, starred=starred))
         self._model.reset_entries(entries)
         self._grid_last = None
         self._schedule_grid_sync()
         self._schedule_thumb_prefetch(force=True)
-        if self._selected_path is not None:
-            for row in range(self._model.rowCount()):
-                ent = self._model.entry_at(row)
-                if ent is not None and ent.path == self._selected_path:
-                    self._list.setCurrentIndex(self._model.index(row, 0))
-                    break
-            else:
-                self._selected_path = None
+        tab = self._owner_ref_tab()
+        if tab is not None:
+            tab.validate_selected_path()
 
     def _star_hit_rect_for_index(self, index: QModelIndex) -> QRect:
         rect = self._list.visualRect(index)
         g = _REF_GRID_GAP
-        outer = rect.adjusted(0, 0, -g, -g)
-        return _ref_star_hit_rect(outer)
+        cell = rect.adjusted(0, 0, -g, -g)
+        card = QRect(cell.left(), cell.top(), cell.width(), _REF_THUMB_SIZE)
+        return _ref_star_hit_rect(card)
 
     def _on_list_clicked(self, index: QModelIndex) -> None:
         entry = self._model.entry_at(index.row())
         if entry is None:
             return
-        self._selected_path = entry.path
-        self._list.viewport().update()
+        tab = self._owner_ref_tab()
+        if tab is not None:
+            tab.set_selected_path(entry.path)
+        else:
+            self._list.viewport().update()
 
     def _on_list_double_clicked(self, index: QModelIndex) -> None:
         entry = self._model.entry_at(index.row())
         if entry is None:
             return
-        self._selected_path = entry.path
+        tab = self._owner_ref_tab()
+        if tab is not None:
+            tab.set_selected_path(entry.path)
         self._open_file(entry.path)
 
     def _open_file(self, path: Path) -> None:
@@ -998,12 +935,10 @@ class _InspectorRefSection(QWidget):
         except OSError as e:
             QMessageBox.warning(self._list, "Delete", f"Could not delete: {e}")
             return
-        key = _ref_path_key(path)
-        self._thumb_pixmaps.pop(key, None)
-        self._thumb_pending.discard(key)
-        self._thumb_missing.discard(key)
-        if self._selected_path == path:
-            self._selected_path = None
+        self._explorer_thumb_loader.invalidate_all()
+        tab = self._owner_ref_tab()
+        if tab is not None and tab.is_path_selected(path):
+            tab.clear_selected_path()
         self.files_imported.emit(self._section_id)
         from monostudio.ui_qt.notification import notify as notification_service
 
@@ -1053,10 +988,10 @@ class _InspectorRefSection(QWidget):
                     shutil.rmtree(path)
             except OSError:
                 failed.append(path.name)
-        self._thumb_pixmaps.clear()
-        self._thumb_pending.clear()
-        self._thumb_missing.clear()
-        self._selected_path = None
+        self._explorer_thumb_loader.invalidate_all()
+        tab = self._owner_ref_tab()
+        if tab is not None:
+            tab.clear_selected_path()
         self.files_imported.emit(self._section_id)
         from monostudio.ui_qt.notification import notify as notification_service
 
@@ -1145,6 +1080,7 @@ class InspectorRefTab(QWidget):
         self._paths: dict[EntitySpecialFolderId, Path | None] = {}
         self._scanned_key: str | None = None
         self._visible_once = False
+        self._selected_path: Path | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1374,6 +1310,35 @@ class InspectorRefTab(QWidget):
         super().showEvent(event)
         self._schedule_sync_all()
 
+    def is_path_selected(self, path: Path) -> bool:
+        return self._selected_path is not None and self._selected_path == path
+
+    def set_selected_path(self, path: Path) -> None:
+        if self._selected_path == path:
+            return
+        self._selected_path = path
+        self._repaint_all_sections()
+
+    def clear_selected_path(self) -> None:
+        if self._selected_path is None:
+            return
+        self._selected_path = None
+        self._repaint_all_sections()
+
+    def validate_selected_path(self) -> None:
+        if self._selected_path is None:
+            return
+        for sec in (self._concept, self._reference):
+            for row in range(sec._model.rowCount()):
+                ent = sec._model.entry_at(row)
+                if ent is not None and ent.path == self._selected_path:
+                    return
+        self.clear_selected_path()
+
+    def _repaint_all_sections(self) -> None:
+        for sec in (self._concept, self._reference):
+            sec._list.viewport().update()
+
     def set_show_placeholder(self, show: bool, message: str = "Select an item to view details") -> None:
         """Hide concept/reference UI when Main View has no asset/shot selection."""
         show = bool(show)
@@ -1389,6 +1354,7 @@ class InspectorRefTab(QWidget):
         self._entity = None
         self._paths = {}
         self._scanned_key = None
+        self._selected_path = None
         for sec in (self._concept, self._reference):
             sec.set_entity_root(None)
             sec.set_drop_enabled(False)
@@ -1417,16 +1383,13 @@ class InspectorRefTab(QWidget):
         self._visible_once = True
         self._scan_if_needed()
         self._schedule_sync_all()
-        self._concept._sync_thumb_decode_bucket()
-        self._reference._sync_thumb_decode_bucket()
         self._concept._schedule_thumb_prefetch(force=True)
         self._reference._schedule_thumb_prefetch(force=True)
 
     def refresh_from_disk(self) -> None:
         self._scanned_key = None
         for sec in (self._concept, self._reference):
-            for path in sec._files:
-                sec._thumb_cache.invalidate_file(path)
+            sec._explorer_thumb_loader.invalidate_all()
         self._scan_if_needed()
 
     def total_preview_file_count(self) -> int:

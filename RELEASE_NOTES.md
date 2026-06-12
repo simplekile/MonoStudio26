@@ -1,18 +1,19 @@
-# MonoStudio 26 — Release v26.15.5
+# MonoStudio 26 — Release v26.15.6
 
 ## Highlights
 
-- **Schedule target / goal status**: Trạng thái mục tiêu theo department trên timeline; menu đổi status, goal dialog, bulk bar actions; quick milestone popup; planner tính goal-met.
-- **Department status presets**: Registry theo department (`department_status_registry`, presets trong pipeline); Inspector/Main View dùng workflow đúng từng dept.
-- **Schedule timeline**: Cải thiện lớn — bulk dialogs, target status memory, tương tác bar/row.
-- **Discord**: Test webhook từ Settings; copy/assign notify mở rộng.
-- **UI**: Page loading bar; project status menu; entity ref pins; project picker; Main View refresh.
+- **Inbox / Outbox / Project Guide explorer**: Grid card paint, async thumbnail loader (không decode trên UI thread), tag badges trên card, breadcrumb/filter cải thiện.
+- **Project Guide tags**: Lọc theo tag, department tag, PureRef brand icon.
+- **Dashboard**: Widget palette cho customize mode; bento host cập nhật.
+- **App hotkeys**: Registry phím tắt tập trung + UI chỉnh trong Settings.
+- **Thumbnails**: Explorer preview disk cache, spinner loading, HiDPI paint helpers.
+- **UI**: Sidebar/nav refresh; Inspector ref tab; notification toast/overlay; style tokens.
 
 ## Changes in this release
 
-- feat: `department_status_registry.py`, `schedule_target_status_*`, `schedule_goal_status_dialog.py`, `schedule_bar_bulk_dialogs.py`, `schedule_quick_milestone_popup.py`.
-- feat: `entity_ref_pins.py`, `discord_webhook_test.py`, `discord_notification_test_dialog.py`, `page_loading_bar.py`, `project_status_menu.py`, `view_item_mtime.py`.
-- feat: `project_schedule.py`, `schedule_planner.py`, `schedule_assign_notify.py`, `schedule_timeline_widget.py`, `schedule_page_widget.py`, `main_view.py`, `main_window.py`.
+- feat: `app_hotkeys.py`, `dashboard_widget_palette.py`, `explorer_thumbnail_loader.py`.
+- feat: `inbox_split_view.py`, `inbox_grid_card_paint.py`, `inbox_list_row_paint.py`, `thumbnails.py`, `project_guide_tags.py`.
+- feat: `dashboard_bento_host.py`, `inspector_ref_tab.py`, `sidebar.py`, `main_window.py`, `style.py`.
 
 ## Install
 

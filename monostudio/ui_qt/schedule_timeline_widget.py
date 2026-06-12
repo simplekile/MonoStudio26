@@ -146,8 +146,8 @@ _HEADER_H = _HEADER_DAY_TOP + _HEADER_DAY_H + _HEADER_BOTTOM_PAD
 _HEADER_MARKER_LINE_BOTTOM = _HEADER_DAY_TOP - 1
 _WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _DAY_W = 28.0
-_BAR_H = 18
-_MINI_BAR_H = 6
+_BAR_ROW_FILL = 0.8
+_BAR_H = max(1, int(_ROW_H * _BAR_ROW_FILL))
 _MINI_BAR_GAP = 2
 _EDGE_GRAB = 7
 # Hover/drag key for collapsed entity row (whole block, not a single dept mini-bar).
@@ -178,8 +178,11 @@ WAVE_DRAW_FIRST_ONLY = "first_only"
 VIEW_ENTITY = "entity"
 VIEW_DEPARTMENT = "department"
 VIEW_DEPT_WAVE = "dept_wave"
-_MIN_DAY_W = 4.0
-_MAX_DAY_W = 56.0
+_ABS_MIN_DAY_W = 1.0
+_MAX_DAY_W = 112.0
+# Match Dashboard page / card surfaces (style.py DashboardPage, DashboardCard).
+_SCHEDULE_SURFACE_BG = "#1a1c1e"
+_SCHEDULE_HEADER_BG = "#1e2124"
 # At or below this day width, header shows in-month weeks (W1, W2, …) instead of per-day labels.
 _DAY_W_WEEK_IN_MONTH_MAX = 12.0
 _ZOOM_STEP_FACTOR = 1.12
@@ -1002,7 +1005,7 @@ class _GanttCanvas(QWidget):
             widget.releaseMouse()
 
     def set_day_width(self, day_w: float) -> None:
-        self._day_w = max(_MIN_DAY_W, min(_MAX_DAY_W, float(day_w)))
+        self._day_w = float(day_w)
         self._update_minimum_size()
         self.update()
 
@@ -1686,17 +1689,17 @@ class _GanttCanvas(QWidget):
     @staticmethod
     def _collapsed_slot_metrics(slot_count: int) -> tuple[int, int]:
         """Mini-bar height and gap so ``slot_count`` bars fit inside a collapsed row."""
+        available = _BAR_H
         if slot_count <= 1:
-            return min(_MINI_BAR_H, _ROW_H - 4), _MINI_BAR_GAP
-        available = _ROW_H - 4
+            return available, 0
         gap = _MINI_BAR_GAP
         while gap >= 1:
             mini_h = (available - (slot_count - 1) * gap) // slot_count
             if mini_h >= 2:
-                return min(_MINI_BAR_H, mini_h), gap
+                return mini_h, gap
             gap -= 1
         mini_h = max(1, available // slot_count)
-        return min(_MINI_BAR_H, mini_h), 0
+        return mini_h, 0
 
     def _mini_bar_rect(
         self, visible_index: int, slot: int, slot_count: int, start: date, due: date
@@ -1706,7 +1709,8 @@ class _GanttCanvas(QWidget):
             return None
         row_y = self._body_row_y(visible_index)
         mini_h, gap = self._collapsed_slot_metrics(slot_count)
-        slot_y = row_y + 2 + slot * (mini_h + gap)
+        stack_h = slot_count * mini_h + max(0, slot_count - 1) * gap
+        slot_y = row_y + (_ROW_H - stack_h) // 2 + slot * (mini_h + gap)
         return QRectF(x0, slot_y, width, mini_h)
 
     def _dept_rows_for_visible(self, visible_index: int) -> list[TimelineRow]:
@@ -2835,8 +2839,8 @@ class _GanttCanvas(QWidget):
         p.drawLine(x1, bot, x1 - tick, bot - tick)
 
     def _paint_corner_pane(self, p: QPainter, w: int, h: int) -> None:
-        p.fillRect(self.rect(), QColor("#141416"))
-        p.fillRect(0, 0, w, h, QColor("#0d0d0f"))
+        p.fillRect(self.rect(), QColor(_SCHEDULE_SURFACE_BG))
+        p.fillRect(0, 0, w, h, QColor(_SCHEDULE_HEADER_BG))
         p.setPen(QColor("#52525b"))
         p.setFont(monos_font("Inter", 10, QFont.Weight.ExtraBold))
         p.drawText(QRect(8, 0, w - 12, h), Qt.AlignLeft | Qt.AlignVCenter, "ITEM")
@@ -2916,7 +2920,7 @@ class _GanttCanvas(QWidget):
             p.drawLine(x + 3, _HEADER_DAY_UNDERLINE_Y, x + col_w - 3, _HEADER_DAY_UNDERLINE_Y)
 
     def _paint_header_pane(self, p: QPainter, w: int, h: int) -> None:
-        p.fillRect(self.rect(), QColor("#0d0d0f"))
+        p.fillRect(self.rect(), QColor(_SCHEDULE_HEADER_BG))
         self._paint_project_range_header(p, w, h)
         self._paint_deadline_marker(p, h, header=True)
 
@@ -2935,7 +2939,7 @@ class _GanttCanvas(QWidget):
         self._paint_all_marker_grips(p)
 
     def _paint_label_pane(self, p: QPainter, w: int, h: int) -> None:
-        p.fillRect(self.rect(), QColor("#141416"))
+        p.fillRect(self.rect(), QColor(_SCHEDULE_SURFACE_BG))
         inner_w = max(1, w - 1)  # keep column right edge for continuous border
 
         fm = QFontMetrics(p.font())
@@ -3023,7 +3027,7 @@ class _GanttCanvas(QWidget):
     def _paint_timeline_body(
         self, p: QPainter, w: int, h: int, *, clip: QRect | None = None
     ) -> None:
-        bg = QColor(MONOS_COLORS.get("content_bg", "#121214"))
+        bg = QColor(_SCHEDULE_SURFACE_BG)
         if clip is not None:
             p.fillRect(clip, bg)
         else:
@@ -4911,6 +4915,8 @@ class ScheduleGanttWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("ScheduleGantt")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._markers_unlocked = False
         self._label_w = _LABEL_W_DEFAULT
@@ -4929,6 +4935,8 @@ class ScheduleGanttWidget(QWidget):
         self._corner_pane = self._build_corner_search()
 
         self._header_scroll = QScrollArea(self)
+        self._header_scroll.setObjectName("ScheduleHeaderScroll")
+        self._header_scroll.setAttribute(Qt.WA_StyledBackground, True)
         self._header_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._header_scroll.setWidgetResizable(False)
         self._header_scroll.setFixedHeight(_HEADER_H)
@@ -4947,6 +4955,8 @@ class ScheduleGanttWidget(QWidget):
 
         # One vertical scroll for ITEM + timeline rows (avoids dual-scroll drift).
         self._body_vscroll = QScrollArea(self)
+        self._body_vscroll.setObjectName("ScheduleBodyScroll")
+        self._body_vscroll.setAttribute(Qt.WA_StyledBackground, True)
         self._body_vscroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._body_vscroll.setWidgetResizable(False)
         self._body_vscroll.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -4968,6 +4978,8 @@ class ScheduleGanttWidget(QWidget):
         self._timeline_pane._gantt = self
 
         self._timeline_hscroll = QScrollArea(self._body_host)
+        self._timeline_hscroll.setObjectName("ScheduleTimelineScroll")
+        self._timeline_hscroll.setAttribute(Qt.WA_StyledBackground, True)
         self._timeline_hscroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._timeline_hscroll.setWidgetResizable(False)
         self._timeline_hscroll.setViewportMargins(0, 0, 0, 0)
@@ -5154,6 +5166,31 @@ class ScheduleGanttWidget(QWidget):
     def _timeline_viewport_width(self) -> int:
         return max(32, self._body_visible_width() - self._label_left_width())
 
+    def _fit_day_width(self) -> float:
+        """Day width so the full view range spans the timeline viewport."""
+        vp_w = self._timeline_viewport_width()
+        days = max(1, self._timeline_pane._num_days())
+        if vp_w <= 0:
+            return _ABS_MIN_DAY_W
+        return vp_w / days
+
+    def _min_day_width(self) -> float:
+        """Lowest zoom-out: fit entire calendar in the viewport (floor 1px/day)."""
+        return max(_ABS_MIN_DAY_W, self._fit_day_width())
+
+    def _clamp_day_width(self, day_w: float) -> float:
+        return max(self._min_day_width(), min(_MAX_DAY_W, float(day_w)))
+
+    def _maybe_fit_timeline_to_viewport(self) -> None:
+        """When canvas is narrower than the viewport, grow day width to fill."""
+        vp_w = self._timeline_viewport_width()
+        tw = self._timeline_pane._content_width()
+        if vp_w <= 0 or tw >= vp_w:
+            return
+        fit = self._fit_day_width()
+        if self._timeline_pane._day_w < fit - 0.01:
+            self._apply_day_width(fit, adjust_scroll=False)
+
     def _body_content_height(self) -> int:
         """At least as tall as the visible body area so empty rows can show grid cells."""
         data_h = max(_ROW_H, len(self._label_pane._visible) * _ROW_H)
@@ -5203,6 +5240,7 @@ class ScheduleGanttWidget(QWidget):
         if self._body_host.width() != host_w or self._body_host.height() != row_h:
             self._body_host.setMinimumSize(host_w, row_h)
             self._body_host.resize(host_w, row_h)
+        self._maybe_fit_timeline_to_viewport()
         self._sync_footer_hbar_range()
 
     def _sync_footer_hbar_range(self) -> None:
@@ -5258,10 +5296,16 @@ class ScheduleGanttWidget(QWidget):
         self.reload()
 
     def scroll_to_today(self) -> None:
+        """Zoom to max day width and center today in the timeline viewport."""
         today = date.today()
         vp = self._timeline_hscroll.viewport()
-        x = int(self._timeline_pane._date_to_x(today) - vp.width() * 0.3)
-        self._timeline_hscroll.horizontalScrollBar().setValue(max(0, x))
+        vp_w = max(1, vp.width())
+        anchor = vp_w / 2.0
+        self._zoom_to_day_width(_MAX_DAY_W, anchor_viewport_x=anchor)
+        today_x = self._timeline_pane._date_to_x(today)
+        hbar = self._timeline_hscroll.horizontalScrollBar()
+        scroll_val = int(today_x - anchor)
+        hbar.setValue(max(hbar.minimum(), min(scroll_val, hbar.maximum())))
 
     def set_entity_highlight(
         self,
@@ -5477,7 +5521,7 @@ class ScheduleGanttWidget(QWidget):
         min_delta: float = 0.05,
     ) -> None:
         old_dw = self._timeline_pane._day_w
-        new_dw = max(_MIN_DAY_W, min(_MAX_DAY_W, float(day_w)))
+        new_dw = self._clamp_day_width(day_w)
         if min_delta > 0 and abs(new_dw - old_dw) < min_delta:
             return
         self._timeline_pane.set_day_width(new_dw)

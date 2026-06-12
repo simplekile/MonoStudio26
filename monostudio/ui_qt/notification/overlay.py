@@ -7,7 +7,7 @@ Max visible per stack from settings (default 1).
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QSettings, QRect, QPoint
+from PySide6.QtCore import Qt, QSettings, QRect, QPoint, QSize
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QPalette, QColor
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -28,6 +28,35 @@ from monostudio.ui_qt.notification.toast import (
 MARGIN_PX = 24
 SETTINGS_KEY_MAX_VISIBLE = "notification/max_visible"
 DEFAULT_MAX_VISIBLE = 1
+
+
+def _measure_toast_stack(container: QWidget, *, min_width: int = 280, min_height: int = 48) -> QSize:
+    """Size toast stack from children — avoids clipping when container kept a stale narrow width."""
+    layout = container.layout()
+    if layout is None:
+        return QSize(min_width, min_height)
+    margins = layout.contentsMargins()
+    spacing = max(0, layout.spacing())
+    max_w = 0
+    total_h = margins.top() + margins.bottom()
+    visible = 0
+    for i in range(layout.count()):
+        item = layout.itemAt(i)
+        if item is None:
+            continue
+        widget = item.widget()
+        if widget is None or not widget.isVisible():
+            continue
+        widget.adjustSize()
+        hint = widget.sizeHint()
+        if not hint.isValid():
+            hint = widget.minimumSizeHint()
+        max_w = max(max_w, hint.width())
+        total_h += hint.height()
+        visible += 1
+    if visible > 1:
+        total_h += spacing * (visible - 1)
+    return QSize(max(min_width, max_w + margins.left() + margins.right()), max(min_height, total_h))
 
 
 def _get_max_visible() -> int:
@@ -175,11 +204,9 @@ class NotificationOverlayWidget(QWidget):
             # General: insert at 0 so newest appears at top (top-right stack)
             container.layout().insertWidget(0, toast, 0, Qt.AlignmentFlag.AlignRight)
 
+        toast.adjustSize()
         toast.show()
         container.layout().activate()
-        target_y = toast.y()
-        toast.set_entered_y(target_y)
-        toast.start_enter_animation()
         if is_sidebar:
             self._sidebar_container.raise_()
             if self._main_view is not None:
@@ -187,6 +214,9 @@ class NotificationOverlayWidget(QWidget):
         else:
             if self._general_anchor_widget is not None:
                 self._update_general_container_geometry()
+        target_y = toast.y()
+        toast.set_entered_y(target_y)
+        toast.start_enter_animation()
 
     def _update_sidebar_container_geometry(self) -> None:
         """
@@ -201,9 +231,9 @@ class NotificationOverlayWidget(QWidget):
         x = main_top_left.x() + max(8, MARGIN_PX // 2)
 
         self._sidebar_container.layout().activate()
-        sh = self._sidebar_container.sizeHint()
-        w = max(200, sh.width() if sh.isValid() else 200)
-        h = max(40, sh.height() if sh.isValid() else 40)
+        sh = _measure_toast_stack(self._sidebar_container, min_width=200, min_height=40)
+        w = sh.width()
+        h = sh.height()
 
         if self._sidebar_anchor_y is not None:
             # Căn giữa toast theo hàng (anchor_y ~ tâm hàng).
@@ -220,9 +250,10 @@ class NotificationOverlayWidget(QWidget):
         if w is None or not w.isVisible():
             return
         self._container.layout().activate()
-        sh = self._container.sizeHint()
-        cw = max(280, sh.width() if sh.isValid() else 280)
-        ch = max(60, sh.height() if sh.isValid() else 60)
+        sh = _measure_toast_stack(self._container, min_width=280, min_height=48)
+        max_cw = max(280, self.width() - MARGIN_PX * 2)
+        cw = min(sh.width(), max_cw)
+        ch = sh.height()
         # Anchor bottom-right in overlay coords
         anchor_br = self.mapFromGlobal(w.mapToGlobal(w.rect().bottomRight()))
         x = anchor_br.x() - cw

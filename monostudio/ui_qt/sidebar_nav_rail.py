@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
     QListWidget,
     QListWidgetItem,
+    QScrollArea,
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
@@ -142,7 +143,24 @@ class SidebarNavRail(QWidget):
         top_block_56_layout.addWidget(_sep_line(top_block_56), 0)
         root.addWidget(top_block_56, 0)
 
-        home_group = NavRailGroup(self, nav_group="home")
+        scroll = QScrollArea(self)
+        scroll.setObjectName("SidebarNavRailScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+
+        middle = QWidget(scroll)
+        middle.setObjectName("SidebarNavRailMiddle")
+        middle.setMinimumWidth(RAIL_SLOT_W)
+        middle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+        middle_layout = QVBoxLayout(middle)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setSpacing(_RAIL_SECTION_GAP)
+        scroll.setWidget(middle)
+
+        home_group = NavRailGroup(middle, nav_group="home")
         _home_btn = self._make_expand_item("house", "Dashboard", nav_group="home")
         _home_btn.clicked.connect(lambda: self._on_home_clicked())
         self._home_button = home_group.add_item(_home_btn)
@@ -159,11 +177,11 @@ class SidebarNavRail(QWidget):
             lambda: self._on_page_clicked(SidebarContext.PROJECT_GUIDE.value)
         )
         self._home_group_buttons[SidebarContext.PROJECT_GUIDE.value] = home_group.add_item(_guide_btn)
-        root.addWidget(home_group, 0, Qt.AlignmentFlag.AlignHCenter)
+        middle_layout.addWidget(home_group, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        root.addWidget(_sep_line(self), 0)
+        middle_layout.addWidget(_sep_line(middle), 0)
 
-        scope_group = NavRailGroup(self, nav_group="scope")
+        scope_group = NavRailGroup(middle, nav_group="scope")
         for ctx_name, icon_name, label in [
             (SidebarContext.ASSETS.value, "box", "Assets"),
             (SidebarContext.SHOTS.value, "clapperboard", "Shots"),
@@ -171,10 +189,10 @@ class SidebarNavRail(QWidget):
             btn = self._make_expand_item(icon_name, label, nav_group="scope")
             btn.clicked.connect(lambda checked=False, c=ctx_name: self._on_scope_clicked(c))
             self._scope_buttons[ctx_name] = scope_group.add_item(btn)
-        root.addWidget(scope_group, 0, Qt.AlignmentFlag.AlignHCenter)
-        root.addWidget(_sep_line(self), 0)
+        middle_layout.addWidget(scope_group, 0, Qt.AlignmentFlag.AlignHCenter)
+        middle_layout.addWidget(_sep_line(middle), 0)
 
-        workflow_group = NavRailGroup(self, nav_group="workflow")
+        workflow_group = NavRailGroup(middle, nav_group="workflow")
         for ctx_name, icon_name, label in [
             (SidebarContext.INBOX.value, "inbox", "Inbox"),
             (SidebarContext.OUTBOX.value, "send", "Outbox"),
@@ -182,10 +200,10 @@ class SidebarNavRail(QWidget):
             btn = self._make_expand_item(icon_name, label, nav_group="workflow")
             btn.clicked.connect(lambda checked=False, c=ctx_name: self._on_page_clicked(c))
             self._footer_buttons[ctx_name] = workflow_group.add_item(btn)
-        root.addWidget(workflow_group, 0, Qt.AlignmentFlag.AlignHCenter)
-        root.addWidget(_sep_line(self), 0)
+        middle_layout.addWidget(workflow_group, 0, Qt.AlignmentFlag.AlignHCenter)
+        middle_layout.addWidget(_sep_line(middle), 0)
 
-        utility_group = NavRailGroup(self, nav_group="utility")
+        utility_group = NavRailGroup(middle, nav_group="utility")
         self._filter_btn = self._make_expand_item(
             "sliders-horizontal",
             "Filters",
@@ -194,9 +212,10 @@ class SidebarNavRail(QWidget):
         )
         self._filter_btn.clicked.connect(self._on_filter_clicked)
         utility_group.add_item(self._filter_btn)
-        root.addWidget(utility_group, 0, Qt.AlignmentFlag.AlignHCenter)
+        middle_layout.addWidget(utility_group, 0, Qt.AlignmentFlag.AlignHCenter)
+        middle_layout.addStretch(1)
 
-        root.addStretch(1)
+        root.addWidget(scroll, 1)
 
         bottom_group = NavRailGroup(self, nav_group="bottom")
         self._recent_tasks_btn = self._make_expand_item(
@@ -381,8 +400,10 @@ class SidebarNavRail(QWidget):
 
     def refresh_quick_view_tooltips(self, settings: QSettings) -> None:
         """Show assigned quick-view slot numbers on nav rail hovers."""
+        from monostudio.ui_qt.app_hotkeys import format_nav_quick_hint
+
         by_ctx = contexts_by_slot(settings)
-        hint = "Ctrl+1–9 assign · 1–9 go"
+        hint = format_nav_quick_hint(settings)
 
         if self._home_button is not None:
             lines = [

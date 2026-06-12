@@ -52,6 +52,8 @@ def _department_folder_path(project_root: Path | None, department_id: str) -> Pa
 class ReferencePageWidget(QWidget):
     """Project Guide: sidebar department + Inbox-style file explorer (no date folders)."""
 
+    tag_filter_badge_clicked = Signal()
+
     tree_selection_changed = Signal(object)  # Path | None
     drop_requested = Signal(object, object, bool)  # list[Path], target folder, copy_only
     import_requested = Signal()
@@ -76,15 +78,16 @@ class ReferencePageWidget(QWidget):
         header.setObjectName("MainViewHeader")
         header.setAttribute(Qt.WA_StyledBackground, True)
         header_v = QVBoxLayout(header)
-        header_v.setContentsMargins(12, 12, 12, 10)
+        header_v.setContentsMargins(12, 12, 12, 12)
         header_v.setSpacing(6)
 
         top_row = QWidget(header)
         hlay = QHBoxLayout(top_row)
         hlay.setContentsMargins(0, 0, 0, 0)
-        hlay.setSpacing(10)
+        hlay.setSpacing(12)
 
         self._title_row = InboxOutboxTitleRow("Project Guide", root_icon="folder-open", parent=top_row)
+        self._title_row.tag_filter_clicked.connect(self.tag_filter_badge_clicked.emit)
         hlay.addWidget(self._title_row, 0, Qt.AlignmentFlag.AlignVCenter)
         hlay.addStretch(1)
 
@@ -113,7 +116,7 @@ class ReferencePageWidget(QWidget):
         self._content_lay.setSpacing(0)
         root_lay.addWidget(self._content_host, 1)
         self._refresh_chrome()
-        bind_explorer_view_mode_tab_shortcut(self, lambda: self._tree_pane)
+        self._bound_hotkeys = bind_explorer_view_mode_tab_shortcut(self, lambda: self._tree_pane)
 
     def _mount_explorer_path_bar(self) -> None:
         if self._tree_pane is None:
@@ -152,6 +155,12 @@ class ReferencePageWidget(QWidget):
         self._header_badge_label = (label or "").strip() or None
         self._header_badge_icon = (icon_name or "").strip() or None
         self._refresh_chrome()
+
+    def set_tag_filter_badge(self, label: str | None, *, color_hex: str | None = None) -> None:
+        self._title_row.set_tag_filter_badge(label, color_hex=color_hex)
+
+    def set_tag_filter_badges(self, badges: list[tuple[str, str]]) -> None:
+        self._title_row.set_tag_filter_badges(badges)
 
     def _tree_state_key(self, department_id: str) -> str:
         return _normalize_department(department_id)
@@ -222,11 +231,18 @@ class ReferencePageWidget(QWidget):
             self._tree_state_cache[self._tree_state_key(self._department)] = self._tree_pane.get_tree_state()
         self._department = new_dept
         self._ensure_tree_pane()
+        self.reload_tag_definitions()
         self._refresh_chrome()
 
-    def set_tag_filter(self, tag_id: str | None) -> None:
+    def set_tag_filter(self, tag_ids: list[str] | None) -> None:
+        self._ensure_tree_pane()
         if self._tree_pane is not None:
-            self._tree_pane.set_tag_filter(tag_id)
+            self._tree_pane.set_tag_filter(tag_ids)
+
+    def set_tag_data(self, item_tags: dict[str, list[str]]) -> None:
+        self._ensure_tree_pane()
+        if self._tree_pane is not None:
+            self._tree_pane.set_tag_data(item_tags)
 
     def get_item_tags(self) -> dict[str, list[str]]:
         if self._tree_pane is not None:

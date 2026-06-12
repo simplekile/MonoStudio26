@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QPoint, Qt, QRect, QSettings, Signal, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDragMoveEvent, QDropEvent, QMouseEvent
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QShortcut
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QMenu, QMessageBox, QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QToolTip, QVBoxLayout, QWidget
 from qframelesswindow import FramelessMainWindow
 
@@ -359,6 +359,9 @@ class MainWindow(FramelessMainWindow):
         self._filter_panel.filters().entityScopeChanged.connect(self._on_schedule_sidebar_filters_changed)
         self._filter_panel.filters().tagClicked.connect(self._on_tag_filter_changed)
         self._filter_panel.filters().tagsDefinitionsChanged.connect(self._on_tag_definitions_changed)
+        self._filter_panel.dashboard_widget_visibility_toggled.connect(
+            self._on_dashboard_widget_palette_toggled
+        )
         self._controller.departmentChanged.connect(lambda v: self._set_current_department(v, toggle_if_same=False))
         self._controller.typeChanged.connect(lambda v: self._set_current_type(v, toggle_if_same=False))
         self._controller.departmentChanged.connect(self._on_department_changed_notify)
@@ -428,16 +431,49 @@ class MainWindow(FramelessMainWindow):
         self._inspector.edit_allocation_requested.connect(self._on_inspector_edit_allocation)
         self._inspector.assignee_changed.connect(self._on_inspector_assignee_changed)
         self._inspector.assignment_confirmed.connect(self._refresh_noti_unread_badge)
-        _sc_inspector_tab_1 = QShortcut(QKeySequence("Alt+1"), self)
-        _sc_inspector_tab_1.activated.connect(lambda: self._inspector.set_inspector_tab_index(0))
-        _sc_inspector_tab_2 = QShortcut(QKeySequence("Alt+2"), self)
-        _sc_inspector_tab_2.activated.connect(lambda: self._inspector.set_inspector_tab_index(1))
-        _sc_inspector_tab_3 = QShortcut(QKeySequence("Alt+3"), self)
-        _sc_inspector_tab_3.activated.connect(lambda: self._inspector.set_inspector_tab_index(2))
-        _sc_open_ref = QShortcut(QKeySequence("Alt+R"), self)
-        _sc_open_ref.activated.connect(self._inspector.open_reference_folder_for_selection)
-        _sc_open_concept = QShortcut(QKeySequence("Alt+C"), self)
-        _sc_open_concept.activated.connect(self._inspector.open_concept_folder_for_selection)
+        self._bound_hotkeys: list[QShortcut] = []
+        from monostudio.ui_qt.app_hotkeys import bind_hotkey
+
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "inspector.tab_pipeline",
+                self,
+                lambda: self._inspector.set_inspector_tab_index(0),
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "inspector.tab_reference",
+                self,
+                lambda: self._inspector.set_inspector_tab_index(1),
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "inspector.tab_details",
+                self,
+                lambda: self._inspector.set_inspector_tab_index(2),
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "inspector.open_reference",
+                self,
+                self._inspector.open_reference_folder_for_selection,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "inspector.open_concept",
+                self,
+                self._inspector.open_concept_folder_for_selection,
+            )
+        )
         from monostudio.ui_qt.nav_quick_view import NavQuickViewController
 
         self._nav_quick_view = NavQuickViewController(
@@ -448,10 +484,17 @@ class MainWindow(FramelessMainWindow):
             recall_slot=self._recall_nav_quick_slot,
             on_assigned=self._on_nav_quick_slot_assigned,
         )
+        self._bound_hotkeys.extend(self._nav_quick_view.bound_shortcuts())
         self._nav_rail.refresh_quick_view_tooltips(self._settings)
-        _sc_command_palette = QShortcut(QKeySequence("Ctrl+`"), self)
-        _sc_command_palette.setContext(Qt.ShortcutContext.WindowShortcut)
-        _sc_command_palette.activated.connect(self._open_command_palette)
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "global.command_palette",
+                self,
+                self._open_command_palette,
+                context=Qt.ShortcutContext.WindowShortcut,
+            )
+        )
         self._main_view.production_status_override_chosen.connect(self._on_production_status_override)
         self._main_view.active_dcc_changed.connect(self._on_main_view_active_dcc_changed)
         self._main_view.thumbnail_source_changed.connect(self._on_main_view_thumbnail_source_changed)
@@ -551,6 +594,7 @@ class MainWindow(FramelessMainWindow):
         dialog.nav_quick_slots_changed.connect(
             lambda: self._nav_rail.refresh_quick_view_tooltips(self._settings)
         )
+        dialog.hotkeys_changed.connect(self._reload_app_hotkeys)
         dialog.open_to_updates_tab()
         dialog.exec()
         self._refresh_user_button()
@@ -758,6 +802,8 @@ class MainWindow(FramelessMainWindow):
     def _set_sidebar_panel_visible(self, visible: bool) -> None:
         if visible:
             self._dismiss_compact_filter_popup()
+            if self._dashboard_customize_sidebar_open():
+                self._filter_panel.set_dashboard_customize_mode(True)
         self._sidebar_panel_visible = bool(visible)
         self._filter_panel.setVisible(visible)
         if visible:
@@ -771,11 +817,51 @@ class MainWindow(FramelessMainWindow):
             self._filter_panel.setMinimumWidth(0)
             self._filter_panel.setMaximumWidth(0)
 
+    def _dashboard_customize_sidebar_open(self) -> bool:
+        w = self._dashboard_page_widget
+        return w is not None and w.is_customize_mode()
+
+    def _sync_dashboard_sidebar_panel(self) -> None:
+        """Dashboard browse: rail-only. Customize: full sidebar with widget palette."""
+        if self._nav_rail.current_context() != "Dashboard":
+            return
+        in_customize = self._dashboard_customize_sidebar_open()
+        self._filter_panel.set_dashboard_customize_mode(in_customize)
+        if in_customize and self._dashboard_page_widget is not None:
+            self._filter_panel.sync_dashboard_widget_slots(
+                self._dashboard_page_widget.dashboard_slots()
+            )
+            self._apply_main_splitter_sidebar_metric("full")
+        else:
+            self._apply_main_splitter_sidebar_metric("compact")
+
+    def _on_dashboard_customize_mode_changed(self, enabled: bool) -> None:
+        _ = enabled
+        self._sync_dashboard_sidebar_panel()
+
+    def _on_dashboard_layout_changed(self, slots: object) -> None:
+        if self._nav_rail.current_context() != "Dashboard":
+            return
+        if not self._dashboard_customize_sidebar_open():
+            return
+        self._filter_panel.sync_dashboard_widget_slots(slots)
+
+    def _on_dashboard_widget_palette_toggled(self, widget_id: str, visible: bool) -> None:
+        if self._dashboard_page_widget is None:
+            return
+        self._dashboard_page_widget.set_dashboard_widget_visible(widget_id, visible)
+
     def _apply_main_splitter_sidebar_metric(self, mode: str) -> None:
         """
         Set main splitter so the first pane width exactly matches the sidebar column (no dead gap).
         mode: 'compact' (rail only, 68px) | 'full' (rail + filter panel, 324px)
         """
+        if (
+            mode == "full"
+            and self._nav_rail.current_context() == "Dashboard"
+            and not self._dashboard_customize_sidebar_open()
+        ):
+            mode = "compact"
         w = max(0, self._main_splitter.width())
         if mode == "compact":
             self._set_sidebar_panel_visible(False)
@@ -1094,7 +1180,8 @@ class MainWindow(FramelessMainWindow):
             load_pipeline_types_and_presets_for_project(self._project_root)
         )
         try:
-            self._filter_panel.filters().reload_from_pipeline_metadata()
+            ctx = self._nav_rail.current_context()
+            self._filter_panel.sync_nav_context(ctx, force=True)
         except Exception:
             pass
 
@@ -1231,6 +1318,7 @@ class MainWindow(FramelessMainWindow):
                 self._reference_page_widget.set_department(dept)
                 dep_label, dep_icon = self._filter_panel.filters().get_department_display(dept)
                 self._reference_page_widget.set_header_badge_display(label=dep_label, icon_name=dep_icon)
+                self._update_reference_tag_badge()
             return
         if ctx not in ("Assets", "Shots"):
             return
@@ -1308,7 +1396,7 @@ class MainWindow(FramelessMainWindow):
         self._main_view.set_selected_asset_type(type_id, label=label, icon_name=icon_name)
 
     def _sync_main_view_header(self) -> None:
-        """Header breadcrumbs (Asset → type → dept) — safe before project index is ready."""
+        """Header breadcrumbs (Assets → type → dept) — safe before project index is ready."""
         ctx = self._nav_rail.current_context()
         if ctx not in ("Assets", "Shots"):
             return
@@ -1320,17 +1408,11 @@ class MainWindow(FramelessMainWindow):
         if self._nav_rail.current_context() == "Schedule":
             self._apply_schedule_sidebar_filters()
             return
-        if self._nav_rail.current_context() == "Dashboard":
-            self._apply_dashboard_sidebar_filters()
-            return
         self._controller.on_department_clicked(department)
 
     def _on_sidebar_type_clicked(self, type_id: object) -> None:
         if self._nav_rail.current_context() == "Schedule":
             self._apply_schedule_sidebar_filters()
-            return
-        if self._nav_rail.current_context() == "Dashboard":
-            self._apply_dashboard_sidebar_filters()
             return
         self._controller.on_type_clicked(type_id)
 
@@ -1341,6 +1423,25 @@ class MainWindow(FramelessMainWindow):
         title_row.department_clicked.connect(
             lambda tr=title_row: self._open_header_department_filter_picker(tr.filter_badge_widget())
         )
+
+    def _update_reference_tag_badge(self) -> None:
+        if self._reference_page_widget is None:
+            return
+        filters = self._filter_panel.filters()
+        tag_ids = filters.current_tags()
+        if not tag_ids:
+            self._reference_page_widget.set_tag_filter_badges([])
+            return
+        badges: list[tuple[str, str]] = []
+        for tag_id in tag_ids:
+            label = filters.get_tag_display(tag_id)
+            if not label:
+                continue
+            badges.append((label, filters.get_tag_color(tag_id) or "#a1a1aa"))
+        self._reference_page_widget.set_tag_filter_badges(badges)
+
+    def _on_reference_tag_badge_clear(self) -> None:
+        self._filter_panel.filters().clear_active_tag()
 
     def _open_header_type_filter_picker(self, anchor) -> None:
         filters = self._filter_panel.filters()
@@ -1355,9 +1456,6 @@ class MainWindow(FramelessMainWindow):
         filters.show_department_filter_popup(anchor)
 
     def _on_schedule_sidebar_filters_changed(self, *_args) -> None:
-        if self._nav_rail.current_context() == "Dashboard":
-            self._apply_dashboard_sidebar_filters()
-            return
         self._apply_schedule_sidebar_filters()
 
     def _on_schedule_sidebar_department_sync(self, department: object) -> None:
@@ -1367,6 +1465,20 @@ class MainWindow(FramelessMainWindow):
         dep = department if isinstance(department, str) and department.strip() else None
         self._filter_panel.filters().set_selected_department(dep, emit=False)
         self._apply_schedule_sidebar_filters()
+
+    def _ensure_schedule_scope_for_entity_keys(self, keys: list[tuple[str, str]]) -> None:
+        """Enable Assets/Shots scope toggles required to show dashboard-driven entity keys."""
+        has_shot = any((kind or "").strip().lower() == "shot" for kind, _rel in keys)
+        has_asset = any((kind or "").strip().lower() == "asset" for kind, _rel in keys)
+        if not has_shot and not has_asset:
+            return
+        panel = self._filter_panel.filters()
+        shots, assets = panel.entity_scope()
+        if has_shot:
+            shots = True
+        if has_asset:
+            assets = True
+        panel.set_entity_scope(include_shots=shots, include_assets=assets, emit=False)
 
     def _apply_schedule_sidebar_filters(self) -> None:
         if self._schedule_page_widget is None or self._nav_rail.current_context() != "Schedule":
@@ -1388,7 +1500,7 @@ class MainWindow(FramelessMainWindow):
         self._refresh_inspector_selection()
 
     def _push_dashboard_filter(self) -> None:
-        """Share the sidebar/Schedule department visibility with the Dashboard."""
+        """Apply inspector hidden-department rules to the dashboard overview."""
         if self._dashboard_page_widget is None:
             return
         from monostudio.core.schedule_dept_filter import (
@@ -1397,24 +1509,15 @@ class MainWindow(FramelessMainWindow):
             load_inspector_hidden_departments,
         )
 
-        panel = self._filter_panel.filters()
         respect_hidden = bool(
             self._settings.value(SCHEDULE_RESPECT_HIDDEN_KEY, True, type=bool)
         )
         self._dashboard_page_widget.set_dept_filter(
-            allowed_department_ids=panel.visible_department_ids(),
+            allowed_department_ids=None,
             hidden_departments=load_inspector_hidden_departments(self._settings),
             respect_hidden=respect_hidden,
             dept_scope=DEPT_SCOPE_LEAF,
         )
-
-    def _apply_dashboard_sidebar_filters(self) -> None:
-        if self._dashboard_page_widget is None or self._nav_rail.current_context() != "Dashboard":
-            return
-        if getattr(self, "_context_switch_in_progress", False):
-            return
-        self._push_dashboard_filter()
-        self._schedule_dashboard_refresh()
 
     def _schedule_dashboard_refresh(self) -> None:
         """Coalesce rapid filter signals into a single dashboard refresh."""
@@ -2526,6 +2629,12 @@ class MainWindow(FramelessMainWindow):
             department=department,
         )
 
+    def _entity_has_department(self, ref: Asset | Shot, department: str) -> bool:
+        dept_key = self._norm(department)
+        if not dept_key:
+            return False
+        return any(self._norm(d.name) == dept_key for d in ref.departments)
+
     def _pipeline_ref_for_path(self, item_path: Path, item_type: str) -> Asset | Shot | None:
         if self._project_index is None:
             return None
@@ -2561,6 +2670,9 @@ class MainWindow(FramelessMainWindow):
         """Update sidebar/controller filters for tray open without raising the window."""
         kind = (item_type or "").strip().lower()
         if kind not in ("asset", "shot"):
+            return
+        ctx = self._nav_rail.current_context()
+        if ctx not in ("Assets", "Shots"):
             return
         filters = self._filter_panel.filters()
         filters.set_mode("assets" if kind == "asset" else "shots")
@@ -2641,6 +2753,7 @@ class MainWindow(FramelessMainWindow):
         dialog.workspace_root_selected.connect(lambda p: self._apply_workspace_root(p, save=True))
         dialog.project_root_selected.connect(lambda p: self._apply_project_root(p, save=True))
         dialog.access_session_changed.connect(self._refresh_user_button)
+        dialog.hotkeys_changed.connect(self._reload_app_hotkeys)
         dialog.open_to_ui_tab()
         dialog.exec()
         self._refresh_user_button()
@@ -2861,6 +2974,7 @@ class MainWindow(FramelessMainWindow):
         if unscheduled:
             self._pending_unscheduled_entities = None
             self._pending_schedule_jump = None
+            self._ensure_schedule_scope_for_entity_keys(unscheduled)
             self._apply_schedule_sidebar_filters()
             self._schedule_page_widget.focus_unscheduled_entities(unscheduled)
             kind, rel = unscheduled[0]
@@ -2873,6 +2987,7 @@ class MainWindow(FramelessMainWindow):
         if overdue is not None:
             self._pending_overdue_entities = None
             self._pending_schedule_jump = None
+            self._ensure_schedule_scope_for_entity_keys(overdue)
             self._apply_schedule_sidebar_filters()
             self._schedule_page_widget.focus_overdue_entities(overdue)
             if overdue:
@@ -2903,9 +3018,10 @@ class MainWindow(FramelessMainWindow):
                 due = date.fromisoformat(str(due_s)[:10])
             except ValueError:
                 due = None
+        self._ensure_schedule_scope_for_entity_keys([(kind_n, rel_n)])
         if dep:
             self._filter_panel.filters().set_selected_department(dep, emit=False)
-            self._apply_schedule_sidebar_filters()
+        self._apply_schedule_sidebar_filters()
         self._schedule_page_widget.reveal_entity(
             kind_n, rel_n, department=dep, due=due
         )
@@ -3289,14 +3405,18 @@ class MainWindow(FramelessMainWindow):
         except ValueError:
             rel = ""
         ctx = "Shots" if rel.startswith("shots/") else "Assets"
-        self._nav_rail.set_current_context(ctx)
+        kind = "shot" if ctx == "Shots" else "asset"
+        ref = self._pipeline_ref_for_path(entity_path, kind)
+        typ = None
+        if isinstance(ref, Asset):
+            typ = (ref.asset_type or "").strip() or None
         dept = (department_id or "").strip() or None
-        if dept:
-            self._controller.sync_filter_state(department=dept, type_id=self.current_type)
-            self._filter_panel.filters().set_selected_department(dept, emit=False)
-        self._sync_filter_state_from_sidebar()
-        self._reload_main_view()
-        if not self._main_view.select_item_by_path(entity_path):
+        if not self._open_pipeline_entity_in_main_view(
+            context=ctx,
+            path=entity_path,
+            type_id=typ,
+            department=dept,
+        ):
             notification_service.warning(
                 f"Could not find {(entity_path.name)} in the current view."
             )
@@ -3471,14 +3591,18 @@ class MainWindow(FramelessMainWindow):
             return
         dept = (department or "").strip() or None
         ctx = "Shots" if (entity_kind or "").strip().lower() == "shot" else "Assets"
-        self._nav_rail.set_current_context(ctx)
-        if dept:
-            self._controller.sync_filter_state(department=dept, type_id=self.current_type)
-            self._filter_panel.filters().set_selected_department(dept, emit=False)
-        self._sync_filter_state_from_sidebar()
-        self._reload_main_view()
+        kind = "shot" if ctx == "Shots" else "asset"
+        ref = self._pipeline_ref_for_path(p, kind)
+        typ = None
+        if isinstance(ref, Asset):
+            typ = (ref.asset_type or "").strip() or None
         display = (entity_name or "").strip() or p.name
-        if not self._main_view.select_item_by_path(p):
+        if not self._open_pipeline_entity_in_main_view(
+            context=ctx,
+            path=p,
+            type_id=typ,
+            department=dept,
+        ):
             notification_service.warning(f"Could not find {display} in the current view.")
             return
         label = self._department_label_for_id(dept or "")
@@ -3657,6 +3781,10 @@ class MainWindow(FramelessMainWindow):
         # Trigger: user switches between top-level contexts.
         self._filter_panel.sync_nav_context(context_name)
         prev_context = self._active_nav_context
+        if prev_context == "Dashboard" and context_name != "Dashboard":
+            if self._dashboard_page_widget is not None:
+                self._dashboard_page_widget.exit_customize_mode()
+            self._filter_panel.set_dashboard_customize_mode(False)
         if (
             prev_context in ("Assets", "Shots")
             and context_name not in ("Assets", "Shots")
@@ -3736,6 +3864,9 @@ class MainWindow(FramelessMainWindow):
                     self._reference_page_widget.import_requested.connect(self._on_reference_import_requested)
                     self._reference_page_widget.open_folder_requested.connect(self._on_reference_open_folder_requested)
                     self._reference_page_widget.item_tags_changed.connect(self._on_reference_item_tags_changed)
+                    self._reference_page_widget.tag_filter_badge_clicked.connect(
+                        self._on_reference_tag_badge_clear
+                    )
                     self._connect_inbox_outbox_title_row(self._reference_page_widget._title_row)
                     self._content_stack.addWidget(self._reference_page_widget)
                 self._reference_page_widget.set_project_root(self._project_root)
@@ -3743,7 +3874,10 @@ class MainWindow(FramelessMainWindow):
                 dep_label, dep_icon = self._filter_panel.filters().get_department_display(dept)
                 self._reference_page_widget.set_header_badge_display(label=dep_label, icon_name=dep_icon)
                 self._reference_page_widget.set_department(dept)
+                self._filter_panel.filters().sync_tags_for_department(dept, emit_filter=False)
                 self._filter_panel.filters().set_tag_item_tags(self._reference_page_widget.get_item_tags())
+                self._reference_page_widget.set_tag_filter(self._filter_panel.filters().current_tags())
+                self._update_reference_tag_badge()
                 self._content_stack.setCurrentWidget(self._reference_page_widget)
                 self._inspector.set_inbox_tree_preview(None)
             elif context_name == "Outbox":
@@ -3803,6 +3937,14 @@ class MainWindow(FramelessMainWindow):
                         self._on_dashboard_overdue_entities,
                         Qt.ConnectionType.UniqueConnection,
                     )
+                    self._dashboard_page_widget.customize_mode_changed.connect(
+                        self._on_dashboard_customize_mode_changed,
+                        Qt.ConnectionType.UniqueConnection,
+                    )
+                    self._dashboard_page_widget.dashboard_layout_changed.connect(
+                        self._on_dashboard_layout_changed,
+                        Qt.ConnectionType.UniqueConnection,
+                    )
                     self._content_stack.addWidget(self._dashboard_page_widget)
                 self._dashboard_page_widget.set_project_root(self._project_root)
                 self._dashboard_page_widget.set_workspace_root(self._workspace_root)
@@ -3810,6 +3952,7 @@ class MainWindow(FramelessMainWindow):
                 self._content_stack.setCurrentWidget(self._dashboard_page_widget)
                 self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
+                self._sync_dashboard_sidebar_panel()
             elif context_name == "Schedule":
                 self._sync_filter_state_from_sidebar()
                 self._set_inspector_empty_hint_for_context("Schedule")
@@ -3948,25 +4091,32 @@ class MainWindow(FramelessMainWindow):
         if ctx not in ("Assets", "Shots"):
             return False
         kind = "asset" if ctx == "Assets" else "shot"
+        ref = self._pipeline_ref_for_path(path, kind)
         typ = (type_id or "").strip() or None
-        if ctx == "Assets" and not typ:
-            ref = self._pipeline_ref_for_path(path, kind)
-            if isinstance(ref, Asset):
-                typ = (ref.asset_type or "").strip() or None
+        if ctx == "Assets" and not typ and isinstance(ref, Asset):
+            typ = (ref.asset_type or "").strip() or None
+        active_dept = (department or "").strip() or None
+        filter_dept = active_dept
+        if filter_dept and ref is not None and not self._entity_has_department(ref, filter_dept):
+            filter_dept = None
         self._nav_rail.set_current_context(ctx)
         filters = self._filter_panel.filters()
-        filters.set_mode("assets" if kind == "asset" else "shots")
-        dept = (department or "").strip() or None
         if typ:
             filters.set_selected_type(typ, emit=False)
-        if dept:
-            filters.set_selected_department(dept, emit=False)
-        elif typ:
-            filters.set_selected_department(filters.current_department(), emit=False)
+        filters.set_selected_department(filter_dept, emit=False)
+        self._controller.sync_filter_state(department=filter_dept, type_id=typ)
         self._sync_filter_state_from_sidebar()
         self._reload_main_view()
         self._app_state.set_selection(str(path))
-        return self._main_view.select_item_by_path(path)
+        if not self._main_view.select_item_by_path(path):
+            return False
+        if active_dept:
+            filters.set_selected_department(active_dept, emit=False)
+            self._controller.sync_filter_state(department=active_dept, type_id=typ)
+        self._set_main_view_department()
+        self._set_main_view_type()
+        self._refresh_inspector_selection()
+        return True
 
     def _on_command_palette_entity(self, payload: object) -> None:
         if not isinstance(payload, dict):
@@ -4027,37 +4177,13 @@ class MainWindow(FramelessMainWindow):
         if self._nav_rail.current_context() == ctx:
             if snap is not None:
                 self._apply_nav_quick_filter_snapshot(snap)
-            return
-        self._nav_quick_pending_filters = snap
-        self._nav_rail.set_current_context(ctx)
+        else:
+            self._nav_quick_pending_filters = snap
+            self._nav_rail.set_current_context(ctx)
+        self._show_nav_quick_recall_toast(payload)
 
-    def _apply_nav_quick_filter_snapshot(self, filters: dict[str, object]) -> None:
-        panel = self._filter_panel.filters()
-        panel.import_filter_snapshot(filters, emit=False)
-        ctx = self._nav_rail.current_context()
-        if ctx in ("Assets", "Shots"):
-            self._pull_browser_filters_from_sidebar()
-            self._set_main_view_type()
-            self._set_main_view_department()
-            self._reload_main_view()
-        elif ctx == "Schedule":
-            self._apply_schedule_sidebar_filters()
-        elif ctx == "Dashboard":
-            self._apply_dashboard_sidebar_filters()
-        elif ctx == "Inbox" and self._inbox_page_widget is not None:
-            self._inbox_page_widget.set_type_filter(panel.current_type() or "")
-        elif ctx == "Outbox" and self._outbox_page_widget is not None:
-            self._outbox_page_widget.set_type_filter(panel.current_type() or "")
-        elif ctx == "Project Guide" and self._reference_page_widget is not None:
-            dept = panel.current_department() or "reference"
-            dep_label, dep_icon = panel.get_department_display(dept)
-            self._reference_page_widget.set_header_badge_display(label=dep_label, icon_name=dep_icon)
-            self._reference_page_widget.set_department(dept)
-
-    def _on_nav_quick_slot_assigned(self, slot: int, payload: dict) -> None:
-        from monostudio.core.notification_copy import pick_copy
-
-        ctx = (payload.get("context") or "").strip()
+    def _nav_quick_filter_suffix(self, payload: dict) -> str:
+        """Human-readable type · department suffix from a quick-view snapshot."""
         panel = self._filter_panel.filters()
         filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
         detail_parts: list[str] = []
@@ -4071,12 +4197,40 @@ class MainWindow(FramelessMainWindow):
             dep_label, _ = panel.get_department_display(dept.strip())
             if dep_label:
                 detail_parts.append(dep_label)
-        suffix = f" · {' · '.join(detail_parts)}" if detail_parts else ""
-        msg = pick_copy(
-            f"Quick view {slot} → {ctx}{suffix}",
-            f"Quick view {slot} → {ctx}{suffix}",
-        )
-        notification_service.operational_success(msg)
+        return f" · {' · '.join(detail_parts)}" if detail_parts else ""
+
+    def _show_nav_quick_recall_toast(self, payload: dict) -> None:
+        ctx = (payload.get("context") or "").strip()
+        if not ctx:
+            return
+        suffix = self._nav_quick_filter_suffix(payload)
+        notification_service.operational_success(f"Switched to {ctx}{suffix}")
+
+    def _apply_nav_quick_filter_snapshot(self, filters: dict[str, object]) -> None:
+        panel = self._filter_panel.filters()
+        panel.import_filter_snapshot(filters, emit=False)
+        ctx = self._nav_rail.current_context()
+        if ctx in ("Assets", "Shots"):
+            self._pull_browser_filters_from_sidebar()
+            self._set_main_view_type()
+            self._set_main_view_department()
+            self._reload_main_view()
+        elif ctx == "Schedule":
+            self._apply_schedule_sidebar_filters()
+        elif ctx == "Inbox" and self._inbox_page_widget is not None:
+            self._inbox_page_widget.set_type_filter(panel.current_type() or "")
+        elif ctx == "Outbox" and self._outbox_page_widget is not None:
+            self._outbox_page_widget.set_type_filter(panel.current_type() or "")
+        elif ctx == "Project Guide" and self._reference_page_widget is not None:
+            dept = panel.current_department() or "reference"
+            dep_label, dep_icon = panel.get_department_display(dept)
+            self._reference_page_widget.set_header_badge_display(label=dep_label, icon_name=dep_icon)
+            self._reference_page_widget.set_department(dept)
+
+    def _on_nav_quick_slot_assigned(self, slot: int, payload: dict) -> None:
+        ctx = (payload.get("context") or "").strip()
+        suffix = self._nav_quick_filter_suffix(payload)
+        notification_service.operational_success(f"Quick view {slot} → {ctx}{suffix}")
         self._nav_rail.refresh_quick_view_tooltips(self._settings)
 
     def _on_context_clicked(self, context_name: str) -> None:
@@ -5304,9 +5458,13 @@ class MainWindow(FramelessMainWindow):
             self._outbox_page_widget.set_type_filter(self._filter_panel.filters().current_type() or "")
             return
         if context == "Project Guide" and self._reference_page_widget is not None:
+            dept = self._filter_panel.filters().current_department() or "reference"
             self._reference_page_widget.set_project_root(self._project_root)
-            self._reference_page_widget.set_department(self._filter_panel.filters().current_department() or "reference")
+            self._reference_page_widget.set_department(dept)
+            self._filter_panel.filters().sync_tags_for_department(dept, emit_filter=False)
             self._filter_panel.filters().set_tag_item_tags(self._reference_page_widget.get_item_tags())
+            self._reference_page_widget.set_tag_filter(self._filter_panel.filters().current_tags())
+            self._update_reference_tag_badge()
             return
         # Placeholder for search input (context-aware).
         placeholders = {"Assets": "Search assets", "Shots": "Search shots"}
@@ -5524,15 +5682,18 @@ class MainWindow(FramelessMainWindow):
     def _on_inbox_tree_selection_changed(self, path) -> None:
         self._inspector.set_inbox_tree_preview(Path(path) if path else None)
 
-    def _on_tag_filter_changed(self, tag_id) -> None:
+    def _on_tag_filter_changed(self, tag_ids) -> None:
         """Sidebar tag filter changed: forward to Project Guide tree proxy."""
         if self._reference_page_widget is not None:
-            self._reference_page_widget.set_tag_filter(tag_id)
+            ids = list(tag_ids) if tag_ids else []
+            self._reference_page_widget.set_tag_filter(ids)
+            self._update_reference_tag_badge()
 
     def _on_tag_definitions_changed(self) -> None:
         """Tag definitions were modified (add/rename/delete/recolor). Reload on tree pane."""
         if self._reference_page_widget is not None:
             self._reference_page_widget.reload_tag_definitions()
+            self._update_reference_tag_badge()
 
     def _on_reference_tree_selection_changed(self, path) -> None:
         """Reference page: show file preview in inspector (same as Inbox tree selection)."""
@@ -5541,7 +5702,10 @@ class MainWindow(FramelessMainWindow):
     def _on_reference_item_tags_changed(self) -> None:
         """Tags were updated in Project Guide tree; refresh sidebar tag counts."""
         if self._reference_page_widget is not None:
-            self._filter_panel.filters().set_tag_item_tags(self._reference_page_widget.get_item_tags())
+            tags = self._reference_page_widget.get_item_tags()
+            self._filter_panel.filters().set_tag_item_tags(tags)
+            self._reference_page_widget.set_tag_data(tags)
+            self._reference_page_widget.set_tag_filter(self._filter_panel.filters().current_tags())
 
     def _on_reference_import_requested(self) -> None:
         """Import (header or context menu): open file dialog, then copy to project_guide/<current_department>/."""
@@ -6736,6 +6900,30 @@ class MainWindow(FramelessMainWindow):
         )
         dialog.show()
 
+    def _reload_app_hotkeys(self) -> None:
+        from monostudio.ui_qt.app_hotkeys import refresh_all_hotkey_tooltips, reload_bound_shortcuts
+
+        reload_bound_shortcuts(self._settings, self._bound_hotkeys)
+        self._main_view.reload_hotkeys()
+        self._inspector.reload_hotkey_tooltips()
+        refresh_all_hotkey_tooltips(self._settings)
+        self._nav_rail.refresh_quick_view_tooltips(self._settings)
+        for page in (
+            self._inbox_page_widget,
+            self._outbox_page_widget,
+            self._reference_page_widget,
+        ):
+            if page is None:
+                continue
+            reload_bound_shortcuts(self._settings, getattr(page, "_bound_hotkeys", []))
+            pane = getattr(page, "_tree_pane", None)
+            if pane is not None:
+                sync_tt = getattr(pane, "sync_hotkey_tooltips", None)
+                if callable(sync_tt):
+                    sync_tt(self._settings)
+        if self._schedule_page_widget is not None:
+            self._schedule_page_widget.reload_hotkeys()
+
     def _on_main_view_thumbnail_source_changed(self) -> None:
         """Header popup: user vs render sequence — same refresh path as saving Settings."""
         self._thumbnail_manager.clear_memory_cache()
@@ -6755,6 +6943,7 @@ class MainWindow(FramelessMainWindow):
         dialog.nav_quick_slots_changed.connect(
             lambda: self._nav_rail.refresh_quick_view_tooltips(self._settings)
         )
+        dialog.hotkeys_changed.connect(self._reload_app_hotkeys)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         self._refresh_user_button()
         if accepted:

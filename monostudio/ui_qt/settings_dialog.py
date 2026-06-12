@@ -344,6 +344,7 @@ class SettingsDialog(MonosDialog):
     project_root_selected = Signal(str)
     access_session_changed = Signal()
     nav_quick_slots_changed = Signal()
+    hotkeys_changed = Signal()
 
     def __init__(
         self,
@@ -403,6 +404,7 @@ class SettingsDialog(MonosDialog):
         self._access_keys_info_label: QLabel | None = None
         self._access_debug_cb: QCheckBox | None = None
         self._access_splash_spin: QSpinBox | None = None
+        self._hotkeys_widget: HotkeysSettingsWidget | None = None
 
         self._discord_integrations_banner: QLabel | None = None
         self._discord_enabled_cb: QCheckBox | None = None
@@ -637,6 +639,7 @@ class SettingsDialog(MonosDialog):
                 ("Workspace", self._build_app_workspace_tab()),
                 ("UI", self._build_ui_tab()),
                 ("Behavior", self._build_behavior_tab()),
+                ("Hotkeys", self._build_hotkeys_tab()),
                 ("Updates", self._build_updates_tab()),
                 ("Access", self._build_access_tab()),
             ],
@@ -1130,6 +1133,12 @@ class SettingsDialog(MonosDialog):
         layout.addWidget(grp)
         layout.addStretch(1)
         return root
+
+    def _build_hotkeys_tab(self) -> QWidget:
+        from monostudio.ui_qt.app_hotkeys import HotkeysSettingsWidget
+
+        self._hotkeys_widget = HotkeysSettingsWidget(self._settings, self)
+        return self._hotkeys_widget
 
     def _build_access_tab(self) -> QWidget:
         """General → Access: shared key source info, unlock session, developer-only diagnostics."""
@@ -3382,5 +3391,13 @@ class SettingsDialog(MonosDialog):
                 self._settings.setValue("integrations/rizomuv_exe", (self._rizomuv_exe_field.text() or "").strip())
         except Exception:
             pass
+
+        try:
+            if self._settings is not None and self._hotkeys_widget is not None:
+                self._hotkeys_widget.persist(self._settings)
+                self.hotkeys_changed.emit()
+        except Exception:
+            pass
+
         self.accept()
 

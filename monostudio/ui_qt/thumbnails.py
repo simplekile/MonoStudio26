@@ -4,6 +4,7 @@ import hashlib
 import logging
 import subprocess
 import tempfile
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +84,94 @@ def get_thumbnail_sequence_ignore_tokens(settings: QSettings | None) -> frozense
     return _parse_ignore_tokens(raw)
 
 
+def _get_video_max_dimension(video_path: Path) -> int | None:
+    """Largest video stream dimension via ffprobe; None if unavailable."""
+    ffprobe = resolve_ffprobe_executable()
+    if not ffprobe:
+        return None
+    path_str = str(video_path.resolve())
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                path_str,
+            ],
+            capture_output=True,
+            timeout=5,
+            text=True,
+            check=False,
+            **hide_console_subprocess_kwargs(),
+        )
+        if proc.returncode != 0 or not proc.stdout or not proc.stdout.strip():
+            return None
+        parts = proc.stdout.strip().split("x")
+        if len(parts) != 2:
+            return None
+        w, h = int(parts[0]), int(parts[1])
+        if w < 1 or h < 1:
+            return None
+        return max(w, h)
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+        logger.debug("ffprobe dimensions failed for %s: %s", path_str, e)
+        return None
+
+
+def media_source_max_side(path: Path) -> int | None:
+    """Largest native dimension of a readable image/video file; None if unknown."""
+    if not path.is_file():
+        return None
+    ext = (path.suffix or "").strip().lower()
+    if ext in _VIDEO_EXTENSIONS:
+        return _get_video_max_dimension(path)
+    try:
+        from PySide6.QtGui import QImageReader
+
+        reader = QImageReader(str(path))
+        sz = reader.size()
+        if sz.isValid() and sz.width() > 0 and sz.height() > 0:
+            return max(sz.width(), sz.height())
+    except Exception:
+        pass
+    return None
+
+
+def clamp_decode_side_for_media(requested: int, path: Path) -> int:
+    """Cap decode size to native media dimensions (never upscale beyond source)."""
+    side = max(1, int(requested))
+    src_max = media_source_max_side(path)
+    if src_max is not None:
+        side = min(side, src_max)
+    return side
+
+
+def _downscale_pixmap_max_side(pix: QPixmap, max_side: int) -> QPixmap:
+    mx = max(pix.width(), pix.height())
+    if mx <= max_side:
+        return pix
+    return pix.scaled(
+        max_side,
+        max_side,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+def _downscale_image_max_side(img: QImage, max_side: int) -> QImage:
+    mx = max(img.width(), img.height())
+    if mx <= max_side:
+        return img
+    return img.scaled(
+        max_side,
+        max_side,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
 def _get_video_duration_seconds(video_path: Path) -> float | None:
     """Get video duration in seconds via ffprobe; None if unavailable or invalid."""
     ffprobe = resolve_ffprobe_executable()
@@ -151,12 +240,7 @@ def _load_video_frame_via_ffmpeg(video_path: Path, size_px: int) -> QPixmap | No
         pix = QPixmap.fromImage(img)
         if pix.isNull():
             return None
-        return pix.scaled(
-            size_px,
-            size_px,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
+        return _downscale_pixmap_max_side(pix, size_px)
     except (subprocess.TimeoutExpired, OSError, ValueError) as e:
         logger.debug("Video thumbnail ffmpeg failed for %s: %s", path_str, e)
         return None
@@ -180,6 +264,9 @@ def _thumbnail_disk_cache_dir() -> Path:
 
 
 REF_PREVIEW_DISK_CACHE_VARIANT = "ref_cover"
+EXPLORER_PREVIEW_DISK_CACHE_VARIANT = "explorer"
+INSPECTOR_INBOX_PREVIEW_DISK_CACHE_VARIANT = "inbox_hd"
+EXPLORER_GRID_CARD_WIDTH_PX = 200
 
 
 def _disk_cache_path(source_path: Path, mtime_ns: int, size_px: int, *, variant: str = "") -> Path:
@@ -187,6 +274,76 @@ def _disk_cache_path(source_path: Path, mtime_ns: int, size_px: int, *, variant:
     raw = f"{source_path.resolve()!s}\n{mtime_ns}\n{size_px}\n{variant}"
     h = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:32]
     return _thumbnail_disk_cache_dir() / f"{h}.png"
+
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_MIN_PNG_CACHE_BYTES = 24
+
+
+def _remove_disk_cache_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _is_plausible_png_cache(path: Path) -> bool:
+    try:
+        if not path.is_file():
+            return False
+        if path.stat().st_size < _MIN_PNG_CACHE_BYTES:
+            return False
+        with path.open("rb") as fh:
+            return fh.read(8) == _PNG_SIGNATURE
+    except OSError:
+        return False
+
+
+def _read_disk_cache_qimage(path: Path) -> QImage | None:
+    """Read a cached PNG; drop corrupt/partial files (avoids repeated libpng errors)."""
+    if not _is_plausible_png_cache(path):
+        _remove_disk_cache_file(path)
+        return None
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    img = reader.read()
+    if img.isNull():
+        _remove_disk_cache_file(path)
+        return None
+    return img
+
+
+def _read_disk_cache_pixmap(path: Path) -> QPixmap | None:
+    img = _read_disk_cache_qimage(path)
+    if img is None or img.isNull():
+        return None
+    pix = QPixmap.fromImage(img)
+    return pix if not pix.isNull() else None
+
+
+def _write_disk_cache_qimage(path: Path, img: QImage) -> None:
+    if img.isNull():
+        return
+    tmp: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.part")
+        if not img.save(str(tmp), "PNG"):
+            _remove_disk_cache_file(tmp)
+            return
+        tmp.replace(path)
+        tmp = None
+    except OSError:
+        pass
+    finally:
+        if tmp is not None:
+            _remove_disk_cache_file(tmp)
+
+
+def _write_disk_cache_pixmap(path: Path, pix: QPixmap) -> None:
+    if pix.isNull():
+        return
+    _write_disk_cache_qimage(path, pix.toImage())
 
 
 def _qimage_cover_square(img: QImage, side: int) -> QImage:
@@ -344,11 +501,10 @@ class ThumbnailCache:
             return cached.pixmap
         try:
             dc_path = self._disk_cache_path_for(file_path, mtime_ns)
-            if dc_path.is_file():
-                pix = QPixmap(str(dc_path))
-                if not pix.isNull():
-                    self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
-                    return pix
+            pix = _read_disk_cache_pixmap(dc_path)
+            if pix is not None and not pix.isNull():
+                self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
+                return pix
         except OSError:
             pass
         return None
@@ -368,8 +524,7 @@ class ThumbnailCache:
         self._cache[str(file_path)] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
         try:
             dc_path = self._disk_cache_path_for(file_path, mtime_ns)
-            dc_path.parent.mkdir(parents=True, exist_ok=True)
-            pix.save(str(dc_path), "PNG")
+            _write_disk_cache_pixmap(dc_path, pix)
         except OSError:
             pass
         return pix
@@ -389,11 +544,10 @@ class ThumbnailCache:
         # Disk cache in Windows temp: read first; never deleted by app
         dc_path = self._disk_cache_path_for(file_path, mtime_ns)
         try:
-            if dc_path.is_file():
-                pix = QPixmap(str(dc_path))
-                if not pix.isNull():
-                    self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
-                    return pix
+            pix = _read_disk_cache_pixmap(dc_path)
+            if pix is not None and not pix.isNull():
+                self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
+                return pix
         except OSError:
             pass
 
@@ -403,8 +557,7 @@ class ThumbnailCache:
             if pix is not None:
                 self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=pix)
                 try:
-                    dc_path.parent.mkdir(parents=True, exist_ok=True)
-                    pix.save(str(dc_path), "PNG")
+                    _write_disk_cache_pixmap(dc_path, pix)
                 except OSError:
                     pass
             return pix
@@ -419,19 +572,112 @@ class ThumbnailCache:
         if pix.isNull():
             return None
 
-        scaled = pix.scaled(
-            self._size_px,
-            self._size_px,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
+        scaled = _downscale_pixmap_max_side(pix, self._size_px)
         self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=scaled)
         try:
-            dc_path.parent.mkdir(parents=True, exist_ok=True)
-            scaled.save(str(dc_path), "PNG")
+            _write_disk_cache_pixmap(dc_path, scaled)
         except OSError:
             pass
         return scaled
+
+
+def is_direct_media_preview_path(path: Path) -> bool:
+    """True when *path* is an image or video file the explorer can preview."""
+    if not path.is_file():
+        return False
+    ext = (path.suffix or "").strip().lower()
+    return ext in _IMAGE_EXTENSIONS or ext in _VIDEO_EXTENSIONS
+
+
+def explorer_grid_thumb_decode_px(*, dpr: float = 1.0, card_width: int = EXPLORER_GRID_CARD_WIDTH_PX) -> int:
+    """Device-pixel decode size for 16:9 explorer grid thumb (1:1 with painted band, no upscale)."""
+    dpr_v = max(1.0, float(dpr))
+    thumb_h = max(1, int(card_width) * 9 // 16)
+    dev_w = max(1, int(round(card_width * dpr_v)))
+    dev_h = max(1, int(round(thumb_h * dpr_v)))
+    side = max(dev_w, dev_h)
+    return max(64, min(1024, ((side + 15) // 16) * 16))
+
+
+def explorer_list_icon_decode_px(*, dpr: float = 1.0, icon_logical: int = 40) -> int:
+    """Device-pixel decode size for explorer list-row thumb slot."""
+    side = max(1, int(round(icon_logical * max(1.0, float(dpr)))))
+    return max(32, min(256, ((side + 7) // 8) * 8))
+
+
+def explorer_thumb_decode_px(*, dpr: float = 1.0, card_width: int = EXPLORER_GRID_CARD_WIDTH_PX, list_icon_logical: int = 40) -> int:
+    """Max decode bucket for grid + list explorer views on the same loader."""
+    return max(
+        explorer_grid_thumb_decode_px(dpr=dpr, card_width=card_width),
+        explorer_list_icon_decode_px(dpr=dpr, icon_logical=list_icon_logical),
+    )
+
+
+def peek_direct_file_preview(path: Path, *, size_px: int = 256) -> QPixmap | None:
+    """Return a cached explorer preview only — never decodes on the calling thread."""
+    if not is_direct_media_preview_path(path):
+        return None
+    cache = ThumbnailCache(size_px=max(256, int(size_px)), cache_variant=EXPLORER_PREVIEW_DISK_CACHE_VARIANT)
+    return cache.peek_thumbnail_pixmap(path)
+
+
+def decode_explorer_preview_qimage_worker(
+    file_path: str,
+    size_px: int,
+    *,
+    cache_variant: str = EXPLORER_PREVIEW_DISK_CACHE_VARIANT,
+) -> tuple[str, QImage] | None:
+    """Decode image/video preview in a worker thread (Inbox / Project Guide explorer)."""
+    from PySide6.QtGui import QImageReader
+
+    p = Path(file_path)
+    if not is_direct_media_preview_path(p):
+        return None
+    try:
+        stat = p.stat()
+    except OSError:
+        return None
+    mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+    side = clamp_decode_side_for_media(size_px, p)
+    try:
+        key = str(p.resolve())
+    except OSError:
+        key = str(p)
+    dc_path = _disk_cache_path(p, mtime_ns, side, variant=cache_variant)
+    try:
+        cached = _read_disk_cache_qimage(dc_path)
+        if cached is not None and not cached.isNull():
+            return (key, cached)
+    except OSError:
+        pass
+
+    ext = (p.suffix or "").strip().lower()
+    img: QImage | None = None
+    if ext in _VIDEO_EXTENSIONS:
+        pix = _load_video_frame_via_ffmpeg(p, side)
+        if pix is not None and not pix.isNull():
+            img = pix.toImage()
+    else:
+        img = QImage(str(p))
+        if img.isNull():
+            reader = QImageReader(str(p))
+            reader.setAutoTransform(True)
+            img = reader.read()
+        if img.isNull() and ext in (".dpx", ".exr", ".hdr"):
+            from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+            decoded = load_preview_frame_qimage(p, side)
+            img = decoded if decoded is not None and not decoded.isNull() else QImage()
+
+    if img is None or img.isNull():
+        return None
+
+    scaled = _downscale_image_max_side(img, side)
+    try:
+        _write_disk_cache_qimage(dc_path, scaled)
+    except OSError:
+        pass
+    return (key, scaled)
 
 
 def _load_ref_preview_image_worker(file_path: str, size_px: int) -> tuple[str, QImage] | None:
@@ -449,10 +695,9 @@ def _load_ref_preview_image_worker(file_path: str, size_px: int) -> tuple[str, Q
     side = max(1, int(size_px))
     try:
         dc_path = _disk_cache_path(p, mtime_ns, side, variant=REF_PREVIEW_DISK_CACHE_VARIANT)
-        if dc_path.is_file():
-            img = QImage(str(dc_path))
-            if not img.isNull():
-                return (str(p), img)
+        cached = _read_disk_cache_qimage(dc_path)
+        if cached is not None and not cached.isNull():
+            return (str(p), cached)
     except OSError:
         pass
     try:
@@ -470,8 +715,7 @@ def _load_ref_preview_image_worker(file_path: str, size_px: int) -> tuple[str, Q
             return None
         sq = _qimage_cover_square(img, side)
         try:
-            dc_path.parent.mkdir(parents=True, exist_ok=True)
-            sq.save(str(dc_path), "PNG")
+            _write_disk_cache_qimage(dc_path, sq)
         except OSError:
             pass
         return (str(p), sq)

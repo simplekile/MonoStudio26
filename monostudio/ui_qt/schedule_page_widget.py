@@ -6,7 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, QSize, QTimer, Signal
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
+from PySide6.QtGui import QFont, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QDialog,
@@ -181,17 +181,17 @@ class SchedulePageWidget(QWidget):
         self._btn_view_entity = _schedule_layout_pill(
             layout_toggle,
             "Items",
-            "Per shot or asset — one row per item, department bars stacked (Tab)",
+            "Per shot or asset — one row per item, department bars stacked",
         )
         self._btn_view_dept_lanes = _schedule_layout_pill(
             layout_toggle,
             "Lanes",
-            "Per department — one swimlane per dept, items listed inside (Tab)",
+            "Per department — one swimlane per dept, items listed inside",
         )
         self._btn_view_dept_wave = _schedule_layout_pill(
             layout_toggle,
             "Wave",
-            "Per department — one aggregated bar across all items in that dept (Tab)",
+            "Per department — one aggregated bar across all items in that dept",
         )
         self._btn_view_entity.setChecked(True)
         self._view_group = QButtonGroup(self)
@@ -300,6 +300,7 @@ class SchedulePageWidget(QWidget):
         root.addWidget(self._gantt, 1)
         self._sync_marker_lock_button()
         self._install_schedule_shortcuts()
+        self._register_schedule_hotkey_tooltips()
 
         self._load_view_options_settings()
         self._sync_dept_display_to_gantt(reload_now=False)
@@ -352,22 +353,87 @@ class SchedulePageWidget(QWidget):
 
     def _install_schedule_shortcuts(self) -> None:
         """Shortcuts on the gantt tree so they do not fire inside modal dialogs on the page."""
+        from monostudio.ui_qt.app_hotkeys import bind_hotkey
+
         gantt = self._gantt
         ctx = Qt.ShortcutContext.WidgetWithChildrenShortcut
+        self._bound_hotkeys: list[QShortcut] = []
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "schedule.select_tool",
+                gantt,
+                self._activate_select_tool,
+                context=ctx,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "schedule.draw_tool",
+                gantt,
+                self._activate_draw_tool,
+                context=ctx,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "schedule.today",
+                gantt,
+                self._on_today_clicked,
+                context=ctx,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "schedule.undo",
+                gantt,
+                self._on_undo_clicked,
+                context=ctx,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "schedule.redo",
+                gantt,
+                self._on_redo_clicked,
+                context=ctx,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "schedule.save",
+                gantt,
+                self._on_save_clicked,
+                context=ctx,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "schedule.cycle_layout",
+                gantt,
+                self._cycle_layout_view,
+                context=ctx,
+                auto_repeat=False,
+            )
+        )
 
-        def bind(seq, slot) -> None:
-            sc = QShortcut(QKeySequence(seq), gantt, slot)
-            sc.setContext(ctx)
+    def reload_hotkeys(self) -> None:
+        from monostudio.ui_qt.app_hotkeys import reload_bound_shortcuts
 
-        bind("Q", self._activate_select_tool)
-        bind("W", self._activate_draw_tool)
-        bind("F", self._on_today_clicked)
-        bind(QKeySequence.StandardKey.Undo, self._on_undo_clicked)
-        bind("Ctrl+Shift+Z", self._on_redo_clicked)
-        bind(QKeySequence.StandardKey.Save, self._on_save_clicked)
-        tab_sc = QShortcut(QKeySequence(Qt.Key.Key_Tab), gantt, self._cycle_layout_view)
-        tab_sc.setContext(ctx)
-        tab_sc.setAutoRepeat(False)
+        reload_bound_shortcuts(self._settings, getattr(self, "_bound_hotkeys", []))
+
+    def _register_schedule_hotkey_tooltips(self) -> None:
+        from monostudio.ui_qt.app_hotkeys import register_hotkey_tooltip
+
+        for btn in (self._btn_view_entity, self._btn_view_dept_lanes, self._btn_view_dept_wave):
+            base = (btn.toolTip() or "").strip()
+            register_hotkey_tooltip(btn, base, self._settings, "schedule.cycle_layout")
 
     def _activate_select_tool(self) -> None:
         self._current_tool = TOOL_SELECT
@@ -385,6 +451,8 @@ class SchedulePageWidget(QWidget):
         """Right-click on empty timeline → Tools + Planning context menu."""
         from PySide6.QtWidgets import QMenu
 
+        from monostudio.ui_qt.app_hotkeys import read_hotkey_sequence
+
         doc = self._schedule_doc
         can_undo = bool(doc and doc.can_undo())
         can_redo = bool(doc and doc.can_redo())
@@ -397,20 +465,26 @@ class SchedulePageWidget(QWidget):
         menu = QMenu(self)
         editable = self._schedule_editable
         sel = act(menu, "hand", "Select — move and resize bars")
+        sel.setShortcut(read_hotkey_sequence(self._settings, "schedule.select_tool"))
         sel.setCheckable(True)
         sel.setChecked(self._current_tool == TOOL_SELECT)
         draw = act(menu, "pencil", "Draw bar — drag to pin dates")
+        draw.setShortcut(read_hotkey_sequence(self._settings, "schedule.draw_tool"))
         draw.setCheckable(True)
         draw.setChecked(self._current_tool == TOOL_DRAW)
         draw.setEnabled(editable)
         menu.addSeparator()
         today = act(menu, "scan", "Focus today")
+        today.setShortcut(read_hotkey_sequence(self._settings, "schedule.today"))
         menu.addSeparator()
         undo = act(menu, "undo-2", "Undo")
+        undo.setShortcut(read_hotkey_sequence(self._settings, "schedule.undo"))
         undo.setEnabled(editable and can_undo)
         redo = act(menu, "redo-2", "Redo")
+        redo.setShortcut(read_hotkey_sequence(self._settings, "schedule.redo"))
         redo.setEnabled(editable and can_redo)
         save = act(menu, "save", "Save now")
+        save.setShortcut(read_hotkey_sequence(self._settings, "schedule.save"))
         save.setEnabled(editable and dirty)
         menu.addSeparator()
         tpl = act(menu, "file-text", "Edit templates…")

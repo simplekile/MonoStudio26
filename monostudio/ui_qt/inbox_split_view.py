@@ -30,7 +30,7 @@ def _fs_model_index_for_path(model: QFileSystemModel, path: Path):
         native = QDir.toNativeSeparators(str(path))
     return model.index(native, 0)
 
-from PySide6.QtCore import QDir, QEvent, QFileInfo, QItemSelection, QItemSelectionModel, QMimeData, QPoint, QRect, QSize, Qt, Signal, QTimer, QUrl
+from PySide6.QtCore import QDir, QEvent, QFileInfo, QItemSelection, QItemSelectionModel, QMimeData, QPoint, QRect, QRectF, QSize, Qt, Signal, QTimer, QUrl
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QSettings
 from PySide6.QtGui import (
     QAction,
@@ -40,6 +40,7 @@ from PySide6.QtGui import (
     QIcon,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPixmap,
     QShortcut,
 )
@@ -79,21 +80,33 @@ from monostudio.core.project_guide_tags import (
     ancestor_paths,
     build_color_map,
     get_tags_for_item,
-    paths_with_tag,
+    paths_with_any_tag,
+    normalize_tag_department_id,
     read_tag_definitions,
     set_tags_for_item,
     toggle_tag_for_items,
 )
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
+from monostudio.ui_qt.explorer_thumbnail_loader import ExplorerThumbnailLoader
 from monostudio.ui_qt.inbox_browse_bar import InboxBrowseBar
-from monostudio.ui_qt.inbox_grid_card_paint import paint_grid_card_labels
+from monostudio.ui_qt.inbox_grid_card_paint import (
+    grid_card_fallback_icon_px,
+    paint_grid_card_border,
+    paint_grid_card_fill,
+    paint_grid_card_icon_band,
+    paint_grid_card_labels,
+    paint_grid_card_tag_badges,
+)
 from monostudio.ui_qt.inbox_list_row_paint import (
+    _EXPLORER_ICON_SIZE,
     explorer_list_row_size_hint,
     explorer_path_stats,
     explorer_type_label,
-    load_explorer_thumbnail,
+    paint_explorer_grid_thumbnail,
     paint_explorer_list_row,
+    paint_explorer_thumb_loading_spinner,
 )
+from monostudio.ui_qt.thumbnails import is_direct_media_preview_path
 from monostudio.ui_qt.inbox_page_toolbar import InboxContentToolbar
 from monostudio.ui_qt.explorer_drag_out import MiddleMouseDragTracker, collect_tree_drag_paths
 from monostudio.ui_qt.external_drop import drop_wants_copy, paths_under_root
@@ -104,7 +117,15 @@ from monostudio.ui_qt.external_drop_host import (
 )
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.notification import notify as notification_service
-from monostudio.ui_qt.style import FILE_TYPE_ICON_COLORS, MONOS_COLORS, clear_stuck_widget_hover, monos_font
+from monostudio.ui_qt.style import (
+    FILE_TYPE_ICON_COLORS,
+    MONOS_COLORS,
+    breadcrumb_filter_icon_color,
+    breadcrumb_filter_role,
+    clear_stuck_widget_hover,
+    monos_font,
+    page_badge_accent_color,
+)
 
 _TREE_ICON_SIZE = 18
 
@@ -187,7 +208,8 @@ def _handle_external_url_drag_move(event: QDragMoveEvent) -> bool:
     return False
 
 # Extension sets for file-type icons (lowercase with leading dot)
-_EXT_IMAGE = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tga", ".tif", ".tiff", ".exr", ".hdr", ".ico", ".svg", ".pur"})  # .pur = PureRef
+_EXT_IMAGE = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tga", ".tif", ".tiff", ".exr", ".hdr", ".ico", ".svg"})
+_EXT_PUREF = frozenset({".pur"})  # PureRef → brand:pureref
 _EXT_VIDEO = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg", ".ts"})
 _EXT_AUDIO = frozenset({".mp3", ".wav", ".aiff", ".aif", ".ogg", ".flac", ".m4a", ".wma", ".aac"})
 _EXT_ARCHIVE = frozenset({".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".zst"})
@@ -219,6 +241,8 @@ def _file_icon_spec(is_dir: bool, suffix: str) -> tuple[str, str]:
     ext = (suffix or "").strip().lower()
     if not ext.startswith("."):
         ext = "." + ext if ext else ""
+    if ext in _EXT_PUREF:
+        return ("brand:pureref", colors["dcc"])
     if ext in _EXT_IMAGE:
         return ("file-image", colors["image"])
     if ext in _EXT_VIDEO:
@@ -256,14 +280,15 @@ def _file_icon_spec(is_dir: bool, suffix: str) -> tuple[str, str]:
     return ("file", colors["file"])
 
 
-def _tree_file_icon(name: str, color: str) -> "QIcon":
-    """Tree icon: brand:slug → brand_icon; else lucide_icon."""
+def _tree_file_icon(name: str, color: str, *, size: int | None = None) -> "QIcon":
+    """Tree/grid/list icon: brand:slug → brand_icon; else lucide_icon."""
+    px = max(12, int(size if size is not None else _TREE_ICON_SIZE))
     if name.startswith("brand:"):
         from monostudio.ui_qt.brand_icons import brand_icon
         slug = name[6:]
-        ic = brand_icon(slug, size=_TREE_ICON_SIZE, color_hex=color)
-        return ic if not ic.isNull() else lucide_icon("box", size=_TREE_ICON_SIZE, color_hex=color)
-    return lucide_icon(name, size=_TREE_ICON_SIZE, color_hex=color)
+        ic = brand_icon(slug, size=px, color_hex=color)
+        return ic if not ic.isNull() else lucide_icon("box", size=px, color_hex=color)
+    return lucide_icon(name, size=px, color_hex=color)
 
 
 class _InboxFileSystemModel(QFileSystemModel):
@@ -303,11 +328,16 @@ class _InboxTreeDelegate(QStyledItemDelegate):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._thumb_cache: dict[str, tuple[float, QPixmap | None]] = {}
         self._pane: "InboxTreePane | ReferenceTreePane | None" = None
 
     def set_pane(self, pane: "InboxTreePane | ReferenceTreePane") -> None:
         self._pane = pane
+
+    def _thumb_loader(self) -> ExplorerThumbnailLoader | None:
+        pane = self._pane
+        if pane is None:
+            return None
+        return getattr(pane, "_explorer_thumb_loader", None)
 
     def _fs_model_and_index(self, index: QModelIndex) -> tuple[object | None, QModelIndex]:
         model = index.model()
@@ -339,17 +369,10 @@ class _InboxTreeDelegate(QStyledItemDelegate):
         return None
 
     def _thumbnail_for(self, path: Path) -> QPixmap | None:
-        try:
-            key = str(path.resolve())
-            mtime = path.stat().st_mtime
-        except OSError:
+        loader = self._thumb_loader()
+        if loader is None:
             return None
-        cached = self._thumb_cache.get(key)
-        if cached is not None and cached[0] == mtime:
-            return cached[1]
-        pix = load_explorer_thumbnail(path)
-        self._thumb_cache[key] = (mtime, pix)
-        return pix
+        return loader.get_or_request(path)
 
     def sizeHint(self, option, index) -> QSize:  # noqa: N802
         if index.column() != 0:
@@ -377,8 +400,16 @@ class _InboxTreeDelegate(QStyledItemDelegate):
             )
 
             icon_name, icon_color = _file_icon_spec(is_dir, path.suffix or "")
-            file_icon = _tree_file_icon(icon_name, icon_color)
-            thumb = None if is_dir else self._thumbnail_for(path)
+            file_icon = _tree_file_icon(icon_name, icon_color, size=_EXPLORER_ICON_SIZE)
+            loader = self._thumb_loader()
+            thumb = None
+            thumb_loading = False
+            loading_angle = 0.0
+            if not is_dir and is_direct_media_preview_path(path):
+                thumb = self._thumbnail_for(path)
+                if thumb is None and loader is not None and loader.is_pending(path):
+                    thumb_loading = True
+                    loading_angle = loader.loading_angle
             date_label, size_label = explorer_path_stats(path)
 
             paint_explorer_list_row(
@@ -389,8 +420,10 @@ class _InboxTreeDelegate(QStyledItemDelegate):
                 type_label=explorer_type_label(path),
                 date_label=date_label,
                 size_label=size_label,
-                icon=file_icon if thumb is None else None,
+                icon=file_icon if thumb is None and not thumb_loading else None,
                 thumbnail=thumb,
+                loading=thumb_loading,
+                loading_angle=loading_angle,
             )
 
             if has_branch:
@@ -441,12 +474,21 @@ def _set_lucide_on_label(label: QLabel, icon_name: str, *, size: int, color_hex:
     label.setPixmap(ic.pixmap(size, size))
 
 
+def _inbox_outbox_root_badge_kind(root_title: str) -> str:
+    key = (root_title or "").strip().casefold()
+    return {
+        "inbox": "inbox",
+        "outbox": "outbox",
+        "project guide": "guide",
+    }.get(key, "")
+
+
 def _make_inbox_outbox_title_chevron(parent: QWidget) -> QLabel:
     lbl = QLabel(parent)
     lbl.setObjectName("MainViewTitleChevron")
     lbl.setFixedSize(16, 16)
     lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    chev = lucide_icon("chevron-right", size=14, color_hex=MONOS_COLORS["text_meta"])
+    chev = lucide_icon("chevron-right", size=14, color_hex=MONOS_COLORS["text_label"])
     if not chev.isNull():
         lbl.setPixmap(chev.pixmap(14, 14))
     return lbl
@@ -458,6 +500,7 @@ class InboxOutboxTitleRow(QWidget):
     root_clicked = Signal()
     type_clicked = Signal()
     department_clicked = Signal()
+    tag_filter_clicked = Signal()
 
     def __init__(
         self,
@@ -482,16 +525,19 @@ class InboxOutboxTitleRow(QWidget):
         lay.setSpacing(8)
 
         self._root_static = QWidget(self)
-        self._root_static.setObjectName("MainViewBreadcrumbRoot")
+        self._root_static.setObjectName("MainViewTypeBadge")
+        self._root_static.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._root_page_badge_kind = _inbox_outbox_root_badge_kind(self._root_title)
+        self._root_static.setProperty("badgeKind", self._root_page_badge_kind)
         root_static_l = QHBoxLayout(self._root_static)
-        root_static_l.setContentsMargins(0, 0, 0, 0)
+        root_static_l.setContentsMargins(8, 4, 10, 4)
         root_static_l.setSpacing(6)
         self._root_static_icon = QLabel(self._root_static)
         self._root_static_icon.setFixedSize(16, 16)
         self._root_static_icon.setScaledContents(False)
         self._root_label = QLabel(self._root_title.upper(), self._root_static)
-        self._root_label.setObjectName("MainViewContextTitle")
-        self._root_label.setFont(monos_font("Inter", 16, QFont.Weight.Bold))
+        self._root_label.setObjectName("MainViewTypeBadgeLabel")
+        self._root_label.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
         root_static_l.addWidget(self._root_static_icon, 0, Qt.AlignmentFlag.AlignVCenter)
         root_static_l.addWidget(self._root_label, 0, Qt.AlignmentFlag.AlignVCenter)
         self._root_static.installEventFilter(self)
@@ -500,7 +546,7 @@ class InboxOutboxTitleRow(QWidget):
         self._chevron_type.hide()
 
         self._type_badge = QWidget(self)
-        self._type_badge.setObjectName("MainViewTypeBadge")
+        self._type_badge.setObjectName("MainViewFilterBadge")
         self._type_badge.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         badge_lay = QHBoxLayout(self._type_badge)
         badge_lay.setContentsMargins(8, 4, 10, 4)
@@ -508,7 +554,7 @@ class InboxOutboxTitleRow(QWidget):
         self._type_icon_label = QLabel(self._type_badge)
         self._type_icon_label.setFixedSize(16, 16)
         self._type_label = QLabel(self._type_badge)
-        self._type_label.setObjectName("MainViewTypeBadgeLabel")
+        self._type_label.setObjectName("MainViewFilterBadgeLabel")
         self._type_label.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
         badge_lay.addWidget(self._type_icon_label, 0, Qt.AlignmentFlag.AlignVCenter)
         badge_lay.addWidget(self._type_label, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -519,7 +565,7 @@ class InboxOutboxTitleRow(QWidget):
         self._chevron_date.hide()
 
         self._date_chip = QWidget(self)
-        self._date_chip.setObjectName("MainViewTypeBadge")
+        self._date_chip.setObjectName("MainViewFilterBadge")
         self._date_chip.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         date_lay = QHBoxLayout(self._date_chip)
         date_lay.setContentsMargins(8, 4, 10, 4)
@@ -527,49 +573,170 @@ class InboxOutboxTitleRow(QWidget):
         self._date_icon = QLabel(self._date_chip)
         self._date_icon.setFixedSize(16, 16)
         self._date_label = QLabel(self._date_chip)
-        self._date_label.setObjectName("MainViewTypeBadgeLabel")
+        self._date_label.setObjectName("MainViewFilterBadgeLabel")
         self._date_label.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
         date_lay.addWidget(self._date_icon, 0, Qt.AlignmentFlag.AlignVCenter)
         date_lay.addWidget(self._date_label, 0, Qt.AlignmentFlag.AlignVCenter)
         self._date_chip.hide()
 
+        self._chevron_tag = _make_inbox_outbox_title_chevron(self)
+        self._chevron_tag.hide()
+
+        self._tag_badges_host = QWidget(self)
+        self._tag_badges_host.setObjectName("MainViewTagFilterBadgesHost")
+        self._tag_badges_layout = QHBoxLayout(self._tag_badges_host)
+        self._tag_badges_layout.setContentsMargins(0, 0, 0, 0)
+        self._tag_badges_layout.setSpacing(4)
+        self._tag_filter_chips: list[QWidget] = []
+        self._tag_badges_host.hide()
+
         lay.addWidget(self._root_static, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self._chevron_type, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self._type_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self._chevron_tag, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self._tag_badges_host, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self._chevron_date, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(self._date_chip, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._apply_root_page_badge_style()
+
+    def _apply_root_page_badge_style(self) -> None:
+        self._root_static.setProperty("badgeKind", self._root_page_badge_kind)
+        for w in (self._root_static, self._root_label):
+            w.style().unpolish(w)
+            w.style().polish(w)
+        self._root_static.update()
+        self._root_label.update()
 
     def filter_badge_widget(self) -> QWidget:
         return self._type_badge
 
+    def tag_filter_badge_widget(self) -> QWidget:
+        return self._tag_badges_host
+
     def badge_role(self) -> str:
         return self._badge_role
 
-    def _apply_badge_role_style(self) -> None:
-        is_dept = self._badge_role == "department"
-        if is_dept:
-            self._type_badge.setObjectName("MainViewDepartmentBadge")
-            self._type_label.setObjectName("MainViewDepartmentBadgeLabel")
-            self._type_badge.setProperty("badgeKind", "")
+    def _apply_tag_chip_tint(self, chip: QWidget, color_hex: str) -> None:
+        c = QColor(color_hex)
+        bg = QColor(c.red(), c.green(), c.blue(), 72)
+        border = QColor(c.red(), c.green(), c.blue(), 160)
+        hover_bg = QColor(c.red(), c.green(), c.blue(), 110)
+        chip.setStyleSheet(
+            f"QWidget#MainViewTagFilterBadge {{"
+            f" background-color: rgba({bg.red()}, {bg.green()}, {bg.blue()}, {bg.alpha()});"
+            f" border: 1px solid rgba({border.red()}, {border.green()}, {border.blue()}, {border.alpha()});"
+            f" border-radius: 6px;"
+            f"}}"
+            f"QWidget#MainViewTagFilterBadge[navLink=\"true\"]:hover {{"
+            f" background-color: rgba({hover_bg.red()}, {hover_bg.green()}, {hover_bg.blue()}, {hover_bg.alpha()});"
+            f"}}"
+            f"QLabel#MainViewTagFilterBadgeLabel {{ color: #fafafa; font-weight: 700; }}"
+        )
+
+    def _set_tag_chip_icon(self, chip: QWidget, *, hovered: bool) -> None:
+        icon_label = getattr(chip, "_tag_icon_label", None)
+        color = getattr(chip, "_tag_color", "#a1a1aa")
+        if not isinstance(icon_label, QLabel):
+            return
+        if hovered:
+            _set_lucide_on_label(icon_label, "x", size=16, color_hex="#fafafa")
         else:
-            self._type_badge.setObjectName("MainViewTypeBadge")
-            self._type_label.setObjectName("MainViewTypeBadgeLabel")
-            kind = (self._type_filter or "").strip().lower()
-            self._type_badge.setProperty(
-                "badgeKind",
-                kind if kind in ("client", "freelancer") else "",
-            )
-        for w in (self._type_badge, self._type_label):
+            _set_lucide_on_label(icon_label, "tag-filled", size=16, color_hex=color)
+
+    def _build_tag_filter_chip(self, label: str, color_hex: str) -> QWidget:
+        chip = QWidget(self._tag_badges_host)
+        chip.setObjectName("MainViewTagFilterBadge")
+        chip.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        chip_lay = QHBoxLayout(chip)
+        chip_lay.setContentsMargins(8, 4, 10, 4)
+        chip_lay.setSpacing(6)
+        icon_label = QLabel(chip)
+        icon_label.setFixedSize(16, 16)
+        text_label = QLabel((label or "").strip().upper(), chip)
+        text_label.setObjectName("MainViewTagFilterBadgeLabel")
+        text_label.setFont(monos_font("Inter", 13, QFont.Weight.Bold))
+        chip_lay.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        chip_lay.addWidget(text_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        chip._tag_icon_label = icon_label  # type: ignore[attr-defined]
+        chip._tag_color = color_hex  # type: ignore[attr-defined]
+        self._apply_tag_chip_tint(chip, color_hex)
+        self._set_tag_chip_icon(chip, hovered=False)
+        self._set_nav_link(chip, True, tooltip="Clear tag filters")
+        chip.setMouseTracking(True)
+        chip.installEventFilter(self)
+        return chip
+
+    def _clear_tag_filter_chips(self) -> None:
+        for chip in self._tag_filter_chips:
+            chip.removeEventFilter(self)
+            chip.setParent(None)
+            chip.deleteLater()
+        self._tag_filter_chips.clear()
+        while self._tag_badges_layout.count():
+            item = self._tag_badges_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+
+    def set_tag_filter_badges(self, badges: list[tuple[str, str]]) -> None:
+        """Show one breadcrumb chip per active tag filter (label, color_hex)."""
+        self._clear_tag_filter_chips()
+        cleaned = [(l.strip(), c.strip()) for l, c in badges if (l or "").strip() and (c or "").strip()]
+        if not cleaned:
+            self._chevron_tag.hide()
+            self._tag_badges_host.hide()
+            return
+        for label, color_hex in cleaned:
+            chip = self._build_tag_filter_chip(label, color_hex)
+            self._tag_badges_layout.addWidget(chip)
+            self._tag_filter_chips.append(chip)
+        self._chevron_tag.setVisible(self._type_badge.isVisible())
+        self._tag_badges_host.show()
+
+    def set_tag_filter_badge(self, label: str | None, *, color_hex: str | None = None) -> None:
+        text = (label or "").strip()
+        if not text:
+            self.set_tag_filter_badges([])
+            return
+        self.set_tag_filter_badges([(text, (color_hex or "").strip() or "#a1a1aa")])
+
+    def _apply_filter_chip_style(
+        self,
+        badge: QWidget,
+        label: QLabel,
+        *,
+        badge_role: str = "type",
+        segment: str = "filter",
+    ) -> None:
+        badge.setObjectName("MainViewFilterBadge")
+        label.setObjectName("MainViewFilterBadgeLabel")
+        badge.setProperty("badgeKind", "")
+        badge.setProperty(
+            "filterRole",
+            breadcrumb_filter_role(
+                self._root_page_badge_kind,
+                badge_role=badge_role,
+                segment=segment,
+            ),
+        )
+        for w in (badge, label):
             w.style().unpolish(w)
             w.style().polish(w)
-        self._type_badge.update()
-        self._type_label.update()
+        badge.update()
+        label.update()
 
-    def _set_nav_link(self, widget: QWidget, enabled: bool) -> None:
+    def _apply_badge_role_style(self) -> None:
+        self._apply_filter_chip_style(
+            self._type_badge,
+            self._type_label,
+            badge_role=self._badge_role,
+        )
+
+    def _set_nav_link(self, widget: QWidget, enabled: bool, *, tooltip: str = "") -> None:
         widget.setProperty("navLink", "true" if enabled else "false")
         widget.setCursor(
             Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor
         )
+        widget.setToolTip(tooltip if enabled else "")
         widget.style().unpolish(widget)
         widget.style().polish(widget)
 
@@ -592,11 +759,12 @@ class InboxOutboxTitleRow(QWidget):
         self._badge_icon_override = (badge_icon or "").strip() or None
         type_text = self._badge_label_override or _inbox_outbox_type_label(self._type_filter)
         has_type = bool(type_text)
-        root_icon_color = MONOS_COLORS.get("text_primary", "#cccccc")
-        meta_color = MONOS_COLORS.get("text_label", "#a1a1aa")
-        type_kind = (self._type_filter or "").strip().lower()
-        badge_on_color = self._badge_role == "department" or type_kind in ("client", "freelancer")
-        badge_icon_color = "#fafafa" if badge_on_color else meta_color
+        filter_role = breadcrumb_filter_role(
+            self._root_page_badge_kind,
+            badge_role=self._badge_role,
+        )
+        badge_icon_color = breadcrumb_filter_icon_color(filter_role)
+        root_icon_color = page_badge_accent_color(self._root_page_badge_kind)
 
         _set_lucide_on_label(
             self._root_static_icon, self._root_icon, size=16, color_hex=root_icon_color
@@ -619,27 +787,58 @@ class InboxOutboxTitleRow(QWidget):
         if has_type:
             self._apply_badge_role_style()
 
+        filter_tooltip = (
+            "Change department filter"
+            if self._badge_role == "department"
+            else "Change source filter"
+        )
         if unified_tree:
-            self._set_nav_link(self._type_badge, has_type)
+            self._set_nav_link(self._type_badge, has_type, tooltip=filter_tooltip)
             self._set_nav_link(self._root_static, False)
             self._chevron_date.setVisible(False)
             self._date_chip.setVisible(False)
             return
 
         # Legacy: type pill clickable when inside a date-folder tree drill-down.
-        self._set_nav_link(self._type_badge, self._in_tree and has_type)
-        self._set_nav_link(self._root_static, self._in_tree)
+        self._set_nav_link(
+            self._type_badge,
+            self._in_tree and has_type,
+            tooltip="Back to source list" if self._in_tree and has_type else "",
+        )
+        self._set_nav_link(
+            self._root_static,
+            self._in_tree,
+            tooltip="Back to inbox root" if self._in_tree else "",
+        )
 
         show_date = self._in_tree and self._date_path is not None
         self._chevron_date.setVisible(show_date)
         self._date_chip.setVisible(show_date)
         if show_date:
+            date_filter_role = breadcrumb_filter_role(
+                self._root_page_badge_kind,
+                segment="date",
+            )
             _set_lucide_on_label(
-                self._date_icon, "calendar", size=16, color_hex=meta_color
+                self._date_icon,
+                "calendar",
+                size=16,
+                color_hex=breadcrumb_filter_icon_color(date_filter_role),
             )
             self._date_label.setText(_inbox_outbox_date_label(self._date_path))
+            self._apply_filter_chip_style(
+                self._date_chip,
+                self._date_label,
+                segment="date",
+            )
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj in self._tag_filter_chips:
+            et = event.type()
+            if et == QEvent.Type.Enter:
+                self._set_tag_chip_icon(obj, hovered=True)
+            elif et in (QEvent.Type.Leave, QEvent.Type.Hide):
+                self._set_tag_chip_icon(obj, hovered=False)
         if (
             event.type() == QEvent.Type.MouseButtonPress
             and isinstance(event, QMouseEvent)
@@ -658,6 +857,12 @@ class InboxOutboxTitleRow(QWidget):
                     if self._in_tree:
                         self.type_clicked.emit()
                         return True
+            if obj in self._tag_filter_chips and obj.isVisible():
+                nav = obj.property("navLink")
+                if nav == "true" or nav is True:
+                    self.tag_filter_clicked.emit()
+                    QTimer.singleShot(0, lambda: clear_stuck_widget_hover(obj))
+                    return True
             if (
                 obj is self._root_static
                 and self._in_tree
@@ -669,8 +874,17 @@ class InboxOutboxTitleRow(QWidget):
 
 
 _FILE_CARD_W = 200
-_FILE_CARD_H = 136
+_FILE_CARD_RADIUS = 10
 _FILE_GRID_GAP = 20
+_FILE_GRID_THUMB_TEXT_GAP = 10
+_FILE_GRID_LABEL_PAD_H = 8
+_FILE_GRID_LABEL_PAD_BOTTOM = 8
+# 16:9 thumb (full card width) + text band below.
+_FILE_CARD_H = (_FILE_CARD_W * 9) // 16 + _FILE_GRID_THUMB_TEXT_GAP + 58
+
+
+def _file_card_thumb_height(card_width: int) -> int:
+    return max(1, int(card_width) * 9 // 16)
 
 
 class _InboxFileEntry:
@@ -729,6 +943,7 @@ class _InboxFileGridDelegate(QStyledItemDelegate):
     def __init__(self, *, view: QListView, parent=None) -> None:
         super().__init__(parent)
         self._pane: "InboxTreePane | None" = None
+        self._tag_pixmap_cache: dict[str, QPixmap] = {}
         self._card_size = QSize(_FILE_CARD_W, _FILE_CARD_H)
         self._c_bg = MONOS_COLORS.get("card_bg", "#191b1e")
         self._c_hover = MONOS_COLORS.get("card_hover", "#1d1f23")
@@ -744,6 +959,15 @@ class _InboxFileGridDelegate(QStyledItemDelegate):
     def set_card_size(self, size: QSize) -> None:
         self._card_size = size
 
+    def _thumbnail_for(self, path: Path) -> QPixmap | None:
+        pane = self._pane
+        if pane is None:
+            return None
+        loader = getattr(pane, "_explorer_thumb_loader", None)
+        if loader is None:
+            return None
+        return loader.get_or_request(path)
+
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:  # noqa: N802
         return QSize(self._card_size.width() + _FILE_GRID_GAP, self._card_size.height() + _FILE_GRID_GAP)
 
@@ -754,6 +978,8 @@ class _InboxFileGridDelegate(QStyledItemDelegate):
         meta = index.data(_InboxFileListModel.RoleMeta) or ""
         icon_name = index.data(_InboxFileListModel.RoleIconName) or "file"
         icon_color = index.data(_InboxFileListModel.RoleIconColor) or self._c_muted
+        path_str = index.data(Qt.ItemDataRole.UserRole)
+        path = Path(path_str) if path_str else None
         rect = option.rect.adjusted(_FILE_GRID_GAP // 2, _FILE_GRID_GAP // 2, -_FILE_GRID_GAP // 2, -_FILE_GRID_GAP // 2)
         if rect.width() <= 0 or rect.height() <= 0:
             return
@@ -769,31 +995,123 @@ class _InboxFileGridDelegate(QStyledItemDelegate):
         p.save()
         try:
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            p.setPen(border)
-            p.setBrush(bg)
-            p.drawRoundedRect(rect, 10, 10)
+            border_px = 2 if selected else 1
+            outer = rect
+            inner = outer.adjusted(border_px, border_px, -border_px, -border_px)
+            inner_radius = max(0, _FILE_CARD_RADIUS - border_px)
+            paint_grid_card_fill(p, outer, bg=bg, radius=_FILE_CARD_RADIUS)
 
-            icon = _tree_file_icon(str(icon_name), str(icon_color))
-            if not icon.isNull():
-                px = icon.pixmap(28, 28)
-                ix = rect.center().x() - px.width() // 2
-                iy = rect.top() + 14
-                p.drawPixmap(ix, iy, px)
-
+            loader = getattr(self._pane, "_explorer_thumb_loader", None) if self._pane else None
+            is_media = path is not None and is_direct_media_preview_path(path)
+            thumb_pix = self._thumbnail_for(path) if is_media else None
+            thumb_loading = bool(
+                is_media
+                and (thumb_pix is None or thumb_pix.isNull())
+                and loader is not None
+                and loader.is_pending(path)
+            )
+            thumb_h = _file_card_thumb_height(inner.width())
+            thumb_rect = QRect(inner.left(), inner.top(), inner.width(), thumb_h)
+            fallback_icon_px = grid_card_fallback_icon_px(thumb_rect)
+            file_icon = _tree_file_icon(
+                str(icon_name), str(icon_color), size=fallback_icon_px
+            )
+            content_clip = QPainterPath()
+            content_clip.addRoundedRect(QRectF(inner), inner_radius, inner_radius)
+            p.save()
+            p.setClipPath(content_clip)
+            p.fillRect(thumb_rect, QColor("#27272a"))
+            if thumb_pix is not None and not thumb_pix.isNull():
+                paint_explorer_grid_thumbnail(p, thumb_rect, thumb_pix)
+            elif thumb_loading:
+                paint_explorer_thumb_loading_spinner(
+                    p, thumb_rect, angle=loader.loading_angle if loader else 0.0
+                )
+            else:
+                paint_grid_card_icon_band(
+                    p,
+                    thumb_rect,
+                    file_icon,
+                    icon_px=fallback_icon_px,
+                )
+            if path is not None and self._pane is not None:
+                tag_fn = getattr(self._pane, "tags_for_guide_path", None)
+                color_map = getattr(self._pane, "_tag_color_map", None)
+                if callable(tag_fn) and isinstance(color_map, dict):
+                    tag_ids = tag_fn(path)
+                    if tag_ids:
+                        paint_grid_card_tag_badges(
+                            p,
+                            thumb_rect,
+                            tag_ids,
+                            color_map,
+                            pixmap_cache=self._tag_pixmap_cache,
+                        )
             paint_grid_card_labels(
                 p,
-                rect,
+                inner,
                 title=str(label),
                 meta=str(meta) if meta else "",
                 title_color=title_color,
                 meta_color=meta_color,
-                icon_band_h=44,
+                icon_band_h=thumb_h,
                 title_px=12,
+                band_from_card_top=True,
+                band_gap_after=_FILE_GRID_THUMB_TEXT_GAP,
+                label_pad_h=_FILE_GRID_LABEL_PAD_H,
+                label_pad_bottom=_FILE_GRID_LABEL_PAD_BOTTOM,
             )
+            p.restore()
+
             if self._pane is not None and self._pane.is_drop_hover_grid_row(index.row()):
-                paint_explorer_drop_target_highlight(p, rect)
+                paint_explorer_drop_target_highlight(p, outer)
+            paint_grid_card_border(
+                p,
+                outer,
+                border=border,
+                radius=_FILE_CARD_RADIUS,
+                width=border_px,
+            )
         finally:
             p.restore()
+
+
+def _make_inbox_file_entry(child: Path, *, meta_root: Path | None = None) -> _InboxFileEntry:
+    icon_name, icon_color = _file_icon_spec(child.is_dir(), child.suffix or "")
+    if child.is_dir():
+        files, folders = 0, 0
+        try:
+            for sub in child.iterdir():
+                if sub.name.startswith("."):
+                    continue
+                if sub.is_dir():
+                    folders += 1
+                elif sub.is_file():
+                    files += 1
+        except OSError:
+            pass
+        bits = []
+        if files:
+            bits.append(f"{files} file{'s' if files != 1 else ''}")
+        if folders:
+            bits.append(f"{folders} folder{'s' if folders != 1 else ''}")
+        meta = " · ".join(bits) if bits else "Folder"
+    else:
+        meta = (child.suffix or "file").lstrip(".").upper() or "File"
+        if meta_root is not None:
+            try:
+                rel_parent = child.parent.relative_to(meta_root).as_posix()
+                if rel_parent and rel_parent != ".":
+                    meta = rel_parent
+            except (ValueError, OSError):
+                pass
+    return _InboxFileEntry(
+        child.name,
+        child,
+        meta=meta,
+        icon_name=icon_name,
+        icon_color=icon_color,
+    )
 
 
 def _collect_inbox_file_entries(root: Path) -> list[_InboxFileEntry]:
@@ -810,37 +1128,43 @@ def _collect_inbox_file_entries(root: Path) -> list[_InboxFileEntry]:
         return entries
     children.sort(key=lambda p: (not p.is_dir(), p.name.lower()))
     for child in children:
-        icon_name, icon_color = _file_icon_spec(child.is_dir(), child.suffix or "")
-        if child.is_dir():
-            files, folders = 0, 0
-            try:
-                for sub in child.iterdir():
-                    if sub.name.startswith("."):
-                        continue
-                    if sub.is_dir():
-                        folders += 1
-                    elif sub.is_file():
-                        files += 1
-            except OSError:
-                pass
-            bits = []
-            if files:
-                bits.append(f"{files} file{'s' if files != 1 else ''}")
-            if folders:
-                bits.append(f"{folders} folder{'s' if folders != 1 else ''}")
-            meta = " · ".join(bits) if bits else "Folder"
-        else:
-            meta = (child.suffix or "file").lstrip(".").upper() or "File"
-        entries.append(
-            _InboxFileEntry(
-                child.name,
-                child,
-                meta=meta,
-                icon_name=icon_name,
-                icon_color=icon_color,
-            )
-        )
+        entries.append(_make_inbox_file_entry(child))
     return entries
+
+
+def _collect_tag_filtered_file_entries(
+    browse_root: Path,
+    guide_root: Path,
+    tagged_rels: set[str],
+) -> list[_InboxFileEntry]:
+    """Flat list of tagged items under *browse_root* (files + tagged folders)."""
+    try:
+        browse = browse_root.resolve()
+        guide = guide_root.resolve()
+    except OSError:
+        browse, guide = browse_root, guide_root
+    if not browse.is_dir() or not tagged_rels:
+        return []
+    out: list[_InboxFileEntry] = []
+    seen: set[str] = set()
+    for rel in sorted(tagged_rels):
+        if not rel or rel in seen:
+            continue
+        full = guide / rel
+        try:
+            full_res = full.resolve()
+        except OSError:
+            full_res = full
+        if not full_res.exists():
+            continue
+        try:
+            full_res.relative_to(browse)
+        except ValueError:
+            continue
+        seen.add(rel)
+        out.append(_make_inbox_file_entry(full_res, meta_root=browse))
+    out.sort(key=lambda e: (not e.path.is_dir(), e.label.lower()))
+    return out
 
 
 class InboxTreePane(QWidget):
@@ -937,8 +1261,10 @@ class InboxTreePane(QWidget):
         self._tree.hideColumn(1)
         self._tree.hideColumn(2)
         self._tree.hideColumn(3)
+        self._explorer_thumb_loader = ExplorerThumbnailLoader(self)
         self._tree_delegate = _InboxTreeDelegate(self._tree)
         self._tree.setItemDelegate(self._tree_delegate)
+        self._explorer_thumb_loader.register_view(self._tree)
         self._tree.setExpandsOnDoubleClick(False)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_tree_context_menu)
@@ -963,6 +1289,7 @@ class InboxTreePane(QWidget):
             self._file_grid_delegate = _InboxFileGridDelegate(view=self._file_grid, parent=self._file_grid)
             self._file_grid_delegate.set_pane(self)
             self._file_grid.setItemDelegate(self._file_grid_delegate)
+            self._explorer_thumb_loader.register_view(self._file_grid)
             grid_sm = self._file_grid.selectionModel()
             grid_sm.selectionChanged.connect(self._on_tree_selection_changed)
             grid_sm.currentChanged.connect(self._on_tree_selection_changed)
@@ -1069,6 +1396,10 @@ class InboxTreePane(QWidget):
     def explorer_toolbar(self) -> InboxContentToolbar | None:
         return self._content_toolbar
 
+    def sync_hotkey_tooltips(self, settings) -> None:
+        if self._content_toolbar is not None:
+            self._content_toolbar.sync_hotkey_tooltips(settings)
+
     def set_chrome_context(self, source_filter: str, date_path: Path | None = None) -> None:
         self._source_filter = (source_filter or "").strip().lower()
         if date_path is not None:
@@ -1136,10 +1467,13 @@ class InboxTreePane(QWidget):
             can_forward=self._nav_index < len(self._nav_history) - 1,
         )
 
+    def _file_entries_for_browse_root(self, root: Path) -> list[_InboxFileEntry]:
+        return _collect_inbox_file_entries(root)
+
     def _apply_browse_root(self, path: Path) -> None:
         self._grid_browse_root = Path(path)
         if self._file_model is not None:
-            self._file_model.set_entries(_collect_inbox_file_entries(self._grid_browse_root_path()))
+            self._file_model.set_entries(self._file_entries_for_browse_root(self._grid_browse_root_path()))
         self._sync_content_toolbar()
         self._sync_tree_to_browse_root()
         if self._view_mode == "tile":
@@ -1187,7 +1521,7 @@ class InboxTreePane(QWidget):
     def _reload_file_entries(self) -> None:
         if self._file_model is None:
             return
-        self._file_model.set_entries(_collect_inbox_file_entries(self._grid_browse_root_path()))
+        self._file_model.set_entries(self._file_entries_for_browse_root(self._grid_browse_root_path()))
         self._sync_content_toolbar()
         if self._view_mode == "tile":
             self._grid_last = None
@@ -1237,7 +1571,7 @@ class InboxTreePane(QWidget):
         if not hasattr(self, "_empty_overlay"):
             return
         if self._show_toolbar and self._view_mode == "tile":
-            has_children = bool(_collect_inbox_file_entries(self._grid_browse_root_path()))
+            has_children = bool(self._file_entries_for_browse_root(self._grid_browse_root_path()))
         else:
             root_idx = self._tree.rootIndex()
             has_children = root_idx.isValid() and self._tree.model().rowCount(root_idx) > 0
@@ -1345,6 +1679,9 @@ class InboxTreePane(QWidget):
                 path = entry.path
         self._show_file_context_menu(pos, self._file_grid.viewport(), path, tree_index=None)
 
+    def _supports_project_guide_tags(self) -> bool:
+        return False
+
     def _context_menu_targets(self, path: Path | None) -> list[Path]:
         """Right-click on selection → all selected; otherwise the clicked item only."""
         if path is None:
@@ -1414,6 +1751,28 @@ class InboxTreePane(QWidget):
         menu.addSeparator()
         delete_label = f"Delete {len(targets)} items" if multi else "Delete"
         delete_act = menu.addAction(icon_red("x"), delete_label)
+        tag_actions: dict[str, QAction] = {}
+        remove_tags_act = None
+        sel_rel_paths: list[str] = []
+        if self._supports_project_guide_tags():
+            menu.addSeparator()
+            tags_submenu = menu.addMenu(icon("tag"), "Tags")
+            sel_rel_paths = self._relative_paths_for_guide_targets(targets)
+            for tdef in getattr(self, "_tag_defs", DEFAULT_TAG_DEFINITIONS):
+                tid = tdef["id"]
+                tact = tags_submenu.addAction(
+                    lucide_icon("tag-filled", size=14, color_hex=tdef["color"]),
+                    tdef["label"],
+                )
+                tact.setCheckable(True)
+                if sel_rel_paths:
+                    all_have = all(
+                        tid in get_tags_for_item(self._item_tags, rp) for rp in sel_rel_paths
+                    )
+                    tact.setChecked(all_have)
+                tag_actions[tid] = tact
+            tags_submenu.addSeparator()
+            remove_tags_act = tags_submenu.addAction(icon("tag"), "Remove all tags")
         menu.addSeparator()
         import_act = menu.addAction(icon("upload"), "Import")
         if self._show_history_action:
@@ -1425,6 +1784,13 @@ class InboxTreePane(QWidget):
         action = menu.exec(viewport.mapToGlobal(pos))
         if action is None:
             return
+        if remove_tags_act is not None and action == remove_tags_act:
+            self._remove_all_tags(sel_rel_paths)
+            return
+        for tid, tact in tag_actions.items():
+            if action == tact:
+                self._toggle_tag(sel_rel_paths, tid)
+                return
         if action == browse_act and path.is_dir():
             self._browse_into_folder(path)
         elif action == open_act:
@@ -2289,17 +2655,25 @@ class ProjectGuideTreePane(InboxTreePane):
         self._empty_tag_overlay.setObjectName("TagEmptyOverlay")
         self._empty_tag_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         tag_ov_lay = QVBoxLayout(self._empty_tag_overlay)
-        tag_ov_lay.setContentsMargins(0, 0, 0, 0)
-        tag_ov_lay.setSpacing(8)
+        tag_ov_lay.setContentsMargins(24, 48, 24, 48)
+        tag_ov_lay.setSpacing(12)
         tag_ov_lay.addStretch(2)
         tag_ov_icon = QLabel(self._empty_tag_overlay)
         tag_ov_icon.setAlignment(Qt.AlignCenter)
-        tag_ov_icon.setPixmap(lucide_icon("tag", size=48, color_hex="#3f3f46").pixmap(48, 48))
+        tag_ov_icon.setPixmap(
+            lucide_icon("tag", size=48, color_hex=MONOS_COLORS.get("text_meta", "#71717a")).pixmap(48, 48)
+        )
         tag_ov_lay.addWidget(tag_ov_icon, 0, Qt.AlignCenter)
         tag_ov_text = QLabel("No files tagged", self._empty_tag_overlay)
         tag_ov_text.setAlignment(Qt.AlignCenter)
-        tag_ov_text.setObjectName("TagEmptyOverlayText")
+        tag_ov_text.setObjectName("InboxEmptyStateTitle")
+        tag_ov_text.setFont(monos_font("Inter", 14, QFont.Weight.DemiBold))
         tag_ov_lay.addWidget(tag_ov_text, 0, Qt.AlignCenter)
+        tag_ov_sub = QLabel("Select another tag or clear the filter", self._empty_tag_overlay)
+        tag_ov_sub.setAlignment(Qt.AlignCenter)
+        tag_ov_sub.setObjectName("InboxEmptyStateSubtitle")
+        tag_ov_sub.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
+        tag_ov_lay.addWidget(tag_ov_sub, 0, Qt.AlignCenter)
         tag_ov_lay.addStretch(3)
         self._empty_tag_overlay.hide()
         self._empty_tag_overlay.setParent(self._tree_host)
@@ -2365,7 +2739,14 @@ class ProjectGuideTreePane(InboxTreePane):
                 self._tree.setRootIndex(empty)
         self._reload_file_entries()
         QTimer.singleShot(0, self._sync_empty_overlay)
-        self._sync_empty_tag_overlay()
+
+    def _sync_empty_overlay(self) -> None:
+        if self._tag_proxy is not None and self._tag_proxy._active_tags:
+            self._sync_empty_tag_overlay()
+            return
+        if hasattr(self, "_empty_tag_overlay"):
+            self._empty_tag_overlay.setVisible(False)
+        super()._sync_empty_overlay()
 
     def _on_tree_double_clicked(self, index) -> None:
         if not index.isValid():
@@ -2412,39 +2793,127 @@ class ProjectGuideTreePane(InboxTreePane):
             self._pg_project_root = Path(project_root)
         self._tag_proxy.set_project_guide_root(self._pg_guide_root)
 
+    def tags_for_guide_path(self, path: Path) -> list[str]:
+        if not self._pg_guide_root:
+            return []
+        try:
+            rel = path.resolve().relative_to(self._pg_guide_root.resolve()).as_posix()
+        except (ValueError, OSError):
+            return []
+        return get_tags_for_item(self._item_tags, rel)
+
+    def _file_entries_for_browse_root(self, root: Path) -> list[_InboxFileEntry]:
+        if not self._tag_proxy or not self._tag_proxy._active_tags or not self._pg_guide_root:
+            return _collect_inbox_file_entries(root)
+        tagged = self._tag_proxy._tagged_paths if self._tag_proxy else set()
+        if not tagged:
+            return []
+        return _collect_tag_filtered_file_entries(root, self._pg_guide_root, tagged)
+
     def set_tag_data(self, item_tags: dict[str, list[str]]) -> None:
         self._item_tags = item_tags
+        if self._tag_proxy is not None and self._tag_proxy._active_tags:
+            self._tag_proxy.set_tag_filter(
+                self._tag_proxy._active_tags,
+                self._item_tags,
+                department_id=self._source_filter,
+            )
+            self._reload_file_entries()
+            QTimer.singleShot(0, self._sync_empty_overlay)
 
     def reload_tag_definitions(self) -> None:
         if self._pg_project_root:
-            self._tag_defs = read_tag_definitions(self._pg_project_root)
+            self._tag_defs = read_tag_definitions(self._pg_project_root, self._source_filter)
         else:
             self._tag_defs = list(DEFAULT_TAG_DEFINITIONS)
         self._tag_color_map = build_color_map(self._tag_defs)
         self._tree.viewport().update()
+        if self._file_grid is not None:
+            self._file_grid.viewport().update()
 
-    def set_tag_filter(self, tag_id: str | None) -> None:
-        self._tag_proxy.set_tag_filter(tag_id, self._item_tags)
+    def set_tag_filter(self, tag_ids: list[str] | None) -> None:
+        prev = list(self._tag_proxy._active_tags)
+        ids = [t for t in (tag_ids or []) if t]
+        self._tag_proxy.set_tag_filter(ids, self._item_tags, department_id=self._source_filter)
+        if ids and not prev:
+            self._grid_browse_root = Path(self._date_folder_path)
+            self._nav_history = [Path(self._date_folder_path)]
+            self._nav_index = 0
         self._reload_fs_tree_root()
 
     def get_item_tags(self) -> dict[str, list[str]]:
         return self._item_tags
 
+    def _supports_project_guide_tags(self) -> bool:
+        return True
+
+    def _relative_paths_for_guide_targets(self, targets: list[Path]) -> list[str]:
+        pg_root = self._pg_guide_root
+        if not pg_root:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for p in targets:
+            if p is None or not p.exists():
+                continue
+            try:
+                rel = p.relative_to(pg_root).as_posix()
+            except (ValueError, OSError):
+                continue
+            if rel and rel != "." and rel not in seen:
+                seen.add(rel)
+                out.append(rel)
+        return out
+
+    def _toggle_tag(self, relative_paths: list[str], tag_id: str) -> None:
+        if not self._pg_project_root or not relative_paths:
+            return
+        toggle_tag_for_items(
+            self._pg_project_root,
+            self._item_tags,
+            relative_paths,
+            tag_id,
+            department_id=self._source_filter,
+        )
+        self._tree.viewport().update()
+        if self._file_grid is not None:
+            self._file_grid.viewport().update()
+        self.item_tags_changed.emit()
+
+    def _remove_all_tags(self, relative_paths: list[str]) -> None:
+        if not self._pg_project_root or not relative_paths:
+            return
+        for rel in relative_paths:
+            set_tags_for_item(self._pg_project_root, self._item_tags, rel, [])
+        self._tree.viewport().update()
+        if self._file_grid is not None:
+            self._file_grid.viewport().update()
+        self.item_tags_changed.emit()
+
+    def _apply_browse_root(self, path: Path) -> None:
+        super()._apply_browse_root(path)
+        QTimer.singleShot(0, self._sync_empty_overlay)
+
     def _sync_empty_tag_overlay(self) -> None:
-        super()._sync_empty_overlay()
-        if not hasattr(self, "_empty_tag_overlay"):
+        if not hasattr(self, "_empty_tag_overlay") or self._tag_proxy is None:
             return
-        tag = self._tag_proxy._active_tag
-        if tag:
-            has_items = bool(self._tag_proxy._tagged_paths)
-            self._empty_tag_overlay.setVisible(not has_items)
-            if not has_items:
-                self._empty_tag_overlay.setGeometry(self._tree_host.rect())
-                self._empty_tag_overlay.raise_()
-            if hasattr(self, "_empty_overlay"):
-                self._empty_overlay.setVisible(False)
+        tags = self._tag_proxy._active_tags
+        if not tags:
+            self._empty_tag_overlay.setVisible(False)
+            super()._sync_empty_overlay()
             return
-        self._empty_tag_overlay.setVisible(False)
+        if self._show_toolbar and self._view_mode == "tile":
+            has_items = bool(self._file_entries_for_browse_root(self._grid_browse_root_path()))
+        else:
+            root_idx = self._tree.rootIndex()
+            has_items = root_idx.isValid() and self._tree.model().rowCount(root_idx) > 0
+        show_tag_empty = not has_items
+        if hasattr(self, "_empty_overlay"):
+            self._empty_overlay.setVisible(False)
+        self._empty_tag_overlay.setVisible(show_tag_empty)
+        if show_tag_empty:
+            self._empty_tag_overlay.setGeometry(self._tree_host.rect())
+            self._empty_tag_overlay.raise_()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -2530,7 +2999,7 @@ class _TagFilterProxy(QSortFilterProxyModel):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._active_tag: str | None = None
+        self._active_tags: list[str] = []
         self._tagged_paths: set[str] = set()
         self._ancestor_paths: set[str] = set()
         self._project_guide_root: Path | None = None
@@ -2549,10 +3018,18 @@ class _TagFilterProxy(QSortFilterProxyModel):
         else:
             self._tree_root_rel = None
 
-    def set_tag_filter(self, tag_id: str | None, item_tags: dict[str, list[str]]) -> None:
-        self._active_tag = tag_id
-        if tag_id:
-            self._tagged_paths = paths_with_tag(item_tags, tag_id)
+    def set_tag_filter(
+        self,
+        tag_ids: list[str] | None,
+        item_tags: dict[str, list[str]],
+        *,
+        department_id: str | None = None,
+    ) -> None:
+        self._active_tags = [t for t in (tag_ids or []) if t]
+        if self._active_tags:
+            self._tagged_paths = paths_with_any_tag(
+                item_tags, self._active_tags, department_id=department_id,
+            )
             self._ancestor_paths = ancestor_paths(self._tagged_paths)
         else:
             self._tagged_paths = set()
@@ -2560,7 +3037,7 @@ class _TagFilterProxy(QSortFilterProxyModel):
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent) -> bool:
-        if not self._active_tag:
+        if not self._active_tags:
             return True
         src = self.sourceModel()
         if src is None:
@@ -2773,20 +3250,32 @@ class ReferenceTreePane(QWidget):
     def set_tag_data(self, item_tags: dict[str, list[str]]) -> None:
         self._item_tags = item_tags
 
+    def _tag_department_id(self) -> str:
+        if self._root_path and self._project_guide_root:
+            try:
+                rel = self._root_path.resolve().relative_to(self._project_guide_root.resolve()).as_posix()
+                first = rel.split("/")[0] if rel else ""
+                if first:
+                    return normalize_tag_department_id(first)
+            except (ValueError, OSError):
+                pass
+        return normalize_tag_department_id(self._department_label)
+
     def reload_tag_definitions(self) -> None:
         if self._project_root:
-            self._tag_defs = read_tag_definitions(self._project_root)
+            self._tag_defs = read_tag_definitions(self._project_root, self._tag_department_id())
         else:
             self._tag_defs = list(DEFAULT_TAG_DEFINITIONS)
         self._tag_color_map = build_color_map(self._tag_defs)
         self._tree.viewport().update()
 
-    def set_tag_filter(self, tag_id: str | None) -> None:
-        self._proxy.set_tag_filter(tag_id, self._item_tags)
+    def set_tag_filter(self, tag_ids: list[str] | None) -> None:
+        ids = [t for t in (tag_ids or []) if t]
+        self._proxy.set_tag_filter(ids, self._item_tags, department_id=self._tag_department_id())
         self._apply_root_index()
 
     def _sync_empty_tag_overlay(self) -> None:
-        tag = self._proxy._active_tag
+        tag = self._proxy._active_tags
         if tag:
             has_items = bool(self._proxy._tagged_paths)
             self._empty_tag_overlay.setVisible(not has_items)
@@ -3101,7 +3590,13 @@ class ReferenceTreePane(QWidget):
         """Toggle a tag for the given items and refresh the view."""
         if not self._project_root or not relative_paths:
             return
-        toggle_tag_for_items(self._project_root, self._item_tags, relative_paths, tag_id)
+        toggle_tag_for_items(
+            self._project_root,
+            self._item_tags,
+            relative_paths,
+            tag_id,
+            department_id=self._tag_department_id(),
+        )
         self._tree.viewport().update()
         self.item_tags_changed.emit()
 

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QByteArray, QPoint, Qt, Signal
-from PySide6.QtGui import QDrag, QMouseEvent
+from PySide6.QtCore import QByteArray, QPoint, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -24,16 +24,45 @@ from monostudio.core.dashboard_layout import (
     BentoPlacement,
     DashboardWidgetSlot,
     DEFAULT_LAYOUT,
-    hidden_widget_ids,
     pack_bento_placements,
     reorder_slot,
     set_slot_visible,
     toggle_slot_span,
 )
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MonosMenu
 
 _MAX_DROP_ZONES = 12
+_EDIT_CONTENT_PAD = 8
+_BENTO_BORDER_RADIUS = 10
+
+
+class _DashboardBentoBorderOverlay(QWidget):
+    """Dashed edit border painted above card content (avoids QSS/content clip glitches)."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        r = self.rect()
+        if r.isEmpty():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(255, 255, 255, 38))
+        pen.setWidth(1)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        inset = r.adjusted(1, 1, -1, -1)
+        painter.drawRoundedRect(
+            inset,
+            _BENTO_BORDER_RADIUS - 1,
+            _BENTO_BORDER_RADIUS - 1,
+        )
+        painter.end()
 
 
 class DashboardDropIndicator(QFrame):
@@ -65,6 +94,7 @@ class DashboardBentoChrome(QFrame):
         self._inner = inner
         self._edit_mode = False
         self._drag_start: QPoint | None = None
+        self._border_overlay: _DashboardBentoBorderOverlay | None = None
         self.setObjectName("DashboardBentoChrome")
         self.setProperty("editMode", "false")
         self.setAcceptDrops(True)
@@ -86,6 +116,7 @@ class DashboardBentoChrome(QFrame):
         self._handle.setCursor(Qt.CursorShape.OpenHandCursor)
         self._handle.setToolTip("Drag to reorder")
         self._handle.setAutoRaise(True)
+        self._handle.setIconSize(QSize(14, 14))
 
         self._label = QLabel(DASHBOARD_WIDGET_LABELS.get(widget_id, widget_id), self._toolbar)
         self._label.setObjectName("DashboardBentoChromeLabel")
@@ -97,12 +128,14 @@ class DashboardBentoChrome(QFrame):
         self._btn_span.setObjectName("DashboardBentoChromeBtn")
         self._btn_span.setAutoRaise(True)
         self._btn_span.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_span.setIconSize(QSize(14, 14))
         self._btn_span.setToolTip("Toggle half / full width")
         self._btn_span.clicked.connect(lambda: self.span_toggle_requested.emit(self._widget_id))
 
         self._btn_hide = QToolButton(self._toolbar)
         self._btn_hide.setObjectName("DashboardBentoChromeBtn")
         self._btn_hide.setIcon(lucide_icon("eye-off", size=14, color_hex="#a1a1aa"))
+        self._btn_hide.setIconSize(QSize(14, 14))
         self._btn_hide.setAutoRaise(True)
         self._btn_hide.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_hide.setToolTip("Hide widget")
@@ -113,14 +146,15 @@ class DashboardBentoChrome(QFrame):
         root.addWidget(self._toolbar)
 
         self._content = QWidget(self)
-        content_lay = QVBoxLayout(self._content)
-        content_lay.setContentsMargins(0, 0, 0, 0)
-        content_lay.setSpacing(0)
+        self._content_lay = QVBoxLayout(self._content)
+        self._content_lay.setContentsMargins(0, 0, 0, 0)
+        self._content_lay.setSpacing(0)
         inner.setParent(self._content)
-        content_lay.addWidget(inner)
+        self._content_lay.addWidget(inner)
         root.addWidget(self._content, 1)
 
         self._handle.installEventFilter(self)
+        self.set_span(1)
 
     def widget_id(self) -> str:
         return self._widget_id
@@ -128,19 +162,45 @@ class DashboardBentoChrome(QFrame):
     def set_span(self, span: int) -> None:
         locked = self._widget_id in LOCKED_FULL_WIDTH_IDS
         if locked or span >= 2:
-            self._btn_span.setIcon(lucide_icon("columns-2", size=14, color_hex="#60a5fa"))
+            self._btn_span.setIcon(lucide_icon("maximize-2", size=14, color_hex="#60a5fa"))
             self._btn_span.setToolTip("Full width")
         else:
             self._btn_span.setIcon(lucide_icon("square", size=14, color_hex="#a1a1aa"))
             self._btn_span.setToolTip("Half width — click for full width")
         self._btn_span.setVisible(not locked)
 
+    def _ensure_border_overlay(self) -> None:
+        if self._border_overlay is None:
+            self._border_overlay = _DashboardBentoBorderOverlay(self)
+
+    def _sync_border_overlay(self) -> None:
+        if self._border_overlay is None or not self._edit_mode:
+            return
+        self._border_overlay.setGeometry(self.rect())
+        self._border_overlay.raise_()
+
     def set_edit_mode(self, enabled: bool) -> None:
         self._edit_mode = enabled
         self._toolbar.setVisible(enabled)
+        pad = _EDIT_CONTENT_PAD if enabled else 0
+        self._content_lay.setContentsMargins(pad, 4 if enabled else 0, pad, pad)
         self.setProperty("editMode", "true" if enabled else "false")
         self.style().unpolish(self)
         self.style().polish(self)
+        if enabled:
+            self._ensure_border_overlay()
+            self._border_overlay.show()
+            self._sync_border_overlay()
+        elif self._border_overlay is not None:
+            self._border_overlay.hide()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._sync_border_overlay()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._sync_border_overlay()
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched is self._handle and self._edit_mode:
@@ -256,14 +316,12 @@ class DashboardBentoHost(QWidget):
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(8)
 
-        hint = QLabel("Drag widgets to reorder. Toggle width or hide cards.", self._edit_bar)
+        hint = QLabel(
+            "Use the sidebar to add widgets. Drag cards to reorder or change width.",
+            self._edit_bar,
+        )
         hint.setObjectName("DialogHint")
         bar.addWidget(hint, 1)
-
-        self._btn_add = QPushButton("Add widget", self._edit_bar)
-        self._btn_add.setObjectName("DashboardGhostButton")
-        self._btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_add.clicked.connect(self._show_add_menu)
 
         self._btn_reset = QPushButton("Reset layout", self._edit_bar)
         self._btn_reset.setObjectName("DashboardGhostButton")
@@ -275,13 +333,12 @@ class DashboardBentoHost(QWidget):
         self._btn_done.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_done.clicked.connect(self._finish_edit)
 
-        bar.addWidget(self._btn_add)
         bar.addWidget(self._btn_reset)
         bar.addWidget(self._btn_done)
         root.addWidget(self._edit_bar)
 
         self._empty_layout_hint = QLabel(
-            "No widgets visible. Click Customize, then Add widget to restore cards.",
+            "No widgets visible. Click Customize, then enable widgets in the sidebar.",
             self,
         )
         self._empty_layout_hint.setObjectName("DashboardEmptyHint")
@@ -354,6 +411,20 @@ class DashboardBentoHost(QWidget):
     def enter_edit_mode(self) -> None:
         self.set_edit_mode(True)
 
+    def exit_edit_mode(self) -> None:
+        if self._edit_mode:
+            self._finish_edit()
+
+    def show_widget(self, widget_id: str) -> None:
+        self._slots = set_slot_visible(self._slots, widget_id, True)
+        self.apply_layout(self._slots)
+        self.layout_changed.emit(self.slots())
+
+    def hide_widget(self, widget_id: str) -> None:
+        self._slots = set_slot_visible(self._slots, widget_id, False)
+        self.apply_layout(self._slots)
+        self.layout_changed.emit(self.slots())
+
     def apply_layout(self, slots: list[DashboardWidgetSlot]) -> None:
         """One-shot grid layout (no resize relayout — avoids transient top-level flashes)."""
         self._slots = [DashboardWidgetSlot(s.id, s.span, s.visible) for s in slots]
@@ -367,8 +438,6 @@ class DashboardBentoHost(QWidget):
             has_visible = bool(placements)
             self._empty_layout_hint.setVisible(not has_visible)
             self._grid_host.setVisible(has_visible)
-            self._btn_add.setEnabled(bool(hidden_widget_ids(self._slots)))
-
             if not has_visible:
                 for chrome in self._chrome_by_id.values():
                     chrome.hide()
@@ -458,22 +527,6 @@ class DashboardBentoHost(QWidget):
     def _on_drop_at_end(self, dragged_id: str) -> None:
         merged_len = len(self._slots)
         self._slots = reorder_slot(self._slots, dragged_id, merged_len)
-        self.apply_layout(self._slots)
-        self.layout_changed.emit(self.slots())
-
-    def _show_add_menu(self) -> None:
-        hidden = hidden_widget_ids(self._slots)
-        if not hidden:
-            return
-        menu = MonosMenu(self)
-        for wid in hidden:
-            label = DASHBOARD_WIDGET_LABELS.get(wid, wid)
-            act = menu.addAction(label)
-            act.triggered.connect(lambda _checked=False, w=wid: self._show_widget(w))
-        menu.exec(self._btn_add.mapToGlobal(self._btn_add.rect().bottomLeft()))
-
-    def _show_widget(self, widget_id: str) -> None:
-        self._slots = set_slot_visible(self._slots, widget_id, True)
         self.apply_layout(self._slots)
         self.layout_changed.emit(self.slots())
 

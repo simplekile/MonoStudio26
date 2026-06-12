@@ -24,6 +24,7 @@ from PySide6.QtGui import (
     QFontMetrics,
     QIcon,
     QImage,
+    QKeySequence,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -92,8 +93,13 @@ from monostudio.ui_qt.inspector_preview_settings import (
 from monostudio.ui_qt.thumbnails import (
     ThumbnailCache,
     active_dcc_segment_for_thumbnail_cache,
+    INSPECTOR_INBOX_PREVIEW_DISK_CACHE_VARIANT,
+    clamp_decode_side_for_media,
+    decode_explorer_preview_qimage_worker,
     get_thumbnail_sequence_ignore_extensions,
     get_thumbnail_sequence_ignore_tokens,
+    is_direct_media_preview_path,
+    media_source_max_side,
     resolve_thumbnail_path,
 )
 from monostudio.ui_qt.thumbnail_source_resolve import (
@@ -282,9 +288,19 @@ def _inspector_preview_worker_run(
     sequence_ignore_name_tokens: frozenset[str] | None = None,
 ) -> tuple[str, QImage | None, bool]:
     """Background: load inspector thumb (sequence folder resolved on main thread after apply)."""
-    px = max(256, min(1024, int(decode_max_side)))
+    px = max(1, int(decode_max_side))
     p = Path(path_str)
     if is_inbox and p.is_file():
+        if is_direct_media_preview_path(p):
+            decoded = decode_explorer_preview_qimage_worker(
+                path_str,
+                px,
+                cache_variant=INSPECTOR_INBOX_PREVIEW_DISK_CACHE_VARIANT,
+            )
+            if decoded is not None:
+                _, img = decoded
+                if img is not None and not img.isNull():
+                    return (path_str, img, True)
         pix = get_windows_shell_thumbnail(p, px)
         if pix is not None and not pix.isNull():
             return (path_str, pix.toImage(), True)
@@ -308,6 +324,9 @@ def _inspector_preview_worker_run(
     )
     if thumb is None:
         return (path_str, None, False)
+    src_max = media_source_max_side(thumb)
+    if src_max is not None:
+        px = min(px, src_max)
     use_fit = ".user." in str(thumb)
     cache = ThumbnailCache(size_px=px)
     pm = cache.load_thumbnail_pixmap(thumb)
@@ -656,6 +675,12 @@ class InspectorPanel(QWidget):
         """Share MainWindow QSettings so Inspector reads the same keys as Settings dialog."""
         self._inspector_settings = settings
         self._preview.set_qsettings(settings)
+        self._header.set_inspector_settings(settings)
+        self._asset_status.sync_action_shortcuts(settings)
+
+    def reload_hotkey_tooltips(self) -> None:
+        self._header.sync_tab_hotkey_tooltips(self._inspector_settings)
+        self._asset_status.sync_action_shortcuts(self._inspector_settings)
 
     def apply_preview_thumb(self, path_str: str, image_or_none: QImage | None, use_fit: bool) -> None:
         """Main thread: áp dụng thumb đã load từ worker (chỉ khi path khớp item hiện tại)."""
@@ -711,6 +736,7 @@ class InspectorPanel(QWidget):
             ref=None,
         )
         self.set_item(fake)
+        self.load_inbox_tree_preview_thumb()
         self._asset_status.setVisible(False)
         self._dept_pipeline.setVisible(False)
         self._tech.setVisible(False)
@@ -746,6 +772,11 @@ class InspectorPanel(QWidget):
             ref=None,
         )
         self.set_item(fake)
+        self.load_inbox_tree_preview_thumb()
+
+    def load_inbox_tree_preview_thumb(self) -> None:
+        """Load HD preview for the current Inbox / Project Guide file (on item click)."""
+        self._preview.load_inbox_item_preview()
 
     def set_item(self, item: ViewItem | None, active_department_hint: str | None = None) -> None:
         # Diff-based: never rebuild layout. Update only changed sections; preserve scroll position.
@@ -1378,12 +1409,21 @@ class _InspectorHeader(QWidget):
 
         self._tab_buttons: list[QToolButton] = []
         self._tab_icon_names: list[str] = []
+        self._tab_tooltip_bases: list[str] = []
+        self._tab_hotkey_ids = (
+            "inspector.tab_pipeline",
+            "inspector.tab_reference",
+            "inspector.tab_details",
+        )
+        self._ref_tab_badge_count = 0
+        self._inspector_settings: QSettings | None = None
         _tab_specs = (
             ("Pipeline — thumbnail and departments", "Pipeline", "layers"),
             ("Reference and concept folders", "Ref", "eye"),
             ("Technical specs and metadata", "Details", "sliders-horizontal"),
         )
         for idx, (tip, label, icon_name) in enumerate(_tab_specs):
+            self._tab_tooltip_bases.append(tip)
             btn = QToolButton(self._tab_pill)
             btn.setObjectName("SidebarScopePillSegment")
             btn.setProperty(
@@ -1394,7 +1434,6 @@ class _InspectorHeader(QWidget):
             btn.setAutoRaise(True)
             btn.setFocusPolicy(Qt.NoFocus)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setToolTip(tip)
             btn.setText(label)
             f = monos_font("Inter", 13, QFont.Weight.DemiBold)
             f.setLetterSpacing(QFont.PercentageSpacing, 97)
@@ -1413,6 +1452,7 @@ class _InspectorHeader(QWidget):
         tab_row_l.addWidget(self._tab_pill, 0, Qt.AlignLeft | Qt.AlignVCenter)
         tab_row_l.addStretch(1)
         self._ref_tab_base_tooltip = "Reference and concept folders"
+        self.sync_tab_hotkey_tooltips(None)
 
         self._tab_row.setVisible(True)
         self._title.setVisible(False)
@@ -1452,23 +1492,37 @@ class _InspectorHeader(QWidget):
             is_active = i == index
             btn.setProperty("active", "true" if is_active else "false")
             icon_name = self._tab_icon_names[i] if i < len(self._tab_icon_names) else "layers"
-            color = MONOS_COLORS["pill_segment_active_fg"] if is_active else MONOS_COLORS["pill_segment_inactive_fg"]
+            if is_active:
+                color = MONOS_COLORS.get("pill_segment_subtle_active_icon_fg", MONOS_COLORS["blue_400"])
+            else:
+                color = MONOS_COLORS["pill_segment_inactive_fg"]
             ic = lucide_icon(icon_name, size=15, color_hex=color)
             if not ic.isNull():
                 btn.setIcon(ic)
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
+    def set_inspector_settings(self, settings: QSettings | None) -> None:
+        self._inspector_settings = settings
+        self.sync_tab_hotkey_tooltips(settings)
+
+    def sync_tab_hotkey_tooltips(self, settings: QSettings | None) -> None:
+        from monostudio.ui_qt.app_hotkeys import tooltip_with_hotkey
+
+        settings = settings if settings is not None else self._inspector_settings
+        for idx, btn in enumerate(self._tab_buttons):
+            if idx >= len(self._tab_tooltip_bases) or idx >= len(self._tab_hotkey_ids):
+                continue
+            base = self._tab_tooltip_bases[idx]
+            if idx == 1 and self._ref_tab_badge_count > 0:
+                n = str(self._ref_tab_badge_count) if self._ref_tab_badge_count <= 99 else "99+"
+                word = "file" if self._ref_tab_badge_count == 1 else "files"
+                base = f"{self._ref_tab_base_tooltip} — {n} preview {word}"
+            btn.setToolTip(tooltip_with_hotkey(base, settings, self._tab_hotkey_ids[idx]))
+
     def set_ref_tab_badge(self, count: int) -> None:
-        if len(self._tab_buttons) < 2:
-            return
-        btn = self._tab_buttons[1]
-        if count > 0:
-            n = str(count) if count <= 99 else "99+"
-            word = "file" if count == 1 else "files"
-            btn.setToolTip(f"{self._ref_tab_base_tooltip} — {n} preview {word}")
-        else:
-            btn.setToolTip(self._ref_tab_base_tooltip)
+        self._ref_tab_badge_count = max(0, int(count))
+        self.sync_tab_hotkey_tooltips(self._inspector_settings)
 
 
 class _InspectorEmptyState(QWidget):
@@ -2440,6 +2494,7 @@ class _InspectorPreview(QWidget):
     remove_requested = Signal(object)  # emits ViewItem (asset/shot only)
 
     _PREVIEW_CACHE_MAX = 50
+    _PREVIEW_RESIZE_DEBOUNCE_MS = 200
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -2481,21 +2536,73 @@ class _InspectorPreview(QWidget):
         self._last_thumb_use_fit = False
         self._seq_decode_bucket: int | None = None
         self._seq_live_display = False
+        self._preview_resizing = False
+        self._thumb_reload_after_resize = False
+        self._thumb_decode_bucket: int | None = None
+        self._preview_resize_debounce = QTimer(self)
+        self._preview_resize_debounce.setSingleShot(True)
+        self._preview_resize_debounce.setInterval(self._PREVIEW_RESIZE_DEBOUNCE_MS)
+        self._preview_resize_debounce.timeout.connect(self._on_preview_resize_settled)
 
     def clear_transient_hover_states(self) -> None:
         self._container.clear_transient_hover_states()
 
     def _inspector_preview_decode_max_side(self) -> int:
-        """Decode / scale thumbs to match preview cell (DPR), capped for memory."""
+        """Decode thumbs to current preview cell size (DPR), quantized to reduce churn."""
         wgt = self._container._w
         w = wgt.width()
         if w < 1:
-            w = max(280, wgt.sizeHint().width())
-        h = wgt.heightForWidth(w) if wgt.hasHeightForWidth() else max(1, wgt.height())
-        h = max(1, h)
+            w = max(1, wgt.sizeHint().width())
+        if wgt.hasHeightForWidth():
+            h = max(1, wgt.heightForWidth(w))
+        else:
+            h = max(1, wgt.height() if wgt.height() > 0 else 1)
         dpr = max(1.0, float(wgt.devicePixelRatioF()))
-        side = int(max(w, h) * dpr * 1.08)
-        return max(256, min(1024, side))
+        side = int(max(w, h) * dpr)
+        return max(64, min(2048, ((side + 31) // 32) * 32))
+
+    def _decode_side_for_current_item(self) -> int:
+        """Preview-sized decode, capped to native source resolution."""
+        side = self._inspector_preview_decode_max_side()
+        item = self._item
+        if item is None:
+            return side
+        src_path: Path | None = None
+        if item.kind == ViewItemKind.INBOX_ITEM and item.path.is_file():
+            src_path = item.path
+        elif item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            src_path = self._resolve_inspector_thumbnail_disk_path()
+        if src_path is not None:
+            side = clamp_decode_side_for_media(side, src_path)
+        return max(1, side)
+
+    def _mark_preview_resizing(self) -> None:
+        self._preview_resizing = True
+        self._preview_resize_debounce.start(self._PREVIEW_RESIZE_DEBOUNCE_MS)
+
+    def _defer_thumb_decode_if_resizing(self) -> bool:
+        if not self._preview_resizing:
+            return False
+        self._thumb_reload_after_resize = True
+        return True
+
+    def _on_preview_resize_settled(self) -> None:
+        self._preview_resizing = False
+        new_bucket = self._inspector_preview_decode_max_side()
+        bucket_changed = (
+            self._thumb_decode_bucket is not None
+            and new_bucket != self._thumb_decode_bucket
+        )
+        had_deferred = self._thumb_reload_after_resize
+        self._thumb_reload_after_resize = False
+        self._on_inspector_preview_resize()
+        item = self._item
+        if item is None or (not had_deferred and not bucket_changed):
+            return
+        if item.kind == ViewItemKind.INBOX_ITEM:
+            self.load_inbox_item_preview()
+        elif item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT) and not self._seq_live_display:
+            self.update_thumbnail_only()
 
     def _on_remove_requested(self) -> None:
         if self._item is not None:
@@ -2979,6 +3086,8 @@ class _InspectorPreview(QWidget):
         n = len(self._sequence_frames)
         if idx < 0 or idx >= n:
             return
+        if self._preview_resizing:
+            return
         if idx in self._seq_buffer or idx in self._seq_in_flight:
             return
         self._ensure_inspector_seq_pool()
@@ -3112,7 +3221,7 @@ class _InspectorPreview(QWidget):
         except Exception:
             return False
         if et == QEvent.Type.Resize:
-            self._on_inspector_preview_resize()
+            self._mark_preview_resizing()
             return False
         if et == QEvent.Type.MouseButtonDblClick and isinstance(event, QMouseEvent):
             if event.button() == Qt.MouseButton.LeftButton:
@@ -3191,6 +3300,7 @@ class _InspectorPreview(QWidget):
             self._preview_thumb_cache.popitem(last=False)
         self._preview_thumb_cache[cache_key] = (pix, use_fit)
         self._preview_thumb_cache.move_to_end(cache_key)
+        self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
         self._sync_thumbnail_overlay_mode()
 
     def clear_preview_loading(self) -> None:
@@ -3219,16 +3329,20 @@ class _InspectorPreview(QWidget):
             else:
                 ac = _inspector_get_active_dcc(path, dep)
             adc_seg = active_dcc_segment_for_thumbnail_cache(ac)
-            return f"{base}::dept::{dep}::adc::{adc_seg}::ts::{mode}"
-        if dep:
-            return f"{base}::dept::{dep}::ts::{mode}"
-        return f"{base}::ts::{mode}"
+            key = f"{base}::dept::{dep}::adc::{adc_seg}::ts::{mode}"
+        elif dep:
+            key = f"{base}::dept::{dep}::ts::{mode}"
+        else:
+            key = f"{base}::ts::{mode}"
+        bucket = self._inspector_preview_decode_max_side()
+        return f"{key}::dbg::{bucket}"
 
     def set_item(self, item: ViewItem) -> None:
         self._halt_inline_sequence_ui()
         self._seq_index = 0
         self._seq_decode_bucket = None
         self._seq_live_display = False
+        self._thumb_decode_bucket = None
         self._item = item
         self._sequence_folder = None
         self._sequence_frames = []
@@ -3251,6 +3365,13 @@ class _InspectorPreview(QWidget):
         dept = self._active_department
         mgr = self._worker_manager
 
+        if is_inbox:
+            self._sync_sequence_context_for_inspector_preview()
+            if path.is_file():
+                self._apply_inspector_thumb_decode_failure(w, is_inbox=True, path=path)
+            w.set_loading(False)
+            return
+
         # Đã load rồi thì dùng cache, không load lại
         if cache_key in self._preview_thumb_cache:
             cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
@@ -3258,12 +3379,16 @@ class _InspectorPreview(QWidget):
             if cached_pix is not None and not cached_pix.isNull():
                 w.set_pixmap(cached_pix, use_fit=cached_fit)
                 self._seq_live_display = False
+                self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
                 self._sync_sequence_context_for_inspector_preview()
                 return
             # cache lưu (None, fit) khi không có thumb → placeholder hoặc EXR/HDR unreadable
             self._sync_sequence_context_for_inspector_preview()
             self._apply_inspector_thumb_decode_failure(w, is_inbox=is_inbox, path=path)
             self._seq_live_display = False
+            return
+
+        if self._defer_thumb_decode_if_resizing():
             return
 
         mode = self._inspector_thumb_source_mode()
@@ -3282,12 +3407,16 @@ class _InspectorPreview(QWidget):
                 if getattr(self, "_item", None) is not item or str(self._item.path) != path_str:
                     w.set_loading(False)
                     return
-                ms = self._inspector_preview_decode_max_side()
+                if self._preview_resizing:
+                    self._thumb_reload_after_resize = True
+                    w.set_loading(False)
+                    return
+                ms = self._decode_side_for_current_item()
 
                 def run_load() -> tuple[str, QImage | None, bool]:
                     return _inspector_preview_worker_run(
                         path_str,
-                        is_inbox=is_inbox,
+                        is_inbox=False,
                         dept=dept,
                         mode=mode,
                         work_path_str=wps,
@@ -3306,7 +3435,7 @@ class _InspectorPreview(QWidget):
         def load() -> None:
             if getattr(self, "_item", None) is not item or str(self._item.path) != path_str:
                 return
-            ms = self._inspector_preview_decode_max_side()
+            ms = self._decode_side_for_current_item()
             ps, img, uf = _inspector_preview_worker_run(
                 path_str,
                 is_inbox=is_inbox,
@@ -3317,6 +3446,88 @@ class _InspectorPreview(QWidget):
                 decode_max_side=ms,
                 sequence_ignore_extensions=ign_ext,
                 sequence_ignore_name_tokens=ign_tok,
+            )
+            self.apply_preview_thumb(ps, img, uf)
+
+        QTimer.singleShot(0, load)
+
+    def load_inbox_item_preview(self) -> None:
+        """HD thumb for Inbox / Project Guide — call when user selects a file."""
+        item = self._item
+        if item is None or item.kind != ViewItemKind.INBOX_ITEM:
+            return
+        path = item.path
+        if not path.is_file():
+            return
+        if self._defer_thumb_decode_if_resizing():
+            return
+        path_str = str(path)
+        cache_key = self._preview_cache_key(path)
+        w = self._container._w
+        mgr = self._worker_manager
+
+        if cache_key in self._preview_thumb_cache:
+            cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
+            self._preview_thumb_cache.move_to_end(cache_key)
+            if cached_pix is not None and not cached_pix.isNull():
+                w.set_pixmap(cached_pix, use_fit=cached_fit)
+                w.set_unreadable_preview("", "")
+                self._seq_live_display = False
+                self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
+                self._sync_sequence_context_for_inspector_preview()
+                self._sync_thumbnail_overlay_mode()
+                return
+            self._sync_sequence_context_for_inspector_preview()
+            self._apply_inspector_thumb_decode_failure(w, is_inbox=True, path=path)
+            self._seq_live_display = False
+            self._sync_thumbnail_overlay_mode()
+            return
+
+        w.set_loading(True)
+        self._sync_thumbnail_overlay_mode()
+        decode_ms = self._decode_side_for_current_item()
+
+        if mgr is not None and hasattr(mgr, "submit_task"):
+            w.update()
+            QApplication.processEvents()
+
+            def submit() -> None:
+                if self._item is not item or str(self._item.path) != path_str:
+                    w.set_loading(False)
+                    return
+                if self._preview_resizing:
+                    self._thumb_reload_after_resize = True
+                    w.set_loading(False)
+                    return
+
+                def run_load() -> tuple[str, QImage | None, bool]:
+                    return _inspector_preview_worker_run(
+                        path_str,
+                        is_inbox=True,
+                        dept=self._active_department,
+                        mode=self._inspector_thumb_source_mode(),
+                        work_path_str=None,
+                        work_file_str=None,
+                        decode_max_side=decode_ms,
+                    )
+
+                task = WorkerTask("inspector_preview_thumb", run_load, manager=mgr)
+                mgr.submit_task(task, category="inspector_preview_thumb", replace_existing=True)
+
+            QTimer.singleShot(0, submit)
+            return
+
+        def load() -> None:
+            if self._item is not item or str(self._item.path) != path_str:
+                return
+            ps, img, uf = _inspector_preview_worker_run(
+                path_str,
+                is_inbox=True,
+                dept=self._active_department,
+                mode=self._inspector_thumb_source_mode(),
+                work_path_str=None,
+                work_file_str=None,
+                decode_max_side=decode_ms,
             )
             self.apply_preview_thumb(ps, img, uf)
 
@@ -3333,6 +3544,9 @@ class _InspectorPreview(QWidget):
         cache_key = self._preview_cache_key(path, active_dcc_hint=active_dcc_hint)
         dept = self._active_department
         is_inbox = item.kind == ViewItemKind.INBOX_ITEM
+        if is_inbox:
+            self.load_inbox_item_preview()
+            return
         mgr = self._worker_manager
         mode = self._inspector_thumb_source_mode()
         wp, wf = self._work_paths_for_preview_item(item, active_dcc_hint=active_dcc_hint)
@@ -3348,6 +3562,7 @@ class _InspectorPreview(QWidget):
             if cached_pix is not None and not cached_pix.isNull():
                 w.set_pixmap(cached_pix, use_fit=cached_fit)
                 self._seq_live_display = False
+                self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
                 self._sync_sequence_context_for_inspector_preview()
                 self._sync_thumbnail_overlay_mode()
                 return
@@ -3355,6 +3570,9 @@ class _InspectorPreview(QWidget):
             self._apply_inspector_thumb_decode_failure(w, is_inbox=is_inbox, path=path)
             self._seq_live_display = False
             self._sync_thumbnail_overlay_mode()
+            return
+
+        if self._defer_thumb_decode_if_resizing():
             return
 
         if mgr is not None and hasattr(mgr, "submit_task"):
@@ -3368,7 +3586,11 @@ class _InspectorPreview(QWidget):
                 if self._item is not item or str(self._item.path) != path_str:
                     w.set_loading(False)
                     return
-                ms = self._inspector_preview_decode_max_side()
+                if self._preview_resizing:
+                    self._thumb_reload_after_resize = True
+                    w.set_loading(False)
+                    return
+                ms = self._decode_side_for_current_item()
 
                 def run_load() -> tuple[str, QImage | None, bool]:
                     return _inspector_preview_worker_run(
@@ -3392,7 +3614,7 @@ class _InspectorPreview(QWidget):
         def load() -> None:
             if self._item is not item or str(self._item.path) != path_str:
                 return
-            ms = self._inspector_preview_decode_max_side()
+            ms = self._decode_side_for_current_item()
             ps, img, uf = _inspector_preview_worker_run(
                 path_str,
                 is_inbox=is_inbox,
@@ -3419,6 +3641,8 @@ class _InspectorPreview(QWidget):
         for name in ("thumbnail.user.png", "thumbnail.user.jpg", "thumbnail.png", "thumbnail.jpg"):
             self._thumbs.invalidate_file(item.path / name)
         self.set_item(item)
+        if item.kind == ViewItemKind.INBOX_ITEM:
+            self.load_inbox_item_preview()
 
     def _open_context_menu(self, global_pos: object) -> None:
         gp = global_pos if isinstance(global_pos, QPoint) else QPoint(0, 0)
@@ -3455,6 +3679,25 @@ class _InspectorPreview(QWidget):
         menu.exec(gp)
 
 
+def _inspector_primary_name_text(text: str) -> str:
+    """Soft-wrap friendly display for long file/entity names in the identity block."""
+    s = (text or "").strip()
+    if len(s) <= 48:
+        return s
+    zwsp = "\u200b"
+    out: list[str] = []
+    run = 0
+    for ch in s:
+        out.append(ch)
+        run += 1
+        if ch in " _.-【】()·\t":
+            run = 0
+        elif run >= 24:
+            out.append(zwsp)
+            run = 0
+    return "".join(out)
+
+
 class _IdentityBlock(QWidget):
     open_clicked = Signal()
     open_with_clicked = Signal()
@@ -3463,6 +3706,10 @@ class _IdentityBlock(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("InspectorIdentity")
+        block_policy = self.sizePolicy()
+        block_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+        block_policy.setVerticalPolicy(QSizePolicy.Policy.Minimum)
+        self.setSizePolicy(block_policy)
         self._current_item: ViewItem | None = None
         self._active_department: str | None = None
         self._active_dcc_id: str | None = None
@@ -3476,6 +3723,12 @@ class _IdentityBlock(QWidget):
         self._name.setObjectName("InspectorPrimaryName")
         f = monos_font("Inter", 15, QFont.Weight.DemiBold)
         self._name.setFont(f)
+        self._name.setWordWrap(True)
+        self._name.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        name_policy = self._name.sizePolicy()
+        name_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        name_policy.setVerticalPolicy(QSizePolicy.Policy.Minimum)
+        self._name.setSizePolicy(name_policy)
 
         meta_row = QWidget(self)
         meta_l = QHBoxLayout(meta_row)
@@ -3532,7 +3785,7 @@ class _IdentityBlock(QWidget):
         active_department: str | None = None,
         active_dcc_id: str | None = None,
     ) -> None:
-        self._name.setText(display_name_for_item(item))
+        self._name.setText(_inspector_primary_name_text(display_name_for_item(item)))
         ref = item.ref
 
         # Resolve short_name from pipeline metadata via parent walk
@@ -4024,6 +4277,20 @@ class _InspectorAssetStatusBlock(QWidget):
 
         l.addWidget(row1, 0)
         l.addWidget(row2, 0)
+
+    def sync_action_shortcuts(self, settings: QSettings | None) -> None:
+        from monostudio.ui_qt.app_hotkeys import read_hotkey_sequence
+
+        if settings is None:
+            self._act_open_reference_folder.setShortcut(QKeySequence())
+            self._act_open_concept_folder.setShortcut(QKeySequence())
+            return
+        self._act_open_reference_folder.setShortcut(
+            read_hotkey_sequence(settings, "inspector.open_reference")
+        )
+        self._act_open_concept_folder.setShortcut(
+            read_hotkey_sequence(settings, "inspector.open_concept")
+        )
 
     def _on_open_asset_folder_clicked(self) -> None:
         self.open_asset_folder_clicked.emit()

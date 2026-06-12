@@ -27,6 +27,13 @@
       "tooltip": "Not started or waiting for handoff."
     },
     {
+      "id": "working",
+      "label": "Working",
+      "category": "in_progress",
+      "order": 5,
+      "tooltip": "Active work in progress (generic, before a specific anim stage)."
+    },
+    {
       "id": "anim_layout",
       "label": "Layout",
       "category": "in_progress",
@@ -60,6 +67,13 @@
       "category": "done",
       "order": 50,
       "tooltip": "Animation signed off."
+    },
+    {
+      "id": "published",
+      "label": "Published",
+      "category": "done",
+      "order": 60,
+      "tooltip": "Shipped or published build."
     },
     {
       "id": "omitted",

@@ -80,13 +80,13 @@ class OutboxPageWidget(QWidget):
         header.setObjectName("MainViewHeader")
         header.setAttribute(Qt.WA_StyledBackground, True)
         header_v = QVBoxLayout(header)
-        header_v.setContentsMargins(12, 12, 12, 10)
+        header_v.setContentsMargins(12, 12, 12, 12)
         header_v.setSpacing(6)
 
         top_row = QWidget(header)
         hlay = QHBoxLayout(top_row)
         hlay.setContentsMargins(0, 0, 0, 0)
-        hlay.setSpacing(10)
+        hlay.setSpacing(12)
 
         self._title_row = InboxOutboxTitleRow("Outbox", root_icon="send", parent=top_row)
         hlay.addWidget(self._title_row, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -121,7 +121,7 @@ class OutboxPageWidget(QWidget):
         self._content_lay.setSpacing(0)
         root_lay.addWidget(self._content_host, 1)
         self._refresh_chrome()
-        bind_explorer_view_mode_tab_shortcut(self, lambda: self._tree_pane)
+        self._bound_hotkeys = bind_explorer_view_mode_tab_shortcut(self, lambda: self._tree_pane)
 
     def _mount_explorer_path_bar(self) -> None:
         if self._tree_pane is None:

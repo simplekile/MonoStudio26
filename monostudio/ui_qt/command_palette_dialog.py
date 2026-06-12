@@ -1,4 +1,4 @@
-"""Ctrl+` command palette — Spotlight-style jump search."""
+"""` command palette — Spotlight-style jump search."""
 
 from __future__ import annotations
 

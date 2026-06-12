@@ -457,6 +457,11 @@ MONOS_COLORS: dict[str, str] = {
     "pill_segment_inactive_fg": "#71717a",
     "pill_segment_active_fg": "#fafafa",
     "pill_segment_hover_fg": "#d4d4d8",
+    # Explorer Grid|List + Inspector tabs — subtle tint (not primary blue block).
+    "pill_segment_subtle_active_bg": "rgba(59, 130, 246, 0.18)",
+    "pill_segment_subtle_active_hover_bg": "rgba(59, 130, 246, 0.28)",
+    "pill_segment_subtle_active_fg": "#e4e4e7",
+    "pill_segment_subtle_active_icon_fg": "#60a5fa",
     "pill_segment_outer_radius_px": 8,
     "pill_segment_join_radius_px": 2,
 }
@@ -484,6 +489,67 @@ def project_accent_color(project_name: str) -> str:
     return PROJECT_ACCENT_PALETTE[h % len(PROJECT_ACCENT_PALETTE)]
 
 
+# Breadcrumb root page badge accents (tinted chips; aligned with Dashboard entity chips).
+PAGE_BADGE_ACCENT_COLORS: dict[str, str] = {
+    "asset": "#10b981",  # Emerald-500
+    "shot": "#f59e0b",  # Amber-500
+    "inbox": "#3b82f6",  # Blue-500
+    "outbox": "#a855f7",  # Violet-500
+    "guide": "#14b8a6",  # Teal-500
+}
+
+
+def page_badge_accent_color(badge_kind: str) -> str:
+    """Accent foreground for breadcrumb page-root badge (icon + label)."""
+    key = (badge_kind or "").strip().lower()
+    return PAGE_BADGE_ACCENT_COLORS.get(key, MONOS_COLORS.get("text_label", "#a1a1aa"))
+
+
+# Breadcrumb filter chips — card thumb badge colors (see _GridCardDelegate.paint).
+CARD_THUMB_TYPE_BADGE_ICON_COLOR = "#ffffff"
+CARD_THUMB_DEPT_BADGE_ICON_COLOR = "#ffffff"
+FILTER_BREADCRUMB_MUTED_ICON_COLOR = "#e4e4e7"
+
+_BREADCRUMB_PAGE_FILTER_KINDS = frozenset(PAGE_BADGE_ACCENT_COLORS)
+
+
+def breadcrumb_filter_role(
+    page_kind: str,
+    *,
+    badge_role: str = "type",
+    segment: str = "filter",
+) -> str:
+    """Map breadcrumb context to ``MainViewFilterBadge`` ``filterRole`` QSS key.
+
+    Page root uses ``MainViewTypeBadge`` tint (``badgeKind``). Filter pills use solid
+    accent from the same page family:
+    - Assets type → emerald; pipeline department → blue (card thumb chips).
+    - Inbox/Outbox source → page blue/violet; date → lighter same hue.
+    - Project Guide department → guide teal (not asset pipeline blue).
+    """
+    role = (badge_role or "type").strip().lower()
+    kind = (page_kind or "").strip().lower()
+    if segment == "date" and kind in _BREADCRUMB_PAGE_FILTER_KINDS:
+        return f"{kind}_date"
+    if role == "department":
+        if kind in ("asset", "shot"):
+            return "department"
+        if kind in _BREADCRUMB_PAGE_FILTER_KINDS:
+            return kind
+        return "department"
+    if kind in _BREADCRUMB_PAGE_FILTER_KINDS:
+        return kind
+    if role == "type":
+        return "type"
+    return ""
+
+
+def breadcrumb_filter_icon_color(filter_role: str) -> str:
+    if (filter_role or "").strip():
+        return CARD_THUMB_TYPE_BADGE_ICON_COLOR
+    return FILTER_BREADCRUMB_MUTED_ICON_COLOR
+
+
 # File-type icon colors (Inbox tree / mapping list: folder, image, video, DCC, …)
 FILE_TYPE_ICON_COLORS: dict[str, str] = {
     "folder": "#f59e0b",    # Amber-500
@@ -497,7 +563,8 @@ FILE_TYPE_ICON_COLORS: dict[str, str] = {
 }
 
 # Extension sets for file_icon_spec_for_path (đồng bộ với inbox_split_view)
-_FILE_EXT_IMAGE = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tga", ".tif", ".tiff", ".exr", ".hdr", ".ico", ".svg", ".pur"})  # .pur = PureRef
+_FILE_EXT_IMAGE = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tga", ".tif", ".tiff", ".exr", ".hdr", ".ico", ".svg"})
+_FILE_EXT_PUREF = frozenset({".pur"})  # PureRef → brand:pureref
 _FILE_EXT_VIDEO = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mpeg", ".mpg", ".ts"})
 _FILE_EXT_AUDIO = frozenset({".mp3", ".wav", ".aiff", ".aif", ".ogg", ".flac", ".m4a", ".wma", ".aac"})
 _FILE_EXT_ARCHIVE = frozenset({".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".zst"})
@@ -528,6 +595,8 @@ def file_icon_spec_for_path(path: Path) -> tuple[str, str]:
     ext = (path.suffix or "").strip().lower()
     if not ext.startswith("."):
         ext = "." + ext if ext else ""
+    if ext in _FILE_EXT_PUREF:
+        return ("brand:pureref", colors["dcc"])
     if ext in _FILE_EXT_IMAGE:
         return ("file-image", colors["image"])
     if ext in _FILE_EXT_VIDEO:
@@ -586,7 +655,7 @@ SIDEBAR_DEPT_LIST_STYLE: dict[str, object] = {
     "spacer_row_height_px": 4,
     "dept_row_height_px": 32,
     "list_row_spacing_px": 3,
-    "row_font_size_px": 10,
+    "row_font_size_px": 11,
     "count_font_size_px": 9,
     "row_icon_size_px": 12,
     "indent_step_px": 16,
@@ -1234,7 +1303,16 @@ def apply_dark_theme(app: QApplication) -> None:
         QListView#MainViewGrid {
             background: #151618;
             solid #27272a;
-
+            selection-background-color: transparent;
+            outline: none;
+        }
+        QListView#MainViewGrid::item {
+            background: transparent;
+            border: none;
+        }
+        QListView#MainViewGrid::item:selected {
+            background: transparent;
+            border: none;
         }
         QTableView#MainViewList {
             background: #151618;
@@ -1597,10 +1675,19 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(82, 82, 91, 0.78);
         }
         QWidget#MainViewTypeBadge[badgeKind="asset"][navLink="true"]:hover {
-            background: rgba(5, 150, 105, 0.98);
+            background: rgba(16, 185, 129, 0.24);
         }
         QWidget#MainViewTypeBadge[badgeKind="shot"][navLink="true"]:hover {
-            background: rgba(217, 119, 6, 0.98);
+            background: rgba(245, 158, 11, 0.24);
+        }
+        QWidget#MainViewTypeBadge[badgeKind="inbox"][navLink="true"]:hover {
+            background: rgba(59, 130, 246, 0.24);
+        }
+        QWidget#MainViewTypeBadge[badgeKind="outbox"][navLink="true"]:hover {
+            background: rgba(168, 85, 247, 0.24);
+        }
+        QWidget#MainViewTypeBadge[badgeKind="guide"][navLink="true"]:hover {
+            background: rgba(20, 184, 166, 0.24);
         }
         QLabel#MainViewBreadcrumbCurrent {
             color: #a1a1aa;
@@ -1611,52 +1698,138 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QLabel#MainViewTitleChevron {
             background: transparent;
+            color: #71717a;
         }
         QWidget#MainViewTypeBadge {
-            background: rgba(63, 63, 70, 0.45);
+            background: rgba(63, 63, 70, 0.55);
             border: none;
             border-radius: 6px;
         }
-        QWidget#MainViewTypeBadge[badgeKind="asset"] {
+        QWidget#MainViewFilterBadge {
+            background: #27272a;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 6px;
+        }
+        QWidget#MainViewFilterBadge[filterRole=""][navLink="true"]:hover {
+            background: rgba(63, 63, 70, 0.78);
+            border: 1px solid rgba(255, 255, 255, 0.16);
+        }
+        QWidget#MainViewFilterBadge[filterRole="type"] {
             background: rgba(16, 185, 129, 0.86);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="type"][navLink="true"]:hover {
+            background: rgba(5, 150, 105, 0.95);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="department"] {
+            background: rgba(59, 130, 246, 0.86);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="department"][navLink="true"]:hover {
+            background: rgba(37, 99, 235, 0.95);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="inbox"] {
+            background: rgba(59, 130, 246, 0.86);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="inbox"][navLink="true"]:hover {
+            background: rgba(37, 99, 235, 0.95);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="outbox"] {
+            background: rgba(168, 85, 247, 0.86);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="outbox"][navLink="true"]:hover {
+            background: rgba(147, 51, 234, 0.95);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="guide"] {
+            background: rgba(20, 184, 166, 0.86);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="guide"][navLink="true"]:hover {
+            background: rgba(13, 148, 136, 0.95);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="inbox_date"],
+        QWidget#MainViewFilterBadge[filterRole="outbox_date"],
+        QWidget#MainViewFilterBadge[filterRole="guide_date"] {
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="inbox_date"] {
+            background: rgba(59, 130, 246, 0.55);
+        }
+        QWidget#MainViewFilterBadge[filterRole="outbox_date"] {
+            background: rgba(168, 85, 247, 0.55);
+        }
+        QWidget#MainViewFilterBadge[filterRole="guide_date"] {
+            background: rgba(20, 184, 166, 0.55);
+        }
+        QWidget#MainViewFilterBadge[filterRole="inbox_date"][navLink="true"]:hover {
+            background: rgba(59, 130, 246, 0.68);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="outbox_date"][navLink="true"]:hover {
+            background: rgba(168, 85, 247, 0.68);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="guide_date"][navLink="true"]:hover {
+            background: rgba(20, 184, 166, 0.68);
+            border: none;
+        }
+        QLabel#MainViewFilterBadgeLabel {
+            color: #fafafa;
+            font-weight: 700;
+        }
+        QWidget#MainViewFilterBadge[navLink="true"]:hover QLabel#MainViewFilterBadgeLabel {
+            color: #ffffff;
+        }
+        QWidget#MainViewFilterBadge[filterRole="type"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="department"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="inbox"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="outbox"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="guide"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="inbox_date"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="outbox_date"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="guide_date"] QLabel#MainViewFilterBadgeLabel {
+            color: #ffffff;
+        }
+        QWidget#MainViewTypeBadge[badgeKind="asset"] {
+            background: rgba(16, 185, 129, 0.16);
         }
         QWidget#MainViewTypeBadge[badgeKind="shot"] {
-            background: rgba(245, 158, 11, 0.86);
+            background: rgba(245, 158, 11, 0.16);
         }
-        QWidget#MainViewTypeBadge[badgeKind="client"] {
-            background: rgba(59, 130, 246, 0.86);
+        QWidget#MainViewTypeBadge[badgeKind="inbox"] {
+            background: rgba(59, 130, 246, 0.16);
         }
-        QWidget#MainViewTypeBadge[badgeKind="freelancer"] {
-            background: rgba(168, 85, 247, 0.86);
+        QWidget#MainViewTypeBadge[badgeKind="outbox"] {
+            background: rgba(168, 85, 247, 0.16);
+        }
+        QWidget#MainViewTypeBadge[badgeKind="guide"] {
+            background: rgba(20, 184, 166, 0.16);
         }
         QLabel#MainViewTypeBadgeLabel {
             color: #e4e4e7;
             font-weight: 700;
         }
-        QWidget#MainViewTypeBadge[badgeKind="asset"] QLabel#MainViewTypeBadgeLabel,
-        QWidget#MainViewTypeBadge[badgeKind="shot"] QLabel#MainViewTypeBadgeLabel,
-        QWidget#MainViewTypeBadge[badgeKind="client"] QLabel#MainViewTypeBadgeLabel,
-        QWidget#MainViewTypeBadge[badgeKind="freelancer"] QLabel#MainViewTypeBadgeLabel {
-            color: #ffffff;
+        QWidget#MainViewTypeBadge[badgeKind="asset"] QLabel#MainViewTypeBadgeLabel {
+            color: #10b981;
         }
-        QWidget#MainViewTypeBadge[badgeKind="client"][navLink="true"]:hover {
-            background: rgba(37, 99, 235, 0.95);
+        QWidget#MainViewTypeBadge[badgeKind="shot"] QLabel#MainViewTypeBadgeLabel {
+            color: #f59e0b;
         }
-        QWidget#MainViewTypeBadge[badgeKind="freelancer"][navLink="true"]:hover {
-            background: rgba(147, 51, 234, 0.95);
+        QWidget#MainViewTypeBadge[badgeKind="inbox"] QLabel#MainViewTypeBadgeLabel {
+            color: #3b82f6;
         }
-        QWidget#MainViewDepartmentBadge {
-            background: rgba(59, 130, 246, 0.86);
-            border: none;
-            border-radius: 6px;
+        QWidget#MainViewTypeBadge[badgeKind="outbox"] QLabel#MainViewTypeBadgeLabel {
+            color: #a855f7;
         }
-        QWidget#MainViewDepartmentBadge[navLink="true"]:hover {
-            background: rgba(37, 99, 235, 0.95);
-        }
-        QLabel#MainViewDepartmentBadgeLabel,
-        QWidget#MainViewDepartmentBadge QLabel#MainViewTypeBadgeLabel {
-            color: #ffffff;
-            font-weight: 700;
+        QWidget#MainViewTypeBadge[badgeKind="guide"] QLabel#MainViewTypeBadgeLabel {
+            color: #14b8a6;
         }
         QToolButton {
             padding: 6px 10px;
@@ -2002,11 +2175,22 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(255, 255, 255, 0.08);
         }
 
+        /* Schedule Gantt — surfaces aligned with Dashboard (#1a1c1e / #1e2124) */
+        QWidget#ScheduleGantt,
+        QScrollArea#ScheduleBodyScroll,
+        QScrollArea#ScheduleBodyScroll::viewport,
+        QScrollArea#ScheduleTimelineScroll,
+        QScrollArea#ScheduleTimelineScroll::viewport,
+        QScrollArea#ScheduleHeaderScroll,
+        QScrollArea#ScheduleHeaderScroll::viewport {
+            background: #1a1c1e;
+        }
+
         /* Schedule timeline corner: search field + filter button */
         QWidget#ScheduleCornerSearch {
-            background-color: #0d0d0f;
-            border-right: 1px solid #2a2a2c;
-            border-bottom: 1px solid #2a2a2c;
+            background-color: #1e2124;
+            border-right: 1px solid rgba(255, 255, 255, 0.06);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
         }
         QLineEdit#ScheduleSearchEdit {
             background-color: #18181b;
@@ -2117,6 +2301,13 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #181a1d;
             border-bottom: 1px solid rgba(39, 39, 42, 0.50);
         }
+        QLabel#InspectorPrimaryName {
+            color: #e4e4e7;
+            font-family: "Inter";
+            font-size: 15px;
+            font-weight: 600;
+            line-height: 1.4;
+        }
         QWidget#InspectorHeader[tabMode="true"] {
             background-color: #181a1d;
             border-bottom: 1px solid rgba(39, 39, 42, 0.50);
@@ -2218,6 +2409,21 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #3b82f6;
             border: none;
             color: #fafafa;
+        }
+        /* Inspector header tabs (Pipeline / Ref / Details) — subtle active */
+        QWidget#InspectorTabRow QToolButton#SidebarScopePillSegment[active="true"] {
+            background-color: rgba(59, 130, 246, 0.18);
+            color: #e4e4e7;
+            font-weight: 600;
+        }
+        QWidget#InspectorTabRow QToolButton#SidebarScopePillSegment[active="true"]:hover {
+            background-color: rgba(59, 130, 246, 0.28);
+            color: #fafafa;
+        }
+        QWidget#InspectorTabRow QToolButton#SidebarScopePillSegment:hover {
+            background-color: rgba(255, 255, 255, 0.08);
+            border: none;
+            color: #d4d4d8;
         }
         /* Dept folder / status menu: pill-style hover */
         QWidget#InspectorPanel QToolButton#InspectorDeptOpenButton:hover,
@@ -3567,6 +3773,21 @@ def apply_dark_theme(app: QApplication) -> None:
             border: none;
             color: #d4d4d8;
         }
+        /* Grid|List (main view + Inbox/Outbox/Guide explorer) — subtle active */
+        QWidget#MainViewHeader QPushButton#Tier3Pill:checked,
+        QWidget#InboxContentToolbar QPushButton#Tier3Pill:checked,
+        QWidget#InboxPathBarToolbar QPushButton#Tier3Pill:checked {
+            background-color: rgba(59, 130, 246, 0.18);
+            border: none;
+            color: #e4e4e7;
+            font-weight: 600;
+        }
+        QWidget#MainViewHeader QPushButton#Tier3Pill:checked:hover,
+        QWidget#InboxContentToolbar QPushButton#Tier3Pill:checked:hover,
+        QWidget#InboxPathBarToolbar QPushButton#Tier3Pill:checked:hover {
+            background-color: rgba(59, 130, 246, 0.28);
+            color: #fafafa;
+        }
 
         QStackedWidget#SettingsPageStack {
             background: #151618;
@@ -3936,7 +4157,10 @@ def apply_dark_theme(app: QApplication) -> None:
         /* --- MONOS Sidebar (fixed 256px) --- */
         QWidget#SidebarContainer,
         QWidget#SidebarFilterPanel,
-        QWidget#SidebarFiltersCenter {
+        QWidget#SidebarFiltersCenter,
+        QWidget#SidebarCenterStack,
+        QWidget#SidebarDashboardWidgetsCenter,
+        QWidget#DashboardWidgetPalette {
             background-color: #181a1d;
         }
         QScrollArea#SidebarCompactFilterScroll {
@@ -4215,8 +4439,9 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 10px;
             color: #a1a1aa;
             padding: 6px;
-            font-size: 10px;
-            font-weight: 400;
+            font-family: "Inter";
+            font-size: 11px;
+            font-weight: 500;
         }
         QListWidget#SidebarTagList::item {
             height: 26px;
@@ -4233,16 +4458,9 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid rgba(59, 130, 246, 0.30);
         }
 
-        /* Tag empty overlay (Project Guide tree) */
+        /* Tag empty overlay (Project Guide — same chrome as folder empty) */
         QWidget#TagEmptyOverlay {
-            background: transparent;
-        }
-        QLabel#TagEmptyOverlayText {
-            color: #52525b;
-            font-family: "Inter";
-            font-size: 12px;
-            font-weight: 500;
-            background: transparent;
+            background-color: #151618;
         }
 
         /* Department empty overlay (Project Guide tree, same as Inbox) */
@@ -4395,6 +4613,12 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#SidebarNavRail {
             background-color: #1e2124;
             border-right: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        QScrollArea#SidebarNavRailScroll,
+        QScrollArea#SidebarNavRailScroll::viewport,
+        QWidget#SidebarNavRailMiddle {
+            background-color: #1e2124;
+            border: none;
         }
         QFrame#NavRailFlyout {
             background-color: #2563eb;
@@ -4551,18 +4775,21 @@ def apply_dark_theme(app: QApplication) -> None:
         }
 
         /* --- Dashboard (bento) --- */
+        QWidget#DashboardPage,
+        QScrollArea#DashboardScroll,
+        QScrollArea#DashboardScroll::viewport,
         QWidget#DashboardRoot {
-            background: #151618;
+            background: #141618;
         }
         QFrame#DashboardCard {
-            background: #18181b;
-            border: 1px solid rgba(39, 39, 42, 0.55);
+            background: #191b1e;
+            border: 1px solid rgba(255, 255, 255, 0.05);
             border-radius: 12px;
         }
         QFrame#DashboardHeaderCard {
             background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                stop:0 #1c1c20, stop:1 #161618);
-            border: 1px solid rgba(39, 39, 42, 0.65);
+                stop:0 #1e2124, stop:1 #191b1e);
+            border: 1px solid rgba(255, 255, 255, 0.05);
             border-radius: 12px;
         }
         QLabel#DashboardCardTitle {
@@ -4656,12 +4883,12 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         /* KPI tile */
         QFrame#DashboardMetricTile {
-            background: #18181b;
-            border: 1px solid rgba(39, 39, 42, 0.55);
+            background: #191b1e;
+            border: 1px solid rgba(255, 255, 255, 0.05);
             border-radius: 12px;
         }
         QFrame#DashboardMetricTile[clickable="true"]:hover {
-            background: #1f1f22;
+            background: #212427;
             border: 1px solid rgba(96, 165, 250, 0.45);
         }
         QFrame#DashboardMetricTile[tone="danger"] {
@@ -4717,12 +4944,13 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         /* Generic clickable row used by Dept load / Next 7 days / Attention / Notes */
         QFrame#DashboardRow {
-            background: transparent;
-            border: none;
-            border-radius: 8px;
+            background: #212427;
+            border: 1px solid rgba(255, 255, 255, 0.03);
+            border-radius: 6px;
         }
         QFrame#DashboardRow[clickable="true"]:hover {
-            background: rgba(255, 255, 255, 0.04);
+            background: #282b2e;
+            border: 1px solid rgba(255, 255, 255, 0.06);
         }
         QLabel#DashboardChip {
             color: #fafafa;
@@ -4763,7 +4991,7 @@ def apply_dark_theme(app: QApplication) -> None:
             background: transparent;
         }
         QFrame#DashboardBentoChrome[editMode="true"] {
-            border: 1px dashed rgba(255, 255, 255, 0.14);
+            border: none;
             border-radius: 10px;
             background: rgba(24, 24, 27, 0.35);
         }

@@ -2,7 +2,7 @@
 Tag system for Project Guide items (macOS-style colored tags).
 Storage: <project_root>/.monostudio/project_guide_tags.json
 Keys in item_tags are relative paths from project_guide root (forward-slash separated).
-Tag definitions are stored per-project; defaults are used when none exist.
+Tag definitions are stored per department (reference, script, …) — each has its own tag slots.
 """
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from typing import Any
 from monostudio.core.atomic_write import atomic_write_text
 
 _TAGS_FILENAME = "project_guide_tags.json"
+
+PROJECT_GUIDE_TAG_DEPARTMENTS = ("reference", "script", "storyboard", "guideline", "concept")
 
 DEFAULT_TAG_DEFINITIONS: list[dict[str, str]] = [
     {"id": "red", "color": "#FF3B30", "label": "Red"},
@@ -45,6 +47,19 @@ def _normalize_key(relative_path: str) -> str:
     return (relative_path or "").strip().replace("\\", "/").strip("/")
 
 
+def normalize_tag_department_id(department_id: str | None) -> str:
+    key = (department_id or PROJECT_GUIDE_TAG_DEPARTMENTS[0]).strip().lower()
+    return key if key in PROJECT_GUIDE_TAG_DEPARTMENTS else PROJECT_GUIDE_TAG_DEPARTMENTS[0]
+
+
+def department_for_guide_path(relative_path: str) -> str | None:
+    nk = _normalize_key(relative_path)
+    if not nk:
+        return None
+    first = nk.split("/")[0]
+    return first if first in PROJECT_GUIDE_TAG_DEPARTMENTS else None
+
+
 def _read_raw(project_root: Path) -> dict[str, Any]:
     path = _tags_path(project_root)
     try:
@@ -68,6 +83,40 @@ def _write_raw(project_root: Path, data: dict[str, Any]) -> bool:
         return False
 
 
+def _parse_def_list(raw: list[Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for d in raw:
+        if isinstance(d, dict) and d.get("id") and d.get("color") and d.get("label"):
+            out.append({"id": d["id"], "color": d["color"], "label": d["label"]})
+    return out
+
+
+def _legacy_tag_definitions(data: dict[str, Any]) -> list[dict[str, str]]:
+    raw_defs = data.get("tag_definitions")
+    if isinstance(raw_defs, list):
+        out = _parse_def_list(raw_defs)
+        if out:
+            return out
+    return list(DEFAULT_TAG_DEFINITIONS)
+
+
+def _load_storage(project_root: Path) -> dict[str, Any]:
+    """Load JSON and migrate legacy global tag_definitions to per-department slots."""
+    data = _read_raw(project_root)
+    by_dept = data.get("tag_definitions_by_department")
+    if isinstance(by_dept, dict) and by_dept:
+        return data
+    legacy = _legacy_tag_definitions(data)
+    migrated = {dept: [dict(d) for d in legacy] for dept in PROJECT_GUIDE_TAG_DEPARTMENTS}
+    data["version"] = 3
+    data["tag_definitions_by_department"] = migrated
+    data.pop("tag_definitions", None)
+    if not isinstance(data.get("item_tags"), dict):
+        data["item_tags"] = {}
+    _write_raw(project_root, data)
+    return data
+
+
 def build_color_map(defs: list[dict[str, str]]) -> dict[str, str]:
     return {t["id"]: t["color"] for t in defs if "id" in t and "color" in t}
 
@@ -76,96 +125,129 @@ def build_label_map(defs: list[dict[str, str]]) -> dict[str, str]:
     return {t["id"]: t["label"] for t in defs if "id" in t and "label" in t}
 
 
-def read_tag_definitions(project_root: Path) -> list[dict[str, str]]:
-    """Read tag definitions from JSON. Falls back to DEFAULT_TAG_DEFINITIONS."""
-    data = _read_raw(project_root)
-    raw_defs = data.get("tag_definitions")
-    if isinstance(raw_defs, list) and raw_defs:
-        out: list[dict[str, str]] = []
-        for d in raw_defs:
-            if isinstance(d, dict) and d.get("id") and d.get("color") and d.get("label"):
-                out.append({"id": d["id"], "color": d["color"], "label": d["label"]})
-        if out:
-            return out
+def read_tag_definitions(project_root: Path, department_id: str) -> list[dict[str, str]]:
+    """Read tag slot definitions for one Project Guide department."""
+    data = _load_storage(project_root)
+    dept = normalize_tag_department_id(department_id)
+    by_dept = data.get("tag_definitions_by_department")
+    if isinstance(by_dept, dict):
+        raw = by_dept.get(dept)
+        if isinstance(raw, list):
+            out = _parse_def_list(raw)
+            if out:
+                return out
     return list(DEFAULT_TAG_DEFINITIONS)
+
+
+def _valid_ids_for_path(project_root: Path, relative_path: str) -> set[str]:
+    dept = department_for_guide_path(relative_path)
+    if not dept:
+        return set()
+    return {d["id"] for d in read_tag_definitions(project_root, dept)}
 
 
 def save_tag_definitions(
     project_root: Path,
+    department_id: str,
     defs: list[dict[str, str]],
     item_tags: dict[str, list[str]] | None = None,
 ) -> bool:
-    """Save tag definitions (and optionally item_tags) to JSON."""
-    data = _read_raw(project_root)
-    data["version"] = 2
-    data["tag_definitions"] = defs
+    """Save tag definitions for one department (and optionally item_tags)."""
+    data = _load_storage(project_root)
+    dept = normalize_tag_department_id(department_id)
+    by_dept = data.get("tag_definitions_by_department")
+    if not isinstance(by_dept, dict):
+        by_dept = {}
+    by_dept[dept] = [dict(d) for d in defs if d.get("id") and d.get("color") and d.get("label")]
+    data["tag_definitions_by_department"] = by_dept
+    data["version"] = 3
     if item_tags is not None:
-        valid_ids = {d["id"] for d in defs}
         clean: dict[str, list[str]] = {}
         for k, v in item_tags.items():
             nk = _normalize_key(k)
+            if not nk or not isinstance(v, list):
+                continue
+            valid_ids = _valid_ids_for_path(project_root, nk)
             tags = [t for t in v if isinstance(t, str) and t in valid_ids]
-            if nk and tags:
+            if tags:
                 clean[nk] = tags
         data["item_tags"] = clean
     return _write_raw(project_root, data)
 
 
 def add_tag_definition(
-    project_root: Path, label: str, color: str,
+    project_root: Path,
+    department_id: str,
+    label: str,
+    color: str,
 ) -> tuple[bool, list[dict[str, str]]]:
-    """Add a new tag, return (success, updated_defs)."""
-    defs = read_tag_definitions(project_root)
+    """Add a new tag to a department slot, return (success, updated_defs)."""
+    dept = normalize_tag_department_id(department_id)
+    defs = read_tag_definitions(project_root, dept)
     new_id = f"tag_{uuid.uuid4().hex[:8]}"
     defs.append({"id": new_id, "color": color, "label": label})
-    ok = save_tag_definitions(project_root, defs)
+    ok = save_tag_definitions(project_root, dept, defs)
     return ok, defs
 
 
 def rename_tag_definition(
-    project_root: Path, tag_id: str, new_label: str,
+    project_root: Path,
+    department_id: str,
+    tag_id: str,
+    new_label: str,
 ) -> tuple[bool, list[dict[str, str]]]:
-    """Rename an existing tag, return (success, updated_defs)."""
-    defs = read_tag_definitions(project_root)
+    """Rename an existing tag in a department, return (success, updated_defs)."""
+    dept = normalize_tag_department_id(department_id)
+    defs = read_tag_definitions(project_root, dept)
     for d in defs:
         if d["id"] == tag_id:
             d["label"] = new_label
             break
-    ok = save_tag_definitions(project_root, defs)
+    ok = save_tag_definitions(project_root, dept, defs)
     return ok, defs
 
 
 def recolor_tag_definition(
-    project_root: Path, tag_id: str, new_color: str,
+    project_root: Path,
+    department_id: str,
+    tag_id: str,
+    new_color: str,
 ) -> tuple[bool, list[dict[str, str]]]:
-    """Change color of an existing tag, return (success, updated_defs)."""
-    defs = read_tag_definitions(project_root)
+    """Change color of an existing tag in a department, return (success, updated_defs)."""
+    dept = normalize_tag_department_id(department_id)
+    defs = read_tag_definitions(project_root, dept)
     for d in defs:
         if d["id"] == tag_id:
             d["color"] = new_color
             break
-    ok = save_tag_definitions(project_root, defs)
+    ok = save_tag_definitions(project_root, dept, defs)
     return ok, defs
 
 
 def delete_tag_definition(
-    project_root: Path, tag_id: str, item_tags: dict[str, list[str]],
+    project_root: Path,
+    department_id: str,
+    tag_id: str,
+    item_tags: dict[str, list[str]],
 ) -> tuple[bool, list[dict[str, str]]]:
-    """Delete a tag, remove it from all items, return (success, updated_defs)."""
-    defs = [d for d in read_tag_definitions(project_root) if d["id"] != tag_id]
+    """Delete a tag from a department and remove it from that department's items."""
+    dept = normalize_tag_department_id(department_id)
+    defs = [d for d in read_tag_definitions(project_root, dept) if d["id"] != tag_id]
+    prefix = f"{dept}/"
     for k in list(item_tags.keys()):
-        item_tags[k] = [t for t in item_tags[k] if t != tag_id]
-        if not item_tags[k]:
-            del item_tags[k]
-    ok = save_tag_definitions(project_root, defs, item_tags)
+        nk = _normalize_key(k)
+        if not nk.startswith(prefix):
+            continue
+        item_tags[nk] = [t for t in item_tags.get(nk, []) if t != tag_id]
+        if not item_tags[nk]:
+            del item_tags[nk]
+    ok = save_tag_definitions(project_root, dept, defs, item_tags)
     return ok, defs
 
 
 def read_all_tags(project_root: Path) -> dict[str, list[str]]:
     """Read item_tags from JSON. Returns {relative_path: [tag_id, ...]}."""
-    data = _read_raw(project_root)
-    defs = read_tag_definitions(project_root)
-    valid_ids = {d["id"] for d in defs}
+    data = _load_storage(project_root)
     item_tags = data.get("item_tags")
     if not isinstance(item_tags, dict):
         return {}
@@ -173,23 +255,26 @@ def read_all_tags(project_root: Path) -> dict[str, list[str]]:
     for k, v in item_tags.items():
         nk = _normalize_key(k)
         if nk and isinstance(v, list):
-            out[nk] = [t for t in v if isinstance(t, str) and t in valid_ids]
+            valid_ids = _valid_ids_for_path(project_root, nk)
+            tags = [t for t in v if isinstance(t, str) and t in valid_ids]
+            if tags:
+                out[nk] = tags
     return out
 
 
 def _write_all_tags(project_root: Path, item_tags: dict[str, list[str]]) -> bool:
-    """Write item_tags to JSON (atomic), preserving existing tag_definitions."""
-    data = _read_raw(project_root)
-    defs = read_tag_definitions(project_root)
-    valid_ids = {d["id"] for d in defs}
+    """Write item_tags to JSON (atomic), preserving per-department tag definitions."""
+    data = _load_storage(project_root)
     clean: dict[str, list[str]] = {}
     for k, v in item_tags.items():
         nk = _normalize_key(k)
+        if not nk or not isinstance(v, list):
+            continue
+        valid_ids = _valid_ids_for_path(project_root, nk)
         tags = [t for t in v if isinstance(t, str) and t in valid_ids]
-        if nk and tags:
+        if tags:
             clean[nk] = tags
-    data["version"] = 2
-    data["tag_definitions"] = defs
+    data["version"] = 3
     data["item_tags"] = clean
     return _write_raw(project_root, data)
 
@@ -209,8 +294,7 @@ def set_tags_for_item(
     nk = _normalize_key(relative_path)
     if not nk:
         return False
-    defs = read_tag_definitions(project_root)
-    valid_ids = {d["id"] for d in defs}
+    valid_ids = _valid_ids_for_path(project_root, nk)
     valid = [t for t in tag_ids if t in valid_ids]
     if valid:
         item_tags[nk] = valid
@@ -224,10 +308,17 @@ def toggle_tag_for_items(
     item_tags: dict[str, list[str]],
     relative_paths: list[str],
     tag_id: str,
+    *,
+    department_id: str | None = None,
 ) -> bool:
     """Toggle a single tag for one or more items. If all have it, remove; otherwise add."""
-    defs = read_tag_definitions(project_root)
-    valid_ids = {d["id"] for d in defs}
+    dept = normalize_tag_department_id(department_id) if department_id else None
+    if dept:
+        valid_ids = {d["id"] for d in read_tag_definitions(project_root, dept)}
+    else:
+        valid_ids = set()
+        for rel in relative_paths:
+            valid_ids.update(_valid_ids_for_path(project_root, rel))
     if tag_id not in valid_ids:
         return False
     keys = [_normalize_key(p) for p in relative_paths]
@@ -249,9 +340,32 @@ def toggle_tag_for_items(
     return _write_all_tags(project_root, item_tags)
 
 
-def paths_with_tag(item_tags: dict[str, list[str]], tag_id: str) -> set[str]:
-    """Return set of normalized relative paths that have the given tag."""
-    return {k for k, v in item_tags.items() if tag_id in v}
+def paths_with_tag(
+    item_tags: dict[str, list[str]],
+    tag_id: str,
+    *,
+    department_id: str | None = None,
+) -> set[str]:
+    """Return normalized relative paths that have the given tag, optionally scoped to a department."""
+    paths = {k for k, v in item_tags.items() if tag_id in v}
+    if department_id:
+        prefix = f"{normalize_tag_department_id(department_id)}/"
+        paths = {p for p in paths if p.startswith(prefix)}
+    return paths
+
+
+def paths_with_any_tag(
+    item_tags: dict[str, list[str]],
+    tag_ids: list[str] | set[str],
+    *,
+    department_id: str | None = None,
+) -> set[str]:
+    """Union of paths that have any of the given tags (OR filter)."""
+    out: set[str] = set()
+    for tag_id in tag_ids:
+        if tag_id:
+            out |= paths_with_tag(item_tags, tag_id, department_id=department_id)
+    return out
 
 
 def ancestor_paths(paths: set[str]) -> set[str]:
