@@ -65,6 +65,13 @@ def clear_stuck_widget_hover(widget: QWidget | None) -> None:
     """Clear Qt :hover stuck after popup opens/closes (badge still looks hovered until mouse re-enters)."""
     if widget is None:
         return
+    try:
+        from shiboken6 import isValid
+
+        if not isValid(widget):
+            return
+    except Exception:
+        pass
     widget.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, False)
     QApplication.sendEvent(widget, QEvent(QEvent.Type.Leave))
     try:
@@ -994,6 +1001,30 @@ def apply_dark_theme(app: QApplication) -> None:
             width: 14px;
             height: 14px;
             margin-left: 8px;
+        }
+        QMenu::indicator:checked {
+            image: none;
+            background-color: #3b82f6;
+            border: 1px solid #60a5fa;
+            border-radius: 3px;
+        }
+        QMenu::indicator:unchecked {
+            background-color: transparent;
+            border: 1px solid #52525b;
+            border-radius: 3px;
+        }
+        QMenu::indicator:unchecked:selected {
+            border-color: #71717a;
+        }
+        QMenu::item:checked {
+            color: #f4f4f5;
+        }
+        QMenu QWidget#GuideTagMenuRow {
+            background: transparent;
+            min-width: 180px;
+        }
+        QMenu::item:selected QWidget#GuideTagMenuRow QLabel#GuideTagMenuLabel {
+            background: transparent;
         }
         QMenu::item[class="danger-action"]:selected {
             background-color: #ef4444;

@@ -52,7 +52,7 @@ def _department_folder_path(project_root: Path | None, department_id: str) -> Pa
 class ReferencePageWidget(QWidget):
     """Project Guide: sidebar department + Inbox-style file explorer (no date folders)."""
 
-    tag_filter_badge_clicked = Signal()
+    tag_filter_badge_clicked = Signal(str)  # tag_id to remove
 
     tree_selection_changed = Signal(object)  # Path | None
     drop_requested = Signal(object, object, bool)  # list[Path], target folder, copy_only
@@ -159,7 +159,7 @@ class ReferencePageWidget(QWidget):
     def set_tag_filter_badge(self, label: str | None, *, color_hex: str | None = None) -> None:
         self._title_row.set_tag_filter_badge(label, color_hex=color_hex)
 
-    def set_tag_filter_badges(self, badges: list[tuple[str, str]]) -> None:
+    def set_tag_filter_badges(self, badges: list[tuple[str, str, str]]) -> None:
         self._title_row.set_tag_filter_badges(badges)
 
     def _tree_state_key(self, department_id: str) -> str:
@@ -184,17 +184,29 @@ class ReferencePageWidget(QWidget):
             self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
             self._tree_pane.item_tags_changed.connect(self.item_tags_changed.emit)
             self._content_lay.addWidget(self._tree_pane, 1)
-        else:
-            self._tree_pane.set_project_guide_root(guide_root, self._project_root)
+            key = self._tree_state_key(self._department)
+            saved = self._tree_state_cache.get(key)
+            if saved:
+                self._tree_pane.set_tree_state(saved)
+            self._refresh_chrome()
+            return
+
+        self._tree_pane.set_project_guide_root(guide_root, self._project_root)
+        self._tree_pane.set_chrome_context(self._department, None)
+        dept_changed = True
+        try:
+            dept_changed = Path(self._tree_pane._date_folder_path).resolve() != Path(root).resolve()
+        except OSError:
+            dept_changed = Path(self._tree_pane._date_folder_path) != Path(root)
+        if dept_changed:
             if self._project_root:
                 self._tree_pane.set_tag_data(read_all_tags(self._project_root))
                 self._tree_pane.reload_tag_definitions()
             self._tree_pane.set_date_folder_path(root)
-            self._tree_pane.set_chrome_context(self._department, None)
-        key = self._tree_state_key(self._department)
-        saved = self._tree_state_cache.get(key)
-        if saved:
-            self._tree_pane.set_tree_state(saved)
+            key = self._tree_state_key(self._department)
+            saved = self._tree_state_cache.get(key)
+            if saved:
+                self._tree_pane.set_tree_state(saved)
         self._refresh_chrome()
 
     def _on_tree_selection(self, path) -> None:
@@ -235,12 +247,14 @@ class ReferencePageWidget(QWidget):
         self._refresh_chrome()
 
     def set_tag_filter(self, tag_ids: list[str] | None) -> None:
-        self._ensure_tree_pane()
+        if self._tree_pane is None:
+            self._ensure_tree_pane()
         if self._tree_pane is not None:
             self._tree_pane.set_tag_filter(tag_ids)
 
     def set_tag_data(self, item_tags: dict[str, list[str]]) -> None:
-        self._ensure_tree_pane()
+        if self._tree_pane is None:
+            self._ensure_tree_pane()
         if self._tree_pane is not None:
             self._tree_pane.set_tag_data(item_tags)
 

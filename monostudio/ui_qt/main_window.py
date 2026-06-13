@@ -1437,11 +1437,11 @@ class MainWindow(FramelessMainWindow):
             label = filters.get_tag_display(tag_id)
             if not label:
                 continue
-            badges.append((label, filters.get_tag_color(tag_id) or "#a1a1aa"))
+            badges.append((label, filters.get_tag_color(tag_id) or "#a1a1aa", tag_id))
         self._reference_page_widget.set_tag_filter_badges(badges)
 
-    def _on_reference_tag_badge_clear(self) -> None:
-        self._filter_panel.filters().clear_active_tag()
+    def _on_reference_tag_badge_clear(self, tag_id: str) -> None:
+        self._filter_panel.filters().remove_active_tag(tag_id)
 
     def _open_header_type_filter_picker(self, anchor) -> None:
         filters = self._filter_panel.filters()
@@ -1500,7 +1500,7 @@ class MainWindow(FramelessMainWindow):
         self._refresh_inspector_selection()
 
     def _push_dashboard_filter(self) -> None:
-        """Apply inspector hidden-department rules to the dashboard overview."""
+        """Mirror Schedule department visibility (picker whitelist + inspector hidden)."""
         if self._dashboard_page_widget is None:
             return
         from monostudio.core.schedule_dept_filter import (
@@ -1513,7 +1513,7 @@ class MainWindow(FramelessMainWindow):
             self._settings.value(SCHEDULE_RESPECT_HIDDEN_KEY, True, type=bool)
         )
         self._dashboard_page_widget.set_dept_filter(
-            allowed_department_ids=None,
+            allowed_department_ids=self._filter_panel.filters().schedule_visible_department_ids(),
             hidden_departments=load_inspector_hidden_departments(self._settings),
             respect_hidden=respect_hidden,
             dept_scope=DEPT_SCOPE_LEAF,
@@ -3785,6 +3785,8 @@ class MainWindow(FramelessMainWindow):
             if self._dashboard_page_widget is not None:
                 self._dashboard_page_widget.exit_customize_mode()
             self._filter_panel.set_dashboard_customize_mode(False)
+            # Dashboard browse uses rail-only; restore filter panel for other pages.
+            self._apply_panel_layout()
         if (
             prev_context in ("Assets", "Shots")
             and context_name not in ("Assets", "Shots")
@@ -5705,7 +5707,6 @@ class MainWindow(FramelessMainWindow):
             tags = self._reference_page_widget.get_item_tags()
             self._filter_panel.filters().set_tag_item_tags(tags)
             self._reference_page_widget.set_tag_data(tags)
-            self._reference_page_widget.set_tag_filter(self._filter_panel.filters().current_tags())
 
     def _on_reference_import_requested(self) -> None:
         """Import (header or context menu): open file dialog, then copy to project_guide/<current_department>/."""

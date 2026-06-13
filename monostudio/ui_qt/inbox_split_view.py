@@ -65,6 +65,7 @@ from PySide6.QtWidgets import (
     QTreeView,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from PySide6.QtCore import QSortFilterProxyModel
@@ -128,6 +129,126 @@ from monostudio.ui_qt.style import (
 )
 
 _TREE_ICON_SIZE = 18
+
+
+def _relative_paths_under_guide_root(
+    paths: list[Path],
+    guide_root: Path | None,
+) -> list[str]:
+    if not guide_root:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        if p is None or not p.exists():
+            continue
+        try:
+            rel = p.relative_to(guide_root).as_posix()
+        except (ValueError, OSError):
+            continue
+        if rel and rel != "." and rel not in seen:
+            seen.add(rel)
+            out.append(rel)
+    return out
+
+
+def _guide_tag_assignment_states(
+    item_tags: dict[str, list[str]],
+    relative_paths: list[str],
+    tag_id: str,
+) -> tuple[bool, bool]:
+    """Return (all_assigned, any_assigned) for one tag on the current selection."""
+    if not relative_paths:
+        return False, False
+    states = [tag_id in get_tags_for_item(item_tags, rp) for rp in relative_paths]
+    return all(states), any(states)
+
+
+class _GuideTagMenuRow(QWidget):
+    """One tag row in the Project Guide context submenu (checkbox + icon + colored label)."""
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        color_hex: str,
+        checked: bool,
+        any_assigned: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("GuideTagMenuRow")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(24, 6, 28, 6)
+        lay.setSpacing(8)
+
+        check = QLabel(self)
+        check.setFixedSize(14, 14)
+        if checked:
+            check.setStyleSheet(
+                "background-color: #3b82f6; border: 1px solid #60a5fa; border-radius: 3px;"
+            )
+        else:
+            check.setStyleSheet(
+                "background-color: transparent; border: 1px solid #52525b; border-radius: 3px;"
+            )
+
+        icon_lbl = QLabel(self)
+        icon_lbl.setPixmap(
+            lucide_icon(
+                "tag-filled" if any_assigned else "tag",
+                size=14,
+                color_hex=color_hex,
+            ).pixmap(14, 14)
+        )
+        icon_lbl.setFixedSize(14, 14)
+
+        text = QLabel(label, self)
+        text.setObjectName("GuideTagMenuLabel")
+        if any_assigned:
+            text.setStyleSheet(
+                f'color: {color_hex}; font-family: "Inter"; font-size: 13px; font-weight: 500;'
+                " background: transparent;"
+            )
+        else:
+            text.setStyleSheet(
+                'color: #a1a1aa; font-family: "Inter"; font-size: 13px; font-weight: 500;'
+                " background: transparent;"
+            )
+
+        lay.addWidget(check, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(text, 1, Qt.AlignmentFlag.AlignVCenter)
+
+
+def _populate_guide_tags_submenu(
+    submenu: QMenu,
+    *,
+    tag_defs: list[dict[str, str]],
+    item_tags: dict[str, list[str]],
+    relative_paths: list[str],
+    menu_icon,
+) -> tuple[dict[str, QAction], QAction | None]:
+    tag_actions: dict[str, QAction] = {}
+    for tdef in tag_defs:
+        tid = tdef["id"]
+        all_have, any_have = _guide_tag_assignment_states(item_tags, relative_paths, tid)
+        wa = QWidgetAction(submenu)
+        wa.setDefaultWidget(
+            _GuideTagMenuRow(
+                label=tdef["label"],
+                color_hex=tdef["color"],
+                checked=all_have,
+                any_assigned=any_have,
+            )
+        )
+        if any_have and not all_have:
+            wa.setToolTip("Assigned to some selected items")
+        submenu.addAction(wa)
+        tag_actions[tid] = wa
+    submenu.addSeparator()
+    remove_act = submenu.addAction(menu_icon("tag"), "Remove all tags")
+    return tag_actions, remove_act
 
 
 def _find_project_root(start: Path) -> Path | None:
@@ -500,7 +621,7 @@ class InboxOutboxTitleRow(QWidget):
     root_clicked = Signal()
     type_clicked = Signal()
     department_clicked = Signal()
-    tag_filter_clicked = Signal()
+    tag_filter_clicked = Signal(str)  # tag_id to remove from filter
 
     def __init__(
         self,
@@ -643,7 +764,7 @@ class InboxOutboxTitleRow(QWidget):
         else:
             _set_lucide_on_label(icon_label, "tag-filled", size=16, color_hex=color)
 
-    def _build_tag_filter_chip(self, label: str, color_hex: str) -> QWidget:
+    def _build_tag_filter_chip(self, label: str, color_hex: str, tag_id: str = "") -> QWidget:
         chip = QWidget(self._tag_badges_host)
         chip.setObjectName("MainViewTagFilterBadge")
         chip.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -659,9 +780,10 @@ class InboxOutboxTitleRow(QWidget):
         chip_lay.addWidget(text_label, 0, Qt.AlignmentFlag.AlignVCenter)
         chip._tag_icon_label = icon_label  # type: ignore[attr-defined]
         chip._tag_color = color_hex  # type: ignore[attr-defined]
+        chip._tag_id = (tag_id or "").strip()  # type: ignore[attr-defined]
         self._apply_tag_chip_tint(chip, color_hex)
         self._set_tag_chip_icon(chip, hovered=False)
-        self._set_nav_link(chip, True, tooltip="Clear tag filters")
+        self._set_nav_link(chip, True, tooltip="Remove this tag filter")
         chip.setMouseTracking(True)
         chip.installEventFilter(self)
         return chip
@@ -677,27 +799,35 @@ class InboxOutboxTitleRow(QWidget):
             if item.widget():
                 item.widget().setParent(None)
 
-    def set_tag_filter_badges(self, badges: list[tuple[str, str]]) -> None:
-        """Show one breadcrumb chip per active tag filter (label, color_hex)."""
+    def set_tag_filter_badges(self, badges: list[tuple[str, str, str]]) -> None:
+        """Show one breadcrumb chip per active tag filter (label, color_hex, tag_id)."""
         self._clear_tag_filter_chips()
-        cleaned = [(l.strip(), c.strip()) for l, c in badges if (l or "").strip() and (c or "").strip()]
+        cleaned: list[tuple[str, str, str]] = []
+        for item in badges:
+            if len(item) < 2:
+                continue
+            label = (item[0] or "").strip()
+            color = (item[1] or "").strip()
+            tag_id = (item[2] or "").strip() if len(item) > 2 else ""
+            if label and color:
+                cleaned.append((label, color, tag_id))
         if not cleaned:
             self._chevron_tag.hide()
             self._tag_badges_host.hide()
             return
-        for label, color_hex in cleaned:
-            chip = self._build_tag_filter_chip(label, color_hex)
+        for label, color_hex, tag_id in cleaned:
+            chip = self._build_tag_filter_chip(label, color_hex, tag_id)
             self._tag_badges_layout.addWidget(chip)
             self._tag_filter_chips.append(chip)
         self._chevron_tag.setVisible(self._type_badge.isVisible())
         self._tag_badges_host.show()
 
-    def set_tag_filter_badge(self, label: str | None, *, color_hex: str | None = None) -> None:
+    def set_tag_filter_badge(self, label: str | None, *, color_hex: str | None = None, tag_id: str = "") -> None:
         text = (label or "").strip()
         if not text:
             self.set_tag_filter_badges([])
             return
-        self.set_tag_filter_badges([(text, (color_hex or "").strip() or "#a1a1aa")])
+        self.set_tag_filter_badges([(text, (color_hex or "").strip() or "#a1a1aa", (tag_id or "").strip())])
 
     def _apply_filter_chip_style(
         self,
@@ -859,9 +989,9 @@ class InboxOutboxTitleRow(QWidget):
                         return True
             if obj in self._tag_filter_chips and obj.isVisible():
                 nav = obj.property("navLink")
-                if nav == "true" or nav is True:
-                    self.tag_filter_clicked.emit()
-                    QTimer.singleShot(0, lambda: clear_stuck_widget_hover(obj))
+                tag_id = str(getattr(obj, "_tag_id", "") or "").strip()
+                if (nav == "true" or nav is True) and tag_id:
+                    self.tag_filter_clicked.emit(tag_id)
                     return True
             if (
                 obj is self._root_static
@@ -1758,21 +1888,13 @@ class InboxTreePane(QWidget):
             menu.addSeparator()
             tags_submenu = menu.addMenu(icon("tag"), "Tags")
             sel_rel_paths = self._relative_paths_for_guide_targets(targets)
-            for tdef in getattr(self, "_tag_defs", DEFAULT_TAG_DEFINITIONS):
-                tid = tdef["id"]
-                tact = tags_submenu.addAction(
-                    lucide_icon("tag-filled", size=14, color_hex=tdef["color"]),
-                    tdef["label"],
-                )
-                tact.setCheckable(True)
-                if sel_rel_paths:
-                    all_have = all(
-                        tid in get_tags_for_item(self._item_tags, rp) for rp in sel_rel_paths
-                    )
-                    tact.setChecked(all_have)
-                tag_actions[tid] = tact
-            tags_submenu.addSeparator()
-            remove_tags_act = tags_submenu.addAction(icon("tag"), "Remove all tags")
+            tag_actions, remove_tags_act = _populate_guide_tags_submenu(
+                tags_submenu,
+                tag_defs=getattr(self, "_tag_defs", DEFAULT_TAG_DEFINITIONS),
+                item_tags=self._item_tags,
+                relative_paths=sel_rel_paths,
+                menu_icon=icon,
+            )
         menu.addSeparator()
         import_act = menu.addAction(icon("upload"), "Import")
         if self._show_history_action:
@@ -2738,6 +2860,7 @@ class ProjectGuideTreePane(InboxTreePane):
             if empty.isValid():
                 self._tree.setRootIndex(empty)
         self._reload_file_entries()
+        self._sync_tree_to_browse_root()
         QTimer.singleShot(0, self._sync_empty_overlay)
 
     def _sync_empty_overlay(self) -> None:
@@ -2819,6 +2942,7 @@ class ProjectGuideTreePane(InboxTreePane):
                 department_id=self._source_filter,
             )
             self._reload_file_entries()
+            self._sync_tree_to_browse_root()
             QTimer.singleShot(0, self._sync_empty_overlay)
 
     def reload_tag_definitions(self) -> None:
@@ -2834,12 +2958,17 @@ class ProjectGuideTreePane(InboxTreePane):
     def set_tag_filter(self, tag_ids: list[str] | None) -> None:
         prev = list(self._tag_proxy._active_tags)
         ids = [t for t in (tag_ids or []) if t]
+        filter_changed = ids != prev
         self._tag_proxy.set_tag_filter(ids, self._item_tags, department_id=self._source_filter)
         if ids and not prev:
             self._grid_browse_root = Path(self._date_folder_path)
             self._nav_history = [Path(self._date_folder_path)]
             self._nav_index = 0
-        self._reload_fs_tree_root()
+        if filter_changed:
+            self._reload_fs_tree_root()
+        elif ids:
+            self._reload_file_entries()
+            QTimer.singleShot(0, self._sync_empty_overlay)
 
     def get_item_tags(self) -> dict[str, list[str]]:
         return self._item_tags
@@ -2848,22 +2977,7 @@ class ProjectGuideTreePane(InboxTreePane):
         return True
 
     def _relative_paths_for_guide_targets(self, targets: list[Path]) -> list[str]:
-        pg_root = self._pg_guide_root
-        if not pg_root:
-            return []
-        out: list[str] = []
-        seen: set[str] = set()
-        for p in targets:
-            if p is None or not p.exists():
-                continue
-            try:
-                rel = p.relative_to(pg_root).as_posix()
-            except (ValueError, OSError):
-                continue
-            if rel and rel != "." and rel not in seen:
-                seen.add(rel)
-                out.append(rel)
-        return out
+        return _relative_paths_under_guide_root(targets, self._pg_guide_root)
 
     def _toggle_tag(self, relative_paths: list[str], tag_id: str) -> None:
         if not self._pg_project_root or not relative_paths:
@@ -3486,21 +3600,14 @@ class ReferenceTreePane(QWidget):
         delete_act = menu.addAction(_icon_red("x"), delete_label)
         menu.addSeparator()
         tags_submenu = menu.addMenu(_icon("tag"), "Tags")
-        sel_rel_paths = self._selected_relative_paths()
-        tag_actions: dict[str, QAction] = {}
-        for tdef in self._tag_defs:
-            tid = tdef["id"]
-            act = tags_submenu.addAction(
-                lucide_icon("tag-filled", size=14, color_hex=tdef["color"]),
-                tdef["label"],
-            )
-            act.setCheckable(True)
-            if sel_rel_paths:
-                all_have = all(tid in get_tags_for_item(self._item_tags, rp) for rp in sel_rel_paths)
-                act.setChecked(all_have)
-            tag_actions[tid] = act
-        tags_submenu.addSeparator()
-        remove_tags_act = tags_submenu.addAction(_icon("tag"), "Remove all tags")
+        sel_rel_paths = _relative_paths_under_guide_root(ref_targets, self._project_guide_root)
+        tag_actions, remove_tags_act = _populate_guide_tags_submenu(
+            tags_submenu,
+            tag_defs=self._tag_defs,
+            item_tags=self._item_tags,
+            relative_paths=sel_rel_paths,
+            menu_icon=_icon,
+        )
         menu.addSeparator()
         import_act = menu.addAction(_icon("upload"), "Import")
         action = menu.exec(self._tree.viewport().mapToGlobal(pos))

@@ -1367,6 +1367,29 @@ class SidebarWidget(QWidget):
         """Department ids shown in filter list (+ picker); Schedule timeline uses this whitelist."""
         return list(self._visible_departments or [])
 
+    def schedule_visible_department_ids(self) -> list[str]:
+        """Schedule sidebar whitelist — used by Schedule timeline and Dashboard metrics."""
+        if self._mode == "schedule":
+            return self.visible_department_ids()
+        state = self._state_by_mode.get("schedule") or {}
+        vd = state.get("visible_departments")
+        cleaned = [v.strip() for v in self._all_departments if isinstance(v, str) and v.strip()]
+        cleaned_set = set(cleaned)
+        if vd is None:
+            eligible = [
+                d
+                for d in cleaned
+                if d in self._schedule_dept_shot_ids or d in self._schedule_dept_asset_ids
+            ]
+            return eligible if eligible else cleaned[: self._max_visible]
+        if isinstance(vd, list):
+            return [
+                x.strip()
+                for x in vd
+                if isinstance(x, str) and x.strip() and x.strip() in cleaned_set
+            ]
+        return []
+
     def current_department(self) -> str | None:
         return self._active_department
 
@@ -1405,7 +1428,7 @@ class SidebarWidget(QWidget):
         return self._tag_color_map.get(tag_id)
 
     def clear_active_tag(self) -> None:
-        """Clear sidebar tag filter and emit tagClicked([])."""
+        """Clear all sidebar tag filters and emit tagClicked([])."""
         if not self._active_tags:
             return
         self._active_tags = []
@@ -1413,6 +1436,17 @@ class SidebarWidget(QWidget):
             self._active_tags_by_department[self._tag_department] = []
         self._sync_tag_selection()
         self.tagClicked.emit([])
+
+    def remove_active_tag(self, tag_id: str) -> None:
+        """Remove one tag from the active filter (breadcrumb chip dismiss)."""
+        tid = (tag_id or "").strip()
+        if not tid or tid not in self._active_tags:
+            return
+        self._active_tags = [t for t in self._active_tags if t != tid]
+        self._sync_tag_selection()
+        if self._mode == "reference" and self._tag_department:
+            self._active_tags_by_department[self._tag_department] = list(self._active_tags)
+        self.tagClicked.emit(list(self._active_tags))
 
     def set_tag_item_tags(self, item_tags: dict[str, list[str]]) -> None:
         """Set item->tag_ids map from Project Guide tree (for tag count badges)."""
