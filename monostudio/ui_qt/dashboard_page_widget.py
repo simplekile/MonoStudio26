@@ -1124,8 +1124,6 @@ class DashboardPageWidget(QWidget):
         meta.setMinimumWidth(44)
         meta.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         rl.addWidget(meta, 0)
-        if s.overdue > 0:
-            rl.addWidget(_chip(f"{s.overdue} late", _RED, row), 0)
         self._dept_list.addWidget(row)
 
     def _update_dept_load(self, snap: DashboardSnapshot) -> None:

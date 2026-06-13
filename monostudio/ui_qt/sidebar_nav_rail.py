@@ -451,7 +451,8 @@ class SidebarNavRail(QWidget):
         return self._scope_context
 
     def set_current_context(self, context_name: str, *, force: bool = False) -> None:
-        if not force and context_name == self.current_context():
+        _ = force
+        if context_name == self.current_context():
             return
         if context_name in (SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
             self._footer_context = None
@@ -508,6 +509,7 @@ class SidebarNavRail(QWidget):
             self._filter_btn.set_active(self._filter_popup_active)
 
     def _on_home_clicked(self) -> None:
+        self._hide_nav_flyout()
         ctx = self.current_context()
         if ctx == SidebarContext.SCHEDULE.value:
             self.set_current_context(SidebarContext.DASHBOARD.value)

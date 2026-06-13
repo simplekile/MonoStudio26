@@ -1457,6 +1457,7 @@ class MainWindow(FramelessMainWindow):
 
     def _on_schedule_sidebar_filters_changed(self, *_args) -> None:
         self._apply_schedule_sidebar_filters()
+        self._schedule_dashboard_refresh()
 
     def _on_schedule_sidebar_department_sync(self, department: object) -> None:
         """Wave drilldown / toolbar: align sidebar DEPARTMENTS highlight with timeline filter."""
@@ -1534,6 +1535,14 @@ class MainWindow(FramelessMainWindow):
     def _run_dashboard_refresh(self) -> None:
         if self._dashboard_page_widget is None or self._nav_rail.current_context() != "Dashboard":
             return
+        self._refresh_dashboard_page()
+
+    def _refresh_dashboard_page(self) -> None:
+        """Reload dashboard metrics only — no main-view / inspector churn."""
+        if self._dashboard_page_widget is None:
+            return
+        self._dashboard_page_widget.set_project_root(self._project_root)
+        self._dashboard_page_widget.set_workspace_root(self._workspace_root)
         self._push_dashboard_filter()
         self._dashboard_page_widget.refresh(self._project_index)
         self._refresh_dashboard_mention_unread_dot()
@@ -3948,9 +3957,7 @@ class MainWindow(FramelessMainWindow):
                         Qt.ConnectionType.UniqueConnection,
                     )
                     self._content_stack.addWidget(self._dashboard_page_widget)
-                self._dashboard_page_widget.set_project_root(self._project_root)
-                self._dashboard_page_widget.set_workspace_root(self._workspace_root)
-                self._schedule_dashboard_refresh()
+                self._refresh_dashboard_page()
                 self._content_stack.setCurrentWidget(self._dashboard_page_widget)
                 self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
@@ -4240,6 +4247,9 @@ class MainWindow(FramelessMainWindow):
         # to avoid duplicate with context_changed when user clicks a different page.
         # Spec: click reloads Main View. (No autoscan trigger unless it was a switch.)
         # Note: Switching to Inbox emits both context_changed and context_clicked; we must not clear Inbox here.
+        if context_name == "Dashboard":
+            self._refresh_dashboard_page()
+            return
         self._context_switch_in_progress = True
         try:
             self._main_view.set_context_title(context_name)
@@ -4250,17 +4260,10 @@ class MainWindow(FramelessMainWindow):
                 pass
             self._inspector.set_item(None)
 
-            if context_name in ("Assets", "Shots", "Dashboard", "Schedule"):
+            if context_name in ("Assets", "Shots", "Schedule"):
                 if context_name in ("Assets", "Shots"):
-                    # Clicking an already-selected page should NOT wipe the list/grid.
-                    # If a background scan hasn't produced a ProjectIndex yet, clearing here
-                    # can leave the view empty until another event forces a reload.
                     self._sync_filter_state_from_sidebar()
-                if context_name == "Dashboard" and self._dashboard_page_widget is not None:
-                    self._dashboard_page_widget.set_project_root(self._project_root)
-                    self._dashboard_page_widget.set_workspace_root(self._workspace_root)
-                    self._schedule_dashboard_refresh()
-                elif context_name == "Schedule" and self._schedule_page_widget is not None:
+                if context_name == "Schedule" and self._schedule_page_widget is not None:
                     self._schedule_page_widget.set_project_root(self._project_root)
                     self._schedule_page_widget.refresh(self._project_index)
                     self._apply_schedule_sidebar_filters()

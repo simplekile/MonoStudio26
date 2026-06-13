@@ -445,5 +445,11 @@ class NavRailExpandItem(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            rail = self._rail
+            flyout = getattr(rail, "_nav_flyout", None)
+            owner = getattr(rail, "_flyout_owner", None)
+            if flyout is not None and flyout.isVisible() and owner is self:
+                event.accept()
+                return
             self.clicked.emit()
         super().mousePressEvent(event)

@@ -882,6 +882,8 @@ class SidebarWidget(QWidget):
         self._dept_parent: dict[str, str] = {}  # dept_id -> parent_id for subdepartment grouping
         # Mapping from type_id -> list of department ids that type supports (for per-type dept views).
         self._dept_ids_by_type: dict[str, list[str]] = {}
+        # Full pipeline dept list (all types) — used for Schedule/Dashboard whitelist resolution.
+        self._schedule_universe_department_ids: list[str] = []
         # None = not configured yet (will default to first N once). [] is a valid "show none".
         self._visible_departments: list[str] | None = None
         self._visible_types: list[str] | None = None  # type_ids
@@ -1242,6 +1244,7 @@ class SidebarWidget(QWidget):
                 registry = DepartmentRegistry.for_project(self._project_root)
             except OSError:
                 registry = None
+        self._rebuild_schedule_universe_department_ids(meta, registry)
 
         # Types: stable ids + display names.
         types_out: list[tuple[str, str]] = []
@@ -1363,17 +1366,56 @@ class SidebarWidget(QWidget):
         self._schedule_dept_shot_ids = {d.strip() for d in shots_set if d and d.strip()}
         self._schedule_dept_asset_ids = {d.strip() for d in assets_set if d and d.strip()}
 
+    def _rebuild_schedule_universe_department_ids(
+        self,
+        meta,
+        registry: DepartmentRegistry | None,
+    ) -> None:
+        """All pipeline department ids (every type), independent of sidebar page mode."""
+        seen: set[str] = set()
+        dept_parent: dict[str, str] = {}
+        for _type_id, t in meta.types.items():
+            raw_ids: list[str] = []
+            for d in getattr(t, "departments", []) or []:
+                if isinstance(d, str) and d.strip() and d.strip() not in raw_ids:
+                    raw_ids.append(d.strip())
+            dept_ids = resolve_department_ids_for_ui(raw_ids, meta=meta, registry=registry)
+            seen.update(dept_ids)
+            for did in dept_ids:
+                dd = meta.departments.get(did)
+                if dd is not None and getattr(dd, "parent", None) and dd.parent.strip():
+                    dept_parent[did] = (dd.parent or "").strip()
+                if registry is not None:
+                    parent = registry.get_parent(did)
+                    if parent:
+                        dept_parent[did] = parent
+        order_source = (
+            registry.get_departments() if registry is not None else list(meta.departments.keys())
+        )
+        depts = [dept_id for dept_id in order_source if dept_id in seen]
+        missing = [d for d in seen if d not in depts]
+        missing.sort(key=lambda s: s.lower())
+        depts.extend(missing)
+        self._schedule_universe_department_ids = order_department_ids_grouped_by_parent(
+            depts, dept_parent, order_source
+        )
+
+    def _sync_schedule_filter_state(self) -> None:
+        """Persist live Schedule sidebar picker into per-mode state."""
+        if self._mode != "schedule":
+            return
+        self._state_by_mode["schedule"] = self._snapshot_state()
+
     def visible_department_ids(self) -> list[str]:
         """Department ids shown in filter list (+ picker); Schedule timeline uses this whitelist."""
         return list(self._visible_departments or [])
 
     def schedule_visible_department_ids(self) -> list[str]:
         """Schedule sidebar whitelist — used by Schedule timeline and Dashboard metrics."""
-        if self._mode == "schedule":
-            return self.visible_department_ids()
+        self._sync_schedule_filter_state()
         state = self._state_by_mode.get("schedule") or {}
         vd = state.get("visible_departments")
-        cleaned = [v.strip() for v in self._all_departments if isinstance(v, str) and v.strip()]
+        cleaned = list(self._schedule_universe_department_ids or self._all_departments)
         cleaned_set = set(cleaned)
         if vd is None:
             eligible = [
@@ -4037,6 +4079,8 @@ class Sidebar(QWidget):
         ):
             self._footer_context = context_name
             if context_name == SidebarContext.DASHBOARD.value:
+                fw = self._filters
+                fw._state_by_mode[fw._mode] = fw._snapshot_state()
                 self._filters.setVisible(False)
                 self._dashboard_customize_mode = False
                 self._apply_center_stack_page()

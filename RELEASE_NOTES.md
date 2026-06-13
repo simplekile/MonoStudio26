@@ -1,17 +1,16 @@
-# MonoStudio 26 — Release v26.15.7
+# MonoStudio 26 — Release v26.15.8
 
 ## Highlights
 
-- **Project Guide tags**: Context menu submenu **Tags** trên explorer — gán/bỏ tag theo selection (checkbox + màu tag).
-- **Reference page**: Tag filter badges trên chrome; click badge để bỏ lọc; giữ tree state khi đổi department.
-- **Schedule / Dashboard sync**: Sidebar `schedule_visible_department_ids` đồng bộ whitelist department với timeline và dashboard metrics.
-- **UI**: QSS `GuideTagMenuRow`; dashboard browse khôi phục filter panel khi rời trang.
+- **Dashboard refresh**: Reload metrics riêng (`_refresh_dashboard_page`) — không làm churn main view / Inspector khi cập nhật dashboard.
+- **Schedule department whitelist**: Sidebar giữ universe department ids (mọi type) để resolve whitelist Schedule/Dashboard đúng.
+- **Nav rail**: Flyout không nuốt click khi đang mở trên item owner.
 
 ## Changes in this release
 
-- fix: `inbox_split_view.py` — guide tag submenu, multi-select tag assign/remove.
-- fix: `reference_page_widget.py`, `main_window.py` — tag badges, tree state cache.
-- fix: `sidebar.py` — schedule department visibility export.
+- fix: `main_window.py`, `dashboard_page_widget.py` — targeted dashboard refresh on context switch.
+- fix: `sidebar.py` — `_schedule_universe_department_ids`, rebuild on meta/registry.
+- fix: `nav_rail_expand_item.py`, `sidebar_nav_rail.py` — flyout click routing.
 
 ## Install
 
