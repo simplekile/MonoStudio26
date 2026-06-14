@@ -26,6 +26,7 @@ from PySide6.QtWidgets import QLineEdit
 
 from monostudio.core.pipeline_types_and_presets import (
     TypeDef,
+    filter_departments_for_entity_scope,
     load_department_vocabulary,
     load_pipeline_types_and_presets_for_project,
 )
@@ -384,8 +385,8 @@ class CreateAssetDialog(MonosDialog):
         if not raw:
             return []
         if self._dept_vocab:
-            return [d for d in raw if d in self._dept_vocab]
-        return list(raw)
+            raw = [d for d in raw if d in self._dept_vocab]
+        return filter_departments_for_entity_scope(list(raw), "asset")
 
     def create_subfolders(self) -> bool:
         return _global_create_work_publish_subfolders_default()
@@ -847,8 +848,8 @@ class BatchCreateAssetDialog(MonosDialog):
         if not raw:
             return []
         if self._dept_vocab:
-            return [d for d in raw if d in self._dept_vocab]
-        return list(raw)
+            raw = [d for d in raw if d in self._dept_vocab]
+        return filter_departments_for_entity_scope(list(raw), "asset")
 
     def create_subfolders(self) -> bool:
         return _global_create_work_publish_subfolders_default()

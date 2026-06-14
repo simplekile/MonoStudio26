@@ -512,6 +512,75 @@ def page_badge_accent_color(badge_kind: str) -> str:
     return PAGE_BADGE_ACCENT_COLORS.get(key, MONOS_COLORS.get("text_label", "#a1a1aa"))
 
 
+# Dashboard KPI + schedule attention — single source for icon + accent (aligned with timeline legend).
+SCHEDULE_ATTENTION_VISUALS: dict[str, dict[str, str]] = {
+    "overdue": {"accent_hex": "#ef4444", "icon": "triangle-alert"},  # Red-500 — bar_overdue
+    "unscheduled": {"accent_hex": "#f59e0b", "icon": "calendar"},  # Amber-500 — not on timeline yet
+}
+
+# Dashboard scope tiles — accent matches ``PAGE_BADGE_ACCENT_COLORS`` (Assets / Shots pages).
+PAGE_SCOPE_VISUALS: dict[str, dict[str, str]] = {
+    "asset": {"accent_hex": PAGE_BADGE_ACCENT_COLORS["asset"], "icon": "layers"},
+    "shot": {"accent_hex": PAGE_BADGE_ACCENT_COLORS["shot"], "icon": "clapperboard"},
+}
+
+
+def schedule_attention_accent(kind: str) -> str:
+    key = (kind or "").strip().lower()
+    visual = SCHEDULE_ATTENTION_VISUALS.get(key, {})
+    return str(visual.get("accent_hex") or MONOS_COLORS.get("text_label", "#a1a1aa"))
+
+
+def schedule_attention_icon(kind: str) -> str:
+    key = (kind or "").strip().lower()
+    visual = SCHEDULE_ATTENTION_VISUALS.get(key, {})
+    return str(visual.get("icon") or "circle-help")
+
+
+def page_scope_accent(scope: str) -> str:
+    key = (scope or "").strip().lower()
+    visual = PAGE_SCOPE_VISUALS.get(key, {})
+    accent = visual.get("accent_hex")
+    if accent:
+        return str(accent)
+    return page_badge_accent_color(key)
+
+
+def page_scope_icon(scope: str) -> str:
+    key = (scope or "").strip().lower()
+    visual = PAGE_SCOPE_VISUALS.get(key, {})
+    return str(visual.get("icon") or "box")
+
+
+def _page_scope_badge_kind(scope_key: str) -> str:
+    key = (scope_key or "").strip().lower()
+    if key in ("assets", "asset"):
+        return "asset"
+    if key in ("shots", "shot"):
+        return "shot"
+    return key
+
+
+def page_scope_badge_row_colors(scope_key: str) -> dict[str, QColor | str]:
+    """Tinted row/badge colors aligned with ``MainViewTypeBadge`` on asset/shot pages."""
+    kind = _page_scope_badge_kind(scope_key)
+    accent_hex = page_badge_accent_color(kind)
+    s = accent_hex.lstrip("#")
+    if len(s) != 6:
+        return sidebar_filter_accent_colors("type")
+    r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    return {
+        "highlight": QColor(r, g, b, 41),
+        "highlight_hover": QColor(r, g, b, 61),
+        "text": QColor(accent_hex),
+        "dot": QColor(accent_hex),
+        "accent_hex": accent_hex,
+        "count_bg": QColor(r, g, b, 61),
+        "count_border": QColor(min(r + 37, 255), min(g + 35, 255), min(b + 20, 255), 90),
+        "count_text": QColor(accent_hex),
+    }
+
+
 # Breadcrumb filter chips — card thumb badge colors (see _GridCardDelegate.paint).
 CARD_THUMB_TYPE_BADGE_ICON_COLOR = "#ffffff"
 CARD_THUMB_DEPT_BADGE_ICON_COLOR = "#ffffff"
@@ -555,6 +624,45 @@ def breadcrumb_filter_icon_color(filter_role: str) -> str:
     if (filter_role or "").strip():
         return CARD_THUMB_TYPE_BADGE_ICON_COLOR
     return FILTER_BREADCRUMB_MUTED_ICON_COLOR
+
+
+# Solid accent fills for MainViewFilterBadge — shared with sidebar filter selection.
+FILTER_BADGE_ACCENT: dict[str, dict[str, object]] = {
+    "type": {"rgb": (16, 185, 129), "accent_hex": "#10b981", "text_hex": "#ffffff"},
+    "department": {"rgb": (59, 130, 246), "accent_hex": "#3b82f6", "text_hex": "#ffffff"},
+    "inbox": {"rgb": (59, 130, 246), "accent_hex": "#3b82f6", "text_hex": "#ffffff"},
+    "outbox": {"rgb": (168, 85, 247), "accent_hex": "#a855f7", "text_hex": "#ffffff"},
+    "guide": {"rgb": (20, 184, 166), "accent_hex": "#14b8a6", "text_hex": "#ffffff"},
+}
+
+
+def sidebar_filter_accent_role(page_kind: str, scope: str) -> str:
+    """Map sidebar filter row scope to ``MainViewFilterBadge`` ``filterRole`` key."""
+    kind = (page_kind or "").strip().lower()
+    sc = (scope or "").strip().lower()
+    badge_role = "department" if sc in ("dept", "department") else "type"
+    if badge_role == "type" and kind in ("asset", "shot", "schedule", "assets", "shots"):
+        return "type"
+    if badge_role == "department" and kind in ("asset", "shot", "schedule", "assets", "shots"):
+        return "department"
+    return breadcrumb_filter_role(kind, badge_role=badge_role)
+
+
+def sidebar_filter_accent_colors(filter_role: str) -> dict[str, QColor | str]:
+    """Highlight / dot / label colors for a selected sidebar filter row."""
+    role = (filter_role or "").strip().lower()
+    spec = FILTER_BADGE_ACCENT.get(role) or FILTER_BADGE_ACCENT["department"]
+    r, g, b = spec["rgb"]  # type: ignore[misc]
+    accent_hex = str(spec["accent_hex"])
+    return {
+        "highlight": QColor(r, g, b, 100),
+        "text": QColor(str(spec["text_hex"])),
+        "dot": QColor(accent_hex),
+        "accent_hex": accent_hex,
+        "count_bg": QColor(r, g, b, 120),
+        "count_border": QColor(min(r + 37, 255), min(g + 35, 255), min(b + 20, 255), 90),
+        "count_text": QColor(accent_hex),
+    }
 
 
 # File-type icon colors (Inbox tree / mapping list: folder, image, video, DCC, …)
@@ -1119,6 +1227,13 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#TopBar {
             background-color: #181a1d;
             border-bottom: 1px solid rgba(39, 39, 42, 0.50);
+        }
+        QLabel#TopBarProjectNameLabel {
+            color: #fafafa;
+            font-family: "Inter", sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: -0.01em;
         }
         QWidget#TopBarPanelGroup {
             background-color: rgba(39, 39, 42, 0.85);
@@ -4812,6 +4927,18 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#DashboardRoot {
             background: #141618;
         }
+        QScrollArea#DashboardNextListScroll,
+        QScrollArea#DashboardNextListScroll::viewport,
+        QWidget#DashboardNextListHost,
+        QScrollArea#DashboardDeptListScroll,
+        QScrollArea#DashboardDeptListScroll::viewport,
+        QWidget#DashboardDeptListHost,
+        QScrollArea#DashboardNotesListScroll,
+        QScrollArea#DashboardNotesListScroll::viewport,
+        QWidget#DashboardNotesListHost {
+            background: transparent;
+            border: none;
+        }
         QFrame#DashboardCard {
             background: #191b1e;
             border: 1px solid rgba(255, 255, 255, 0.05);
@@ -4829,24 +4956,34 @@ def apply_dark_theme(app: QApplication) -> None:
             font-size: 14px;
             font-weight: 700;
             letter-spacing: -0.1px;
+            padding: 0px;
+            margin: 0px;
+        }
+        QWidget#DashboardCardHeader,
+        QWidget#DashboardNotesFilterBar,
+        QWidget#DashboardNoteRowTrailing {
+            background: transparent;
         }
         QPushButton#DashboardNotesFilterBtn {
             background: transparent;
-            border: 1px solid rgba(63, 63, 70, 0.8);
+            border: none;
             border-radius: 6px;
-            padding: 4px 10px;
-            color: #a1a1aa;
+            padding: 0px 8px;
+            color: #71717a;
             font-family: "Inter";
             font-size: 11px;
             font-weight: 600;
         }
         QPushButton#DashboardNotesFilterBtn:hover {
-            color: #e4e4e7;
-            border-color: rgba(113, 113, 122, 0.9);
+            background: rgba(255, 255, 255, 0.04);
+            color: #d4d4d8;
         }
         QPushButton#DashboardNotesFilterBtn:checked {
             background: rgba(59, 130, 246, 0.18);
-            border-color: rgba(96, 165, 250, 0.55);
+            color: #fafafa;
+        }
+        QPushButton#DashboardNotesFilterBtn:checked:hover {
+            background: rgba(59, 130, 246, 0.28);
             color: #fafafa;
         }
         QPushButton#DashboardNoteDeptBtn {
@@ -4922,8 +5059,11 @@ def apply_dark_theme(app: QApplication) -> None:
             background: #212427;
             border: 1px solid rgba(96, 165, 250, 0.45);
         }
-        QFrame#DashboardMetricTile[tone="danger"] {
+        QFrame#DashboardMetricTile[tone="danger-overdue"] {
             border: 1px solid rgba(239, 68, 68, 0.35);
+        }
+        QFrame#DashboardMetricTile[tone="danger-unscheduled"] {
+            border: 1px solid rgba(245, 158, 11, 0.35);
         }
         QLabel#DashboardTileLabel {
             color: #71717a;
@@ -4975,13 +5115,13 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         /* Generic clickable row used by Dept load / Next 7 days / Attention / Notes */
         QFrame#DashboardRow {
-            background: #212427;
+            background: #1c1e21;
             border: 1px solid rgba(255, 255, 255, 0.03);
             border-radius: 6px;
         }
         QFrame#DashboardRow[clickable="true"]:hover {
-            background: #282b2e;
-            border: 1px solid rgba(255, 255, 255, 0.06);
+            background: #212427;
+            border: 1px solid rgba(255, 255, 255, 0.05);
         }
         QLabel#DashboardChip {
             color: #fafafa;
@@ -5000,6 +5140,39 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #71717a;
             font-family: "JetBrains Mono";
             font-size: 11px;
+        }
+        QFrame#DashboardDeptWorkloadPopover {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+        }
+        QFrame#DashboardDeptWorkloadPopover QScrollArea#DashboardDeptWorkloadScroll,
+        QFrame#DashboardDeptWorkloadPopover QScrollArea#DashboardDeptWorkloadScroll::viewport,
+        QFrame#DashboardDeptWorkloadPopover QScrollArea#DashboardDeptWorkloadScroll QWidget#qt_scrollarea_viewport,
+        QFrame#DashboardDeptWorkloadPopover QWidget#DashboardDeptWorkloadScrollBody {
+            background: transparent;
+            border: none;
+        }
+        QPushButton#DashboardDeptWorkloadEntityBtn {
+            text-align: left;
+            border: none;
+            border-radius: 6px;
+            background: transparent;
+        }
+        QPushButton#DashboardDeptWorkloadEntityBtn:hover {
+            background: rgba(255, 255, 255, 0.06);
+        }
+        QFrame#DashboardDeptWorkloadEntityRow {
+            background: transparent;
+            border: none;
+            border-radius: 6px;
+        }
+        QFrame#DashboardDeptWorkloadEntityRow:hover {
+            background: rgba(255, 255, 255, 0.06);
+        }
+        QWidget#DashboardWeekStrip {
+            background: transparent;
+            min-height: 80px;
         }
         QPushButton#DashboardGhostButton {
             padding: 6px 12px;

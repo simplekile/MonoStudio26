@@ -1,7 +1,7 @@
 """Dashboard page: project overview as a modern bento grid.
 
 Cards: hero (project + health ring), KPI tiles, pipeline health, department
-load, next 7 days, needs attention, and recent notes. All data is derived from
+load, next 7 days, and recent notes. All data is derived from
 the existing DashboardSnapshot (no extra filesystem scans)."""
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QRectF, QSettings, QSize, Qt, QTimer, Signal, QEvent
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -32,25 +32,90 @@ from monostudio.core.dashboard_layout import (
 from monostudio.core.fs_reader import ProjectIndex
 from monostudio.core.item_comments import ItemCommentEntry
 from monostudio.core.production_status import CATEGORY_COLOR_HEX
+from monostudio.core.schedule_planner import group_upcoming_due_for_week
 from monostudio.core.project_dashboard_stats import (
+    DashboardDeptStat,
     DashboardNoteRow,
     DashboardSnapshot,
     build_dashboard_snapshot,
 )
 from monostudio.core.user_identity import get_current_user, get_current_user_display_name
 from monostudio.ui_qt.dashboard_bento_host import DashboardBentoHost
+from monostudio.ui_qt.dashboard_responsive_row import (
+    DashboardElidedLabel,
+    DashboardEntityBadges,
+    DashboardResponsiveMixin,
+    uniform_dept_chip_width,
+)
+from monostudio.ui_qt.dashboard_week_strip import DashboardWeekStrip, DASHBOARD_WEEK_STRIP_HEIGHT
+from monostudio.ui_qt.dept_workload_popover import DeptWorkloadPopover
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.nav_pill_widgets import UnreadDotBadge
 from monostudio.ui_qt.note_author_row import NoteAuthorRow
-from monostudio.ui_qt.style import MONOS_COLORS, monos_font
+from monostudio.ui_qt.style import (
+    MONOS_COLORS,
+    monos_font,
+    page_scope_accent,
+    page_scope_icon,
+    schedule_attention_accent,
+    schedule_attention_icon,
+)
 
 _COLOR_DONE = CATEGORY_COLOR_HEX.get("done", "#10b981")
 _COLOR_PROGRESS = CATEGORY_COLOR_HEX.get("in_progress", "#f59e0b")
 _COLOR_WAITING = CATEGORY_COLOR_HEX.get("not_started", "#71717a")
-_COLOR_BLOCKED = CATEGORY_COLOR_HEX.get("blocked", "#ef4444")
-_RED = "#ef4444"
-_DEPT_LOAD_PREVIEW = 8
-_DASHBOARD_ENTITY_COL_W = 248
+_COLOR_OVERDUE = schedule_attention_accent("overdue")
+_COLOR_DUE_SOON = "#60a5fa"
+
+
+def _dept_scope_chip(text: str, *, tone: str, parent=None) -> QLabel:
+    accent = page_scope_accent(tone)
+    lab = QLabel(text, parent)
+    lab.setFont(monos_font("Inter", 10, QFont.Weight.DemiBold))
+    lab.setStyleSheet(
+        f"color: {accent}; background: {_hex_to_rgba(accent, 0.14)};"
+        "border-radius: 5px; padding: 2px 6px;"
+    )
+    return lab
+
+
+def _dept_workload_meta(stat: DashboardDeptStat) -> str:
+    parts: list[str] = []
+    if stat.overdue:
+        parts.append(f"{stat.overdue} overdue")
+    if stat.due_soon:
+        parts.append(f"{stat.due_soon} due soon")
+    if parts:
+        return " · ".join(parts)
+    if stat.in_progress:
+        return f"{stat.in_progress} active"
+    return f"{stat.done}/{stat.total} done"
+
+
+def _dept_workload_bar_segments(stat: DashboardDeptStat) -> list[tuple[float, str]]:
+    return [
+        (stat.done, _COLOR_DONE),
+        (stat.in_progress, _COLOR_PROGRESS),
+        (stat.overdue, _COLOR_OVERDUE),
+        (stat.waiting, _COLOR_WAITING),
+    ]
+
+
+_DEPT_ROW_H = 44
+_DEPT_LIST_MAX_ROWS = 8
+_DEPT_LIST_VIEWPORT_H = _DEPT_LIST_MAX_ROWS * (_DEPT_ROW_H + 4)
+_NEXT_DAY_ROW_PREVIEW = 4
+_NEXT_OVERDUE_PREVIEW = 5
+_NEXT_UNFILTERED_MAX_ROWS = 8
+# Fixed list viewport height (stable bento card when switching strip days).
+_NEXT_ROW_H = 40
+_NOTE_ROW_H = _NEXT_ROW_H
+_CARD_HEADER_H = 26
+_CARD_SECTION_SPACING = 10
+_NEXT_LIST_VIEWPORT_H = _NEXT_UNFILTERED_MAX_ROWS * (_NEXT_ROW_H + 4)
+# Notes card has no week strip — reclaim that vertical space in the list viewport.
+_NOTES_LIST_VIEWPORT_H = _NEXT_LIST_VIEWPORT_H + DASHBOARD_WEEK_STRIP_HEIGHT + _CARD_SECTION_SPACING
+_NOTES_VISIBLE_MAX = max(8, _NOTES_LIST_VIEWPORT_H // (_NOTE_ROW_H + 4))
 
 
 def _hex_to_rgba(hex_str: str, alpha: float) -> str:
@@ -331,10 +396,19 @@ class _MetricTile(QFrame):
     def set_value(self, text: str) -> None:
         self._value.setText(text)
 
-    def set_tone(self, danger: bool) -> None:
-        self.setProperty("tone", "danger" if danger else "")
+    def set_tone(self, danger: bool, *, accent_hex: str | None = None) -> None:
+        accent = (accent_hex or schedule_attention_accent("overdue")).strip()
+        if danger:
+            tone = (
+                "danger-unscheduled"
+                if accent == schedule_attention_accent("unscheduled")
+                else "danger-overdue"
+            )
+        else:
+            tone = ""
+        self.setProperty("tone", tone)
         self._value.setStyleSheet(
-            f"color: {_RED if danger else MONOS_COLORS.get('text_primary', '#fafafa')}; background: transparent;"
+            f"color: {accent if danger else MONOS_COLORS.get('text_primary', '#fafafa')}; background: transparent;"
         )
         st = self.style()
         if st is not None:
@@ -356,6 +430,8 @@ class _ClickableRow(QFrame):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._clickable = clickable
         self.setProperty("clickable", "true" if clickable else "false")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
         if clickable:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -377,7 +453,7 @@ class _ClickableRow(QFrame):
         QTimer.singleShot(0, _emit)
 
 
-class _NoteDashboardRow(_ClickableRow):
+class _NoteDashboardRow(DashboardResponsiveMixin, _ClickableRow):
     """Note row with context menu: open notes / jump to department."""
 
     open_notes = Signal()
@@ -387,6 +463,16 @@ class _NoteDashboardRow(_ClickableRow):
         super().__init__(parent)
         self._has_department = bool(has_department)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
+        self._trailing_meta = None
+        self._entity_badges = None
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_responsive_layout()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._apply_responsive_layout()
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         menu = QMenu(self)
@@ -408,101 +494,26 @@ def _chip(text: str, color_hex: str, parent=None) -> QLabel:
     return lab
 
 
-def _uniform_dept_btn_width(labels: list[str]) -> int:
-    """Width for dept buttons so every row matches the longest label."""
-    clean = [(lbl or "").strip() for lbl in labels if (lbl or "").strip()]
-    if not clean:
-        return 0
-    font = monos_font("Inter", 10, QFont.Weight.Bold)
-    metrics = QFontMetrics(font)
-    # Match DashboardNoteDeptBtn QSS: horizontal padding 2×8.
-    pad_border = 16
-    return max(metrics.horizontalAdvance(lbl) for lbl in clean) + pad_border
-
-
-def _style_entity_name_btn(btn: QPushButton, entity_kind: str) -> None:
-    btn.setObjectName("DashboardEntityNameBtn")
-    btn.setFlat(True)
-    tone = "shot" if (entity_kind or "").strip().lower() == "shot" else "asset"
-    btn.setProperty("chipTone", tone)
-    st = btn.style()
-    if st is not None:
-        st.unpolish(btn)
-        st.polish(btn)
-
-
-class _DashboardEntityBlock(QWidget):
-    """Fixed-width entity column: name chip (fit content) · department · stretch."""
-
-    _NAME_PAD = 16
-
-    def __init__(
-        self,
-        *,
-        entity_kind: str,
-        entity_name: str,
-        department: str,
-        dept_label: str,
-        dept_btn_width: int,
-        on_entity_click,
-        parent=None,
-    ) -> None:
+class _ScheduleDueRow(DashboardResponsiveMixin, _ClickableRow):
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setFixedWidth(_DASHBOARD_ENTITY_COL_W)
-        self._full_name = (entity_name or "").strip()
-        self._name_font = monos_font("Inter", 10, QFont.Weight.ExtraBold)
-        self._dept_btn_width = max(0, int(dept_btn_width))
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-
-        self._name_btn = QPushButton(self)
-        self._name_btn.setFont(self._name_font)
-        _style_entity_name_btn(self._name_btn, entity_kind)
-        self._name_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._name_btn.setToolTip("Open this asset/shot in the main view")
-        self._name_btn.clicked.connect(on_entity_click)
-        lay.addWidget(self._name_btn, 0, Qt.AlignVCenter)
-
-        self._dept_btn: QPushButton | None = None
-        if (department or "").strip():
-            self._dept_btn = QPushButton(dept_label, self)
-            self._dept_btn.setObjectName("DashboardNoteDeptBtn")
-            self._dept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._dept_btn.setToolTip("Open this asset/shot in the main view")
-            self._dept_btn.clicked.connect(on_entity_click)
-            if self._dept_btn_width > 0:
-                self._dept_btn.setFixedWidth(self._dept_btn_width)
-            lay.addWidget(self._dept_btn, 0, Qt.AlignVCenter)
-
-        lay.addStretch(1)
-        self._refresh_name_chip()
-
-    def _max_name_chip_width(self) -> int:
-        used = 6 if self._dept_btn is not None else 0
-        if self._dept_btn is not None:
-            used += self._dept_btn_width
-        return max(40, self.width() - used)
-
-    def _refresh_name_chip(self) -> None:
-        max_w = self._max_name_chip_width()
-        text_max = max(24, max_w - self._NAME_PAD)
-        metrics = QFontMetrics(self._name_font)
-        elided = metrics.elidedText(self._full_name, Qt.TextElideMode.ElideRight, text_max)
-        self._name_btn.setText(elided)
-        chip_w = min(metrics.horizontalAdvance(elided) + self._NAME_PAD, max_w)
-        self._name_btn.setFixedWidth(max(chip_w, 40))
-        tip = self._full_name if elided != self._full_name else ""
-        self._name_btn.setToolTip(tip or "Open this asset/shot in the main view")
+        self._trailing_meta = None
+        self._entity_badges = None
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        self._refresh_name_chip()
+        self._apply_responsive_layout()
 
-    def showEvent(self, event) -> None:  # type: ignore[override]
-        super().showEvent(event)
-        self._refresh_name_chip()
+
+class _DeptLoadRow(DashboardResponsiveMixin, _ClickableRow):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._trailing_meta = None
+        self._entity_badges = None
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_responsive_layout()
 
 
 def _dot(color_hex: str, size: int = 9, parent=None) -> QLabel:
@@ -517,23 +528,34 @@ def _card(
     *,
     object_name: str = "DashboardCard",
     right_widget: QWidget | None = None,
+    body_spacing: int = _CARD_SECTION_SPACING,
+    header_height: int = _CARD_HEADER_H,
 ) -> tuple[QFrame, QVBoxLayout]:
     card = QFrame()
     card.setObjectName(object_name)
     card.setAttribute(Qt.WA_StyledBackground, True)
     body = QVBoxLayout(card)
     body.setContentsMargins(16, 14, 16, 14)
-    body.setSpacing(10)
+    body.setSpacing(body_spacing)
     if title:
-        header = QHBoxLayout()
+        header_host = QWidget(card)
+        header_host.setObjectName("DashboardCardHeader")
+        header_host.setFixedHeight(header_height)
+        header = QHBoxLayout(header_host)
+        header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
-        t = QLabel(title, card)
+        t = QLabel(title, header_host)
         t.setObjectName("DashboardCardTitle")
-        header.addWidget(t, 0, Qt.AlignVCenter)
+        t.setFixedHeight(header_height)
+        t.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        t.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        header.addWidget(t, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.addStretch(1)
         if right_widget is not None:
-            header.addWidget(right_widget, 0, Qt.AlignVCenter)
-        body.addLayout(header)
+            right_widget.setFixedHeight(header_height)
+            right_widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+            header.addWidget(right_widget, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        body.addWidget(header_host)
     return card, body
 
 
@@ -593,11 +615,18 @@ class DashboardPageWidget(QWidget):
         self._snapshot: DashboardSnapshot | None = None
         # Shared sidebar/Schedule department filter (None allowed = no whitelist).
         self._allowed_departments: set[str] | None = None
+        self._workload_departments: set[str] | None = None
+        self._workload_department_order: tuple[str, ...] = ()
+        self._workload_shot_departments: set[str] = set()
+        self._workload_asset_departments: set[str] = set()
         self._hidden_departments: set[str] = set()
         self._respect_hidden: bool = True
         self._dept_scope: str = "all"
+        self._include_shots: bool = True
+        self._include_assets: bool = True
         self._notes_filter: str = "all"  # "all" | "mentions"
-        self._dept_load_expanded: bool = False
+        self._next_week_filter_day: date | None = None
+        self._next_week_expanded: bool = False
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
 
         outer = QVBoxLayout(self)
@@ -641,7 +670,6 @@ class DashboardPageWidget(QWidget):
             "pipeline_health": self._health_card,
             "dept_load": self._dept_card,
             "next_7_days": self._next_card,
-            "needs_attention": self._attention_card,
             "recent_notes": self._notes_card,
         }
         self._bento = DashboardBentoHost(
@@ -653,6 +681,12 @@ class DashboardPageWidget(QWidget):
         self._bento.layout_committed.connect(self._persist_bento_layout)
         self._bento.layout_changed.connect(self._on_bento_layout_changed)
         self._bento.edit_mode_changed.connect(self._on_bento_edit_mode_changed)
+
+        self._dept_workload_popover = DeptWorkloadPopover(self)
+        self._dept_workload_popover.open_schedule.connect(
+            lambda dept_id: self.schedule_jump_requested.emit("", "", dept_id, "")
+        )
+        self._dept_workload_popover.entity_nav.connect(self.dashboard_entity_nav_requested.emit)
 
     # --- card construction -------------------------------------------------
     def _build_cards(self) -> None:
@@ -705,11 +739,31 @@ class DashboardPageWidget(QWidget):
         kpi_row = QHBoxLayout(self._kpi_host)
         kpi_row.setContentsMargins(0, 0, 0, 0)
         kpi_row.setSpacing(12)
-        self._tile_assets = _MetricTile("Assets", "layers", "#3b82f6", "View all assets")
-        self._tile_shots = _MetricTile("Shots", "clapperboard", "#14b8a6", "View all shots")
+        self._tile_assets = _MetricTile(
+            "Assets",
+            page_scope_icon("asset"),
+            page_scope_accent("asset"),
+            "View all assets",
+        )
+        self._tile_shots = _MetricTile(
+            "Shots",
+            page_scope_icon("shot"),
+            page_scope_accent("shot"),
+            "View all shots",
+        )
         self._tile_notes = _MetricTile("Open notes", "file-text", "#8b5cf6", "View notes")
-        self._tile_overdue = _MetricTile("Overdue", "triangle-alert", "#f97316", "View tasks")
-        self._tile_unscheduled = _MetricTile("Unscheduled", "calendar", "#ef4444", "View unscheduled")
+        self._tile_overdue = _MetricTile(
+            "Overdue",
+            schedule_attention_icon("overdue"),
+            schedule_attention_accent("overdue"),
+            "View tasks",
+        )
+        self._tile_unscheduled = _MetricTile(
+            "Unscheduled",
+            schedule_attention_icon("unscheduled"),
+            schedule_attention_accent("unscheduled"),
+            "View unscheduled",
+        )
         self._tile_assets.clicked.connect(lambda: self.open_scope_requested.emit("Assets"))
         self._tile_shots.clicked.connect(lambda: self.open_scope_requested.emit("Shots"))
         self._tile_notes.clicked.connect(self._scroll_to_notes)
@@ -738,54 +792,119 @@ class DashboardPageWidget(QWidget):
         phb.addLayout(self._health_legend)
         phb.addStretch(1)
 
-        # Department load card
-        self._dept_card, dlb = _card("Department Load")
+        # Department workload card
+        self._dept_card, dlb = _card("Department workload")
+        self._dept_list_scroll = QScrollArea(self._dept_card)
+        self._dept_list_scroll.setObjectName("DashboardDeptListScroll")
+        self._dept_list_scroll.setWidgetResizable(True)
+        self._dept_list_scroll.setFrameShape(QFrame.NoFrame)
+        self._dept_list_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._dept_list_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._dept_list_scroll.setFixedHeight(_DEPT_LIST_VIEWPORT_H)
+        self._dept_list_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._dept_list_scroll.setAttribute(Qt.WA_StyledBackground, True)
+        self._dept_list_scroll.viewport().setAttribute(Qt.WA_StyledBackground, True)
+        self._dept_list_scroll.viewport().setAutoFillBackground(False)
         self._dept_list_host = QWidget(self._dept_card)
+        self._dept_list_host.setObjectName("DashboardDeptListHost")
+        self._dept_list_host.setAttribute(Qt.WA_StyledBackground, True)
+        self._dept_list_host.setAutoFillBackground(False)
         self._dept_list = QVBoxLayout(self._dept_list_host)
         self._dept_list.setContentsMargins(0, 0, 0, 0)
         self._dept_list.setSpacing(4)
-        dlb.addWidget(self._dept_list_host)
-        self._dept_show_more_btn = QPushButton("", self._dept_card)
-        self._dept_show_more_btn.setObjectName("DashboardTileLink")
-        self._dept_show_more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._dept_show_more_btn.setFlat(True)
-        self._dept_show_more_btn.setVisible(False)
-        self._dept_show_more_btn.clicked.connect(self._toggle_dept_load_expanded)
-        dlb.addWidget(self._dept_show_more_btn, 0, Qt.AlignLeft)
+        self._dept_list.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinAndMaxSize)
+        self._dept_list_scroll.setWidget(self._dept_list_host)
+        dlb.addWidget(self._dept_list_scroll)
         dlb.addStretch(1)
 
         # Next 7 days card
         self._next_card, nxb = _card("Next 7 Days")
+        self._next_week_strip = DashboardWeekStrip(self._next_card)
+        nxb.addWidget(self._next_week_strip)
+        self._next_week_strip.day_clicked.connect(self._on_next_week_day_clicked)
+        self._next_list_scroll = QScrollArea(self._next_card)
+        self._next_list_scroll.setObjectName("DashboardNextListScroll")
+        self._next_list_scroll.setWidgetResizable(True)
+        self._next_list_scroll.setFrameShape(QFrame.NoFrame)
+        self._next_list_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._next_list_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._next_list_scroll.setFixedHeight(_NEXT_LIST_VIEWPORT_H)
+        self._next_list_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._next_list_scroll.setAttribute(Qt.WA_StyledBackground, True)
+        self._next_list_scroll.viewport().setAttribute(Qt.WA_StyledBackground, True)
         self._next_list_host = QWidget(self._next_card)
+        self._next_list_host.setObjectName("DashboardNextListHost")
+        self._next_list_host.setAttribute(Qt.WA_StyledBackground, True)
         self._next_list = QVBoxLayout(self._next_list_host)
         self._next_list.setContentsMargins(0, 0, 0, 0)
         self._next_list.setSpacing(4)
-        nxb.addWidget(self._next_list_host)
-        nxb.addStretch(1)
+        self._next_list.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinAndMaxSize)
+        self._next_list_scroll.setWidget(self._next_list_host)
+        nxb.addWidget(self._next_list_scroll)
+        next_footer = QHBoxLayout()
+        next_footer.setContentsMargins(0, 0, 0, 0)
+        next_footer.setSpacing(8)
+        self._next_show_more_btn = QPushButton(self._next_card)
+        self._next_show_more_btn.setObjectName("DashboardTileLink")
+        self._next_show_more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_show_more_btn.setFlat(True)
+        self._next_show_more_btn.setVisible(False)
+        self._next_show_more_btn.clicked.connect(self._toggle_next_week_expanded)
+        next_footer.addWidget(self._next_show_more_btn, 0, Qt.AlignLeft)
+        next_footer.addStretch(1)
+        self._next_schedule_link = QPushButton("Open Schedule  \u2192", self._next_card)
+        self._next_schedule_link.setObjectName("DashboardTileLink")
+        self._next_schedule_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_schedule_link.setFlat(True)
+        self._next_schedule_link.clicked.connect(self.open_schedule_requested.emit)
+        next_footer.addWidget(self._next_schedule_link, 0, Qt.AlignRight)
+        nxb.addLayout(next_footer)
 
-        # Needs attention card
-        self._attention_badge = QLabel("0")
-        self._attention_badge.setObjectName("DashboardAttentionBadge")
-        self._attention_badge.setVisible(False)
-        self._attention_card, atb = _card(
-            "Needs Attention", right_widget=self._attention_badge
-        )
-        self._attention_list_host = QWidget(self._attention_card)
-        self._attention_list = QVBoxLayout(self._attention_list_host)
-        self._attention_list.setContentsMargins(0, 0, 0, 0)
-        self._attention_list.setSpacing(4)
-        atb.addWidget(self._attention_list_host)
-        atb.addStretch(1)
-
-        # Recent notes card (All open vs Mentions me)
+        # Recent notes — title + filters on header row; taller list fills week-strip slot
         self._notes_filter_host = self._build_notes_filter_bar()
         self._notes_card, ntb = _card("Recent Notes", right_widget=self._notes_filter_host)
+        self._notes_list_scroll = QScrollArea(self._notes_card)
+        self._notes_list_scroll.setObjectName("DashboardNotesListScroll")
+        self._notes_list_scroll.setWidgetResizable(True)
+        self._notes_list_scroll.setFrameShape(QFrame.NoFrame)
+        self._notes_list_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._notes_list_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._notes_list_scroll.setFixedHeight(_NOTES_LIST_VIEWPORT_H)
+        self._notes_list_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._notes_list_scroll.setAttribute(Qt.WA_StyledBackground, True)
+        self._notes_list_scroll.viewport().setAttribute(Qt.WA_StyledBackground, True)
+        self._notes_list_scroll.viewport().installEventFilter(self)
         self._notes_list_host = QWidget(self._notes_card)
+        self._notes_list_host.setObjectName("DashboardNotesListHost")
+        self._notes_list_host.setAttribute(Qt.WA_StyledBackground, True)
+        self._notes_list_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self._notes_list_host.setMinimumWidth(0)
         self._notes_list = QVBoxLayout(self._notes_list_host)
         self._notes_list.setContentsMargins(0, 0, 0, 0)
         self._notes_list.setSpacing(4)
-        ntb.addWidget(self._notes_list_host)
-        ntb.addStretch(1)
+        self._notes_list.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinAndMaxSize)
+        self._notes_list_scroll.setWidget(self._notes_list_host)
+        ntb.addWidget(self._notes_list_scroll)
+
+    def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        if (
+            hasattr(self, "_notes_list_scroll")
+            and obj is self._notes_list_scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._sync_notes_list_geometry()
+        return super().eventFilter(obj, event)
+
+    def _sync_notes_list_geometry(self) -> None:
+        if not hasattr(self, "_notes_list_scroll"):
+            return
+        for i in range(self._notes_list.count()):
+            item = self._notes_list.itemAt(i)
+            if item is None:
+                continue
+            row = item.widget()
+            if row is not None and hasattr(row, "_apply_responsive_layout"):
+                row._apply_responsive_layout()
 
     def _enter_customize_mode(self) -> None:
         self._bento.enter_edit_mode()
@@ -825,10 +944,12 @@ class DashboardPageWidget(QWidget):
         self._btn_notes_all.setObjectName("DashboardNotesFilterBtn")
         self._btn_notes_all.setCheckable(True)
         self._btn_notes_all.setChecked(True)
+        self._btn_notes_all.setFixedHeight(_CARD_HEADER_H)
         self._btn_notes_all.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_notes_mentions = QPushButton("Mentions me", host)
         self._btn_notes_mentions.setObjectName("DashboardNotesFilterBtn")
         self._btn_notes_mentions.setCheckable(True)
+        self._btn_notes_mentions.setFixedHeight(_CARD_HEADER_H)
         self._btn_notes_mentions.setCursor(Qt.CursorShape.PointingHandCursor)
         self._notes_filter_group = QButtonGroup(host)
         self._notes_filter_group.setExclusive(True)
@@ -836,8 +957,8 @@ class DashboardPageWidget(QWidget):
         self._notes_filter_group.addButton(self._btn_notes_mentions, 1)
         self._notes_filter_group.idClicked.connect(self._on_notes_filter_clicked)
         self._mentions_unread_dot = UnreadDotBadge(self._btn_notes_mentions)
-        row.addWidget(self._btn_notes_all)
-        row.addWidget(self._btn_notes_mentions)
+        row.addWidget(self._btn_notes_all, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self._btn_notes_mentions, 0, Qt.AlignmentFlag.AlignVCenter)
         return host
 
     def _sync_mentions_unread_dot(self, has_unread: bool) -> None:
@@ -886,31 +1007,16 @@ class DashboardPageWidget(QWidget):
                 pass
         return did.replace("_", " ").title()
 
-    def _add_note_row(self, note: DashboardNoteRow, *, dept_btn_width: int = 0) -> None:
+    def _add_note_row(self, note: DashboardNoteRow) -> None:
         row = _NoteDashboardRow(self._notes_list_host, has_department=bool(note.department))
+        row.setFixedHeight(_NOTE_ROW_H)
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         row.clicked.connect(lambda n=note: self.open_notes_entity_requested.emit(n))
         row.open_notes.connect(lambda n=note: self.open_notes_entity_requested.emit(n))
         row.go_to_department.connect(lambda n=note: self.note_go_to_department_requested.emit(n))
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(8, 6, 8, 6)
+        rl.setContentsMargins(8, 0, 8, 0)
         rl.setSpacing(8)
-        entity_block = _DashboardEntityBlock(
-            entity_kind=note.entity_kind,
-            entity_name=note.entity_name,
-            department=note.department,
-            dept_label=self._dept_label(note.department),
-            dept_btn_width=dept_btn_width,
-            on_entity_click=lambda _=False, n=note: self.note_go_to_department_requested.emit(n),
-            parent=row,
-        )
-        rl.addWidget(entity_block, 0, Qt.AlignVCenter)
-        text = note.text.replace("\n", " ").strip()
-        if len(text) > 90:
-            text = text[:89].rstrip() + "…"
-        body = QLabel(text, row)
-        body.setFont(monos_font("Inter", 12))
-        body.setStyleSheet("color: #d4d4d8; background: transparent;")
-        rl.addWidget(body, 1)
         stub = ItemCommentEntry(
             id=note.comment_id,
             at=note.at,
@@ -930,22 +1036,54 @@ class DashboardPageWidget(QWidget):
 
             on_author = _open_profile
 
-        rl.addWidget(
-            NoteAuthorRow.for_entry(
-                stub,
-                self._workspace_root,
-                avatar_size=22,
-                name_only=True,
-                on_author_click=on_author,
-                parent=row,
-            ),
-            0,
-            Qt.AlignRight | Qt.AlignVCenter,
+        avatar = NoteAuthorRow.for_entry(
+            stub,
+            self._workspace_root,
+            avatar_size=22,
+            avatar_only=True,
+            on_author_click=on_author,
+            parent=row,
         )
-        when = QLabel(note.at[:16].replace("T", " "), row)
+        rl.addWidget(avatar, 0, Qt.AlignVCenter)
+        body = DashboardElidedLabel(
+            note.text.replace("\n", " ").strip(),
+            font=monos_font("Inter", 12),
+            parent=row,
+        )
+        body.setStyleSheet("color: #d4d4d8; background: transparent;")
+        body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        rl.addWidget(body, 1, Qt.AlignVCenter)
+        trailing = QWidget(row)
+        trailing.setObjectName("DashboardNoteRowTrailing")
+        trailing.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        tl = QHBoxLayout(trailing)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(6)
+        badges = DashboardEntityBadges(
+            entity_kind=note.entity_kind,
+            entity_name=note.entity_name,
+            department=note.department,
+            dept_label=self._dept_label(note.department),
+            dept_chip_width=0,
+            on_entity_click=lambda _=False, n=note: self.note_go_to_department_requested.emit(n),
+            parent=trailing,
+        )
+        tl.addWidget(badges, 0, Qt.AlignVCenter)
+        when = QLabel(note.at[:16].replace("T", " "), trailing)
         when.setObjectName("DashboardMutedMeta")
-        rl.addWidget(when, 0, Qt.AlignRight | Qt.AlignVCenter)
+        when.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        tl.addWidget(when, 0, Qt.AlignVCenter)
+        rl.addWidget(trailing, 0, Qt.AlignVCenter)
+        row.bind_responsive_parts(
+            trailing_meta=when,
+            entity_badges=badges,
+            body=body,
+            trailing_host=trailing,
+            leading_width=avatar.sizeHint().width() + rl.spacing(),
+            body_fills_row=True,
+        )
         self._notes_list.addWidget(row)
+        QTimer.singleShot(0, self._sync_notes_list_geometry)
 
     def _emit_unscheduled(self) -> None:
         keys = list(self._snapshot.unscheduled_entities) if self._snapshot else []
@@ -955,11 +1093,14 @@ class DashboardPageWidget(QWidget):
             self.open_schedule_requested.emit()
 
     def _on_overdue_tile_clicked(self) -> None:
-        keys = list(self._snapshot.overdue_entities) if self._snapshot else []
-        if keys:
-            self.overdue_entities_requested.emit(keys)
-        else:
-            self.open_schedule_requested.emit()
+        self.overdue_entities_requested.emit(
+            list(self._snapshot.overdue_entities) if self._snapshot else []
+        )
+
+    def overdue_entity_rows(self):
+        if self._snapshot is None:
+            return ()
+        return self._snapshot.overdue_entity_rows
 
     # --- public API --------------------------------------------------------
     def set_project_root(self, path: Path | None) -> None:
@@ -972,17 +1113,38 @@ class DashboardPageWidget(QWidget):
         self,
         *,
         allowed_department_ids: list[str] | set[str] | None,
+        workload_department_ids: list[str] | set[str] | None = None,
+        workload_department_order: tuple[str, ...] | list[str] | None = None,
+        workload_shot_department_ids: set[str] | list[str] | None = None,
+        workload_asset_department_ids: set[str] | list[str] | None = None,
         hidden_departments: set[str] | None = None,
         respect_hidden: bool = True,
         dept_scope: str = "leaf",
+        include_shots: bool = True,
+        include_assets: bool = True,
     ) -> None:
         """Mirror Schedule's department visibility so hidden/out-of-list depts disappear."""
         self._allowed_departments = (
             None if allowed_department_ids is None else set(allowed_department_ids)
         )
+        self._workload_departments = (
+            None
+            if workload_department_ids is None
+            else set(workload_department_ids)
+        )
+        order = workload_department_order or workload_department_ids or ()
+        self._workload_department_order = tuple(
+            (d or "").strip() for d in order if (d or "").strip()
+        )
+        self._workload_shot_departments = set(workload_shot_department_ids or ())
+        self._workload_asset_departments = set(workload_asset_department_ids or ())
         self._hidden_departments = set(hidden_departments or set())
         self._respect_hidden = bool(respect_hidden)
         self._dept_scope = (dept_scope or "all").strip() or "all"
+        self._include_shots = bool(include_shots)
+        self._include_assets = bool(include_assets)
+        if not self._include_shots and not self._include_assets:
+            self._include_shots = True
 
     def refresh(self, project_index: ProjectIndex | None) -> None:
         if self._project_root is None or project_index is None:
@@ -1000,7 +1162,13 @@ class DashboardPageWidget(QWidget):
             shots=project_index.shots,
             workspace_root=self._workspace_root,
             project_index=project_index,
+            include_shots=self._include_shots,
+            include_assets=self._include_assets,
             allowed_departments=self._allowed_departments,
+            workload_departments=self._workload_departments,
+            workload_department_order=self._workload_department_order,
+            workload_shot_departments=self._workload_shot_departments,
+            workload_asset_departments=self._workload_asset_departments,
             hidden_departments=self._hidden_departments,
             respect_hidden=self._respect_hidden,
             dept_scope=self._dept_scope,
@@ -1014,7 +1182,6 @@ class DashboardPageWidget(QWidget):
         self._update_health(snap)
         self._update_dept_load(snap)
         self._update_next_7_days(snap)
-        self._update_attention(snap)
         self._update_notes(snap)
         self._sync_mentions_unread_dot(snap.unread_mention_count > 0)
 
@@ -1045,9 +1212,15 @@ class DashboardPageWidget(QWidget):
         self._tile_shots.set_value(str(snap.shots_count))
         self._tile_notes.set_value(str(snap.open_notes_count))
         self._tile_overdue.set_value(str(snap.overdue_count))
-        self._tile_overdue.set_tone(snap.overdue_count > 0)
+        self._tile_overdue.set_tone(
+            snap.overdue_count > 0,
+            accent_hex=schedule_attention_accent("overdue"),
+        )
         self._tile_unscheduled.set_value(str(snap.unscheduled_count))
-        self._tile_unscheduled.set_tone(snap.unscheduled_count > 0)
+        self._tile_unscheduled.set_tone(
+            snap.unscheduled_count > 0,
+            accent_hex=schedule_attention_accent("unscheduled"),
+        )
 
     def _update_health(self, snap: DashboardSnapshot) -> None:
         _clear_layout(self._health_legend)
@@ -1093,65 +1266,155 @@ class DashboardPageWidget(QWidget):
         note.setObjectName("DashboardMutedMeta")
         self._health_legend.addWidget(note)
 
-    def _toggle_dept_load_expanded(self) -> None:
-        self._dept_load_expanded = not self._dept_load_expanded
+    def _toggle_next_week_expanded(self) -> None:
+        self._next_week_expanded = not self._next_week_expanded
         if self._snapshot is not None:
-            self._update_dept_load(self._snapshot)
+            self._update_next_7_days(self._snapshot)
 
-    def _add_dept_load_row(self, s) -> None:
-        row = _ClickableRow(self._dept_list_host)
+    def _on_next_week_day_clicked(self, day: object) -> None:
+        if day is not None and not isinstance(day, date):
+            return
+        if self._next_week_filter_day == day:
+            self._next_week_filter_day = None
+        else:
+            self._next_week_filter_day = day
+        self._next_week_expanded = False
+        if self._next_week_strip is not None:
+            self._next_week_strip.set_selected(self._next_week_filter_day)
+        if self._snapshot is not None:
+            self._update_next_7_days(self._snapshot)
+
+    def _add_next_empty_state(self, text: str) -> None:
+        wrap = QWidget(self._next_list_host)
+        wrap.setMinimumHeight(_NEXT_LIST_VIEWPORT_H)
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addStretch(1)
+        lay.addWidget(_empty_state("calendar", text))
+        lay.addStretch(1)
+        self._next_list.addWidget(wrap)
+
+    def _dept_chip_width_for_rows(self, rows) -> int:
+        return uniform_dept_chip_width(
+            [item.department_label for item in rows if (item.department or "").strip()]
+        )
+
+    def _add_upcoming_due_rows(
+        self,
+        rows,
+        *,
+        dept_chip_width: int,
+        today: date,
+        preview_limit: int | None,
+        row_budget: list[int] | None = None,
+    ) -> int:
+        """Render rows; return count of hidden rows when capped."""
+        total = len(rows)
+        if total <= 0:
+            return 0
+        limit = total
+        if preview_limit is not None:
+            limit = min(limit, preview_limit)
+        if row_budget is not None:
+            limit = min(limit, max(0, row_budget[0]))
+        visible = list(rows)[:limit]
+        for item in visible:
+            self._add_upcoming_due_row(item, dept_chip_width=dept_chip_width, today=today)
+            if row_budget is not None:
+                row_budget[0] -= 1
+        return max(0, total - len(visible))
+
+    def _open_dept_workload_popover(self, anchor: QWidget, stat: DashboardDeptStat) -> None:
+        self._dept_workload_popover.show_for_department(
+            anchor=anchor,
+            stat=stat,
+            snapshot=self._snapshot,
+        )
+
+    def _add_dept_load_row(self, s: DashboardDeptStat) -> None:
+        row = _DeptLoadRow(self._dept_list_host)
+        row.setFixedHeight(_DEPT_ROW_H)
         row.clicked.connect(
-            lambda _checked=False, dep_id=s.department: self.schedule_jump_requested.emit(
-                "", "", dep_id, ""
-            )
+            lambda _checked=False, st=s, anchor=row: self._open_dept_workload_popover(anchor, st)
         )
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(8, 6, 8, 6)
+        rl.setContentsMargins(8, 4, 8, 4)
         rl.setSpacing(8)
-        rl.addWidget(_dot(s.color_hex, 9), 0, Qt.AlignVCenter)
-        name = QLabel(s.department_label, row)
-        name.setFont(monos_font("Inter", 12, QFont.Weight.DemiBold))
+        dot_color = s.color_hex if s.total > 0 else "#52525b"
+        rl.addWidget(_dot(dot_color, 9), 0, Qt.AlignTop)
+        left = QWidget(row)
+        left.setStyleSheet("background: transparent;")
+        left_l = QVBoxLayout(left)
+        left_l.setContentsMargins(0, 0, 0, 0)
+        left_l.setSpacing(2)
+        name = DashboardElidedLabel(
+            s.department_label,
+            font=monos_font("Inter", 12, QFont.Weight.DemiBold),
+            parent=left,
+        )
         name.setStyleSheet("color: #e4e4e7; background: transparent;")
-        rl.addWidget(name, 1)
+        left_l.addWidget(name, 0)
+        if s.applies_to_shots:
+            shot_txt = f"Shots {s.shots_total}"
+            if s.shots_due_soon:
+                shot_txt += f" · {s.shots_due_soon} soon"
+            chip_widgets = [_dept_scope_chip(shot_txt, tone="shot", parent=left)]
+        else:
+            chip_widgets = []
+        if s.applies_to_assets:
+            asset_txt = f"Assets {s.assets_total}"
+            if s.assets_due_soon:
+                asset_txt += f" · {s.assets_due_soon} soon"
+            chip_widgets.append(_dept_scope_chip(asset_txt, tone="asset", parent=left))
+        if chip_widgets:
+            chips_host = QWidget(left)
+            chips_host.setStyleSheet("background: transparent;")
+            chips_l = QHBoxLayout(chips_host)
+            chips_l.setContentsMargins(0, 0, 0, 0)
+            chips_l.setSpacing(4)
+            for chip in chip_widgets:
+                chips_l.addWidget(chip, 0)
+            chips_l.addStretch(1)
+            left_l.addWidget(chips_host, 0)
+        rl.addWidget(left, 1)
         bar = _StackedBar(row, height=6)
-        bar.setFixedWidth(96)
-        done_part = s.done
-        rest = max(0, s.total - s.done)
-        bar.set_segments([(done_part, _COLOR_DONE), (rest, _COLOR_WAITING)])
+        bar.setMinimumWidth(40)
+        bar.setMaximumWidth(80)
+        bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        if s.total > 0:
+            bar.set_segments(_dept_workload_bar_segments(s))
         rl.addWidget(bar, 0, Qt.AlignVCenter)
-        meta = QLabel(f"{s.done}/{s.total}", row)
+        meta = QLabel("—" if s.total <= 0 else _dept_workload_meta(s), row)
         meta.setObjectName("DashboardMutedMeta")
-        meta.setMinimumWidth(44)
+        meta.setMinimumWidth(72)
+        meta.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         meta.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        if s.total > 0:
+            if s.overdue:
+                meta.setStyleSheet(
+                    f"color: {_COLOR_OVERDUE}; font-family: 'Inter'; font-size: 11px; font-weight: 600;"
+                )
+            elif s.due_soon:
+                meta.setStyleSheet(
+                    f"color: {_COLOR_DUE_SOON}; font-family: 'Inter'; font-size: 11px; font-weight: 600;"
+                )
         rl.addWidget(meta, 0)
+        row.bind_responsive_parts(trailing_meta=meta)
         self._dept_list.addWidget(row)
 
     def _update_dept_load(self, snap: DashboardSnapshot) -> None:
         _clear_layout(self._dept_list)
-        stats = [s for s in snap.dept_stats if s.total > 0]
+        stats = list(snap.dept_stats)
         if not stats:
-            self._dept_show_more_btn.setVisible(False)
-            self._dept_list.addWidget(_empty_state("layers", "No scheduled work yet"))
+            self._dept_list.addWidget(_empty_state("layers", "No departments in Schedule"))
             return
-        total = len(stats)
-        if total <= _DEPT_LOAD_PREVIEW:
-            visible = stats
-            self._dept_show_more_btn.setVisible(False)
-        elif self._dept_load_expanded:
-            visible = stats
-            self._dept_show_more_btn.setText("Show less")
-            self._dept_show_more_btn.setVisible(True)
-        else:
-            visible = stats[:_DEPT_LOAD_PREVIEW]
-            hidden = total - _DEPT_LOAD_PREVIEW
-            self._dept_show_more_btn.setText(f"Show all ({total})")
-            self._dept_show_more_btn.setToolTip(f"{hidden} more department{'s' if hidden != 1 else ''}")
-            self._dept_show_more_btn.setVisible(True)
-        for s in visible:
+        for s in stats:
             self._add_dept_load_row(s)
 
-    def _add_upcoming_due_row(self, item, *, dept_btn_width: int, today: date) -> None:
-        row = _ClickableRow(self._next_list_host)
+    def _add_upcoming_due_row(self, item, *, dept_chip_width: int, today: date) -> None:
+        row = _ScheduleDueRow(self._next_list_host)
+        row.setFixedHeight(_NEXT_ROW_H)
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         row.clicked.connect(
             lambda _checked=False, it=item: self.schedule_jump_requested.emit(
                 it.entity_kind,
@@ -1161,14 +1424,14 @@ class DashboardPageWidget(QWidget):
             )
         )
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(8, 6, 8, 6)
+        rl.setContentsMargins(8, 0, 8, 0)
         rl.setSpacing(8)
-        entity_block = _DashboardEntityBlock(
+        badges = DashboardEntityBadges(
             entity_kind=item.entity_kind,
             entity_name=item.entity_name,
             department=item.department,
             dept_label=item.department_label,
-            dept_btn_width=dept_btn_width,
+            dept_chip_width=dept_chip_width,
             on_entity_click=lambda _=False, it=item: self.dashboard_entity_nav_requested.emit(
                 it.entity_kind,
                 it.entity_rel,
@@ -1177,84 +1440,100 @@ class DashboardPageWidget(QWidget):
             ),
             parent=row,
         )
-        rl.addWidget(entity_block, 0, Qt.AlignVCenter)
+        rl.addWidget(badges, 0, Qt.AlignVCenter)
         rl.addStretch(1)
         due_text, is_overdue = _relative_due(item.due, today)
         due = QLabel(due_text, row)
         due.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.DemiBold))
+        due.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         due.setStyleSheet(
-            f"color: {_RED if is_overdue else '#a1a1aa'}; background: transparent;"
+            f"color: {schedule_attention_accent('overdue') if is_overdue else '#a1a1aa'}; background: transparent;"
         )
         rl.addWidget(due, 0, Qt.AlignRight | Qt.AlignVCenter)
+        row._trailing_meta_pinned = True  # type: ignore[attr-defined]
+        row.bind_responsive_parts(trailing_meta=due, entity_badges=badges, leading_width=0)
         self._next_list.addWidget(row)
 
     def _update_next_7_days(self, snap: DashboardSnapshot) -> None:
         _clear_layout(self._next_list)
+        if hasattr(self, "_next_list_scroll"):
+            self._next_list_scroll.verticalScrollBar().setValue(0)
         rows = list(snap.upcoming_due)
-        if not rows:
-            self._next_list.addWidget(_empty_state("calendar", "Nothing due in the next 7 days"))
-            return
         today = date.today()
-        visible = rows[:10]
-        dept_btn_width = _uniform_dept_btn_width(
-            [item.department_label for item in visible if (item.department or "").strip()]
-        )
-        for item in visible:
-            self._add_upcoming_due_row(item, dept_btn_width=dept_btn_width, today=today)
+        week = group_upcoming_due_for_week(rows, today=today)
+        counts = {d: len(bucket) for d, bucket in week.by_day}
+        self._next_week_strip.set_week(today=today, counts=counts)
+        self._next_week_strip.set_selected(self._next_week_filter_day)
 
-    def _update_attention(self, snap: DashboardSnapshot) -> None:
-        _clear_layout(self._attention_list)
-        alerts = [
-            ("triangle-alert", _RED, "Overdue tasks", snap.overdue_count, "overdue"),
-            ("hand", _COLOR_BLOCKED, "Blocked tasks", snap.blocked_count, "blocked"),
-            (
-                "clock",
-                _COLOR_PROGRESS,
-                "Unscheduled entities",
-                snap.unscheduled_count,
-                "unscheduled",
-            ),
-        ]
-        active = [a for a in alerts if a[3] > 0]
-        total_attention = sum(a[3] for a in active)
-        self._attention_badge.setText(str(total_attention))
-        self._attention_badge.setVisible(total_attention > 0)
-        if not active:
-            self._attention_list.addWidget(self._empty_hint("All clear — nothing needs attention"))
+        has_overdue = bool(week.overdue)
+        has_upcoming = any(bucket for _, bucket in week.by_day)
+        if not has_overdue and not has_upcoming:
+            self._next_show_more_btn.setVisible(False)
+            self._add_next_empty_state("Nothing due in the next 7 days")
             return
-        for icon_name, color, label, count, alert_id in active:
-            row = _ClickableRow(self._attention_list_host)
-            if alert_id == "unscheduled":
-                keys = list(snap.unscheduled_entities)
 
-                def _on_unscheduled(_checked: bool = False, ents: list = keys) -> None:
-                    self.unscheduled_entities_requested.emit(ents)
+        expanded = self._next_week_expanded
+        filter_day = self._next_week_filter_day
+        if expanded:
+            day_preview: int | None = None
+            overdue_preview: int | None = None
+            row_budget: list[int] | None = None
+        elif filter_day is not None:
+            day_preview = _NEXT_DAY_ROW_PREVIEW
+            overdue_preview = _NEXT_OVERDUE_PREVIEW
+            row_budget = None
+        else:
+            day_preview = None
+            overdue_preview = None
+            row_budget = [_NEXT_UNFILTERED_MAX_ROWS]
+        hidden_total = 0
 
-                row.clicked.connect(_on_unscheduled)
-            elif alert_id == "overdue":
-                keys = list(snap.overdue_entities)
-
-                def _on_overdue(_checked: bool = False, ents: list = keys) -> None:
-                    self.overdue_entities_requested.emit(ents)
-
-                row.clicked.connect(_on_overdue)
+        if has_overdue:
+            if row_budget is None or row_budget[0] > 0:
+                dept_w = self._dept_chip_width_for_rows(week.overdue)
+                hidden_total += self._add_upcoming_due_rows(
+                    week.overdue,
+                    dept_chip_width=dept_w,
+                    today=today,
+                    preview_limit=overdue_preview,
+                    row_budget=row_budget,
+                )
             else:
-                row.clicked.connect(self.open_schedule_requested.emit)
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(8, 6, 8, 6)
-            rl.setSpacing(10)
-            ic = QLabel(row)
-            icon = lucide_icon(icon_name, size=16, color_hex=color)
-            if not icon.isNull():
-                ic.setPixmap(icon.pixmap(16, 16))
-            ic.setFixedSize(16, 16)
-            rl.addWidget(ic, 0, Qt.AlignVCenter)
-            lab = QLabel(label, row)
-            lab.setFont(monos_font("Inter", 12, QFont.Weight.DemiBold))
-            lab.setStyleSheet("color: #e4e4e7; background: transparent;")
-            rl.addWidget(lab, 1)
-            rl.addWidget(_chip(str(count), color, row), 0, Qt.AlignVCenter)
-            self._attention_list.addWidget(row)
+                hidden_total += len(week.overdue)
+
+        day_sections: list[tuple[date, tuple]] = []
+        for d, bucket in week.by_day:
+            if not bucket:
+                continue
+            if filter_day is not None and d != filter_day:
+                continue
+            day_sections.append((d, bucket))
+
+        for _d, bucket in day_sections:
+            if row_budget is not None and row_budget[0] <= 0:
+                hidden_total += len(bucket)
+                continue
+            dept_w = self._dept_chip_width_for_rows(bucket)
+            hidden_total += self._add_upcoming_due_rows(
+                bucket,
+                dept_chip_width=dept_w,
+                today=today,
+                preview_limit=day_preview,
+                row_budget=row_budget,
+            )
+
+        if hidden_total > 0:
+            self._next_show_more_btn.setText(f"+{hidden_total} more")
+            self._next_show_more_btn.setToolTip(
+                f"{hidden_total} more task{'s' if hidden_total != 1 else ''} in this view"
+            )
+            self._next_show_more_btn.setVisible(True)
+        elif expanded:
+            self._next_show_more_btn.setText("Show less")
+            self._next_show_more_btn.setToolTip("")
+            self._next_show_more_btn.setVisible(True)
+        else:
+            self._next_show_more_btn.setVisible(False)
 
     def _update_notes(self, snap: DashboardSnapshot) -> None:
         _clear_layout(self._notes_list)
@@ -1273,21 +1552,22 @@ class DashboardPageWidget(QWidget):
                 self._notes_list.addWidget(
                     self._empty_hint("Sign in to see notes that mention you")
                 )
+                self._sync_notes_list_geometry()
                 return
             if not notes:
                 self._notes_list.addWidget(self._empty_hint("No open notes mention you"))
+                self._sync_notes_list_geometry()
                 return
         else:
             notes = list(snap.open_notes)
             if not notes:
                 self._notes_list.addWidget(self._empty_hint("No open notes"))
+                self._sync_notes_list_geometry()
                 return
-        visible = notes[:8]
-        dept_btn_width = _uniform_dept_btn_width(
-            [self._dept_label(n.department) for n in visible if (n.department or "").strip()]
-        )
+        visible = notes[:_NOTES_VISIBLE_MAX]
         for note in visible:
-            self._add_note_row(note, dept_btn_width=dept_btn_width)
+            self._add_note_row(note)
+        self._sync_notes_list_geometry()
 
     def _empty_hint(self, text: str) -> QLabel:
         lab = QLabel(text)

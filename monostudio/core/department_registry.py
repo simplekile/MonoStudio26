@@ -210,7 +210,10 @@ def _load_departments_json(path: Path) -> dict[str, dict] | None:
         else:
             shot_folder = folder.strip()
         asset_folder = node.get("asset_folder")
-        if isinstance(asset_folder, str) and asset_folder.strip():
+        shot_only = bool(node.get("shot_only"))
+        if shot_only:
+            asset_folder = ""
+        elif isinstance(asset_folder, str) and asset_folder.strip():
             asset_folder = asset_folder.strip()
         else:
             asset_folder = folder.strip()
@@ -227,6 +230,8 @@ def _load_departments_json(path: Path) -> dict[str, dict] | None:
             "asset_folder": asset_folder,
             "order": int(order),
         }
+        if shot_only:
+            node_out["shot_only"] = True
         parent_val = node.get("parent")
         if isinstance(parent_val, str) and parent_val.strip():
             node_out["parent"] = parent_val.strip()
@@ -433,6 +438,8 @@ class DepartmentRegistry:
         node = self._mapping.get(dept_id)
         if not node:
             return dept_id or ""
+        if context == "asset" and node.get("shot_only"):
+            return ""
         key = "shot_folder" if context == "shot" else "asset_folder"
         folder = (node.get(key) or node.get("folder") or dept_id or "").strip()
         return folder or dept_id
@@ -647,7 +654,10 @@ def _build_departments_payload(mapping: dict[str, dict]) -> dict[str, dict]:
         if not isinstance(shot_folder, str) or not shot_folder.strip():
             shot_folder = folder.strip()
         asset_folder = node.get("asset_folder")
-        if not isinstance(asset_folder, str) or not asset_folder.strip():
+        shot_only = bool(node.get("shot_only"))
+        if shot_only:
+            asset_folder = ""
+        elif not isinstance(asset_folder, str) or not asset_folder.strip():
             asset_folder = folder.strip()
         label = node.get("label")
         if not isinstance(label, str) or not label.strip():
@@ -659,9 +669,11 @@ def _build_departments_payload(mapping: dict[str, dict]) -> dict[str, dict]:
             "label": label.strip(),
             "folder": folder.strip(),
             "shot_folder": shot_folder.strip(),
-            "asset_folder": asset_folder.strip(),
+            "asset_folder": asset_folder.strip() if isinstance(asset_folder, str) else "",
             "order": int(order),
         }
+        if shot_only:
+            row["shot_only"] = True
         if isinstance(node.get("parent"), str) and (node.get("parent") or "").strip():
             row["parent"] = (node.get("parent") or "").strip()
         dccs = node.get("dccs")

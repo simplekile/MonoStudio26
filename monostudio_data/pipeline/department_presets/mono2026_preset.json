@@ -22,7 +22,7 @@
     "fluids": {"label": "Fluids", "folder": "fluids", "shot_folder": "fluids", "asset_folder": "fluids", "order": 20, "parent": "fx"},
     "destruction": {"label": "Destruction", "folder": "destruction", "shot_folder": "destruction", "asset_folder": "destruction", "order": 21, "parent": "fx"},
     "particles": {"label": "Particles", "folder": "particles", "shot_folder": "particles", "asset_folder": "particles", "order": 22, "parent": "fx"},
-    "lighting": {"label": "Lighting", "folder": "lighting", "shot_folder": "03_lighting", "asset_folder": "08_lighting", "order": 23},
+    "lighting": {"label": "Lighting", "folder": "lighting", "shot_folder": "03_lighting", "shot_only": true, "order": 23},
     "comp": {"label": "Comp", "folder": "comp", "shot_folder": "04_comp", "asset_folder": "comp", "order": 24}
   },
   "create_default_dcc_by_department": {

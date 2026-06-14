@@ -110,6 +110,10 @@ def _departments_for_mode(meta: PipelineTypesAndPresets, mode: Mode, category_id
                     depts.append(d)
     depts = [d for d in depts if isinstance(d, str) and d.strip()]
     depts.sort(key=lambda s: s.lower())
+    if mode == "assets":
+        from monostudio.core.pipeline_types_and_presets import filter_departments_for_entity_scope
+
+        depts = filter_departments_for_entity_scope(depts, "asset")
     # No per-department display/short/icon schema yet → use id as label/short.
     return [FilterItem(id=d, label=d, short=d) for d in depts]
 

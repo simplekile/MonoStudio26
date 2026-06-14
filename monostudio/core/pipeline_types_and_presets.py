@@ -40,6 +40,21 @@ class PipelineTypesAndPresets:
 
 EntityScope = Literal["asset", "shot"]
 
+# Departments that exist on shots only (never offered for assets).
+SHOT_ONLY_DEPARTMENT_IDS: frozenset[str] = frozenset({"lighting"})
+
+
+def filter_departments_for_entity_scope(
+    dept_ids: list[str],
+    scope: EntityScope,
+) -> list[str]:
+    """Drop shot-only departments when ``scope`` is ``asset``."""
+    if scope != "asset":
+        return list(dept_ids)
+    blocked = SHOT_ONLY_DEPARTMENT_IDS
+    return [d for d in dept_ids if (d or "").strip() and d.strip() not in blocked]
+
+
 # Lucide slugs shipped under monostudio_data/icons/lucide/ (sidebar, picker, badges).
 DEPARTMENT_ICON_DEFAULTS: dict[str, str] = {
     "layout": "layout-dashboard",
@@ -299,7 +314,8 @@ def ordered_department_ids_for_scope(
             p = registry.get_parent(dept_id)
             if p:
                 parent_of[dept_id] = p
-    return order_department_ids_grouped_by_parent(depts, parent_of, order_source)
+    ordered = order_department_ids_grouped_by_parent(depts, parent_of, order_source)
+    return filter_departments_for_entity_scope(ordered, scope)
 
 
 def pipeline_root() -> Path:
@@ -337,7 +353,7 @@ def get_default_pipeline_types_and_presets() -> PipelineTypesAndPresets:
         "shot": TypeDef("shot", "Shot", "sh", ["layout", "anim", "fx", "lighting"], "clapperboard"),
         "character": TypeDef("character", "Character", "char", ["model", "rig", "surfacing", "grooming", "lookdev"], "user"),
         "prop": TypeDef("prop", "Prop", "prop", ["model", "surfacing", "grooming", "lookdev"], "package"),
-        "environment": TypeDef("environment", "Environment", "env", ["layout", "model", "lighting", "lookdev"], "trees"),
+        "environment": TypeDef("environment", "Environment", "env", ["layout", "model", "lookdev"], "trees"),
     }
     return PipelineTypesAndPresets(types=default_types, departments=default_depts)
 
@@ -399,7 +415,7 @@ def ensure_pipeline_bootstrap() -> None:
                 "name": "Environment",
                 "short_name": "env",
                 "icon_name": "trees",
-                "departments": ["layout", "model", "lighting", "lookdev"],
+                "departments": ["layout", "model", "lookdev"],
             },
         }
     }

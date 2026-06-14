@@ -25,7 +25,7 @@
       "id": "_environment",
       "name": "Environment",
       "short_name": "env",
-      "departments": ["layout", "sculpt", "retopo", "uv", "lighting", "lookdev"],
+      "departments": ["layout", "sculpt", "retopo", "uv", "lookdev"],
       "icon_name": "trees"
     },
     "vehicle": {

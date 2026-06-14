@@ -201,8 +201,10 @@ def default_target_status_for_department(
     visible = reg.menu_status_ids()
     if not visible:
         return "working"
-    # Prefer last in-progress/review stage before done
-    for cat in ("review", "in_progress", "done"):
+    preferred = "published"
+    if preferred in visible:
+        return preferred
+    for cat in ("in_progress", "review", "done"):
         for sid in reversed(visible):
             if reg.category_for(sid) == cat:
                 return sid

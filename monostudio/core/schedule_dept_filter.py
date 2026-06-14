@@ -14,6 +14,7 @@ INSPECTOR_HIDDEN_DEPTS_KEY = "inspector/hidden_departments"
 SCHEDULE_DEPT_SCOPE_KEY = "schedule/dept_scope"
 SCHEDULE_RESPECT_HIDDEN_KEY = "schedule/respect_inspector_hidden"
 SCHEDULE_BAR_LABEL_KEY = "schedule/bar_label_mode"
+SCHEDULE_HIDE_SKIPPED_KEY = "schedule/hide_skipped"
 
 BAR_LABEL_DAYS = "days"
 BAR_LABEL_DATE_RANGE = "date_range"

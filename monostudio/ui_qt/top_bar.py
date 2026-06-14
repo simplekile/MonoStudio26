@@ -7,6 +7,7 @@ from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer, Sig
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontMetrics,
     QIcon,
     QMouseEvent,
     QPainter,
@@ -381,10 +382,25 @@ class TopBar(QWidget):
         # Keep visuals in sync with current layout mode (sizes stay fixed).
         self._panel_compact = False
 
+        self._project_display_name_raw: str | None = None
+        self._project_name_label = QLabel("SELECT PROJECT", self)
+        self._project_name_label.setObjectName("TopBarProjectNameLabel")
+        self._project_name_label.setWordWrap(False)
+        self._project_name_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._project_name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._project_name_label.setMinimumWidth(0)
+        try:
+            pf = self._project_name_label.font()
+            pf.setPointSize(14)
+            pf.setWeight(QFont.Weight.Bold)
+            self._project_name_label.setFont(pf)
+        except Exception:
+            pass
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 10, 8, 10)
         layout.setSpacing(0)
-        layout.addStretch(1)
+        layout.addWidget(self._project_name_label, 1, Qt.AlignLeft | Qt.AlignVCenter)
         layout.addWidget(self._panel_group, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addSpacing(10)
         self._action_strip = QWidget(self)
@@ -411,6 +427,36 @@ class TopBar(QWidget):
         layout.addWidget(self._btn_min, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_max, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self._btn_close, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+    def set_project_display_name(self, name: str | None) -> None:
+        if not name:
+            self._project_display_name_raw = None
+            self._project_name_label.setText("SELECT PROJECT")
+            self._project_name_label.setToolTip("")
+        else:
+            self._project_display_name_raw = name
+            self._sync_project_name_label_text()
+
+    def _sync_project_name_label_text(self) -> None:
+        raw = self._project_display_name_raw
+        if not raw:
+            return
+        display = raw.upper()
+        label = self._project_name_label
+        available = max(0, label.width())
+        if available > 0:
+            fm = QFontMetrics(label.font())
+            if fm.horizontalAdvance(display) > available:
+                label.setText(fm.elidedText(display, Qt.TextElideMode.ElideRight, available))
+                label.setToolTip(display)
+                return
+        label.setText(display)
+        label.setToolTip("")
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._project_display_name_raw:
+            self._sync_project_name_label_text()
 
     def set_notification_context(
         self,

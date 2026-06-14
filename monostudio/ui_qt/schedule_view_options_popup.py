@@ -97,7 +97,16 @@ class ScheduleViewOptionsPopup:
         )
         self.chk_unscheduled = QCheckBox("Unscheduled only", self.popup)
         self.chk_overdue = QCheckBox("Overdue only", self.popup)
-        for chk in (self.chk_respect_hidden, self.chk_unscheduled, self.chk_overdue):
+        self.chk_hide_skipped = QCheckBox("Hide skipped", self.popup)
+        self.chk_hide_skipped.setToolTip(
+            "Hide timeline rows marked Skipped (N/A) — items, departments, lanes, and waves"
+        )
+        for chk in (
+            self.chk_respect_hidden,
+            self.chk_unscheduled,
+            self.chk_overdue,
+            self.chk_hide_skipped,
+        ):
             chk.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             outer.addWidget(chk)
 

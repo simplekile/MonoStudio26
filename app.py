@@ -9,7 +9,7 @@ from pathlib import Path
 
 import time
 from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImageReader, QPainter, QPixmap
+from PySide6.QtGui import QIcon, QImageReader
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
 from monostudio.core.access_control import (
@@ -29,17 +29,17 @@ from monostudio.core.single_instance import acquire_single_instance
 from monostudio.core.tray_preferences import read_start_minimized_to_tray, read_startup_splash_ms
 from monostudio.ui_qt.main_window import MainWindow
 from monostudio.core.version import get_app_version
+
+from monostudio.ui_qt.splash import (
+    SPLASH_DISMISS_DELAY_MS,
+    dismiss_splash_to_main_window,
+    ensure_splash_fonts,
+    make_splash_pixmap,
+    splash_tail_status,
+)
 from monostudio.ui_qt.style import apply_dark_theme
 
 SPLASH_LOADING_UPDATE_MS = 50
-SPLASH_SIZE = (460, 280)
-SPLASH_BG = "#121214"
-SPLASH_ICON_SIZE = 88
-SPLASH_TITLE_COLOR = "#fafafa"  # Zinc-100
-SPLASH_SUBTITLE_COLOR = "#71717a"  # Zinc-500
-SPLASH_STATUS_COLOR = "#52525b"   # Zinc-600 (status text)
-SPLASH_LOADING_COLOR = "#3f3f46"  # track
-SPLASH_LOADING_FILL = "#2563eb"   # Electric Blue (active)
 
 
 def _parse_launch_args(argv: list[str]) -> argparse.Namespace:
@@ -48,85 +48,6 @@ def _parse_launch_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--minimized", action="store_true", help="Alias for startup-to-tray flow")
     known, _rest = parser.parse_known_args(argv[1:])
     return known
-
-
-def _make_splash_pixmap(
-    icon: QIcon,
-    loading_progress: float = 0.0,
-    status_text: str = "",
-    version: str = "",
-) -> QPixmap:
-    from PySide6.QtGui import QBrush
-
-    w, h = SPLASH_SIZE
-    _app = QApplication.instance()
-    dpr = _app.primaryScreen().devicePixelRatio() if _app and _app.primaryScreen() else 1.0
-    pix = QPixmap(int(w * dpr), int(h * dpr))
-    pix.setDevicePixelRatio(dpr)
-    pix.fill(QColor(SPLASH_BG))
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-
-    # Logo container (rounded rect, subtle bg)
-    icon_box_pad = 16
-    icon_box_size = SPLASH_ICON_SIZE + icon_box_pad * 2
-    icon_box_x = (w - icon_box_size) // 2
-    icon_box_y = 44
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QBrush(QColor(255, 255, 255, 18)))
-    painter.drawRoundedRect(icon_box_x, icon_box_y, icon_box_size, icon_box_size, 14, 14)
-
-    # Logo centered inside container
-    icon_pix = icon.pixmap(SPLASH_ICON_SIZE, SPLASH_ICON_SIZE)
-    if not icon_pix.isNull():
-        ix = icon_box_x + icon_box_pad
-        iy = icon_box_y + icon_box_pad
-        painter.drawPixmap(ix, iy, SPLASH_ICON_SIZE, SPLASH_ICON_SIZE, icon_pix)
-
-    # Title: MONOS (italic)
-    title_y = icon_box_y + icon_box_size + 16
-    title_font = QFont("Inter", 16, QFont.Weight.Bold)
-    title_font.setItalic(True)
-    title_font.setLetterSpacing(QFont.PercentageSpacing, 98)
-    painter.setFont(title_font)
-    painter.setPen(QColor(SPLASH_TITLE_COLOR))
-    painter.drawText(0, title_y, w, 24, Qt.AlignmentFlag.AlignCenter, "MONOS")
-
-    # Subtitle: Mono Studio v26.xx (smaller)
-    sub_font = QFont("Inter", 9, QFont.Weight.Normal)
-    painter.setFont(sub_font)
-    painter.setPen(QColor(SPLASH_SUBTITLE_COLOR))
-    subtitle = f"Mono Studio {version}" if version else "Mono Studio"
-    painter.drawText(0, title_y + 24, w, 16, Qt.AlignmentFlag.AlignCenter, subtitle)
-
-    # Status text (above loading bar)
-    bar_margin = 32
-    bar_y = h - 20
-    if status_text:
-        status_font = QFont("Inter", 10, QFont.Weight.Normal)
-        painter.setFont(status_font)
-        painter.setPen(QColor(SPLASH_STATUS_COLOR))
-        painter.drawText(bar_margin, bar_y - 18, w - 2 * bar_margin, 16,
-                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         status_text)
-
-    # Loading bar
-    bar_height = 3
-    bar_width = w - 2 * bar_margin
-    bar_x = bar_margin
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QBrush(QColor(SPLASH_LOADING_COLOR)))
-    painter.drawRoundedRect(bar_x, bar_y, bar_width, bar_height, 2, 2)
-    if loading_progress > 0:
-        fill_width = max(0, min(bar_width, int(bar_width * loading_progress)))
-        if fill_width > 0:
-            painter.setBrush(QBrush(QColor(SPLASH_LOADING_FILL)))
-            painter.drawRoundedRect(bar_x, bar_y, fill_width, bar_height, 2, 2)
-
-    painter.end()
-    return pix
 
 
 def _ensure_comtypes_on_windows() -> None:
@@ -229,46 +150,51 @@ def main() -> int:
     # Resolve version once (git commit count)
     _version = get_app_version()
 
-    # Splash first — show immediately (before theme/font/icon loading)
+    # Splash first — show immediately (before theme/icon loading)
+    ensure_splash_fonts()
     splash_start = time.monotonic()
     _icon = QIcon()
     _splash_status = ""
     splash = QSplashScreen(
-        _make_splash_pixmap(_icon, 0.0, "Starting…", _version),
+        make_splash_pixmap(_icon, 0.0, "Starting…", _version),
         Qt.WindowType.WindowStaysOnTopHint,
     )
     splash.show()
     app.processEvents()
 
-    def _splash_step(status: str, progress: float) -> None:
+    def _splash_step(status: str) -> None:
         nonlocal _splash_status
         _splash_status = status
-        splash.setPixmap(_make_splash_pixmap(_icon, progress, status, _version))
+        splash.setPixmap(make_splash_pixmap(_icon, 0.0, status, _version))
         app.processEvents()
 
     # Init steps while splash is visible
-    _splash_step("Loading config…", 0.10)
+    _splash_step("Starting…")
+    _splash_step("Preparing environment…")
     QImageReader.setAllocationLimit(0)
     QApplication.setWheelScrollLines(1)
+
+    _splash_step("Loading config…")
     ensure_user_default_config_dir()
+
+    _splash_step("Migrating settings…")
     migrate_app_settings_if_needed()
     write_install_path_for_tools()  # so MonoFXSuite etc. can discover install dir for "Under MonoStudio"
 
-    _splash_step("Applying theme…", 0.25)
+    _splash_step("Applying theme…")
     apply_dark_theme(app)
 
-    _splash_step("Loading icons…", 0.40)
+    _splash_step("Loading icons…")
     _icon_path = get_app_base_path() / "monostudio_data" / "icons" / "app.ico"
     _icon = QIcon(str(_icon_path)) if _icon_path.is_file() else QIcon()
     if not _icon.isNull():
         app.setWindowIcon(_icon)
-    _splash_step("Loading icons…", 0.45)
 
-    _splash_step("Checking dependencies…", 0.50)
+    _splash_step("Checking dependencies…")
     _ensure_comtypes_on_windows()
 
-    _splash_step("Building interface…", 0.65)
-    window = MainWindow()
+    _splash_step("Building interface…")
+    window = MainWindow(splash_status=_splash_step)
     window.launch_hidden_to_tray = hide_to_tray_after_splash
     if launch_deep_link:
         window.set_pending_deep_link(launch_deep_link)
@@ -276,6 +202,7 @@ def main() -> int:
         window.setWindowIcon(_icon)
     instance_guard.set_on_raise(lambda: window.present())
     instance_guard.set_on_deep_link(lambda url: window.handle_deep_link(url))
+    _splash_step("Starting background services…")
     try:
         from monostudio.core.deep_link_server import start_deep_link_server
 
@@ -283,27 +210,34 @@ def main() -> int:
     except Exception:
         pass
 
-    _splash_step("Almost ready…", 0.90)
+    _splash_init_done_at = time.monotonic()
+
+    _splash_ready_at: float | None = None
 
     # Keep splash visible until at least configured minimum has passed
     def _tick_splash() -> None:
+        nonlocal _splash_ready_at
         elapsed = (time.monotonic() - splash_start) * 1000
         if _splash_display_ms <= 0:
             progress = 1.0
         else:
             progress = min(1.0, elapsed / _splash_display_ms)
-        status = "Ready" if progress >= 1.0 else _splash_status
-        splash.setPixmap(_make_splash_pixmap(_icon, progress, status, _version))
         if progress >= 1.0:
+            status = "Ready"
+        elif _splash_init_done_at is not None:
+            tail_elapsed_ms = (time.monotonic() - _splash_init_done_at) * 1000
+            status = splash_tail_status(tail_elapsed_ms)
+        else:
+            status = _splash_status
+        splash.setPixmap(make_splash_pixmap(_icon, progress, status, _version))
+        if progress >= 1.0:
+            if _splash_ready_at is None:
+                _splash_ready_at = time.monotonic()
+            if (time.monotonic() - _splash_ready_at) * 1000 < SPLASH_DISMISS_DELAY_MS:
+                return
             _splash_timer.stop()
-            if hide_to_tray_after_splash:
-                splash.finish(window)
-                window.hide()
-                window.complete_startup()
-            else:
-                window.show()
-                splash.finish(window)
-                window.complete_startup()
+            dismiss_splash_to_main_window(splash, window, show_main=not hide_to_tray_after_splash)
+            window.complete_startup()
 
     _splash_timer = QTimer(splash)
     _splash_timer.timeout.connect(_tick_splash)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 from monostudio.core.item_comments import (
@@ -15,6 +16,7 @@ from monostudio.core.project_schedule import (
     collect_unscheduled_entity_keys,
     read_project_schedule,
 )
+from monostudio.core.schedule_dept_filter import DEPT_SCOPE_ALL
 from monostudio.core.schedule_planner import (
     STATUS_DONE,
     STATUS_EXCLUDED,
@@ -22,6 +24,7 @@ from monostudio.core.schedule_planner import (
     bar_has_blocked_status,
     build_planned_bars,
     collect_overdue_entity_keys,
+    collect_overdue_entity_rows,
     collect_upcoming_due_rows,
     count_overdue_bars,
 )
@@ -43,7 +46,7 @@ class DashboardNoteRow:
 
 @dataclass(frozen=True)
 class DashboardDeptStat:
-    """Per-department roll-up across all planned bars (Department Load card)."""
+    """Per-department roll-up for the Department workload card."""
 
     department: str
     department_label: str
@@ -51,7 +54,17 @@ class DashboardDeptStat:
     done: int
     in_progress: int
     overdue: int
+    waiting: int
+    due_soon: int
     color_hex: str
+    shots_total: int = 0
+    assets_total: int = 0
+    shots_due_soon: int = 0
+    assets_due_soon: int = 0
+    shots_overdue: int = 0
+    assets_overdue: int = 0
+    applies_to_shots: bool = False
+    applies_to_assets: bool = False
 
     @property
     def completion_pct(self) -> float:
@@ -67,12 +80,15 @@ class DashboardSnapshot:
     unread_mention_count: int  # unread @mentions in mention_inbox (not yet viewed)
     overdue_count: int
     overdue_entities: tuple[tuple[str, str], ...]  # (entity_kind, entity_rel)
+    overdue_entity_rows: tuple  # OverdueEntityRow
     unscheduled_count: int
     unscheduled_entities: tuple[tuple[str, str], ...]  # (entity_kind, entity_rel)
     allocation_count: int
     open_notes: tuple[DashboardNoteRow, ...]
     mention_notes: tuple[DashboardNoteRow, ...]  # open notes @mentioning signed-in user
     upcoming_due: tuple  # UpcomingDueRow
+    dept_workload_overdue_rows: tuple = ()  # OverdueEntityRow — all depts (workload popover)
+    dept_workload_upcoming_due: tuple = ()  # UpcomingDueRow — all depts (workload popover)
     # Pipeline health (derived from planned bars)
     total_bars: int = 0
     done_count: int = 0
@@ -202,6 +218,36 @@ def _filter_bars_by_departments(
     return out
 
 
+def build_metrics_planned_bars(
+    project_root: Path,
+    project_index,
+    schedule: ProjectSchedule,
+    *,
+    include_shots: bool = True,
+    include_assets: bool = True,
+    allowed_departments: set[str] | None = None,
+    hidden_departments: set[str] | None = None,
+    respect_hidden: bool = True,
+    dept_scope: str = "leaf",
+) -> dict:
+    """Planned bars for Dashboard KPIs and Schedule overdue stat — shared scope rules."""
+    bars = build_planned_bars(
+        project_root,
+        project_index,
+        schedule,
+        include_shots=bool(include_shots),
+        include_assets=bool(include_assets),
+    )
+    return _filter_bars_by_departments(
+        bars,
+        project_root,
+        allowed=allowed_departments,
+        hidden=hidden_departments or set(),
+        respect_hidden=respect_hidden,
+        dept_scope=dept_scope,
+    )
+
+
 def build_dashboard_snapshot(
     project_root: Path | None,
     *,
@@ -209,7 +255,13 @@ def build_dashboard_snapshot(
     shots: tuple,
     workspace_root: Path | None = None,
     project_index=None,
+    include_shots: bool = True,
+    include_assets: bool = True,
     allowed_departments: set[str] | None = None,
+    workload_departments: set[str] | None = None,
+    workload_department_order: tuple[str, ...] | None = None,
+    workload_shot_departments: set[str] | None = None,
+    workload_asset_departments: set[str] | None = None,
     hidden_departments: set[str] | None = None,
     respect_hidden: bool = True,
     dept_scope: str = "all",
@@ -240,24 +292,23 @@ def build_dashboard_snapshot(
     blocked_count = 0
     completion_pct = 0.0
     dept_stats: tuple[DashboardDeptStat, ...] = ()
+    dept_workload_overdue: tuple = ()
+    dept_workload_upcoming: tuple = ()
     bars: dict = {}
     if project_index is not None:
-        bars = build_planned_bars(
+        bars = build_metrics_planned_bars(
             root,
             project_index,
             schedule,
-            include_shots=True,
-            include_assets=True,
-        )
-        bars = _filter_bars_by_departments(
-            bars,
-            root,
-            allowed=allowed_departments,
-            hidden=hidden_departments or set(),
+            include_shots=include_shots,
+            include_assets=include_assets,
+            allowed_departments=allowed_departments,
+            hidden_departments=hidden_departments,
             respect_hidden=respect_hidden,
             dept_scope=dept_scope,
         )
         overdue_count = count_overdue_bars(bars)
+        overdue_rows = tuple(collect_overdue_entity_rows(bars))
         upcoming = tuple(collect_upcoming_due_rows(bars))
         (
             total_bars,
@@ -266,8 +317,32 @@ def build_dashboard_snapshot(
             waiting_count,
             blocked_count,
             completion_pct,
-            dept_stats,
+            _,
         ) = _summarize_bars(bars, root)
+        # Department workload: Schedule universe, both scopes, all dept levels.
+        workload_allow = workload_departments if workload_departments is not None else allowed_departments
+        bars_workload = build_metrics_planned_bars(
+            root,
+            project_index,
+            schedule,
+            include_shots=True,
+            include_assets=True,
+            allowed_departments=workload_allow,
+            hidden_departments=hidden_departments,
+            respect_hidden=respect_hidden,
+            dept_scope=DEPT_SCOPE_ALL,
+        )
+        dept_stats = _summarize_dept_workload(
+            bars_workload,
+            root,
+            universe_ids=workload_department_order or tuple(workload_allow or ()),
+            shot_dept_ids=workload_shot_departments or set(),
+            asset_dept_ids=workload_asset_departments or set(),
+            hidden_departments=hidden_departments,
+            respect_hidden=respect_hidden,
+        )
+        dept_workload_overdue = tuple(collect_overdue_entity_rows(bars_workload))
+        dept_workload_upcoming = tuple(collect_upcoming_due_rows(bars_workload))
 
     return DashboardSnapshot(
         assets_count=len(assets),
@@ -277,6 +352,7 @@ def build_dashboard_snapshot(
         unread_mention_count=unread_mention_count,
         overdue_count=overdue_count,
         overdue_entities=tuple(collect_overdue_entity_keys(bars)),
+        overdue_entity_rows=overdue_rows,
         unscheduled_entities=tuple(
             unscheduled_keys := collect_unscheduled_entity_keys(
                 schedule,
@@ -290,6 +366,8 @@ def build_dashboard_snapshot(
         open_notes=tuple(open_notes),
         mention_notes=tuple(mention_notes),
         upcoming_due=upcoming,
+        dept_workload_overdue_rows=dept_workload_overdue,
+        dept_workload_upcoming_due=dept_workload_upcoming,
         total_bars=total_bars,
         done_count=done_count,
         in_progress_count=in_progress_count,
@@ -303,18 +381,23 @@ def build_dashboard_snapshot(
 def _summarize_bars(
     bars: dict,
     project_root: Path,
+    *,
+    today: date | None = None,
 ) -> tuple[int, int, int, int, int, float, tuple[DashboardDeptStat, ...]]:
     """Derive pipeline-health counts + per-department roll-ups from planned bars."""
+    ref = today or date.today()
+    horizon = ref + timedelta(days=7)
     done = in_progress = waiting = blocked = 0
     in_scope = 0
     status_regs: dict[str, object] = {}
-    # dept_id -> [label, total, done, in_progress, overdue, color_hex]
+    # dept_id -> [label, total, done, in_progress, overdue, waiting, due_soon, color_hex]
     by_dept: dict[str, list] = {}
     for bar in bars.values():
         if bar.status == STATUS_EXCLUDED:
             continue
         in_scope += 1
-        if bar.status == STATUS_DONE:
+        is_done = bar.status == STATUS_DONE or bar.goal_met
+        if is_done:
             done += 1
         elif bar.status == STATUS_PROGRESS:
             in_progress += 1
@@ -325,23 +408,34 @@ def _summarize_bars(
         dep = (bar.department or "").strip() or "unknown"
         slot = by_dept.get(dep)
         if slot is None:
-            slot = [bar.department_label or dep, 0, 0, 0, 0, bar.color_hex]
+            slot = [bar.department_label or dep, 0, 0, 0, 0, 0, 0, bar.color_hex]
             by_dept[dep] = slot
         slot[1] += 1
-        if bar.status == STATUS_DONE:
+        if is_done:
             slot[2] += 1
         elif bar.status == STATUS_PROGRESS:
             slot[3] += 1
-        if bar.overdue:
+        elif bar.overdue:
             slot[4] += 1
-        # Prefer a "louder" color for the dept dot: overdue/in-progress over done.
-        if bar.overdue or bar.status == STATUS_PROGRESS:
-            slot[5] = bar.color_hex
+        else:
+            slot[5] += 1
+        if (
+            not is_done
+            and bar.status != STATUS_EXCLUDED
+            and ref <= bar.due <= horizon
+        ):
+            slot[6] += 1
+        if bar.overdue:
+            slot[7] = "#ef4444"
+        elif bar.status == STATUS_PROGRESS:
+            slot[7] = bar.color_hex
+        elif slot[4] == 0 and slot[6] > 0:
+            slot[7] = "#60a5fa"
 
     total = in_scope
     completion = (done / in_scope * 100.0) if in_scope else 0.0
     stats: list[DashboardDeptStat] = []
-    for dep, (label, tot, dn, ip, ov, color) in by_dept.items():
+    for dep, (label, tot, dn, ip, ov, wt, due_soon, color) in by_dept.items():
         stats.append(
             DashboardDeptStat(
                 department=dep,
@@ -350,9 +444,173 @@ def _summarize_bars(
                 done=dn,
                 in_progress=ip,
                 overdue=ov,
+                waiting=wt,
+                due_soon=due_soon,
                 color_hex=color,
             )
         )
-    # Surface the most pressing departments first: overdue, then least complete.
-    stats.sort(key=lambda s: (-s.overdue, s.completion_pct, s.department_label.lower()))
+    stats.sort(
+        key=lambda s: (-s.overdue, -s.due_soon, s.completion_pct, s.department_label.lower())
+    )
     return total, done, in_progress, waiting, blocked, completion, tuple(stats)
+
+
+def _summarize_dept_workload(
+    bars: dict,
+    project_root: Path,
+    *,
+    universe_ids: tuple[str, ...],
+    shot_dept_ids: set[str],
+    asset_dept_ids: set[str],
+    hidden_departments: set[str] | None = None,
+    respect_hidden: bool = True,
+    today: date | None = None,
+) -> tuple[DashboardDeptStat, ...]:
+    """Roll up workload per Schedule department, split by shot/asset, fill empty universe rows."""
+    from monostudio.core.department_registry import DepartmentRegistry
+
+    ref = today or date.today()
+    horizon = ref + timedelta(days=7)
+    dept_reg = DepartmentRegistry.for_project(project_root)
+    status_regs: dict[str, object] = {}
+    hidden = hidden_departments or set()
+    # dep -> mutable slot
+    slots: dict[str, dict[str, object]] = {}
+
+    def _slot(dep: str, label: str, color: str) -> dict[str, object]:
+        existing = slots.get(dep)
+        if existing is not None:
+            return existing
+        created: dict[str, object] = {
+            "label": label,
+            "total": 0,
+            "done": 0,
+            "in_progress": 0,
+            "overdue": 0,
+            "waiting": 0,
+            "due_soon": 0,
+            "color": color,
+            "shots_total": 0,
+            "assets_total": 0,
+            "shots_due_soon": 0,
+            "assets_due_soon": 0,
+            "shots_overdue": 0,
+            "assets_overdue": 0,
+        }
+        slots[dep] = created
+        return created
+
+    for bar in bars.values():
+        if bar.status == STATUS_EXCLUDED:
+            continue
+        dep = (bar.department or "").strip() or "unknown"
+        is_shot = (bar.entity_kind or "").strip().lower() == "shot"
+        is_done = bar.status == STATUS_DONE or bar.goal_met
+        slot = _slot(dep, bar.department_label or dep, bar.color_hex)
+        slot["total"] = int(slot["total"]) + 1
+        if is_shot:
+            slot["shots_total"] = int(slot["shots_total"]) + 1
+        else:
+            slot["assets_total"] = int(slot["assets_total"]) + 1
+        if is_done:
+            slot["done"] = int(slot["done"]) + 1
+        elif bar.status == STATUS_PROGRESS:
+            slot["in_progress"] = int(slot["in_progress"]) + 1
+        elif bar.overdue:
+            slot["overdue"] = int(slot["overdue"]) + 1
+            if is_shot:
+                slot["shots_overdue"] = int(slot["shots_overdue"]) + 1
+            else:
+                slot["assets_overdue"] = int(slot["assets_overdue"]) + 1
+        else:
+            slot["waiting"] = int(slot["waiting"]) + 1
+        due_soon = (
+            not is_done
+            and bar.status != STATUS_EXCLUDED
+            and ref <= bar.due <= horizon
+        )
+        if due_soon:
+            slot["due_soon"] = int(slot["due_soon"]) + 1
+            if is_shot:
+                slot["shots_due_soon"] = int(slot["shots_due_soon"]) + 1
+            else:
+                slot["assets_due_soon"] = int(slot["assets_due_soon"]) + 1
+        if bar.overdue:
+            slot["color"] = "#ef4444"
+        elif bar.status == STATUS_PROGRESS:
+            slot["color"] = bar.color_hex
+        elif int(slot["overdue"]) == 0 and int(slot["due_soon"]) > 0:
+            slot["color"] = "#60a5fa"
+        if bar_has_blocked_status(bar, project_root, reg_cache=status_regs):
+            pass
+
+    def _visible_dep(dep: str) -> bool:
+        return not (respect_hidden and dep in hidden)
+
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+    for dep in universe_ids:
+        d = (dep or "").strip()
+        if not d or d in seen or not _visible_dep(d):
+            continue
+        seen.add(d)
+        ordered_ids.append(d)
+    for dep in sorted(slots.keys(), key=lambda s: s.lower()):
+        if dep not in seen and _visible_dep(dep):
+            ordered_ids.append(dep)
+
+    stats: list[DashboardDeptStat] = []
+    for dep in ordered_ids:
+        slot = slots.get(dep)
+        label = dept_reg.get_department_label(dep) or dep
+        if slot is None:
+            stats.append(
+                DashboardDeptStat(
+                    department=dep,
+                    department_label=label,
+                    total=0,
+                    done=0,
+                    in_progress=0,
+                    overdue=0,
+                    waiting=0,
+                    due_soon=0,
+                    color_hex="#71717a",
+                    applies_to_shots=dep in shot_dept_ids,
+                    applies_to_assets=dep in asset_dept_ids,
+                )
+            )
+            continue
+        tot = int(slot["total"])
+        dn = int(slot["done"])
+        stats.append(
+            DashboardDeptStat(
+                department=dep,
+                department_label=str(slot["label"]) or label,
+                total=tot,
+                done=dn,
+                in_progress=int(slot["in_progress"]),
+                overdue=int(slot["overdue"]),
+                waiting=int(slot["waiting"]),
+                due_soon=int(slot["due_soon"]),
+                color_hex=str(slot["color"]),
+                shots_total=int(slot["shots_total"]),
+                assets_total=int(slot["assets_total"]),
+                shots_due_soon=int(slot["shots_due_soon"]),
+                assets_due_soon=int(slot["assets_due_soon"]),
+                shots_overdue=int(slot["shots_overdue"]),
+                assets_overdue=int(slot["assets_overdue"]),
+                applies_to_shots=dep in shot_dept_ids,
+                applies_to_assets=dep in asset_dept_ids,
+            )
+        )
+
+    stats.sort(
+        key=lambda s: (
+            0 if s.total > 0 else 1,
+            -s.overdue,
+            -s.due_soon,
+            s.completion_pct if s.total else 100.0,
+            s.department_label.lower(),
+        )
+    )
+    return tuple(stats)

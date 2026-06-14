@@ -68,6 +68,7 @@ from monostudio.core.models import Asset, ProjectIndex, Shot
 from monostudio.core.department_registry import DepartmentRegistry
 from monostudio.core.pipeline_types_and_presets import (
     department_icon_name,
+    filter_departments_for_entity_scope,
     load_pipeline_types_and_presets_for_project,
     order_department_ids_grouped_by_parent,
     resolve_department_ids_for_ui,
@@ -88,7 +89,11 @@ from monostudio.ui_qt.style import (
     MonosMenu,
     clear_stuck_widget_hover,
     monos_font,
+    page_badge_accent_color,
+    page_scope_badge_row_colors,
     project_accent_color,
+    sidebar_filter_accent_colors,
+    sidebar_filter_accent_role,
 )
 
 
@@ -134,6 +139,20 @@ def _filter_mode_for_nav_context(context_name: str) -> str | None:
     return None
 
 
+def _filter_page_kind_for_nav_context(context_name: str, *, mode: str = "") -> str:
+    """Breadcrumb page family for sidebar filter accent colors."""
+    ctx = (context_name or "").strip()
+    if ctx == SidebarContext.OUTBOX.value:
+        return "outbox"
+    if ctx == SidebarContext.INBOX.value:
+        return "inbox"
+    if ctx == SidebarContext.PROJECT_GUIDE.value:
+        return "guide"
+    if ctx == SidebarContext.SHOTS.value or (mode or "").strip().lower() == "shots":
+        return "shot"
+    return "asset"
+
+
 def _title_case_label(value: str) -> str:
     # UI display only (ids remain unchanged). Keep simple + deterministic.
     return (value or "").strip().replace("_", " ").title()
@@ -170,24 +189,40 @@ def _make_filter_section_chevron(parent: QWidget, *, expanded: bool, on_toggle) 
     return btn
 
 
-def _lucide_two_state_icon(icon_name: str, *, fallback_name: str) -> QIcon:
+def _lucide_two_state_icon(
+    icon_name: str,
+    *,
+    fallback_name: str,
+    selected_color_hex: str | None = None,
+) -> QIcon:
     """
     Build a 2-state QIcon:
     - Normal: Zinc-400 (text_label)
-    - Selected: Blue-400
+    - Selected: page filter accent (defaults to Blue-400)
     """
     normal = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS["text_label"])
     if normal.isNull():
         normal = lucide_icon(fallback_name, size=16, color_hex=MONOS_COLORS["text_label"])
 
-    selected = lucide_icon(icon_name, size=16, color_hex=MONOS_COLORS["blue_400"])
+    selected_hex = (selected_color_hex or "").strip() or MONOS_COLORS["blue_400"]
+    selected = lucide_icon(icon_name, size=16, color_hex=selected_hex)
     if selected.isNull():
-        selected = lucide_icon(fallback_name, size=16, color_hex=MONOS_COLORS["blue_400"])
+        selected = lucide_icon(fallback_name, size=16, color_hex=selected_hex)
 
     out = QIcon()
     out.addPixmap(normal.pixmap(16, 16), QIcon.Normal, QIcon.Off)
     out.addPixmap(selected.pixmap(16, 16), QIcon.Selected, QIcon.Off)
     return out
+
+
+def _filters_panel_from_widget(widget: QWidget | None):
+    """Return sidebar filter panel (``SidebarWidget``) ancestor, if any."""
+    w = widget
+    while w is not None:
+        if hasattr(w, "filter_page_kind") and callable(getattr(w, "filter_page_kind")):
+            return w
+        w = w.parentWidget()
+    return None
 
 
 def _load_logo_pixmap(size: int, color_hex: str) -> QPixmap:
@@ -235,6 +270,7 @@ def _paint_filter_count_badge(
     rect: QRect,
     count: int,
     selected: bool,
+    accent: dict[str, QColor | str] | None = None,
 ) -> None:
     badge_font = monos_font("Inter", 9, QFont.Weight.Medium)
     fm = QFontMetrics(badge_font)
@@ -246,15 +282,22 @@ def _paint_filter_count_badge(
     badge_y = rect.center().y() - badge_h // 2
     badge_rect = QRect(badge_x, badge_y, badge_w, badge_h)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.setPen(Qt.PenStyle.NoPen)
-    if selected:
-        painter.setBrush(QColor(37, 99, 235, 120))
-        painter.setPen(QPen(QColor(96, 165, 250, 90), 1))
+    if selected and accent is not None:
+        painter.setPen(QPen(accent["count_border"], 1))  # type: ignore[arg-type]
+        painter.setBrush(accent["count_bg"])  # type: ignore[arg-type]
     else:
-        painter.setBrush(QColor(39, 39, 42))
+        painter.setPen(Qt.PenStyle.NoPen)
+        if selected:
+            painter.setBrush(QColor(37, 99, 235, 120))
+            painter.setPen(QPen(QColor(96, 165, 250, 90), 1))
+        else:
+            painter.setBrush(QColor(39, 39, 42))
     painter.drawRoundedRect(badge_rect, 4, 4)
     painter.setFont(badge_font)
-    painter.setPen(QColor(MONOS_COLORS["blue_400"] if selected else "#d4d4d8"))
+    if selected and accent is not None:
+        painter.setPen(accent["count_text"])  # type: ignore[arg-type]
+    else:
+        painter.setPen(QColor(MONOS_COLORS["blue_400"] if selected else "#d4d4d8"))
     painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
 
 
@@ -339,14 +382,22 @@ def _filter_row_content_pad_right() -> int:
     return int(SIDEBAR_DEPT_LIST_STYLE.get("row_content_pad_right_px", 12))
 
 
-def _paint_filter_lead_dot(painter: QPainter, *, x: int, cy: int, selected: bool) -> int:
+def _paint_filter_lead_dot(
+    painter: QPainter,
+    *,
+    x: int,
+    cy: int,
+    selected: bool,
+    dot_color: QColor | None = None,
+) -> int:
     """Small circular socket before leaf row icon; returns x after dot + gap."""
     dot_r = int(SIDEBAR_DEPT_LIST_STYLE.get("row_lead_dot_radius_px", 3))
     gap = int(SIDEBAR_DEPT_LIST_STYLE.get("row_lead_dot_gap_px", 6))
-    dot_color = MONOS_COLORS["blue_400"] if selected else MONOS_COLORS["text_meta"]
+    if dot_color is None:
+        dot_color = QColor(MONOS_COLORS["blue_400"] if selected else MONOS_COLORS["text_meta"])
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(dot_color))
+    painter.setBrush(dot_color)
     painter.drawEllipse(x, cy - dot_r, dot_r * 2, dot_r * 2)
     return x + dot_r * 2 + gap
 
@@ -393,6 +444,41 @@ class _TagListDelegate(QStyledItemDelegate):
 
 class _SidebarFilterTreeDelegate(QStyledItemDelegate):
     """Flat tree rows: group (chevron + toggle) and leaf (selectable). No gradients."""
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        page_kind: str | None = None,
+        filter_panel: SidebarWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._page_kind_override = (page_kind or "").strip().lower() or None
+        self._filter_panel = filter_panel
+
+    def set_filter_panel(self, panel: SidebarWidget | None) -> None:
+        self._filter_panel = panel
+
+    def set_page_kind(self, kind: str | None) -> None:
+        self._page_kind_override = (kind or "").strip().lower() or None
+
+    def _resolve_page_kind(self, widget: QWidget | None) -> str:
+        if self._page_kind_override:
+            return self._page_kind_override
+        if self._filter_panel is not None:
+            return self._filter_panel.filter_page_kind()
+        panel = _filters_panel_from_widget(widget)
+        if panel is not None:
+            return panel.filter_page_kind()
+        return "asset"
+
+    def _accent_for_row(self, widget: QWidget | None, data: dict) -> dict[str, QColor | str] | None:
+        scope_id = data.get("scope_id")
+        if scope_id:
+            return page_scope_badge_row_colors(str(scope_id))
+        scope = str(data.get("scope") or "dept")
+        role = sidebar_filter_accent_role(self._resolve_page_kind(widget), scope)
+        return sidebar_filter_accent_colors(role)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[override]
         opt = QStyleOptionViewItem(option)
@@ -484,6 +570,7 @@ class _SidebarFilterTreeDelegate(QStyledItemDelegate):
         else:
             is_selected = bool(opt.state & QStyle.State_Selected)
         is_hovered = bool(opt.state & QStyle.State_MouseOver)
+        accent = self._accent_for_row(opt.widget, data)
         painter.save()
         try:
             sel_rect = _filter_row_highlight_rect(r)
@@ -491,7 +578,11 @@ class _SidebarFilterTreeDelegate(QStyledItemDelegate):
             if is_selected:
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(37, 99, 235, 100))
+                if accent is not None:
+                    fill = accent.get("highlight_hover") if is_hovered else accent.get("highlight")
+                    painter.setBrush(fill if fill is not None else accent["highlight"])  # type: ignore[arg-type]
+                else:
+                    painter.setBrush(QColor(37, 99, 235, 100))
                 painter.drawRoundedRect(sel_rect, radius, radius)
             elif is_hovered:
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -505,7 +596,10 @@ class _SidebarFilterTreeDelegate(QStyledItemDelegate):
             # Child rows under a group: chevron column spacer for alignment.
             if indent > 0:
                 x += 16
-            x = _paint_filter_lead_dot(painter, x=x, cy=cy, selected=is_selected)
+            dot_color = None
+            if is_selected and accent is not None:
+                dot_color = accent["dot"]  # type: ignore[assignment]
+            x = _paint_filter_lead_dot(painter, x=x, cy=cy, selected=is_selected, dot_color=dot_color)
             _, icon_px, body_font = self._row_metrics(selected=is_selected)
             if not opt.icon.isNull():
                 ir = QRect(x, cy - icon_px // 2, icon_px, icon_px)
@@ -521,6 +615,8 @@ class _SidebarFilterTreeDelegate(QStyledItemDelegate):
             text_rect = QRect(x, r.top(), max(0, text_right - x), r.height())
             if scope_row and not is_selected:
                 pen_color = QColor(MONOS_COLORS["text_meta"])
+            elif is_selected and accent is not None:
+                pen_color = accent["text"]  # type: ignore[assignment]
             elif is_selected:
                 pen_color = QColor(MONOS_COLORS["blue_400"])
             else:
@@ -535,7 +631,11 @@ class _SidebarFilterTreeDelegate(QStyledItemDelegate):
             if count is not None:
                 try:
                     _paint_filter_count_badge(
-                        painter, rect=r.adjusted(0, 0, -pad_right, 0), count=int(count), selected=is_selected
+                        painter,
+                        rect=r.adjusted(0, 0, -pad_right, 0),
+                        count=int(count),
+                        selected=is_selected,
+                        accent=accent if is_selected else None,
                     )
                 except (TypeError, ValueError):
                     pass
@@ -869,6 +969,7 @@ class SidebarWidget(QWidget):
         self._active_tags: list[str] = []
 
         self._mode: str = "assets"  # assets | shots | schedule | inbox | reference
+        self._filter_page_kind: str = "asset"
         self._include_shots: bool = True
         self._include_assets: bool = False
         # Default number of items shown per section (user can pick any count).
@@ -900,6 +1001,7 @@ class SidebarWidget(QWidget):
         self._type_section_expanded = True
         self._dept_list_max_height_px: int | None = None
         self._type_list_max_height_px: int | None = None
+        self._scope_list_max_height_px: int | None = None
         self._tag_list_max_height_px: int = _SIDEBAR_TAG_LIST_MAX_HEIGHT_PX
         self._filters_dept_stretch_callback = None
         self._filters_layout_callback = None
@@ -946,19 +1048,24 @@ class SidebarWidget(QWidget):
         self._scope_list.setUniformItemSizes(False)
         self._scope_list.setFocusPolicy(Qt.NoFocus)
         self._scope_list.setIconSize(QSize(16, 16))
-        self._scope_list.setItemDelegate(_SidebarFilterTreeDelegate(self._scope_list))
+        self._scope_list.setItemDelegate(
+            _SidebarFilterTreeDelegate(self._scope_list, filter_panel=self)
+        )
         self._scope_list.setSpacing(int(SIDEBAR_DEPT_LIST_STYLE.get("list_row_spacing_px", 3)))
-        self._scope_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scope_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._scope_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._scope_list.setMaximumHeight(88)
+        self._scope_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self._scope_list.itemClicked.connect(self._on_scope_clicked)
+        scope_header_row.setFixedHeight(20)
         self._scope_section = QWidget(self)
         self._scope_section.setObjectName("SidebarFilterScopeSection")
+        self._scope_section.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         scope_section_lay = QVBoxLayout(self._scope_section)
         scope_section_lay.setContentsMargins(0, 0, 0, 0)
         scope_section_lay.setSpacing(4)
         scope_section_lay.addWidget(scope_header_row, 0)
-        scope_section_lay.addWidget(self._scope_list_container, 0)
+        self._scope_list_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scope_section_lay.addWidget(self._scope_list_container, 1)
         self._scope_section.setVisible(False)
         self._rebuild_scope_list()
 
@@ -1009,7 +1116,9 @@ class SidebarWidget(QWidget):
         self._dept_list.setUniformItemSizes(False)  # section/spacer/dept have different heights
         self._dept_list.setFocusPolicy(Qt.NoFocus)
         self._dept_list.setIconSize(QSize(12, 12))
-        self._dept_list.setItemDelegate(_SidebarFilterTreeDelegate(self._dept_list))
+        self._dept_list.setItemDelegate(
+            _SidebarFilterTreeDelegate(self._dept_list, filter_panel=self)
+        )
         self._dept_list.setSpacing(int(SIDEBAR_DEPT_LIST_STYLE.get("list_row_spacing_px", 3)))
         self._dept_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._dept_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -1070,7 +1179,9 @@ class SidebarWidget(QWidget):
         self._type_list.setUniformItemSizes(False)
         self._type_list.setFocusPolicy(Qt.NoFocus)
         self._type_list.setIconSize(QSize(12, 12))
-        self._type_list.setItemDelegate(_SidebarFilterTreeDelegate(self._type_list))
+        self._type_list.setItemDelegate(
+            _SidebarFilterTreeDelegate(self._type_list, filter_panel=self)
+        )
         self._type_list.setSpacing(int(SIDEBAR_DEPT_LIST_STYLE.get("list_row_spacing_px", 3)))
         self._type_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._type_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -1267,6 +1378,8 @@ class SidebarWidget(QWidget):
                 if isinstance(d, str) and d.strip() and d.strip() not in raw_ids:
                     raw_ids.append(d.strip())
             dept_ids = resolve_department_ids_for_ui(raw_ids, meta=meta, registry=registry)
+            if not _is_shot_type(type_id):
+                dept_ids = filter_departments_for_entity_scope(dept_ids, "asset")
             if dept_ids:
                 self._dept_ids_by_type[type_id] = dept_ids
         types_out.sort(key=lambda x: x[1].lower())
@@ -1321,20 +1434,34 @@ class SidebarWidget(QWidget):
             self._active_type = None
         if self._active_department is not None and self._active_department not in set(self._all_departments):
             self._active_department = None
-        # When a type is active, department must be in that type's allowed list (per-type restore).
+        # When a type is active, department must be in that type's allowed list.
+        # Schedule: optional dept filter — never auto-pick the first department.
         if self._active_type and self._active_type in self._dept_ids_by_type:
             allowed = set(self._dept_ids_by_type[self._active_type])
-            if self._active_department not in allowed:
-                self._active_department = self._dept_ids_by_type[self._active_type][0] if self._dept_ids_by_type[self._active_type] else None
+            if self._active_department is not None and self._active_department not in allowed:
+                self._active_department = None
+            elif (
+                self._mode != "schedule"
+                and self._active_department not in allowed
+            ):
+                self._active_department = (
+                    self._dept_ids_by_type[self._active_type][0]
+                    if self._dept_ids_by_type[self._active_type]
+                    else None
+                )
 
         self.set_departments(self._all_departments)
         self.set_types(self._all_types)
+        if self._mode == "shots":
+            self._active_type = None
         self._dept_section.setVisible(True)
-        self._type_section.setVisible(True)
+        self._type_section.setVisible(self._mode != "shots")
         self._scope_section.setVisible(self._mode == "schedule")
         self._tag_section.setVisible(False)
         if self._mode == "schedule":
             self._rebuild_schedule_dept_scope_sets()
+            self._sanitize_schedule_type_for_scope()
+            self._sanitize_schedule_department_for_scope()
             self._rebuild_scope_list()
         self._notify_filters_layout()
 
@@ -1380,6 +1507,8 @@ class SidebarWidget(QWidget):
                 if isinstance(d, str) and d.strip() and d.strip() not in raw_ids:
                     raw_ids.append(d.strip())
             dept_ids = resolve_department_ids_for_ui(raw_ids, meta=meta, registry=registry)
+            if not _is_shot_type(_type_id):
+                dept_ids = filter_departments_for_entity_scope(dept_ids, "asset")
             seen.update(dept_ids)
             for did in dept_ids:
                 dd = meta.departments.get(did)
@@ -1410,6 +1539,22 @@ class SidebarWidget(QWidget):
         """Department ids shown in filter list (+ picker); Schedule timeline uses this whitelist."""
         return list(self._visible_departments or [])
 
+    def schedule_asset_department_ids(self) -> set[str]:
+        return set(self._schedule_dept_asset_ids)
+
+    def schedule_shot_department_ids(self) -> set[str]:
+        return set(self._schedule_dept_shot_ids)
+
+    def schedule_eligible_department_ids(self) -> list[str]:
+        """Departments in the Schedule pipeline universe (shot/asset scope), ignoring sidebar picker."""
+        cleaned = list(self._schedule_universe_department_ids or self._all_departments)
+        eligible = [
+            d
+            for d in cleaned
+            if d in self._schedule_dept_shot_ids or d in self._schedule_dept_asset_ids
+        ]
+        return eligible if eligible else cleaned[: self._max_visible]
+
     def schedule_visible_department_ids(self) -> list[str]:
         """Schedule sidebar whitelist — used by Schedule timeline and Dashboard metrics."""
         self._sync_schedule_filter_state()
@@ -1418,12 +1563,7 @@ class SidebarWidget(QWidget):
         cleaned = list(self._schedule_universe_department_ids or self._all_departments)
         cleaned_set = set(cleaned)
         if vd is None:
-            eligible = [
-                d
-                for d in cleaned
-                if d in self._schedule_dept_shot_ids or d in self._schedule_dept_asset_ids
-            ]
-            return eligible if eligible else cleaned[: self._max_visible]
+            return self.schedule_eligible_department_ids()
         if isinstance(vd, list):
             return [
                 x.strip()
@@ -1643,6 +1783,31 @@ class SidebarWidget(QWidget):
             json.dumps(state.get("visible_types"), ensure_ascii=False),
         )
 
+    def filter_page_kind(self) -> str:
+        return self._filter_page_kind
+
+    def set_filter_page_kind(self, kind: str, *, force: bool = False) -> None:
+        k = (kind or "asset").strip().lower()
+        if not force and k == self._filter_page_kind:
+            return
+        self._filter_page_kind = k
+        for list_w in (self._type_list, self._dept_list, self._scope_list):
+            deleg = list_w.itemDelegate()
+            if isinstance(deleg, _SidebarFilterTreeDelegate):
+                deleg.set_filter_panel(self)
+                deleg.set_page_kind(k)
+        if self._all_types:
+            self.set_types(self._all_types)
+        if self._all_departments:
+            self.set_departments(self._all_departments)
+        for list_w in (self._type_list, self._dept_list, self._scope_list):
+            list_w.viewport().update()
+
+    def _selected_icon_color_for_scope(self, scope: str) -> str:
+        role = sidebar_filter_accent_role(self._filter_page_kind, scope)
+        accent = sidebar_filter_accent_colors(role)
+        return str(accent.get("accent_hex", MONOS_COLORS["blue_400"]))
+
     def set_mode(self, mode: str) -> None:
         """
         UI-only: switch between assets/shots/inbox modes.
@@ -1698,7 +1863,13 @@ class SidebarWidget(QWidget):
         else:
             self._department_by_type = {}
         # Restore department for current type when available; else fallback to legacy active_department.
-        if self._active_type and self._active_type in self._department_by_type and self._department_by_type[self._active_type]:
+        # Schedule keeps only the explicitly persisted active_department (type-only filter is valid).
+        if (
+            self._mode != "schedule"
+            and self._active_type
+            and self._active_type in self._department_by_type
+            and self._department_by_type[self._active_type]
+        ):
             self._active_department = self._department_by_type[self._active_type]
         else:
             self._active_department = state.get("active_department") if isinstance(state.get("active_department"), str) else None
@@ -1778,6 +1949,8 @@ class SidebarWidget(QWidget):
         try:
             self._scope_list.clear()
             for i, (scope_id, label, icon_name, selected) in enumerate(rows):
+                kind = "asset" if scope_id == "assets" else "shot"
+                accent_hex = page_badge_accent_color(kind)
                 it = QListWidgetItem(label)
                 it.setData(
                     Qt.UserRole,
@@ -1788,11 +1961,18 @@ class SidebarWidget(QWidget):
                         "indent": 0,
                     },
                 )
-                it.setIcon(_lucide_two_state_icon(icon_name, fallback_name="box"))
+                it.setIcon(
+                    _lucide_two_state_icon(
+                        icon_name,
+                        fallback_name="box",
+                        selected_color_hex=accent_hex,
+                    )
+                )
                 self._scope_list.addItem(it)
         finally:
             self._scope_list.blockSignals(False)
         self._scope_list.viewport().update()
+        self._notify_filters_layout()
 
     def _on_scope_clicked(self, item: QListWidgetItem) -> None:
         data = item.data(Qt.UserRole) or {}
@@ -1894,7 +2074,8 @@ class SidebarWidget(QWidget):
         it.setData(Qt.UserRole, role)
         if icon_name:
             fb = "folder" if scope == "type" else "layers"
-            it.setIcon(_lucide_two_state_icon(icon_name, fallback_name=fb))
+            sel_hex = self._selected_icon_color_for_scope(scope)
+            it.setIcon(_lucide_two_state_icon(icon_name, fallback_name=fb, selected_color_hex=sel_hex))
         list_w.addItem(it)
 
     def _build_dept_tree_rows(self, list_w: QListWidget, visible: list[str]) -> None:
@@ -2041,6 +2222,18 @@ class SidebarWidget(QWidget):
             self._dept_list.blockSignals(False)
         self._notify_filters_layout()
 
+    def set_scope_list_max_height(self, px: int | None) -> None:
+        """Expand scope list to fill remaining sidebar height; None = fit content only."""
+        cap = px
+        if self._scope_section.isVisible():
+            sec_h = int(self._scope_section.height())
+            if sec_h > 28:
+                section_cap = sec_h - 28
+                cap = max(cap or 0, section_cap) if cap is not None else section_cap
+        self._scope_list_max_height_px = cap
+        if self._scope_section.isVisible():
+            self._fit_scope_list()
+
     def set_dept_list_max_height(self, px: int | None) -> None:
         """Cap department list height (scroll when content exceeds); None = fit content only."""
         self._dept_list_max_height_px = px
@@ -2052,6 +2245,22 @@ class SidebarWidget(QWidget):
         self._type_list_max_height_px = px
         if self._type_section_expanded and self._all_types:
             self._fit_type_list()
+
+    def _fit_scope_list(self) -> None:
+        self._fit_list_height(
+            self._scope_list,
+            max_height_px=self._scope_list_max_height_px,
+            allow_shrink=True,
+            fill_to_cap=True,
+        )
+        self._sync_scope_list_container_height()
+
+    def _sync_scope_list_container_height(self) -> None:
+        h = int(self._scope_list.height())
+        self._scope_list_container.setMinimumHeight(h)
+        self._scope_list_container.setMaximumHeight(16777215)
+        self._scope_list_container.setFixedHeight(h)
+        self._scope_list.updateGeometry()
 
     def _fit_dept_list(self) -> None:
         self._fit_list_height(
@@ -2165,11 +2374,17 @@ class SidebarWidget(QWidget):
         if tid:
             allowed_list = self._dept_ids_by_type.get(tid, [])
             allowed_set = set(allowed_list)
-            restored = self._department_by_type.get(tid)
-            if restored and restored in allowed_set:
-                self._active_department = restored
+            if self._mode == "schedule":
+                dep = self._active_department
+                self._active_department = dep if dep and dep in allowed_set else None
             else:
-                self._active_department = allowed_list[0] if allowed_list else None
+                restored = self._department_by_type.get(tid)
+                if restored and restored in allowed_set:
+                    self._active_department = restored
+                else:
+                    self._active_department = allowed_list[0] if allowed_list else None
+        else:
+            self._active_department = None
         self.set_departments(self._all_departments)
         self._sync_selection()
         if emit:
@@ -2285,7 +2500,7 @@ class SidebarWidget(QWidget):
         list_w.setUniformItemSizes(False)
         list_w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         list_w.setIconSize(QSize(16, 16))
-        list_w.setItemDelegate(_SidebarFilterTreeDelegate(list_w))
+        list_w.setItemDelegate(_SidebarFilterTreeDelegate(list_w, page_kind=self._filter_page_kind))
         list_w.setSpacing(int(SIDEBAR_DEPT_LIST_STYLE.get("list_row_spacing_px", 3)))
         list_w.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         list_w.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -2450,11 +2665,14 @@ class SidebarWidget(QWidget):
         # Restore department for the new type; validate it is allowed for this type.
         allowed_list = self._dept_ids_by_type.get(clicked, [])
         allowed_set = set(allowed_list)
-        restored = self._department_by_type.get(clicked) if clicked else None
-        if restored and restored in allowed_set:
-            self._active_department = restored
+        if self._mode == "schedule":
+            self._active_department = None
         else:
-            self._active_department = allowed_list[0] if allowed_list else None
+            restored = self._department_by_type.get(clicked) if clicked else None
+            if restored and restored in allowed_set:
+                self._active_department = restored
+            else:
+                self._active_department = allowed_list[0] if allowed_list else None
         # When switching type, refresh department list to show only departments for this type
         # that also pass the Select Departments visibility filter.
         self.set_departments(self._all_departments)
@@ -2682,11 +2900,16 @@ class SidebarWidget(QWidget):
 
     @staticmethod
     def _fit_list_height(
-        w: QListWidget, *, max_height_px: int | None = None, allow_shrink: bool = False
+        w: QListWidget,
+        *,
+        max_height_px: int | None = None,
+        allow_shrink: bool = False,
+        fill_to_cap: bool = False,
     ) -> None:
         """
         Size list to fit rows; max_height_px caps height and enables scroll when content exceeds.
         allow_shrink: only for compact type lists — never shrink department lists after ensure.
+        fill_to_cap: grow list to max_height_px even when content is shorter (scope panel).
         """
         rows = int(w.count())
         if rows <= 0:
@@ -2697,7 +2920,7 @@ class SidebarWidget(QWidget):
         content_h = SidebarWidget._list_content_height(w)
         cap = max_height_px
         if cap is not None:
-            target = min(content_h, cap)
+            target = cap if fill_to_cap else min(content_h, cap)
         else:
             target = content_h
 
@@ -3692,6 +3915,7 @@ class Sidebar(QWidget):
         dept_w = self._filters.dept_section()
         tag_w = self._filters.tag_section()
 
+        scope_idx = lay.indexOf(scope_w)
         type_idx = lay.indexOf(type_w)
         dept_idx = lay.indexOf(dept_w)
         tail_idx = lay.indexOf(tail)
@@ -3701,23 +3925,41 @@ class Sidebar(QWidget):
         for i in range(lay.count()):
             lay.setStretch(i, 0)
 
-        lay.setAlignment(scope_w, Qt.AlignmentFlag.AlignTop)
+        scope_visible = scope_w.isVisible()
+        if scope_visible and scope_idx >= 0:
+            scope_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+            lay.setStretch(scope_idx, 1)
+            lay.setAlignment(scope_w, Qt.AlignmentFlag.AlignTop)
+            tail.setVisible(False)
+            tail.setMinimumHeight(0)
+            tail.setMaximumHeight(0)
+            lay.setStretch(tail_idx, 0)
+        else:
+            if scope_idx >= 0:
+                scope_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+                lay.setStretch(scope_idx, 0)
+                lay.setAlignment(scope_w, Qt.AlignmentFlag.AlignTop)
+            tail.setVisible(True)
+            tail.setMinimumHeight(0)
+            tail.setMaximumHeight(16777215)
+            lay.setStretch(tail_idx, 1)
+
         lay.setAlignment(type_w, Qt.AlignmentFlag.AlignTop)
         lay.setAlignment(dept_w, Qt.AlignmentFlag.AlignTop)
         lay.setAlignment(tag_w, Qt.AlignmentFlag.AlignTop)
 
         type_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         dept_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        tail.setVisible(True)
-        tail.setMinimumHeight(0)
-        tail.setMaximumHeight(16777215)
-        lay.setStretch(tail_idx, 1)
 
         self._apply_filter_list_heights()
 
     def _apply_filter_list_heights(self) -> None:
-        type_max, dept_max = self._compute_filter_list_max_heights()
+        type_max, dept_max, scope_max = self._compute_filter_list_max_heights()
         fw = self._filters
+        if fw.scope_section().isVisible():
+            fw.set_scope_list_max_height(scope_max)
+        else:
+            fw.set_scope_list_max_height(None)
         # Type first so it compacts to row count before department claims remaining space.
         if fw.type_section().isVisible() and fw._type_section_expanded and fw._all_types:
             fw.set_type_list_max_height(type_max)
@@ -3728,11 +3970,11 @@ class Sidebar(QWidget):
         else:
             fw.set_dept_list_max_height(None)
 
-    def _compute_filter_list_max_heights(self) -> tuple[int | None, int | None]:
-        """Split filters_center height between type and department lists (top → bottom)."""
+    def _compute_filter_list_max_heights(self) -> tuple[int | None, int | None, int | None]:
+        """Split filters_center height; scope (Schedule) fills leftover space above type/dept."""
         center_h = int(self._filters_center.height())
         if center_h <= 1:
-            return None, None
+            return None, None, None
 
         lay = self._filters_scroll_layout
         margins = lay.contentsMargins()
@@ -3740,6 +3982,7 @@ class Sidebar(QWidget):
         spacing = lay.spacing()
         fw = self._filters
 
+        scope_on = fw.scope_section().isVisible()
         type_list = (
             fw.type_section().isVisible()
             and fw._type_section_expanded
@@ -3750,12 +3993,12 @@ class Sidebar(QWidget):
             and fw._dept_section_expanded
             and bool(fw._all_departments)
         )
-        if not type_list and not dept_list:
-            return None, None
+        if not scope_on and not type_list and not dept_list:
+            return None, None, None
 
         _HEADER_EXPANDED = 24
         _HEADER_COLLAPSED = 20
-        _SECTION_LIST_GAP = 4  # dept/type section layout spacing below header
+        _SECTION_LIST_GAP = 4
         visible_blocks: list[QWidget] = []
         for i in range(lay.count()):
             w = lay.itemAt(i).widget()
@@ -3764,10 +4007,16 @@ class Sidebar(QWidget):
             visible_blocks.append(w)
 
         fixed = 0
+        scope_header = 0
         type_header = 0
         dept_header = 0
         for w in visible_blocks:
-            if w is fw.type_section():
+            if w is fw.scope_section():
+                if scope_on:
+                    scope_header = _HEADER_EXPANDED + _SECTION_LIST_GAP
+                else:
+                    fixed += _HEADER_COLLAPSED
+            elif w is fw.type_section():
                 if type_list:
                     type_header = _HEADER_EXPANDED + _SECTION_LIST_GAP
                 else:
@@ -3780,13 +4029,13 @@ class Sidebar(QWidget):
             else:
                 fixed += int(w.sizeHint().height())
 
-        fixed += type_header + dept_header
+        fixed += scope_header + type_header + dept_header
         if len(visible_blocks) > 1:
             fixed += spacing * (len(visible_blocks) - 1)
 
         list_budget = budget - fixed
         if list_budget <= 0:
-            return None, None
+            return None, None, None
 
         type_content = (
             SidebarWidget._list_content_height(fw._type_list) if type_list else 0
@@ -3794,14 +4043,39 @@ class Sidebar(QWidget):
         dept_content = (
             SidebarWidget._list_content_height(fw._dept_list) if dept_list else 0
         )
+        scope_content = (
+            SidebarWidget._list_content_height(fw._scope_list) if scope_on else 0
+        )
+
+        if scope_on:
+            need_type_dept = type_content + dept_content
+            if need_type_dept <= list_budget:
+                scope_max = max(scope_content, list_budget - need_type_dept)
+                type_max = None if type_list else None
+                dept_max = None if dept_list else None
+                return type_max, dept_max, scope_max
+
+            remain = max(0, list_budget - scope_content)
+            if type_list and dept_list:
+                type_max, dept_max = self._split_filter_list_budget(
+                    remain, type_content, dept_content
+                )
+                return type_max, dept_max, scope_content
+            if type_list:
+                type_max = None if type_content <= remain else remain
+                return type_max, None, scope_content
+            if dept_list:
+                dept_max = None if dept_content <= remain else remain
+                return None, dept_max, scope_content
+            return None, None, max(scope_content, list_budget)
 
         if type_list and dept_list:
             if type_content + dept_content <= list_budget:
-                return None, None
-            return self._split_filter_list_budget(list_budget, type_content, dept_content)
+                return None, None, None
+            return (*self._split_filter_list_budget(list_budget, type_content, dept_content), None)
         if type_list:
-            return None if type_content <= list_budget else list_budget, None
-        return None, None if dept_content <= list_budget else list_budget
+            return (None if type_content <= list_budget else list_budget, None, None)
+        return (None, None if dept_content <= list_budget else list_budget, None)
 
     @staticmethod
     def _split_filter_list_budget(
@@ -3980,7 +4254,7 @@ class Sidebar(QWidget):
         if self._project_display_name_raw:
             self._sync_project_name_label_text()
         if hasattr(self, "_filters_center") and self._filters_center.height() > 1:
-            self._apply_filter_list_heights()
+            self._sync_filters_center_layout()
 
     def _rebuild_recent_tasks_list(self) -> None:
         tasks = list(self._recent_tasks_cache)
@@ -4056,9 +4330,15 @@ class Sidebar(QWidget):
     def sync_nav_context(self, context_name: str, *, force: bool = False) -> None:
         """Update filter panel for nav context without emitting navigation signals."""
         expected_mode = _filter_mode_for_nav_context(context_name)
+        page_kind = _filter_page_kind_for_nav_context(
+            context_name,
+            mode=expected_mode or self._filters._mode,
+        )
         mode_aligned = expected_mode is None or self._filters._mode == expected_mode
-        if not force and context_name == self.current_context() and mode_aligned:
+        page_kind_aligned = self._filters.filter_page_kind() == page_kind
+        if not force and context_name == self.current_context() and mode_aligned and page_kind_aligned:
             return
+        self._filters.set_filter_page_kind(page_kind, force=force)
         if context_name in (SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
             self._footer_context = None
             self._scope_context = context_name

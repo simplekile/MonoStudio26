@@ -53,12 +53,17 @@ class NoteAuthorRow(QWidget):
         avatar_size: int = 24,
         time_text: str = "",
         name_only: bool = False,
+        avatar_only: bool = False,
         on_author_click: Callable[[], None] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("NoteAuthorRow")
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._on_author_click = on_author_click
+        self.setSizePolicy(
+            QSizePolicy.Policy.Fixed if avatar_only else QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -67,6 +72,9 @@ class NoteAuthorRow(QWidget):
         self._avatar = QLabel(self)
         self._avatar.setObjectName("NoteAuthorAvatar")
         self._avatar.setFixedSize(avatar_size, avatar_size)
+        if on_author_click is not None:
+            self._avatar.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._avatar.setToolTip("View profile")
         dpr = effective_device_pixel_ratio(self)
         self._avatar.setPixmap(
             avatar_pixmap_for(
@@ -77,7 +85,10 @@ class NoteAuthorRow(QWidget):
                 dpr=dpr,
             )
         )
-        layout.addWidget(self._avatar, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(self._avatar, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        if avatar_only:
+            return
 
         name_col = QHBoxLayout()
         name_col.setContentsMargins(0, 0, 0, 0)
@@ -102,6 +113,17 @@ class NoteAuthorRow(QWidget):
         name_col.addStretch(1)
         layout.addLayout(name_col, 1)
 
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if (
+            self._on_author_click is not None
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._avatar.geometry().contains(event.pos())
+        ):
+            self._on_author_click()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     @classmethod
     def for_entry(
         cls,
@@ -111,6 +133,7 @@ class NoteAuthorRow(QWidget):
         avatar_size: int = 24,
         time_text: str = "",
         name_only: bool = False,
+        avatar_only: bool = False,
         on_author_click: Callable[[], None] | None = None,
         parent=None,
     ) -> NoteAuthorRow:
@@ -119,6 +142,7 @@ class NoteAuthorRow(QWidget):
             avatar_size=avatar_size,
             time_text=time_text,
             name_only=name_only,
+            avatar_only=avatar_only,
             on_author_click=on_author_click,
             parent=parent,
         )
@@ -131,6 +155,7 @@ class NoteAuthorRow(QWidget):
         avatar_size: int = 24,
         time_text: str = "",
         name_only: bool = False,
+        avatar_only: bool = False,
         on_author_click: Callable[[], None] | None = None,
         parent=None,
     ) -> NoteAuthorRow:
@@ -139,6 +164,7 @@ class NoteAuthorRow(QWidget):
             avatar_size=avatar_size,
             time_text=time_text,
             name_only=name_only,
+            avatar_only=avatar_only,
             on_author_click=on_author_click,
             parent=parent,
         )

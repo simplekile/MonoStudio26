@@ -6,7 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, QSize, QTimer, Signal
-from PySide6.QtGui import QFont, QShortcut
+from PySide6.QtGui import QFont, QMouseEvent, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QDialog,
@@ -41,7 +41,8 @@ from monostudio.core.project_schedule import (
     clear_entity_schedule,
     read_project_schedule,
 )
-from monostudio.core.schedule_planner import build_planned_bars, count_overdue_bars
+from monostudio.core.project_dashboard_stats import build_metrics_planned_bars
+from monostudio.core.schedule_planner import count_overdue_bars
 from monostudio.ui_qt.schedule_allocate_dialog import ScheduleAllocateDialog, _EntityOption
 from monostudio.ui_qt.schedule_target_status_memory import remember_target_status
 from monostudio.ui_qt.schedule_bar_bulk_dialogs import (
@@ -65,10 +66,12 @@ from monostudio.core.schedule_dept_filter import (
     BAR_LABEL_DEFAULT,
     DEPT_SCOPE_LEAF,
     SCHEDULE_BAR_LABEL_KEY,
+    SCHEDULE_HIDE_SKIPPED_KEY,
     SCHEDULE_RESPECT_HIDDEN_KEY,
     load_inspector_hidden_departments,
     normalize_bar_label_mode,
 )
+from monostudio.core.schedule_skip import SkippedScheduleSnapshot, build_skipped_schedule_snapshot
 from monostudio.ui_qt.schedule_legend_widget import ScheduleLegendBar
 from monostudio.ui_qt.schedule_timeline_widget import (
     TOOL_DRAW,
@@ -83,7 +86,7 @@ from monostudio.ui_qt.schedule_timeline_widget import (
 )
 from monostudio.ui_qt.schedule_view_options_popup import ScheduleViewOptionsPopup
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS, monos_font
+from monostudio.ui_qt.style import MONOS_COLORS, monos_font, schedule_attention_accent, schedule_attention_icon
 from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators
 
 # Debounced autosave: 30s after the last edit (only if still dirty).
@@ -100,6 +103,56 @@ def _schedule_layout_pill(parent: QWidget, label: str, tooltip: str) -> QPushBut
     return btn
 
 
+class _ScheduleClickableStat(QFrame):
+    """Summary metric tile — click opens a detail list (Skipped)."""
+
+    clicked = Signal()
+
+    def __init__(
+        self,
+        label: str,
+        parent: QWidget,
+        *,
+        icon_name: str,
+        accent: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("DashboardMetricTile")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setProperty("clickable", "true")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(12)
+
+        r, g, b = SchedulePageWidget._hex_to_rgb(accent)
+        chip = QLabel(self)
+        chip.setFixedSize(40, 40)
+        chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        chip.setStyleSheet(
+            f"background-color: rgba({r}, {g}, {b}, 0.14); border-radius: 10px;"
+        )
+        chip.setPixmap(lucide_icon(icon_name, size=18, color_hex=accent).pixmap(18, 18))
+        lay.addWidget(chip, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(0)
+        value = QLabel("—", self)
+        value.setFont(monos_font("Inter", 18, QFont.Weight.Bold))
+        cap = QLabel(label.upper(), self)
+        cap.setObjectName("DashboardTileLabel")
+        text_col.addWidget(value)
+        text_col.addWidget(cap)
+        lay.addLayout(text_col, 1)
+        self._value_label = value
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
 class SchedulePageWidget(QWidget):
     """Deadline allocation timeline — full-page schedule management."""
 
@@ -109,6 +162,9 @@ class SchedulePageWidget(QWidget):
     entity_row_selected = Signal(str, str)  # entity_kind, entity_rel → Inspector
     entity_row_cleared = Signal()  # deselect timeline row / Inspector
     department_skip_toggle_requested = Signal(str, str, str, bool)  # kind, rel, dep, skip
+    entity_skip_toggle_requested = Signal(str, str, bool)  # kind, rel, skip
+    lane_skip_toggle_requested = Signal(str, bool)  # department, skip
+    skipped_list_requested = Signal()
     jump_to_entity_requested = Signal(str, str, str)  # entity_kind, entity_rel, department
 
     def __init__(self, parent=None) -> None:
@@ -123,6 +179,8 @@ class SchedulePageWidget(QWidget):
         self._filter_type_aliases: set[str] = set()
         self._include_shots = True
         self._include_assets = False
+        self._metrics_allowed_departments: set[str] | None = None
+        self._skipped_snapshot = SkippedScheduleSnapshot(0, 0, ())
         self._schedule_doc: ScheduleDocument | None = None
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
@@ -233,6 +291,7 @@ class SchedulePageWidget(QWidget):
         self._view_options.chk_respect_hidden.toggled.connect(self._on_dept_display_changed)
         self._view_options.chk_unscheduled.toggled.connect(self._on_filter_changed)
         self._view_options.chk_overdue.toggled.connect(self._on_filter_changed)
+        self._view_options.chk_hide_skipped.toggled.connect(self._on_filter_changed)
         self._view_options.wave_draw_mode.currentIndexChanged.connect(self._on_wave_draw_mode_changed)
         self._view_options.bar_label_mode.currentIndexChanged.connect(self._on_bar_label_mode_changed)
         self._view_options.date_display_format.currentIndexChanged.connect(
@@ -252,12 +311,24 @@ class SchedulePageWidget(QWidget):
             "Milestones", self, icon_name="flag", accent="#10b981"
         )
         self._stat_overdue = self._make_stat(
-            "Overdue", self, icon_name="power", accent="#ef4444"
+            "Overdue",
+            self,
+            icon_name=schedule_attention_icon("overdue"),
+            accent=schedule_attention_accent("overdue"),
         )
+        self._stat_skipped = _ScheduleClickableStat(
+            "Skipped",
+            self,
+            icon_name="checkerboard",
+            accent="#71717a",
+        )
+        self._stat_skipped.setToolTip("Items and departments marked Skipped (N/A). Click to view list.")
+        self._stat_skipped.clicked.connect(self.skipped_list_requested.emit)
         summary.addWidget(self._stat_alloc, 1)
         summary.addWidget(self._stat_pinned, 1)
         summary.addWidget(self._stat_milestones, 1)
         summary.addWidget(self._stat_overdue, 1)
+        summary.addWidget(self._stat_skipped, 1)
         root.addLayout(summary)
 
         self._legend = ScheduleLegendBar(self)
@@ -282,6 +353,12 @@ class SchedulePageWidget(QWidget):
         self._gantt.entity_row_cleared.connect(self.entity_row_cleared.emit)
         self._gantt.department_skip_toggle_requested.connect(
             self.department_skip_toggle_requested.emit
+        )
+        self._gantt.entity_skip_toggle_requested.connect(
+            self.entity_skip_toggle_requested.emit
+        )
+        self._gantt.lane_skip_toggle_requested.connect(
+            self.lane_skip_toggle_requested.emit
         )
         self._gantt.jump_to_entity_requested.connect(self.jump_to_entity_requested.emit)
         self._gantt.search_filter_requested.connect(self._toggle_view_options_popup)
@@ -317,6 +394,7 @@ class SchedulePageWidget(QWidget):
             self._stat_pinned,
             self._stat_milestones,
             self._stat_overdue,
+            self._stat_skipped,
             self._gantt,
         )
         self._sync_wave_draw_controls()
@@ -333,6 +411,10 @@ class SchedulePageWidget(QWidget):
     @property
     def _chk_overdue(self):
         return self._view_options.chk_overdue
+
+    @property
+    def _chk_hide_skipped(self):
+        return self._view_options.chk_hide_skipped
 
     @property
     def _wave_draw_mode(self):
@@ -761,21 +843,50 @@ class SchedulePageWidget(QWidget):
         self._filter_type_aliases = {x.casefold() for x in (type_aliases or set()) if x}
         if self._filter_type and not self._filter_type_aliases:
             self._filter_type_aliases = {self._filter_type.casefold()}
+        if allowed_department_ids is None:
+            self._metrics_allowed_departments = None
+        else:
+            self._metrics_allowed_departments = {
+                d.strip() for d in allowed_department_ids if isinstance(d, str) and d.strip()
+            }
         if self._project_index is None:
             return
         self._gantt.set_include_shots(self._include_shots)
         self._gantt.set_include_assets(self._include_assets)
         self._apply_filters(allowed_department_ids=allowed_department_ids)
+        self._update_stats()
+
+    def _planned_bars_for_metrics(self):
+        if self._project_root is None or self._project_index is None:
+            return {}
+        schedule = read_project_schedule(self._project_root)
+        return build_metrics_planned_bars(
+            self._project_root,
+            self._project_index,
+            schedule,
+            include_shots=self._include_shots,
+            include_assets=self._include_assets,
+            allowed_departments=self._metrics_allowed_departments,
+            hidden_departments=load_inspector_hidden_departments(self._settings),
+            respect_hidden=self._chk_respect_hidden.isChecked(),
+            dept_scope=DEPT_SCOPE_LEAF,
+        )
 
     def _load_view_options_settings(self) -> None:
         respect = bool(
             self._settings.value(SCHEDULE_RESPECT_HIDDEN_KEY, True, type=bool)
         )
+        hide_skipped = bool(
+            self._settings.value(SCHEDULE_HIDE_SKIPPED_KEY, False, type=bool)
+        )
         self._chk_respect_hidden.blockSignals(True)
+        self._chk_hide_skipped.blockSignals(True)
         try:
             self._chk_respect_hidden.setChecked(respect)
+            self._chk_hide_skipped.setChecked(hide_skipped)
         finally:
             self._chk_respect_hidden.blockSignals(False)
+            self._chk_hide_skipped.blockSignals(False)
 
         saved_label = normalize_bar_label_mode(
             str(self._settings.value(SCHEDULE_BAR_LABEL_KEY, BAR_LABEL_DEFAULT) or "")
@@ -836,12 +947,14 @@ class SchedulePageWidget(QWidget):
         self._save_dept_display_settings()
         self._sync_dept_display_to_gantt()
         self._apply_filters()
+        self._update_stats()
 
     def _apply_filters(self, *, allowed_department_ids: list[str] | None = None) -> None:
         self._gantt.apply_filters(
             dept_filter=self._filter_department,
             unscheduled_only=self._chk_unscheduled.isChecked(),
             overdue_only=self._chk_overdue.isChecked(),
+            hide_skipped=self._chk_hide_skipped.isChecked(),
             type_filter=self._filter_type,
             type_aliases=self._filter_type_aliases,
             allowed_department_ids=allowed_department_ids,
@@ -873,17 +986,35 @@ class SchedulePageWidget(QWidget):
             str(len(schedule.allocations) + len(schedule.waves))
         )  # type: ignore[attr-defined]
         self._stat_milestones._value_label.setText(str(len(schedule.milestones)))  # type: ignore[attr-defined]
-        overdue = 0
+        bars = self._planned_bars_for_metrics()
+        overdue = count_overdue_bars(bars)
+        self._stat_overdue._value_label.setText(str(overdue))  # type: ignore[attr-defined]
+        snap = SkippedScheduleSnapshot(0, 0, ())
         if self._project_index is not None:
-            bars = build_planned_bars(
+            dept_reg = DepartmentRegistry.for_project(self._project_root)
+            snap = build_skipped_schedule_snapshot(
                 self._project_root,
                 self._project_index,
-                schedule,
                 include_shots=self._include_shots,
                 include_assets=self._include_assets,
+                hidden_departments=load_inspector_hidden_departments(self._settings),
+                respect_hidden=self._chk_respect_hidden.isChecked(),
+                dept_scope=DEPT_SCOPE_LEAF,
+                dept_reg=dept_reg,
+                allowed_departments=self._metrics_allowed_departments,
             )
-            overdue = count_overdue_bars(bars)
-        self._stat_overdue._value_label.setText(str(overdue))  # type: ignore[attr-defined]
+        self._skipped_snapshot = snap
+        if snap.item_count or snap.department_count:
+            self._stat_skipped._value_label.setText(f"{snap.item_count} · {snap.department_count}")
+        else:
+            self._stat_skipped._value_label.setText("0")
+        self._stat_skipped.setToolTip(
+            f"{snap.item_count} fully skipped items · {snap.department_count} skipped departments. "
+            "Click to view list."
+        )
+
+    def skipped_snapshot(self) -> SkippedScheduleSnapshot:
+        return self._skipped_snapshot
 
     def reveal_entity(
         self,
@@ -1001,7 +1132,9 @@ class SchedulePageWidget(QWidget):
         self._sync_wave_draw_controls()
 
     def _on_filter_changed(self) -> None:
+        self._settings.setValue(SCHEDULE_HIDE_SKIPPED_KEY, self._chk_hide_skipped.isChecked())
         self._apply_filters()
+        self._update_stats()
 
     def _on_schedule_changed(self) -> None:
         self._update_stats()

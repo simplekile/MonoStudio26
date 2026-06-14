@@ -451,8 +451,7 @@ class SidebarNavRail(QWidget):
         return self._scope_context
 
     def set_current_context(self, context_name: str, *, force: bool = False) -> None:
-        _ = force
-        if context_name == self.current_context():
+        if not force and context_name == self.current_context():
             return
         if context_name in (SidebarContext.SHOTS.value, SidebarContext.ASSETS.value):
             self._footer_context = None

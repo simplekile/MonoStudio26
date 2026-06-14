@@ -77,6 +77,12 @@ class _LegendSwatch(QWidget):
                 p.setPen(QPen(QColor("#fafafa"), 1, Qt.PenStyle.DashLine))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawRoundedRect(2.5, 4.5, w - 5, h - 9, 3, 3)
+            elif kind == "bar_skipped":
+                p.fillRect(2, 3, w - 4, h - 6, QColor(255, 255, 255, 8))
+                p.setPen(QPen(QColor("#71717a"), 1))
+                step = 5
+                for offset in range(-h, w + h, step):
+                    p.drawLine(2 + offset, 3, 2 + offset + h, h - 3)
         finally:
             p.end()
 
@@ -120,6 +126,7 @@ class ScheduleLegendBar(QWidget):
             ("bar_waiting", "Waiting"),
             ("bar_overdue", "Overdue"),
             ("bar_pinned", "Pinned bar"),
+            ("bar_skipped", "Skipped"),
         ):
             root.addWidget(_legend_item(self, kind, label), 0, Qt.AlignmentFlag.AlignVCenter)
 

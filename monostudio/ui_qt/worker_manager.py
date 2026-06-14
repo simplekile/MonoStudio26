@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 _TASK_FINISHED_TYPE = QEvent.Type(QEvent.registerEventType())
 
 
+def _manager_accepts_results(manager: "WorkerManager | None") -> bool:
+    if manager is None or getattr(manager, "_shutting_down", False):
+        return False
+    try:
+        from shiboken6 import isValid
+
+        return isValid(manager)
+    except ImportError:
+        return True
+
+
 class _TaskFinishedEvent(QEvent):
     """Carries task result from pool thread to WorkerManager (main thread) via postEvent."""
 
@@ -72,9 +83,16 @@ class WorkerTask(QRunnable):
         if self._cancelled:
             return
         schedule_cat = getattr(self, "_schedule_category", self._category)
+        manager = self._manager
+        if not _manager_accepts_results(manager):
+            return
         app = QCoreApplication.instance()
-        if app is not None:
-            app.postEvent(self._manager, _TaskFinishedEvent(schedule_cat, result, error))
+        if app is None:
+            return
+        try:
+            app.postEvent(manager, _TaskFinishedEvent(schedule_cat, result, error))
+        except RuntimeError:
+            logger.debug("WorkerTask %s result dropped (manager deleted)", self._category)
 
 
 class WorkerManager(QObject):
@@ -87,12 +105,26 @@ class WorkerManager(QObject):
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._shutting_down = False
         self._pool = QThreadPool(self)
         n = max(1, (os.cpu_count() or 2) - 1)
         self._pool.setMaxThreadCount(n)
         self._pending: dict[str, WorkerTask] = {}
         self._debounce_timers: dict[str, QTimer] = {}
         self._debounce_pending: dict[str, WorkerTask] = {}
+
+    def shutdown(self, *, wait_ms: int = 3000) -> None:
+        """Cancel pending work and wait for running pool tasks (app/window quit)."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        for cat in list(self._debounce_timers):
+            self.cancel_category(cat)
+        for cat in list(self._pending):
+            self.cancel_category(cat)
+        for cat in list(self._debounce_pending):
+            self.cancel_category(cat)
+        self._pool.waitForDone(max(0, wait_ms))
 
     def customEvent(self, event: QEvent) -> None:
         if event.type() == _TASK_FINISHED_TYPE and isinstance(event, _TaskFinishedEvent):
@@ -130,6 +162,8 @@ class WorkerManager(QObject):
         - replace_existing: cancel previous pending task in the same category.
         - debounce_ms: delay execution and coalesce repeated submissions in this category.
         """
+        if self._shutting_down:
+            return
         cat = (category or "").strip() or task.category
         setattr(task, "_schedule_category", cat)
         if replace_existing and cat in self._pending:

@@ -180,6 +180,22 @@ def _bar_is_excluded(bucket: str, status_id: str) -> bool:
     return bucket == STATUS_EXCLUDED or (status_id or "").strip() == SKIPPED_STATUS_ID
 
 
+def bar_is_schedule_overdue(
+    *,
+    due: date,
+    today: date,
+    bucket: str,
+    excluded: bool = False,
+    goal_met: bool = False,
+) -> bool:
+    """Past due while still waiting — in-progress slips are late (amber), not overdue."""
+    if excluded or goal_met:
+        return False
+    if bucket in (STATUS_DONE, STATUS_EXCLUDED, STATUS_PROGRESS):
+        return False
+    return due < today and bucket == STATUS_WAITING
+
+
 def _norm_entity_kind(kind: str) -> str:
     return (kind or "").strip().lower()
 
@@ -358,7 +374,11 @@ def build_planned_bars(
             if _bar_is_excluded(bucket, sid):
                 end_cursor = start - timedelta(days=1)
                 continue
-            overdue = due < today and bucket != STATUS_DONE
+            overdue = bar_is_schedule_overdue(
+                due=due,
+                today=today,
+                bucket=bucket,
+            )
             _store_bar(
                 PlannedBar(
                     entity_kind=kind,
@@ -403,7 +423,12 @@ def build_planned_bars(
         )
         bucket, sid, color, _ = _status_for(ref, dep_id)
         excluded = _bar_is_excluded(bucket, sid)
-        overdue = not excluded and due_d < today and bucket != STATUS_DONE
+        overdue = bar_is_schedule_overdue(
+            due=due_d,
+            today=today,
+            bucket=bucket,
+            excluded=excluded,
+        )
         _store_bar(
             PlannedBar(
                 entity_kind=kind,
@@ -445,7 +470,13 @@ def build_planned_bars(
         if met:
             bucket = STATUS_DONE
         excluded = _bar_is_excluded(bucket, current_sid)
-        overdue = not excluded and not met and due < today
+        overdue = bar_is_schedule_overdue(
+            due=due,
+            today=today,
+            bucket=STATUS_DONE if met else bucket,
+            excluded=excluded,
+            goal_met=met,
+        )
         # Timeline paints overdue via bar.overdue; keep production/target color here.
         color = "#10b981" if met else target_color
         _store_bar(
@@ -556,6 +587,92 @@ def collect_overdue_entity_keys(
         else:
             shot_keys.append(key)
     return asset_keys + shot_keys
+
+
+@dataclass(frozen=True)
+class OverdueEntityRow:
+    """One asset/shot with at least one overdue planned bar."""
+
+    entity_kind: str
+    entity_rel: str
+    entity_name: str
+    overdue_bar_count: int
+    worst_overdue_days: int
+    primary_department: str
+    primary_department_label: str
+    department_labels: tuple[str, ...]
+    department_ids: tuple[str, ...] = ()
+
+
+def collect_overdue_entity_rows(
+    bars: BarStore,
+    *,
+    today: date | None = None,
+) -> list[OverdueEntityRow]:
+    """Unique entities with overdue bars — assets first, then worst-late first."""
+    ref_day = today or date.today()
+    grouped: dict[tuple[str, str], dict[str, object]] = {}
+    for bar in bars.values():
+        if not bar.overdue:
+            continue
+        kind = (bar.entity_kind or "").strip().lower()
+        rel = (bar.entity_rel or "").replace("\\", "/").strip()
+        if not kind or not rel:
+            continue
+        key = (kind, rel)
+        slot = grouped.get(key)
+        if slot is None:
+            slot = {
+                "name": (bar.entity_name or "").strip() or rel.rsplit("/", 1)[-1],
+                "count": 0,
+                "worst_days": 0,
+                "primary_department": (bar.department or "").strip(),
+                "primary_department_label": (bar.department_label or bar.department or "").strip(),
+                "dept_labels": set(),
+                "dept_ids": set(),
+            }
+            grouped[key] = slot
+        slot["count"] = int(slot["count"]) + 1
+        days_late = max(0, (ref_day - bar.due).days)
+        if days_late >= int(slot["worst_days"]):
+            slot["worst_days"] = days_late
+            dep = (bar.department or "").strip()
+            slot["primary_department"] = dep
+            slot["primary_department_label"] = (bar.department_label or dep).strip()
+        label = (bar.department_label or bar.department or "").strip()
+        if label:
+            slot["dept_labels"].add(label)
+        dep_id = (bar.department or "").strip()
+        if dep_id:
+            slot["dept_ids"].add(dep_id)
+
+    assets: list[OverdueEntityRow] = []
+    shots: list[OverdueEntityRow] = []
+    for (kind, rel), slot in grouped.items():
+        dept_labels = tuple(sorted(slot["dept_labels"]))  # type: ignore[arg-type]
+        dept_ids = tuple(sorted(slot["dept_ids"]))  # type: ignore[arg-type]
+        row = OverdueEntityRow(
+            entity_kind=kind,
+            entity_rel=rel,
+            entity_name=str(slot["name"]),
+            overdue_bar_count=int(slot["count"]),
+            worst_overdue_days=int(slot["worst_days"]),
+            primary_department=str(slot["primary_department"]),
+            primary_department_label=str(slot["primary_department_label"]),
+            department_labels=dept_labels,
+            department_ids=dept_ids,
+        )
+        if kind == "asset":
+            assets.append(row)
+        else:
+            shots.append(row)
+
+    def _sort_key(r: OverdueEntityRow) -> tuple:
+        return (-r.worst_overdue_days, -r.overdue_bar_count, r.entity_name.lower())
+
+    assets.sort(key=_sort_key)
+    shots.sort(key=_sort_key)
+    return assets + shots
 
 
 @dataclass(frozen=True)
@@ -892,6 +1009,47 @@ def collect_upcoming_due_rows(
         )
     rows.sort(key=lambda r: (not r.overdue, r.due, r.entity_name.lower(), r.department))
     return rows[:limit]
+
+
+@dataclass(frozen=True)
+class UpcomingDueWeekView:
+    today: date
+    horizon: date
+    overdue: tuple[UpcomingDueRow, ...]
+    by_day: tuple[tuple[date, tuple[UpcomingDueRow, ...]], ...]
+
+
+def group_upcoming_due_for_week(
+    rows: list[UpcomingDueRow],
+    *,
+    today: date | None = None,
+    days: int = 7,
+) -> UpcomingDueWeekView:
+    """Partition upcoming-due rows into overdue + fixed day buckets (today .. today+N-1)."""
+    ref = today or date.today()
+    span = max(1, int(days))
+    horizon = ref + timedelta(days=span - 1)
+    day_slots = [ref + timedelta(days=i) for i in range(span)]
+    buckets: dict[date, list[UpcomingDueRow]] = {d: [] for d in day_slots}
+    overdue: list[UpcomingDueRow] = []
+    for row in rows:
+        if row.overdue:
+            overdue.append(row)
+            continue
+        bucket = buckets.get(row.due)
+        if bucket is not None:
+            bucket.append(row)
+    sort_key = lambda r: (r.entity_name.lower(), r.department)
+    overdue.sort(key=sort_key)
+    for d in day_slots:
+        buckets[d].sort(key=sort_key)
+    by_day = tuple((d, tuple(buckets[d])) for d in day_slots)
+    return UpcomingDueWeekView(
+        today=ref,
+        horizon=horizon,
+        overdue=tuple(overdue),
+        by_day=by_day,
+    )
 
 
 def list_due_display(

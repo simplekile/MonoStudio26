@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "category_order": [
+    "not_started",
+    "in_progress",
+    "review",
+    "done",
+    "hold",
+    "blocked",
+    "na"
+  ],
+  "menu_category_order": [
+    "not_started",
+    "in_progress",
+    "review",
+    "done",
+    "hold",
+    "blocked",
+    "na"
+  ],
+  "statuses": [
+    {
+      "id": "rig_waiting",
+      "label": "Waiting",
+      "category": "not_started",
+      "order": 0,
+      "tooltip": "Not started or waiting for handoff."
+    },
+    {
+      "id": "working",
+      "label": "Working",
+      "category": "in_progress",
+      "order": 5,
+      "tooltip": "Active work in progress (generic, before a specific rig stage)."
+    },
+    {
+      "id": "rig_proxy",
+      "label": "Proxy rig",
+      "category": "in_progress",
+      "order": 10,
+      "tooltip": "Temporary rig on proxy or incomplete geo — ready for layout animation."
+    },
+    {
+      "id": "rig_final",
+      "label": "Final rig",
+      "category": "in_progress",
+      "order": 20,
+      "tooltip": "Full rig on finalized model — ready for block and spline animation."
+    },
+    {
+      "id": "published",
+      "label": "Published",
+      "category": "done",
+      "order": 60,
+      "tooltip": "Shipped or published build."
+    },
+    {
+      "id": "omitted",
+      "label": "Skipped / N/A",
+      "category": "na",
+      "order": 99,
+      "tooltip": "Not applicable for this department."
+    }
+  ]
+}

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from PySide6.QtCore import QSettings
 
-LAYOUT_VERSION = 1
+LAYOUT_VERSION = 2
 SETTINGS_KEY_LAYOUT = "dashboard/layout_v1"
 MIME_WIDGET_TYPE = "application/x-monos-dashboard-widget"
 
@@ -20,7 +20,6 @@ DASHBOARD_WIDGET_IDS: frozenset[str] = frozenset(
         "pipeline_health",
         "dept_load",
         "next_7_days",
-        "needs_attention",
         "recent_notes",
     }
 )
@@ -29,9 +28,8 @@ DASHBOARD_WIDGET_LABELS: dict[str, str] = {
     "header": "Welcome header",
     "kpi": "KPI tiles",
     "pipeline_health": "Pipeline Health",
-    "dept_load": "Department Load",
+    "dept_load": "Department workload",
     "next_7_days": "Next 7 Days",
-    "needs_attention": "Needs Attention",
     "recent_notes": "Recent Notes",
 }
 
@@ -65,8 +63,7 @@ DEFAULT_LAYOUT: list[DashboardWidgetSlot] = [
     DashboardWidgetSlot("pipeline_health", span=1, visible=True),
     DashboardWidgetSlot("dept_load", span=1, visible=True),
     DashboardWidgetSlot("next_7_days", span=1, visible=True),
-    DashboardWidgetSlot("needs_attention", span=1, visible=True),
-    DashboardWidgetSlot("recent_notes", span=2, visible=True),
+    DashboardWidgetSlot("recent_notes", span=1, visible=True),
 ]
 
 _DEFAULT_BY_ID: dict[str, DashboardWidgetSlot] = {s.id: s for s in DEFAULT_LAYOUT}
@@ -139,12 +136,35 @@ def slots_to_json(slots: list[DashboardWidgetSlot]) -> str:
     return json.dumps(payload, separators=(",", ":"))
 
 
+def _migrate_layout_v2(slots: list[DashboardWidgetSlot]) -> list[DashboardWidgetSlot]:
+    """Drop removed widgets and place Recent Notes beside Next 7 Days."""
+    cleaned: list[DashboardWidgetSlot] = []
+    for raw in slots:
+        slot = raw.normalized()
+        if not slot.id:
+            continue
+        if slot.id == "recent_notes":
+            cleaned.append(DashboardWidgetSlot(slot.id, span=1, visible=slot.visible))
+        else:
+            cleaned.append(slot)
+    by_id = {s.id: s for s in cleaned}
+    order = [s.id for s in cleaned]
+    if "next_7_days" in order and "recent_notes" in order:
+        order.remove("recent_notes")
+        order.insert(order.index("next_7_days") + 1, "recent_notes")
+    merged = [by_id[i] for i in order]
+    return _merge_with_defaults(merged)
+
+
 def slots_from_json(raw: str) -> list[DashboardWidgetSlot] | None:
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(data, dict) or data.get("version") != LAYOUT_VERSION:
+    if not isinstance(data, dict):
+        return None
+    version = data.get("version")
+    if version not in (1, LAYOUT_VERSION):
         return None
     widgets = data.get("widgets")
     if not isinstance(widgets, list):
@@ -165,18 +185,27 @@ def slots_from_json(raw: str) -> list[DashboardWidgetSlot] | None:
         )
     if not parsed:
         return None
+    if version < LAYOUT_VERSION:
+        return _migrate_layout_v2(parsed)
     return _merge_with_defaults(parsed)
 
 
 def load_dashboard_layout(settings: QSettings | None) -> list[DashboardWidgetSlot]:
+    default = [DashboardWidgetSlot(s.id, s.span, s.visible) for s in DEFAULT_LAYOUT]
     if settings is None:
-        return [DashboardWidgetSlot(s.id, s.span, s.visible) for s in DEFAULT_LAYOUT]
+        return default
     raw = settings.value(SETTINGS_KEY_LAYOUT, "", str) or ""
     if not raw.strip():
-        return [DashboardWidgetSlot(s.id, s.span, s.visible) for s in DEFAULT_LAYOUT]
+        return default
     parsed = slots_from_json(raw)
     if parsed is None:
-        return [DashboardWidgetSlot(s.id, s.span, s.visible) for s in DEFAULT_LAYOUT]
+        return default
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    if isinstance(data, dict) and int(data.get("version", 0)) < LAYOUT_VERSION:
+        save_dashboard_layout(settings, parsed)
     return parsed
 
 

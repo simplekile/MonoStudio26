@@ -4,6 +4,9 @@ import base64
 import json
 import logging
 import time
+from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime
 import os
 import shutil
@@ -112,6 +115,163 @@ from monostudio.ui_qt.app_footer import AppFooter
 from monostudio.ui_qt.notification import notify as notification_service
 
 
+@dataclass
+class _ProductionStatusBatchResult:
+    failed: list[tuple[str, str]]
+    ok_resolved: set[str]
+    current_assets: dict[str, Asset]
+    current_shots: dict[str, Shot]
+    schedule_touched: bool
+
+
+def _batch_sync_schedule_after_status_overrides(
+    project_root: Path,
+    applied: list[tuple[Path, str, str | None]],
+) -> bool:
+    """Batch schedule JSON updates after production status overrides."""
+    if not applied:
+        return False
+    from monostudio.core.production_status import SKIPPED_STATUS_ID
+    from monostudio.core.project_schedule import (
+        clear_auto_bar_suppressions_for_entities,
+        clear_entity_department_schedules,
+        entity_rel_path,
+    )
+
+    struct_reg = StructureRegistry.for_project(project_root)
+    assets_dir = project_root / struct_reg.get_folder("assets")
+    skip_rows: list[tuple[str, str, str]] = []
+    unskip_by_dep: dict[str, list[tuple[str, str]]] = defaultdict(list)
+
+    for ep, dep_s, sid in applied:
+        dep = (dep_s or "").strip()
+        if not dep:
+            continue
+        try:
+            ep_r = ep.resolve()
+        except OSError:
+            ep_r = ep
+        try:
+            ep_r.relative_to(assets_dir.resolve())
+            kind = "asset"
+        except ValueError:
+            kind = "shot"
+        rel = entity_rel_path(project_root, ep_r)
+        if sid == SKIPPED_STATUS_ID:
+            skip_rows.append((kind, rel, dep))
+        elif sid is None:
+            unskip_by_dep[dep].append((kind, rel))
+
+    touched = False
+    if skip_rows:
+        clear_entity_department_schedules(
+            project_root, rows=skip_rows, suppress_auto=True
+        )
+        touched = True
+    for dep, entities in unskip_by_dep.items():
+        if entities:
+            clear_auto_bar_suppressions_for_entities(
+                project_root, department=dep, entities=entities
+            )
+            touched = True
+    return touched
+
+
+def run_production_status_batch(
+    project_root: Path,
+    updates: list[tuple[Path, str, str | None]],
+    *,
+    current_assets: dict[str, Asset],
+    current_shots: dict[str, Shot],
+) -> _ProductionStatusBatchResult:
+    """Write status overrides, rescan touched entities, batch schedule sync (worker-safe)."""
+    failed: list[tuple[str, str]] = []
+    ok_paths: list[Path] = []
+    applied: list[tuple[Path, str, str | None]] = []
+    seen_write: set[tuple[str, str]] = set()
+
+    for ep, dep, sid in updates:
+        dep_s = (dep or "").strip()
+        if not dep_s:
+            continue
+        key = (str(ep), dep_s)
+        if key in seen_write:
+            continue
+        seen_write.add(key)
+        try:
+            set_department_status_override(ep, dep_s, sid)
+            applied.append((ep, dep_s, sid))
+            if ep not in ok_paths:
+                ok_paths.append(ep)
+        except OSError as e:
+            failed.append((str(ep), str(e)))
+        except ValueError:
+            pass
+
+    ok_resolved: set[str] = set()
+    if ok_paths:
+        dept_reg = DepartmentRegistry.for_project(project_root)
+        type_reg = TypeRegistry.for_project(project_root)
+        struct_reg = StructureRegistry.for_project(project_root)
+        assets_dir = project_root / struct_reg.get_folder("assets")
+        shots_dir = project_root / struct_reg.get_folder("shots")
+
+        def same_path(key: str, path_value: Path) -> bool:
+            try:
+                return Path(key).resolve() == Path(path_value).resolve()
+            except OSError:
+                return False
+
+        for ep in ok_paths:
+            try:
+                ep_r = ep.resolve()
+            except OSError:
+                ep_r = ep
+            ok_resolved.add(str(ep_r))
+
+            updated_asset: Asset | None = None
+            updated_shot: Shot | None = None
+            try:
+                ep_r.relative_to(assets_dir.resolve())
+                updated_asset = scan_single_asset(project_root, ep_r, dept_reg, type_reg)
+            except ValueError:
+                pass
+            if updated_asset is None:
+                try:
+                    ep_r.relative_to(shots_dir.resolve())
+                    updated_shot = scan_single_shot(project_root, ep_r, dept_reg)
+                except ValueError:
+                    pass
+
+            if updated_asset is not None:
+                key = next(
+                    (k for k in current_assets if same_path(k, updated_asset.path)),
+                    str(updated_asset.path),
+                )
+                for k in list(current_assets):
+                    if k != key and same_path(k, updated_asset.path):
+                        current_assets.pop(k, None)
+                current_assets[key] = updated_asset
+            if updated_shot is not None:
+                key = next(
+                    (k for k in current_shots if same_path(k, updated_shot.path)),
+                    str(updated_shot.path),
+                )
+                for k in list(current_shots):
+                    if k != key and same_path(k, updated_shot.path):
+                        current_shots.pop(k, None)
+                current_shots[key] = updated_shot
+
+    schedule_touched = _batch_sync_schedule_after_status_overrides(project_root, applied)
+    return _ProductionStatusBatchResult(
+        failed=failed,
+        ok_resolved=ok_resolved,
+        current_assets=current_assets,
+        current_shots=current_shots,
+        schedule_touched=schedule_touched,
+    )
+
+
 class _StartupUpdateCheckWorker(QThread):
     """Runs full update check (MonoStudio + extra repos) in background at startup; emits (result, error_message)."""
 
@@ -143,10 +303,13 @@ class MainWindow(FramelessMainWindow):
     departmentChanged = Signal(object)  # str | None
     typeChanged = Signal(object)  # str | None
 
-    def __init__(self) -> None:
+    def __init__(self, *, splash_status: Callable[[str], None] | None = None) -> None:
         super().__init__()
+        _splash = splash_status or (lambda _msg: None)
         self.setWindowTitle("MONOS")
         ensure_pipeline_bootstrap()
+
+        _splash("Initializing pipeline…")
 
         # Minimum window size (usability floor).
         self.setMinimumSize(640, 480)
@@ -172,6 +335,7 @@ class MainWindow(FramelessMainWindow):
         self._identity_prompt_pending: bool = False
         self._pending_deep_link: str | None = None
         self.launch_hidden_to_tray: bool = False
+        self._pending_restore_maximized: bool = False
         self._force_quit: bool = False
         self._tray_manager = None
         self._workspace_root: Path | None = None
@@ -220,8 +384,8 @@ class MainWindow(FramelessMainWindow):
             self._filter_panel.filters().set_settings(self._settings)
         except Exception:
             pass
-        # Restore nav + filter UI before project load so the first main-view build respects saved dept/type.
-        self._restore_sidebar_context()
+        # Filter panel only — nav rail + content stack are restored after context_changed is connected.
+        self._restore_sidebar_context(nav_rail=False)
         self._sidebar_container = QWidget(self)
         self._sidebar_container.setObjectName("SidebarContainer")
         self._sidebar_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
@@ -257,6 +421,7 @@ class MainWindow(FramelessMainWindow):
         self._top_bar = TopBar(self)
         self._top_bar.setFixedHeight(56)  # so FramelessMainWindow resize keeps height
         self.setTitleBar(self._top_bar)  # replace library title bar with MONOS TopBar
+        _splash("Building workspace…")
         self._geometry_before_maximize: QRect | None = None  # restore về đúng kích thước khi bấm restore
         self._clipboard_thumbs = ClipboardThumbnailHandler(parent=self)
 
@@ -311,12 +476,17 @@ class MainWindow(FramelessMainWindow):
         _central_layout.addWidget(self._app_footer, 0)
         self.setCentralWidget(_central)
         _central.installEventFilter(self)
+        from monostudio.ui_qt.splash import prepare_main_window_shell
+
+        prepare_main_window_shell(self)
+        _splash("Assembling layout…")
         self._content_stack.installEventFilter(self)
         self._inspector.installEventFilter(self)
         self._main_view.installEventFilter(self)
         self._main_view._tile_view.viewport().installEventFilter(self)
         self._main_view._list_view.viewport().installEventFilter(self)
         self._restore_project_root()
+        _splash("Loading project…")
         self._restore_splitter_sizes()
         # Store sizes to restore when showing panels again after narrow resize.
         self._content_splitter_sizes_restore: list[int] = [800, 320]
@@ -338,6 +508,7 @@ class MainWindow(FramelessMainWindow):
         self._main_splitter.splitterMoved.connect(self._update_title_bar_geometry)
 
         self._nav_rail.context_changed.connect(self._on_context_switched)
+        _splash("Connecting UI…")
         self._nav_rail.context_clicked.connect(self._on_context_clicked)
         self._nav_rail.project_switch_requested.connect(self._switch_project)
         self._nav_rail.browse_projects_requested.connect(self._open_project_picker)
@@ -1256,7 +1427,7 @@ class MainWindow(FramelessMainWindow):
             return
         filters = self._filter_panel.filters()
         new_dept = filters.current_department()
-        new_type = filters.current_type()
+        new_type = None if ctx == "Shots" else filters.current_type()
         self.current_department = new_dept if isinstance(new_dept, str) and new_dept.strip() else None
         self.current_type = new_type if isinstance(new_type, str) and new_type.strip() else None
         self._controller.current_department = self.current_department
@@ -1388,6 +1559,9 @@ class MainWindow(FramelessMainWindow):
         if ctx not in ("Assets", "Shots"):
             self._main_view.set_selected_asset_type(None)
             return
+        if ctx == "Shots":
+            self._main_view.set_selected_asset_type(None)
+            return
         type_id = self._filter_panel.filters().current_type()
         if not type_id:
             self._main_view.set_selected_asset_type(None)
@@ -1494,7 +1668,7 @@ class MainWindow(FramelessMainWindow):
             department=dept,
             type_id=type_id,
             type_aliases=self._type_aliases_for_id(type_id),
-            allowed_department_ids=panel.visible_department_ids(),
+            allowed_department_ids=panel.schedule_visible_department_ids(),
         )
         dep_label, dep_icon = panel.get_department_display(dept) if dept else (None, None)
         self._main_view.set_active_department(dept, label=dep_label, icon_name=dep_icon)
@@ -1513,11 +1687,20 @@ class MainWindow(FramelessMainWindow):
         respect_hidden = bool(
             self._settings.value(SCHEDULE_RESPECT_HIDDEN_KEY, True, type=bool)
         )
+        shots, assets = self._filter_panel.filters().entity_scope()
+        panel = self._filter_panel.filters()
+        eligible = panel.schedule_eligible_department_ids()
         self._dashboard_page_widget.set_dept_filter(
-            allowed_department_ids=self._filter_panel.filters().schedule_visible_department_ids(),
+            allowed_department_ids=panel.schedule_visible_department_ids(),
+            workload_department_ids=eligible,
+            workload_department_order=tuple(eligible),
+            workload_shot_department_ids=panel.schedule_shot_department_ids(),
+            workload_asset_department_ids=panel.schedule_asset_department_ids(),
             hidden_departments=load_inspector_hidden_departments(self._settings),
             respect_hidden=respect_hidden,
             dept_scope=DEPT_SCOPE_LEAF,
+            include_shots=shots,
+            include_assets=assets,
         )
 
     def _schedule_dashboard_refresh(self) -> None:
@@ -1780,6 +1963,9 @@ class MainWindow(FramelessMainWindow):
         return self._project_root.name
 
     _WORKSPACE_STATS_WORKER = "workspace_quick_stats"
+    _PRODUCTION_STATUS_BATCH_WORKER = "production_status_batch"
+    _SKIP_STATUS_LOADING_MESSAGE = "Updating skip status…"
+    _PRODUCTION_STATUS_ASYNC_MIN = 3
 
     def _refresh_workspace_project_stats(self, *, schedule_aware: bool = False) -> None:
         """Rebuild per-project quick stats on the UI thread (light scans only)."""
@@ -1886,9 +2072,11 @@ class MainWindow(FramelessMainWindow):
             current_root=self._project_root,
             status_by_root=self._workspace_project_status,
         )
+        display_name = self._project_display_name()
         self._filter_panel.set_project_display_name(
-            self._project_display_name(), project_root=self._project_root
+            display_name, project_root=self._project_root
         )
+        self._top_bar.set_project_display_name(display_name)
         from monostudio.core.user_identity import get_current_user
 
         user = get_current_user(self._workspace_root)
@@ -2174,6 +2362,7 @@ class MainWindow(FramelessMainWindow):
         if self._schedule_page_widget is None or self._nav_rail.current_context() != "Schedule":
             return
         self._schedule_page_widget.refresh(self._project_index)
+        self._apply_schedule_sidebar_filters()
 
     def _on_schedule_changed(self) -> None:
         self._refresh_dashboard_if_visible()
@@ -2508,6 +2697,12 @@ class MainWindow(FramelessMainWindow):
         else:
             self._identity_prompt_pending = True
 
+    def apply_pending_window_state(self) -> None:
+        """Apply saved maximize after first dark paint (splash transition — avoids white fullscreen flash)."""
+        if self._pending_restore_maximized:
+            self._pending_restore_maximized = False
+            self._apply_restore_maximized()
+
     def complete_startup(self) -> None:
         """Called from app.py after splash.dismiss; runs deferred sign-in prompt."""
         self._startup_complete = True
@@ -2770,6 +2965,7 @@ class MainWindow(FramelessMainWindow):
     def quit_application(self) -> None:
         """Exit from tray menu — bypass hide-to-tray."""
         self._force_quit = True
+        self._worker_manager.shutdown()
         self._flush_discord_inbox_outbox()
         self._persist_window_state()
         app = QApplication.instance()
@@ -2942,18 +3138,102 @@ class MainWindow(FramelessMainWindow):
         self._nav_rail.set_current_context("Schedule", force=True)
 
     def _on_dashboard_overdue_entities(self, entities: object) -> None:
-        raw = list(entities) if entities is not None else []
-        keys: list[tuple[str, str]] = []
-        for item in raw:
-            if not isinstance(item, (tuple, list)) or len(item) < 2:
-                continue
-            kind = str(item[0] or "").strip().lower()
-            rel = str(item[1] or "").replace("\\", "/").strip()
-            if kind and rel:
-                keys.append((kind, rel))
+        self._open_overdue_entities_dialog()
+
+    def _open_overdue_entities_dialog(self) -> None:
+        from monostudio.ui_qt.overdue_entities_dialog import OverdueEntitiesDialog
+
+        rows = ()
+        if self._dashboard_page_widget is not None:
+            rows = self._dashboard_page_widget.overdue_entity_rows()
+        dlg = getattr(self, "_overdue_entities_dialog", None)
+        if dlg is None:
+            dlg = OverdueEntitiesDialog(parent=self)
+            dlg.open_in_main_view.connect(self._on_overdue_dialog_open_main_view)
+            dlg.open_in_schedule.connect(self._on_overdue_dialog_open_schedule)
+            self._overdue_entities_dialog = dlg
+        dlg.set_rows(rows)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _open_skipped_schedule_dialog(self) -> None:
+        from monostudio.core.schedule_skip import SkippedScheduleSnapshot
+        from monostudio.ui_qt.skipped_schedule_dialog import SkippedScheduleDialog
+
+        snap = SkippedScheduleSnapshot(0, 0, ())
+        if self._schedule_page_widget is not None:
+            snap = self._schedule_page_widget.skipped_snapshot()
+        dlg = getattr(self, "_skipped_schedule_dialog", None)
+        if dlg is None:
+            dlg = SkippedScheduleDialog(parent=self)
+            dlg.open_in_main_view.connect(self._on_overdue_dialog_open_main_view)
+            dlg.open_in_schedule.connect(self._on_skipped_dialog_open_schedule)
+            self._skipped_schedule_dialog = dlg
+        dlg.set_snapshot(snap)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_skipped_dialog_open_schedule(
+        self,
+        entity_kind: str,
+        entity_rel: str,
+        department: str,
+    ) -> None:
+        kind = (entity_kind or "").strip().lower()
+        rel = (entity_rel or "").replace("\\", "/").strip()
+        if not kind or not rel:
+            return
+        dep = (department or "").strip() or None
+        if self._nav_rail.current_context() != "Schedule":
+            self._pending_schedule_jump = (kind, rel, dep or "", "")
+            self._pending_overdue_entities = None
+            self._pending_unscheduled_entities = None
+            self._nav_rail.set_current_context("Schedule", force=True)
+            return
+        if dep:
+            self._controller.sync_filter_state(department=dep, type_id=self.current_type)
+            self._filter_panel.filters().set_selected_department(dep, emit=False)
+            self._apply_schedule_sidebar_filters()
+        if self._schedule_page_widget is not None:
+            self._schedule_page_widget.clear_transient_view_filters()
+            self._schedule_page_widget.reveal_entity(kind, rel, department=dep)
+        item = self._view_item_for_schedule_entity(kind, rel)
+        if item is not None:
+            self._schedule_inspector_item = item
+            self._refresh_inspector_selection()
+
+    def _on_overdue_dialog_open_main_view(
+        self,
+        entity_kind: str,
+        entity_rel: str,
+        department: str,
+        entity_name: str,
+    ) -> None:
+        self._navigate_dashboard_to_entity(
+            entity_kind=entity_kind,
+            entity_name=entity_name,
+            department=department,
+            entity_rel=entity_rel,
+        )
+
+    def _on_overdue_dialog_open_schedule(
+        self,
+        entity_kind: str,
+        entity_rel: str,
+        department: str,
+    ) -> None:
+        kind = (entity_kind or "").strip().lower()
+        rel = (entity_rel or "").replace("\\", "/").strip()
+        if not kind or not rel:
+            return
+        dep = (department or "").strip() or None
         self._pending_schedule_jump = None
         self._pending_unscheduled_entities = None
-        self._pending_overdue_entities = keys or []
+        self._pending_overdue_entities = [(kind, rel)]
+        if dep:
+            self._filter_panel.filters().set_selected_department(dep, emit=False)
         self._nav_rail.set_current_context("Schedule", force=True)
 
     def _on_dashboard_schedule_jump(
@@ -3776,15 +4056,24 @@ class MainWindow(FramelessMainWindow):
         path = self._settings.value("project/root", "", str)
         self._apply_project_root(path or None, save=False)
 
-    def _restore_sidebar_context(self, *, force: bool = False) -> None:
+    def _restore_sidebar_context(
+        self,
+        *,
+        force: bool = False,
+        nav_rail: bool = True,
+        filter_panel: bool = True,
+    ) -> None:
         """Restore last selected nav page from QSettings."""
         _valid = ("Assets", "Shots", "Inbox", "Project Guide", "Dashboard", "Schedule", "Outbox", "Trash")
         ctx = (self._settings.value("ui/sidebar_context", "Assets", str) or "Assets").strip()
         if ctx == "Projects":
             ctx = "Dashboard"
-        if ctx in _valid:
-            self._nav_rail.set_current_context(ctx, force=force)
+        if ctx not in _valid:
+            return
+        if filter_panel:
             self._filter_panel.sync_nav_context(ctx, force=force)
+        if nav_rail:
+            self._nav_rail.set_current_context(ctx, force=force)
 
     def _on_context_switched(self, context_name: str) -> None:
         # Trigger: user switches between top-level contexts.
@@ -3982,6 +4271,18 @@ class MainWindow(FramelessMainWindow):
                     )
                     self._schedule_page_widget.department_skip_toggle_requested.connect(
                         self._on_schedule_department_skip_toggle,
+                        Qt.ConnectionType.UniqueConnection,
+                    )
+                    self._schedule_page_widget.entity_skip_toggle_requested.connect(
+                        self._on_schedule_entity_skip_toggle,
+                        Qt.ConnectionType.UniqueConnection,
+                    )
+                    self._schedule_page_widget.lane_skip_toggle_requested.connect(
+                        self._on_schedule_lane_skip_toggle,
+                        Qt.ConnectionType.UniqueConnection,
+                    )
+                    self._schedule_page_widget.skipped_list_requested.connect(
+                        self._open_skipped_schedule_dialog,
                         Qt.ConnectionType.UniqueConnection,
                     )
                     self._schedule_page_widget.jump_to_entity_requested.connect(
@@ -4477,7 +4778,14 @@ class MainWindow(FramelessMainWindow):
         if error is not None:
             logging.getLogger(__name__).warning("Worker task %s failed: %s", category, error)
             _dcc_log.debug("worker taskFinished category=%s error=%s", category, error)
-            if category == "inspector_preview_thumb":
+            if category == self._PRODUCTION_STATUS_BATCH_WORKER:
+                self._hide_page_loading()
+                QMessageBox.warning(
+                    self,
+                    "Production status",
+                    f"Could not update skip status:\n{error}",
+                )
+            elif category == "inspector_preview_thumb":
                 self._inspector.clear_preview_loading()
             elif category == "project_load":
                 failed_path = str(self._project_root) if self._project_root is not None else ""
@@ -4486,6 +4794,11 @@ class MainWindow(FramelessMainWindow):
                     error,
                     save=bool(getattr(self, "_project_load_save_on_complete", False)),
                 )
+            return
+        if category == self._PRODUCTION_STATUS_BATCH_WORKER:
+            self._hide_page_loading()
+            if isinstance(result, _ProductionStatusBatchResult):
+                self._finish_production_status_batch(result)
             return
         if category == "project_load" and isinstance(result, tuple) and len(result) == 2:
             expected_root, index = result[0], result[1]
@@ -6509,86 +6822,78 @@ class MainWindow(FramelessMainWindow):
             s = str(status_id).strip()
             sid = s if s else None
 
-        failed: list[tuple[Path, str]] = []
-        ok_paths: list[Path] = []
-        for ep in raw_paths:
-            try:
-                set_department_status_override(ep, dep, sid)
-                ok_paths.append(ep)
-            except OSError as e:
-                failed.append((ep, str(e)))
-            except ValueError:
-                pass
+        updates = [(ep, dep, sid) for ep in raw_paths]
+        self._apply_production_status_overrides(updates)
 
-        if not ok_paths:
-            if failed:
-                msg = "\n".join(f"{fp}: {err}" for fp, err in failed[:5])
-                if len(failed) > 5:
-                    msg += f"\n… (+{len(failed) - 5} more)"
+    def _apply_production_status_overrides(
+        self,
+        updates: list[tuple[Path, str, str | None]],
+        *,
+        show_progress: bool = False,
+    ) -> None:
+        if self._project_root is None or not updates:
+            return
+
+        use_async = show_progress or len(updates) >= self._PRODUCTION_STATUS_ASYNC_MIN
+        if use_async:
+            self._show_page_loading(self._SKIP_STATUS_LOADING_MESSAGE)
+            root = self._project_root
+            assets = dict(self._app_state.assets())
+            shots = dict(self._app_state.shots())
+            batch_updates = list(updates)
+
+            def run() -> _ProductionStatusBatchResult:
+                return run_production_status_batch(
+                    root,
+                    batch_updates,
+                    current_assets=assets,
+                    current_shots=shots,
+                )
+
+            task = WorkerTask(
+                self._PRODUCTION_STATUS_BATCH_WORKER,
+                run,
+                manager=self._worker_manager,
+            )
+            self._worker_manager.submit_task(
+                task,
+                category=self._PRODUCTION_STATUS_BATCH_WORKER,
+                replace_existing=True,
+            )
+            return
+
+        result = run_production_status_batch(
+            self._project_root,
+            updates,
+            current_assets=dict(self._app_state.assets()),
+            current_shots=dict(self._app_state.shots()),
+        )
+        self._finish_production_status_batch(result)
+
+    def _finish_production_status_batch(self, result: _ProductionStatusBatchResult) -> None:
+        if self._project_root is None:
+            return
+
+        if not result.ok_resolved:
+            if result.failed:
+                msg = "\n".join(f"{fp}: {err}" for fp, err in result.failed[:5])
+                if len(result.failed) > 5:
+                    msg += f"\n… (+{len(result.failed) - 5} more)"
                 QMessageBox.warning(self, "Production status", f"Could not save status:\n{msg}")
             return
 
-        if failed:
-            msg = "\n".join(f"{fp}: {err}" for fp, err in failed[:5])
-            if len(failed) > 5:
-                msg += f"\n… (+{len(failed) - 5} more)"
+        if result.failed:
+            msg = "\n".join(f"{fp}: {err}" for fp, err in result.failed[:5])
+            if len(result.failed) > 5:
+                msg += f"\n… (+{len(result.failed) - 5} more)"
             QMessageBox.warning(
                 self,
                 "Production status",
-                f"Saved {len(ok_paths)} item(s); {len(failed)} failed:\n{msg}",
+                f"Saved {len(result.ok_resolved)} item(s); {len(result.failed)} failed:\n{msg}",
             )
 
-        dept_reg = DepartmentRegistry.for_project(self._project_root)
-        type_reg = TypeRegistry.for_project(self._project_root)
-        struct_reg = StructureRegistry.for_project(self._project_root)
-        assets_dir = self._project_root / struct_reg.get_folder("assets")
-        shots_dir = self._project_root / struct_reg.get_folder("shots")
-
-        current_assets = dict(self._app_state.assets())
-        current_shots = dict(self._app_state.shots())
-
-        def same_path(key: str, path_value: Path) -> bool:
-            try:
-                return Path(key).resolve() == Path(path_value).resolve()
-            except OSError:
-                return False
-
-        ok_resolved: set[str] = set()
-        for ep in ok_paths:
-            try:
-                ep_r = ep.resolve()
-            except OSError:
-                ep_r = ep
-            ok_resolved.add(str(ep_r))
-
-            try:
-                ep_r.relative_to(assets_dir.resolve())
-                updated_asset = scan_single_asset(self._project_root, ep_r, dept_reg, type_reg)
-            except ValueError:
-                updated_asset = None
-            updated_shot: Shot | None = None
-            if updated_asset is None:
-                try:
-                    ep_r.relative_to(shots_dir.resolve())
-                    updated_shot = scan_single_shot(self._project_root, ep_r, dept_reg)
-                except ValueError:
-                    pass
-
-            if updated_asset is not None:
-                key = next((k for k in current_assets if same_path(k, updated_asset.path)), str(updated_asset.path))
-                for k in list(current_assets):
-                    if k != key and same_path(k, updated_asset.path):
-                        current_assets.pop(k, None)
-                current_assets[key] = updated_asset
-            if updated_shot is not None:
-                key = next((k for k in current_shots if same_path(k, updated_shot.path)), str(updated_shot.path))
-                for k in list(current_shots):
-                    if k != key and same_path(k, updated_shot.path):
-                        current_shots.pop(k, None)
-                current_shots[key] = updated_shot
-
-        self._app_state.update_assets(current_assets)
-        self._app_state.update_shots(current_shots)
+        self._app_state.update_assets(result.current_assets)
+        self._app_state.update_shots(result.current_shots)
         self._app_state.commit_immediate()
         if self._project_index is not None:
             ca = dict(self._app_state.assets())
@@ -6600,7 +6905,10 @@ class MainWindow(FramelessMainWindow):
             )
             self._filter_panel.set_project_index(self._project_index)
 
-        self._sync_schedule_after_status_override(ok_paths, dep, sid)
+        if result.schedule_touched:
+            self._on_schedule_changed()
+
+        ok_resolved = result.ok_resolved
 
         def _refresh_inspector() -> None:
             sel = self._main_view.selected_view_item()
@@ -6615,57 +6923,9 @@ class MainWindow(FramelessMainWindow):
 
         QTimer.singleShot(0, _refresh_inspector)
         QTimer.singleShot(0, self._main_view.repaint_tile_and_list_views)
-
-    def _sync_schedule_after_status_override(
-        self,
-        paths: list[Path],
-        department: str,
-        status_id: str | None,
-    ) -> None:
-        """When a dept is Skipped (omitted), drop its schedule bars and suppress auto-plan."""
-        from monostudio.core.production_status import SKIPPED_STATUS_ID
-        from monostudio.core.project_schedule import (
-            clear_auto_bar_suppression_for_row,
-            clear_entity_department_schedules,
-            entity_rel_path,
-        )
-
-        root = self._project_root
-        if root is None or not paths:
-            return
-        dep = (department or "").strip()
-        if not dep:
-            return
-        struct_reg = StructureRegistry.for_project(root)
-        assets_dir = root / struct_reg.get_folder("assets")
-        touched = False
-        for ep in paths:
-            try:
-                ep.resolve().relative_to(assets_dir.resolve())
-                kind = "asset"
-            except ValueError:
-                kind = "shot"
-            rel = entity_rel_path(root, ep)
-            try:
-                if status_id == SKIPPED_STATUS_ID:
-                    clear_entity_department_schedules(
-                        root,
-                        rows=[(kind, rel, dep)],
-                        suppress_auto=True,
-                    )
-                    touched = True
-                elif status_id is None:
-                    clear_auto_bar_suppression_for_row(
-                        root,
-                        entity_kind=kind,
-                        entity_rel=rel,
-                        department=dep,
-                    )
-                    touched = True
-            except OSError:
-                continue
-        if touched:
-            self._on_schedule_changed()
+        sw = getattr(self, "_schedule_page_widget", None)
+        if sw is not None and self._project_index is not None:
+            QTimer.singleShot(0, lambda: sw.refresh(self._project_index))
 
     def _on_schedule_department_skip_toggle(
         self,
@@ -6693,6 +6953,88 @@ class MainWindow(FramelessMainWindow):
             path,
             department,
             SKIPPED_STATUS_ID if skip else None,
+        )
+
+    def _on_schedule_entity_skip_toggle(
+        self,
+        entity_kind: str,
+        entity_rel: str,
+        skip: bool,
+    ) -> None:
+        if not self._can_edit_schedule() or self._project_root is None:
+            return
+        rel = (entity_rel or "").replace("\\", "/").strip()
+        if not rel:
+            return
+        path = self._project_root / rel
+        try:
+            if not path.is_dir():
+                return
+        except OSError:
+            return
+        from monostudio.core.models import Asset, Shot
+        from monostudio.core.production_status import SKIPPED_STATUS_ID
+        from monostudio.core.project_schedule import entity_rel_path
+        from monostudio.core.schedule_skip import ScheduleSkipResolver
+
+        kind = (entity_kind or "").strip().lower()
+        ref: Asset | Shot | None = None
+        if self._project_index is not None:
+            for asset in self._project_index.assets:
+                if (
+                    kind == "asset"
+                    and entity_rel_path(self._project_root, asset.path).replace("\\", "/") == rel
+                ):
+                    ref = asset
+                    break
+            if ref is None:
+                for shot in self._project_index.shots:
+                    if (
+                        kind == "shot"
+                        and entity_rel_path(self._project_root, shot.path).replace("\\", "/") == rel
+                    ):
+                        ref = shot
+                        break
+        if ref is None:
+            return
+        resolver = ScheduleSkipResolver(self._project_root)
+        dept_ids = resolver.entity_department_ids(ref)
+        if not dept_ids:
+            return
+        sid = SKIPPED_STATUS_ID if skip else None
+        self._apply_production_status_overrides(
+            [(path, dep, sid) for dep in dept_ids],
+            show_progress=True,
+        )
+
+    def _on_schedule_lane_skip_toggle(self, department: str, skip: bool) -> None:
+        if not self._can_edit_schedule() or self._project_root is None:
+            return
+        dep = (department or "").strip()
+        if not dep:
+            return
+        from monostudio.core.production_status import SKIPPED_STATUS_ID
+        from monostudio.core.project_schedule import build_timeline_entity_groups
+        from monostudio.core.schedule_skip import collect_lane_entity_paths
+
+        sw = getattr(self, "_schedule_page_widget", None)
+        groups = list(getattr(getattr(sw, "_gantt", None), "_groups", []) or [])
+        if not groups and self._project_index is not None:
+            include_shots = bool(getattr(sw, "_include_shots", True)) if sw else True
+            include_assets = bool(getattr(sw, "_include_assets", False)) if sw else False
+            groups = build_timeline_entity_groups(
+                self._project_root,
+                self._project_index,
+                include_shots=include_shots,
+                include_assets=include_assets,
+            )
+        paths = collect_lane_entity_paths(groups, dep, self._project_root)
+        if not paths:
+            return
+        sid = SKIPPED_STATUS_ID if skip else None
+        self._apply_production_status_overrides(
+            [(p, dep, sid) for p in paths],
+            show_progress=True,
         )
 
     def _on_main_view_active_dcc_changed(self, path: object, department: str, dcc_id: str) -> None:
@@ -7072,7 +7414,7 @@ class MainWindow(FramelessMainWindow):
                     restored = False
             # Restore maximized state (6b B: gọi set_maximized sau showMaximized)
             if data.get("window_maximized") is True and restored:
-                QTimer.singleShot(0, self._apply_restore_maximized)
+                self._pending_restore_maximized = True
             always_top = data.get("window_always_on_top") is True
             self._window_always_on_top = always_top
             if always_top and sys.platform != "win32":
@@ -7153,6 +7495,7 @@ class MainWindow(FramelessMainWindow):
         self._persist_window_state()
         if self._force_quit:
             self._flush_discord_inbox_outbox()
+        self._worker_manager.shutdown()
         super().closeEvent(event)
 
     def _switch_project(self, project_root: str) -> None:
@@ -7279,6 +7622,8 @@ class MainWindow(FramelessMainWindow):
             to_create: list[Path] = [target, target / "reference", target / "concept"]
             for d in departments:
                 dept_folder = dept_reg.get_department_relative_path(d, entity_kind)
+                if not (dept_folder or "").strip():
+                    continue
                 dept_dir = target / dept_folder
                 to_create.append(dept_dir)
                 if create_subfolders:

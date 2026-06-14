@@ -86,6 +86,7 @@ from monostudio.core.schedule_dept_filter import (
     load_inspector_hidden_departments,
     normalize_bar_label_mode,
 )
+from monostudio.core.schedule_skip import ScheduleSkipResolver
 from monostudio.core.production_status import SKIPPED_STATUS_ID
 from monostudio.core.department_status_registry import default_target_status_for_department
 from monostudio.core.schedule_planner import (
@@ -197,6 +198,8 @@ _DRAW_PREVIEW = QColor(MONOS_COLORS.get("blue_400", "#60a5fa"))
 _MARKER_GRIP_DIAM = 8
 _MARKER_GRIP_HIT = 12
 _MILESTONE_MARKER = QColor("#a855f7")
+_SKIP_STRIPE_TINT = QColor(255, 255, 255, 8)
+_SKIP_STRIPE_LINE = QColor(113, 113, 122, 56)
 
 
 def _row_key(kind: str, rel: str, dept: str | None) -> tuple[str, str, str]:
@@ -538,6 +541,8 @@ class _GanttCanvas(QWidget):
     entity_row_selected = Signal(str, str)  # entity_kind, entity_rel
     entity_row_cleared = Signal()  # Ctrl+click or empty-area click — clear highlight / Inspector
     department_skip_toggle_requested = Signal(str, str, str, bool)  # kind, rel, dep, skip
+    entity_skip_toggle_requested = Signal(str, str, bool)  # kind, rel, skip
+    lane_skip_toggle_requested = Signal(str, bool)  # department, skip
     bars_bulk_dates_requested = Signal(list)  # allocation ids
     bars_bulk_assign_requested = Signal(list)
     bars_bulk_note_requested = Signal(list)
@@ -1186,6 +1191,8 @@ class _GanttCanvas(QWidget):
             dept_filter=self._dept_filter,
             wave_rollups=self._wave_rollups,
         )
+        if self._gantt is not None:
+            self._visible = self._gantt._filter_skipped_visible_rows(self._visible)
         self._drag_dates.clear()
         self._drag_collapsed_orig.clear()
         self._drag_selection_orig.clear()
@@ -2684,6 +2691,24 @@ class _GanttCanvas(QWidget):
         p.fillRect(0, y, row_w, _ROW_H, _HIGHLIGHT_FILL)
         p.fillRect(0, y, 3, _ROW_H, _HIGHLIGHT_EDGE)
 
+    @staticmethod
+    def _paint_skip_stripes(p: QPainter, x: int, y: int, w: int, h: int) -> None:
+        rect = QRect(x, y, w, h)
+        p.fillRect(rect, _SKIP_STRIPE_TINT)
+        p.save()
+        p.setClipRect(rect)
+        p.setPen(QPen(_SKIP_STRIPE_LINE, 1))
+        step = 8
+        for offset in range(-h, w + h, step):
+            p.drawLine(x + offset, y, x + offset + h, y + h)
+        p.restore()
+
+    def _row_shows_skip_stripes(self, display: _DisplayRow) -> bool:
+        gantt = self._gantt
+        if gantt is None:
+            return False
+        return gantt.is_display_row_skipped(display)
+
     def _paint_col_highlight(self, p: QPainter, col: int, h: int) -> None:
         x0 = int(col * self._day_w)
         col_w = max(1, int(self._day_w))
@@ -2959,6 +2984,8 @@ class _GanttCanvas(QWidget):
                 self._paint_row_highlight(p, y, inner_w)
             elif vi == self._hover_row and display.mode != "scope_separator":
                 p.fillRect(0, y, inner_w, _ROW_H, QColor(255, 255, 255, 10))
+            if self._row_shows_skip_stripes(display):
+                self._paint_skip_stripes(p, 0, y, inner_w, _ROW_H)
 
             if display.mode == "collapsed":
                 assert display.group is not None
@@ -3035,13 +3062,6 @@ class _GanttCanvas(QWidget):
         self._paint_timeline_body_grid(p, w, h, clip=clip)
         self._paint_outside_production_range(p, w, h)
         self._paint_project_range_body(p, w, h)
-        self._paint_deadline_marker(p, h, header=False)
-
-        today = date.today()
-        if self._view_start <= today <= self._view_end:
-            tx = int(self._date_to_x(today))
-            p.setPen(QPen(QColor(MONOS_COLORS.get("blue_400", "#60a5fa")), 2))
-            p.drawLine(tx, 0, tx, h)
 
         if not self._visible:
             self._paint_filler_rows(p, w, h)
@@ -3059,14 +3079,6 @@ class _GanttCanvas(QWidget):
             )
             return
 
-        for m in self._schedule.milestones:
-            md = self._parse(m.date)
-            if md is None or md < self._view_start or md > self._view_end:
-                continue
-            mx = int(self._date_to_x(md))
-            p.setPen(QPen(QColor("#a855f7"), 1, Qt.PenStyle.DashLine))
-            p.drawLine(mx, 0, mx, h)
-
         for vi, display in enumerate(self._visible):
             y = self._body_row_y(vi)
             if clip is not None and not QRect(0, y, w, _ROW_H).intersects(clip):
@@ -3077,6 +3089,8 @@ class _GanttCanvas(QWidget):
                 self._paint_row_highlight(p, y, w)
             elif vi == self._hover_row and display.mode != "scope_separator":
                 p.fillRect(0, y, w, _ROW_H, QColor(255, 255, 255, 10))
+            if self._row_shows_skip_stripes(display):
+                self._paint_skip_stripes(p, 0, y, w, _ROW_H)
 
             if display.mode == "collapsed":
                 assert display.group is not None
@@ -3133,7 +3147,7 @@ class _GanttCanvas(QWidget):
                         due_override=dates[1],
                     )
             elif display.mode == "scope_separator":
-                p.fillRect(0, y, w, _ROW_H, QColor(18, 18, 20))
+                pass  # label pane paints the band; keep markers visible on timeline
             elif display.mode == "dept_lane_header":
                 p.fillRect(0, y, w, _ROW_H, QColor(255, 255, 255, 4))
             elif display.mode == "dept_wave":
@@ -3170,6 +3184,7 @@ class _GanttCanvas(QWidget):
                                 bar=goal_bar,
                             )
 
+        self._paint_timeline_vertical_markers(p, h)
         self._paint_filler_rows(p, w, h)
 
         if self._hover_col is not None:
@@ -3185,6 +3200,33 @@ class _GanttCanvas(QWidget):
                 p.drawRoundedRect(preview, 4, 4)
 
         self._paint_marquee_rect(p)
+
+    def _paint_timeline_vertical_markers(self, p: QPainter, h: int) -> None:
+        """Vertical guides on top of row bands (e.g. ASSETS/SHOTS separators)."""
+        ps, pe = self._project_range()
+        if ps is not None and self._view_start <= ps <= self._view_end:
+            x = int(self._date_to_x_start(ps))
+            self._paint_range_edge_marker(
+                p, x, h, edge="in", color=QColor(_RANGE_IN_HEX), header=False
+            )
+        if pe is not None and self._view_start <= pe <= self._view_end:
+            x = self._deadline_x()
+            if x is not None:
+                self._paint_range_edge_marker(
+                    p, x, h, edge="out", color=_DEADLINE_HEADER, header=False
+                )
+        today = date.today()
+        if self._view_start <= today <= self._view_end:
+            tx = int(self._date_to_x(today))
+            p.setPen(QPen(QColor(MONOS_COLORS.get("blue_400", "#60a5fa")), 2))
+            p.drawLine(tx, 0, tx, h)
+        for m in self._schedule.milestones:
+            md = self._parse(m.date)
+            if md is None or md < self._view_start or md > self._view_end:
+                continue
+            mx = int(self._date_to_x(md))
+            p.setPen(QPen(QColor("#a855f7"), 1, Qt.PenStyle.DashLine))
+            p.drawLine(mx, 0, mx, h)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         p = QPainter(self)
@@ -4518,11 +4560,21 @@ class _GanttCanvas(QWidget):
         dep = (display.wave.department or "").strip()
         editable = self._schedule_editable()
         menu = QMenu(self)
+        is_lane_skipped = (
+            self._gantt is not None and self._gantt.is_display_row_skipped(display)
+        )
+        skip_act = menu.addAction(
+            "Unskip wave" if is_lane_skipped else "Skip wave (N/A)…"
+        )
+        skip_act.setEnabled(editable and bool(dep))
+        menu.addSeparator()
         delete_act = menu.addAction("Delete wave bar…")
         delete_act.setEnabled(editable and bool(dep) and self._wave_department_has_bars(dep))
         drill = menu.addAction("Show shots in department…")
         chosen = menu.exec(global_pos)
-        if chosen is delete_act and dep:
+        if chosen is skip_act and dep:
+            self.lane_skip_toggle_requested.emit(dep, not is_lane_skipped)
+        elif chosen is delete_act and dep:
             self._delete_wave_department_bar(dep)
         elif chosen is drill and dep:
             self.wave_drilldown_requested.emit(dep)
@@ -4643,9 +4695,25 @@ class _GanttCanvas(QWidget):
             if self._exec_selected_bars_context_menu(row, event.globalPos()):
                 return
 
-        # Entity label menu (Plan / Clear) — Select tool, label pane, on a real row.
+        # Entity / lane label menu — Select tool, label pane.
         if self._tool == TOOL_SELECT and self._is_label_pane() and row is not None:
             display = self._visible[row]
+            if display.mode == "dept_lane_header" and display.dept is not None:
+                dep = (display.dept.department or "").strip()
+                editable = self._schedule_editable()
+                is_lane_skipped = (
+                    self._gantt is not None and self._gantt.is_display_row_skipped(display)
+                )
+                menu = QMenu(self)
+                skip_act = menu.addAction(
+                    "Unskip lane" if is_lane_skipped else "Skip lane (N/A)…"
+                )
+                skip_act.setEnabled(editable and bool(dep))
+                chosen = menu.exec(event.globalPos())
+                if chosen is skip_act and dep:
+                    self.lane_skip_toggle_requested.emit(dep, not is_lane_skipped)
+                return
+
             if display.group is not None and display.mode in (
                 "collapsed",
                 "header",
@@ -4672,11 +4740,48 @@ class _GanttCanvas(QWidget):
                 editable = self._schedule_editable()
                 plan_act.setEnabled(editable)
                 clear_act.setEnabled(editable and has_plan)
+                menu.addSeparator()
+                is_item_row = display.mode in ("collapsed", "header")
+                is_dept_row = display.mode in ("dept", "dept_lane") and display.dept is not None
+                skip_act = None
+                is_skipped = False
+                if is_item_row:
+                    is_skipped = (
+                        self._gantt is not None and self._gantt.is_display_row_skipped(display)
+                    )
+                    skip_act = menu.addAction(
+                        "Unskip item" if is_skipped else "Skip item (N/A)…"
+                    )
+                    skip_act.setEnabled(editable)
+                elif is_dept_row:
+                    is_skipped = (
+                        self._gantt is not None and self._gantt.is_display_row_skipped(display)
+                    )
+                    skip_act = menu.addAction(
+                        "Unskip department" if is_skipped else "Skip department (N/A)…"
+                    )
+                    skip_act.setEnabled(editable)
                 chosen = menu.exec(event.globalPos())
                 if chosen is plan_act:
                     self.entity_plan_requested.emit(group.entity_kind, group.entity_rel)
                 elif chosen is clear_act and has_plan:
                     self.entity_clear_plan_requested.emit(group.entity_kind, group.entity_rel)
+                elif skip_act is not None and chosen is skip_act:
+                    if is_item_row:
+                        self.entity_skip_toggle_requested.emit(
+                            group.entity_kind,
+                            group.entity_rel,
+                            not is_skipped,
+                        )
+                    elif is_dept_row and display.dept is not None:
+                        dep = (display.dept.department or "").strip()
+                        if dep:
+                            self.department_skip_toggle_requested.emit(
+                                group.entity_kind,
+                                group.entity_rel,
+                                dep,
+                                not is_skipped,
+                            )
                 return
 
         # Bar menu (Edit / Reset / Skip) — Select tool, timeline pane, on a bar.
@@ -4751,14 +4856,10 @@ class _GanttCanvas(QWidget):
                             hit.department,
                             not is_skipped,
                         )
-                    elif (
-                        status_submenu is not None
-                        and bar is not None
-                        and bar.allocation_id
-                    ):
-                        data = chosen.data()
-                        sid = str(data).strip() if data is not None else ""
-                        if sid:
+                    elif chosen is not None and bar is not None and bar.allocation_id:
+                        sid_data = chosen.data()
+                        sid = str(sid_data).strip() if sid_data is not None else ""
+                        if sid and chosen.property("schedule_target_dep"):
                             self.allocation_target_status_requested.emit(
                                 bar.allocation_id, sid
                             )
@@ -4902,6 +5003,8 @@ class ScheduleGanttWidget(QWidget):
     entity_row_selected = Signal(str, str)
     entity_row_cleared = Signal()
     department_skip_toggle_requested = Signal(str, str, str, bool)
+    entity_skip_toggle_requested = Signal(str, str, bool)
+    lane_skip_toggle_requested = Signal(str, bool)
     bars_bulk_dates_requested = Signal(list)
     bars_bulk_assign_requested = Signal(list)
     bars_bulk_note_requested = Signal(list)
@@ -5046,6 +5149,8 @@ class ScheduleGanttWidget(QWidget):
         self._asset_type_by_rel: dict[str, str] = {}
         self._unscheduled_only = False
         self._overdue_only = False
+        self._hide_skipped = False
+        self._skip_resolver: ScheduleSkipResolver | None = None
         self._dept_order: list[str] = []
         self._dept_reg = None
         self._hidden_departments: set[str] = set()
@@ -5070,8 +5175,18 @@ class ScheduleGanttWidget(QWidget):
         self._timeline_pane.entity_row_selected.connect(self.entity_row_selected.emit)
         self._label_pane.entity_row_cleared.connect(self.entity_row_cleared.emit)
         self._timeline_pane.entity_row_cleared.connect(self.entity_row_cleared.emit)
-        self._timeline_pane.department_skip_toggle_requested.connect(
-            self.department_skip_toggle_requested.emit
+        for pane in (self._label_pane, self._timeline_pane):
+            pane.department_skip_toggle_requested.connect(
+                self.department_skip_toggle_requested.emit
+            )
+        self._label_pane.entity_skip_toggle_requested.connect(
+            self.entity_skip_toggle_requested.emit
+        )
+        self._label_pane.lane_skip_toggle_requested.connect(
+            self.lane_skip_toggle_requested.emit
+        )
+        self._timeline_pane.lane_skip_toggle_requested.connect(
+            self.lane_skip_toggle_requested.emit
         )
         for pane in (self._label_pane, self._timeline_pane):
             pane.bars_bulk_dates_requested.connect(self.bars_bulk_dates_requested.emit)
@@ -5911,6 +6026,7 @@ class ScheduleGanttWidget(QWidget):
         dept_filter: str | None,
         unscheduled_only: bool,
         overdue_only: bool = False,
+        hide_skipped: bool = False,
         type_filter: str | None = None,
         type_aliases: set[str] | None = None,
         allowed_department_ids: list[str] | None = None,
@@ -5924,6 +6040,7 @@ class ScheduleGanttWidget(QWidget):
             self._type_filter_aliases = {self._type_filter.casefold()}
         self._unscheduled_only = bool(unscheduled_only)
         self._overdue_only = bool(overdue_only)
+        self._hide_skipped = bool(hide_skipped)
         self._rebuild_filtered_groups()
 
     def _rebuild_filtered_groups(self) -> None:
@@ -6090,6 +6207,7 @@ class ScheduleGanttWidget(QWidget):
             self._bars = {}
             self._schedule = ProjectSchedule()
             self._entity_refs = {}
+            self._skip_resolver = None
             self._set_pane_data(
                 project_root=None,
                 workspace_root=self._workspace_root,
@@ -6102,6 +6220,7 @@ class ScheduleGanttWidget(QWidget):
             )
             return
         self._schedule = read_project_schedule(self._project_root)
+        self._skip_resolver = ScheduleSkipResolver(self._project_root)
         self._rebuild_entity_refs()
         from monostudio.core.department_registry import DepartmentRegistry
 
@@ -6152,6 +6271,74 @@ class ScheduleGanttWidget(QWidget):
             rel = entity_rel_path(root, asset.path).replace("\\", "/")
             refs[("asset", rel)] = asset
         self._entity_refs = refs
+
+    def _entity_ref_for_group(self, group: TimelineEntityGroup) -> Asset | Shot | None:
+        key = (
+            (group.entity_kind or "").strip().lower(),
+            (group.entity_rel or "").replace("\\", "/"),
+        )
+        return self._entity_refs.get(key)
+
+    def _allowed_department_set(self) -> set[str] | None:
+        if self._allowed_departments is None:
+            return None
+        return set(self._allowed_departments)
+
+    def _is_lane_department_skipped(self, department: str) -> bool:
+        dep = (department or "").strip()
+        resolver = self._skip_resolver
+        if not dep or resolver is None or self._dept_reg is None:
+            return False
+        checked = False
+        for group in self._groups:
+            if not any((d.department or "").strip() == dep for d in group.departments):
+                continue
+            ref = self._entity_ref_for_group(group)
+            if ref is None:
+                continue
+            checked = True
+            if not resolver.is_department_skipped(ref, dep):
+                return False
+        return checked
+
+    def is_display_row_skipped(self, display: _DisplayRow) -> bool:
+        if display.mode == "scope_separator":
+            return False
+        resolver = self._skip_resolver
+        if resolver is None or self._dept_reg is None:
+            return False
+        allowed = self._allowed_department_set()
+        if display.mode == "dept_wave" and display.wave is not None:
+            return self._is_lane_department_skipped(display.wave.department)
+        if display.mode == "dept_lane_header" and display.dept is not None:
+            return self._is_lane_department_skipped(display.dept.department)
+        if (
+            display.mode in ("dept", "dept_lane")
+            and display.dept is not None
+            and display.group is not None
+        ):
+            ref = self._entity_ref_for_group(display.group)
+            if ref is None:
+                return False
+            return resolver.is_department_skipped(ref, display.dept.department)
+        if display.mode in ("collapsed", "header") and display.group is not None:
+            ref = self._entity_ref_for_group(display.group)
+            if ref is None:
+                return False
+            return resolver.is_entity_fully_skipped(
+                ref,
+                hidden_departments=self._hidden_departments,
+                dept_scope=self._dept_scope,
+                dept_reg=self._dept_reg,
+                respect_hidden=self._respect_inspector_hidden,
+                allowed_departments=allowed,
+            )
+        return False
+
+    def _filter_skipped_visible_rows(self, rows: list[_DisplayRow]) -> list[_DisplayRow]:
+        if not self._hide_skipped:
+            return rows
+        return [row for row in rows if not self.is_display_row_skipped(row)]
 
     def pixmap_for_entity(self, entity_kind: str, entity_rel: str) -> QPixmap | None:
         mgr = self._thumbnail_manager
@@ -6238,6 +6425,7 @@ class ScheduleGanttWidget(QWidget):
             dept_filter=self._dept_filter,
             wave_rollups=rollups,
         )
+        visible = self._filter_skipped_visible_rows(visible)
         if visible_index < 0 or visible_index >= len(visible):
             return
         display = visible[visible_index]

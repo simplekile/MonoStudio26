@@ -28,7 +28,6 @@ _WIDGET_ICONS: dict[str, str] = {
     "pipeline_health": "activity",
     "dept_load": "users",
     "next_7_days": "calendar-days",
-    "needs_attention": "triangle-alert",
     "recent_notes": "message-square",
 }
 
