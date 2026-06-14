@@ -145,10 +145,51 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 
 # Icon size for update list rows
 _UPDATE_ROW_ICON_SIZE = 24
-# Fixed size for Download/Latest button and loading bar (same size so layout doesn't jump)
-_UPDATE_ACTION_WIDTH = 128  # 96 + 1/3
+# Download/Latest action button — width from label (loading bar matches button width)
 _UPDATE_ACTION_HEIGHT = 28
+_UPDATE_ACTION_PADDING_X = 24  # matches QSS padding 6px 12px on update action buttons
+_UPDATE_ACTION_WIDTH_MIN = 88  # "Latest"
+_UPDATE_CANCEL_GAP = 4
+_UPDATE_CANCEL_BTN_WIDTH = 20
+_UPDATE_CANCEL_ICON_SIZE = 16
 _UPDATE_STATUS_ICON_SIZE = 32
+
+
+def _configure_update_cancel_btn(btn: QToolButton) -> None:
+    btn.setObjectName("UpdateDownloadCancelBtn")
+    btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+    btn.setIconSize(QSize(_UPDATE_CANCEL_ICON_SIZE, _UPDATE_CANCEL_ICON_SIZE))
+    btn.setIcon(lucide_icon("x", size=_UPDATE_CANCEL_ICON_SIZE, color_hex="#a1a1aa"))
+    btn.setFixedSize(_UPDATE_CANCEL_BTN_WIDTH, _UPDATE_ACTION_HEIGHT)
+    btn.setToolTip("Cancel download")
+
+
+def _measure_update_action_width(btn: QPushButton) -> int:
+    fm = btn.fontMetrics()
+    w = fm.horizontalAdvance(btn.text()) + _UPDATE_ACTION_PADDING_X + 4
+    if not btn.icon().isNull():
+        w += btn.iconSize().width() + 4
+    return max(_UPDATE_ACTION_WIDTH_MIN, w)
+
+
+def _apply_update_action_width(
+    action_btn: QPushButton,
+    *,
+    loading_widget: QWidget | None = None,
+    progress_bar: QProgressBar | None = None,
+) -> int:
+    """Size action button and its loading slot so Download labels are not clipped."""
+    width = _measure_update_action_width(action_btn)
+    action_btn.setFixedSize(width, _UPDATE_ACTION_HEIGHT)
+    slot_w = width + _UPDATE_CANCEL_GAP + _UPDATE_CANCEL_BTN_WIDTH
+    if loading_widget is not None:
+        loading_widget.setFixedSize(slot_w, _UPDATE_ACTION_HEIGHT)
+    if progress_bar is not None:
+        progress_bar.setFixedSize(width, _UPDATE_ACTION_HEIGHT)
+    container = action_btn.parentWidget()
+    if container is not None and loading_widget is not None:
+        container.setFixedSize(slot_w, _UPDATE_ACTION_HEIGHT)
+    return width
 
 
 def _update_product_icon_pixmap(product_id: str, size: int = _UPDATE_ROW_ICON_SIZE) -> QPixmap:
@@ -501,10 +542,10 @@ class SettingsDialog(MonosDialog):
         self._content_stack.setCurrentIndex(0)
         stack = getattr(self, "_general_tier2_stack", None)
         buttons = getattr(self, "_general_tier2_buttons", None)
-        if stack is not None and buttons is not None and len(buttons) > 3:
-            stack.setCurrentIndex(3)
+        if stack is not None and buttons is not None and len(buttons) > 4:
+            stack.setCurrentIndex(4)
             for i, b in enumerate(buttons):
-                b.setChecked(i == 3)
+                b.setChecked(i == 4)
         self._apply_cached_update_result(get_cached_check_result())
         self._refresh_ffmpeg_update_row()
 
@@ -608,7 +649,7 @@ class SettingsDialog(MonosDialog):
 
     def _on_general_tier2_changed(self, index: int) -> None:
         """When General → Updates tab is shown, apply cached result; if no extra repos yet, fetch in background."""
-        if index == 3:
+        if index == 4:
             self._apply_cached_update_result(get_cached_check_result())
             self._refresh_ffmpeg_update_row()
             if not get_cached_extra_repos() and not getattr(self, "_extra_repos_fetch_worker", None):
@@ -633,7 +674,7 @@ class SettingsDialog(MonosDialog):
             b.setChecked(i == index)
 
     def _build_general_page(self) -> QWidget:
-        """Tier 2: General → Workspace | UI | Behavior | Updates | Access (nút page ngang)."""
+        """Tier 2: General → Workspace | UI | Behavior | Hotkeys | Updates | Access (nút page ngang)."""
         return self._build_tier2_page_buttons(
             [
                 ("Workspace", self._build_app_workspace_tab()),
@@ -1649,28 +1690,22 @@ class SettingsDialog(MonosDialog):
                 self._update_monostudio_link_btn = link_btn
                 action_btn = QPushButton("Latest", row)
                 action_btn.setObjectName("UpdateProductListBtnLatest")
-                action_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
                 action_btn.clicked.connect(self._on_download_and_install)
                 link_btn.clicked.connect(self._on_view_release_on_github)
                 self._update_monostudio_action_btn = action_btn
 
                 loading_widget = QWidget(row)
                 loading_widget.setObjectName("UpdateDownloadLoading")
-                loading_widget.setFixedSize(_UPDATE_ACTION_WIDTH + 6 + 24, _UPDATE_ACTION_HEIGHT)
                 loading_l = QHBoxLayout(loading_widget)
                 loading_l.setContentsMargins(0, 0, 0, 0)
-                loading_l.setSpacing(6)
+                loading_l.setSpacing(_UPDATE_CANCEL_GAP)
                 progress_bar = QProgressBar(loading_widget)
                 progress_bar.setObjectName("UpdateDownloadProgress")
                 progress_bar.setMinimum(0)
                 progress_bar.setMaximum(0)
-                progress_bar.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
                 loading_l.addWidget(progress_bar)
                 cancel_btn = QToolButton(loading_widget)
-                cancel_btn.setObjectName("UpdateDownloadCancelBtn")
-                cancel_btn.setIcon(lucide_icon("x", size=14, color_hex="#a1a1aa"))
-                cancel_btn.setFixedSize(24, _UPDATE_ACTION_HEIGHT)
-                cancel_btn.setToolTip("Cancel download")
+                _configure_update_cancel_btn(cancel_btn)
                 loading_l.addWidget(cancel_btn)
                 loading_widget.hide()
 
@@ -1679,17 +1714,20 @@ class SettingsDialog(MonosDialog):
                 self._update_monostudio_cancel_btn = cancel_btn
 
                 action_container = QWidget(row)
-                action_container.setFixedSize(_UPDATE_ACTION_WIDTH + 6 + 24, _UPDATE_ACTION_HEIGHT)
                 action_container_l = QHBoxLayout(action_container)
                 action_container_l.setContentsMargins(0, 0, 0, 0)
                 action_container_l.setSpacing(0)
                 action_container_l.addWidget(action_btn)
                 action_container_l.addWidget(loading_widget)
+                _apply_update_action_width(
+                    action_btn,
+                    loading_widget=loading_widget,
+                    progress_bar=progress_bar,
+                )
                 row_l.addWidget(action_container)
             else:
                 action_btn = QPushButton("View on GitHub", row)
                 action_btn.setObjectName("SettingsCategoryActionButton")
-                action_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
                 if repo:
                     fallback_url = f"https://github.com/{repo}/releases"
                     self._update_extra_fallback_url[display_name] = fallback_url
@@ -1703,32 +1741,31 @@ class SettingsDialog(MonosDialog):
 
                 loading_widget = QWidget(row)
                 loading_widget.setObjectName("UpdateDownloadLoading")
-                loading_widget.setFixedSize(_UPDATE_ACTION_WIDTH + 6 + 24, _UPDATE_ACTION_HEIGHT)
                 loading_l = QHBoxLayout(loading_widget)
                 loading_l.setContentsMargins(0, 0, 0, 0)
-                loading_l.setSpacing(6)
+                loading_l.setSpacing(_UPDATE_CANCEL_GAP)
                 progress_bar = QProgressBar(loading_widget)
                 progress_bar.setObjectName("UpdateDownloadProgress")
                 progress_bar.setMinimum(0)
                 progress_bar.setMaximum(0)
-                progress_bar.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
                 loading_l.addWidget(progress_bar)
                 cancel_btn = QToolButton(loading_widget)
-                cancel_btn.setObjectName("UpdateDownloadCancelBtn")
-                cancel_btn.setIcon(lucide_icon("x", size=14, color_hex="#a1a1aa"))
-                cancel_btn.setFixedSize(24, _UPDATE_ACTION_HEIGHT)
-                cancel_btn.setToolTip("Cancel download")
+                _configure_update_cancel_btn(cancel_btn)
                 loading_l.addWidget(cancel_btn)
                 loading_widget.hide()
                 self._update_extra_loading[display_name] = (loading_widget, progress_bar, cancel_btn)
 
                 action_container = QWidget(row)
-                action_container.setFixedSize(_UPDATE_ACTION_WIDTH + 6 + 24, _UPDATE_ACTION_HEIGHT)
                 action_container_l = QHBoxLayout(action_container)
                 action_container_l.setContentsMargins(0, 0, 0, 0)
                 action_container_l.setSpacing(0)
                 action_container_l.addWidget(action_btn)
                 action_container_l.addWidget(loading_widget)
+                _apply_update_action_width(
+                    action_btn,
+                    loading_widget=loading_widget,
+                    progress_bar=progress_bar,
+                )
                 row_l.addWidget(action_container)
 
             list_layout.addWidget(row)
@@ -1803,9 +1840,7 @@ class SettingsDialog(MonosDialog):
         )
         row_l.addWidget(link_btn)
 
-        _aw = _UPDATE_ACTION_WIDTH + 6 + 24
         outer = QWidget(row)
-        outer.setFixedSize(28 + 6 + _aw, _UPDATE_ACTION_HEIGHT)
         outer_l = QHBoxLayout(outer)
         outer_l.setContentsMargins(0, 0, 0, 0)
         outer_l.setSpacing(6)
@@ -1819,7 +1854,6 @@ class SettingsDialog(MonosDialog):
         outer_l.addWidget(locate_tb)
 
         stack = QStackedWidget(outer)
-        stack.setFixedSize(_aw, _UPDATE_ACTION_HEIGHT)
 
         page_get = QWidget(stack)
         pg_l = QHBoxLayout(page_get)
@@ -1827,7 +1861,6 @@ class SettingsDialog(MonosDialog):
         get_btn = QPushButton("Get FFmpeg", page_get)
         get_btn.setObjectName("SettingsCategoryActionButton")
         get_btn.setIcon(lucide_icon("download", size=16, color_hex="#a1a1aa"))
-        get_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
         get_btn.setToolTip(
             "Download ffmpeg-release-essentials.zip to temp, then click Install. "
             "Other packages: Official builds."
@@ -1839,17 +1872,13 @@ class SettingsDialog(MonosDialog):
         page_load = QWidget(stack)
         pl_l = QHBoxLayout(page_load)
         pl_l.setContentsMargins(0, 0, 0, 0)
-        pl_l.setSpacing(6)
+        pl_l.setSpacing(_UPDATE_CANCEL_GAP)
         prog = QProgressBar(page_load)
         prog.setObjectName("UpdateDownloadProgress")
         prog.setMinimum(0)
         prog.setMaximum(0)
-        prog.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
         cancel_tb = QToolButton(page_load)
-        cancel_tb.setObjectName("UpdateDownloadCancelBtn")
-        cancel_tb.setIcon(lucide_icon("x", size=14, color_hex="#a1a1aa"))
-        cancel_tb.setFixedSize(24, _UPDATE_ACTION_HEIGHT)
-        cancel_tb.setToolTip("Cancel download")
+        _configure_update_cancel_btn(cancel_tb)
         pl_l.addWidget(prog)
         pl_l.addWidget(cancel_tb)
         stack.addWidget(page_load)
@@ -1860,11 +1889,18 @@ class SettingsDialog(MonosDialog):
         install_btn = QPushButton("Install", page_inst)
         install_btn.setObjectName("UpdateProductListBtnDownload")
         install_btn.setIcon(lucide_icon("package", size=16, color_hex="#fafafa"))
-        install_btn.setFixedSize(_UPDATE_ACTION_WIDTH, _UPDATE_ACTION_HEIGHT)
         install_btn.setToolTip("Extract to %LOCALAPPDATA%\\MonoStudio\\tools\\ffmpeg and register ffmpeg.exe")
         install_btn.clicked.connect(self._on_ffmpeg_install_clicked)
         pi_l.addWidget(install_btn)
         stack.addWidget(page_inst)
+
+        action_w = max(_measure_update_action_width(get_btn), _measure_update_action_width(install_btn))
+        slot_w = action_w + _UPDATE_CANCEL_GAP + _UPDATE_CANCEL_BTN_WIDTH
+        get_btn.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
+        install_btn.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
+        prog.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
+        stack.setFixedSize(slot_w, _UPDATE_ACTION_HEIGHT)
+        outer.setFixedSize(28 + 6 + slot_w, _UPDATE_ACTION_HEIGHT)
 
         outer_l.addWidget(stack)
         row_l.addWidget(outer)
@@ -2211,6 +2247,11 @@ class SettingsDialog(MonosDialog):
             action_btn.setStyleSheet("")
             action_btn.style().unpolish(action_btn)
             action_btn.style().polish(action_btn)
+        _apply_update_action_width(
+            action_btn,
+            loading_widget=getattr(self, "_update_monostudio_loading_widget", None),
+            progress_bar=getattr(self, "_update_monostudio_progress_bar", None),
+        )
 
     def _apply_extra_repos_ui(self, extra_repos: dict[str, ExtraRepoRelease]) -> None:
         """Update extra-repo rows: version, release notes link; Download vX.X.X (when update available) or Latest, like MonoStudio."""
@@ -2251,6 +2292,12 @@ class SettingsDialog(MonosDialog):
                 action_btn.setText("View on GitHub")
                 action_btn.setObjectName("SettingsCategoryActionButton")
                 action_btn.setEnabled(True)
+            loading_tuple = getattr(self, "_update_extra_loading", {}).get(name)
+            if loading_tuple:
+                lw, pb, _ = loading_tuple
+                _apply_update_action_width(action_btn, loading_widget=lw, progress_bar=pb)
+            else:
+                _apply_update_action_width(action_btn)
 
     def _on_extra_repo_release_link_clicked(self, name: str) -> None:
         url = self._update_extra_html_url.get(name)

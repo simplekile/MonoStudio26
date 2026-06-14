@@ -3358,7 +3358,7 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #ffffff;
             border: none;
             border-radius: 8px;
-            padding: 6px 14px;
+            padding: 6px 12px;
             font-size: 12px;
             font-weight: 600;
         }
@@ -3375,7 +3375,7 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #71717a;
             border: 1px solid #3f3f46;
             border-radius: 8px;
-            padding: 6px 14px;
+            padding: 6px 12px;
             font-size: 12px;
             font-weight: 500;
         }
@@ -3403,6 +3403,10 @@ def apply_dark_theme(app: QApplication) -> None:
             background: transparent;
             border: none;
             border-radius: 4px;
+            padding: 0px;
+            margin: 0px;
+            min-width: 0px;
+            min-height: 0px;
         }
         QToolButton#UpdateDownloadCancelBtn:hover {
             background-color: rgba(255, 255, 255, 0.1);

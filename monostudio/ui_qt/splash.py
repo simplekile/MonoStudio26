@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QSplashScreen, QWidget
 
 from monostudio.core.app_paths import get_app_base_path
 
-SPLASH_SIZE = (960, 540)
+SPLASH_SIZE = (672, 378)
 SPLASH_BG = "#121214"
 MONOS_MAIN_WINDOW_BG = "#151618"
 SPLASH_TITLE_COLOR = "#fafafa"
@@ -30,12 +30,12 @@ SPLASH_LEGAL_COLOR = "#52525b"
 SPLASH_LOADING_COLOR = "#3f3f46"
 SPLASH_LOADING_FILL = "#2563eb"
 
-SPLASH_MARGIN = 40
-SPLASH_BAR_MARGIN = 32
+SPLASH_MARGIN = 28
+SPLASH_BAR_MARGIN = 22
 SPLASH_BAR_HEIGHT = 2
-SPLASH_BAR_BOTTOM = 20
-SPLASH_ICON_SIZE = 48
-SPLASH_ICON_MARGIN = 24
+SPLASH_BAR_BOTTOM = 14
+SPLASH_ICON_SIZE = 34
+SPLASH_ICON_MARGIN = 17
 SPLASH_GRADIENT_END_RATIO = 0.42
 SPLASH_DISMISS_DELAY_MS = 500
 SPLASH_TAIL_INTERVAL_MS = 350
@@ -157,51 +157,51 @@ def make_splash_pixmap(
     text_x = SPLASH_MARGIN
     text_w = int(w * SPLASH_GRADIENT_END_RATIO) - SPLASH_MARGIN * 2
 
-    title_font = QFont("Inter", 40, QFont.Weight.Bold)
+    title_font = QFont("Inter", 28, QFont.Weight.Bold)
     title_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 98)
     painter.setFont(title_font)
     painter.setPen(QColor(SPLASH_TITLE_COLOR))
-    title_y = 168
-    painter.drawText(text_x, title_y, text_w, 48, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "MONOS")
+    title_y = 118
+    painter.drawText(text_x, title_y, text_w, 34, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "MONOS")
 
-    sub_font = QFont("Inter", 11, QFont.Weight.ExtraBold)
+    sub_font = QFont("Inter", 8, QFont.Weight.ExtraBold)
     sub_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 118)
     painter.setFont(sub_font)
     painter.setPen(QColor(SPLASH_SUBTITLE_COLOR))
-    sub_y = title_y + 52
-    painter.drawText(text_x, sub_y, text_w, 18, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "MONO STUDIO")
+    sub_y = title_y + 36
+    painter.drawText(text_x, sub_y, text_w, 13, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "MONO STUDIO")
     if version:
-        ver_font = QFont("Inter", 11, QFont.Weight.DemiBold)
+        ver_font = QFont("Inter", 8, QFont.Weight.DemiBold)
         ver_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 110)
         painter.setFont(ver_font)
-        painter.drawText(text_x, sub_y + 22, text_w, 18, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, version.upper())
+        painter.drawText(text_x, sub_y + 15, text_w, 13, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, version.upper())
 
     bar_y = h - SPLASH_BAR_BOTTOM - SPLASH_BAR_HEIGHT
-    legal_font = QFont("Inter", 8, QFont.Weight.Medium)
+    legal_font = QFont("Inter", 6, QFont.Weight.Medium)
     legal_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 105)
     painter.setFont(legal_font)
     painter.setPen(QColor(SPLASH_LEGAL_COLOR))
     year = datetime.now().year
-    legal_y = bar_y - 36
+    legal_y = bar_y - 25
     painter.drawText(
         text_x,
         legal_y,
         text_w,
-        14,
+        10,
         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
         f"© {year} MONO STUDIO",
     )
 
     if status_text:
-        status_font = QFont("Inter", 10, QFont.Weight.DemiBold)
+        status_font = QFont("Inter", 7, QFont.Weight.DemiBold)
         status_font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108)
         painter.setFont(status_font)
         painter.setPen(QColor(SPLASH_STATUS_COLOR))
         painter.drawText(
             text_x,
-            legal_y - 22,
+            legal_y - 15,
             text_w,
-            16,
+            11,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             _format_status(status_text),
         )
