@@ -23,7 +23,8 @@ from monostudio.ui_qt.video_preview_settings import (
 
 logger = logging.getLogger(__name__)
 
-_SPEED_STEPS = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+PLAYBACK_SPEED_STEPS = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+_SPEED_STEPS = PLAYBACK_SPEED_STEPS
 
 
 class VideoPlayerBackend(ABC):
@@ -53,7 +54,7 @@ class VideoPlayerBackend(ABC):
     def attach_to_widget(self, widget: QWidget) -> None: ...
 
     @abstractmethod
-    def load(self, path: Path) -> None: ...
+    def load(self, path: Path, *, start_sec: float = 0.0) -> None: ...
 
     @abstractmethod
     def play(self) -> None: ...
@@ -88,8 +89,38 @@ class VideoPlayerBackend(ABC):
     @abstractmethod
     def release(self) -> None: ...
 
-    def prime_for_scrub(self) -> None:
+    def prime_for_scrub(self, *, initial_sec: float | None = None) -> None:
         """Prepare decoder so paused seek/scrub shows frames (Qt backend)."""
+
+    def file_ready(self) -> bool:
+        return True
+
+    def decode_ready(self) -> bool:
+        return self.file_ready()
+
+    def refresh_paused_video(self) -> None:
+        """Decode and paint the current frame while paused (backend-specific)."""
+
+    def show_initial_frame(self, sec: float) -> None:
+        """Seek to ``sec`` and force a visible paused frame."""
+        self.seek(max(0.0, float(sec)), precise=True)
+        self.refresh_paused_video()
+
+    def play_from(self, sec: float) -> None:
+        """Seek to ``sec`` then start playback."""
+        self.seek(max(0.0, float(sec)), precise=True)
+        self.play()
+
+    def ensure_paused(self) -> None:
+        self.pause()
+
+    def position_matches(self, sec: float, *, tolerance_sec: float = 1.0 / 48.0) -> bool:
+        return abs(self.position() - max(0.0, float(sec))) <= tolerance_sec
+
+    def preview_paused_at(self, sec: float, *, precise: bool = False) -> None:
+        """Seek while paused and show the frame (scrub / click-to-seek)."""
+        self.seek(max(0.0, float(sec)), precise=precise)
+        self.refresh_paused_video()
 
     def layout_video(self) -> None:
         """Reposition embedded video after the host widget resizes."""
@@ -114,10 +145,15 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
         self._eof_notified = False
         self._scrub_primed = False
         self._prime_pending = False
+        self._prime_initial_sec: float | None = None
+        self._pending_start_sec = 0.0
         self._attached_wid: int | None = None
 
     def supports_embed(self) -> bool:
         return True
+
+    def file_ready(self) -> bool:
+        return self._file_ready()
 
     @staticmethod
     def _mpv_error_benign(exc: BaseException) -> bool:
@@ -202,10 +238,13 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
                     if self._on_duration:
                         self._on_duration(self._duration)
             eof = bool(getattr(self._player, "eof_reached", False))
-            if eof and not self._eof_notified:
-                self._eof_notified = True
-                if self._on_ended:
-                    self._on_ended()
+            if eof and not self._eof_notified and self._playing:
+                pos_sec = float(pos) if pos is not None else 0.0
+                if pos_sec > 0.05:
+                    self._eof_notified = True
+                    self._playing = False
+                    if self._on_ended:
+                        self._on_ended()
             elif not eof:
                 self._eof_notified = False
         except Exception:
@@ -225,24 +264,39 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
                     self._attached_wid = wid
                 except Exception as e:
                     logger.debug("mpv wid attach: %s", e)
-            if self._poll is not None and self._playing:
-                self._poll.start()
+            self._ensure_poll()
             return
         if self._ensure_player() and self._player is not None:
             self._attached_wid = wid
-            if self._poll is not None and self._playing:
-                self._poll.start()
+            self._ensure_poll()
 
     def layout_video(self) -> None:
-        return
+        widget = self._widget
+        if widget is None or self._player is None or not widget.isVisible():
+            return
+        try:
+            wid = int(widget.winId())
+            self._player.wid = str(wid)
+            self._attached_wid = wid
+        except Exception as e:
+            logger.debug("mpv layout wid: %s", e)
 
     def _load_path(self, path: Path) -> None:
         if self._player is None:
             return
+        start = max(0.0, float(self._pending_start_sec))
+        self._pending_start_sec = 0.0
         try:
             self._player.command("loadfile", str(path), "replace")
+            try:
+                self._player.pause = True
+            except Exception:
+                pass
             self._duration = 0.0
             self._eof_notified = False
+            self._prime_initial_sec = start
+            self._prime_pending = True
+            self._scrub_primed = False
             self._ensure_poll()
         except Exception as e:
             if self._mpv_error_benign(e):
@@ -251,18 +305,22 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
             if self._on_error:
                 self._on_error(str(e))
 
-    def load(self, path: Path) -> None:
+    def load(self, path: Path, *, start_sec: float = 0.0) -> None:
         self._scrub_primed = False
         self._prime_pending = False
+        self._prime_initial_sec = None
+        self._pending_start_sec = max(0.0, float(start_sec))
         self._pending_path = path
         if not self._ensure_player():
             return
         self._pending_path = None
         self._load_path(path)
 
-    def prime_for_scrub(self) -> None:
+    def prime_for_scrub(self, *, initial_sec: float | None = None) -> None:
         if self._scrub_primed:
             return
+        if initial_sec is not None:
+            self._prime_initial_sec = max(0.0, float(initial_sec))
         self._prime_pending = True
         self._try_prime_for_scrub()
 
@@ -274,13 +332,15 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
         if not self._file_ready():
             self._ensure_poll()
             return
+        target = 0.0 if self._prime_initial_sec is None else self._prime_initial_sec
+        self._prime_initial_sec = None
         self._prime_pending = False
         self._scrub_primed = True
         try:
             self._player.pause = True
-            self._player.seek(0, reference="absolute", precision="keyframes")
+            self._player.seek(target, reference="absolute", precision="keyframes")
             if self._on_position:
-                self._on_position(0.0)
+                self._on_position(float(target))
         except Exception as e:
             self._scrub_primed = False
             self._prime_pending = True
@@ -288,6 +348,23 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
                 logger.debug("mpv prime_for_scrub deferred: %s", e)
                 self._ensure_poll()
                 return
+            if self._on_error:
+                self._on_error(str(e))
+
+    def play_from(self, sec: float) -> None:
+        if not self._ensure_player() or self._player is None:
+            return
+        sec = max(0.0, float(sec))
+        try:
+            self._eof_notified = False
+            self._player.pause = True
+            self._player.seek(sec, reference="absolute", precision="exact")
+            self._player.pause = False
+            self._playing = True
+            if self._poll:
+                self._poll.start()
+        except Exception as e:
+            self._playing = False
             if self._on_error:
                 self._on_error(str(e))
 
@@ -306,6 +383,7 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
 
     def pause(self) -> None:
         if self._player is None:
+            self._playing = False
             return
         try:
             self._player.pause = True
@@ -435,9 +513,53 @@ class QtMultimediaBackend(VideoPlayerBackend):
         self._speed = 1.0
         self._primed = False
         self._prime_playing = False
+        self._prime_initial_sec: float | None = None
+        self._pending_seek_sec: float | None = None
+        self._prime_requested = False
+        self._pending_start_sec = 0.0
 
     def supports_embed(self) -> bool:
         return True
+
+    def file_ready(self) -> bool:
+        return self._media_ready()
+
+    def decode_ready(self) -> bool:
+        if not self._media_ready() or self._player is None:
+            return False
+        try:
+            return bool(self._player.hasVideo())
+        except Exception:
+            return self._media_ready()
+
+    def refresh_paused_video(self) -> None:
+        if self._player is None or not self._media_ready() or self.is_playing():
+            return
+        try:
+            pos_ms = self._player.position()
+            self._prime_playing = True
+            self._player.play()
+            if self._widget is not None:
+                QTimer.singleShot(60, lambda: self._finish_qt_refresh(pos_ms))
+            else:
+                self._player.pause()
+                self._player.setPosition(pos_ms)
+                self._prime_playing = False
+        except Exception as e:
+            self._prime_playing = False
+            logger.debug("Qt refresh_paused_video: %s", e)
+
+    def _finish_qt_refresh(self, pos_ms: int) -> None:
+        if self._player is None or self.is_playing():
+            self._prime_playing = False
+            return
+        try:
+            self._player.pause()
+            self._player.setPosition(pos_ms)
+        except Exception as e:
+            logger.debug("Qt finish refresh: %s", e)
+        finally:
+            self._prime_playing = False
 
     def _ensure(self) -> bool:
         if self._player is not None:
@@ -490,25 +612,49 @@ class QtMultimediaBackend(VideoPlayerBackend):
                 QMediaPlayer.MediaStatus.LoadedMedia,
                 QMediaPlayer.MediaStatus.BufferedMedia,
             ):
-                self.prime_for_scrub()
+                if not self._primed:
+                    self.prime_for_scrub(initial_sec=self._pending_start_sec)
+                    self._pending_start_sec = 0.0
+                elif self._pending_seek_sec is not None:
+                    sec = self._pending_seek_sec
+                    self._pending_seek_sec = None
+                    self.seek(sec, precise=True)
         except Exception:
             pass
 
-    def prime_for_scrub(self) -> None:
-        if self._primed or self._player is None or not self._media_ready():
+    def _try_prime_for_scrub(self) -> None:
+        if not self._prime_requested or self._primed:
+            return
+        if self._player is None or not self._media_ready():
             return
         self._primed = True
+        self._prime_requested = False
+        target_sec = 0.0 if self._prime_initial_sec is None else self._prime_initial_sec
+        self._prime_initial_sec = None
+        target_ms = int(target_sec * 1000)
         try:
             self._prime_playing = True
-            self._player.setPosition(0)
+            self._player.setPosition(target_ms)
             self._player.play()
             self._player.pause()
             self._prime_playing = False
             if self._on_position:
-                self._on_position(0.0)
+                self._on_position(target_sec)
+            self.refresh_paused_video()
         except Exception as e:
             self._primed = False
+            self._prime_requested = True
+            self._prime_initial_sec = target_sec
             logger.debug("Qt prime_for_scrub: %s", e)
+
+    def prime_for_scrub(self, *, initial_sec: float | None = None) -> None:
+        if self._primed:
+            if initial_sec is not None:
+                self.seek(initial_sec, precise=True)
+            return
+        self._prime_initial_sec = 0.0 if initial_sec is None else max(0.0, float(initial_sec))
+        self._prime_requested = True
+        self._try_prime_for_scrub()
 
     def _embed_video_widget(self) -> None:
         widget = self._widget
@@ -551,17 +697,26 @@ class QtMultimediaBackend(VideoPlayerBackend):
     def layout_video(self) -> None:
         self._layout_embedded_video()
 
-    def load(self, path: Path) -> None:
+    def load(self, path: Path, *, start_sec: float = 0.0) -> None:
         if not self._ensure() or self._player is None:
             return
         self._primed = False
+        self._prime_requested = False
+        self._prime_initial_sec = None
+        self._pending_seek_sec = None
+        self._pending_start_sec = max(0.0, float(start_sec))
         self._player.setSource(QUrl.fromLocalFile(str(path)))
-        if self._media_ready():
-            self.prime_for_scrub()
 
     def play(self) -> None:
         if self._player:
             self._player.play()
+
+    def play_from(self, sec: float) -> None:
+        if self._player is None:
+            return
+        sec = max(0.0, float(sec))
+        self._player.setPosition(int(sec * 1000))
+        self._player.play()
 
     def pause(self) -> None:
         if self._player:
@@ -574,9 +729,14 @@ class QtMultimediaBackend(VideoPlayerBackend):
     def seek(self, sec: float, *, precise: bool = False) -> None:
         if self._player is None:
             return
+        sec = max(0.0, float(sec))
+        if not self._media_ready():
+            self._pending_seek_sec = sec
+            return
         if not self._primed:
-            self.prime_for_scrub()
-        self._player.setPosition(int(max(0.0, sec) * 1000))
+            self.prime_for_scrub(initial_sec=sec)
+            return
+        self._player.setPosition(int(sec * 1000))
 
     def duration(self) -> float:
         if self._player:
@@ -640,7 +800,7 @@ class ExternalPlayerBackend(VideoPlayerBackend):
     def layout_video(self) -> None:
         return
 
-    def load(self, path: Path) -> None:
+    def load(self, path: Path, *, start_sec: float = 0.0) -> None:
         self._path = path
 
     def play(self) -> None:

@@ -16,8 +16,12 @@ KEY_VIDEO_PREVIEW_GEOMETRY = "ui/video_preview_geometry"
 KEY_VIDEO_PREVIEW_RANGE_PANEL = "ui/video_preview_range_panel_visible"
 KEY_SEQUENCE_PREVIEW_GEOMETRY = "ui/sequence_preview_geometry"
 KEY_VIDEO_EXPORT_NAMING_MODE = "ui/video_export_naming_mode"
+KEY_VIDEO_EXPORT_FORMAT = "ui/video_export_format"
 KEY_VIDEO_PREVIEW_PRECISE_SCRUB_DRAG = "ui/video_preview_precise_scrub_drag"
 KEY_VIDEO_PREVIEW_TIME_DISPLAY = "ui/video_preview_time_display"
+KEY_VIDEO_PREVIEW_PLAYBACK_SPEED = "ui/video_preview_playback_speed"
+KEY_VIDEO_PREVIEW_VOLUME = "ui/video_preview_volume"
+KEY_VIDEO_PREVIEW_LOOP = "ui/video_preview_loop"
 
 TIME_DISPLAY_FRAME = "frame"
 TIME_DISPLAY_TIMECODE = "timecode"
@@ -31,15 +35,30 @@ EXPORT_NAMING_RANGE = "range_names"
 EXPORT_NAMING_SOURCE_INDEX = "source_index"
 EXPORT_NAMING_RANGE_INDEX = "range_names_index"
 
+EXPORT_FORMAT_SOURCE = "source"
+EXPORT_FORMAT_MP4 = "mp4"
+EXPORT_FORMAT_MOV = "mov"
+EXPORT_FORMAT_MKV = "mkv"
+EXPORT_FORMAT_WEBM = "webm"
+EXPORT_FORMAT_GIF = "gif"
+
 ReviewWorkspaceId = Literal["focus", "review", "tools", "theater"]
-ReviewToolModeId = Literal["ranges", "note", "draw"]
+ReviewToolModeId = Literal["ranges", "markers", "note", "draw"]
 
 VideoPlayerBackendId = Literal["auto", "mpv", "qt", "external"]
 
 _VALID_BACKENDS = frozenset({BACKEND_AUTO, BACKEND_MPV, BACKEND_QT, BACKEND_EXTERNAL})
 _VALID_EXPORT_NAMING = frozenset({EXPORT_NAMING_RANGE, EXPORT_NAMING_SOURCE_INDEX, EXPORT_NAMING_RANGE_INDEX})
+_VALID_EXPORT_FORMAT = frozenset({
+    EXPORT_FORMAT_SOURCE,
+    EXPORT_FORMAT_MP4,
+    EXPORT_FORMAT_MOV,
+    EXPORT_FORMAT_MKV,
+    EXPORT_FORMAT_WEBM,
+    EXPORT_FORMAT_GIF,
+})
 _VALID_WORKSPACES = frozenset({"focus", "review", "tools", "theater"})
-_VALID_TOOL_MODES = frozenset({"ranges", "note", "draw"})
+_VALID_TOOL_MODES = frozenset({"ranges", "markers", "note", "draw"})
 _VALID_TIME_DISPLAY = frozenset({TIME_DISPLAY_FRAME, TIME_DISPLAY_TIMECODE})
 
 
@@ -149,6 +168,20 @@ def write_video_export_naming_mode(settings: QSettings, mode: str) -> None:
         settings.setValue(KEY_VIDEO_EXPORT_NAMING_MODE, m)
 
 
+def read_video_export_format(settings: QSettings | None) -> str:
+    if settings is None:
+        return EXPORT_FORMAT_SOURCE
+    v = settings.value(KEY_VIDEO_EXPORT_FORMAT, EXPORT_FORMAT_SOURCE)
+    s = (v or EXPORT_FORMAT_SOURCE).strip().lower() if isinstance(v, str) else str(v or "").strip().lower()
+    return s if s in _VALID_EXPORT_FORMAT else EXPORT_FORMAT_SOURCE
+
+
+def write_video_export_format(settings: QSettings, fmt: str) -> None:
+    f = (fmt or EXPORT_FORMAT_SOURCE).strip().lower()
+    if f in _VALID_EXPORT_FORMAT:
+        settings.setValue(KEY_VIDEO_EXPORT_FORMAT, f)
+
+
 def read_review_workspace(settings: QSettings | None, *, profile: str) -> str:
     if settings is None:
         return "focus"
@@ -202,3 +235,53 @@ def write_video_preview_time_display(settings: QSettings, mode: str) -> None:
     m = (mode or TIME_DISPLAY_TIMECODE).strip().lower()
     if m in _VALID_TIME_DISPLAY:
         settings.setValue(KEY_VIDEO_PREVIEW_TIME_DISPLAY, m)
+
+
+def read_video_preview_playback_speed(settings: QSettings | None) -> float:
+    if settings is None:
+        return 1.0
+    v = settings.value(KEY_VIDEO_PREVIEW_PLAYBACK_SPEED, 1.0)
+    try:
+        speed = float(v)
+    except (TypeError, ValueError):
+        return 1.0
+    from monostudio.ui_qt.video_player_backend import PLAYBACK_SPEED_STEPS
+
+    if speed in PLAYBACK_SPEED_STEPS:
+        return speed
+    return min(PLAYBACK_SPEED_STEPS, key=lambda s: abs(s - speed))
+
+
+def write_video_preview_playback_speed(settings: QSettings, speed: float) -> None:
+    from monostudio.ui_qt.video_player_backend import PLAYBACK_SPEED_STEPS
+
+    if speed in PLAYBACK_SPEED_STEPS:
+        settings.setValue(KEY_VIDEO_PREVIEW_PLAYBACK_SPEED, speed)
+
+
+def read_video_preview_volume(settings: QSettings | None) -> int:
+    if settings is None:
+        return 80
+    v = settings.value(KEY_VIDEO_PREVIEW_VOLUME, 80)
+    try:
+        vol = int(v)
+    except (TypeError, ValueError):
+        return 80
+    return max(0, min(100, vol))
+
+
+def write_video_preview_volume(settings: QSettings, volume: int) -> None:
+    settings.setValue(KEY_VIDEO_PREVIEW_VOLUME, max(0, min(100, int(volume))))
+
+
+def read_video_preview_loop(settings: QSettings | None) -> bool:
+    if settings is None:
+        return False
+    v = settings.value(KEY_VIDEO_PREVIEW_LOOP, False)
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes")
+
+
+def write_video_preview_loop(settings: QSettings, enabled: bool) -> None:
+    settings.setValue(KEY_VIDEO_PREVIEW_LOOP, bool(enabled))

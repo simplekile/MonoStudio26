@@ -169,6 +169,46 @@ class ScheduleSkipResolver:
         return [(d.name or "").strip() for d in ref.departments if (d.name or "").strip()]
 
 
+def department_should_show_in_workload(
+    resolver: ScheduleSkipResolver,
+    project_index: ProjectIndex,
+    department: str,
+    *,
+    include_shots: bool,
+    include_assets: bool,
+    hidden_departments: set[str],
+    respect_hidden: bool,
+    dept_scope: str,
+    dept_reg: DepartmentRegistry,
+    allowed_departments: set[str] | None = None,
+) -> bool:
+    """Hide a department row when every entity that has it on Schedule skipped it."""
+    dep = (department or "").strip()
+    if not dep:
+        return False
+    found = False
+    refs: list[Asset | Shot] = []
+    if include_assets:
+        refs.extend(project_index.assets)
+    if include_shots:
+        refs.extend(project_index.shots)
+    for ref in refs:
+        deps = resolver.schedule_department_ids_for_entity(
+            ref,
+            hidden_departments=hidden_departments,
+            dept_scope=dept_scope,
+            dept_reg=dept_reg,
+            respect_hidden=respect_hidden,
+            allowed_departments=allowed_departments,
+        )
+        if dep not in deps:
+            continue
+        found = True
+        if not resolver.is_department_skipped(ref, dep):
+            return True
+    return not found
+
+
 def count_fully_skipped_entities(
     project_root: Path,
     project_index: ProjectIndex,

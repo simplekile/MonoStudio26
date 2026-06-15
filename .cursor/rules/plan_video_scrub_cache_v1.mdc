@@ -1,0 +1,174 @@
+---
+description: Plan cache thumbnail scrub/hover trong Video Preview — tách khỏi mpv seek, prefetch keyframe, LRU + disk optional.
+alwaysApply: false
+---
+
+# Plan: Video Scrub Cache (v1)
+
+Cache phục vụ **hover/scrub popup thumbnail** (FFmpeg) trong `VideoPreviewDialog`. **Không** thay thế và **không** can thiệp luồng seek video embed (mpv/Qt).
+
+---
+
+## 1. Vấn đề & bài học
+
+| Hiện tượng | Nguyên nhân |
+|------------|-------------|
+| Scrub mpv **đã hoạt động** trước khi thêm cache | `prime_for_scrub()` + `backend.seek()` — đủ cho mpv embed |
+| Sau khi gỡ cache vẫn lỗi scrub | Các “fix mpv” (scrub session, `preview_paused_at`, `ensure_paused` mỗi frame…) **couple** hover/scrub UI với backend |
+| Cache hover **không** làm hỏng mpv nếu tách layer | Popup thumb = FFmpeg async; video surface = mpv seek riêng |
+
+**Quy tắc bất biến (mpv):**
+
+- Kéo scrub → `_apply_scrub_preview` → `MpvEmbeddedBackend.seek(sec, precise=…)` only
+- Chỉ `pause=True` trước seek khi `precise=True`
+- `prime_for_scrub`: pause + seek keyframe lần đầu (prime decoder)
+- **Cấm** trong cache layer: `begin_scrub_session`, micro-unpause, `frame-step` cho scrub, gọi `ensure_paused` trên mỗi frame scrub
+
+---
+
+## 2. Phạm vi cache
+
+### Cache **có**
+
+- Thumbnail PNG/QPixmap cho **hover popup** trên timeline (`VideoPreviewScrubHover`)
+- Thumbnail khi **kéo scrub** (popup bám chuột) — optional reuse cùng cache
+- Keyframe list (`probe_video_keyframe_frames` / fallback) — metadata, không cache frame bitmap
+
+### Cache **không**
+
+- Frame video trong mpv surface (VO render)
+- Thumbnail asset chung (`monostudio/ui_qt/thumbnails.py`) — module riêng
+- Export FFmpeg output
+
+---
+
+## 3. Kiến trúc 2 tầng
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ VideoPreviewDialog                                       │
+│  ┌─────────────────────┐  ┌──────────────────────────┐  │
+│  │ mpv / Qt backend    │  │ ScrubThumbCache (mới)    │  │
+│  │ seek / play / pause │  │ LRU memory + disk opt.   │  │
+│  └──────────▲──────────┘  └──────────▲───────────────┘  │
+│             │ scrub only              │ hover / popup only│
+│  _apply_scrub_preview ────────────────┼── _show_scrub_thumb│
+└─────────────────────────────────────┴────────────────────┘
+```
+
+**Module đề xuất:** `monostudio/ui_qt/video_scrub_thumb_cache.py` (hoặc `monostudio/core/video_scrub_cache.py` nếu dùng disk-only API).
+
+---
+
+## 4. API cache (đề xuất)
+
+```python
+@dataclass(frozen=True)
+class ScrubThumbKey:
+    video_path: Path          # resolved
+    mtime_ns: int             # invalidate khi file đổi
+    lookup_frame: int         # frame sau snap keyframe (drag) hoặc exact (hover)
+
+class VideoScrubThumbCache:
+    def get_pixmap(self, key: ScrubThumbKey) -> QPixmap | None: ...
+    def put_pixmap(self, key: ScrubThumbKey, px: QPixmap) -> None: ...
+    def prefetch_keyframes(
+        self, path, fps, frame_count, key_frames, *, workers=2
+    ) -> None: ...  # cancel token per video
+    def clear_video(self, path: Path) -> None: ...
+    def clear_all(self) -> None: ...
+```
+
+- **Memory LRU:** `OrderedDict[ScrubThumbKey, QPixmap]`, cap `_HOVER_CACHE_MAX = 128` (giữ constant trong dialog hoặc settings)
+- **Disk (Phase 2):** `{app_cache}/video_scrub/{path_hash}/{lookup_frame}.png` — chỉ ghi sau encode FFmpeg thành công; đọc trước memory miss
+- **Invalidation:** `mtime` + `size` của video file; đổi file → bucket cache mới
+
+---
+
+## 5. Luồng UI (khôi phục + cải tiến)
+
+### 5.1 Hover / scrub popup (FFmpeg)
+
+1. `_on_scrub_hover_frame` / `_show_scrub_thumb` → `_position_hover_preview`
+2. Debounce `_HOVER_FETCH_DEBOUNCE_MS` (30ms)
+3. `_thumb_lookup_frame` → snap keyframe khi drag (trừ “Exact scrub”)
+4. **Cache hit** → set pixmap ngay, không spawn worker
+5. **Cache miss** → `QThreadPool` + `extract_video_frame_png_bytes` (128px encode → scale 160×90)
+6. Ready → `put_pixmap` + hiển thị nếu token/frame còn khớp
+
+### 5.2 Video surface (mpv) — không đổi
+
+```python
+def _apply_scrub_preview(self, frame, *, precise=False):
+    ...
+    self._backend.seek(sec, precise=precise)  # ONLY
+```
+
+---
+
+## 6. Prefetch (Phase 2)
+
+Sau `_load_file` + keyframe probe xong:
+
+- Queue prefetch **toàn bộ keyframe** (2 worker, low priority)
+- Cap: dừng khi dialog đóng / đổi file (`clear_video`)
+- Không block UI; progress optional (footer “Warming scrub thumbs…”)
+
+**Thứ tự ưu tiên fetch:**
+
+1. Frame quanh playhead (±N keyframe)
+2. Keyframe còn lại theo thứ tự timeline
+
+---
+
+## 7. Cấu hình & vị trí lưu
+
+| Key | Mặc định | Ghi chú |
+|-----|----------|---------|
+| Memory cap | 128 entries | `video_preview_settings` optional |
+| Disk cache | off (Phase 2) | Settings → Inspector / Video |
+| Prefetch on open | on | Có thể tắt với file 4K dài |
+| Encode width | 128px | `-an -sn -dn`, `-skip_frame nokey` khi keyframe_aligned |
+
+**Disk path:** `monostudio_data/cache/video_scrub/` (gitignore) — **không** commit runtime cache.
+
+---
+
+## 8. Implementation touch points
+
+| File | Việc |
+|------|------|
+| `video_scrub_thumb_cache.py` | **Mới** — LRU + disk + prefetch coordinator |
+| `video_preview_dialog.py` | Wire cache; **giữ** seek mpv đơn giản; restore `_hover_pixmap_cache` logic qua module |
+| `video_media.py` | `extract_video_frame_png_bytes`, `probe_video_keyframe_frames` (đã có) |
+| `video_preview_settings.py` | Keys: enable disk, prefetch, memory cap |
+| `.gitignore` | `monostudio_data/cache/video_scrub/` |
+
+**Không sửa** `MpvEmbeddedBackend.seek` / `prime_for_scrub` khi làm cache.
+
+---
+
+## 9. Phase
+
+| Phase | Nội dung | Effort |
+|-------|----------|--------|
+| **1** | Module LRU memory + cache hit trước FFmpeg worker | ~0.5 ngày |
+| **2** | Prefetch keyframe nền + cancel on close | ~0.5 ngày |
+| **3** | Disk cache + settings toggle + retention (LRU folder size) | ~1 ngày |
+
+---
+
+## 10. Test matrix
+
+- [ ] mpv: pause → kéo scrub → **video surface** cập nhật (không chỉ playhead)
+- [ ] Hover popup: cache miss → hiện thumb; lần 2 cùng keyframe → instant (memory hit)
+- [ ] Đổi file trong dialog → cache cũ không leak / không hiện nhầm
+- [ ] Exact scrub drag: lookup frame = exact, không snap keyframe
+- [ ] 4K VP9: prefetch không làm UI giật; cancel khi đóng dialog
+- [ ] Qt backend: seek scrub vẫn OK (cache chỉ hover)
+
+---
+
+## 11. Tham chiếu code (trước khi tách module)
+
+Commit `dac8451` có `_hover_pixmap_cache: OrderedDict[int, QPixmap]` trong dialog — pattern LRU cần khôi phục **trong module riêng**, không inline dialog.

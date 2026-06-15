@@ -3,24 +3,28 @@
 from __future__ import annotations
 
 import logging
-from collections import OrderedDict
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QRect, QEvent, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QFont, QGuiApplication, QKeySequence, QMouseEvent, QPixmap, QShortcut
+from PySide6.QtGui import QCursor, QFont, QGuiApplication, QKeySequence, QMouseEvent, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSlider,
     QTextEdit,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -28,6 +32,8 @@ from PySide6.QtWidgets import (
 from monostudio.core.video_media import (
     VideoFrameRange,
     VideoInfo,
+    VideoReviewMarker,
+    export_video_markers_png,
     extract_video_frame_png_bytes,
     fallback_scrub_snap_frames,
     format_frame_label,
@@ -35,15 +41,23 @@ from monostudio.core.video_media import (
     format_timecode,
     TimeDisplayMode,
     list_video_siblings,
+    load_video_markers_for_preview,
+    load_video_preview_session_local_draft,
     load_video_ranges_for_preview,
+    markers_content_equal,
+    new_marker_id,
     new_range_id,
     probe_video,
     probe_video_keyframe_frames,
     ranges_content_equal,
+    save_video_markers_local_draft,
+    save_video_markers_sidecar,
+    save_video_preview_session_local_draft,
     save_video_ranges_local_draft,
     save_video_ranges_sidecar,
     sec_to_frame,
     snap_frame_to_nearest_keyframe,
+    validate_marker_frame,
     validate_range,
 )
 from monostudio.ui_qt.dialog_geometry import (
@@ -63,21 +77,27 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, MonosMenu, monos_f
 from monostudio.ui_qt.video_export_dialog import VideoExportDialog
 from monostudio.ui_qt.video_player_backend import (
     ExternalPlayerBackend,
+    PLAYBACK_SPEED_STEPS,
     VideoPlayerBackend,
     create_video_player_backend,
-    next_speed,
 )
 from monostudio.ui_qt.video_preview_context import PreviewContext, VideoPreviewOpenRequest
 from monostudio.ui_qt.video_preview_scrubber import VideoPreviewScrubber
 from monostudio.ui_qt.video_preview_settings import (
     read_review_tool_mode,
     read_review_workspace,
+    read_video_preview_loop,
+    read_video_preview_playback_speed,
     read_video_preview_precise_scrub_drag,
     read_video_preview_time_display,
+    read_video_preview_volume,
     write_review_tool_mode,
     write_review_workspace,
+    write_video_preview_loop,
+    write_video_preview_playback_speed,
     write_video_preview_precise_scrub_drag,
     write_video_preview_time_display,
+    write_video_preview_volume,
     TIME_DISPLAY_FRAME,
     TIME_DISPLAY_TIMECODE,
 )
@@ -87,7 +107,6 @@ logger = logging.getLogger(__name__)
 _HOVER_PREVIEW_W = 160
 _HOVER_PREVIEW_H = 90
 _HOVER_ENCODE_W = 128
-_HOVER_CACHE_MAX = 128
 _HOVER_FETCH_DEBOUNCE_MS = 30
 _SCRUB_SEEK_INTERVAL_KEYFRAME_MS = 66
 _SCRUB_SEEK_INTERVAL_KEYFRAME_MPV_MS = 50
@@ -107,6 +126,10 @@ class _RangeEditSnapshot:
     active_range_id: str | None
     range_edit_unlocked: bool
 _PREVIEW_TOPBAR_H = 40
+_PREVIEW_CLOSE_BTN = 28
+_PREVIEW_CLOSE_INSET = 8
+_FULLSCREEN_EDGE_PX = 48
+_FULLSCREEN_CHROME_HIDE_MS = 700
 _DIALOG_BORDER_INSET = 1  # match _MONOS_DIALOG_BORDER_INSET — native embed vs MonosDialog border
 _VIDEO_NATIVE_CLIP_BOTTOM = 1  # mpv / QVideoWidget HWND bleed above timeline divider
 
@@ -193,7 +216,6 @@ class VideoPreviewDialog(MonosDialog):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("VideoPreviewDialog")
-        self.set_host_dim_overlay_enabled(False)
         self.setWindowModality(Qt.WindowModality.NonModal)
         if request is not None:
             self._request = request
@@ -218,20 +240,26 @@ class VideoPreviewDialog(MonosDialog):
         self._info: VideoInfo | None = None
         self._ranges: list[VideoFrameRange] = []
         self._published_ranges: list[VideoFrameRange] = []
+        self._markers: list[VideoReviewMarker] = []
+        self._published_markers: list[VideoReviewMarker] = []
         self._active_range_id: str | None = None
+        self._active_marker_id: str | None = None
         self._range_edit_unlocked = False
         self._draft_in: int | None = None
         self._draft_out: int | None = None
         self._range_undo_stack: list[_RangeEditSnapshot] = []
         self._range_redo_stack: list[_RangeEditSnapshot] = []
         self._applying_range_undo = False
-        self._loop_playback = False
-        self._speed = 1.0
-        self._volume = 80
+        self._loop_playback = read_video_preview_loop(settings)
+        self._speed = read_video_preview_playback_speed(settings)
+        self._volume = read_video_preview_volume(settings)
+        self._volume_muted = False
+        self._volume_before_mute = self._volume if self._volume > 0 else 80
         self._scrubbing = False
-        self._playback_primed = False
-        self._video_attached = False
         self._was_playing_before_scrub = False
+        self._playback_primed = False
+        self._frame_paint_gen = 0
+        self._video_attached = False
         self._video_scrub_pending = False
         self._video_scrub_active = False
         self._video_scrub_start_x = 0
@@ -268,13 +296,24 @@ class VideoPreviewDialog(MonosDialog):
         self._keyframe_probe_token = 0
         self._pending_hover_frame: int | None = None
         self._hover_key_frames: list[int] = []
-        self._hover_pixmap_cache: OrderedDict[int, QPixmap] = OrderedDict()
         self._hover_debounce = QTimer(self)
         self._hover_debounce.setSingleShot(True)
         self._hover_debounce.setInterval(_HOVER_FETCH_DEBOUNCE_MS)
         self._hover_debounce.timeout.connect(self._start_hover_fetch)
 
+        self._restore_frame: int | None = None
+        self._session_persist_timer = QTimer(self)
+        self._session_persist_timer.setSingleShot(True)
+        self._session_persist_timer.setInterval(400)
+        self._session_persist_timer.timeout.connect(self._persist_preview_session)
+        self._fs_bottom_revealed = False
+        self._fs_right_revealed = False
+        self._fs_app_filter_installed = False
+        self._fs_chrome_hide_timer = QTimer(self)
+        self._fs_chrome_hide_timer.setSingleShot(True)
+        self._fs_chrome_hide_timer.timeout.connect(self._on_fullscreen_chrome_hide_timeout)
         self._status_log = ""
+        self._footer_pointer_zone = ""
         self._backend: VideoPlayerBackend = create_video_player_backend(settings)
         self._backend.set_callbacks(
             on_position=self._on_backend_position,
@@ -304,23 +343,14 @@ class VideoPreviewDialog(MonosDialog):
         self._root_layout.setSpacing(0)
         self._apply_dialog_content_inset()
 
-        body = QHBoxLayout()
-        body.setSpacing(0)
-
-        self._main_column = QWidget(self)
-        self._main_column.setObjectName("VideoPreviewMainColumn")
-        main_lay = QVBoxLayout(self._main_column)
-        main_lay.setContentsMargins(0, 0, 0, 0)
-        main_lay.setSpacing(0)
-
-        self._top_bar = QWidget(self._main_column)
+        self._top_bar = QWidget(self)
         self._top_bar.setObjectName("VideoPreviewTopBar")
         self._top_bar.setFixedHeight(_PREVIEW_TOPBAR_H)
         top_lay = QHBoxLayout(self._top_bar)
         top_lay.setContentsMargins(
             _PREVIEW_CHROME_PAD_H,
             0,
-            _PREVIEW_CHROME_PAD_H,
+            _PREVIEW_CHROME_PAD_H + _PREVIEW_CLOSE_BTN + _PREVIEW_CLOSE_INSET,
             0,
         )
         top_lay.setSpacing(8)
@@ -338,7 +368,24 @@ class VideoPreviewDialog(MonosDialog):
         self._title_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._title_btn.clicked.connect(self._show_video_picker_menu)
         top_lay.addWidget(self._title_btn, 1)
-        main_lay.addWidget(self._top_bar, 0)
+
+        self._btn_close = QToolButton(self)
+        self._btn_close.setObjectName("VideoPreviewDialogCloseBtn")
+        self._btn_close.setAutoRaise(False)
+        self._btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_close.setFixedSize(_PREVIEW_CLOSE_BTN, _PREVIEW_CLOSE_BTN)
+        self._btn_close.setIcon(lucide_icon("x", size=16, color_hex="#fafafa"))
+        self._btn_close.setToolTip("Close")
+        self._btn_close.clicked.connect(self.close)
+
+        body = QHBoxLayout()
+        body.setSpacing(0)
+
+        self._main_column = QWidget(self)
+        self._main_column.setObjectName("VideoPreviewMainColumn")
+        main_lay = QVBoxLayout(self._main_column)
+        main_lay.setContentsMargins(0, 0, 0, 0)
+        main_lay.setSpacing(0)
 
         self._viewer = QWidget(self._main_column)
         self._viewer.setObjectName("VideoPreviewViewer")
@@ -359,12 +406,16 @@ class VideoPreviewDialog(MonosDialog):
         wrap_lay.setSpacing(0)
         self._surface = QWidget(self._surface_wrap)
         self._surface.setObjectName("VideoPreviewSurface")
+        self._surface.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self._surface.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self._surface.setMinimumSize(480, 270)
         self._surface.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
         wrap_lay.addWidget(self._surface, 1)
+        self._surface.setMouseTracking(True)
+        self._surface_wrap.setMouseTracking(True)
         self._surface.installEventFilter(self)
         self._surface_wrap.installEventFilter(self)
         self._surface.setToolTip(
@@ -402,20 +453,20 @@ class VideoPreviewDialog(MonosDialog):
         timeline_lay.setSpacing(0)
 
         self._scrubber = VideoPreviewScrubber(self._timeline_block)
-        self._scrubber.setToolTip(
-            "Timeline — right-click menu · Alt+wheel zoom · wheel pan when zoomed · "
-            "middle-drag pan · Alt+F fit · F focus range"
-        )
+        self._scrubber.setToolTip("")
         self._scrubber.sliderPressed.connect(self._on_scrub_pressed)
         self._scrubber.seek_released.connect(lambda f: self._on_scrub_released(int(f)))
         self._scrubber.frame_preview.connect(self._on_scrub_frame_preview)
         self._scrubber.hover_frame.connect(self._on_scrub_hover_frame)
+        self._scrubber.footer_context_changed.connect(self._on_scrubber_footer_context)
         self._scrubber.valueChanged.connect(self._on_scrub_value)
         self._scrubber.in_out_changed.connect(self._on_scrub_in_out)
         self._scrubber.range_handles_drag_started.connect(self._push_range_undo)
         self._scrubber.range_highlighted.connect(self._on_range_highlighted)
         self._scrubber.range_edit_requested.connect(self._on_range_edit_requested)
         self._scrubber.range_deselected.connect(self._on_range_deselected)
+        self._scrubber.marker_highlighted.connect(self._on_marker_selected)
+        self._scrubber.marker_deselected.connect(self._on_marker_deselected)
         self._scrubber.go_to_in_requested.connect(self._go_to_range_in)
         self._scrubber.go_to_out_requested.connect(self._go_to_range_out)
         self._scrubber.range_duplicate_requested.connect(self._duplicate_range)
@@ -438,14 +489,6 @@ class VideoPreviewDialog(MonosDialog):
         self._btn_tl_focus = self._tool_btn("scan", "Focus to selected range (F)")
         zoom_lay.addWidget(self._btn_tl_fit, 0, Qt.AlignmentFlag.AlignHCenter)
         zoom_lay.addWidget(self._btn_tl_focus, 0, Qt.AlignmentFlag.AlignHCenter)
-        self._current_frame_label = QLabel("0000", self._timeline_zoom)
-        self._current_frame_label.setObjectName("VideoPreviewCurrentFrame")
-        self._current_frame_label.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
-        self._current_frame_label.setAlignment(
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._current_frame_label.setToolTip("Current frame")
-        zoom_lay.addWidget(self._current_frame_label, 0, Qt.AlignmentFlag.AlignHCenter)
         zoom_lay.addStretch(1)
 
         timeline_lay.addWidget(self._timeline_zoom, 0)
@@ -467,23 +510,53 @@ class VideoPreviewDialog(MonosDialog):
         )
         tlay.setSpacing(8)
 
-        self._btn_prev_file = self._tool_btn("skip-back", "Previous file")
+        self._transport_controls = QWidget(self._transport)
+        self._transport_controls.setObjectName("VideoPreviewTransportControls")
+        transport_btn_lay = QHBoxLayout(self._transport_controls)
+        transport_btn_lay.setContentsMargins(0, 0, 0, 0)
+        transport_btn_lay.setSpacing(2)
+        self._btn_prev_file = self._tool_btn("skip-back", "Previous file", compact=True)
         self._btn_prev_file.clicked.connect(self._prev_file)
-        self._btn_play = self._tool_btn("play", "Play / pause (Space)")
+        self._btn_play = self._tool_btn("play", "Play / pause (Space)", compact=True)
         self._btn_play.clicked.connect(self._toggle_play)
-        self._btn_next_file = self._tool_btn("skip-forward", "Next file")
+        self._btn_next_file = self._tool_btn("skip-forward", "Next file", compact=True)
         self._btn_next_file.clicked.connect(self._next_file)
-        self._btn_tool_strip = self._tool_btn("sliders-horizontal", "Tools strip (T)")
+        self._btn_tool_strip = self._tool_btn("sliders-horizontal", "Tools strip (T)", compact=True)
         self._btn_tool_strip.setCheckable(True)
         self._btn_tool_strip.clicked.connect(self._toggle_tool_strip)
-        tlay.addWidget(self._btn_prev_file)
-        tlay.addWidget(self._btn_play)
-        tlay.addWidget(self._btn_next_file)
-        tlay.addWidget(self._btn_tool_strip)
+        transport_btn_lay.addWidget(self._btn_prev_file)
+        transport_btn_lay.addWidget(self._btn_play)
+        transport_btn_lay.addWidget(self._btn_next_file)
+        transport_btn_lay.addWidget(self._btn_tool_strip)
+        tlay.addWidget(self._transport_controls)
 
-        self._time_label = QLabel("00:00:00 / 00:00:00", self._transport)
-        self._time_label.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Normal))
-        tlay.addWidget(self._time_label)
+        self._position_box = QWidget(self._transport)
+        self._position_box.setObjectName("VideoPreviewPositionBox")
+        self._position_box.setFixedWidth(136)
+        self._position_box.setToolTip("Current position — type frame and press Enter")
+        pos_lay = QHBoxLayout(self._position_box)
+        pos_lay.setContentsMargins(8, 2, 8, 2)
+        pos_lay.setSpacing(0)
+        self._frame_input = QLineEdit(self._position_box)
+        self._frame_input.setObjectName("VideoPreviewFrameInput")
+        self._frame_input.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
+        self._frame_input.setFixedWidth(52)
+        self._frame_input.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._frame_input.setPlaceholderText("0")
+        self._frame_input.returnPressed.connect(self._on_frame_input_commit)
+        self._frame_input.editingFinished.connect(self._on_frame_input_commit)
+        self._position_suffix = QLabel(" / 0000", self._position_box)
+        self._position_suffix.setObjectName("VideoPreviewPositionSuffix")
+        self._position_suffix.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
+        self._timecode_position = QLabel("00:00:00 / 00:00:00", self._position_box)
+        self._timecode_position.setObjectName("VideoPreviewTimecodePosition")
+        self._timecode_position.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
+        self._timecode_position.setFixedWidth(120)
+        pos_lay.addWidget(self._frame_input)
+        pos_lay.addWidget(self._position_suffix)
+        pos_lay.addWidget(self._timecode_position)
+        tlay.addWidget(self._position_box)
+        self._sync_position_controls_visibility()
 
         self._chk_precise_scrub = QCheckBox("Exact scrub", self._transport)
         self._chk_precise_scrub.setObjectName("VideoPreviewPreciseScrubCheck")
@@ -502,6 +575,7 @@ class VideoPreviewDialog(MonosDialog):
         self._chk_loop.setToolTip(
             "Loop playback (L) — full video, or highlighted range when selected"
         )
+        self._chk_loop.setChecked(self._loop_playback)
         self._chk_loop.toggled.connect(self._on_loop_toggled)
         tlay.addWidget(self._chk_loop)
 
@@ -529,15 +603,44 @@ class VideoPreviewDialog(MonosDialog):
 
         tlay.addStretch(1)
 
-        self._speed_label = QLabel("1.0×", self._transport)
-        self._speed_label.setFont(monos_font("Inter", 13, QFont.Weight.Normal))
-        tlay.addWidget(self._speed_label)
-        vol = QSlider(Qt.Orientation.Horizontal, self._transport)
-        vol.setMaximum(100)
-        vol.setValue(self._volume)
-        vol.setFixedWidth(80)
-        vol.valueChanged.connect(self._on_volume)
-        tlay.addWidget(vol)
+        self._speed_icon = self._transport_icon("gauge")
+        self._speed_icon.setToolTip("Reset to 1×")
+        self._speed_icon.clicked.connect(self._reset_playback_speed)
+        tlay.addWidget(self._speed_icon)
+        self._cmb_speed = QComboBox(self._transport)
+        self._cmb_speed.setObjectName("VideoPreviewSpeedCombo")
+        self._cmb_speed.setToolTip("Playback speed")
+        for speed in PLAYBACK_SPEED_STEPS:
+            label = "1×" if speed == 1.0 else f"{speed:g}×"
+            self._cmb_speed.addItem(label, speed)
+        speed_idx = (
+            PLAYBACK_SPEED_STEPS.index(self._speed)
+            if self._speed in PLAYBACK_SPEED_STEPS
+            else PLAYBACK_SPEED_STEPS.index(1.0)
+        )
+        self._cmb_speed.setCurrentIndex(speed_idx)
+        self._cmb_speed.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._cmb_speed.currentIndexChanged.connect(self._on_speed_changed)
+        tlay.addWidget(self._cmb_speed)
+
+        self._volume_icon = self._transport_icon("volume-2")
+        self._volume_icon.setToolTip("")
+        self._volume_icon.clicked.connect(self._toggle_volume_mute)
+        tlay.addWidget(self._volume_icon)
+        self._volume_slider = QSlider(Qt.Orientation.Horizontal, self._transport)
+        self._volume_slider.setObjectName("VideoPreviewVolumeSlider")
+        self._volume_slider.setMaximum(100)
+        self._volume_slider.setValue(self._volume)
+        self._volume_slider.setFixedWidth(80)
+        self._volume_slider.setToolTip("")
+        self._volume_slider.valueChanged.connect(self._on_volume)
+        self._volume_slider.sliderPressed.connect(self._on_volume_slider_pressed)
+        self._volume_slider.sliderReleased.connect(self._on_volume_slider_released)
+        self._volume_slider.sliderMoved.connect(self._on_volume_slider_moved)
+        self._volume_slider.installEventFilter(self)
+        self._volume_icon.installEventFilter(self)
+        self._volume_dragging = False
+        tlay.addWidget(self._volume_slider)
 
         self._btn_sync = self._action_btn(
             "sync",
@@ -548,11 +651,8 @@ class VideoPreviewDialog(MonosDialog):
         self._btn_sync.clicked.connect(self._sync_ranges)
         self._btn_export = self._action_btn("download", "Export…", "Export marked ranges")
         self._btn_export.clicked.connect(self._export)
-        self._btn_close = self._action_btn("x", "Close", "Close (Esc)")
-        self._btn_close.clicked.connect(self.close)
         tlay.addWidget(self._btn_sync)
         tlay.addWidget(self._btn_export)
-        tlay.addWidget(self._btn_close)
 
         main_lay.addWidget(self._transport, 0)
 
@@ -565,13 +665,21 @@ class VideoPreviewDialog(MonosDialog):
             _PREVIEW_CHROME_PAD_H,
             _PREVIEW_CHROME_PAD_V,
         )
-        footer_lay.setSpacing(0)
+        footer_lay.setSpacing(12)
+        self._footer_hint = QLabel("", self._footer)
+        self._footer_hint.setObjectName("VideoPreviewFooterHint")
+        self._footer_hint.setFont(monos_font("Inter", 11, QFont.Weight.Medium))
+        self._footer_hint.setWordWrap(False)
+        self._footer_hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        footer_lay.addWidget(self._footer_hint, 1)
         self._footer_label = QLabel("", self._footer)
         self._footer_label.setObjectName("VideoPreviewFooterLog")
         self._footer_label.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
         self._footer_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._footer_label.setWordWrap(True)
-        footer_lay.addWidget(self._footer_label, 1)
+        self._footer_label.setWordWrap(False)
+        self._footer_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._footer_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+        footer_lay.addWidget(self._footer_label, 0)
         main_lay.addWidget(self._footer, 0)
 
         body.addWidget(self._main_column, 1)
@@ -587,9 +695,15 @@ class VideoPreviewDialog(MonosDialog):
         self._tools_panel.go_to_in_requested.connect(self._go_to_range_in)
         self._tools_panel.go_to_out_requested.connect(self._go_to_range_out)
         self._tools_panel.range_label_changed.connect(self._on_range_label_changed)
+        self._tools_panel.marker_selected.connect(self._on_marker_selected)
+        self._tools_panel.marker_deselected.connect(self._on_marker_deselected)
+        self._tools_panel.marker_delete_requested.connect(self._delete_marker)
+        self._tools_panel.marker_label_changed.connect(self._on_marker_label_changed)
+        self._tools_panel.marker_export_requested.connect(self._export_markers_png)
         self._tools_panel.open_all_notes_requested.connect(self.open_all_notes_requested.emit)
         body.addWidget(self._tools_panel, 0)
 
+        self._root_layout.addWidget(self._top_bar, 0)
         self._root_layout.addLayout(body, 1)
 
         self._on_tool_strip_visibility_changed(self._tools_panel.strip_visible())
@@ -635,12 +749,37 @@ class VideoPreviewDialog(MonosDialog):
         self.raise_border_overlay()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
-        if watched is self._surface_wrap and event.type() == QEvent.Type.Resize:
-            self._sync_video_backend()
-            self._position_hud()
-            self._position_tool_strip()
-            self._position_strip_toggle()
-            self._raise_video_overlays()
+        if self._fullscreen and event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+            gpos = event.globalPosition().toPoint()
+            if self.frameGeometry().contains(gpos):
+                self._update_fullscreen_chrome(gpos)
+        if watched is self._surface_wrap:
+            if event.type() == QEvent.Type.Enter:
+                if not self._scrubber.underMouse():
+                    self._set_footer_pointer_zone("video")
+            elif event.type() == QEvent.Type.Leave:
+                if not self._scrubber.underMouse():
+                    self._set_footer_pointer_zone("")
+            elif event.type() == QEvent.Type.Resize:
+                self._sync_video_backend()
+                self._position_hud()
+                self._position_tool_strip()
+                self._position_strip_toggle()
+                self._raise_video_overlays()
+        vol_slider = getattr(self, "_volume_slider", None)
+        vol_icon = getattr(self, "_volume_icon", None)
+        if vol_slider is not None and watched in (vol_slider, vol_icon):
+            if event.type() == QEvent.Type.Enter:
+                self._show_volume_tooltip(watched)
+            elif event.type() == QEvent.Type.Leave:
+                if not self._volume_dragging:
+                    QToolTip.hideText()
+            elif (
+                watched is vol_slider
+                and event.type() == QEvent.Type.MouseMove
+                and isinstance(event, QMouseEvent)
+            ):
+                self._show_volume_tooltip(vol_slider, vol_slider.value(), event.globalPos())
         if watched is self._surface and self._info is not None:
             handled = self._filter_video_surface_mouse(event)
             if handled is not None:
@@ -706,13 +845,26 @@ class VideoPreviewDialog(MonosDialog):
         self._scrubber.setValue(frame)
         self._on_scrub_frame_preview(frame)
 
-    def _tool_btn(self, icon: str, tip: str) -> QToolButton:
+    def _tool_btn(self, icon: str, tip: str, *, compact: bool = False) -> QToolButton:
         btn = QToolButton(self)
+        if compact:
+            btn.setObjectName("VideoPreviewTransportTool")
         btn.setIcon(lucide_icon(icon, size=18, color_hex=MONOS_COLORS["text_label"]))
         btn.setIconSize(QSize(18, 18))
         btn.setToolTip(tip)
         btn.setAutoRaise(True)
-        btn.setFixedSize(32, 32)
+        size = 28 if compact else 32
+        btn.setFixedSize(size, size)
+        return btn
+
+    def _transport_icon(self, icon: str) -> QToolButton:
+        btn = QToolButton(self._transport)
+        btn.setObjectName("VideoPreviewTransportTool")
+        btn.setIcon(lucide_icon(icon, size=16, color_hex=MONOS_COLORS["text_meta"]))
+        btn.setIconSize(QSize(16, 16))
+        btn.setAutoRaise(True)
+        btn.setFixedSize(28, 28)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
         return btn
 
     def _action_btn(
@@ -744,16 +896,16 @@ class VideoPreviewDialog(MonosDialog):
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self._frame_step(1))
         QShortcut(QKeySequence("Shift+Left"), self, lambda: self._jump_sec(-1))
         QShortcut(QKeySequence("Shift+Right"), self, lambda: self._jump_sec(1))
-        QShortcut(QKeySequence(Qt.Key.Key_BracketLeft), self, lambda: self._change_speed(-1))
-        QShortcut(QKeySequence(Qt.Key.Key_BracketRight), self, lambda: self._change_speed(1))
+        QShortcut(QKeySequence(Qt.Key.Key_BracketLeft), self, self._select_prev_list_item)
+        QShortcut(QKeySequence(Qt.Key.Key_BracketRight), self, self._select_next_list_item)
         QShortcut(QKeySequence(Qt.Key.Key_PageUp), self, self._prev_file)
         QShortcut(QKeySequence(Qt.Key.Key_PageDown), self, self._next_file)
         sc_del = QShortcut(QKeySequence(Qt.Key.Key_Delete), self)
         sc_del.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_del.activated.connect(self._delete_active_range)
+        sc_del.activated.connect(self._delete_active_item)
         sc_bs = QShortcut(QKeySequence(Qt.Key.Key_Backspace), self)
         sc_bs.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc_bs.activated.connect(self._delete_active_range)
+        sc_bs.activated.connect(self._delete_active_item)
         QShortcut(QKeySequence(Qt.Key.Key_Up), self, self._select_prev_range)
         QShortcut(QKeySequence(Qt.Key.Key_Down), self, self._select_next_range)
         QShortcut(QKeySequence("Ctrl+F"), self, self._toggle_fullscreen)
@@ -775,6 +927,10 @@ class VideoPreviewDialog(MonosDialog):
         sc_redo_y.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         sc_redo_y.activated.connect(self._redo_range_edit)
         QShortcut(QKeySequence(Qt.Key.Key_R), self, lambda: self._activate_tool(ReviewToolMode.ranges))
+        QShortcut(QKeySequence(Qt.Key.Key_M), self, lambda: self._activate_tool(ReviewToolMode.markers))
+        QShortcut(QKeySequence(Qt.Key.Key_K), self, self._add_marker_at_playhead)
+        QShortcut(QKeySequence(Qt.Key.Key_Comma), self, self._select_prev_marker_shortcut)
+        QShortcut(QKeySequence(Qt.Key.Key_Period), self, self._select_next_marker_shortcut)
         QShortcut(QKeySequence(Qt.Key.Key_N), self, lambda: self._activate_tool(ReviewToolMode.note))
 
     def apply_profile(self, context: PreviewContext) -> None:
@@ -814,6 +970,8 @@ class VideoPreviewDialog(MonosDialog):
     def _on_tools_mode_changed(self, mode_name: str) -> None:
         if self._settings is not None:
             write_review_tool_mode(self._settings, self._profile_key, mode_name)
+        self._apply_timeline_list_mode()
+        self._sync_range_ui()
 
     def _cycle_workspace(self) -> None:
         self._tools_panel.cycle_workspace()
@@ -837,6 +995,24 @@ class VideoPreviewDialog(MonosDialog):
 
     def _range_list(self):
         return self._tools_panel.range_list_widget()
+
+    def _marker_list(self):
+        return self._tools_panel.marker_list_widget()
+
+    def _apply_timeline_list_mode(self) -> None:
+        if self._tools_panel.tool_mode() == ReviewToolMode.markers:
+            self._scrubber.set_timeline_list_mode("markers")
+        else:
+            self._scrubber.set_timeline_list_mode("ranges")
+
+    def _active_marker(self) -> VideoReviewMarker | None:
+        if not self._active_marker_id:
+            return None
+        return next((m for m in self._markers if m.id == self._active_marker_id), None)
+
+    def _active_marker_label(self) -> str:
+        m = self._active_marker()
+        return (m.label if m else "") or ""
 
     def _active_range_label(self) -> str:
         rng = self._active_range()
@@ -870,7 +1046,8 @@ class VideoPreviewDialog(MonosDialog):
         if lay is not None:
             m = lay.contentsMargins()
             bar_w -= m.left() + m.right() + lay.spacing()
-        return max(48, bar_w - counter_w - 12)
+        close_reserve = _PREVIEW_CLOSE_BTN + _PREVIEW_CLOSE_INSET
+        return max(48, bar_w - counter_w - close_reserve - 12)
 
     def _refresh_title_elide(self) -> None:
         if self._path is None:
@@ -885,6 +1062,10 @@ class VideoPreviewDialog(MonosDialog):
         self._title_btn.setText(text)
 
     def _update_footer(self) -> None:
+        self._update_footer_meta()
+        self._refresh_footer_hint()
+
+    def _update_footer_meta(self) -> None:
         if self._path is None:
             self._footer_label.setText("")
             return
@@ -907,6 +1088,117 @@ class VideoPreviewDialog(MonosDialog):
         if self._status_log:
             parts.append(self._status_log)
         self._footer_label.setText(" · ".join(parts))
+
+    def _on_scrubber_footer_context(self, zone: str) -> None:
+        self._set_footer_pointer_zone(zone)
+
+    def _set_footer_pointer_zone(self, zone: str) -> None:
+        if zone == self._footer_pointer_zone:
+            return
+        self._footer_pointer_zone = zone
+        self._refresh_footer_hint()
+
+    def _refresh_footer_hint(self) -> None:
+        if not hasattr(self, "_footer_hint"):
+            return
+        if self._path is None or self._info is None:
+            self._footer_hint.setText("")
+            return
+        parts = self._footer_hint_parts()
+        self._footer_hint.setText("  ·  ".join(parts) if parts else "")
+
+    def _footer_range_cycle_hint(self) -> str | None:
+        if len(self._ranges) < 2:
+            return None
+        return "[ / ] — Prev/Next range"
+
+    def _footer_marker_hint(self) -> str | None:
+        if self._tools_panel.tool_mode() != ReviewToolMode.markers:
+            return None
+        if len(self._markers) < 2:
+            return None
+        return ", / . — Prev/Next marker"
+
+    def _footer_hint_parts(self) -> list[str]:
+        zone = self._footer_pointer_zone
+        has_draft = self._draft_in is not None or self._draft_out is not None
+        has_sel = self._active_range_id is not None
+        editing = self._range_edit_unlocked and has_sel
+        range_cycle = self._footer_range_cycle_hint()
+        marker_jump = self._footer_marker_hint()
+
+        if self._fullscreen:
+            return ["Esc — exit fullscreen", "Bottom edge — timeline", "Right edge — tools"]
+
+        if zone == "video":
+            parts = ["Space — Play/Pause"]
+            if editing:
+                parts += ["I/O — Set on range", "Esc — Exit edit"]
+            elif has_draft:
+                parts += ["Enter — Add range", "Esc — Clear draft"]
+            else:
+                parts += ["I — Mark In", "O — Mark Out"]
+            if range_cycle:
+                parts.append(range_cycle)
+            return parts
+
+        if zone == "handle_in":
+            return ["Drag — Trim In", "Esc — Exit edit"]
+        if zone == "handle_out":
+            return ["Drag — Trim Out", "Esc — Exit edit"]
+        if zone == "range_move":
+            return ["Drag — Move range", "Esc — Exit edit"]
+
+        if zone == "range_overlap":
+            return [
+                "LMB — Cycle overlapping",
+                "E — Edit",
+                "Del — Delete",
+                "Esc — Deselect",
+            ]
+
+        if zone == "range":
+            if editing:
+                parts = ["I/O — Set In/Out", "Del — Delete", "Esc — Exit edit"]
+            elif has_sel:
+                parts = ["E — Edit range", "Del — Delete", "Esc — Deselect"]
+            else:
+                parts = ["LMB — Select", "Dbl-click — Edit", "E — Edit"]
+            if range_cycle:
+                parts.append(range_cycle)
+            return parts
+
+        if zone in ("track", "ruler"):
+            if self._tools_panel.tool_mode() == ReviewToolMode.markers:
+                parts = ["K — Add marker", "LMB — Select marker", "Del — Delete"]
+                if marker_jump:
+                    parts.append(marker_jump)
+                return parts
+            parts = ["LMB — Scrub", "RMB — Menu"]
+            if zone == "ruler":
+                parts += ["Alt+Wheel — Zoom", "Wheel — Pan"]
+            if has_draft:
+                parts += ["Enter — Add range", "Esc — Clear draft"]
+            elif editing:
+                parts += ["I/O — Set on range", "Esc — Exit edit"]
+            else:
+                parts.append("I/O — Mark In/Out")
+            if range_cycle:
+                parts.append(range_cycle)
+            return parts
+
+        parts = ["Space — Play/Pause"]
+        if has_sel and not editing:
+            parts.append("Esc — Deselect")
+        elif has_draft:
+            parts.append("Esc — Clear draft")
+        elif editing:
+            parts.append("Esc — Exit edit")
+        else:
+            parts += ["I/O — Draft range", "E — Edit range"]
+        if range_cycle:
+            parts.append(range_cycle)
+        return parts
 
     def _show_video_picker_menu(self) -> None:
         if len(self._paths) <= 1:
@@ -994,22 +1286,35 @@ class VideoPreviewDialog(MonosDialog):
         self._update_sync_button()
 
     def _on_escape(self) -> None:
+        if (
+            self._tools_panel.tool_mode() == ReviewToolMode.markers
+            and self._active_marker_id is not None
+        ):
+            self._on_marker_deselected()
+            return
+        if self._active_range_id is not None and not self._range_edit_unlocked:
+            self._scrubber.clear_overlap_cycle()
+            self._on_range_deselected()
+            return
+        if self._draft_in is not None or self._draft_out is not None:
+            self._draft_in = None
+            self._draft_out = None
+            self._sync_range_ui()
+            return
         if self._fullscreen:
             self._toggle_fullscreen()
             return
-        if self._tools_panel.retreat_workspace_or_mode():
-            if self._settings is not None:
-                write_review_workspace(
-                    self._settings,
-                    self._profile_key,
-                    self._tools_panel.workspace().value,
-                )
+        if self._range_edit_unlocked:
+            self._range_edit_unlocked = False
+            self._sync_range_ui()
             return
-        self.close()
 
     def _toggle_fullscreen(self) -> None:
         if self._fullscreen:
             self._fullscreen = False
+            self._teardown_fullscreen_chrome_tracking()
+            self._set_fullscreen_bottom_chrome(False, force=True)
+            self._set_fullscreen_right_chrome(False, force=True)
             self.showNormal()
             self._apply_dialog_content_inset()
             self._top_bar.show()
@@ -1017,10 +1322,13 @@ class VideoPreviewDialog(MonosDialog):
             self._viewer_divider.show()
             self._transport.show()
             self._footer.show()
+            self._refresh_footer_hint()
             self._tools_panel.show()
             self._restore_locked_size()
         else:
             self._fullscreen = True
+            self._fs_bottom_revealed = False
+            self._fs_right_revealed = False
             self._top_bar.hide()
             self._timeline_block.hide()
             self._viewer_divider.hide()
@@ -1029,9 +1337,115 @@ class VideoPreviewDialog(MonosDialog):
             self._tools_panel.hide()
             self._apply_dialog_content_inset()
             self.showFullScreen()
+            self._setup_fullscreen_chrome_tracking()
         self._position_hud()
         self._position_tool_strip()
         self._position_strip_toggle()
+        self._position_close_btn()
+        self._raise_video_overlays()
+        if getattr(self, "_btn_close", None):
+            self._btn_close.raise_()
+        self._sync_host_dim_overlay()
+
+    def _sync_host_dim_overlay(self) -> None:
+        overlay = getattr(self, "_overlay", None)
+        if overlay is None:
+            return
+        if self._fullscreen:
+            overlay.hide()
+        else:
+            overlay.show()
+            overlay.raise_()
+            self.raise_()
+
+    def _setup_fullscreen_chrome_tracking(self) -> None:
+        app = QApplication.instance()
+        if app is not None and not self._fs_app_filter_installed:
+            app.installEventFilter(self)
+            self._fs_app_filter_installed = True
+
+    def _teardown_fullscreen_chrome_tracking(self) -> None:
+        self._fs_chrome_hide_timer.stop()
+        app = QApplication.instance()
+        if app is not None and self._fs_app_filter_installed:
+            app.removeEventFilter(self)
+            self._fs_app_filter_installed = False
+
+    def _global_point_over_widget(self, gpos: QPoint, widget: QWidget) -> bool:
+        if not widget.isVisible():
+            return False
+        top_left = widget.mapToGlobal(QPoint(0, 0))
+        return QRect(top_left, widget.size()).contains(gpos)
+
+    def _cursor_over_fullscreen_bottom_chrome(self, gpos: QPoint) -> bool:
+        return any(
+            self._global_point_over_widget(gpos, w)
+            for w in (self._timeline_block, self._transport)
+        )
+
+    def _cursor_over_fullscreen_right_chrome(self, gpos: QPoint) -> bool:
+        return self._global_point_over_widget(gpos, self._tools_panel)
+
+    def _update_fullscreen_chrome(self, gpos: QPoint) -> None:
+        if not self._fullscreen:
+            return
+        local = self.mapFromGlobal(gpos)
+        w, h = max(1, self.width()), max(1, self.height())
+        edge = _FULLSCREEN_EDGE_PX
+        near_bottom = local.y() >= h - edge
+        near_right = local.x() >= w - edge
+        if not near_bottom:
+            near_bottom = self._cursor_over_fullscreen_bottom_chrome(gpos)
+        if not near_right:
+            near_right = self._cursor_over_fullscreen_right_chrome(gpos)
+        self._set_fullscreen_bottom_chrome(near_bottom)
+        self._set_fullscreen_right_chrome(near_right)
+        if near_bottom or near_right:
+            self._fs_chrome_hide_timer.stop()
+        else:
+            if not self._fs_chrome_hide_timer.isActive():
+                self._fs_chrome_hide_timer.start(_FULLSCREEN_CHROME_HIDE_MS)
+
+    def _on_fullscreen_chrome_hide_timeout(self) -> None:
+        if not self._fullscreen:
+            return
+        gpos = QCursor.pos()
+        local = self.mapFromGlobal(gpos)
+        edge = _FULLSCREEN_EDGE_PX
+        if local.y() >= self.height() - edge or local.x() >= self.width() - edge:
+            return
+        if self._cursor_over_fullscreen_bottom_chrome(gpos) or self._cursor_over_fullscreen_right_chrome(gpos):
+            return
+        self._set_fullscreen_bottom_chrome(False)
+        self._set_fullscreen_right_chrome(False)
+
+    def _set_fullscreen_bottom_chrome(self, visible: bool, *, force: bool = False) -> None:
+        if not force and (not self._fullscreen or visible == self._fs_bottom_revealed):
+            return
+        self._fs_bottom_revealed = visible
+        if visible:
+            self._timeline_block.show()
+            self._viewer_divider.show()
+            self._transport.show()
+        elif self._fullscreen:
+            self._timeline_block.hide()
+            self._viewer_divider.hide()
+            self._transport.hide()
+        self._position_hud()
+        if self._video_attached:
+            self._sync_video_backend()
+
+    def _set_fullscreen_right_chrome(self, visible: bool, *, force: bool = False) -> None:
+        if not force and (not self._fullscreen or visible == self._fs_right_revealed):
+            return
+        self._fs_right_revealed = visible
+        if visible:
+            if self._tools_panel.workspace() != ReviewWorkspace.tools:
+                self._tools_panel.set_workspace(ReviewWorkspace.tools)
+            self._tools_panel.show()
+        elif self._fullscreen:
+            self._tools_panel.hide()
+        self._position_tool_strip()
         self._raise_video_overlays()
 
     def _restore_locked_size(self) -> None:
@@ -1064,8 +1478,10 @@ class VideoPreviewDialog(MonosDialog):
         if self._playback_primed:
             return
         self._playback_primed = True
+        frame = self._restore_frame if self._restore_frame is not None else 0
+        self._restore_frame = None
         self._backend.prime_for_scrub()
-        self._seek_frame(0)
+        self._seek_frame(frame)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -1074,6 +1490,20 @@ class VideoPreviewDialog(MonosDialog):
         QTimer.singleShot(0, self._deferred_video_attach)
         QTimer.singleShot(0, self._prime_playback)
         self._refresh_title_elide()
+        QTimer.singleShot(0, self._position_close_btn)
+
+    def _position_close_btn(self) -> None:
+        if not getattr(self, "_btn_close", None):
+            return
+        inset = 0 if self._fullscreen else _DIALOG_BORDER_INSET
+        x = self.width() - self._btn_close.width() - _PREVIEW_CLOSE_INSET - inset
+        if self._fullscreen:
+            y = _PREVIEW_CLOSE_INSET
+        else:
+            y = inset + max(0, (_PREVIEW_TOPBAR_H - self._btn_close.height()) // 2)
+        self._btn_close.move(x, y)
+        self._btn_close.show()
+        self._btn_close.raise_()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -1082,9 +1512,12 @@ class VideoPreviewDialog(MonosDialog):
         self._position_hud()
         self._position_tool_strip()
         self._position_strip_toggle()
+        self._position_close_btn()
         self._refresh_title_elide()
         self._raise_video_overlays()
         self.raise_border_overlay()
+        if getattr(self, "_btn_close", None):
+            self._btn_close.raise_()
 
     def _position_hud(self) -> None:
         if not self._hud or not self._viewer:
@@ -1126,24 +1559,34 @@ class VideoPreviewDialog(MonosDialog):
             self._tool_strip.raise_()
         if self._strip_toggle and self._strip_toggle.isVisible():
             self._strip_toggle.raise_()
+        if getattr(self, "_btn_close", None):
+            self._btn_close.raise_()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._loop_timer.stop()
         self._scrub_seek_timer.stop()
         self._hover_debounce.stop()
         self._hide_hover_preview()
+        self._session_persist_timer.stop()
         self._persist_ranges_local()
+        self._persist_markers_local()
+        self._persist_preview_session()
+        self._teardown_fullscreen_chrome_tracking()
         if self._settings is not None and not self._fullscreen:
             write_review_workspace(self._settings, self._profile_key, self._tools_panel.workspace().value)
             write_review_tool_mode(self._settings, self._profile_key, self._tools_panel.tool_mode().value)
             write_video_preview_precise_scrub_drag(self._settings, self._precise_scrub_drag())
             write_video_preview_time_display(self._settings, self._time_display_mode)
+            write_video_preview_playback_speed(self._settings, self._speed)
+            write_video_preview_volume(self._settings, self._volume)
+            write_video_preview_loop(self._settings, self._loop_playback)
         self._backend.release()
         self._video_attached = False
         super().closeEvent(event)
 
     def release_player(self) -> None:
         """Stop playback and release handles (before file move)."""
+        self._persist_preview_session()
         self._loop_timer.stop()
         self._backend.stop()
         self._backend.release()
@@ -1154,20 +1597,22 @@ class VideoPreviewDialog(MonosDialog):
     def _load_file(self, path: Path) -> None:
         if self._path and self._path != path:
             self._persist_ranges_local()
+            self._persist_markers_local()
+            self._persist_preview_session()
         self._path = path
         self._status_log = ""
-        self._hover_pixmap_cache.clear()
         self._hover_key_frames = []
         self._info = probe_video(path)
         self._ranges = []
         self._published_ranges = []
+        self._markers = []
+        self._published_markers = []
+        self._active_marker_id = None
         self._clear_range_undo_stacks()
         self._active_range_id = None
         self._range_edit_unlocked = False
         self._draft_in = None
         self._draft_out = None
-        self._loop_playback = False
-        self._chk_loop.setChecked(False)
         parent_hint = path.parent.name
         self.setWindowTitle(f"{path.name} · {parent_hint}")
         if self._info is None:
@@ -1184,16 +1629,36 @@ class VideoPreviewDialog(MonosDialog):
         )
         self._published_ranges = published
         self._ranges = working
+        pub_m, work_m, _from_local_m = load_video_markers_for_preview(
+            path,
+            total_frames=self._info.frame_count,
+        )
+        self._published_markers = pub_m
+        self._markers = work_m
+        if self._markers and self._active_marker_id is None:
+            self._active_marker_id = self._markers[0].id
         self._playback_primed = False
-        self._backend.load(path)
-        self._backend.set_volume(self._volume)
+        saved_frame = load_video_preview_session_local_draft(
+            path,
+            total_frames=self._info.frame_count,
+        )
+        self._restore_frame = saved_frame
+        start_frame = saved_frame if saved_frame is not None else 0
+        start_sec = start_frame / max(1e-6, self._info.fps)
+        self._backend.load(path, start_sec=start_sec)
+        self._backend.set_volume(0 if self._volume_muted else self._volume)
         self._backend.set_speed(self._speed)
         if self.isVisible():
-            QTimer.singleShot(0, self._prime_playback)
+            QTimer.singleShot(80, self._prime_playback)
         self._sync_range_ui()
         self._update_top_bar()
         self._update_footer()
-        self._update_time_label(0.0)
+        if saved_frame is not None:
+            sec = saved_frame / max(1e-6, self._info.fps)
+            self._scrubber.set_position_frame(saved_frame)
+            self._update_position_display(sec)
+        else:
+            self._update_position_display(0.0)
         self._start_keyframe_probe()
 
     def _start_keyframe_probe(self) -> None:
@@ -1236,7 +1701,12 @@ class VideoPreviewDialog(MonosDialog):
         return self._info.frame_count if self._info else 1
 
     def _current_frame(self) -> int:
-        return sec_to_frame(self._backend.position(), self._fps())
+        return int(self._scrubber.value())
+
+    def _schedule_preview_session_persist(self) -> None:
+        if self._path is None or self._info is None:
+            return
+        self._session_persist_timer.start()
 
     def _on_time_display_changed(self, _index: int) -> None:
         mode = self._cmb_time_display.currentData()
@@ -1247,9 +1717,10 @@ class VideoPreviewDialog(MonosDialog):
         panel = self._range_list()
         panel.set_display_mode(self._time_display_mode)
         panel.refresh_display()
+        self._sync_position_controls_visibility()
         frame = self._current_frame()
         self._update_hud(frame)
-        self._update_time_label(self._backend.position())
+        self._update_position_display(self._backend.position())
         self._update_note_frame_hint(frame)
         if self._settings is not None:
             write_video_preview_time_display(self._settings, self._time_display_mode)
@@ -1260,10 +1731,22 @@ class VideoPreviewDialog(MonosDialog):
         panel.set_display_mode(self._time_display_mode)
         panel.set_ranges(self._ranges, active_id=self._active_range_id)
         panel.set_draft_hint(self._draft_in, self._draft_out)
-        self._tools_panel.set_active_range_id(
-            self._active_range_id if self._range_edit_unlocked else None,
-            label=self._active_range_label() if self._range_edit_unlocked else "",
-        )
+        marker_panel = self._marker_list()
+        marker_panel.set_fps(self._fps())
+        marker_panel.set_display_mode(self._time_display_mode)
+        marker_panel.set_published_markers(self._published_markers)
+        marker_panel.set_markers(self._markers, active_id=self._active_marker_id)
+        if self._tools_panel.tool_mode() == ReviewToolMode.markers:
+            self._tools_panel.set_active_marker_id(
+                self._active_marker_id,
+                label=self._active_marker_label(),
+            )
+        else:
+            self._tools_panel.set_active_range_id(
+                self._active_range_id if self._range_edit_unlocked else None,
+                label=self._active_range_label() if self._range_edit_unlocked else "",
+            )
+        self._apply_timeline_list_mode()
         self._scrubber.set_fps(self._fps())
         self._scrubber.set_time_display_mode(self._time_display_mode)
         edit_id = self._active_range_id if self._range_edit_unlocked else None
@@ -1271,6 +1754,10 @@ class VideoPreviewDialog(MonosDialog):
             self._ranges,
             highlight_id=self._active_range_id,
             edit_id=edit_id,
+        )
+        self._scrubber.set_markers(
+            self._markers,
+            highlight_id=self._active_marker_id,
         )
         self._scrubber.set_draft(self._draft_in, self._draft_out)
         has_selection = self._active_range_id is not None
@@ -1282,6 +1769,7 @@ class VideoPreviewDialog(MonosDialog):
         self._btn_export.setEnabled(len(self._ranges) > 0)
         self._btn_tl_focus.setEnabled(self._active_range_id is not None)
         self._update_sync_button()
+        self._refresh_footer_hint()
 
     def _update_note_frame_hint(self, frame: int | None = None) -> None:
         f = self._current_frame() if frame is None else int(frame)
@@ -1289,32 +1777,77 @@ class VideoPreviewDialog(MonosDialog):
         self._tools_panel.note_panel().set_frame_hint(hint)
 
     def _update_sync_button(self) -> None:
-        dirty = not ranges_content_equal(self._ranges, self._published_ranges)
+        ranges_dirty = not ranges_content_equal(self._ranges, self._published_ranges)
+        markers_dirty = not markers_content_equal(self._markers, self._published_markers)
+        dirty = ranges_dirty or markers_dirty
         self._btn_sync.setEnabled(dirty)
         if dirty:
-            self._btn_sync.setToolTip("Sync local range changes to project sidecar")
+            tips: list[str] = []
+            if ranges_dirty:
+                tips.append("ranges")
+            if markers_dirty:
+                tips.append("markers")
+            self._btn_sync.setToolTip(f"Sync local {' and '.join(tips)} to project sidecar")
         else:
-            self._btn_sync.setToolTip("All ranges synced with project")
+            self._btn_sync.setToolTip("All ranges and markers synced with project")
 
     def _update_hud(self, frame: int) -> None:
         fps = self._fps()
         pos = format_position_display(frame, fps, mode=self._time_display_mode)
         self._hud.setText(f"{pos} · {fps:.3f}fps  ⎘")
-        self._current_frame_label.setText(format_frame_label(frame))
         self._position_hud()
 
-    def _update_time_label(self, pos_sec: float) -> None:
+    def _sync_position_controls_visibility(self) -> None:
+        frame_mode = self._time_display_mode == TIME_DISPLAY_FRAME
+        self._frame_input.setVisible(frame_mode)
+        self._position_suffix.setVisible(frame_mode)
+        self._timecode_position.setVisible(not frame_mode)
+
+    def _update_position_display(self, pos_sec: float) -> None:
         fps = self._fps()
         max_frame = max(0, self._total_frames() - 1)
-        if self._time_display_mode == "frame":
-            cur = format_position_display(sec_to_frame(pos_sec, fps), fps, mode="frame")
-            end = format_frame_label(max_frame)
-            self._time_label.setText(f"{cur} / {end}")
+        if self._time_display_mode == TIME_DISPLAY_FRAME:
+            frame = sec_to_frame(pos_sec, fps)
+            if not self._frame_input.hasFocus():
+                self._frame_input.blockSignals(True)
+                self._frame_input.setText(str(frame))
+                self._frame_input.blockSignals(False)
+            self._position_suffix.setText(f" / {format_frame_label(max_frame)}")
             return
         dur = self._backend.duration() or (self._info.duration_sec if self._info else 0.0)
-        self._time_label.setText(
+        self._timecode_position.setText(
             f"{format_timecode(pos_sec, fps=fps)} / {format_timecode(dur, fps=fps)}"
         )
+
+    def _on_frame_input_commit(self) -> None:
+        if self._time_display_mode != TIME_DISPLAY_FRAME:
+            return
+        raw = self._frame_input.text().strip()
+        if not raw:
+            self._update_position_display(self._backend.position())
+            return
+        try:
+            frame = int(raw)
+        except ValueError:
+            self._update_position_display(self._backend.position())
+            return
+        max_frame = max(0, self._total_frames() - 1)
+        self._seek_frame(max(0, min(max_frame, frame)))
+        self._update_position_display(self._backend.position())
+
+    def _reset_playback_speed(self) -> None:
+        if self._speed == 1.0:
+            return
+        self._cmb_speed.setCurrentIndex(PLAYBACK_SPEED_STEPS.index(1.0))
+
+    def _on_speed_changed(self, _index: int) -> None:
+        speed = self._cmb_speed.currentData()
+        if speed is None:
+            return
+        self._speed = float(speed)
+        self._backend.set_speed(self._speed)
+        if self._settings is not None:
+            write_video_preview_playback_speed(self._settings, self._speed)
 
     def _on_backend_position(self, sec: float) -> None:
         if self._scrubbing:
@@ -1323,7 +1856,8 @@ class VideoPreviewDialog(MonosDialog):
         self._scrubber.set_position_frame(frame)
         self._update_hud(frame)
         self._update_note_frame_hint(frame)
-        self._update_time_label(sec)
+        self._update_position_display(sec)
+        self._schedule_preview_session_persist()
 
     def _on_backend_duration(self, sec: float) -> None:
         if self._info and sec > 0:
@@ -1340,11 +1874,16 @@ class VideoPreviewDialog(MonosDialog):
             self._scrubber.set_frame_count(self._info.frame_count)
 
     def _on_backend_ended(self) -> None:
+        self._set_play_icon(False)
         if self._loop_playback:
-            self._seek_loop_start()
-            self._backend.play()
-        else:
-            self._set_play_icon(False)
+            start, _ = self._loop_bounds()
+            sec = start / max(1e-6, self._fps())
+            self._scrubber.set_position_frame(start)
+            self._update_hud(start)
+            self._update_position_display(sec)
+            self._backend.play_from(sec)
+            self._set_play_icon(True)
+            self._loop_timer.start()
 
     def _on_backend_error(self, msg: str) -> None:
         logger.warning("video player: %s", msg)
@@ -1357,20 +1896,100 @@ class VideoPreviewDialog(MonosDialog):
         self._btn_play.setIcon(lucide_icon(icon, size=18, color_hex=MONOS_COLORS["text_label"]))
 
     def _toggle_play(self) -> None:
+        self._frame_paint_gen += 1
         if self._backend.is_playing():
             self._backend.pause()
             self._loop_timer.stop()
             self._set_play_icon(False)
         else:
-            self._seek_frame(self._scrubber.value())
-            self._backend.play()
+            frame = self._current_frame()
+            sec = frame / max(1e-6, self._fps())
+            tol = 0.5 / max(1e-6, self._fps())
+            if self._backend.position_matches(sec, tolerance_sec=tol):
+                self._backend.play()
+            else:
+                self._backend.play_from(sec)
             if self._loop_playback:
                 self._loop_timer.start()
             self._set_play_icon(True)
 
+    def _volume_tooltip_text(self, value: int | None = None) -> str:
+        if self._volume_muted:
+            return "0"
+        vol = self._volume if value is None else int(value)
+        return str(max(0, min(100, vol)))
+
+    def _sync_volume_icon(self) -> None:
+        icon = "volume-x" if self._volume_muted else "volume-2"
+        self._volume_icon.setIcon(
+            lucide_icon(icon, size=16, color_hex=MONOS_COLORS["text_meta"])
+        )
+
+    def _effective_volume(self) -> int:
+        return 0 if self._volume_muted else self._volume
+
+    def _apply_volume_to_backend(self) -> None:
+        self._backend.set_volume(self._effective_volume())
+
+    def _toggle_volume_mute(self) -> None:
+        if self._volume_muted:
+            self._volume_muted = False
+            restore = self._volume_before_mute if self._volume_before_mute > 0 else 80
+            if self._volume <= 0:
+                self._volume = restore
+                self._volume_slider.blockSignals(True)
+                self._volume_slider.setValue(restore)
+                self._volume_slider.blockSignals(False)
+        else:
+            if self._volume > 0:
+                self._volume_before_mute = self._volume
+            self._volume_muted = True
+        self._sync_volume_icon()
+        self._apply_volume_to_backend()
+        if self._volume_icon.underMouse():
+            self._show_volume_tooltip(self._volume_icon)
+        if self._settings is not None and not self._volume_muted:
+            write_video_preview_volume(self._settings, self._volume)
+
+    def _show_volume_tooltip(
+        self,
+        widget: QWidget,
+        value: int | None = None,
+        global_pos: QPoint | None = None,
+    ) -> None:
+        gp = global_pos
+        if gp is None:
+            gp = widget.mapToGlobal(QPoint(widget.width() // 2, widget.height() // 2))
+        QToolTip.showText(gp, self._volume_tooltip_text(value), widget)
+
+    def _on_volume_slider_pressed(self) -> None:
+        self._volume_dragging = True
+        self._show_volume_tooltip(self._volume_slider, self._volume_slider.value())
+
+    def _on_volume_slider_moved(self, value: int) -> None:
+        self._show_volume_tooltip(self._volume_slider, value)
+
+    def _on_volume_slider_released(self) -> None:
+        self._volume_dragging = False
+        if not self._volume_slider.underMouse() and not self._volume_icon.underMouse():
+            QToolTip.hideText()
+
     def _on_volume(self, v: int) -> None:
         self._volume = v
-        self._backend.set_volume(v)
+        if self._volume_muted and v > 0:
+            self._volume_muted = False
+            self._sync_volume_icon()
+        if v > 0:
+            self._volume_before_mute = v
+        self._apply_volume_to_backend()
+        if (
+            self._volume_dragging
+            or self._volume_slider.underMouse()
+            or self._volume_icon.underMouse()
+        ):
+            self._show_volume_tooltip(self._volume_slider, v)
+        if self._settings is not None and not self._volume_muted:
+            write_video_preview_volume(self._settings, v)
 
     def _on_scrub_value(self, frame: int) -> None:
         if not self._scrubbing:
@@ -1385,16 +2004,38 @@ class VideoPreviewDialog(MonosDialog):
         except Exception:
             pass
 
+    def _persist_markers_local(self) -> None:
+        if self._path is None:
+            return
+        try:
+            save_video_markers_local_draft(self._path, self._markers)
+        except Exception:
+            pass
+
+    def _persist_preview_session(self) -> None:
+        if self._path is None or self._info is None:
+            return
+        try:
+            save_video_preview_session_local_draft(
+                self._path,
+                frame=self._current_frame(),
+            )
+        except Exception:
+            pass
+
     def _sync_ranges(self) -> None:
         if self._path is None:
             return
         try:
             save_video_ranges_sidecar(self._path, self._ranges)
             save_video_ranges_local_draft(self._path, self._ranges)
+            save_video_markers_sidecar(self._path, self._markers)
+            save_video_markers_local_draft(self._path, self._markers)
         except Exception:
-            logger.warning("sync video ranges failed for %s", self._path, exc_info=True)
+            logger.warning("sync video review data failed for %s", self._path, exc_info=True)
             return
         self._published_ranges = list(self._ranges)
+        self._published_markers = list(self._markers)
         self._sync_range_ui()
 
     def _precise_scrub_drag(self) -> bool:
@@ -1424,6 +2065,8 @@ class VideoPreviewDialog(MonosDialog):
         self._was_playing_before_scrub = self._backend.is_playing()
         if self._was_playing_before_scrub:
             self._backend.pause()
+            self._loop_timer.stop()
+            self._set_play_icon(False)
 
     def _on_scrub_frame_preview(self, frame: int) -> None:
         if not self._scrubbing:
@@ -1469,7 +2112,11 @@ class VideoPreviewDialog(MonosDialog):
         self._hide_hover_preview()
         if self._was_playing_before_scrub:
             self._backend.play()
+            if self._loop_playback:
+                self._loop_timer.start()
+            self._set_play_icon(True)
         self._was_playing_before_scrub = False
+        self._persist_preview_session()
 
     def _on_scrub_in_out(self, in_f: int, out_f: int) -> None:
         if not self._range_edit_unlocked or self._active_range_id is None:
@@ -1648,27 +2295,9 @@ class VideoPreviewDialog(MonosDialog):
     def _show_scrub_thumb(self, frame: int) -> None:
         self._pending_hover_frame = frame
         self._position_hover_preview(frame)
-        lookup = self._thumb_lookup_frame(frame, for_drag=True)
-        cached = self._hover_cache_get(lookup)
-        if cached is not None:
-            self._hover_label.setPixmap(cached)
-            self._hover_label.show()
-            return
         self._hover_label.show()
         self._hover_debounce.stop()
         self._hover_debounce.start()
-
-    def _hover_cache_get(self, frame: int) -> QPixmap | None:
-        pix = self._hover_pixmap_cache.get(frame)
-        if pix is not None:
-            self._hover_pixmap_cache.move_to_end(frame)
-        return pix
-
-    def _hover_cache_put(self, frame: int, pix: QPixmap) -> None:
-        self._hover_pixmap_cache[frame] = pix
-        self._hover_pixmap_cache.move_to_end(frame)
-        while len(self._hover_pixmap_cache) > _HOVER_CACHE_MAX:
-            self._hover_pixmap_cache.popitem(last=False)
 
     def _pixmap_from_hover_png(self, png_bytes: bytes) -> QPixmap | None:
         pix = QPixmap()
@@ -1689,13 +2318,6 @@ class VideoPreviewDialog(MonosDialog):
             return
         self._pending_hover_frame = frame
         self._position_hover_preview(frame)
-        snap = self._hover_snap_frame(frame)
-        cached = self._hover_cache_get(snap)
-        if cached is not None:
-            self._hover_label.setPixmap(cached)
-            self._hover_label.show()
-            self._hover_debounce.stop()
-            return
         self._hover_label.show()
         self._hover_debounce.stop()
         self._hover_debounce.start()
@@ -1706,13 +2328,6 @@ class VideoPreviewDialog(MonosDialog):
             return
         for_drag = self._scrubbing
         lookup = self._thumb_lookup_frame(frame, for_drag=for_drag)
-        cached = self._hover_cache_get(lookup)
-        if cached is not None:
-            if frame == self._pending_hover_frame:
-                self._hover_label.setPixmap(cached)
-                self._position_hover_preview(frame)
-                self._hover_label.show()
-            return
         self._hover_token += 1
         token = self._hover_token
         sec = lookup / max(1e-6, self._fps())
@@ -1736,7 +2351,6 @@ class VideoPreviewDialog(MonosDialog):
         scaled = self._pixmap_from_hover_png(bytes(png_bytes))
         if scaled is None or scaled.isNull():
             return
-        self._hover_cache_put(frame, scaled)
         pending = self._pending_hover_frame
         if pending is None:
             return
@@ -1766,16 +2380,136 @@ class VideoPreviewDialog(MonosDialog):
         self._hover_token += 1
         self._hover_label.hide()
 
-    def _delete_active_range(self) -> None:
+    def _delete_active_item(self) -> None:
         if self._text_editing_focused():
+            return
+        if self._tools_panel.tool_mode() == ReviewToolMode.markers:
+            if self._active_marker_id:
+                self._delete_marker(self._active_marker_id)
             return
         if self._active_range_id:
             self._delete_range(self._active_range_id)
 
-    def _select_prev_range(self) -> None:
-        if not self._ranges:
+    def _add_marker_at_playhead(self) -> None:
+        if self._info is None:
             return
-        ids = [r.id for r in self._ranges]
+        frame = self._current_frame()
+        if not validate_marker_frame(frame, total_frames=self._info.frame_count):
+            return
+        existing = next((m for m in self._markers if m.frame == frame), None)
+        if existing is not None:
+            self._active_marker_id = existing.id
+            self._sync_range_ui()
+            self._seek_frame(frame)
+            return
+        rid = new_marker_id()
+        self._markers.append(VideoReviewMarker(rid, frame, "", time.time()))
+        self._active_marker_id = rid
+        self._sync_range_ui()
+        self._persist_markers_local()
+        self._activate_tool(ReviewToolMode.markers)
+
+    def _on_marker_selected(self, marker_id: str) -> None:
+        self._active_marker_id = marker_id
+        self._sync_range_ui()
+        marker = next((m for m in self._markers if m.id == marker_id), None)
+        if marker is not None:
+            self._seek_frame(marker.frame)
+
+    def _on_marker_deselected(self) -> None:
+        if self._active_marker_id is None:
+            return
+        self._active_marker_id = None
+        self._sync_range_ui()
+
+    def _delete_marker(self, marker_id: str) -> None:
+        self._markers = [m for m in self._markers if m.id != marker_id]
+        if self._active_marker_id == marker_id:
+            self._active_marker_id = self._markers[0].id if self._markers else None
+        self._sync_range_ui()
+        self._persist_markers_local()
+
+    def _on_marker_label_changed(self, marker_id: str, label: str) -> None:
+        updated: list[VideoReviewMarker] = []
+        now = time.time()
+        for m in self._markers:
+            if m.id == marker_id:
+                updated.append(
+                    VideoReviewMarker(m.id, m.frame, label.strip()[:80], created_at=now)
+                )
+            else:
+                updated.append(m)
+        self._markers = updated
+        self._sync_range_ui()
+        self._persist_markers_local()
+
+    def _export_markers_png(self) -> None:
+        if self._path is None or not self._markers:
+            return
+        start_dir = str(self._path.parent)
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Export markers as PNG",
+            start_dir,
+        )
+        if not folder:
+            return
+        ordered = self._marker_list().ordered_markers()
+        try:
+            outs = export_video_markers_png(
+                self._path,
+                ordered,
+                Path(folder),
+                fps=self._fps(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete", f"Exported {len(outs)} PNG file(s).")
+
+    def _select_prev_marker(self) -> None:
+        ordered = self._marker_list().ordered_markers()
+        if not ordered:
+            return
+        ids = [m.id for m in ordered]
+        if self._active_marker_id not in ids:
+            self._on_marker_selected(ids[0])
+            return
+        idx = max(0, ids.index(self._active_marker_id) - 1)
+        self._on_marker_selected(ids[idx])
+
+    def _select_next_marker(self) -> None:
+        ordered = self._marker_list().ordered_markers()
+        if not ordered:
+            return
+        ids = [m.id for m in ordered]
+        if self._active_marker_id not in ids:
+            self._on_marker_selected(ids[0])
+            return
+        idx = min(len(ids) - 1, ids.index(self._active_marker_id) + 1)
+        self._on_marker_selected(ids[idx])
+
+    def _select_prev_list_item(self) -> None:
+        self._select_prev_range()
+
+    def _select_next_list_item(self) -> None:
+        self._select_next_range()
+
+    def _select_prev_marker_shortcut(self) -> None:
+        if self._tools_panel.tool_mode() != ReviewToolMode.markers:
+            return
+        self._select_prev_marker()
+
+    def _select_next_marker_shortcut(self) -> None:
+        if self._tools_panel.tool_mode() != ReviewToolMode.markers:
+            return
+        self._select_next_marker()
+
+    def _select_prev_range(self) -> None:
+        ordered = self._range_list().ordered_ranges()
+        if not ordered:
+            return
+        ids = [r.id for r in ordered]
         if self._active_range_id not in ids:
             self._on_range_selected(ids[0])
             return
@@ -1783,9 +2517,10 @@ class VideoPreviewDialog(MonosDialog):
         self._on_range_selected(ids[idx])
 
     def _select_next_range(self) -> None:
-        if not self._ranges:
+        ordered = self._range_list().ordered_ranges()
+        if not ordered:
             return
-        ids = [r.id for r in self._ranges]
+        ids = [r.id for r in ordered]
         if self._active_range_id not in ids:
             self._on_range_selected(ids[0])
             return
@@ -1802,6 +2537,8 @@ class VideoPreviewDialog(MonosDialog):
         self._backend.seek(sec, precise=True)
         self._scrubber.set_position_frame(frame)
         self._update_hud(frame)
+        self._update_position_display(sec)
+        self._schedule_preview_session_persist()
 
     def _loop_bounds(self) -> tuple[int, int]:
         rng = self._active_range()
@@ -1819,9 +2556,15 @@ class VideoPreviewDialog(MonosDialog):
             return
         start, end = self._loop_bounds()
         if self._current_frame() > end:
-            self._seek_frame(start)
+            start, _ = self._loop_bounds()
+            sec = start / max(1e-6, self._fps())
+            self._scrubber.set_position_frame(start)
+            self._update_hud(start)
+            self._update_position_display(sec)
             if not self._backend.is_playing():
-                self._backend.play()
+                self._backend.play_from(sec)
+            else:
+                self._backend.seek(sec, precise=True)
 
     def _on_loop_toggled(self, checked: bool) -> None:
         self._loop_playback = checked
@@ -1830,6 +2573,8 @@ class VideoPreviewDialog(MonosDialog):
             self._loop_timer.start()
         else:
             self._loop_timer.stop()
+        if self._settings is not None:
+            write_video_preview_loop(self._settings, checked)
 
     def _toggle_loop_shortcut(self) -> None:
         self._chk_loop.setChecked(not self._chk_loop.isChecked())
@@ -1843,11 +2588,6 @@ class VideoPreviewDialog(MonosDialog):
 
     def _jump_sec(self, delta: int) -> None:
         self._backend.seek(max(0.0, self._backend.position() + float(delta)))
-
-    def _change_speed(self, direction: int) -> None:
-        self._speed = next_speed(self._speed, direction=direction)
-        self._backend.set_speed(self._speed)
-        self._speed_label.setText(f"{self._speed:.2g}×")
 
     def _copy_timecode(self) -> None:
         frame = self._current_frame()

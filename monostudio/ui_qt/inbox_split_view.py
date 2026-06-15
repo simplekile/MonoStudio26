@@ -30,6 +30,36 @@ def _fs_model_index_for_path(model: QFileSystemModel, path: Path):
         native = QDir.toNativeSeparators(str(path))
     return model.index(native, 0)
 
+
+def _proxy_map_to_source(
+    index: QModelIndex,
+    *,
+    proxy: QSortFilterProxyModel | None,
+    source_model: QFileSystemModel,
+) -> QModelIndex:
+    if not index.isValid():
+        return index
+    if proxy is None or index.model() is source_model:
+        return index
+    if index.model() is proxy:
+        return proxy.mapToSource(index)
+    return QModelIndex()
+
+
+def _proxy_map_from_source(
+    source_index: QModelIndex,
+    *,
+    proxy: QSortFilterProxyModel | None,
+    source_model: QFileSystemModel,
+) -> QModelIndex:
+    if not source_index.isValid():
+        return source_index
+    if proxy is None or source_index.model() is proxy:
+        return source_index
+    if source_index.model() is source_model:
+        return proxy.mapFromSource(source_index)
+    return QModelIndex()
+
 from PySide6.QtCore import QDir, QEvent, QFileInfo, QItemSelection, QItemSelectionModel, QMimeData, QPoint, QRect, QRectF, QSize, Qt, Signal, QTimer, QUrl
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QSettings
 from PySide6.QtGui import (
@@ -461,13 +491,24 @@ class _InboxTreeDelegate(QStyledItemDelegate):
         return getattr(pane, "_explorer_thumb_loader", None)
 
     def _fs_model_and_index(self, index: QModelIndex) -> tuple[object | None, QModelIndex]:
+        if not index.isValid():
+            return None, index
+        pane = self._pane
+        if pane is not None:
+            to_source = getattr(pane, "_to_source_index", None)
+            if callable(to_source):
+                src_idx = to_source(index)
+                fs_model = getattr(pane, "_fs_model", None)
+                if fs_model is not None and src_idx.isValid():
+                    return fs_model, src_idx
+                return None, index
         model = index.model()
         if model is None:
             return None, index
         if hasattr(model, "filePath"):
             return model, index
         map_to_source = getattr(model, "mapToSource", None)
-        if callable(map_to_source):
+        if callable(map_to_source) and index.model() is model:
             src_idx = map_to_source(index)
             src_model = model.sourceModel()
             if src_model is not None and hasattr(src_model, "filePath"):
@@ -2636,18 +2677,23 @@ class InboxTreePane(QWidget):
             unresolved = self._select_dropped_paths_in_grid([path], navigate=True)
             return path not in unresolved
         parent = path.parent
-        idx = self._fs_model.index(str(parent.resolve()), 0) if parent.is_dir() else QModelIndex()
-        if not idx.isValid():
+        parent_src = self._fs_model.index(str(parent.resolve()), 0) if parent.is_dir() else QModelIndex()
+        if not parent_src.isValid():
             return False
-        file_idx = self._fs_model.index(str(path.resolve()), 0)
+        file_src = self._fs_model.index(str(path.resolve()), 0)
+        if not file_src.isValid():
+            return False
+        file_idx = self._to_tree_index(file_src)
         if not file_idx.isValid():
             return False
-        p = file_idx.parent()
-        while p.isValid():
-            if p == self._tree.rootIndex():
+        parent_src = file_src.parent()
+        while parent_src.isValid():
+            parent_tree = self._to_tree_index(parent_src)
+            if parent_tree == self._tree.rootIndex():
                 break
-            self._tree.expand(p)
-            p = p.parent()
+            if parent_tree.isValid():
+                self._tree.expand(parent_tree)
+            parent_src = parent_src.parent()
         self._tree.scrollTo(file_idx)
         sm = self._tree.selectionModel()
         if sm is not None:
@@ -2670,15 +2716,20 @@ class InboxTreePane(QWidget):
             path.resolve().relative_to(self._date_folder_path.resolve())
         except ValueError:
             return
-        idx = self._fs_model.index(str(path.resolve()), 0)
-        if not idx.isValid():
+        src_idx = self._fs_model.index(str(path.resolve()), 0)
+        if not src_idx.isValid():
             return
-        parent = idx.parent()
-        while parent.isValid():
-            if parent == self._tree.rootIndex():
+        tree_idx = self._to_tree_index(src_idx)
+        if not tree_idx.isValid():
+            return
+        parent_src = src_idx.parent()
+        while parent_src.isValid():
+            parent_tree = self._to_tree_index(parent_src)
+            if parent_tree == self._tree.rootIndex():
                 break
-            self._tree.expand(parent)
-            parent = parent.parent()
+            if parent_tree.isValid():
+                self._tree.expand(parent_tree)
+            parent_src = parent_src.parent()
         if self._show_toolbar:
             try:
                 if path.resolve() != self._date_folder_path.resolve():
@@ -2686,13 +2737,13 @@ class InboxTreePane(QWidget):
             except OSError:
                 if path != self._date_folder_path:
                     self._navigate_to(path)
-        self._tree.scrollTo(idx)
+        self._tree.scrollTo(tree_idx)
         sm = self._tree.selectionModel()
         if sm is not None:
             from PySide6.QtCore import QItemSelectionModel
 
             sm.setCurrentIndex(
-                idx,
+                tree_idx,
                 QItemSelectionModel.SelectionFlag.ClearAndSelect
                 | QItemSelectionModel.SelectionFlag.Rows,
             )
@@ -2766,26 +2817,44 @@ class InboxTreePane(QWidget):
             model = self._tree.model()
             for r in range(model.rowCount(root_idx)):
                 walk(model.index(r, 0, root_idx))
-        return {"expanded_paths": expanded}
+        state: dict = {"expanded_paths": expanded}
+        if self._show_toolbar:
+            state["browse_path"] = str(self._grid_browse_root_path().resolve())
+        return state
 
     def set_tree_state(self, state: dict | None) -> None:
         if not state:
             return
         expanded = state.get("expanded_paths")
-        if not expanded or not isinstance(expanded, list):
+        browse_path_str = state.get("browse_path") if self._show_toolbar else None
+        if (not expanded or not isinstance(expanded, list)) and not browse_path_str:
             return
         root_path = self._date_folder_path.resolve()
 
         def apply():
-            for rel in sorted(expanded, key=lambda p: (p.count("/"), p)):
-                full = root_path / rel.replace("\\", "/")
-                if not full.exists():
-                    continue
-                idx = self._fs_model.index(str(full), 0)
-                if idx.isValid():
-                    tree_idx = self._to_tree_index(idx)
-                    if tree_idx.isValid():
-                        self._tree.expand(tree_idx)
+            if expanded and isinstance(expanded, list):
+                for rel in sorted(expanded, key=lambda p: (p.count("/"), p)):
+                    full = root_path / rel.replace("\\", "/")
+                    if not full.exists():
+                        continue
+                    idx = self._fs_model.index(str(full), 0)
+                    if idx.isValid():
+                        tree_idx = self._to_tree_index(idx)
+                        if tree_idx.isValid():
+                            self._tree.expand(tree_idx)
+            if browse_path_str:
+                browse_path = Path(str(browse_path_str))
+                if browse_path.is_dir():
+                    try:
+                        browse_path.resolve().relative_to(root_path)
+                    except ValueError:
+                        return
+                    try:
+                        if browse_path.resolve() != self._grid_browse_root_path().resolve():
+                            self._navigate_to(browse_path)
+                    except OSError:
+                        if browse_path != self._grid_browse_root_path():
+                            self._navigate_to(browse_path)
 
         # Defer so root index and model are ready (e.g. after set_date_folder_path / setRootIndex).
         QTimer.singleShot(50, apply)
@@ -2878,11 +2947,11 @@ class ProjectGuideTreePane(InboxTreePane):
         proxy = getattr(self, "_tag_proxy", None)
         if proxy is None or self._tree.model() is self._fs_model:
             return source_index
-        if source_index.model() is proxy:
-            return source_index
-        if source_index.model() is self._fs_model:
-            return proxy.mapFromSource(source_index)
-        return source_index
+        return _proxy_map_from_source(
+            source_index,
+            proxy=proxy,
+            source_model=self._fs_model,
+        )
 
     def _to_source_index(self, tree_index: QModelIndex) -> QModelIndex:
         if not tree_index.isValid():
@@ -2890,11 +2959,11 @@ class ProjectGuideTreePane(InboxTreePane):
         proxy = getattr(self, "_tag_proxy", None)
         if proxy is None or self._tree.model() is self._fs_model:
             return tree_index
-        if tree_index.model() is self._fs_model:
-            return tree_index
-        if tree_index.model() is proxy:
-            return proxy.mapToSource(tree_index)
-        return tree_index
+        return _proxy_map_to_source(
+            tree_index,
+            proxy=proxy,
+            source_model=self._fs_model,
+        )
 
     def _reload_fs_tree_root(self) -> None:
         proxy = getattr(self, "_tag_proxy", None)
@@ -3366,18 +3435,32 @@ class ReferenceTreePane(QWidget):
 
     # ---- Helpers: proxy-aware index ↔ path ----
 
+    def _to_tree_index(self, source_index: QModelIndex) -> QModelIndex:
+        return _proxy_map_from_source(
+            source_index,
+            proxy=self._proxy,
+            source_model=self._fs_model,
+        )
+
+    def _to_source_index(self, tree_index: QModelIndex) -> QModelIndex:
+        return _proxy_map_to_source(
+            tree_index,
+            proxy=self._proxy,
+            source_model=self._fs_model,
+        )
+
     def _path_from_tree_index(self, proxy_idx) -> Path | None:
         """Convert a proxy (tree) index to a filesystem Path."""
-        if not proxy_idx.isValid():
+        src_idx = self._to_source_index(proxy_idx)
+        if not src_idx.isValid():
             return None
-        src_idx = self._proxy.mapToSource(proxy_idx)
         fp = self._fs_model.filePath(src_idx)
         return Path(fp) if fp else None
 
     def _tree_index_from_path(self, path: Path):
         """Convert a filesystem Path to a proxy (tree) index."""
         src_idx = self._fs_model.index(str(Path(path).resolve()))
-        return self._proxy.mapFromSource(src_idx)
+        return self._to_tree_index(src_idx)
 
     def _on_fs_directory_loaded(self, path: str) -> None:
         """Re-apply tree root when the fs model finishes loading (avoids drives flash)."""

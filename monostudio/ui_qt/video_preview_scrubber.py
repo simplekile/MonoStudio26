@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QMouseEvent, QPainter, QPen, QPolygon, QWheelEvent
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import QInputDialog, QSizePolicy, QWidget
 
 from monostudio.core.video_media import (
     VideoFrameRange,
+    VideoReviewMarker,
     format_frame_label,
     format_range_span_display,
     format_ruler_tick,
@@ -20,6 +22,10 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, monos_font
 from monostudio.ui_qt.video_range_colors import range_color_qcolor
 
 
+TimelineListMode = Literal["ranges", "markers"]
+_MARKER_COLOR = QColor("#f472b6")
+
+
 class VideoPreviewScrubber(QWidget):
     """Horizontal timeline: time ruler + range track + playhead."""
 
@@ -28,11 +34,14 @@ class VideoPreviewScrubber(QWidget):
     seek_released = Signal(float)
     frame_preview = Signal(int)
     hover_frame = Signal(int)
+    footer_context_changed = Signal(str)
     in_out_changed = Signal(int, int)
     range_handles_drag_started = Signal()
     range_highlighted = Signal(str)
     range_edit_requested = Signal(str)
     range_deselected = Signal()
+    marker_highlighted = Signal(str)
+    marker_deselected = Signal()
     go_to_in_requested = Signal(str)
     go_to_out_requested = Signal(str)
     range_duplicate_requested = Signal(str)
@@ -48,7 +57,7 @@ class VideoPreviewScrubber(QWidget):
     _MARGIN_H = 0
     _RULER_H = 28
     _TRACK_H = 32
-    _GAP = 2
+    _GAP = 0
     _HANDLE_W = 11
     _END_CAP_W = 6
     _PLAYHEAD_W = 2
@@ -61,7 +70,7 @@ class VideoPreviewScrubber(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("VideoPreviewTimeline")
-        self.setMinimumHeight(self._RULER_H + self._GAP + self._TRACK_H + 4)
+        self.setMinimumHeight(self._RULER_H + self._GAP + self._TRACK_H)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
@@ -69,6 +78,9 @@ class VideoPreviewScrubber(QWidget):
         self._total_frames = 1
         self._playhead_frame = 0
         self._ranges: list[VideoFrameRange] = []
+        self._markers: list[VideoReviewMarker] = []
+        self._timeline_list_mode: TimelineListMode = "ranges"
+        self._marker_highlight_id: str | None = None
         self._highlight_id: str | None = None
         self._edit_id: str | None = None
         self._draft_in: int | None = None
@@ -79,6 +91,7 @@ class VideoPreviewScrubber(QWidget):
         self._drag_move_origin_in = 0
         self._drag_move_origin_out = 0
         self._last_hover_frame: int | None = None
+        self._last_footer_zone: str | None = None
         self._block_value_signal = False
         self._overlap_cycle_frame: int | None = None
         self._overlap_cycle_ids: tuple[str, ...] = ()
@@ -89,6 +102,7 @@ class VideoPreviewScrubber(QWidget):
         self._pan_origin_start = 0.0
         self._press_x = 0
         self._press_outside_range = False
+        self._press_outside_marker = False
         self._scrub_pointer_x: int | None = None
         self._time_display_mode: TimeDisplayMode = "timecode"
         self._sync_view_to_fit()
@@ -192,6 +206,24 @@ class VideoPreviewScrubber(QWidget):
             self._time_display_mode = mode
             self.update()
 
+    def set_timeline_list_mode(self, mode: TimelineListMode) -> None:
+        if mode not in ("ranges", "markers"):
+            return
+        if mode == self._timeline_list_mode:
+            return
+        self._timeline_list_mode = mode
+        self.update()
+
+    def set_markers(
+        self,
+        markers: list[VideoReviewMarker],
+        *,
+        highlight_id: str | None,
+    ) -> None:
+        self._markers = list(markers)
+        self._marker_highlight_id = highlight_id
+        self.update()
+
     def set_ranges(
         self,
         ranges: list[VideoFrameRange],
@@ -222,7 +254,12 @@ class VideoPreviewScrubber(QWidget):
     def _track_rect(self):
         w = max(1, self.width() - 2 * self._MARGIN_H)
         top = self._RULER_H + self._GAP
-        return QRect(self._MARGIN_H, top, w, self._TRACK_H)
+        h = max(self._TRACK_H, self.height() - top)
+        return QRect(self._MARGIN_H, top, w, h)
+
+    def _band_metrics(self, track: QRect) -> tuple[int, int]:
+        inset = 1
+        return track.top() + inset, max(4, track.height() - 2 * inset)
 
     def _duration_sec(self) -> float:
         return self._total_frames / self._fps if self._fps > 0 else 0.0
@@ -313,6 +350,86 @@ class VideoPreviewScrubber(QWidget):
         hits.sort(key=lambda r: (-r.in_frame, -r.out_frame, r.id))
         return hits
 
+    def _footer_zone_at(self, x: int, y: int) -> str:
+        track = self._track_rect()
+        if x < 0 or y < 0 or x >= self.width() or y >= self.height():
+            return ""
+        if y < track.top():
+            return "ruler"
+        if not track.contains(x, y):
+            return "ruler"
+        if self._timeline_list_mode == "markers" and self._hit_marker_at(x, y) is not None:
+            return "marker"
+        handle = self._hit_handle(x, y)
+        if handle == "in":
+            return "handle_in"
+        if handle == "out":
+            return "handle_out"
+        if self._edit_id and self._hit_edit_body(x, y) is not None:
+            return "range_move"
+        frame = self._frame_at_x(x)
+        hits = self._ranges_at_frame(frame)
+        if len(hits) > 1:
+            return "range_overlap"
+        if hits:
+            return "range"
+        return "track"
+
+    def _emit_footer_context(self, x: int, y: int) -> None:
+        zone = self._footer_zone_at(x, y)
+        if zone == self._last_footer_zone:
+            return
+        self._last_footer_zone = zone
+        self.footer_context_changed.emit(zone)
+
+    def _marker_at_frame(self, frame: int, *, tolerance: int = 2) -> VideoReviewMarker | None:
+        best: VideoReviewMarker | None = None
+        best_d = tolerance + 1
+        for m in self._markers:
+            d = abs(m.frame - frame)
+            if d <= tolerance and d < best_d:
+                best_d = d
+                best = m
+        return best
+
+    def _hit_marker_at(self, x: int, y: int, *, px_tolerance: int = 10) -> VideoReviewMarker | None:
+        if not self._markers:
+            return None
+        if y < 0 or y > self._track_rect().bottom():
+            return None
+        best: VideoReviewMarker | None = None
+        best_dx = px_tolerance + 1
+        for m in self._markers:
+            px = self._x_for_frame(m.frame)
+            dx = abs(x - px)
+            if dx <= px_tolerance and dx < best_dx:
+                best_dx = dx
+                best = m
+        return best
+
+    def _draw_markers(self, painter: QPainter, track: QRect) -> None:
+        if not self._markers:
+            return
+        for m in self._markers:
+            px = self._x_for_frame(m.frame)
+            active = m.id == self._marker_highlight_id
+            color = QColor("#fafafa") if active else _MARKER_COLOR
+            painter.setPen(QPen(color, 2 if active else 1))
+            painter.drawLine(px, 0, px, track.bottom())
+            cy = max(8, self._RULER_H // 2)
+            size = 7 if active else 5
+            painter.setBrush(color if active else QColor(244, 114, 182, 210))
+            painter.drawPolygon(
+                QPolygon(
+                    [
+                        QPoint(px, cy - size),
+                        QPoint(px + size, cy),
+                        QPoint(px, cy + size),
+                        QPoint(px - size, cy),
+                    ]
+                )
+            )
+
     def _pick_range_at(self, frame: int) -> VideoFrameRange | None:
         hits = self._ranges_at_frame(frame)
         if not hits:
@@ -335,14 +452,14 @@ class VideoPreviewScrubber(QWidget):
         return hits[0]
 
     def _hit_handle(self, x: int, y: int) -> str | None:
-        if self._edit_id is None:
+        if self._timeline_list_mode == "markers" or self._edit_id is None:
             return None
         active = next((r for r in self._ranges if r.id == self._edit_id), None)
         if active is None:
             return None
         track = self._track_rect()
-        band_top = track.top() + 4
-        band_bottom = track.bottom() - 4
+        band_top, band_h = self._band_metrics(track)
+        band_bottom = band_top + band_h - 1
         if not (band_top <= y <= band_bottom):
             return None
         for role, frame in (("in", active.in_frame), ("out", active.out_frame)):
@@ -352,14 +469,14 @@ class VideoPreviewScrubber(QWidget):
         return None
 
     def _hit_edit_body(self, x: int, y: int) -> VideoFrameRange | None:
-        if self._edit_id is None or self._hit_handle(x, y) is not None:
+        if self._timeline_list_mode == "markers" or self._edit_id is None or self._hit_handle(x, y) is not None:
             return None
         active = next((r for r in self._ranges if r.id == self._edit_id), None)
         if active is None:
             return None
         track = self._track_rect()
-        band_top = track.top() + 4
-        band_bottom = track.bottom() - 4
+        band_top, band_h = self._band_metrics(track)
+        band_bottom = band_top + band_h - 1
         if not (band_top <= y <= band_bottom):
             return None
         frame = self._frame_at_x(x)
@@ -426,8 +543,7 @@ class VideoPreviewScrubber(QWidget):
         *,
         bold: bool,
     ) -> None:
-        band_top = track.top() + 4
-        band_h = track.height() - 8
+        band_top, band_h = self._band_metrics(track)
         if bold:
             cap_w = self._HANDLE_W
             y = band_top - 2
@@ -443,6 +559,43 @@ class VideoPreviewScrubber(QWidget):
         for f in (in_f, out_f):
             cx = self._x_for_frame(f)
             painter.drawRoundedRect(cx - cap_w // 2, y, cap_w, h, 2, 2)
+
+    def _draw_draft_marker(
+        self,
+        painter: QPainter,
+        track: QRect,
+        frame: int,
+        role: str,
+    ) -> None:
+        px = self._x_for_frame(frame)
+        accent = QColor(MONOS_COLORS.get("blue_400", "#60a5fa"))
+        band_top, band_h = self._band_metrics(track)
+        cap_w = self._END_CAP_W
+
+        painter.setPen(QPen(accent, 1, Qt.PenStyle.DashLine))
+        painter.drawLine(px, 0, px, track.bottom())
+
+        painter.setPen(QPen(accent, 2))
+        painter.setBrush(QColor(37, 99, 235, 150))
+        painter.drawRoundedRect(px - cap_w // 2, band_top, cap_w, band_h, 2, 2)
+
+        short = "I" if role == "in" else "O"
+        label = f"{short} {format_frame_label(frame)}"
+        font = monos_font("JetBrains Mono", 10, QFont.Weight.DemiBold)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        pad_x = 5
+        pad_y = 2
+        tw = fm.horizontalAdvance(label) + pad_x * 2
+        th = fm.height() + pad_y * 2
+        x = px - tw // 2
+        x = max(2, min(x, self.width() - tw - 2))
+        y = 2
+        painter.setPen(QPen(accent, 1))
+        painter.setBrush(QColor(9, 9, 11, 235))
+        painter.drawRoundedRect(x, y, tw, th, 4, 4)
+        painter.setPen(accent)
+        painter.drawText(x + pad_x, y + th - pad_y - 1, label)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -481,96 +634,109 @@ class VideoPreviewScrubber(QWidget):
         painter.setBrush(QColor(255, 255, 255, 14))
         painter.drawRoundedRect(track, 4, 4)
 
-        def draw_band(
-            in_f: int,
-            out_f: int,
-            rng: VideoFrameRange | None,
-            *,
-            editing: bool,
-            highlighted: bool,
-            draft: bool,
-        ) -> None:
-            x1 = self._x_for_frame(in_f)
-            x2 = self._x_for_frame(out_f)
-            if x2 < x1:
-                x1, x2 = x2, x1
-            band_top = track.top() + 4
-            band_h = track.height() - 8
-            width = max(3, x2 - x1)
-            if draft:
-                painter.setPen(QPen(QColor(MONOS_COLORS.get("blue_400", "#60a5fa")), 1, Qt.PenStyle.DashLine))
-                painter.setBrush(QColor(37, 99, 235, 48))
-            elif editing:
-                painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
-                painter.setBrush(self._range_color(rng, active=True) if rng else QColor(37, 99, 235, 180))
-            elif highlighted:
-                painter.setPen(QPen(QColor(255, 255, 255, 55), 1))
-                color = self._range_color(rng, active=False) if rng else QColor(37, 99, 235, 64)
-                painter.setBrush(color)
-            else:
-                painter.setPen(Qt.PenStyle.NoPen)
-                color = self._range_color(rng, active=False) if rng else QColor(37, 99, 235, 64)
-                painter.setBrush(color)
-            painter.drawRoundedRect(x1, band_top, width, band_h, 3, 3)
+        if self._timeline_list_mode == "markers":
+            self._draw_markers(painter, track)
 
-        for rng in self._ranges:
-            if rng.id in (self._highlight_id, self._edit_id):
-                continue
-            draw_band(
-                rng.in_frame,
-                rng.out_frame,
-                rng,
-                editing=False,
-                highlighted=False,
-                draft=False,
-            )
+        if self._timeline_list_mode == "ranges":
 
-        if self._highlight_id and self._highlight_id != self._edit_id:
-            rng = next((r for r in self._ranges if r.id == self._highlight_id), None)
-            if rng is not None:
+            def draw_band(
+                in_f: int,
+                out_f: int,
+                rng: VideoFrameRange | None,
+                *,
+                editing: bool,
+                highlighted: bool,
+                draft: bool,
+            ) -> None:
+                x1 = self._x_for_frame(in_f)
+                x2 = self._x_for_frame(out_f)
+                if x2 < x1:
+                    x1, x2 = x2, x1
+                band_top, band_h = self._band_metrics(track)
+                width = max(3, x2 - x1)
+                if draft:
+                    painter.setPen(QPen(QColor(MONOS_COLORS.get("blue_400", "#60a5fa")), 1, Qt.PenStyle.DashLine))
+                    painter.setBrush(QColor(37, 99, 235, 48))
+                elif editing:
+                    painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+                    painter.setBrush(self._range_color(rng, active=True) if rng else QColor(37, 99, 235, 180))
+                elif highlighted:
+                    painter.setPen(QPen(QColor(255, 255, 255, 55), 1))
+                    color = self._range_color(rng, active=False) if rng else QColor(37, 99, 235, 64)
+                    painter.setBrush(color)
+                else:
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    color = self._range_color(rng, active=False) if rng else QColor(37, 99, 235, 64)
+                    painter.setBrush(color)
+                painter.drawRoundedRect(x1, band_top, width, band_h, 3, 3)
+
+            for rng in self._ranges:
+                if rng.id in (self._highlight_id, self._edit_id):
+                    continue
                 draw_band(
                     rng.in_frame,
                     rng.out_frame,
                     rng,
                     editing=False,
-                    highlighted=True,
-                    draft=False,
-                )
-
-        if self._edit_id:
-            rng = next((r for r in self._ranges if r.id == self._edit_id), None)
-            if rng is not None:
-                draw_band(
-                    rng.in_frame,
-                    rng.out_frame,
-                    rng,
-                    editing=True,
                     highlighted=False,
                     draft=False,
                 )
 
-        if (
-            self._draft_in is not None
-            and self._draft_out is not None
-            and self._draft_in <= self._draft_out
-        ):
-            draw_band(self._draft_in, self._draft_out, None, editing=False, highlighted=False, draft=True)
+            if self._highlight_id and self._highlight_id != self._edit_id:
+                rng = next((r for r in self._ranges if r.id == self._highlight_id), None)
+                if rng is not None:
+                    draw_band(
+                        rng.in_frame,
+                        rng.out_frame,
+                        rng,
+                        editing=False,
+                        highlighted=True,
+                        draft=False,
+                    )
 
-        self._draw_selection_dim(painter, track, w)
+            if self._edit_id:
+                rng = next((r for r in self._ranges if r.id == self._edit_id), None)
+                if rng is not None:
+                    draw_band(
+                        rng.in_frame,
+                        rng.out_frame,
+                        rng,
+                        editing=True,
+                        highlighted=False,
+                        draft=False,
+                    )
 
-        if self._highlight_id and self._highlight_id != self._edit_id:
-            rng = next((r for r in self._ranges if r.id == self._highlight_id), None)
-            if rng is not None:
-                self._draw_range_end_caps(
-                    painter, track, rng.in_frame, rng.out_frame, bold=False
-                )
+            has_draft_in = self._draft_in is not None
+            has_draft_out = self._draft_out is not None
+            if has_draft_in and has_draft_out:
+                in_f = int(self._draft_in)
+                out_f = int(self._draft_out)
+                if in_f <= out_f:
+                    draw_band(in_f, out_f, None, editing=False, highlighted=False, draft=True)
+                    self._draw_range_end_caps(painter, track, in_f, out_f, bold=False)
+                else:
+                    self._draw_draft_marker(painter, track, in_f, "in")
+                    self._draw_draft_marker(painter, track, out_f, "out")
+            elif has_draft_in:
+                self._draw_draft_marker(painter, track, int(self._draft_in), "in")
+            elif has_draft_out:
+                self._draw_draft_marker(painter, track, int(self._draft_out), "out")
 
-        if self._edit_id:
-            rng = next((r for r in self._ranges if r.id == self._edit_id), None)
-            if rng is not None:
-                self._draw_range_end_caps(
-                    painter, track, rng.in_frame, rng.out_frame, bold=True
-                )
+            self._draw_selection_dim(painter, track, w)
+
+            if self._highlight_id and self._highlight_id != self._edit_id:
+                rng = next((r for r in self._ranges if r.id == self._highlight_id), None)
+                if rng is not None:
+                    self._draw_range_end_caps(
+                        painter, track, rng.in_frame, rng.out_frame, bold=False
+                    )
+
+            if self._edit_id:
+                rng = next((r for r in self._ranges if r.id == self._edit_id), None)
+                if rng is not None:
+                    self._draw_range_end_caps(
+                        painter, track, rng.in_frame, rng.out_frame, bold=True
+                    )
 
         # Playhead
         px = self._playhead_x()
@@ -716,6 +882,10 @@ class VideoPreviewScrubber(QWidget):
         if self._highlight_id or self._edit_id:
             menu.addSeparator()
             act_clear = menu.addAction("Deselect range")
+        act_clear_marker = None
+        if self._timeline_list_mode == "markers" and self._marker_highlight_id:
+            menu.addSeparator()
+            act_clear_marker = menu.addAction("Deselect marker")
 
         chosen = menu.exec(event.globalPos())
         if chosen is None:
@@ -756,6 +926,8 @@ class VideoPreviewScrubber(QWidget):
         elif chosen == act_clear:
             self.clear_overlap_cycle()
             self.range_deselected.emit()
+        elif chosen == act_clear_marker:
+            self.marker_deselected.emit()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -770,6 +942,13 @@ class VideoPreviewScrubber(QWidget):
             return
         x = int(event.position().x()) if hasattr(event, "position") else event.x()
         y = int(event.position().y()) if hasattr(event, "position") else event.y()
+
+        if self._timeline_list_mode == "markers":
+            hit_m = self._hit_marker_at(x, y)
+            if hit_m is not None:
+                self.marker_highlighted.emit(hit_m.id)
+                event.accept()
+                return
 
         handle = self._hit_handle(x, y)
         if handle is not None:
@@ -793,18 +972,26 @@ class VideoPreviewScrubber(QWidget):
 
         track = self._track_rect()
         if track.contains(x, y):
-            hit = self._pick_range_at(self._frame_at_x(x))
-            if hit is not None:
-                self.range_highlighted.emit(hit.id)
-                event.accept()
-                return
+            frame = self._frame_at_x(x)
+            if self._timeline_list_mode == "ranges":
+                hit = self._pick_range_at(frame)
+                if hit is not None:
+                    self.range_highlighted.emit(hit.id)
+                    event.accept()
+                    return
 
         self.clear_overlap_cycle()
 
         self._press_x = x
         self._press_outside_range = bool(
-            (self._highlight_id or self._edit_id)
+            self._timeline_list_mode == "ranges"
+            and (self._highlight_id or self._edit_id)
             and not self._ranges_at_frame(self._frame_at_x(x))
+        )
+        self._press_outside_marker = bool(
+            self._timeline_list_mode == "markers"
+            and self._marker_highlight_id
+            and self._hit_marker_at(x, y) is None
         )
         self._dragging = True
         self._drag_handle = None
@@ -841,14 +1028,18 @@ class VideoPreviewScrubber(QWidget):
         if not self._dragging:
             pos = self.mapFromGlobal(QCursor.pos())
             x = max(0, min(int(pos.x()), self.width() - 1))
+            y = max(0, min(int(pos.y()), self.height() - 1))
             frame = self._frame_at_x(x)
             self._last_hover_frame = frame
             self.hover_frame.emit(frame)
+            self._emit_footer_context(x, y)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         self._last_hover_frame = None
         self.hover_frame.emit(-1)
+        self._last_footer_zone = None
+        self.footer_context_changed.emit("")
         super().leaveEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -869,6 +1060,7 @@ class VideoPreviewScrubber(QWidget):
             if frame != self._last_hover_frame:
                 self._last_hover_frame = frame
                 self.hover_frame.emit(frame)
+            self._emit_footer_context(x, y)
             if self._edit_id and self._hit_edit_body(x, y) is not None:
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
             elif self._edit_id and self._hit_handle(x, y) is not None:
@@ -928,6 +1120,12 @@ class VideoPreviewScrubber(QWidget):
             ):
                 self.clear_overlap_cycle()
                 self.range_deselected.emit()
+            if (
+                self._press_outside_marker
+                and abs(rx - self._press_x) <= self._CLICK_DRAG_THRESHOLD_PX
+            ):
+                self.marker_deselected.emit()
             self.seek_released.emit(float(self.value()))
         self._press_outside_range = False
+        self._press_outside_marker = False
         super().mouseReleaseEvent(event)

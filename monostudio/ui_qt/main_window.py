@@ -132,6 +132,34 @@ class _ProductionStatusBatchResult:
     schedule_touched: bool
 
 
+@dataclass(frozen=True)
+class _AssetRenameWorkerResult:
+    old_path: Path
+    new_path: Path
+    index: ProjectIndex
+
+
+def run_asset_rename_worker(
+    *,
+    project_root: Path,
+    asset_path: Path,
+    new_name: str,
+    work_file_renames: list[tuple[Path, Path]],
+) -> _AssetRenameWorkerResult:
+    result = rename_asset(
+        project_root=project_root,
+        asset_path=asset_path,
+        new_name=new_name,
+        work_file_renames=work_file_renames,
+    )
+    index = build_project_index(project_root)
+    return _AssetRenameWorkerResult(
+        old_path=asset_path,
+        new_path=result.new_path,
+        index=index,
+    )
+
+
 def _batch_sync_schedule_after_status_overrides(
     project_root: Path,
     applied: list[tuple[Path, str, str | None]],
@@ -1855,6 +1883,7 @@ class MainWindow(FramelessMainWindow):
         self._app_state.set_filters(self.current_department, self.current_type)
         if self._nav_rail.current_context() == "Project Guide" and self._reference_page_widget is not None:
             self._reference_page_widget.set_department(self.current_department or "reference")
+            self._restore_project_guide_browse_state()
         self.departmentChanged.emit(new)
 
     def _set_current_type(self, type_id, *, toggle_if_same: bool) -> None:
@@ -1976,7 +2005,9 @@ class MainWindow(FramelessMainWindow):
 
     _WORKSPACE_STATS_WORKER = "workspace_quick_stats"
     _PRODUCTION_STATUS_BATCH_WORKER = "production_status_batch"
+    _ASSET_RENAME_WORKER = "asset_rename"
     _SKIP_STATUS_LOADING_MESSAGE = "Updating skip status…"
+    _RENAME_LOADING_MESSAGE = "Renaming asset…"
     _PRODUCTION_STATUS_ASYNC_MIN = 3
 
     def _refresh_workspace_project_stats(self, *, schedule_aware: bool = False) -> None:
@@ -3998,60 +4029,60 @@ class MainWindow(FramelessMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
 
+        final_name = dlg.final_name()
+        project_root = self._project_root
+        try:
+            expected_root = project_root.resolve()
+        except OSError:
+            expected_root = project_root
+
         try:
             work_file_renames = prepare_work_file_renames(
-                project_root=self._project_root,
+                project_root=project_root,
                 asset_path=old_path,
-                new_name=dlg.final_name(),
+                new_name=final_name,
             )
         except (OSError, ValueError, FileNotFoundError) as e:
             logging.warning("Prepare rename failed: %s", e)
             notification_service.error(f"Rename failed: {e}")
             return
 
-        try:
-            result = rename_asset(
-                project_root=self._project_root,
+        self._show_page_loading(self._RENAME_LOADING_MESSAGE)
+
+        def run() -> _AssetRenameWorkerResult:
+            return run_asset_rename_worker(
+                project_root=expected_root,
                 asset_path=old_path,
-                new_name=dlg.final_name(),
+                new_name=final_name,
                 work_file_renames=work_file_renames,
             )
-        except (OSError, PermissionError, ValueError, FileExistsError) as e:
-            logging.warning("Rename asset failed: %s", e)
-            if getattr(e, "winerror", None) == 5:
-                notification_service.error(
-                    "Rename failed: Access denied. The folder may be in use by Dropbox or another app. "
-                    "Try pausing sync for this folder, or rename it in Explorer and refresh the project."
-                )
-            else:
-                notification_service.error(f"Rename failed: {e}")
-            return
-        except Exception as e:
-            logging.exception("Rename asset failed unexpectedly: %s", e)
-            notification_service.error(f"Rename failed: {e}")
-            return
 
+        task = WorkerTask(self._ASSET_RENAME_WORKER, run, manager=self._worker_manager)
+        self._worker_manager.submit_task(
+            task,
+            category=self._ASSET_RENAME_WORKER,
+            replace_existing=True,
+        )
+
+    def _finish_asset_rename(self, result: _AssetRenameWorkerResult) -> None:
+        old_path = result.old_path
         new_path = result.new_path
 
-        # Clear inspector if it points at old or new path (will be reloaded by selection).
         cur = self._main_view.selected_view_item()
         if cur is not None and getattr(cur, "path", None) in (old_path, new_path):
             self._inspector.set_item(None)
 
-        # Invalidate thumbnails for both ids (ids are absolute path strings).
         self._app_state.invalidate_thumbnails([str(old_path), str(new_path)])
 
-        # Refresh index/state; simplest is rebuild index (consistent with delete).
-        self._project_index = build_project_index(self._project_index.root)
-        self._app_state.update_assets(list(self._project_index.assets))
-        self._app_state.update_shots(list(self._project_index.shots))
+        self._project_index = result.index
+        self._app_state.update_assets(list(result.index.assets))
+        self._app_state.update_shots(list(result.index.shots))
         self._app_state.commit_immediate()
         self._filter_panel.set_project_index(self._project_index)
         self._reload_main_view()
         self._sync_primary_action()
         self._update_fs_watcher_paths()
 
-        # Keep selection on renamed asset if it exists in the refreshed index.
         try:
             if new_path.exists():
                 self._app_state.set_selection(str(new_path))
@@ -4059,6 +4090,20 @@ class MainWindow(FramelessMainWindow):
             pass
 
         notification_service.success(f"Renamed Asset '{old_path.name}' → '{new_path.name}'.")
+
+    def _notify_asset_rename_failed(self, error: str) -> None:
+        err = (error or "").strip()
+        if not err:
+            notification_service.error("Rename failed.")
+            return
+        lower = err.lower()
+        if "winerror 5" in lower or "access is denied" in lower or "permission denied" in lower:
+            notification_service.error(
+                "Rename failed: Access denied. The folder may be in use by Dropbox or another app. "
+                "Try pausing sync for this folder, or rename it in Explorer and refresh the project."
+            )
+            return
+        notification_service.error(f"Rename failed: {err}")
 
     def _restore_workspace_root(self) -> None:
         path = self._settings.value("workspace/root", "", str)
@@ -4185,6 +4230,9 @@ class MainWindow(FramelessMainWindow):
                     self._reference_page_widget.video_preview_requested.connect(
                         self._open_video_preview_from_project_guide
                     )
+                    self._reference_page_widget.browse_path_changed.connect(
+                        self._on_project_guide_browse_path_changed
+                    )
                     self._connect_inbox_outbox_title_row(self._reference_page_widget._title_row)
                     self._content_stack.addWidget(self._reference_page_widget)
                 self._reference_page_widget.set_project_root(self._project_root)
@@ -4197,6 +4245,7 @@ class MainWindow(FramelessMainWindow):
                 self._reference_page_widget.set_tag_filter(self._filter_panel.filters().current_tags())
                 self._update_reference_tag_badge()
                 self._content_stack.setCurrentWidget(self._reference_page_widget)
+                self._restore_project_guide_browse_state()
                 self._inspector.set_inbox_tree_preview(None)
             elif context_name == "Outbox":
                 self._sync_filter_state_from_sidebar()
@@ -4812,6 +4861,10 @@ class MainWindow(FramelessMainWindow):
                     error,
                     save=bool(getattr(self, "_project_load_save_on_complete", False)),
                 )
+            elif category == self._ASSET_RENAME_WORKER:
+                self._hide_page_loading()
+                logging.warning("Rename asset failed: %s", error)
+                self._notify_asset_rename_failed(error or "")
             return
         if category == self._PRODUCTION_STATUS_BATCH_WORKER:
             self._hide_page_loading()
@@ -4834,6 +4887,24 @@ class MainWindow(FramelessMainWindow):
             if current_root != loaded_root or not isinstance(index, ProjectIndex):
                 return
             self._complete_project_load(index)
+            return
+        if category == self._ASSET_RENAME_WORKER and isinstance(result, _AssetRenameWorkerResult):
+            if self._project_root is None:
+                self._hide_page_loading()
+                return
+            try:
+                current_root = self._project_root.resolve()
+            except OSError:
+                current_root = self._project_root
+            try:
+                index_root = result.index.root.resolve()
+            except OSError:
+                index_root = result.index.root
+            if current_root != index_root:
+                self._hide_page_loading()
+                return
+            self._hide_page_loading()
+            self._finish_asset_rename(result)
             return
         if category == self._WORKSPACE_STATS_WORKER:
             self._apply_workspace_stats_worker_result(result)
@@ -6013,6 +6084,45 @@ class MainWindow(FramelessMainWindow):
         except OSError:
             return False
         self._outbox_page_widget.restore_browse_path(path)
+        return True
+
+    def _project_guide_browse_settings_key(self, department: str) -> str:
+        from monostudio.ui_qt.reference_page_widget import PROJECT_GUIDE_DEPARTMENTS
+
+        dept = (department or PROJECT_GUIDE_DEPARTMENTS[0]).strip().lower()
+        if dept not in PROJECT_GUIDE_DEPARTMENTS:
+            dept = PROJECT_GUIDE_DEPARTMENTS[0]
+        return f"project_guide/last_browse_path/{dept}"
+
+    def _on_project_guide_browse_path_changed(self, department: str, path: Path) -> None:
+        """Persist browse folder per Project Guide department so we can restore when switching back."""
+        self._save_project_guide_browse_state(department, path)
+
+    def _save_project_guide_browse_state(self, department: str, path: Path) -> None:
+        if not path or not path.is_dir() or not self._project_root:
+            return
+        if not str(path).startswith(str(self._project_root)):
+            return
+        key = self._project_guide_browse_settings_key(department)
+        self._settings.setValue(key, str(path.resolve()))
+
+    def _restore_project_guide_browse_state(self) -> bool:
+        """Restore Project Guide browse folder for current department. Returns True if restored."""
+        if not self._reference_page_widget or not self._project_root:
+            return False
+        department = self._filter_panel.filters().current_department() or "reference"
+        path_str = self._settings.value(self._project_guide_browse_settings_key(department), "", str)
+        if not path_str:
+            return False
+        path = Path(path_str)
+        if not path.is_dir():
+            return False
+        try:
+            if not str(path.resolve()).startswith(str(self._project_root.resolve())):
+                return False
+        except OSError:
+            return False
+        self._reference_page_widget.restore_browse_path(path)
         return True
 
     def _release_video_preview(self) -> None:

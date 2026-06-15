@@ -6,6 +6,7 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from monostudio.core.video_media import (
+    ListSortMode,
     TimeDisplayMode,
     VideoFrameRange,
     format_frame_label,
@@ -23,6 +25,7 @@ from monostudio.core.video_media import (
     format_range_span_display,
     format_timecode,
     range_is_synced,
+    sort_video_ranges,
 )
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MonosMenu, monos_font
@@ -31,6 +34,10 @@ from monostudio.ui_qt.video_range_colors import range_color_hex
 _SYNC_COLOR = "#4ade80"
 _LOCAL_COLOR = "#fbbf24"
 _SYNC_ICON_PX = 12
+
+_SORT_TIMELINE = "timeline"
+_SORT_NAME = "name"
+_SORT_MODIFIED = "modified"
 
 
 def _sync_status_label(parent: QWidget, *, synced: bool) -> QLabel:
@@ -117,19 +124,28 @@ class VideoRangeListWidget(QWidget):
     range_rename_requested = Signal(str, str)  # id, new label
     go_to_in_requested = Signal(str)
     go_to_out_requested = Signal(str)
+    sort_mode_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("VideoPreviewRangePanel")
         self._fps = 24.0
+        self._sort_mode: ListSortMode = "timeline"
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
 
-        title = QLabel("RANGES", self)
-        title.setObjectName("VideoPreviewRangeTitle")
-        title.setFont(monos_font("Inter", 10, QFont.Weight.ExtraBold))
-        lay.addWidget(title, 0)
+        header = QHBoxLayout()
+        header.addStretch(1)
+        self._sort_combo = QComboBox(self)
+        self._sort_combo.setObjectName("VideoPreviewTimeDisplayCombo")
+        self._sort_combo.addItem("Timeline", _SORT_TIMELINE)
+        self._sort_combo.addItem("Name", _SORT_NAME)
+        self._sort_combo.addItem("Modified", _SORT_MODIFIED)
+        self._sort_combo.setToolTip("List sort order for [ ] navigation")
+        self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        header.addWidget(self._sort_combo)
+        lay.addLayout(header)
 
         self._list = QListWidget(self)
         self._list.setObjectName("VideoPreviewRangeList")
@@ -163,28 +179,105 @@ class VideoRangeListWidget(QWidget):
         self._draft_out: int | None = None
         self._block_row_signal = False
 
+    def sort_mode(self) -> ListSortMode:
+        return self._sort_mode
+
+    def set_sort_mode(self, mode: ListSortMode) -> None:
+        if mode not in (_SORT_TIMELINE, _SORT_NAME, _SORT_MODIFIED):
+            return
+        self._sort_mode = mode
+        idx = self._sort_combo.findData(mode)
+        if idx >= 0:
+            self._sort_combo.blockSignals(True)
+            self._sort_combo.setCurrentIndex(idx)
+            self._sort_combo.blockSignals(False)
+
+    def ordered_ranges(self) -> list[VideoFrameRange]:
+        return sort_video_ranges(self._ranges, self._sort_mode)
+
+    def _on_sort_changed(self, _index: int) -> None:
+        mode = self._sort_combo.currentData()
+        if not isinstance(mode, str) or mode == self._sort_mode:
+            return
+        self._sort_mode = mode  # type: ignore[assignment]
+        self.set_ranges(self._ranges, active_id=self._active_id)
+        self.sort_mode_changed.emit(self._sort_mode)
+
     def set_fps(self, fps: float) -> None:
-        self._fps = max(1e-6, float(fps))
+        fps = max(1e-6, float(fps))
+        if fps == self._fps:
+            return
+        self._fps = fps
+        if self._ranges:
+            self.set_ranges(self._ranges, active_id=self._active_id)
 
     def set_display_mode(self, mode: TimeDisplayMode) -> None:
-        if mode in ("frame", "timecode"):
-            self._display_mode = mode
+        if mode not in ("frame", "timecode") or mode == self._display_mode:
+            return
+        self._display_mode = mode
+        if self._ranges:
+            self.set_ranges(self._ranges, active_id=self._active_id)
 
     def refresh_display(self) -> None:
         self.set_ranges(self._ranges, active_id=self._active_id)
         self.set_draft_hint(self._draft_in, self._draft_out)
 
     def set_published_ranges(self, published: list[VideoFrameRange]) -> None:
-        self._published_ranges = list(published)
+        pub = list(published)
+        if pub == self._published_ranges:
+            return
+        self._published_ranges = pub
+        if self._ranges:
+            self.set_ranges(self._ranges, active_id=self._active_id)
+
+    def ordered_ranges(self) -> list[VideoFrameRange]:
+        return sort_video_ranges(self._ranges, self._sort_mode)
+
+    def _list_range_ids(self) -> list[str]:
+        ids: list[str] = []
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is None:
+                continue
+            rid = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(rid, str):
+                ids.append(rid)
+        return ids
+
+    def _apply_active_selection(self, active_id: str | None) -> None:
+        self._block_row_signal = True
+        if active_id:
+            for row in range(self._list.count()):
+                item = self._list.item(row)
+                if item is None:
+                    continue
+                if item.data(Qt.ItemDataRole.UserRole) == active_id:
+                    if self._list.currentRow() != row:
+                        self._list.setCurrentRow(row)
+                    break
+        else:
+            self._list.clearSelection()
+            self._list.setCurrentRow(-1)
+        self._block_row_signal = False
 
     def set_ranges(self, ranges: list[VideoFrameRange], *, active_id: str | None) -> None:
-        self._ranges = list(ranges)
+        new_ranges = list(ranges)
+        ordered = sort_video_ranges(new_ranges, self._sort_mode)
+        ordered_ids = [r.id for r in ordered]
+        list_ids = self._list_range_ids()
+        if new_ranges == self._ranges and ordered_ids == list_ids:
+            self._active_id = active_id
+            self._apply_active_selection(active_id)
+            return
+
+        scroll_pos = self._list.verticalScrollBar().value()
+        self._ranges = new_ranges
         self._active_id = active_id
-        self._placeholder.setVisible(len(ranges) == 0)
+        self._placeholder.setVisible(len(ordered) == 0)
         self._block_row_signal = True
         self._list.clear()
         row_hint = _RangeListRowWidget.size_hint()
-        for rng in ranges:
+        for rng in ordered:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, rng.id)
             item.setSizeHint(row_hint)
@@ -201,10 +294,19 @@ class VideoRangeListWidget(QWidget):
                 ),
             )
         if active_id:
-            self._list.setCurrentRow(next((i for i, r in enumerate(ranges) if r.id == active_id), -1))
+            row = next((i for i, r in enumerate(ordered) if r.id == active_id), -1)
+            self._list.setCurrentRow(row)
+            if row >= 0:
+                item = self._list.item(row)
+                if item is not None:
+                    self._list.scrollToItem(
+                        item,
+                        QAbstractItemView.ScrollHint.EnsureVisible,
+                    )
         else:
             self._list.clearSelection()
             self._list.setCurrentRow(-1)
+            self._list.verticalScrollBar().setValue(scroll_pos)
         self._block_row_signal = False
 
     def set_draft_hint(self, draft_in: int | None, draft_out: int | None) -> None:
@@ -232,24 +334,17 @@ class VideoRangeListWidget(QWidget):
             self._draft.setText("")
 
     def select_range_id(self, range_id: str | None) -> None:
-        self._block_row_signal = True
-        if range_id is None:
-            self._list.clearSelection()
-            self._list.setCurrentRow(-1)
-            self._block_row_signal = False
-            return
-        for row in range(self._list.count()):
-            item = self._list.item(row)
-            if item and item.data(Qt.ItemDataRole.UserRole) == range_id:
-                self._list.setCurrentRow(row)
-                self._block_row_signal = False
-                return
-        self._block_row_signal = False
+        self._active_id = range_id
+        self._apply_active_selection(range_id)
 
     def _range_at_row(self, row: int) -> VideoFrameRange | None:
-        if row < 0 or row >= len(self._ranges):
+        item = self._list.item(row)
+        if item is None:
             return None
-        return self._ranges[row]
+        rid = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(rid, str):
+            return None
+        return next((r for r in self._ranges if r.id == rid), None)
 
     def _on_context_menu(self, pos) -> None:
         item = self._list.itemAt(pos)

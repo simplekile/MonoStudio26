@@ -1,4 +1,5 @@
 __pycache__/
+monostudio_data/cache/video_scrub/
 *.py[cod]
 
 .venv/

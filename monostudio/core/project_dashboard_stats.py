@@ -335,11 +335,13 @@ def build_dashboard_snapshot(
         dept_stats = _summarize_dept_workload(
             bars_workload,
             root,
+            project_index=project_index,
             universe_ids=workload_department_order or tuple(workload_allow or ()),
             shot_dept_ids=workload_shot_departments or set(),
             asset_dept_ids=workload_asset_departments or set(),
             hidden_departments=hidden_departments,
             respect_hidden=respect_hidden,
+            workload_allowed_departments=workload_allow,
         )
         dept_workload_overdue = tuple(collect_overdue_entity_rows(bars_workload))
         dept_workload_upcoming = tuple(collect_upcoming_due_rows(bars_workload))
@@ -459,15 +461,21 @@ def _summarize_dept_workload(
     bars: dict,
     project_root: Path,
     *,
+    project_index=None,
     universe_ids: tuple[str, ...],
     shot_dept_ids: set[str],
     asset_dept_ids: set[str],
     hidden_departments: set[str] | None = None,
     respect_hidden: bool = True,
+    workload_allowed_departments: set[str] | None = None,
     today: date | None = None,
 ) -> tuple[DashboardDeptStat, ...]:
     """Roll up workload per Schedule department, split by shot/asset, fill empty universe rows."""
     from monostudio.core.department_registry import DepartmentRegistry
+    from monostudio.core.schedule_skip import (
+        ScheduleSkipResolver,
+        department_should_show_in_workload,
+    )
 
     ref = today or date.today()
     horizon = ref + timedelta(days=7)
@@ -547,6 +555,29 @@ def _summarize_dept_workload(
     def _visible_dep(dep: str) -> bool:
         return not (respect_hidden and dep in hidden)
 
+    skip_resolver: ScheduleSkipResolver | None = None
+
+    def _show_dep_in_workload(dep: str, *, total: int) -> bool:
+        if total > 0:
+            return True
+        if project_index is None:
+            return True
+        nonlocal skip_resolver
+        if skip_resolver is None:
+            skip_resolver = ScheduleSkipResolver(project_root)
+        return department_should_show_in_workload(
+            skip_resolver,
+            project_index,
+            dep,
+            include_shots=True,
+            include_assets=True,
+            hidden_departments=hidden,
+            respect_hidden=respect_hidden,
+            dept_scope=DEPT_SCOPE_ALL,
+            dept_reg=dept_reg,
+            allowed_departments=workload_allowed_departments,
+        )
+
     ordered_ids: list[str] = []
     seen: set[str] = set()
     for dep in universe_ids:
@@ -563,6 +594,9 @@ def _summarize_dept_workload(
     for dep in ordered_ids:
         slot = slots.get(dep)
         label = dept_reg.get_department_label(dep) or dep
+        tot_preview = int(slot["total"]) if slot is not None else 0
+        if not _show_dep_in_workload(dep, total=tot_preview):
+            continue
         if slot is None:
             stats.append(
                 DashboardDeptStat(

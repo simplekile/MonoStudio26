@@ -60,6 +60,7 @@ class ReferencePageWidget(QWidget):
     open_folder_requested = Signal(object)  # Path
     item_tags_changed = Signal()
     video_preview_requested = Signal(object)  # Path
+    browse_path_changed = Signal(str, object)  # (department, browse path)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -185,6 +186,7 @@ class ReferencePageWidget(QWidget):
             self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
             self._tree_pane.item_tags_changed.connect(self.item_tags_changed.emit)
             self._tree_pane.video_preview_requested.connect(self.video_preview_requested.emit)
+            self._tree_pane.browse_path_changed.connect(self._on_browse_path_changed)
             self._content_lay.addWidget(self._tree_pane, 1)
             key = self._tree_state_key(self._department)
             saved = self._tree_state_cache.get(key)
@@ -210,6 +212,9 @@ class ReferencePageWidget(QWidget):
             if saved:
                 self._tree_pane.set_tree_state(saved)
         self._refresh_chrome()
+
+    def _on_browse_path_changed(self, path: Path) -> None:
+        self.browse_path_changed.emit(self._department or "", path)
 
     def _on_tree_selection(self, path) -> None:
         self.tree_selection_changed.emit(path)
@@ -270,6 +275,12 @@ class ReferencePageWidget(QWidget):
     def reload_tag_definitions(self) -> None:
         if self._tree_pane is not None:
             self._tree_pane.reload_tag_definitions()
+
+    def restore_browse_path(self, path: Path) -> None:
+        """Restore last browsed folder within the current department tree."""
+        self._ensure_tree_pane()
+        if self._tree_pane is not None:
+            self._tree_pane.navigate_to_path(path)
 
     def refresh_tree(self) -> None:
         if self._tree_pane is not None:

@@ -9,11 +9,11 @@ import logging
 import os
 import re
 import subprocess
+import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 from typing import Literal
 
 from monostudio.core.ffmpeg_resolve import resolve_ffmpeg_executable, resolve_ffprobe_executable
@@ -26,6 +26,25 @@ VIDEO_EXTENSIONS = frozenset({
 })
 
 ExportMode = Literal["separate", "concat"]
+ExportFormat = Literal["source", "mp4", "mov", "mkv", "webm", "gif"]
+
+EXPORT_FORMAT_SOURCE = "source"
+EXPORT_FORMAT_MP4 = "mp4"
+EXPORT_FORMAT_MOV = "mov"
+EXPORT_FORMAT_MKV = "mkv"
+EXPORT_FORMAT_WEBM = "webm"
+EXPORT_FORMAT_GIF = "gif"
+
+_EXPORT_FORMAT_SUFFIX: dict[str, str] = {
+    EXPORT_FORMAT_MP4: ".mp4",
+    EXPORT_FORMAT_MOV: ".mov",
+    EXPORT_FORMAT_MKV: ".mkv",
+    EXPORT_FORMAT_WEBM: ".webm",
+    EXPORT_FORMAT_GIF: ".gif",
+}
+
+_EXPORT_GIF_MAX_FPS = 24.0
+_EXPORT_GIF_MAX_WIDTH = 720
 
 
 @dataclass(frozen=True)
@@ -55,6 +74,52 @@ class VideoFrameRange:
 
     def duration_sec(self, fps: float) -> float:
         return max(0.0, self.end_sec_exclusive(fps) - self.start_sec(fps))
+
+
+@dataclass(frozen=True)
+class VideoReviewMarker:
+    id: str
+    frame: int
+    label: str = ""
+    created_at: float = 0.0
+
+
+ListSortMode = Literal["timeline", "name", "modified"]
+
+
+def new_marker_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def validate_marker_frame(frame: int, *, total_frames: int) -> bool:
+    if total_frames <= 0:
+        return int(frame) >= 0
+    return 0 <= int(frame) < total_frames
+
+
+def sort_video_ranges(
+    ranges: Sequence[VideoFrameRange],
+    mode: ListSortMode,
+) -> list[VideoFrameRange]:
+    items = list(ranges)
+    if mode == "timeline":
+        return sorted(items, key=lambda r: (r.in_frame, r.out_frame, r.id))
+    if mode == "name":
+        return sorted(items, key=lambda r: ((r.label or "").strip().lower() or "zzz", r.in_frame))
+    # modified — preserve working-list order, newest (last) first
+    return list(reversed(items))
+
+
+def sort_video_markers(
+    markers: Sequence[VideoReviewMarker],
+    mode: ListSortMode,
+) -> list[VideoReviewMarker]:
+    items = list(markers)
+    if mode == "timeline":
+        return sorted(items, key=lambda m: (m.frame, m.id))
+    if mode == "name":
+        return sorted(items, key=lambda m: ((m.label or "").strip().lower() or "zzz", m.frame))
+    return sorted(items, key=lambda m: (-float(m.created_at or 0.0), m.frame))
 
 
 def is_video_path(path: Path) -> bool:
@@ -259,6 +324,48 @@ def probe_video(path: Path) -> VideoInfo | None:
     )
 
 
+def resolve_export_suffix(output_format: str, src: Path) -> str:
+    key = (output_format or EXPORT_FORMAT_SOURCE).strip().lower()
+    if key == EXPORT_FORMAT_SOURCE:
+        return src.suffix or ".mp4"
+    return _EXPORT_FORMAT_SUFFIX.get(key, ".mp4")
+
+
+def export_format_changes_container(output_format: str, src: Path) -> bool:
+    if export_format_is_gif(output_format):
+        return True
+    out = resolve_export_suffix(output_format, src).lower()
+    src_ext = (src.suffix or ".mp4").lower()
+    return out != src_ext
+
+
+def export_format_is_gif(output_format: str) -> bool:
+    return (output_format or "").strip().lower() == EXPORT_FORMAT_GIF
+
+
+def _gif_export_fps(fps: float) -> float:
+    return min(_EXPORT_GIF_MAX_FPS, max(1.0, float(fps)))
+
+
+def _gif_video_filter(fps: float) -> str:
+    gif_fps = _gif_export_fps(fps)
+    return (
+        f"fps={gif_fps:.3f},"
+        f"scale={_EXPORT_GIF_MAX_WIDTH}:-1:flags=lanczos:force_original_aspect_ratio=decrease,"
+        "split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3"
+    )
+
+
+def _ffmpeg_output_args(dst: Path, *, reencode: bool, src: Path) -> list[str]:
+    out_ext = dst.suffix.lower()
+    src_ext = (src.suffix or ".mp4").lower()
+    if not reencode and out_ext == src_ext:
+        return ["-c", "copy"]
+    if out_ext == ".webm":
+        return ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-c:a", "libopus", "-b:a", "128k"]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", "-b:a", "192k"]
+
+
 def export_video_trim(
     src: Path,
     dst: Path,
@@ -266,6 +373,7 @@ def export_video_trim(
     end_sec: float,
     *,
     reencode: bool = False,
+    fps: float | None = None,
 ) -> None:
     ffmpeg = resolve_ffmpeg_executable()
     if not ffmpeg:
@@ -273,6 +381,11 @@ def export_video_trim(
     if end_sec <= start_sec:
         raise ValueError("Invalid trim range: end must be after start.")
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.suffix.lower() == ".gif":
+        if fps is None:
+            raise ValueError("GIF export requires fps.")
+        _export_video_trim_gif(ffmpeg, src, dst, start_sec, end_sec, fps=fps)
+        return
     args = [
         ffmpeg,
         "-y",
@@ -281,10 +394,7 @@ def export_video_trim(
         "-to", f"{end_sec:.6f}",
         "-i", str(src),
     ]
-    if reencode:
-        args.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", "-b:a", "192k"])
-    else:
-        args.extend(["-c", "copy"])
+    args.extend(_ffmpeg_output_args(dst, reencode=reencode, src=src))
     args.append(str(dst))
     proc = subprocess.run(
         args,
@@ -297,6 +407,40 @@ def export_video_trim(
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(err or f"FFmpeg trim failed (code {proc.returncode})")
+
+
+def _export_video_trim_gif(
+    ffmpeg: str,
+    src: Path,
+    dst: Path,
+    start_sec: float,
+    end_sec: float,
+    *,
+    fps: float,
+) -> None:
+    args = [
+        ffmpeg,
+        "-y",
+        "-loglevel", "error",
+        "-ss", f"{start_sec:.6f}",
+        "-to", f"{end_sec:.6f}",
+        "-i", str(src),
+        "-vf", _gif_video_filter(fps),
+        "-an",
+        "-loop", "0",
+        str(dst),
+    ]
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=3600,
+        check=False,
+        **hide_console_subprocess_kwargs(),
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(err or f"FFmpeg GIF export failed (code {proc.returncode})")
 
 
 def _output_name(stem: str, suffix: str, index: int, template: str) -> str:
@@ -365,6 +509,7 @@ def export_video_ranges(
     fps: float,
     mode: ExportMode = "separate",
     reencode: bool = False,
+    output_format: str = EXPORT_FORMAT_SOURCE,
     name_template: str = "{stem}_{index:03d}{suffix}",
     naming_mode: str | None = None,
     progress_callback=None,
@@ -376,17 +521,24 @@ def export_video_ranges(
     if not ffmpeg:
         raise RuntimeError("FFmpeg not found. Configure it in Settings → Tools.")
     output_dir.mkdir(parents=True, exist_ok=True)
-    suffix = src.suffix or ".mp4"
+    suffix = resolve_export_suffix(output_format, src)
+    seg_suffix = src.suffix or ".mp4"
     stem = src.stem
     outputs: list[Path] = []
     if naming_mode:
         name_template = export_naming_template_for_mode(naming_mode)
     used_names: set[str] = set()
 
+    if export_format_is_gif(output_format) and mode == "concat":
+        raise ValueError("GIF export supports separate files only (one GIF per range).")
+
     if mode == "separate":
+        total = len(ranges)
         for i, rng in enumerate(ranges, start=1):
             if cancel_check and cancel_check():
                 break
+            if progress_callback:
+                progress_callback(i - 1, total, None)
             out_name = _output_name_for_range(stem, suffix, i, rng, name_template, used_names=used_names)
             dst = output_dir / out_name
             export_video_trim(
@@ -395,13 +547,15 @@ def export_video_ranges(
                 rng.start_sec(fps),
                 rng.end_sec_exclusive(fps),
                 reencode=reencode,
+                fps=fps,
             )
             outputs.append(dst)
             if progress_callback:
-                progress_callback(i, len(ranges), dst)
+                progress_callback(i, total, dst)
         return outputs
 
     # concat: cut segments then concat demuxer
+    total = len(ranges) + 1
     seg_dir = output_dir / f".{stem}_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     list_file = seg_dir / "concat.txt"
@@ -409,23 +563,28 @@ def export_video_ranges(
     for i, rng in enumerate(ranges, start=1):
         if cancel_check and cancel_check():
             break
-        seg = seg_dir / f"seg_{i:03d}{suffix}"
+        if progress_callback:
+            progress_callback(i - 1, total, None)
+        seg = seg_dir / f"seg_{i:03d}{seg_suffix}"
         export_video_trim(
             src,
             seg,
             rng.start_sec(fps),
             rng.end_sec_exclusive(fps),
             reencode=reencode,
+            fps=fps,
         )
         seg_paths.append(seg)
         if progress_callback:
-            progress_callback(i, len(ranges) + 1, seg)
+            progress_callback(i, total, seg)
 
     if not seg_paths:
         return []
     lines = [f"file '{p.resolve().as_posix()}'" for p in seg_paths]
     list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     final = output_dir / f"{stem}_concat{suffix}"
+    if progress_callback:
+        progress_callback(len(ranges), total, None)
     args = [
         ffmpeg,
         "-y",
@@ -433,9 +592,9 @@ def export_video_ranges(
         "-f", "concat",
         "-safe", "0",
         "-i", str(list_file),
-        "-c", "copy",
-        str(final),
     ]
+    args.extend(_ffmpeg_output_args(final, reencode=reencode, src=src))
+    args.append(str(final))
     proc = subprocess.run(
         args,
         capture_output=True,
@@ -448,7 +607,7 @@ def export_video_ranges(
         err = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(err or f"FFmpeg concat failed (code {proc.returncode})")
     if progress_callback:
-        progress_callback(len(ranges) + 1, len(ranges) + 1, final)
+        progress_callback(total, total, final)
     return [final]
 
 
@@ -680,6 +839,280 @@ def load_sequence_ranges_for_preview(
     if local is not None:
         return published, local, True
     return published, list(published), False
+
+
+def markers_sidecar_path(video_path: Path) -> Path:
+    return Path(f"{video_path}.monos.markers.json")
+
+
+def markers_local_draft_path(video_path: Path) -> Path:
+    try:
+        key_src = str(video_path.resolve()).casefold()
+    except OSError:
+        key_src = str(video_path).casefold()
+    digest = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:32]
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if localappdata:
+        base = Path(localappdata) / "MonoStudio" / "cache" / "video_markers"
+    else:
+        from monostudio.core.app_paths import get_app_base_path
+
+        base = get_app_base_path() / "monostudio_data" / "cache" / "video_markers"
+    return base / f"{digest}.json"
+
+
+def _markers_payload(video_path: Path, markers: Sequence[VideoReviewMarker]) -> dict:
+    try:
+        source_path = str(video_path.resolve())
+    except OSError:
+        source_path = str(video_path)
+    return {
+        "version": 1,
+        "source": video_path.name,
+        "source_path": source_path,
+        "markers": [
+            {
+                "id": m.id,
+                "frame": m.frame,
+                "label": m.label,
+                "created_at": float(m.created_at or 0.0),
+            }
+            for m in markers
+        ],
+    }
+
+
+def _parse_markers_payload(data: object, *, total_frames: int) -> list[VideoReviewMarker]:
+    raw = data.get("markers") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    out: list[VideoReviewMarker] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            frame = int(item.get("frame", 0))
+        except (TypeError, ValueError):
+            continue
+        if not validate_marker_frame(frame, total_frames=total_frames):
+            continue
+        rid = str(item.get("id") or new_marker_id())
+        label = str(item.get("label") or "")
+        try:
+            created_at = float(item.get("created_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        out.append(VideoReviewMarker(rid, frame, label, created_at))
+    return out
+
+
+def markers_content_equal(
+    a: Sequence[VideoReviewMarker],
+    b: Sequence[VideoReviewMarker],
+) -> bool:
+    if len(a) != len(b):
+        return False
+    for ma, mb in zip(a, b, strict=True):
+        if ma.frame != mb.frame or ma.label != mb.label:
+            return False
+    return True
+
+
+def marker_is_synced(m: VideoReviewMarker, published: Sequence[VideoReviewMarker]) -> bool:
+    for pub in published:
+        if pub.id != m.id:
+            continue
+        return pub.frame == m.frame and pub.label == m.label
+    return False
+
+
+def _read_markers_file(path: Path, *, total_frames: int) -> list[VideoReviewMarker]:
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.debug("load markers %s: %s", path, e)
+        return []
+    return _parse_markers_payload(data, total_frames=total_frames)
+
+
+def _write_markers_file(path: Path, video_path: Path, markers: Sequence[VideoReviewMarker]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _markers_payload(video_path, markers)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_video_markers_sidecar(video_path: Path, *, total_frames: int) -> list[VideoReviewMarker]:
+    return _read_markers_file(markers_sidecar_path(video_path), total_frames=total_frames)
+
+
+def load_video_markers_local_draft(
+    video_path: Path,
+    *,
+    total_frames: int,
+) -> list[VideoReviewMarker] | None:
+    path = markers_local_draft_path(video_path)
+    if not path.is_file():
+        return None
+    return _read_markers_file(path, total_frames=total_frames)
+
+
+def save_video_markers_local_draft(video_path: Path, markers: Sequence[VideoReviewMarker]) -> None:
+    try:
+        _write_markers_file(markers_local_draft_path(video_path), video_path, markers)
+    except OSError as e:
+        logger.debug("save marker draft %s: %s", video_path, e)
+
+
+def preview_session_local_draft_path(video_path: Path) -> Path:
+    """Per-machine preview session (playhead frame) keyed by source video path."""
+    try:
+        key_src = str(video_path.resolve()).casefold()
+    except OSError:
+        key_src = str(video_path).casefold()
+    digest = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:32]
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if localappdata:
+        base = Path(localappdata) / "MonoStudio" / "cache" / "video_preview_session"
+    else:
+        from monostudio.core.app_paths import get_app_base_path
+
+        base = get_app_base_path() / "monostudio_data" / "cache" / "video_preview_session"
+    return base / f"{digest}.json"
+
+
+def load_video_preview_session_local_draft(
+    video_path: Path,
+    *,
+    total_frames: int,
+) -> int | None:
+    """Return saved playhead frame, or ``None`` when no session file exists."""
+    path = preview_session_local_draft_path(video_path)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.debug("load preview session %s: %s", path, e)
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        frame = int(data.get("frame", 0))
+    except (TypeError, ValueError):
+        return None
+    max_f = max(0, int(total_frames) - 1)
+    return max(0, min(frame, max_f))
+
+
+def save_video_preview_session_local_draft(video_path: Path, *, frame: int) -> None:
+    try:
+        path = preview_session_local_draft_path(video_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            source_path = str(video_path.resolve())
+        except OSError:
+            source_path = str(video_path)
+        payload = {
+            "version": 1,
+            "source": video_path.name,
+            "source_path": source_path,
+            "frame": max(0, int(frame)),
+        }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as e:
+        logger.debug("save preview session %s: %s", video_path, e)
+
+
+def save_video_markers_sidecar(video_path: Path, markers: Sequence[VideoReviewMarker]) -> None:
+    path = markers_sidecar_path(video_path)
+    if not markers:
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError as e:
+            logger.debug("remove marker sidecar %s: %s", path, e)
+        return
+    try:
+        _write_markers_file(path, video_path, markers)
+    except OSError as e:
+        logger.debug("save marker sidecar %s: %s", path, e)
+
+
+def load_video_markers_for_preview(
+    video_path: Path,
+    *,
+    total_frames: int,
+) -> tuple[list[VideoReviewMarker], list[VideoReviewMarker], bool]:
+    published = load_video_markers_sidecar(video_path, total_frames=total_frames)
+    local = load_video_markers_local_draft(video_path, total_frames=total_frames)
+    if local is not None:
+        return published, local, True
+    return published, list(published), False
+
+
+def export_video_markers_png(
+    src: Path,
+    markers: Sequence[VideoReviewMarker],
+    output_dir: Path,
+    *,
+    fps: float,
+    progress_callback=None,
+) -> list[Path]:
+    if not markers:
+        return []
+    ffmpeg = resolve_ffmpeg_executable()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg not found. Configure it in Settings → Tools.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = src.stem
+    outputs: list[Path] = []
+    total = len(markers)
+    try:
+        path_str = str(src.resolve())
+    except OSError:
+        path_str = str(src)
+    for i, marker in enumerate(markers, start=1):
+        if progress_callback:
+            progress_callback(i - 1, total, None)
+        safe_label = re.sub(r"[^\w\-]+", "_", (marker.label or "").strip())[:32].strip("_")
+        label_part = f"_{safe_label}" if safe_label else ""
+        out_name = f"{stem}_mk_{i:03d}_f{marker.frame:04d}{label_part}.png"
+        dst = output_dir / out_name
+        sec = frame_to_sec(marker.frame, fps)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{max(0.0, float(sec)):.6f}",
+            "-i",
+            path_str,
+            "-an",
+            "-sn",
+            "-dn",
+            "-vframes",
+            "1",
+            "-f",
+            "image2",
+            str(dst),
+        ]
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=60,
+            check=False,
+            **hide_console_subprocess_kwargs(),
+        )
+        if proc.returncode != 0 or not dst.is_file():
+            err = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(err or f"FFmpeg export failed for frame {marker.frame}")
+        outputs.append(dst)
+        if progress_callback:
+            progress_callback(i, total, dst)
+    return outputs
 
 
 def resolve_work_preview_video(work_path: Path, work_file_path: Path | None) -> Path | None:

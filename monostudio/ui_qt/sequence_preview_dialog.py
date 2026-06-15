@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QFont, QImage, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 from monostudio.core.video_media import (
     VideoFrameRange,
@@ -20,6 +20,7 @@ from monostudio.core.video_media import (
     validate_range,
 )
 from monostudio.ui_qt.dialog_geometry import apply_dialog_geometry, main_window_bounds
+from monostudio.ui_qt.inspector_preview_settings import write_sequence_preview_fps
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.media_preview_transport import BasicMediaTransportRow
 from monostudio.ui_qt.review_tools_panel import ReviewToolMode, ReviewToolsPanel, ReviewWorkspace
@@ -150,6 +151,19 @@ class SequencePreviewDialog(MonosDialog):
         self._transport.btn_close.clicked.connect(self.close)
 
         row_actions = QHBoxLayout()
+        self._fps_label = QLabel("FPS", self)
+        self._fps_label.setFont(monos_font("Inter", 12, QFont.Weight.Medium))
+        self._fps_label.setStyleSheet(f"color: {MONOS_COLORS.get('text_label', '#a1a1aa')};")
+        self._fps_spin = QSpinBox(self)
+        self._fps_spin.setObjectName("SequencePreviewFpsSpin")
+        self._fps_spin.setRange(1, 60)
+        self._fps_spin.setValue(self._fps)
+        self._fps_spin.setFixedWidth(56)
+        self._fps_spin.setToolTip("Playback frame rate for this sequence")
+        self._fps_spin.valueChanged.connect(self._on_fps_changed)
+        row_actions.addWidget(self._fps_label)
+        row_actions.addWidget(self._fps_spin)
+        row_actions.addSpacing(12)
         self._btn_in = QPushButton("In", self)
         self._btn_in.setObjectName("DialogSecondaryButton")
         self._btn_in.clicked.connect(self._mark_in)
@@ -193,6 +207,15 @@ class SequencePreviewDialog(MonosDialog):
 
     def _update_meta(self) -> None:
         self._meta.setText(f"{self._n} frames  ·  {self._fps} fps  ·  {self._sequence_folder.name}")
+
+    def _on_fps_changed(self, value: int) -> None:
+        self._fps = max(1, min(60, int(value)))
+        self._update_meta()
+        self._sync_range_ui()
+        if self._settings is not None:
+            write_sequence_preview_fps(self._settings, self._fps)
+        if self._playing:
+            self._schedule_next_tick()
 
     def _load_ranges(self) -> None:
         published, working, _local = load_sequence_ranges_for_preview(
@@ -350,6 +373,8 @@ class SequencePreviewDialog(MonosDialog):
         self._poll_timer.stop()
         self._pool.clear()
         self._persist_local()
+        if self._settings is not None:
+            write_sequence_preview_fps(self._settings, self._fps)
         super().closeEvent(event)
 
     def _detect_heavy_sequence(self) -> bool:

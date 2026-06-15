@@ -3265,24 +3265,23 @@ def apply_dark_theme(app: QApplication) -> None:
         QDialog#InboxDropDialog QDialogButtonBox QPushButton#DialogPrimaryButton {
             padding: 8px 12px;
             border-radius: 8px;
-            border: 1px solid rgba(37, 99, 235, 0.70);
-            background: rgba(37, 99, 235, 0.22);
+            border: none;
+            background: #2563eb;
             color: #fafafa;
         }
         QDialog#InboxDropDialog QDialogButtonBox QPushButton#DialogPrimaryButton:hover {
-            background: rgba(37, 99, 235, 0.35);
-            border-color: rgba(59, 130, 246, 0.80);
+            background: #3b82f6;
+            color: #ffffff;
         }
         QDialog#InboxDropDialog QDialogButtonBox QPushButton#DialogSecondaryButton {
             padding: 8px 12px;
             border-radius: 8px;
-            border: 1px solid rgba(39, 39, 42, 0.50);
-            background: rgba(24, 24, 27, 0.35);
+            border: none;
+            background: #27272a;
             color: #a1a1aa;
         }
         QDialog#InboxDropDialog QDialogButtonBox QPushButton#DialogSecondaryButton:hover {
-            background: rgba(24, 24, 27, 0.55);
-            border-color: rgba(39, 39, 42, 0.70);
+            background: #3f3f46;
             color: #fafafa;
         }
         QScrollArea#InboxDropScroll {
@@ -3331,6 +3330,18 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #1e2124;
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
         }
+        QToolButton#VideoPreviewDialogCloseBtn {
+            padding: 0px;
+            border: none;
+            border-radius: 8px;
+            background: #ef4444;
+            color: #fafafa;
+        }
+        QToolButton#VideoPreviewDialogCloseBtn:hover {
+            background: #dc2626;
+            border: none;
+            color: #ffffff;
+        }
         QLabel#VideoPreviewFileCounter {
             color: #71717a;
             background: transparent;
@@ -3359,9 +3370,89 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #71717a;
             background: transparent;
         }
+        QLabel#VideoPreviewFooterHint {
+            color: #a1a1aa;
+            background: transparent;
+        }
         QLabel#VideoPreviewCurrentFrame {
             color: #fafafa;
             background: transparent;
+        }
+        QWidget#VideoPreviewPositionBox {
+            background-color: #27272a;
+            border: 1px solid rgba(63, 63, 70, 0.65);
+            border-radius: 6px;
+        }
+        QLineEdit#VideoPreviewFrameInput {
+            color: #fafafa;
+            background: transparent;
+            border: none;
+            padding: 0px 2px 0px 0px;
+            font-family: "JetBrains Mono";
+            font-size: 11px;
+            font-weight: 500;
+            min-height: 22px;
+        }
+        QLabel#VideoPreviewPositionSuffix,
+        QLabel#VideoPreviewTimecodePosition {
+            color: #a1a1aa;
+            background: transparent;
+            font-family: "JetBrains Mono";
+            font-size: 11px;
+            font-weight: 500;
+        }
+        QToolButton#VideoPreviewTransportTool {
+            padding: 0px;
+            margin: 0px;
+            border: none;
+            border-radius: 6px;
+            background-color: transparent;
+        }
+        QToolButton#VideoPreviewTransportTool:hover {
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+        QToolButton#VideoPreviewTransportTool:pressed {
+            background-color: rgba(255, 255, 255, 0.1);
+        }
+        QComboBox#VideoPreviewSpeedCombo {
+            color: #a1a1aa;
+            background-color: #27272a;
+            border: 1px solid rgba(63, 63, 70, 0.55);
+            border-radius: 6px;
+            padding: 4px 6px;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 500;
+            min-height: 24px;
+        }
+        QComboBox#VideoPreviewSpeedCombo:hover {
+            color: #e4e4e7;
+            border-color: #52525b;
+        }
+        QComboBox#VideoPreviewSpeedCombo::drop-down {
+            border: none;
+            width: 16px;
+        }
+        QComboBox#VideoPreviewSpeedCombo QAbstractItemView {
+            background-color: #27272a;
+            color: #e4e4e7;
+            border: 1px solid #3f3f46;
+            selection-background-color: #3b82f6;
+        }
+        QSlider#VideoPreviewVolumeSlider::groove:horizontal {
+            background: #3f3f46;
+            height: 4px;
+            border-radius: 2px;
+        }
+        QSlider#VideoPreviewVolumeSlider::handle:horizontal {
+            background: #a1a1aa;
+            width: 10px;
+            height: 10px;
+            margin: -3px 0;
+            border-radius: 5px;
+        }
+        QSlider#VideoPreviewVolumeSlider::handle:horizontal:hover {
+            background: #fafafa;
         }
         QWidget#VideoPreviewTimelineZoom {
             background-color: transparent;
@@ -3453,6 +3544,31 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #e4e4e7;
             border: 1px solid #3f3f46;
             selection-background-color: #3b82f6;
+        }
+        QSpinBox#SequencePreviewFpsSpin {
+            color: #a1a1aa;
+            background-color: #27272a;
+            border: 1px solid rgba(63, 63, 70, 0.55);
+            border-radius: 6px;
+            padding: 4px 8px;
+            font-family: "JetBrains Mono";
+            font-size: 12px;
+            font-weight: 500;
+            min-height: 24px;
+        }
+        QSpinBox#SequencePreviewFpsSpin:hover {
+            color: #e4e4e7;
+            border-color: #52525b;
+        }
+        QSpinBox#SequencePreviewFpsSpin:focus {
+            border-color: #3b82f6;
+            color: #fafafa;
+        }
+        QSpinBox#SequencePreviewFpsSpin::up-button,
+        QSpinBox#SequencePreviewFpsSpin::down-button {
+            width: 16px;
+            border: none;
+            background: transparent;
         }
         QWidget#VideoPreviewTimeline {
             background-color: transparent;
@@ -3577,6 +3693,28 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QDialog#VideoExportDialog {
             background-color: #18181b;
+        }
+        QLabel#VideoExportProgressTitle {
+            color: #fafafa;
+        }
+        QLabel#VideoExportProgressFile {
+            color: #a1a1aa;
+        }
+        QProgressBar#VideoExportProgress {
+            background-color: #27272a;
+            border: none;
+            border-radius: 4px;
+            text-align: center;
+            min-height: 10px;
+            max-height: 10px;
+            color: #e4e4e7;
+            font-family: "Inter";
+            font-size: 11px;
+            font-weight: 500;
+        }
+        QProgressBar#VideoExportProgress::chunk {
+            background-color: #3b82f6;
+            border-radius: 4px;
         }
         QToolButton#DialogSizeGrip {
             background: transparent;
@@ -4322,61 +4460,59 @@ def apply_dark_theme(app: QApplication) -> None:
         QDialog QPushButton {
             padding: 8px 12px;
             border-radius: 8px;
-            border: 1px solid rgba(39, 39, 42, 0.50);
-            background: rgba(24, 24, 27, 0.35);
+            border: none;
+            background: #27272a;
             color: #a1a1aa;
         }
         QDialog QPushButton:hover {
-            background: rgba(24, 24, 27, 0.55);
-            border-color: rgba(39, 39, 42, 0.70);
+            background: #3f3f46;
             color: #fafafa;
         }
         QDialog QPushButton:disabled {
-            color: rgba(161, 161, 170, 0.5);
-            background: rgba(24, 24, 27, 0.25);
+            color: #71717a;
+            background: #1f1f23;
         }
         /* Nút đồng ý trong dialog: ghi đè QDialog QPushButton, luôn màu primary */
         QDialog QPushButton#DialogPrimaryButton {
-            background: rgba(37, 99, 235, 0.22);
-            border: 1px solid rgba(37, 99, 235, 0.70);
+            background: #2563eb;
+            border: none;
             color: #fafafa;
         }
         QDialog QPushButton#DialogPrimaryButton:hover {
-            background: rgba(37, 99, 235, 0.35);
-            border-color: rgba(59, 130, 246, 0.80);
+            background: #3b82f6;
+            color: #ffffff;
         }
         QPushButton#DialogPrimaryButton {
             padding: 8px 12px;
             border-radius: 8px;
-            border: 1px solid rgba(37, 99, 235, 0.70);
-            background: rgba(37, 99, 235, 0.22);
+            border: none;
+            background: #2563eb;
             color: #fafafa;
         }
         QPushButton#DialogPrimaryButton:hover {
-            background: rgba(37, 99, 235, 0.35);
-            border-color: rgba(59, 130, 246, 0.80);
+            background: #3b82f6;
+            color: #ffffff;
         }
         QPushButton#DialogPrimaryButton:disabled {
-            border: 1px solid rgba(39, 39, 42, 0.50);
-            background: rgba(24, 24, 27, 0.35);
-            color: rgba(250, 250, 250, 0.45);
+            border: none;
+            background: #27272a;
+            color: #71717a;
         }
         /* Dialog: nút hủy (phải) — màu xám, giống Settings */
         QPushButton#DialogSecondaryButton {
             padding: 8px 12px;
             border-radius: 8px;
-            border: 1px solid rgba(39, 39, 42, 0.50);
-            background: rgba(24, 24, 27, 0.35);
+            border: none;
+            background: #27272a;
             color: #a1a1aa;
         }
         QPushButton#DialogSecondaryButton:hover {
-            background: rgba(24, 24, 27, 0.55);
-            border-color: rgba(39, 39, 42, 0.70);
+            background: #3f3f46;
             color: #fafafa;
         }
         QPushButton#DialogSecondaryButton:disabled {
-            color: rgba(161, 161, 170, 0.5);
-            background: rgba(24, 24, 27, 0.25);
+            color: #71717a;
+            background: #1f1f23;
         }
         /* Dialog: nút Delete (destructive) — đỏ */
         QPushButton#DialogDestructiveButton {
