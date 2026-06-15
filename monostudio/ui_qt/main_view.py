@@ -22,6 +22,7 @@ from PySide6.QtCore import (
     Qt,
     QTimer,
     Signal,
+    Slot,
     QUrl,
 )
 from PySide6.QtGui import (
@@ -4949,9 +4950,7 @@ class MainView(QWidget):
 
         self._tile_placeholder = MainViewLoadingPlaceholder()
         self._tile_placeholder.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._tile_placeholder.customContextMenuRequested.connect(
-            lambda p: self.root_context_menu_requested.emit(self._tile_placeholder.mapToGlobal(p))
-        )
+        self._tile_placeholder.customContextMenuRequested.connect(self._on_tile_placeholder_context_menu)
 
         tile_page = QStackedWidget()
         tile_page.addWidget(self._tile_placeholder)
@@ -4990,9 +4989,7 @@ class MainView(QWidget):
 
         self._list_placeholder = MainViewLoadingPlaceholder()
         self._list_placeholder.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._list_placeholder.customContextMenuRequested.connect(
-            lambda p: self.root_context_menu_requested.emit(self._list_placeholder.mapToGlobal(p))
-        )
+        self._list_placeholder.customContextMenuRequested.connect(self._on_list_placeholder_context_menu)
 
         list_page = QStackedWidget()
         list_page.addWidget(self._list_placeholder)
@@ -8249,7 +8246,7 @@ class MainView(QWidget):
         """Tile/list inner stacks: placeholder (0) vs content view (1) from current row count."""
         if getattr(self, "_in_batch_set_items", False) and not force:
             return
-        tile_has_rows = self._tile_model.rowCount() > 0
+        tile_has_rows = self._tile_model.row_count() > 0
         list_has_rows = self._list_model.rowCount() > 0
         idx_tile = 1 if tile_has_rows else 0
         idx_list = 1 if list_has_rows else 0
@@ -8698,6 +8695,14 @@ class MainView(QWidget):
                 self._notify_transient_hint("No copied work file. Use Copy Work File first.")
         elif text.startswith("Delete ") and " folder" in text:
             self.dcc_delete_requested.emit(item, dcc_id, department)
+
+    @Slot(QPoint)
+    def _on_tile_placeholder_context_menu(self, pos: QPoint) -> None:
+        self.root_context_menu_requested.emit(self._tile_placeholder.mapToGlobal(pos))
+
+    @Slot(QPoint)
+    def _on_list_placeholder_context_menu(self, pos: QPoint) -> None:
+        self.root_context_menu_requested.emit(self._list_placeholder.mapToGlobal(pos))
 
     def _on_tile_context_menu(self, pos) -> None:
         # DCC badge right-click takes priority

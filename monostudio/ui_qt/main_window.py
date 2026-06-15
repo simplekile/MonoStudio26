@@ -83,6 +83,14 @@ from monostudio.ui_qt.dashboard_page_widget import DashboardPageWidget
 from monostudio.ui_qt.user_identity_dialog import UserIdentityDialog
 from monostudio.ui_qt.schedule_page_widget import SchedulePageWidget
 from monostudio.ui_qt.reference_page_widget import ReferencePageWidget
+from monostudio.ui_qt.video_preview_dialog import VideoPreviewDialog
+from monostudio.ui_qt.sequence_preview_dialog import SequencePreviewDialog
+from monostudio.ui_qt.video_preview_context import (
+    PreviewContext,
+    SequencePreviewOpenRequest,
+    VideoPreviewOpenRequest,
+)
+from monostudio.core.video_media import is_video_path, list_video_siblings, paths_under_project_root
 from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
 from monostudio.ui_qt.new_project_dialog import NewProjectDialog
@@ -413,6 +421,8 @@ class MainWindow(FramelessMainWindow):
         self._pending_overdue_entities: list[tuple[str, str]] | None = None
         self._active_nav_context: str | None = None
         self._reference_page_widget: ReferencePageWidget | None = None
+        self._video_preview_dialog: VideoPreviewDialog | None = None
+        self._sequence_preview_dialog: SequencePreviewDialog | None = None
         self._inspector = InspectorPanel()
         self._inspector.set_app_settings(self._settings)
         self._inspector.set_thumbnail_manager(self._thumbnail_manager)
@@ -602,6 +612,8 @@ class MainWindow(FramelessMainWindow):
         self._inspector.edit_allocation_requested.connect(self._on_inspector_edit_allocation)
         self._inspector.assignee_changed.connect(self._on_inspector_assignee_changed)
         self._inspector.assignment_confirmed.connect(self._refresh_noti_unread_badge)
+        self._inspector.video_preview_requested.connect(self._open_video_preview_from_inspector)
+        self._inspector.sequence_preview_requested.connect(self._open_sequence_preview)
         self._bound_hotkeys: list[QShortcut] = []
         from monostudio.ui_qt.app_hotkeys import bind_hotkey
 
@@ -4147,6 +4159,9 @@ class MainWindow(FramelessMainWindow):
                     self._inbox_page_widget.drop_requested.connect(self._on_inbox_drop_requested)
                     self._inbox_page_widget.import_requested.connect(self._on_inbox_import_requested)
                     self._inbox_page_widget.date_folder_entered.connect(self._on_inbox_date_folder_entered)
+                    self._inbox_page_widget.video_preview_requested.connect(
+                        self._open_video_preview_from_inbox
+                    )
                     self._connect_inbox_outbox_title_row(self._inbox_page_widget._title_row)
                     self._content_stack.addWidget(self._inbox_page_widget)
                 self._inbox_page_widget.set_project_root(self._project_root)
@@ -4166,6 +4181,9 @@ class MainWindow(FramelessMainWindow):
                     self._reference_page_widget.item_tags_changed.connect(self._on_reference_item_tags_changed)
                     self._reference_page_widget.tag_filter_badge_clicked.connect(
                         self._on_reference_tag_badge_clear
+                    )
+                    self._reference_page_widget.video_preview_requested.connect(
+                        self._open_video_preview_from_project_guide
                     )
                     self._connect_inbox_outbox_title_row(self._reference_page_widget._title_row)
                     self._content_stack.addWidget(self._reference_page_widget)
@@ -5997,6 +6015,160 @@ class MainWindow(FramelessMainWindow):
         self._outbox_page_widget.restore_browse_path(path)
         return True
 
+    def _release_video_preview(self) -> None:
+        dlg = self._video_preview_dialog
+        if dlg is None:
+            return
+        try:
+            dlg.release_player()
+            dlg.close()
+        except Exception:
+            pass
+        self._video_preview_dialog = None
+
+    def _open_video_preview_from_inbox(self, path) -> None:
+        p = Path(path) if path is not None else None
+        if p is None or not is_video_path(p):
+            return
+        self._open_video_preview_with_request(
+            VideoPreviewOpenRequest(path=p, context=PreviewContext.inbox, sibling_paths=list_video_siblings(p))
+        )
+
+    def _open_video_preview_from_project_guide(self, path) -> None:
+        p = Path(path) if path is not None else None
+        if p is None or not is_video_path(p):
+            return
+        self._open_video_preview_with_request(
+            VideoPreviewOpenRequest(
+                path=p,
+                context=PreviewContext.project_guide,
+                sibling_paths=list_video_siblings(p),
+            )
+        )
+
+    def _open_video_preview_from_inspector(self, path) -> None:
+        p = Path(path) if path is not None else None
+        if p is None or not is_video_path(p):
+            return
+        entity_path = None
+        dept_id = None
+        try:
+            item = getattr(self._inspector, "_current_item", None)
+            if item is not None and getattr(item, "path", None):
+                entity_path = Path(item.path)
+            dept_id = getattr(self._inspector, "_last_focused_department", None)
+        except Exception:
+            pass
+        self._open_video_preview_with_request(
+            VideoPreviewOpenRequest(
+                path=p,
+                context=PreviewContext.entity,
+                sibling_paths=list_video_siblings(p),
+                entity_path=entity_path,
+                department_id=dept_id,
+            )
+        )
+
+    def _open_video_preview_with_request(self, request: VideoPreviewOpenRequest) -> None:
+        existing = self._video_preview_dialog
+        if existing is not None and existing.isVisible():
+            try:
+                existing.release_player()
+                existing.close()
+            except Exception:
+                pass
+        dlg = VideoPreviewDialog(
+            request.path,
+            request=request,
+            sibling_paths=request.sibling_paths,
+            settings=self._settings,
+            parent=self,
+        )
+        self._video_preview_dialog = dlg
+        dlg.closed.connect(lambda: setattr(self, "_video_preview_dialog", None))
+        dlg.export_completed.connect(self._on_video_export_completed)
+        dlg.open_all_notes_requested.connect(self._on_video_preview_open_all_notes)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_video_preview_open_all_notes(self) -> None:
+        item = getattr(self._inspector, "_current_item", None)
+        if item is None:
+            return
+        self._on_item_notes_dialog_requested(item)
+
+    def _open_sequence_preview(self, request: object) -> None:
+        if not isinstance(request, SequencePreviewOpenRequest):
+            return
+        existing = self._sequence_preview_dialog
+        if existing is not None and existing.isVisible():
+            try:
+                existing.close()
+            except Exception:
+                pass
+        dlg = SequencePreviewDialog(
+            request.frames,
+            sequence_folder=request.sequence_folder,
+            fps=request.fps,
+            entity_path=request.entity_path,
+            settings=self._settings,
+            parent=self,
+        )
+        self._sequence_preview_dialog = dlg
+        dlg.closed.connect(lambda: setattr(self, "_sequence_preview_dialog", None))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _open_video_preview(self, path) -> None:
+        """Legacy entry — treat as entity context."""
+        p = Path(path) if path is not None else None
+        if p is None or not is_video_path(p):
+            return
+        self._open_video_preview_with_request(
+            VideoPreviewOpenRequest(
+                path=p,
+                context=PreviewContext.entity,
+                sibling_paths=list_video_siblings(p),
+            )
+        )
+
+    def _on_video_export_completed(self, outputs) -> None:
+        """Refresh thumbnails for exported clips written inside the open project."""
+        if not outputs:
+            return
+        try:
+            paths = [Path(p) for p in outputs]
+        except Exception:
+            return
+        root = getattr(self, "_project_root", None)
+        in_project = paths_under_project_root(paths, root)
+        if not in_project:
+            return
+        mgr = getattr(self, "_thumbnail_manager", None)
+        for p in in_project:
+            if mgr is not None:
+                try:
+                    mgr.invalidate_file(p)
+                except Exception:
+                    pass
+            try:
+                self._app_state.invalidate_thumbnails([str(p)])
+            except Exception:
+                pass
+        # New files under Project Guide / Inbox trees — best-effort refresh.
+        try:
+            if self._reference_page_widget is not None:
+                self._reference_page_widget.refresh_tree()
+        except Exception:
+            pass
+        try:
+            if self._inbox_page_widget is not None:
+                self._inbox_page_widget.refresh_tree()
+        except Exception:
+            pass
+
     def _on_inbox_tree_selection_changed(self, path) -> None:
         self._inspector.set_inbox_tree_preview(Path(path) if path else None)
 
@@ -6063,6 +6235,7 @@ class MainWindow(FramelessMainWindow):
             return
         if not copy_only:
             # Release inspector preview (video/thumb handles) before in-place moves.
+            self._release_video_preview()
             self._inspector.set_inbox_tree_preview(None)
             QApplication.processEvents()
         added = 0

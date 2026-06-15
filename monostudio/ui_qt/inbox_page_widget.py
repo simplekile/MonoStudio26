@@ -62,6 +62,7 @@ class InboxPageWidget(QWidget):
     drop_requested = Signal(object, object, bool)  # list[Path], drop target, copy_only
     import_requested = Signal(object)  # Path | None
     date_folder_entered = Signal(str, object)  # (type_filter, browse path)
+    video_preview_requested = Signal(object)  # Path
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -177,6 +178,7 @@ class InboxPageWidget(QWidget):
             self._tree_pane.history_requested.connect(self._on_history_clicked)
             self._tree_pane.browse_path_changed.connect(self._on_browse_path_changed)
             self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
+            self._tree_pane.video_preview_requested.connect(self.video_preview_requested.emit)
             self._content_lay.addWidget(self._tree_pane, 1)
         else:
             self._tree_pane.set_date_folder_path(root)

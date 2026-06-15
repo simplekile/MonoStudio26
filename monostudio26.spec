@@ -22,6 +22,7 @@ datas = [
     (os.path.join(repo, 'fonts'), 'fonts'),
     (os.path.join(repo, 'monos_blender'), 'monos_blender'),
 ]
+# libmpv: optional tools/mpv/ copied by build_installer.ps1 → dist/MonoStudio26/tools/mpv/ (see tools/mpv/README.txt)
 
 a = Analysis(
     [os.path.join(repo, 'app.py')],

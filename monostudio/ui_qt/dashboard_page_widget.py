@@ -68,8 +68,7 @@ _COLOR_OVERDUE = schedule_attention_accent("overdue")
 _COLOR_DUE_SOON = "#60a5fa"
 
 
-def _dept_scope_chip(text: str, *, tone: str, parent=None) -> QLabel:
-    accent = page_scope_accent(tone)
+def _dept_workload_attention_badge(text: str, *, accent: str, parent=None) -> QLabel:
     lab = QLabel(text, parent)
     lab.setFont(monos_font("Inter", 10, QFont.Weight.DemiBold))
     lab.setStyleSheet(
@@ -77,6 +76,37 @@ def _dept_scope_chip(text: str, *, tone: str, parent=None) -> QLabel:
         "border-radius: 5px; padding: 2px 6px;"
     )
     return lab
+
+
+_SCOPE_BADGE_LABEL = {"shot": "Shots", "asset": "Assets"}
+
+
+def _dept_workload_scope_badges(
+    *,
+    scope: str,
+    scheduled: int,
+    due_soon: int = 0,
+    overdue: int = 0,
+    parent=None,
+) -> list[QLabel]:
+    """Muted scope + count; colored pills only for overdue / due soon."""
+    scope_key = (scope or "").strip().lower()
+    label = _SCOPE_BADGE_LABEL.get(scope_key, scope_key.title() or "Items")
+    meta = MONOS_COLORS.get("text_meta", "#71717a")
+    widgets: list[QLabel] = []
+    meta_lab = QLabel(f"{label} · {scheduled} scheduled", parent)
+    meta_lab.setFont(monos_font("Inter", 10, QFont.Weight.Medium))
+    meta_lab.setStyleSheet(f"color: {meta}; background: transparent;")
+    widgets.append(meta_lab)
+    if overdue > 0:
+        widgets.append(
+            _dept_workload_attention_badge(f"{overdue} overdue", accent=_COLOR_OVERDUE, parent=parent)
+        )
+    if due_soon > 0:
+        widgets.append(
+            _dept_workload_attention_badge(f"{due_soon} soon", accent=_COLOR_DUE_SOON, parent=parent)
+        )
+    return widgets
 
 
 def _dept_workload_meta(stat: DashboardDeptStat) -> str:
@@ -1346,26 +1376,35 @@ class DashboardPageWidget(QWidget):
         left.setStyleSheet("background: transparent;")
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(0, 0, 0, 0)
-        left_l.setSpacing(2)
+        left_l.setSpacing(3)
         name = DashboardElidedLabel(
             s.department_label,
-            font=monos_font("Inter", 12, QFont.Weight.DemiBold),
+            font=monos_font("Inter", 13, QFont.Weight.DemiBold),
             parent=left,
         )
-        name.setStyleSheet("color: #e4e4e7; background: transparent;")
+        name.setStyleSheet("color: #fafafa; background: transparent;")
         left_l.addWidget(name, 0)
+        chip_widgets: list[QLabel] = []
         if s.applies_to_shots:
-            shot_txt = f"Shots {s.shots_total}"
-            if s.shots_due_soon:
-                shot_txt += f" · {s.shots_due_soon} soon"
-            chip_widgets = [_dept_scope_chip(shot_txt, tone="shot", parent=left)]
-        else:
-            chip_widgets = []
+            chip_widgets.extend(
+                _dept_workload_scope_badges(
+                    scope="shot",
+                    scheduled=s.shots_total,
+                    due_soon=s.shots_due_soon,
+                    overdue=s.shots_overdue,
+                    parent=left,
+                )
+            )
         if s.applies_to_assets:
-            asset_txt = f"Assets {s.assets_total}"
-            if s.assets_due_soon:
-                asset_txt += f" · {s.assets_due_soon} soon"
-            chip_widgets.append(_dept_scope_chip(asset_txt, tone="asset", parent=left))
+            chip_widgets.extend(
+                _dept_workload_scope_badges(
+                    scope="asset",
+                    scheduled=s.assets_total,
+                    due_soon=s.assets_due_soon,
+                    overdue=s.assets_overdue,
+                    parent=left,
+                )
+            )
         if chip_widgets:
             chips_host = QWidget(left)
             chips_host.setStyleSheet("background: transparent;")

@@ -99,6 +99,7 @@ from monostudio.ui_qt.thumbnails import (
     get_thumbnail_sequence_ignore_extensions,
     get_thumbnail_sequence_ignore_tokens,
     is_direct_media_preview_path,
+    is_video_preview_path,
     media_source_max_side,
     resolve_thumbnail_path,
 )
@@ -107,7 +108,9 @@ from monostudio.ui_qt.thumbnail_source_resolve import (
     resolve_department_work_path_for_preview,
     resolve_entity_thumbnail_source_path,
 )
+from monostudio.core.video_media import resolve_work_preview_video
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
+from monostudio.ui_qt.video_preview_context import SequencePreviewOpenRequest
 from monostudio.ui_qt.view_item_mtime import view_item_last_updated_display
 from monostudio.core.fs_reader import work_file_prefix
 from monostudio.ui_qt.main_view import (
@@ -449,6 +452,8 @@ class InspectorPanel(QWidget):
     edit_allocation_requested = Signal()
     assignee_changed = Signal(str, str, str, object)
     assignment_confirmed = Signal()
+    video_preview_requested = Signal(object)  # Path
+    sequence_preview_requested = Signal(object)  # SequencePreviewOpenRequest
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -504,6 +509,8 @@ class InspectorPanel(QWidget):
         self._asset_status.item_notes_clicked.connect(self.item_notes_dialog_requested.emit)
         self._preview.paste_requested.connect(self._on_paste_requested)
         self._preview.remove_requested.connect(self._on_remove_requested)
+        self._preview.video_preview_requested.connect(self.video_preview_requested.emit)
+        self._preview.sequence_preview_requested.connect(self.sequence_preview_requested.emit)
         self._show_publish: bool = False
         self._last_focused_department: str | None = None
         self._asset_status.open_asset_folder_clicked.connect(self._on_open_asset_folder_requested)
@@ -2492,6 +2499,8 @@ class _InspectorSeqDecodeRunnable(QRunnable):
 class _InspectorPreview(QWidget):
     paste_requested = Signal()
     remove_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    video_preview_requested = Signal(object)  # Path
+    sequence_preview_requested = Signal(object)  # SequencePreviewOpenRequest
 
     _PREVIEW_CACHE_MAX = 50
     _PREVIEW_RESIZE_DEBOUNCE_MS = 200
@@ -2518,6 +2527,7 @@ class _InspectorPreview(QWidget):
         self._container.sequence_play_clicked.connect(self._toggle_inspector_inline_seq_play)
         self._container._w.context_menu_requested.connect(self._open_context_menu)
         self._container._w.installEventFilter(self)
+        self._container._w.setToolTip("Double-click for large review · Ctrl+F fullscreen in player")
         self._set_paste_enabled(False)
         self._seq_pool: QThreadPool | None = None
         self._seq_sig = _InspectorSeqDecodeSignaler(self)
@@ -3225,8 +3235,34 @@ class _InspectorPreview(QWidget):
             return False
         if et == QEvent.Type.MouseButtonDblClick and isinstance(event, QMouseEvent):
             if event.button() == Qt.MouseButton.LeftButton:
-                if self._resolve_inspector_thumbnail_disk_path() is None:
+                thumb_path = self._resolve_inspector_thumbnail_disk_path()
+                if thumb_path is None:
                     return False
+                item = self._item
+                if thumb_path is not None and is_video_preview_path(thumb_path):
+                    self.video_preview_requested.emit(thumb_path)
+                    return True
+                if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+                    wp, wf = self._work_paths_for_preview_item(item)
+                    if wp is not None:
+                        blast = resolve_work_preview_video(wp, wf)
+                        if blast is not None:
+                            self.video_preview_requested.emit(blast)
+                            return True
+                if self._sequence_frames and self._sequence_folder is not None:
+                    fps = read_sequence_preview_fps(self._qsettings)
+                    entity_path = None
+                    if item is not None and getattr(item, "path", None):
+                        entity_path = Path(item.path)
+                    self.sequence_preview_requested.emit(
+                        SequencePreviewOpenRequest(
+                            frames=list(self._sequence_frames),
+                            sequence_folder=self._sequence_folder,
+                            fps=max(1, min(60, int(fps))),
+                            entity_path=entity_path,
+                        )
+                    )
+                    return True
                 if self._seq_playing:
                     self._seq_playing = False
                     self._seq_tick.stop()
@@ -3663,6 +3699,30 @@ class _InspectorPreview(QWidget):
         act_open.setEnabled(open_path is not None)
         act_open.triggered.connect(self._open_inspector_thumbnail_externally)
         menu.addAction(act_open)
+
+        if item is not None and item.kind == ViewItemKind.INBOX_ITEM:
+            vpath = item.path
+            if vpath.is_file() and is_video_preview_path(vpath):
+                act_play = QAction(
+                    lucide_icon("play", size=16, color_hex=MONOS_COLORS["text_label"]),
+                    "Play video…",
+                    menu,
+                )
+                act_play.triggered.connect(lambda: self.video_preview_requested.emit(vpath))
+                menu.insertAction(act_open, act_play)
+
+        if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            wp, wf = self._work_paths_for_preview_item(item)
+            if wp is not None:
+                blast = resolve_work_preview_video(wp, wf)
+                if blast is not None:
+                    act_blast = QAction(
+                        lucide_icon("play", size=16, color_hex=MONOS_COLORS["text_label"]),
+                        "Play playblast…",
+                        menu,
+                    )
+                    act_blast.triggered.connect(lambda p=blast: self.video_preview_requested.emit(p))
+                    menu.insertAction(act_open, act_blast)
 
         seq_dir = self._sequence_folder if (self._sequence_folder is not None and self._sequence_folder.is_dir()) else None
         act_open_render = QAction(

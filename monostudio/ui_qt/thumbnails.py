@@ -589,6 +589,13 @@ def is_direct_media_preview_path(path: Path) -> bool:
     return ext in _IMAGE_EXTENSIONS or ext in _VIDEO_EXTENSIONS
 
 
+def is_video_preview_path(path: Path) -> bool:
+    """True when *path* is a video file supported by the video preview dialog."""
+    if not path.is_file():
+        return False
+    return (path.suffix or "").strip().lower() in _VIDEO_EXTENSIONS
+
+
 def explorer_grid_thumb_decode_px(*, dpr: float = 1.0, card_width: int = EXPLORER_GRID_CARD_WIDTH_PX) -> int:
     """Device-pixel decode size for 16:9 explorer grid thumb (1:1 with painted band, no upscale)."""
     dpr_v = max(1.0, float(dpr))

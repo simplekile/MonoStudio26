@@ -82,6 +82,23 @@ from monostudio.ui_qt.inspector_preview_settings import (
     write_inspector_thumbnail_source,
     write_sequence_preview_fps,
 )
+from monostudio.ui_qt.video_preview_settings import (
+    BACKEND_AUTO,
+    BACKEND_EXTERNAL,
+    BACKEND_MPV,
+    BACKEND_QT,
+    read_mpv_directory,
+    read_video_external_player_exe,
+    read_video_player_backend,
+    write_mpv_directory,
+    write_video_external_player_exe,
+    write_video_player_backend,
+)
+from monostudio.core.mpv_resolve import format_mpv_detect_status, resolve_mpv_dll
+from monostudio.core.mpv_install import (
+    MPV_BUILDS_PAGE,
+    MPV_WIN64_7Z_NAME,
+)
 from monostudio.ui_qt.pipeline_structure_editor import PipelineStructureEditorWidget
 from monostudio.ui_qt.settings_section_widgets import (
     SettingsSegmentedControl,
@@ -165,11 +182,38 @@ def _configure_update_cancel_btn(btn: QToolButton) -> None:
 
 
 def _measure_update_action_width(btn: QPushButton) -> int:
+    if not btn.icon().isNull() and btn.iconSize().width() <= 0:
+        btn.setIconSize(QSize(16, 16))
+    btn.ensurePolished()
+    hint_w = btn.sizeHint().width()
+    if hint_w > 0:
+        return max(_UPDATE_ACTION_WIDTH_MIN, hint_w)
     fm = btn.fontMetrics()
     w = fm.horizontalAdvance(btn.text()) + _UPDATE_ACTION_PADDING_X + 4
     if not btn.icon().isNull():
         w += btn.iconSize().width() + 4
     return max(_UPDATE_ACTION_WIDTH_MIN, w)
+
+
+def _apply_update_tool_action_slot(
+    get_btn: QPushButton,
+    install_btn: QPushButton,
+    prog: QProgressBar,
+    stack: QStackedWidget,
+    outer: QWidget,
+    *,
+    leading_width: int = 28,
+    leading_gap: int = 6,
+) -> int:
+    """Size Get/Install stacked action slot (+ leading locate button) on Updates tool rows."""
+    action_w = max(_measure_update_action_width(get_btn), _measure_update_action_width(install_btn))
+    slot_w = action_w + _UPDATE_CANCEL_GAP + _UPDATE_CANCEL_BTN_WIDTH
+    for btn in (get_btn, install_btn):
+        btn.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
+    prog.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
+    stack.setFixedSize(slot_w, _UPDATE_ACTION_HEIGHT)
+    outer.setFixedSize(leading_width + leading_gap + slot_w, _UPDATE_ACTION_HEIGHT)
+    return action_w
 
 
 def _apply_update_action_width(
@@ -355,6 +399,61 @@ class _FfmpegInstallWorker(QThread):
             self.err.emit(str(e).replace("\n", " ")[:400])
 
 
+class _Mpv7zDownloadWorker(QThread):
+    """Download mpv portable .7z to temp."""
+
+    download_finished = Signal(bool, str, str)
+    progress = Signal(int, int)
+
+    def __init__(self, dest_path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self._dest_path = dest_path
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _progress_callback(self, read: int, total: int | None) -> None:
+        if self._cancelled:
+            raise RuntimeError("Cancelled")
+        self.progress.emit(read, total or 0)
+
+    def run(self) -> None:
+        from monostudio.core.mpv_install import download_mpv_win64_7z
+
+        try:
+            download_mpv_win64_7z(self._dest_path, progress_callback=self._progress_callback)
+            if self._cancelled:
+                self.download_finished.emit(False, str(self._dest_path), "Cancelled")
+                return
+            self.download_finished.emit(True, str(self._dest_path), "")
+        except RuntimeError as e:
+            if "Cancelled" in str(e):
+                self.download_finished.emit(False, str(self._dest_path), "Cancelled")
+            else:
+                self.download_finished.emit(False, str(self._dest_path), str(e))
+        except Exception as e:
+            self.download_finished.emit(False, str(self._dest_path), str(e))
+
+
+class _MpvInstallWorker(QThread):
+    ok = Signal(str)
+    err = Signal(str)
+
+    def __init__(self, archive_path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self._archive_path = archive_path
+
+    def run(self) -> None:
+        try:
+            from monostudio.core.mpv_install import extract_mpv_portable_7z
+
+            p = extract_mpv_portable_7z(self._archive_path)
+            self.ok.emit(str(p.resolve()))
+        except Exception as e:
+            self.err.emit(str(e).replace("\n", " ")[:400])
+
+
 def _is_valid_type_id(type_id: str) -> bool:
     if not type_id:
         return False
@@ -437,6 +536,11 @@ class SettingsDialog(MonosDialog):
         self._ffmpeg_pending_zip: Path | None = None
         self._ffmpeg_download_worker: _FfmpegZipDownloadWorker | None = None
         self._ffmpeg_install_worker: _FfmpegInstallWorker | None = None
+
+        self._mpv_pending_7z: Path | None = None
+        self._mpv_download_worker: _Mpv7zDownloadWorker | None = None
+        self._mpv_install_worker: _MpvInstallWorker | None = None
+        self._mpv_detect_helper: QLabel | None = None
 
         self._pipeline_access_banner: QLabel | None = None
         self._access_status_label: QLabel | None = None
@@ -937,6 +1041,89 @@ class SettingsDialog(MonosDialog):
             "Double-click the Inspector thumbnail (or Open thumbnail file) runs this app with the image path. "
             "Hover the preview for sequence play/pause.",
         )
+
+        insp_l.addWidget(settings_divider(insp_card))
+        add_settings_subsection_title(insp_l, "Video preview player")
+
+        self._video_player_backend_combo = QComboBox(insp_card)
+        style_settings_combo(self._video_player_backend_combo, width=220)
+        for label, val in (
+            ("mpv embed (default)", BACKEND_MPV),
+            ("Auto (mpv → Qt → external)", BACKEND_AUTO),
+            ("Qt Multimedia only", BACKEND_QT),
+            ("External app only", BACKEND_EXTERNAL),
+        ):
+            self._video_player_backend_combo.addItem(label, val)
+        try:
+            cur = read_video_player_backend(self._settings)
+            for i in range(self._video_player_backend_combo.count()):
+                if self._video_player_backend_combo.itemData(i) == cur:
+                    self._video_player_backend_combo.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+        add_settings_field_row(insp_l, "Playback backend", self._video_player_backend_combo)
+
+        mpv_row = QWidget(insp_card)
+        mpv_row_l = QHBoxLayout(mpv_row)
+        mpv_row_l.setContentsMargins(0, 0, 0, 0)
+        mpv_row_l.setSpacing(8)
+        self._mpv_dir_field = QLineEdit(mpv_row)
+        style_settings_line_edit(self._mpv_dir_field, min_width=200)
+        self._mpv_dir_field.setPlaceholderText("Folder containing mpv-2.dll (optional)")
+        try:
+            self._mpv_dir_field.setText(read_mpv_directory(self._settings))
+        except Exception:
+            self._mpv_dir_field.setText("")
+        btn_mpv_browse = QPushButton("Browse…", mpv_row)
+        btn_mpv_browse.setObjectName("SettingsCategoryActionButton")
+        btn_mpv_browse.clicked.connect(self._browse_mpv_directory)
+        btn_mpv_clear = QPushButton("Clear", mpv_row)
+        btn_mpv_clear.setObjectName("SettingsCategoryActionButton")
+        btn_mpv_clear.clicked.connect(lambda: self._mpv_dir_field.setText(""))
+        mpv_row_l.addWidget(self._mpv_dir_field, 1)
+        mpv_row_l.addWidget(btn_mpv_browse, 0)
+        mpv_row_l.addWidget(btn_mpv_clear, 0)
+        insp_l.addWidget(mpv_row)
+        add_settings_field_row(insp_l, "libmpv folder", mpv_row)
+
+        vid_ext_row = QWidget(insp_card)
+        vid_ext_row_l = QHBoxLayout(vid_ext_row)
+        vid_ext_row_l.setContentsMargins(0, 0, 0, 0)
+        vid_ext_row_l.setSpacing(8)
+        self._video_external_player_field = QLineEdit(vid_ext_row)
+        style_settings_line_edit(self._video_external_player_field, min_width=200)
+        self._video_external_player_field.setPlaceholderText("External player .exe (fallback)")
+        try:
+            self._video_external_player_field.setText(read_video_external_player_exe(self._settings))
+        except Exception:
+            self._video_external_player_field.setText("")
+        btn_vid_browse = QPushButton("Browse…", vid_ext_row)
+        btn_vid_browse.setObjectName("SettingsCategoryActionButton")
+        btn_vid_browse.clicked.connect(self._browse_video_external_player)
+        btn_vid_clear = QPushButton("Clear", vid_ext_row)
+        btn_vid_clear.setObjectName("SettingsCategoryActionButton")
+        btn_vid_clear.clicked.connect(lambda: self._video_external_player_field.setText(""))
+        vid_ext_row_l.addWidget(self._video_external_player_field, 1)
+        vid_ext_row_l.addWidget(btn_vid_browse, 0)
+        vid_ext_row_l.addWidget(btn_vid_clear, 0)
+        insp_l.addWidget(vid_ext_row)
+        add_settings_field_row(insp_l, "External player", vid_ext_row)
+
+        mpv_status = "not found"
+        try:
+            mpv_status = format_mpv_detect_status(self._settings)
+        except Exception:
+            pass
+        self._mpv_detect_helper = QLabel(
+            "Embedded playback uses libmpv (mpv-2.dll). Install via Settings → Updates → libmpv, "
+            "or bundle at build time. Double-click a video in Inbox or Project Guide to preview. "
+            f"Detected: {mpv_status}",
+            insp_card,
+        )
+        self._mpv_detect_helper.setWordWrap(True)
+        self._mpv_detect_helper.setObjectName("DialogHelper")
+        insp_l.addWidget(self._mpv_detect_helper)
         layout.addWidget(insp_card)
 
         tray_card, tray_l = add_settings_section(
@@ -1141,6 +1328,44 @@ class SettingsDialog(MonosDialog):
         )
         if path and self._inspector_thumb_open_exe_field is not None:
             self._inspector_thumb_open_exe_field.setText(path.strip())
+
+    def _browse_mpv_directory(self) -> None:
+        start = ""
+        try:
+            if self._mpv_dir_field is not None:
+                t = (self._mpv_dir_field.text() or "").strip()
+                if t:
+                    p = Path(t)
+                    start = str(p if p.is_dir() else p.parent)
+        except Exception:
+            start = ""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select folder containing mpv-2.dll",
+            start,
+        )
+        if folder and self._mpv_dir_field is not None:
+            self._mpv_dir_field.setText(folder.strip())
+
+    def _browse_video_external_player(self) -> None:
+        start = ""
+        try:
+            if self._video_external_player_field is not None:
+                t = (self._video_external_player_field.text() or "").strip()
+                if t:
+                    p = Path(t)
+                    if p.parent.is_dir():
+                        start = str(p.parent)
+        except Exception:
+            start = ""
+        path, _flt = QFileDialog.getOpenFileName(
+            self,
+            "Select external video player",
+            start,
+            "Executable (*.exe);;All files (*.*)",
+        )
+        if path and self._video_external_player_field is not None:
+            self._video_external_player_field.setText(path.strip())
 
     def _build_behavior_tab(self) -> QWidget:
         """General → Behavior: global pipeline options (create asset/shot)."""
@@ -1771,7 +1996,9 @@ class SettingsDialog(MonosDialog):
             list_layout.addWidget(row)
 
         self._build_ffmpeg_update_row(list_container, list_layout)
+        self._build_mpv_update_row(list_container, list_layout)
         self._refresh_ffmpeg_update_row()
+        self._refresh_mpv_update_row()
 
         layout.addWidget(list_container)
 
@@ -1788,7 +2015,8 @@ class SettingsDialog(MonosDialog):
 
         hint = QLabel(
             "Updates are delivered via GitHub Releases. Download runs the installer and closes the app. "
-            "FFmpeg is used for DPX / EXR / video thumbnails — Get FFmpeg (download to temp) then Install, or locate ffmpeg.exe.",
+            "FFmpeg is used for DPX / EXR / video thumbnails — Get FFmpeg (download to temp) then Install, or locate ffmpeg.exe. "
+            "libmpv (mpv-2.dll) powers embedded video preview — Get libmpv then Install (requires 7-Zip).",
             root,
         )
         hint.setWordWrap(True)
@@ -1805,7 +2033,6 @@ class SettingsDialog(MonosDialog):
         """FFmpeg row: Get → download to temp → Install (extract to LocalAppData) + locate + official link."""
         row = QWidget(list_container)
         row.setObjectName("UpdateProductListRow")
-        row.setProperty("last", "true")
         row.setFixedHeight(44)
         row_l = QHBoxLayout(row)
         row_l.setContentsMargins(12, 0, 12, 0)
@@ -1859,8 +2086,9 @@ class SettingsDialog(MonosDialog):
         pg_l = QHBoxLayout(page_get)
         pg_l.setContentsMargins(0, 0, 0, 0)
         get_btn = QPushButton("Get FFmpeg", page_get)
-        get_btn.setObjectName("SettingsCategoryActionButton")
+        get_btn.setObjectName("UpdateProductListBtnLatest")
         get_btn.setIcon(lucide_icon("download", size=16, color_hex="#a1a1aa"))
+        get_btn.setIconSize(QSize(16, 16))
         get_btn.setToolTip(
             "Download ffmpeg-release-essentials.zip to temp, then click Install. "
             "Other packages: Official builds."
@@ -1889,18 +2117,13 @@ class SettingsDialog(MonosDialog):
         install_btn = QPushButton("Install", page_inst)
         install_btn.setObjectName("UpdateProductListBtnDownload")
         install_btn.setIcon(lucide_icon("package", size=16, color_hex="#fafafa"))
+        install_btn.setIconSize(QSize(16, 16))
         install_btn.setToolTip("Extract to %LOCALAPPDATA%\\MonoStudio\\tools\\ffmpeg and register ffmpeg.exe")
         install_btn.clicked.connect(self._on_ffmpeg_install_clicked)
         pi_l.addWidget(install_btn)
         stack.addWidget(page_inst)
 
-        action_w = max(_measure_update_action_width(get_btn), _measure_update_action_width(install_btn))
-        slot_w = action_w + _UPDATE_CANCEL_GAP + _UPDATE_CANCEL_BTN_WIDTH
-        get_btn.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
-        install_btn.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
-        prog.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
-        stack.setFixedSize(slot_w, _UPDATE_ACTION_HEIGHT)
-        outer.setFixedSize(28 + 6 + slot_w, _UPDATE_ACTION_HEIGHT)
+        _apply_update_tool_action_slot(get_btn, install_btn, prog, stack, outer)
 
         outer_l.addWidget(stack)
         row_l.addWidget(outer)
@@ -1912,6 +2135,135 @@ class SettingsDialog(MonosDialog):
         self._ffmpeg_install_btn = install_btn
         stack.setCurrentIndex(0)
         list_layout.addWidget(row)
+
+    def _build_mpv_update_row(self, list_container: QWidget, list_layout: QVBoxLayout) -> None:
+        """libmpv row: Get → download .7z → Install (extract to LocalAppData) + locate folder."""
+        row = QWidget(list_container)
+        row.setObjectName("UpdateProductListRow")
+        row.setProperty("last", "true")
+        row.setFixedHeight(44)
+        row_l = QHBoxLayout(row)
+        row_l.setContentsMargins(12, 0, 12, 0)
+        row_l.setSpacing(12)
+
+        icon_l = QLabel(row)
+        icon_l.setFixedSize(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
+        icon_l.setScaledContents(True)
+        ic = lucide_icon("play", size=_UPDATE_ROW_ICON_SIZE, color_hex="#a1a1aa")
+        pm = ic.pixmap(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
+        if not pm.isNull():
+            icon_l.setPixmap(pm)
+        row_l.addWidget(icon_l)
+
+        name_l = QLabel("libmpv", row)
+        name_l.setObjectName("UpdateProductListName")
+        row_l.addWidget(name_l)
+
+        ver_l = QLabel("—", row)
+        ver_l.setObjectName("UpdateProductListVersion")
+        ver_l.setProperty("mono", True)
+        row_l.addWidget(ver_l)
+        self._mpv_version_label = ver_l
+
+        row_l.addStretch(1)
+
+        link_btn = QPushButton("Official builds", row)
+        link_btn.setObjectName("UpdateProductListLink")
+        link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        link_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(MPV_BUILDS_PAGE)))
+        row_l.addWidget(link_btn)
+
+        outer = QWidget(row)
+        outer_l = QHBoxLayout(outer)
+        outer_l.setContentsMargins(0, 0, 0, 0)
+        outer_l.setSpacing(6)
+
+        locate_tb = QToolButton(outer)
+        locate_tb.setObjectName("UpdateDownloadCancelBtn")
+        locate_tb.setIcon(lucide_icon("search", size=16, color_hex="#a1a1aa"))
+        locate_tb.setFixedSize(28, _UPDATE_ACTION_HEIGHT)
+        locate_tb.setToolTip("Locate folder containing mpv-2.dll (override)")
+        locate_tb.clicked.connect(self._on_mpv_locate_clicked)
+        outer_l.addWidget(locate_tb)
+
+        stack = QStackedWidget(outer)
+
+        page_get = QWidget(stack)
+        pg_l = QHBoxLayout(page_get)
+        pg_l.setContentsMargins(0, 0, 0, 0)
+        get_btn = QPushButton("Get libmpv", page_get)
+        get_btn.setObjectName("UpdateProductListBtnLatest")
+        get_btn.setIcon(lucide_icon("download", size=16, color_hex="#a1a1aa"))
+        get_btn.setIconSize(QSize(16, 16))
+        get_btn.setToolTip(f"Download {MPV_WIN64_7Z_NAME} to temp, then click Install (needs 7-Zip).")
+        get_btn.clicked.connect(self._on_mpv_download_clicked)
+        pg_l.addWidget(get_btn)
+        stack.addWidget(page_get)
+
+        page_load = QWidget(stack)
+        pl_l = QHBoxLayout(page_load)
+        pl_l.setContentsMargins(0, 0, 0, 0)
+        pl_l.setSpacing(_UPDATE_CANCEL_GAP)
+        prog = QProgressBar(page_load)
+        prog.setObjectName("UpdateDownloadProgress")
+        prog.setMinimum(0)
+        prog.setMaximum(0)
+        cancel_tb = QToolButton(page_load)
+        _configure_update_cancel_btn(cancel_tb)
+        pl_l.addWidget(prog)
+        pl_l.addWidget(cancel_tb)
+        stack.addWidget(page_load)
+
+        page_inst = QWidget(stack)
+        pi_l = QHBoxLayout(page_inst)
+        pi_l.setContentsMargins(0, 0, 0, 0)
+        install_btn = QPushButton("Install", page_inst)
+        install_btn.setObjectName("UpdateProductListBtnDownload")
+        install_btn.setIcon(lucide_icon("package", size=16, color_hex="#fafafa"))
+        install_btn.setIconSize(QSize(16, 16))
+        install_btn.setToolTip("Extract to %LOCALAPPDATA%\\MonoStudio\\tools\\mpv (mpv-2.dll)")
+        install_btn.clicked.connect(self._on_mpv_install_clicked)
+        pi_l.addWidget(install_btn)
+        stack.addWidget(page_inst)
+
+        _apply_update_tool_action_slot(get_btn, install_btn, prog, stack, outer)
+
+        outer_l.addWidget(stack)
+        row_l.addWidget(outer)
+
+        self._mpv_action_stack = stack
+        self._mpv_get_btn = get_btn
+        self._mpv_progress_bar = prog
+        self._mpv_cancel_btn = cancel_tb
+        self._mpv_install_btn = install_btn
+        stack.setCurrentIndex(0)
+        list_layout.addWidget(row)
+
+    def _refresh_mpv_update_row(self) -> None:
+        lab = getattr(self, "_mpv_version_label", None)
+        if lab is None:
+            return
+        try:
+            status = format_mpv_detect_status(self._settings)
+        except Exception:
+            status = "not found"
+        if status.startswith("not found"):
+            lab.setText("Not found")
+        elif status.startswith("bundled:"):
+            lab.setText("Bundled")
+        elif status.startswith("installed:"):
+            lab.setText("Installed")
+        elif status.startswith("manual:"):
+            lab.setText("Manual")
+        else:
+            lab.setText("OK")
+        helper = getattr(self, "_mpv_detect_helper", None)
+        if helper is not None:
+            helper.setText(
+                "Embedded playback uses libmpv (mpv-2.dll). Install via Settings → Updates → libmpv, "
+                "or bundle at build time. Double-click a video in Inbox or Project Guide to preview. "
+                f"Detected: {status}"
+            )
 
     def _refresh_ffmpeg_update_row(self) -> None:
         lab = getattr(self, "_ffmpeg_version_label", None)
@@ -2063,6 +2415,144 @@ class SettingsDialog(MonosDialog):
     def _on_ffmpeg_install_thread_finished(self) -> None:
         self._ffmpeg_install_worker = None
         btn = getattr(self, "_ffmpeg_install_btn", None)
+        if btn is not None:
+            btn.setEnabled(True)
+
+    def _on_mpv_locate_clicked(self) -> None:
+        from monostudio.core.mpv_resolve import find_mpv_dll_under
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select folder containing mpv-2.dll",
+            self._mpv_dir_field.text().strip() if getattr(self, "_mpv_dir_field", None) else "",
+        )
+        if not folder:
+            return
+        p = Path(folder)
+        if find_mpv_dll_under(p) is None:
+            QMessageBox.warning(self, "libmpv", "mpv-2.dll was not found in the selected folder.")
+            return
+        s = self._settings or QSettings("MonoStudio26", "MonoStudio26")
+        write_mpv_directory(s, folder)
+        s.sync()
+        if getattr(self, "_mpv_dir_field", None) is not None:
+            self._mpv_dir_field.setText(folder)
+        self._refresh_mpv_update_row()
+
+    def _on_mpv_download_clicked(self) -> None:
+        stack = getattr(self, "_mpv_action_stack", None)
+        if stack is None:
+            return
+        dest = Path(tempfile.gettempdir()) / "MonoStudio26" / MPV_WIN64_7Z_NAME
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        stack.setCurrentIndex(1)
+        bar = getattr(self, "_mpv_progress_bar", None)
+        if bar is not None:
+            bar.setMinimum(0)
+            bar.setMaximum(0)
+            bar.setValue(0)
+        cancel = getattr(self, "_mpv_cancel_btn", None)
+        if cancel is not None:
+            try:
+                cancel.clicked.disconnect(self._on_mpv_download_cancel_clicked)
+            except (TypeError, RuntimeError):
+                pass
+            cancel.clicked.connect(self._on_mpv_download_cancel_clicked)
+        self._mpv_download_worker = _Mpv7zDownloadWorker(dest, self)
+        self._mpv_download_worker.progress.connect(self._on_mpv_7z_download_progress)
+        self._mpv_download_worker.download_finished.connect(self._on_mpv_7z_download_finished)
+        self._mpv_download_worker.start()
+
+    def _on_mpv_download_cancel_clicked(self) -> None:
+        if self._mpv_download_worker is not None:
+            self._mpv_download_worker.cancel()
+
+    def _on_mpv_7z_download_progress(self, read: int, total: int) -> None:
+        bar = getattr(self, "_mpv_progress_bar", None)
+        if bar is None:
+            return
+        if total > 0:
+            bar.setMaximum(total)
+            bar.setValue(read)
+        else:
+            bar.setMaximum(0)
+            bar.setMinimum(0)
+
+    def _on_mpv_7z_download_finished(self, success: bool, path_str: str, error_message: str = "") -> None:
+        self._mpv_download_worker = None
+        stack = getattr(self, "_mpv_action_stack", None)
+        cancel = getattr(self, "_mpv_cancel_btn", None)
+        if cancel is not None:
+            try:
+                cancel.clicked.disconnect(self._on_mpv_download_cancel_clicked)
+            except (TypeError, RuntimeError):
+                pass
+        bar = getattr(self, "_mpv_progress_bar", None)
+        if bar is not None:
+            bar.setMinimum(0)
+            bar.setMaximum(0)
+        if stack is None:
+            return
+        p = Path(path_str)
+        if success:
+            self._mpv_pending_7z = p
+            stack.setCurrentIndex(2)
+            return
+        stack.setCurrentIndex(0)
+        self._mpv_pending_7z = None
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        err = (error_message or "").strip()
+        if err != "Cancelled":
+            QMessageBox.warning(self, "libmpv download", err[:400] if err else "Download failed.")
+
+    def _on_mpv_install_clicked(self) -> None:
+        z = self._mpv_pending_7z
+        stack = getattr(self, "_mpv_action_stack", None)
+        if z is None or not z.is_file():
+            if stack is not None:
+                stack.setCurrentIndex(0)
+            QMessageBox.warning(self, "libmpv", "No downloaded package. Click Get libmpv first.")
+            return
+        btn = getattr(self, "_mpv_install_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+        self._mpv_install_worker = _MpvInstallWorker(z, self)
+        self._mpv_install_worker.ok.connect(self._on_mpv_install_ok)
+        self._mpv_install_worker.err.connect(self._on_mpv_install_err)
+        self._mpv_install_worker.finished.connect(self._on_mpv_install_thread_finished)
+        self._mpv_install_worker.start()
+
+    def _on_mpv_install_ok(self, dll_path: str) -> None:
+        s = self._settings or QSettings("MonoStudio26", "MonoStudio26")
+        write_mpv_directory(s, "")
+        s.sync()
+        if getattr(self, "_mpv_dir_field", None) is not None:
+            self._mpv_dir_field.setText("")
+        try:
+            if self._mpv_pending_7z is not None:
+                self._mpv_pending_7z.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._mpv_pending_7z = None
+        stack = getattr(self, "_mpv_action_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(0)
+        self._refresh_mpv_update_row()
+        QMessageBox.information(
+            self,
+            "libmpv",
+            f"Installed to Local AppData tools folder.\n{dll_path}\n\nSet Playback backend to Auto or mpv embed.",
+        )
+
+    def _on_mpv_install_err(self, msg: str) -> None:
+        QMessageBox.warning(self, "libmpv install", msg)
+
+    def _on_mpv_install_thread_finished(self) -> None:
+        self._mpv_install_worker = None
+        btn = getattr(self, "_mpv_install_btn", None)
         if btn is not None:
             btn.setEnabled(True)
 
@@ -3354,6 +3844,17 @@ class SettingsDialog(MonosDialog):
                 write_inspector_thumbnail_open_exe(
                     self._settings,
                     (self._inspector_thumb_open_exe_field.text() or "").strip(),
+                )
+            if self._settings is not None and getattr(self, "_video_player_backend_combo", None) is not None:
+                backend = self._video_player_backend_combo.currentData()
+                if isinstance(backend, str):
+                    write_video_player_backend(self._settings, backend)
+            if self._settings is not None and getattr(self, "_mpv_dir_field", None) is not None:
+                write_mpv_directory(self._settings, (self._mpv_dir_field.text() or "").strip())
+            if self._settings is not None and getattr(self, "_video_external_player_field", None) is not None:
+                write_video_external_player_exe(
+                    self._settings,
+                    (self._video_external_player_field.text() or "").strip(),
                 )
         except Exception:
             pass

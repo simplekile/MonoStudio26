@@ -1308,6 +1308,7 @@ class InboxTreePane(QWidget):
     selection_count_changed = Signal(int)
     browse_path_changed = Signal(object)  # Path
     external_drop_requested = Signal(object, object, bool)  # list[Path], target folder, copy_only
+    video_preview_requested = Signal(object)  # Path
 
     def __init__(
         self,
@@ -1938,6 +1939,11 @@ class InboxTreePane(QWidget):
             except Exception:
                 pass
         else:
+            from monostudio.ui_qt.thumbnails import is_video_preview_path
+
+            if is_video_preview_path(path):
+                self.video_preview_requested.emit(path)
+                return
             try:
                 os.startfile(path.resolve())
             except (OSError, AttributeError):
@@ -2359,6 +2365,37 @@ class InboxTreePane(QWidget):
             return False
         return None
 
+    def _primary_selected_file_path(self) -> Path | None:
+        if self._show_toolbar and self._view_mode == "tile" and self._file_grid is not None:
+            sm = self._file_grid.selectionModel()
+            idx = QModelIndex()
+            if sm is not None:
+                selected = sm.selectedIndexes()
+                idx = selected[0] if selected else sm.currentIndex()
+            if idx.isValid() and self._file_model is not None:
+                entry = self._file_model.entry_at(idx.row())
+                return entry.path if entry is not None else None
+            return None
+        sm = self._tree.selectionModel()
+        idx = QModelIndex()
+        if sm is not None:
+            selected = sm.selectedIndexes()
+            idx = selected[0] if selected else self._tree.currentIndex()
+        else:
+            idx = self._tree.currentIndex()
+        if not idx.isValid():
+            return None
+        return self._path_for_tree_index(idx)
+
+    def _open_video_if_selected(self) -> bool:
+        from monostudio.ui_qt.thumbnails import is_video_preview_path
+
+        path = self._primary_selected_file_path()
+        if path is None or not path.is_file() or not is_video_preview_path(path):
+            return False
+        self.video_preview_requested.emit(path)
+        return True
+
     def _delete_selected_paths(self) -> bool:
         paths = self.get_selected_paths()
         if not paths:
@@ -2376,6 +2413,13 @@ class InboxTreePane(QWidget):
             )
             if handled is not None:
                 return handled
+            if (
+                event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            ):
+                if self._open_video_if_selected():
+                    return True
             if (
                 event.type() == QEvent.Type.KeyPress
                 and event.key() == Qt.Key.Key_Delete
@@ -2398,6 +2442,13 @@ class InboxTreePane(QWidget):
                 self._schedule_file_grid_sync()
             if (
                 event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            ):
+                if self._open_video_if_selected():
+                    return True
+            if (
+                event.type() == QEvent.Type.KeyPress
                 and event.key() == Qt.Key.Key_Delete
                 and event.modifiers() == Qt.KeyboardModifier.NoModifier
             ):
@@ -2414,6 +2465,13 @@ class InboxTreePane(QWidget):
         if obj is self._tree:
             if event.type() == QEvent.Type.FocusIn:
                 self._emit_tree_selection()
+            elif (
+                event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            ):
+                if self._open_video_if_selected():
+                    return True
             elif (
                 event.type() == QEvent.Type.KeyPress
                 and event.key() == Qt.Key.Key_Delete
@@ -3182,6 +3240,7 @@ class ReferenceTreePane(QWidget):
     open_folder_requested = Signal(object)  # Path
     import_requested = Signal()
     item_tags_changed = Signal()  # emitted after tag assign/remove so sidebar can refresh counts
+    video_preview_requested = Signal(object)  # Path
 
     def __init__(self, root_path: Path | None, department_label: str, parent=None) -> None:
         super().__init__(parent)
@@ -3725,6 +3784,11 @@ class ReferenceTreePane(QWidget):
             except Exception:
                 pass
         else:
+            from monostudio.ui_qt.thumbnails import is_video_preview_path
+
+            if is_video_preview_path(path):
+                self.video_preview_requested.emit(path)
+                return
             try:
                 os.startfile(path.resolve())
             except (OSError, AttributeError):
@@ -3816,6 +3880,11 @@ class ReferenceTreePane(QWidget):
             return
         path = self._path_from_tree_index(index)
         if path and path.is_file():
+            from monostudio.ui_qt.thumbnails import is_video_preview_path
+
+            if is_video_preview_path(path):
+                self.video_preview_requested.emit(path)
+                return
             try:
                 os.startfile(path.resolve())
             except OSError:
@@ -3917,6 +3986,20 @@ class ReferenceTreePane(QWidget):
         if obj is self._tree and event.type() == QEvent.Type.FocusIn:
             self._emit_tree_selection()
             return super().eventFilter(obj, event)
+        if obj is self._tree:
+            if (
+                event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            ):
+                idx = self._tree.currentIndex()
+                path = self._path_from_tree_index(idx) if idx.isValid() else None
+                if path is not None and path.is_file():
+                    from monostudio.ui_qt.thumbnails import is_video_preview_path
+
+                    if is_video_preview_path(path):
+                        self.video_preview_requested.emit(path)
+                        return True
         if obj is self._tree.viewport():
             if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
                 self._middle_drag.on_mouse_press(event)

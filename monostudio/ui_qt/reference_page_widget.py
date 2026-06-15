@@ -59,6 +59,7 @@ class ReferencePageWidget(QWidget):
     import_requested = Signal()
     open_folder_requested = Signal(object)  # Path
     item_tags_changed = Signal()
+    video_preview_requested = Signal(object)  # Path
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -183,6 +184,7 @@ class ReferencePageWidget(QWidget):
             self._tree_pane.import_requested.connect(self.import_requested.emit)
             self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
             self._tree_pane.item_tags_changed.connect(self.item_tags_changed.emit)
+            self._tree_pane.video_preview_requested.connect(self.video_preview_requested.emit)
             self._content_lay.addWidget(self._tree_pane, 1)
             key = self._tree_state_key(self._department)
             saved = self._tree_state_cache.get(key)

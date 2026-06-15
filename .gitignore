@@ -22,5 +22,10 @@ monostudio_dcc_debug.log
 build/
 dist/
 
+# Bundled libmpv binaries (maintainers copy before release build; see tools/mpv/README.txt)
+tools/mpv/*.dll
+tools/mpv/*.exe
+tools/mpv/*.manifest
+
 # Temporary files
 temp_*

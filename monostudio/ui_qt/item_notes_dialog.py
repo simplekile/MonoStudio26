@@ -67,24 +67,25 @@ def _format_local_time(iso_at: str) -> str:
         return s[:16] if len(s) >= 16 else s
 
 
-def _entries_fingerprint(entries: list[ItemCommentEntry]) -> tuple:
-    return tuple(
-        (
-            e.id,
-            e.at,
-            e.author,
-            e.text,
-            e.done,
-            e.done_at,
-            e.author_id,
-            e.body_html,
-            e.mentions,
-            e.department,
-            tuple((r.at, r.editor, r.text) for r in e.edit_history),
-            tuple((s.user_id, s.at, s.name) for s in e.seen_by),
-        )
-        for e in sorted(entries, key=lambda x: x.id)
+def _entry_fingerprint(entry: ItemCommentEntry) -> tuple:
+    return (
+        entry.id,
+        entry.at,
+        entry.author,
+        entry.text,
+        entry.done,
+        entry.done_at,
+        entry.author_id,
+        entry.body_html,
+        entry.mentions,
+        entry.department,
+        tuple((r.at, r.editor, r.text) for r in entry.edit_history),
+        tuple((s.user_id, s.at, s.name) for s in entry.seen_by),
     )
+
+
+def _entries_fingerprint(entries: list[ItemCommentEntry]) -> tuple:
+    return tuple(_entry_fingerprint(e) for e in sorted(entries, key=lambda x: x.id))
 
 
 def _click_target_blocks_card(w: QWidget | None) -> bool:
@@ -164,6 +165,7 @@ class ItemNotesDialog(MonosDialog):
         )
         self._initial_fp = _entries_fingerprint(self._draft)
         self._known_ids = {e.id for e in self._draft}
+        self._initial_by_id = {e.id: e for e in self._draft}
         self._initial_mentions_by_id = {e.id: frozenset(e.mentions) for e in self._draft}
         self._initial_done_by_id = {e.id: bool(e.done) for e in self._draft}
         self._editing_note_id: str | None = None
@@ -491,6 +493,12 @@ class ItemNotesDialog(MonosDialog):
         n_done = sum(1 for e in self._draft if e.done)
         self._summary.setText(f"{n_open} active · {n_done} completed")
 
+    def _note_is_synced(self, entry: ItemCommentEntry) -> bool:
+        initial = self._initial_by_id.get(entry.id)
+        if initial is None:
+            return False
+        return _entry_fingerprint(entry) == _entry_fingerprint(initial)
+
     def _rebuild_list(self) -> None:
         while self._list_layout.count() > 1:
             item = self._list_layout.takeAt(0)
@@ -543,6 +551,24 @@ class ItemNotesDialog(MonosDialog):
             text_col.addWidget(seen_lab, 0)
         row.addLayout(text_col, 1)
 
+        actions_col = QVBoxLayout()
+        actions_col.setContentsMargins(0, 0, 0, 0)
+        actions_col.setSpacing(4)
+        synced = self._note_is_synced(entry)
+        sync_lab = QLabel(card)
+        sync_lab.setObjectName("ItemNoteSyncedBadge" if synced else "ItemNoteUnsyncedBadge")
+        color = "#4ade80" if synced else "#fbbf24"
+        icon_name = "sync" if synced else "local"
+        sync_lab.setPixmap(
+            lucide_icon(icon_name, size=12, color_hex=color).pixmap(12, 12)
+        )
+        sync_lab.setFixedSize(12, 12)
+        sync_lab.setAlignment(Qt.AlignmentFlag.AlignRight)
+        sync_lab.setToolTip(
+            "Saved to project" if synced else "Changed in this session — Save changes to sync"
+        )
+        actions_col.addWidget(sync_lab, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
         open_btn = QToolButton(card)
         open_btn.setObjectName("ItemNotesOpenButton")
         open_btn.setAutoRaise(True)
@@ -551,7 +577,8 @@ class ItemNotesDialog(MonosDialog):
         open_btn.setIconSize(QSize(16, 16))
         open_btn.setToolTip("View full note")
         open_btn.clicked.connect(lambda _=False, eid=entry.id: self._open_note_view(eid))
-        row.addWidget(open_btn, 0, Qt.AlignmentFlag.AlignTop)
+        actions_col.addWidget(open_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        row.addLayout(actions_col, 0)
 
         card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         card.customContextMenuRequested.connect(
@@ -734,6 +761,7 @@ class ItemNotesDialog(MonosDialog):
         self._dispatch_note_done_for_changed_entries()
         self._initial_fp = _entries_fingerprint(self._draft)
         self._known_ids = {e.id for e in self._draft}
+        self._initial_by_id = {e.id: e for e in self._draft}
         self._initial_done_by_id = {e.id: bool(e.done) for e in self._draft}
         self.notes_changed.emit()
         self.accept()

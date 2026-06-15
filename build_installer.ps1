@@ -66,6 +66,17 @@ Write-Host "Building PyInstaller onedir (dist/MonoStudio26/)..."
 python -m PyInstaller --clean --noconfirm monostudio26.spec
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# 4b) Optional bundled libmpv next to onedir (not inside _internal)
+$mpvSrc = Join-Path $root "tools\mpv"
+$mpvDst = Join-Path $root "dist\MonoStudio26\tools\mpv"
+if (Test-Path (Join-Path $mpvSrc "mpv-2.dll")) {
+    Write-Host "Copying bundled libmpv to dist/MonoStudio26/tools/mpv/ ..."
+    New-Item -ItemType Directory -Force -Path $mpvDst | Out-Null
+    Copy-Item -Path (Join-Path $mpvSrc "*") -Destination $mpvDst -Recurse -Force
+} else {
+    Write-Host "No tools/mpv/mpv-2.dll - skip bundled libmpv (users can Install from Settings -> Updates)."
+}
+
 # 5) Optional: Inno Setup (iscc in PATH or default install path)
 $isccExe = $null
 if (Get-Command iscc -ErrorAction SilentlyContinue) { $isccExe = "iscc" }
