@@ -6,6 +6,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from PySide6.QtCore import QObject, QPoint, QRect, QEvent, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QCursor, QFont, QGuiApplication, QKeySequence, QMouseEvent, QPixmap, QShortcut
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -29,6 +31,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.video_proxy import (
+    format_heavy_proxy_message,
+    is_heavy_source_for_proxy,
+)
+from monostudio.core.video_proxy_cache import (
+    ProxyManifest,
+    clear_proxy_cache_for_source,
+    is_full_proxy_ready,
+    list_cached_range_spans,
+    lookup_full_proxy,
+    lookup_range_proxy,
+)
 from monostudio.core.video_media import (
     VideoFrameRange,
     VideoInfo,
@@ -60,6 +74,7 @@ from monostudio.core.video_media import (
     validate_marker_frame,
     validate_range,
 )
+from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.dialog_geometry import (
     apply_dialog_geometry,
     clamp_dialog_to_bounds,
@@ -75,6 +90,8 @@ from monostudio.ui_qt.review_tools_panel import (
 )
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, MonosMenu, monos_font
 from monostudio.ui_qt.video_export_dialog import VideoExportDialog
+from monostudio.ui_qt.video_proxy_build_worker import ProxyBuildRunnable, ProxyBuildSignaler
+from monostudio.ui_qt.video_proxy_heavy_dialog import ask_build_full_proxy
 from monostudio.ui_qt.video_player_backend import (
     ExternalPlayerBackend,
     PLAYBACK_SPEED_STEPS,
@@ -84,6 +101,7 @@ from monostudio.ui_qt.video_player_backend import (
 from monostudio.ui_qt.video_preview_context import PreviewContext, VideoPreviewOpenRequest
 from monostudio.ui_qt.video_preview_scrubber import VideoPreviewScrubber
 from monostudio.ui_qt.video_preview_settings import (
+    PROXY_SCALE_STEPS,
     read_review_tool_mode,
     read_review_workspace,
     read_video_preview_loop,
@@ -100,6 +118,7 @@ from monostudio.ui_qt.video_preview_settings import (
     write_video_preview_volume,
     TIME_DISPLAY_FRAME,
     TIME_DISPLAY_TIMECODE,
+    PROXY_SCALE_FULL,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +135,7 @@ _VIDEO_SCRUB_DRAG_THRESHOLD_PX = 6
 _PREVIEW_CHROME_PAD_H = 12
 _PREVIEW_CHROME_PAD_V = 8
 _RANGE_UNDO_MAX = 50
+_PROXY_SCALE_LABELS = {1.0: "1", 0.5: "½", 0.25: "¼", 0.125: "⅛"}
 
 
 @dataclass(frozen=True)
@@ -132,6 +152,7 @@ _FULLSCREEN_EDGE_PX = 48
 _FULLSCREEN_CHROME_HIDE_MS = 700
 _DIALOG_BORDER_INSET = 1  # match _MONOS_DIALOG_BORDER_INSET — native embed vs MonosDialog border
 _VIDEO_NATIVE_CLIP_BOTTOM = 1  # mpv / QVideoWidget HWND bleed above timeline divider
+_PREVIEW_TIMELINE_H = 64  # ~80% of prior 80px chrome — scrubber fills block height
 
 
 class _HoverFrameSignaler(QObject):
@@ -251,6 +272,21 @@ class VideoPreviewDialog(MonosDialog):
         self._range_redo_stack: list[_RangeEditSnapshot] = []
         self._applying_range_undo = False
         self._loop_playback = read_video_preview_loop(settings)
+        self._proxy_enabled = False
+        self._proxy_scale = PROXY_SCALE_FULL
+        self._proxy_mode: Literal["off", "full", "range"] = "off"
+        self._full_proxy_ready = False
+        self._full_proxy_manifest: ProxyManifest | None = None
+        self._range_proxy_manifest: ProxyManifest | None = None
+        self._cached_spans: list[tuple[int, int]] = []
+        self._playback_path: Path | None = None
+        self._proxy_build_token = 0
+        self._proxy_build_active_token = 0
+        self._proxy_cancel_flag: list[bool] = [False]
+        self._proxy_heavy_ack_key: str | None = None
+        self._proxy_build_signaler = ProxyBuildSignaler(self)
+        self._proxy_build_signaler.progress.connect(self._on_proxy_build_progress)
+        self._proxy_build_signaler.finished.connect(self._on_proxy_build_finished)
         self._speed = read_video_preview_playback_speed(settings)
         self._volume = read_video_preview_volume(settings)
         self._volume_muted = False
@@ -428,6 +464,24 @@ class VideoPreviewDialog(MonosDialog):
         self._hud.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hud.mousePressEvent = lambda _e: self._copy_timecode()  # type: ignore[method-assign]
 
+        self._proxy_build_overlay = QWidget(self._viewer)
+        self._proxy_build_overlay.setObjectName("VideoPreviewProxyBuildOverlay")
+        self._proxy_build_overlay.hide()
+        proxy_overlay_lay = QVBoxLayout(self._proxy_build_overlay)
+        proxy_overlay_lay.setContentsMargins(16, 12, 16, 12)
+        proxy_overlay_lay.setSpacing(8)
+        self._proxy_build_label = QLabel("Building proxy…", self._proxy_build_overlay)
+        self._proxy_build_label.setObjectName("DialogBody")
+        self._proxy_progress = QProgressBar(self._proxy_build_overlay)
+        self._proxy_progress.setObjectName("VideoPreviewProxyProgress")
+        self._proxy_progress.setRange(0, 1000)
+        self._proxy_progress.setValue(0)
+        self._proxy_build_cancel_btn = QPushButton("Cancel", self._proxy_build_overlay)
+        self._proxy_build_cancel_btn.clicked.connect(self._cancel_proxy_build)
+        proxy_overlay_lay.addWidget(self._proxy_build_label)
+        proxy_overlay_lay.addWidget(self._proxy_progress)
+        proxy_overlay_lay.addWidget(self._proxy_build_cancel_btn, 0, Qt.AlignmentFlag.AlignRight)
+
         self._tool_strip = ReviewToolStrip(self._viewer)
         self._tool_strip.hide()
         self._strip_toggle = QToolButton(self._viewer)
@@ -448,11 +502,13 @@ class VideoPreviewDialog(MonosDialog):
 
         self._timeline_block = QWidget(self._viewer)
         self._timeline_block.setObjectName("VideoPreviewTimelineBlock")
+        self._timeline_block.setFixedHeight(_PREVIEW_TIMELINE_H)
         timeline_lay = QHBoxLayout(self._timeline_block)
         timeline_lay.setContentsMargins(0, 0, 0, 0)
         timeline_lay.setSpacing(0)
 
         self._scrubber = VideoPreviewScrubber(self._timeline_block)
+        self._scrubber.setMinimumHeight(_PREVIEW_TIMELINE_H)
         self._scrubber.setToolTip("")
         self._scrubber.sliderPressed.connect(self._on_scrub_pressed)
         self._scrubber.seek_released.connect(lambda f: self._on_scrub_released(int(f)))
@@ -483,10 +539,10 @@ class VideoPreviewDialog(MonosDialog):
         self._timeline_zoom.setObjectName("VideoPreviewTimelineZoom")
         self._timeline_zoom.setFixedWidth(44)
         zoom_lay = QVBoxLayout(self._timeline_zoom)
-        zoom_lay.setContentsMargins(6, 6, 6, 6)
-        zoom_lay.setSpacing(4)
-        self._btn_tl_fit = self._tool_btn("maximize-2", "Fit timeline (Alt+F)")
-        self._btn_tl_focus = self._tool_btn("scan", "Focus to selected range (F)")
+        zoom_lay.setContentsMargins(4, 2, 4, 2)
+        zoom_lay.setSpacing(2)
+        self._btn_tl_fit = self._tool_btn("maximize-2", "Fit timeline (Alt+F)", compact=True)
+        self._btn_tl_focus = self._tool_btn("scan", "Focus to selected range (F)", compact=True)
         zoom_lay.addWidget(self._btn_tl_fit, 0, Qt.AlignmentFlag.AlignHCenter)
         zoom_lay.addWidget(self._btn_tl_focus, 0, Qt.AlignmentFlag.AlignHCenter)
         zoom_lay.addStretch(1)
@@ -578,6 +634,40 @@ class VideoPreviewDialog(MonosDialog):
         self._chk_loop.setChecked(self._loop_playback)
         self._chk_loop.toggled.connect(self._on_loop_toggled)
         tlay.addWidget(self._chk_loop)
+
+        self._chk_proxy = QCheckBox("Proxy", self._transport)
+        self._chk_proxy.setObjectName("VideoPreviewProxyCheck")
+        self._chk_proxy.setToolTip(
+            "Scrub and playback use H.264 proxy when cached. "
+            "No range: full timeline. With range: cached segment (source outside span). "
+            "Export always uses original."
+        )
+        self._chk_proxy.setChecked(self._proxy_enabled)
+        self._chk_proxy.toggled.connect(self._on_proxy_toggled)
+        tlay.addWidget(self._chk_proxy)
+
+        self._cmb_proxy_scale = QComboBox(self._transport)
+        self._cmb_proxy_scale.setObjectName("VideoPreviewProxyScaleCombo")
+        self._cmb_proxy_scale.setToolTip("Proxy resolution scale")
+        for scale in PROXY_SCALE_STEPS:
+            self._cmb_proxy_scale.addItem(_PROXY_SCALE_LABELS.get(scale, str(scale)), scale)
+        scale_idx = (
+            PROXY_SCALE_STEPS.index(self._proxy_scale)
+            if self._proxy_scale in PROXY_SCALE_STEPS
+            else PROXY_SCALE_STEPS.index(1.0)
+        )
+        self._cmb_proxy_scale.setCurrentIndex(scale_idx)
+        self._cmb_proxy_scale.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._cmb_proxy_scale.currentIndexChanged.connect(self._on_proxy_scale_changed)
+        tlay.addWidget(self._cmb_proxy_scale)
+
+        self._btn_proxy_menu = QToolButton(self._transport)
+        self._btn_proxy_menu.setObjectName("VideoPreviewProxyMenuBtn")
+        self._btn_proxy_menu.setText("…")
+        self._btn_proxy_menu.setToolTip("Proxy actions")
+        self._btn_proxy_menu.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_proxy_menu.clicked.connect(self._show_proxy_menu)
+        tlay.addWidget(self._btn_proxy_menu)
 
         self._cmb_time_display = QComboBox(self._transport)
         self._cmb_time_display.setObjectName("VideoPreviewTimeDisplayCombo")
@@ -691,6 +781,7 @@ class VideoPreviewDialog(MonosDialog):
         self._tools_panel.tool_mode_changed.connect(self._on_tools_mode_changed)
         self._tools_panel.range_selected.connect(self._on_range_selected)
         self._tools_panel.range_delete_requested.connect(self._delete_range)
+        self._tools_panel.range_delete_all_requested.connect(self._delete_all_ranges)
         self._tools_panel.range_duplicate_requested.connect(self._duplicate_range)
         self._tools_panel.go_to_in_requested.connect(self._go_to_range_in)
         self._tools_panel.go_to_out_requested.connect(self._go_to_range_out)
@@ -698,6 +789,7 @@ class VideoPreviewDialog(MonosDialog):
         self._tools_panel.marker_selected.connect(self._on_marker_selected)
         self._tools_panel.marker_deselected.connect(self._on_marker_deselected)
         self._tools_panel.marker_delete_requested.connect(self._delete_marker)
+        self._tools_panel.marker_delete_all_requested.connect(self._delete_all_markers)
         self._tools_panel.marker_label_changed.connect(self._on_marker_label_changed)
         self._tools_panel.marker_export_requested.connect(self._export_markers_png)
         self._tools_panel.open_all_notes_requested.connect(self.open_all_notes_requested.emit)
@@ -1087,6 +1179,9 @@ class VideoPreviewDialog(MonosDialog):
         ]
         if self._status_log:
             parts.append(self._status_log)
+        proxy_tag = self._proxy_footer_tag()
+        if proxy_tag:
+            parts.append(proxy_tag)
         self._footer_label.setText(" · ".join(parts))
 
     def _on_scrubber_footer_context(self, zone: str) -> None:
@@ -1130,6 +1225,14 @@ class VideoPreviewDialog(MonosDialog):
         if self._fullscreen:
             return ["Esc — exit fullscreen", "Bottom edge — timeline", "Right edge — tools"]
 
+        if self._proxy_enabled:
+            parts = ["Space — Play/Pause", "Scrub/play use proxy when cached"]
+            if has_sel and not editing:
+                parts += ["Dbl-click outside — Deselect", "Esc — Deselect"]
+            else:
+                parts.append("Esc — Turn off proxy")
+            return parts
+
         if zone == "video":
             parts = ["Space — Play/Pause"]
             if editing:
@@ -1161,7 +1264,7 @@ class VideoPreviewDialog(MonosDialog):
             if editing:
                 parts = ["I/O — Set In/Out", "Del — Delete", "Esc — Exit edit"]
             elif has_sel:
-                parts = ["E — Edit range", "Del — Delete", "Esc — Deselect"]
+                parts = ["E — Edit range", "Del — Delete", "Dbl-click outside — Deselect", "Esc — Deselect"]
             else:
                 parts = ["LMB — Select", "Dbl-click — Edit", "E — Edit"]
             if range_cycle:
@@ -1183,6 +1286,8 @@ class VideoPreviewDialog(MonosDialog):
                 parts += ["I/O — Set on range", "Esc — Exit edit"]
             else:
                 parts.append("I/O — Mark In/Out")
+            if has_sel and not editing:
+                parts.append("Dbl-click outside — Deselect")
             if range_cycle:
                 parts.append(range_cycle)
             return parts
@@ -1295,6 +1400,9 @@ class VideoPreviewDialog(MonosDialog):
         if self._active_range_id is not None and not self._range_edit_unlocked:
             self._scrubber.clear_overlap_cycle()
             self._on_range_deselected()
+            return
+        if self._proxy_enabled:
+            self._chk_proxy.setChecked(False)
             return
         if self._draft_in is not None or self._draft_out is not None:
             self._draft_in = None
@@ -1480,8 +1588,10 @@ class VideoPreviewDialog(MonosDialog):
         self._playback_primed = True
         frame = self._restore_frame if self._restore_frame is not None else 0
         self._restore_frame = None
-        self._backend.prime_for_scrub()
+        sec = frame / max(1e-6, self._fps())
+        self._backend.prime_for_scrub(initial_sec=sec)
         self._seek_frame(frame)
+        self._sync_playback_loop()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -1510,6 +1620,7 @@ class VideoPreviewDialog(MonosDialog):
         if self._video_attached:
             self._backend.layout_video()
         self._position_hud()
+        self._position_proxy_overlay()
         self._position_tool_strip()
         self._position_strip_toggle()
         self._position_close_btn()
@@ -1518,6 +1629,21 @@ class VideoPreviewDialog(MonosDialog):
         self.raise_border_overlay()
         if getattr(self, "_btn_close", None):
             self._btn_close.raise_()
+
+    def _position_proxy_overlay(self) -> None:
+        overlay = getattr(self, "_proxy_build_overlay", None)
+        if overlay is None or not self._viewer:
+            return
+        if not overlay.isVisible():
+            return
+        area = self._video_overlay_rect()
+        overlay.adjustSize()
+        w = min(320, max(240, area.width() - 32))
+        overlay.setFixedWidth(w)
+        overlay.move(
+            area.left() + (area.width() - w) // 2,
+            area.top() + area.height() // 2 - overlay.height() // 2,
+        )
 
     def _position_hud(self) -> None:
         if not self._hud or not self._viewer:
@@ -1555,6 +1681,9 @@ class VideoPreviewDialog(MonosDialog):
     def _raise_video_overlays(self) -> None:
         if self._hud:
             self._hud.raise_()
+        overlay = getattr(self, "_proxy_build_overlay", None)
+        if overlay and overlay.isVisible():
+            overlay.raise_()
         if self._tool_strip and self._tool_strip.isVisible():
             self._tool_strip.raise_()
         if self._strip_toggle and self._strip_toggle.isVisible():
@@ -1563,6 +1692,7 @@ class VideoPreviewDialog(MonosDialog):
             self._btn_close.raise_()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._cancel_proxy_build()
         self._loop_timer.stop()
         self._scrub_seek_timer.stop()
         self._hover_debounce.stop()
@@ -1621,7 +1751,7 @@ class VideoPreviewDialog(MonosDialog):
             self._update_footer()
             return
         self._range_list().set_fps(self._info.fps)
-        self._scrubber.set_frame_count(self._info.frame_count)
+        self._scrubber.set_frame_count(self._info.frame_count, refit_view=True)
         self._scrubber.clear_overlap_cycle()
         published, working, _from_local = load_video_ranges_for_preview(
             path,
@@ -1645,9 +1775,16 @@ class VideoPreviewDialog(MonosDialog):
         self._restore_frame = saved_frame
         start_frame = saved_frame if saved_frame is not None else 0
         start_sec = start_frame / max(1e-6, self._info.fps)
+        self._playback_path = None
+        self._full_proxy_ready = False
+        self._full_proxy_manifest = None
+        self._range_proxy_manifest = None
+        self._cancel_proxy_build()
         self._backend.load(path, start_sec=start_sec)
+        self._playback_path = path
         self._backend.set_volume(0 if self._volume_muted else self._volume)
         self._backend.set_speed(self._speed)
+        self._backend.configure_position_poll(self._info.fps)
         if self.isVisible():
             QTimer.singleShot(80, self._prime_playback)
         self._sync_range_ui()
@@ -1659,6 +1796,7 @@ class VideoPreviewDialog(MonosDialog):
             self._update_position_display(sec)
         else:
             self._update_position_display(0.0)
+        self._sync_proxy_state()
         self._start_keyframe_probe()
 
     def _start_keyframe_probe(self) -> None:
@@ -1770,6 +1908,7 @@ class VideoPreviewDialog(MonosDialog):
         self._btn_tl_focus.setEnabled(self._active_range_id is not None)
         self._update_sync_button()
         self._refresh_footer_hint()
+        self._sync_playback_loop()
 
     def _update_note_frame_hint(self, frame: int | None = None) -> None:
         f = self._current_frame() if frame is None else int(frame)
@@ -1852,14 +1991,38 @@ class VideoPreviewDialog(MonosDialog):
     def _on_backend_position(self, sec: float) -> None:
         if self._scrubbing:
             return
-        frame = sec_to_frame(sec, self._fps())
-        self._scrubber.set_position_frame(frame)
-        self._update_hud(frame)
-        self._update_note_frame_hint(frame)
-        self._update_position_display(sec)
+        frame = self._source_frame_from_backend(sec)
+        if self._proxy_enabled and self._backend.is_playing():
+            prev_path = self._playback_path
+            self._ensure_playback_clip(frame)
+            if self._playback_path != prev_path:
+                sec = self._backend.position()
+                frame = self._source_frame_from_backend(sec)
+        fps = max(1e-6, self._fps())
+        source_sec = frame / fps
+        if self._loop_playback and not self._backend_native_loop():
+            start, end = self._loop_bounds()
+            if frame > end or source_sec >= (end + 1) / fps - 1e-6:
+                self._restart_loop_at(start)
+                return
+        elif self._backend_native_loop() and self._active_range() is not None:
+            _, end = self._loop_bounds()
+            if frame > end:
+                source_sec = end / fps
+        if frame != self._scrubber.value():
+            self._scrubber.set_position_frame(frame)
+            self._update_hud(frame)
+            self._update_note_frame_hint(frame)
+        self._update_position_display(source_sec)
         self._schedule_preview_session_persist()
 
     def _on_backend_duration(self, sec: float) -> None:
+        if not self._info or sec <= 0:
+            return
+        # Range/full proxy clips are shorter than source — ignore their duration
+        # so the scrubber keeps the full source timeline (avoids faux "zoom to bar").
+        if self._path is not None and self._playback_path not in (None, self._path):
+            return
         if self._info and sec > 0:
             self._info = VideoInfo(
                 path=self._info.path,
@@ -1877,13 +2040,8 @@ class VideoPreviewDialog(MonosDialog):
         self._set_play_icon(False)
         if self._loop_playback:
             start, _ = self._loop_bounds()
-            sec = start / max(1e-6, self._fps())
-            self._scrubber.set_position_frame(start)
-            self._update_hud(start)
-            self._update_position_display(sec)
-            self._backend.play_from(sec)
-            self._set_play_icon(True)
-            self._loop_timer.start()
+            self._restart_loop_at(start, resume=True)
+            self._update_loop_timer()
 
     def _on_backend_error(self, msg: str) -> None:
         logger.warning("video player: %s", msg)
@@ -1895,6 +2053,28 @@ class VideoPreviewDialog(MonosDialog):
         icon = "pause" if playing else "play"
         self._btn_play.setIcon(lucide_icon(icon, size=18, color_hex=MONOS_COLORS["text_label"]))
 
+    def _playback_sec_for_frame(self, frame: int) -> float:
+        if self._proxy_enabled:
+            return self._backend_sec_for_source_frame(frame)
+        return frame / max(1e-6, self._fps())
+
+    def _ensure_playback_clip_for_frame(self, frame: int) -> None:
+        if self._path is None:
+            return
+        if self._proxy_enabled:
+            self._ensure_playback_clip(frame)
+        elif self._playback_path != self._path:
+            self._ensure_source_at_frame(frame)
+
+    def _start_playback_at_frame(self, frame: int) -> None:
+        """Ensure clip + resume — single seek (no keyframe pre-seek flash)."""
+        self._ensure_playback_clip_for_frame(frame)
+        sec = self._playback_sec_for_frame(frame)
+        if self._backend.position_matches(sec):
+            self._backend.play()
+        else:
+            self._backend.play_from(sec)
+
     def _toggle_play(self) -> None:
         self._frame_paint_gen += 1
         if self._backend.is_playing():
@@ -1902,15 +2082,8 @@ class VideoPreviewDialog(MonosDialog):
             self._loop_timer.stop()
             self._set_play_icon(False)
         else:
-            frame = self._current_frame()
-            sec = frame / max(1e-6, self._fps())
-            tol = 0.5 / max(1e-6, self._fps())
-            if self._backend.position_matches(sec, tolerance_sec=tol):
-                self._backend.play()
-            else:
-                self._backend.play_from(sec)
-            if self._loop_playback:
-                self._loop_timer.start()
+            self._start_playback_at_frame(self._current_frame())
+            self._update_loop_timer()
             self._set_play_icon(True)
 
     def _volume_tooltip_text(self, value: int | None = None) -> str:
@@ -2087,6 +2260,10 @@ class VideoPreviewDialog(MonosDialog):
             )
 
     def _apply_scrub_preview(self, frame: int, *, precise: bool = False) -> None:
+        if self._backend.is_playing():
+            self._backend.pause()
+            self._loop_timer.stop()
+            self._set_play_icon(False)
         seek_frame = int(frame) if precise else self._hover_snap_frame(frame)
         if not precise and seek_frame == self._last_scrub_video_frame:
             return
@@ -2096,8 +2273,7 @@ class VideoPreviewDialog(MonosDialog):
             return
         else:
             self._last_scrub_video_frame = seek_frame
-        sec = seek_frame / max(1e-6, self._fps())
-        self._backend.seek(sec, precise=precise)
+        self._apply_playback_for_frame(seek_frame, precise=precise)
 
     def _on_scrub_released(self, frame: int | None = None) -> None:
         self._scrubbing = False
@@ -2105,17 +2281,14 @@ class VideoPreviewDialog(MonosDialog):
         self._pending_scrub_frame = None
         self._last_scrub_video_frame = None
         f = int(frame) if frame is not None else self._scrubber.value()
-        sec = f / max(1e-6, self._fps())
-        self._backend.seek(sec, precise=True)
+        self._apply_playback_for_frame(f, precise=True)
         self._scrubber.set_position_frame(f)
         self._update_hud(f)
         self._hide_hover_preview()
-        if self._was_playing_before_scrub:
-            self._backend.play()
-            if self._loop_playback:
-                self._loop_timer.start()
-            self._set_play_icon(True)
+        self._loop_timer.stop()
+        self._set_play_icon(False)
         self._was_playing_before_scrub = False
+        self._update_position_display(f / max(1e-6, self._fps()))
         self._persist_preview_session()
 
     def _on_scrub_in_out(self, in_f: int, out_f: int) -> None:
@@ -2237,6 +2410,7 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_range_ui()
         if rng is not None:
             self._seek_frame(rng.in_frame)
+        self._sync_proxy_state()
 
     def _on_range_highlighted(self, range_id: str) -> None:
         self._active_range_id = range_id
@@ -2245,6 +2419,7 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_range_ui()
         if rng is not None:
             self._seek_frame(rng.in_frame)
+        self._sync_proxy_state()
 
     def _on_range_edit_requested(self, range_id: str) -> None:
         self._active_range_id = range_id
@@ -2259,6 +2434,7 @@ class VideoPreviewDialog(MonosDialog):
         self._active_range_id = None
         self._range_edit_unlocked = False
         self._sync_range_ui()
+        self._sync_proxy_state()
 
     def _delete_range(self, range_id: str) -> None:
         self._push_range_undo()
@@ -2268,6 +2444,27 @@ class VideoPreviewDialog(MonosDialog):
             self._range_edit_unlocked = False
         self._sync_range_ui()
         self._persist_ranges_local()
+        if self._proxy_enabled:
+            self._sync_proxy_state()
+
+    def _delete_all_ranges(self) -> None:
+        if not self._ranges:
+            return
+        n = len(self._ranges)
+        if not ask_delete(
+            self,
+            "Delete all ranges",
+            f"Delete all {n} range{'s' if n != 1 else ''}? This cannot be undone from the list.",
+        ):
+            return
+        self._push_range_undo()
+        self._ranges = []
+        self._active_range_id = None
+        self._range_edit_unlocked = False
+        self._sync_range_ui()
+        self._persist_ranges_local()
+        if self._proxy_enabled:
+            self._sync_proxy_state()
 
     def _duplicate_range(self, range_id: str) -> None:
         rng = next((r for r in self._ranges if r.id == range_id), None)
@@ -2429,6 +2626,21 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_range_ui()
         self._persist_markers_local()
 
+    def _delete_all_markers(self) -> None:
+        if not self._markers:
+            return
+        n = len(self._markers)
+        if not ask_delete(
+            self,
+            "Delete all markers",
+            f"Delete all {n} marker{'s' if n != 1 else ''}? This cannot be undone from the list.",
+        ):
+            return
+        self._markers = []
+        self._active_marker_id = None
+        self._sync_range_ui()
+        self._persist_markers_local()
+
     def _on_marker_label_changed(self, marker_id: str, label: str) -> None:
         updated: list[VideoReviewMarker] = []
         now = time.time()
@@ -2533,11 +2745,10 @@ class VideoPreviewDialog(MonosDialog):
         return next((r for r in self._ranges if r.id == self._active_range_id), None)
 
     def _seek_frame(self, frame: int) -> None:
-        sec = frame / max(1e-6, self._fps())
-        self._backend.seek(sec, precise=True)
+        self._apply_playback_for_frame(frame, precise=True)
         self._scrubber.set_position_frame(frame)
         self._update_hud(frame)
-        self._update_position_display(sec)
+        self._update_position_display(frame / max(1e-6, self._fps()))
         self._schedule_preview_session_persist()
 
     def _loop_bounds(self) -> tuple[int, int]:
@@ -2547,32 +2758,90 @@ class VideoPreviewDialog(MonosDialog):
             return lo, hi
         return 0, max(0, self._total_frames() - 1)
 
+    def _backend_native_loop(self) -> bool:
+        return getattr(self._backend, "name", "") == "mpv" and self._loop_playback
+
+    def _sync_playback_loop(self) -> None:
+        fps = max(1e-6, self._fps())
+        if self._loop_playback:
+            rng = self._active_range()
+            if rng is not None:
+                lo, hi = sorted((rng.in_frame, rng.out_frame))
+                on_range_proxy = (
+                    self._proxy_enabled
+                    and self._proxy_mode == "range"
+                    and self._range_proxy_manifest is not None
+                    and self._playback_path is not None
+                    and self._path is not None
+                    and self._playback_path != self._path
+                )
+                if on_range_proxy:
+                    self._backend.configure_playback_loop(
+                        enabled=True,
+                        range_start_sec=0.0,
+                        range_end_sec=(hi - lo + 1) / fps,
+                    )
+                else:
+                    self._backend.configure_playback_loop(
+                        enabled=True,
+                        range_start_sec=lo / fps,
+                        range_end_sec=(hi + 1) / fps,
+                    )
+            else:
+                self._backend.configure_playback_loop(enabled=True)
+        else:
+            self._backend.configure_playback_loop(enabled=False)
+
+    def _loop_past_end(self, sec: float, end_frame: int) -> bool:
+        fps = max(1e-6, self._fps())
+        return sec >= (end_frame + 1) / fps - 1e-6
+
+    def _restart_loop_at(self, start_frame: int, *, resume: bool | None = None) -> None:
+        if resume is None:
+            resume = self._backend.is_playing()
+        fps = max(1e-6, self._fps())
+        self._ensure_playback_clip_for_frame(start_frame)
+        sec = self._playback_sec_for_frame(start_frame)
+        self._scrubber.set_position_frame(start_frame)
+        self._update_hud(start_frame)
+        self._update_position_display(start_frame / fps)
+        if resume:
+            if self._backend.position_matches(sec):
+                self._backend.play()
+            else:
+                self._backend.play_from(sec)
+            self._set_play_icon(True)
+        else:
+            self._backend.seek(sec, precise=True)
+
+    def _update_loop_timer(self) -> None:
+        if (
+            self._loop_playback
+            and not self._backend_native_loop()
+            and self._backend.is_playing()
+        ):
+            self._loop_timer.start()
+        else:
+            self._loop_timer.stop()
+
     def _seek_loop_start(self) -> None:
         start, _ = self._loop_bounds()
         self._seek_frame(start)
 
     def _check_loop(self) -> None:
-        if not self._loop_playback:
+        if not self._loop_playback or self._backend_native_loop() or self._scrubbing:
             return
         start, end = self._loop_bounds()
-        if self._current_frame() > end:
-            start, _ = self._loop_bounds()
-            sec = start / max(1e-6, self._fps())
-            self._scrubber.set_position_frame(start)
-            self._update_hud(start)
-            self._update_position_display(sec)
-            if not self._backend.is_playing():
-                self._backend.play_from(sec)
-            else:
-                self._backend.seek(sec, precise=True)
+        sec = self._backend.position()
+        if self._loop_past_end(sec, end) or self._current_frame() > end:
+            self._restart_loop_at(start)
 
     def _on_loop_toggled(self, checked: bool) -> None:
         self._loop_playback = checked
+        self._sync_playback_loop()
         if checked:
             self._seek_loop_start()
-            self._loop_timer.start()
-        else:
-            self._loop_timer.stop()
+        self._update_loop_timer()
         if self._settings is not None:
             write_video_preview_loop(self._settings, checked)
 
@@ -2607,6 +2876,379 @@ class VideoPreviewDialog(MonosDialog):
             return
         self._path_index = (self._path_index + 1) % len(self._paths)
         self._load_file(self._paths[self._path_index])
+
+    def _source_file_size(self) -> int:
+        if self._path is None:
+            return 0
+        try:
+            return int(self._path.stat().st_size)
+        except OSError:
+            return 0
+
+    def _proxy_scale_label(self) -> str:
+        return _PROXY_SCALE_LABELS.get(self._proxy_scale, str(self._proxy_scale))
+
+    def _proxy_heavy_session_key(self, mode: str) -> str:
+        if self._path is None:
+            return ""
+        from monostudio.core.video_proxy_cache import source_digest
+
+        digest, _, _ = source_digest(self._path)
+        return f"{digest}|{mode}|{self._proxy_scale}"
+
+    def _source_frame_from_backend(self, sec: float) -> int:
+        fps = max(1e-6, self._fps())
+        if self._path is None or self._playback_path in (None, self._path):
+            return sec_to_frame(sec, fps)
+        if self._proxy_mode == "full" and self._full_proxy_manifest:
+            return sec_to_frame(sec, fps)
+        if self._proxy_mode == "range" and self._range_proxy_manifest:
+            local = sec_to_frame(sec, fps)
+            return self._range_proxy_manifest.in_frame + local
+        return sec_to_frame(sec, fps)
+
+    def _playback_clip_for_frame(self, frame: int) -> tuple[Path | None, bool]:
+        if self._path is None or not self._proxy_enabled:
+            return self._path, False
+        if self._proxy_mode == "full" and self._full_proxy_ready and self._full_proxy_manifest:
+            return Path(self._full_proxy_manifest.proxy_path), True
+        if self._proxy_mode == "range" and self._range_proxy_manifest:
+            m = self._range_proxy_manifest
+            lo, hi = sorted((m.in_frame, m.out_frame))
+            if lo <= frame <= hi:
+                return Path(m.proxy_path), True
+        return self._path, False
+
+    def _backend_sec_for_source_frame(self, frame: int) -> float:
+        fps = max(1e-6, self._fps())
+        _, is_proxy = self._playback_clip_for_frame(frame)
+        if not is_proxy:
+            return frame / fps
+        if self._proxy_mode == "full":
+            return frame / fps
+        if self._range_proxy_manifest:
+            return (frame - self._range_proxy_manifest.in_frame) / fps
+        return frame / fps
+
+    def _apply_playback_for_frame(self, frame: int, *, precise: bool = False) -> None:
+        """Resolve proxy vs source clip and seek (scrub + play)."""
+        if self._path is None:
+            return
+        if self._proxy_enabled:
+            self._ensure_playback_clip(frame)
+            sec = self._backend_sec_for_source_frame(frame)
+        else:
+            if self._playback_path != self._path:
+                self._ensure_source_at_frame(frame)
+            sec = frame / max(1e-6, self._fps())
+        self._backend.seek(sec, precise=precise)
+
+    def _ensure_source_at_frame(self, frame: int) -> None:
+        """Load source file for scrub — single timeline, no proxy offset."""
+        if self._path is None:
+            return
+        if self._playback_path == self._path:
+            return
+        sec = frame / max(1e-6, self._fps())
+        self._backend.load(self._path, start_sec=sec)
+        self._playback_path = self._path
+        self._backend.set_volume(0 if self._volume_muted else self._volume)
+        self._backend.set_speed(self._speed)
+        if self._info is not None:
+            self._backend.configure_position_poll(self._info.fps)
+        self._sync_playback_loop()
+
+    def _ensure_playback_clip(self, frame: int) -> None:
+        if self._path is None:
+            return
+        if not self._proxy_enabled:
+            if self._playback_path != self._path:
+                self._ensure_source_at_frame(frame)
+            return
+        clip_path, _ = self._playback_clip_for_frame(frame)
+        if clip_path is None:
+            return
+        if self._playback_path == clip_path:
+            return
+        was_playing = self._backend.is_playing()
+        sec = self._backend_sec_for_source_frame(frame)
+        self._backend.load(clip_path, start_sec=sec)
+        self._playback_path = clip_path
+        self._backend.set_volume(0 if self._volume_muted else self._volume)
+        self._backend.set_speed(self._speed)
+        self._backend.configure_position_poll(self._info.fps if self._info else 24.0)
+        self._sync_playback_loop()
+        if was_playing:
+            self._backend.play()
+            self._set_play_icon(True)
+
+    def _reload_source_at_frame(self, frame: int) -> None:
+        if self._path is None:
+            return
+        sec = frame / max(1e-6, self._fps())
+        was_playing = self._backend.is_playing()
+        self._backend.stop()
+        self._backend.load(self._path, start_sec=sec)
+        self._playback_path = self._path
+        self._backend.set_volume(0 if self._volume_muted else self._volume)
+        self._backend.set_speed(self._speed)
+        self._sync_playback_loop()
+        if was_playing:
+            self._backend.play()
+            self._set_play_icon(True)
+        else:
+            self._backend.seek(sec, precise=True)
+
+    def _detach_playback_for_proxy_build(self) -> None:
+        """Release mpv handles on proxy cache files before FFmpeg writes."""
+        if self._path is None:
+            return
+        if self._playback_path in (None, self._path):
+            return
+        self._reload_source_at_frame(self._current_frame())
+
+    def _refresh_proxy_ruler(self) -> None:
+        if self._path is None:
+            self._scrubber.set_proxy_full_timeline(ready=False)
+            self._scrubber.set_proxy_spans([])
+            return
+        spans = list_cached_range_spans(self._path, self._ranges, scale=self._proxy_scale)
+        self._cached_spans = spans
+        if self._proxy_mode == "full" and self._full_proxy_ready:
+            self._scrubber.set_proxy_full_timeline(ready=True)
+            self._scrubber.set_proxy_spans([])
+        elif self._proxy_enabled:
+            self._scrubber.set_proxy_full_timeline(ready=False)
+            self._scrubber.set_proxy_spans(spans)
+        else:
+            self._scrubber.set_proxy_full_timeline(ready=False)
+            self._scrubber.set_proxy_spans([])
+
+    def _proxy_footer_tag(self) -> str | None:
+        if not self._proxy_enabled or self._proxy_mode == "off":
+            return None
+        scale = self._proxy_scale_label()
+        if self._proxy_mode == "full":
+            return f"PROXY {scale} · Full"
+        rng = self._active_range()
+        if rng and rng.label.strip():
+            return f'PROXY {scale} · "{rng.label.strip()}"'
+        if rng:
+            return f"PROXY {scale} · Range"
+        return f"PROXY {scale}"
+
+    def _set_proxy_build_overlay(self, visible: bool, *, label: str = "Building proxy…") -> None:
+        overlay = getattr(self, "_proxy_build_overlay", None)
+        if overlay is None:
+            return
+        if visible:
+            self._proxy_build_label.setText(label)
+            self._proxy_progress.setValue(0)
+            overlay.show()
+            self._position_proxy_overlay()
+            overlay.raise_()
+        else:
+            overlay.hide()
+
+    def _cancel_proxy_build(self) -> None:
+        self._proxy_cancel_flag[0] = True
+        self._proxy_build_token += 1
+        self._scrubber.clear_proxy_build_progress()
+        self._set_proxy_build_overlay(False)
+
+    def _proxy_build_ruler_span(self, mode: Literal["full", "range"], rng: VideoFrameRange | None) -> tuple[int, int]:
+        if mode == "full":
+            return 0, max(0, self._total_frames() - 1)
+        if rng is None:
+            return 0, max(0, self._total_frames() - 1)
+        lo, hi = sorted((rng.in_frame, rng.out_frame))
+        return lo, hi
+
+    def _start_proxy_build(self, mode: Literal["full", "range"], rng: VideoFrameRange | None = None) -> None:
+        if self._path is None or self._info is None:
+            return
+        self._detach_playback_for_proxy_build()
+        self._proxy_cancel_flag[0] = True
+        self._proxy_build_token += 1
+        token = self._proxy_build_token
+        self._proxy_build_active_token = token
+        self._proxy_cancel_flag[0] = False
+        label = "Building full proxy…" if mode == "full" else "Building range proxy…"
+        lo, hi = self._proxy_build_ruler_span(mode, rng)
+        self._scrubber.set_proxy_build_progress(lo, hi, 0.0)
+        self._set_proxy_build_overlay(True, label=label)
+        self._status_log = label
+        self._update_footer()
+        QThreadPool.globalInstance().start(
+            ProxyBuildRunnable(
+                mode=mode,
+                src=self._path,
+                src_info=self._info,
+                scale=self._proxy_scale,
+                rng=rng,
+                signaler=self._proxy_build_signaler,
+                cancel_flag=self._proxy_cancel_flag,
+            )
+        )
+
+    def _on_proxy_build_progress(self, fraction: float) -> None:
+        frac = max(0.0, min(1.0, float(fraction)))
+        bar = getattr(self, "_proxy_progress", None)
+        if bar is not None:
+            bar.setValue(max(0, min(1000, int(frac * 1000))))
+        self._scrubber.set_proxy_build_fraction(frac)
+
+    def _on_proxy_build_finished(self, manifest_obj: object, error: object) -> None:
+        token = self._proxy_build_active_token
+        self._set_proxy_build_overlay(False)
+        self._scrubber.clear_proxy_build_progress()
+        if error:
+            self._status_log = str(error)[:240]
+            self._update_footer()
+            if self._proxy_enabled and "cancel" not in str(error).lower():
+                QMessageBox.warning(self, "Proxy build", str(error))
+            return
+        if token != self._proxy_build_active_token:
+            return
+        if not isinstance(manifest_obj, ProxyManifest):
+            return
+        manifest = manifest_obj
+        if manifest.mode == "full":
+            self._full_proxy_manifest = manifest
+            self._full_proxy_ready = True
+        elif self._active_range_id and manifest.range_id == self._active_range_id:
+            self._range_proxy_manifest = manifest
+        self._status_log = ""
+        self._sync_proxy_state()
+        if self._proxy_enabled:
+            self._apply_playback_for_frame(self._current_frame())
+        if self._proxy_enabled and self._backend.is_playing():
+            sec = self._backend_sec_for_source_frame(self._current_frame())
+            self._backend.seek(sec, precise=True)
+        self._update_footer()
+
+    def _maybe_confirm_heavy_full(self) -> bool:
+        if self._path is None or self._info is None:
+            return False
+        key = self._proxy_heavy_session_key("full")
+        if key and key == self._proxy_heavy_ack_key:
+            return True
+        heavy, reason = is_heavy_source_for_proxy(
+            self._info,
+            file_size_bytes=self._source_file_size(),
+        )
+        if not heavy:
+            return True
+        detail = format_heavy_proxy_message(
+            self._info,
+            file_size_bytes=self._source_file_size(),
+            reason=reason,
+        )
+        detail = f"{detail} — may take several minutes."
+        if ask_build_full_proxy(self, detail=detail):
+            self._proxy_heavy_ack_key = key
+            return True
+        return False
+
+    def _sync_proxy_state(self) -> None:
+        self._cmb_proxy_scale.setEnabled(self._proxy_enabled)
+        self._btn_proxy_menu.setEnabled(self._path is not None)
+        if not self._proxy_enabled or self._path is None or self._info is None:
+            self._proxy_mode = "off"
+            self._cancel_proxy_build()
+            self._scrubber.clear_proxy_build_progress()
+            self._full_proxy_ready = False
+            self._full_proxy_manifest = None
+            self._range_proxy_manifest = None
+            self._refresh_proxy_ruler()
+            frame = self._current_frame()
+            if self._playback_path != self._path:
+                self._reload_source_at_frame(frame)
+            self._update_footer()
+            return
+
+        if self._active_range_id:
+            self._proxy_mode = "range"
+            self._full_proxy_ready = is_full_proxy_ready(self._path, scale=self._proxy_scale)
+            if self._full_proxy_ready:
+                self._full_proxy_manifest = lookup_full_proxy(self._path, scale=self._proxy_scale)
+            rng = self._active_range()
+            self._refresh_proxy_ruler()
+            if rng is None:
+                return
+            manifest = lookup_range_proxy(self._path, rng, scale=self._proxy_scale)
+            if manifest:
+                self._range_proxy_manifest = manifest
+                self._apply_playback_for_frame(self._current_frame())
+            else:
+                self._range_proxy_manifest = None
+                lo, hi = sorted((rng.in_frame, rng.out_frame))
+                fps = max(1e-6, self._fps())
+                range_sec = (hi - lo + 1) / fps
+                heavy, reason = is_heavy_source_for_proxy(
+                    self._info,
+                    file_size_bytes=self._source_file_size(),
+                )
+                if heavy and range_sec > 120:
+                    self._status_log = f"Heavy source — building range proxy ({reason})"
+                self._start_proxy_build("range", rng)
+        else:
+            self._proxy_mode = "full"
+            self._range_proxy_manifest = None
+            manifest = lookup_full_proxy(self._path, scale=self._proxy_scale)
+            if manifest:
+                self._full_proxy_manifest = manifest
+                self._full_proxy_ready = True
+                self._refresh_proxy_ruler()
+                self._apply_playback_for_frame(self._current_frame())
+            else:
+                self._full_proxy_ready = False
+                self._full_proxy_manifest = None
+                self._refresh_proxy_ruler()
+                if not self._maybe_confirm_heavy_full():
+                    self._chk_proxy.blockSignals(True)
+                    self._chk_proxy.setChecked(False)
+                    self._chk_proxy.blockSignals(False)
+                    self._proxy_enabled = False
+                    self._sync_proxy_state()
+                    return
+                self._start_proxy_build("full")
+        self._update_footer()
+
+    def _on_proxy_toggled(self, checked: bool) -> None:
+        self._proxy_enabled = checked
+        self._sync_proxy_state()
+
+    def _on_proxy_scale_changed(self, _index: int) -> None:
+        scale = self._cmb_proxy_scale.currentData()
+        if scale is None:
+            return
+        self._proxy_scale = float(scale)
+        if self._proxy_enabled:
+            self._sync_proxy_state()
+
+    def _show_proxy_menu(self) -> None:
+        menu = MonosMenu(self)
+        clear_act = menu.addAction("Clear proxy for this video")
+        clear_act.triggered.connect(self._clear_proxy_for_current_video)
+        position_popup_near_anchor(menu, self._btn_proxy_menu)
+        menu.popup(menu.mapToGlobal(QPoint(0, 0)))
+
+    def _clear_proxy_for_current_video(self) -> None:
+        if self._path is None:
+            return
+        self._cancel_proxy_build()
+        clear_proxy_cache_for_source(self._path)
+        self._full_proxy_ready = False
+        self._full_proxy_manifest = None
+        self._range_proxy_manifest = None
+        frame = self._current_frame()
+        self._reload_source_at_frame(frame)
+        if self._proxy_enabled:
+            self._sync_proxy_state()
+        else:
+            self._refresh_proxy_ruler()
+            self._update_footer()
 
     def _export(self) -> None:
         if not self._ranges or self._info is None:

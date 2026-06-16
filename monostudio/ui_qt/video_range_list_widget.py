@@ -120,6 +120,7 @@ class VideoRangeListWidget(QWidget):
 
     range_selected = Signal(str)  # range id
     range_delete_requested = Signal(str)
+    range_delete_all_requested = Signal()
     range_duplicate_requested = Signal(str)
     range_rename_requested = Signal(str, str)  # id, new label
     go_to_in_requested = Signal(str)
@@ -348,39 +349,49 @@ class VideoRangeListWidget(QWidget):
 
     def _on_context_menu(self, pos) -> None:
         item = self._list.itemAt(pos)
-        if item is None:
-            return
-        row = self._list.row(item)
-        rng = self._range_at_row(row)
-        if rng is None:
+        rng: VideoFrameRange | None = None
+        if item is not None:
+            rng = self._range_at_row(self._list.row(item))
+        if rng is None and not self._ranges:
             return
         menu = MonosMenu(self)
-        act_in = menu.addAction("Go to In")
-        act_out = menu.addAction("Go to Out")
-        menu.addSeparator()
-        act_copy = menu.addAction("Copy range text")
-        act_rename = menu.addAction("Rename…")
-        act_dup = menu.addAction("Duplicate")
-        menu.addSeparator()
-        act_del = menu.addAction("Delete")
+        act_in = act_out = act_copy = act_rename = act_dup = act_del = act_del_all = None
+        if rng is not None:
+            act_in = menu.addAction("Go to In")
+            act_out = menu.addAction("Go to Out")
+            menu.addSeparator()
+            act_copy = menu.addAction("Copy range text")
+            act_rename = menu.addAction("Rename…")
+            act_dup = menu.addAction("Duplicate")
+            menu.addSeparator()
+            act_del = menu.addAction("Delete")
+            act_del.setProperty("danger-action", True)
+        if self._ranges:
+            if rng is not None:
+                menu.addSeparator()
+            act_del_all = menu.addAction("Delete all…")
+            act_del_all.setProperty("danger-action", True)
         chosen = menu.exec(self._list.mapToGlobal(pos))
         if chosen is None:
             return
-        if chosen == act_in:
-            self.go_to_in_requested.emit(rng.id)
-        elif chosen == act_out:
-            self.go_to_out_requested.emit(rng.id)
-        elif chosen == act_copy:
-            text = format_range_span_display(rng, self._fps, mode=self._display_mode)
-            cb = QGuiApplication.clipboard()
-            if cb:
-                cb.setText(text)
-        elif chosen == act_rename:
-            self._prompt_rename(rng)
-        elif chosen == act_dup:
-            self.range_duplicate_requested.emit(rng.id)
-        elif chosen == act_del:
-            self.range_delete_requested.emit(rng.id)
+        if rng is not None:
+            if chosen == act_in:
+                self.go_to_in_requested.emit(rng.id)
+            elif chosen == act_out:
+                self.go_to_out_requested.emit(rng.id)
+            elif chosen == act_copy:
+                text = format_range_span_display(rng, self._fps, mode=self._display_mode)
+                cb = QGuiApplication.clipboard()
+                if cb:
+                    cb.setText(text)
+            elif chosen == act_rename:
+                self._prompt_rename(rng)
+            elif chosen == act_dup:
+                self.range_duplicate_requested.emit(rng.id)
+            elif chosen == act_del:
+                self.range_delete_requested.emit(rng.id)
+        if chosen == act_del_all:
+            self.range_delete_all_requested.emit()
 
     def _prompt_rename(self, rng: VideoFrameRange) -> None:
         text, ok = QInputDialog.getText(self, "Rename range", "Name", text=rng.label or "")

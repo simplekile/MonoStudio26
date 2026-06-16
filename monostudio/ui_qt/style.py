@@ -3439,6 +3439,57 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid #3f3f46;
             selection-background-color: #3b82f6;
         }
+        QComboBox#VideoPreviewProxyScaleCombo {
+            color: #a1a1aa;
+            background-color: #27272a;
+            border: 1px solid rgba(63, 63, 70, 0.55);
+            border-radius: 6px;
+            padding: 4px 6px;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 500;
+            min-height: 24px;
+        }
+        QComboBox#VideoPreviewProxyScaleCombo:hover {
+            color: #e4e4e7;
+            border-color: #52525b;
+        }
+        QComboBox#VideoPreviewProxyScaleCombo::drop-down {
+            border: none;
+            width: 16px;
+        }
+        QToolButton#VideoPreviewProxyMenuBtn {
+            color: #a1a1aa;
+            background-color: transparent;
+            border: none;
+            font-family: "Inter";
+            font-size: 14px;
+            font-weight: 600;
+            min-width: 20px;
+            min-height: 24px;
+            padding: 0 4px;
+        }
+        QToolButton#VideoPreviewProxyMenuBtn:hover {
+            color: #e4e4e7;
+            background-color: rgba(255, 255, 255, 0.06);
+            border-radius: 4px;
+        }
+        QWidget#VideoPreviewProxyBuildOverlay {
+            background-color: rgba(9, 9, 11, 0.92);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+        }
+        QProgressBar#VideoPreviewProxyProgress {
+            background-color: #27272a;
+            border: none;
+            border-radius: 4px;
+            min-height: 8px;
+            max-height: 8px;
+        }
+        QProgressBar#VideoPreviewProxyProgress::chunk {
+            background-color: #3b82f6;
+            border-radius: 4px;
+        }
         QSlider#VideoPreviewVolumeSlider::groove:horizontal {
             background: #3f3f46;
             height: 4px;
@@ -3496,7 +3547,8 @@ def apply_dark_theme(app: QApplication) -> None:
             border-top: 1px solid rgba(255, 255, 255, 0.06);
         }
         QCheckBox#VideoPreviewPreciseScrubCheck,
-        QCheckBox#VideoPreviewLoopCheck {
+        QCheckBox#VideoPreviewLoopCheck,
+        QCheckBox#VideoPreviewProxyCheck {
             color: #a1a1aa;
             font-family: "Inter";
             font-size: 12px;
@@ -3504,7 +3556,8 @@ def apply_dark_theme(app: QApplication) -> None:
             spacing: 6px;
         }
         QCheckBox#VideoPreviewPreciseScrubCheck::indicator,
-        QCheckBox#VideoPreviewLoopCheck::indicator {
+        QCheckBox#VideoPreviewLoopCheck::indicator,
+        QCheckBox#VideoPreviewProxyCheck::indicator {
             width: 14px;
             height: 14px;
             border-radius: 3px;
@@ -3512,12 +3565,14 @@ def apply_dark_theme(app: QApplication) -> None:
             background: #27272a;
         }
         QCheckBox#VideoPreviewPreciseScrubCheck::indicator:checked,
-        QCheckBox#VideoPreviewLoopCheck::indicator:checked {
+        QCheckBox#VideoPreviewLoopCheck::indicator:checked,
+        QCheckBox#VideoPreviewProxyCheck::indicator:checked {
             background: #3b82f6;
             border-color: #3b82f6;
         }
         QCheckBox#VideoPreviewPreciseScrubCheck:hover,
-        QCheckBox#VideoPreviewLoopCheck:hover {
+        QCheckBox#VideoPreviewLoopCheck:hover,
+        QCheckBox#VideoPreviewProxyCheck:hover {
             color: #e4e4e7;
         }
         QComboBox#VideoPreviewTimeDisplayCombo {

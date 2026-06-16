@@ -22,6 +22,19 @@ KEY_VIDEO_PREVIEW_TIME_DISPLAY = "ui/video_preview_time_display"
 KEY_VIDEO_PREVIEW_PLAYBACK_SPEED = "ui/video_preview_playback_speed"
 KEY_VIDEO_PREVIEW_VOLUME = "ui/video_preview_volume"
 KEY_VIDEO_PREVIEW_LOOP = "ui/video_preview_loop"
+KEY_VIDEO_PREVIEW_PROXY_ENABLED = "ui/video_preview_proxy_enabled"
+KEY_VIDEO_PREVIEW_PROXY_SCALE = "ui/video_preview_proxy_scale"
+
+PROXY_SCALE_FULL = 1.0
+PROXY_SCALE_HALF = 0.5
+PROXY_SCALE_QUARTER = 0.25
+PROXY_SCALE_EIGHTH = 0.125
+PROXY_SCALE_STEPS = (
+    PROXY_SCALE_FULL,
+    PROXY_SCALE_HALF,
+    PROXY_SCALE_QUARTER,
+    PROXY_SCALE_EIGHTH,
+)
 
 TIME_DISPLAY_FRAME = "frame"
 TIME_DISPLAY_TIMECODE = "timecode"
@@ -285,3 +298,36 @@ def read_video_preview_loop(settings: QSettings | None) -> bool:
 
 def write_video_preview_loop(settings: QSettings, enabled: bool) -> None:
     settings.setValue(KEY_VIDEO_PREVIEW_LOOP, bool(enabled))
+
+
+def read_video_preview_proxy_enabled(settings: QSettings | None) -> bool:
+    if settings is None:
+        return False
+    v = settings.value(KEY_VIDEO_PREVIEW_PROXY_ENABLED, False)
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes")
+
+
+def write_video_preview_proxy_enabled(settings: QSettings, enabled: bool) -> None:
+    settings.setValue(KEY_VIDEO_PREVIEW_PROXY_ENABLED, bool(enabled))
+
+
+def read_video_preview_proxy_scale(settings: QSettings | None) -> float:
+    if settings is None:
+        return PROXY_SCALE_FULL
+    v = settings.value(KEY_VIDEO_PREVIEW_PROXY_SCALE, PROXY_SCALE_FULL)
+    try:
+        scale = float(v)
+    except (TypeError, ValueError):
+        return PROXY_SCALE_FULL
+    if scale in PROXY_SCALE_STEPS:
+        return scale
+    return PROXY_SCALE_FULL
+
+
+def write_video_preview_proxy_scale(settings: QSettings, scale: float) -> None:
+    s = float(scale)
+    if s not in PROXY_SCALE_STEPS:
+        s = PROXY_SCALE_FULL
+    settings.setValue(KEY_VIDEO_PREVIEW_PROXY_SCALE, s)

@@ -1,0 +1,34 @@
+---
+description: Video Preview proxy — hybrid full/range H.264 cache, playback mapping, scrub/Esc rules.
+alwaysApply: false
+---
+
+# Video Preview Proxy (v1)
+
+## Modes
+
+| Mode | When | Playback |
+|------|------|----------|
+| **full** | Proxy ON, no active range | Full proxy MP4, 1:1 frames |
+| **range** | Proxy ON + active range | Proxy clip in cached span; source outside |
+| **off** | Proxy unchecked | Always source |
+
+Export / ranges / markers: always **source** path and source frame index.
+
+## Cache
+
+- `%LOCALAPPDATA%/MonoStudio/cache/video_proxy/`
+- Keys: `{digest}_full_s{scale}.mp4` | `{digest}_r{range_id}_s{scale}.mp4`
+- Modules: `monostudio/core/video_proxy_cache.py`, `monostudio/core/video_proxy.py`
+
+## UI
+
+- `QCheckBox` Proxy + `QComboBox` scale (1 · ½ · ¼ · ⅛)
+- Esc + proxy ON → **tắt proxy**
+- **Scrub + Play** dùng proxy khi cached (ngoài span range = source)
+- Ruler: full ready = xanh cả timeline; range = multi-span xanh @ scale; **đang build** = xanh mờ + xanh đậm lan dần theo %
+- Clear: preview menu (this video) + Settings → Tools (all)
+
+## mpv
+
+Proxy chỉ đổi `backend.load(playback_path)`. Scrub vẫn `seek()` only — không couple cache layer.

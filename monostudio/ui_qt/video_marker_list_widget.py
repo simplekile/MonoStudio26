@@ -117,6 +117,7 @@ class VideoMarkerListWidget(QWidget):
     marker_selected = Signal(str)
     marker_deselected = Signal()
     marker_delete_requested = Signal(str)
+    marker_delete_all_requested = Signal()
     marker_rename_requested = Signal(str, str)
     sort_mode_changed = Signal(str)
     export_requested = Signal()
@@ -339,23 +340,33 @@ class VideoMarkerListWidget(QWidget):
 
     def _on_context_menu(self, pos) -> None:
         marker = self._marker_at_pos(pos)
-        if marker is None:
+        if marker is None and not self._markers:
             return
         menu = MonosMenu(self)
-        act_go = menu.addAction(f"Go to {format_frame_label(marker.frame)}")
-        act_rename = menu.addAction("Rename…")
-        menu.addSeparator()
-        act_delete = menu.addAction("Delete")
-        act_delete.setProperty("danger-action", True)
+        act_go = act_rename = act_delete = act_delete_all = None
+        if marker is not None:
+            act_go = menu.addAction(f"Go to {format_frame_label(marker.frame)}")
+            act_rename = menu.addAction("Rename…")
+            menu.addSeparator()
+            act_delete = menu.addAction("Delete")
+            act_delete.setProperty("danger-action", True)
+        if self._markers:
+            if marker is not None:
+                menu.addSeparator()
+            act_delete_all = menu.addAction("Delete all…")
+            act_delete_all.setProperty("danger-action", True)
         chosen = menu.exec(self._list.mapToGlobal(pos))
-        if chosen is act_go:
-            self.marker_selected.emit(marker.id)
-        elif chosen is act_rename:
-            text, ok = QInputDialog.getText(self, "Rename marker", "Label:", text=marker.label)
-            if ok:
-                self.marker_rename_requested.emit(marker.id, text.strip())
-        elif chosen is act_delete:
-            self.marker_delete_requested.emit(marker.id)
+        if marker is not None:
+            if chosen is act_go:
+                self.marker_selected.emit(marker.id)
+            elif chosen is act_rename:
+                text, ok = QInputDialog.getText(self, "Rename marker", "Label:", text=marker.label)
+                if ok:
+                    self.marker_rename_requested.emit(marker.id, text.strip())
+            elif chosen is act_delete:
+                self.marker_delete_requested.emit(marker.id)
+        if chosen is act_delete_all:
+            self.marker_delete_all_requested.emit()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         if watched is self._list.viewport():

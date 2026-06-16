@@ -125,6 +125,18 @@ class VideoPlayerBackend(ABC):
     def layout_video(self) -> None:
         """Reposition embedded video after the host widget resizes."""
 
+    def configure_position_poll(self, fps: float) -> None:
+        """Tune how often the backend reports position (playhead sync)."""
+
+    def configure_playback_loop(
+        self,
+        *,
+        enabled: bool,
+        range_start_sec: float | None = None,
+        range_end_sec: float | None = None,
+    ) -> None:
+        """Optional backend-native loop. ``range_end_sec`` is exclusive (past out frame)."""
+
     @abstractmethod
     def supports_embed(self) -> bool: ...
 
@@ -147,6 +159,10 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
         self._prime_pending = False
         self._prime_initial_sec: float | None = None
         self._pending_start_sec = 0.0
+        self._pending_seek_sec: float | None = None
+        self._pending_seek_precise = False
+        self._pending_play = False
+        self._pending_play_from_sec: float | None = None
         self._attached_wid: int | None = None
 
     def supports_embed(self) -> bool:
@@ -158,8 +174,9 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
     @staticmethod
     def _mpv_error_benign(exc: BaseException) -> bool:
         """mpv returns -12 when seek/command runs before the file is ready."""
-        if isinstance(exc, SystemError) and len(getattr(exc, "args", ())) >= 2:
-            return exc.args[1] == -12
+        args = getattr(exc, "args", ())
+        if len(args) >= 2 and args[1] == -12:
+            return True
         return "-12" in str(exc)
 
     def _file_ready(self) -> bool:
@@ -176,6 +193,38 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
     def _ensure_poll(self) -> None:
         if self._poll is not None and not self._poll.isActive():
             self._poll.start()
+
+    def configure_position_poll(self, fps: float) -> None:
+        rate = max(1.0, float(fps))
+        # ~2 position samples per source frame (16–40 ms).
+        interval_ms = max(16, min(40, int(500.0 / rate)))
+        if self._poll is not None:
+            self._poll.setInterval(interval_ms)
+
+    def configure_playback_loop(
+        self,
+        *,
+        enabled: bool,
+        range_start_sec: float | None = None,
+        range_end_sec: float | None = None,
+    ) -> None:
+        if not self._ensure_player() or self._player is None:
+            return
+        try:
+            if enabled and range_start_sec is not None and range_end_sec is not None:
+                self._player.ab_loop_a = float(range_start_sec)
+                self._player.ab_loop_b = float(range_end_sec)
+                self._player.loop_file = "no"
+            elif enabled:
+                self._player.ab_loop_a = "no"
+                self._player.ab_loop_b = "no"
+                self._player.loop_file = "inf"
+            else:
+                self._player.ab_loop_a = "no"
+                self._player.ab_loop_b = "no"
+                self._player.loop_file = "no"
+        except Exception as e:
+            logger.debug("mpv configure_playback_loop: %s", e)
 
     def _widget_ready(self) -> bool:
         widget = self._widget
@@ -204,7 +253,7 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
             )
             if self._poll is None and self._widget is not None:
                 self._poll = QTimer(self._widget)
-                self._poll.setInterval(100)
+                self._poll.setInterval(33)
                 self._poll.timeout.connect(self._tick_poll)
             if self._pending_path is not None:
                 pending = self._pending_path
@@ -227,6 +276,8 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
         if self._player is None:
             return
         self._try_prime_for_scrub()
+        self._apply_pending_seek()
+        self._apply_pending_play()
         try:
             pos = self._player.time_pos
             if pos is not None and self._on_position:
@@ -309,6 +360,10 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
         self._scrub_primed = False
         self._prime_pending = False
         self._prime_initial_sec = None
+        self._pending_seek_sec = None
+        self._pending_seek_precise = False
+        self._pending_play = False
+        self._pending_play_from_sec = None
         self._pending_start_sec = max(0.0, float(start_sec))
         self._pending_path = path
         if not self._ensure_player():
@@ -318,11 +373,35 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
 
     def prime_for_scrub(self, *, initial_sec: float | None = None) -> None:
         if self._scrub_primed:
+            if initial_sec is not None:
+                self.seek(max(0.0, float(initial_sec)), precise=True)
             return
         if initial_sec is not None:
             self._prime_initial_sec = max(0.0, float(initial_sec))
         self._prime_pending = True
         self._try_prime_for_scrub()
+
+    def _apply_pending_seek(self) -> None:
+        if self._pending_seek_sec is None or not self._file_ready():
+            return
+        sec = self._pending_seek_sec
+        precise = self._pending_seek_precise
+        self._pending_seek_sec = None
+        self._pending_seek_precise = False
+        self.seek(sec, precise=precise)
+
+    def _apply_pending_play(self) -> None:
+        if not self._file_ready():
+            return
+        if self._pending_play_from_sec is not None:
+            sec = self._pending_play_from_sec
+            self._pending_play_from_sec = None
+            self._pending_play = False
+            self.play_from(sec)
+            return
+        if self._pending_play:
+            self._pending_play = False
+            self.play()
 
     def _try_prime_for_scrub(self) -> None:
         if not self._prime_pending or self._scrub_primed:
@@ -332,18 +411,25 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
         if not self._file_ready():
             self._ensure_poll()
             return
+        restore = self._prime_initial_sec is not None
         target = 0.0 if self._prime_initial_sec is None else self._prime_initial_sec
         self._prime_initial_sec = None
         self._prime_pending = False
         self._scrub_primed = True
         try:
             self._player.pause = True
-            self._player.seek(target, reference="absolute", precision="keyframes")
+            self._player.seek(
+                target,
+                reference="absolute",
+                precision="exact" if restore else "keyframes",
+            )
             if self._on_position:
                 self._on_position(float(target))
         except Exception as e:
             self._scrub_primed = False
             self._prime_pending = True
+            if restore:
+                self._prime_initial_sec = target
             if self._mpv_error_benign(e):
                 logger.debug("mpv prime_for_scrub deferred: %s", e)
                 self._ensure_poll()
@@ -355,6 +441,14 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
         if not self._ensure_player() or self._player is None:
             return
         sec = max(0.0, float(sec))
+        if not self._file_ready():
+            self._pending_play_from_sec = sec
+            self._pending_play = False
+            self._ensure_poll()
+            return
+        if self.position_matches(sec):
+            self.play()
+            return
         try:
             self._eof_notified = False
             self._player.pause = True
@@ -365,11 +459,21 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
                 self._poll.start()
         except Exception as e:
             self._playing = False
+            if self._mpv_error_benign(e):
+                logger.debug("mpv play_from deferred: %s", e)
+                self._pending_play_from_sec = sec
+                self._ensure_poll()
+                return
             if self._on_error:
                 self._on_error(str(e))
 
     def play(self) -> None:
         if not self._ensure_player() or self._player is None:
+            return
+        if not self._file_ready():
+            self._pending_play = True
+            self._pending_play_from_sec = None
+            self._ensure_poll()
             return
         try:
             self._player.pause = False
@@ -378,17 +482,30 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
             if self._poll:
                 self._poll.start()
         except Exception as e:
+            if self._mpv_error_benign(e):
+                logger.debug("mpv play deferred: %s", e)
+                self._pending_play = True
+                self._ensure_poll()
+                return
             if self._on_error:
                 self._on_error(str(e))
 
     def pause(self) -> None:
         if self._player is None:
             self._playing = False
+            self._pending_play = False
+            self._pending_play_from_sec = None
             return
+        self._pending_play = False
+        self._pending_play_from_sec = None
         try:
             self._player.pause = True
             self._playing = False
         except Exception as e:
+            if self._mpv_error_benign(e):
+                logger.debug("mpv pause ignored (not ready): %s", e)
+                self._playing = False
+                return
             if self._on_error:
                 self._on_error(str(e))
 
@@ -400,23 +517,26 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
     def seek(self, sec: float, *, precise: bool = False) -> None:
         if not self._ensure_player() or self._player is None:
             return
+        sec = max(0.0, float(sec))
         if not self._file_ready():
-            self._prime_pending = True
+            self._pending_seek_sec = sec
+            self._pending_seek_precise = precise
             self._ensure_poll()
             return
         try:
             self._eof_notified = False
-            if precise:
-                self._player.pause = True
+            self._player.pause = True
+            self._playing = False
             self._player.seek(
-                max(0.0, float(sec)),
+                sec,
                 reference="absolute",
                 precision="exact" if precise else "keyframes",
             )
         except Exception as e:
             if self._mpv_error_benign(e):
                 logger.debug("mpv seek deferred: %s", e)
-                self._prime_pending = True
+                self._pending_seek_sec = sec
+                self._pending_seek_precise = precise
                 self._ensure_poll()
                 return
             if self._on_error:
@@ -497,6 +617,8 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
                 pass
             self._player = None
         self._pending_path = None
+        self._pending_play = False
+        self._pending_play_from_sec = None
         self._playing = False
         self._prime_pending = False
         self._attached_wid = None
@@ -736,6 +858,8 @@ class QtMultimediaBackend(VideoPlayerBackend):
         if not self._primed:
             self.prime_for_scrub(initial_sec=sec)
             return
+        if self.is_playing():
+            self.pause()
         self._player.setPosition(int(sec * 1000))
 
     def duration(self) -> float:

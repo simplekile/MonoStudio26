@@ -55,12 +55,14 @@ class VideoPreviewScrubber(QWidget):
     fit_timeline_requested = Signal()
 
     _MARGIN_H = 0
-    _RULER_H = 28
+    _RULER_H = 26
     _TRACK_H = 32
+    _RANGE_BAND_H = 18
     _GAP = 0
     _HANDLE_W = 11
     _END_CAP_W = 6
     _PLAYHEAD_W = 2
+    _PROXY_RULER_BAR_H = 5
     _MIN_VIEW_SPAN = 8.0
     _ZOOM_WHEEL_FACTOR = 1.15
     _WHEEL_ZOOM_DEG = 120.0
@@ -71,7 +73,7 @@ class VideoPreviewScrubber(QWidget):
         super().__init__(parent)
         self.setObjectName("VideoPreviewTimeline")
         self.setMinimumHeight(self._RULER_H + self._GAP + self._TRACK_H)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
         self._fps = 24.0
@@ -101,9 +103,15 @@ class VideoPreviewScrubber(QWidget):
         self._pan_anchor_x = 0
         self._pan_origin_start = 0.0
         self._press_x = 0
+        self._press_frame = 0
         self._press_outside_range = False
+        self._press_scrub_clears_selection = False
         self._press_outside_marker = False
         self._scrub_pointer_x: int | None = None
+        self._proxy_full_timeline = False
+        self._proxy_spans: list[tuple[int, int]] = []
+        self._proxy_build_span: tuple[int, int] | None = None
+        self._proxy_build_fraction = 0.0
         self._time_display_mode: TimeDisplayMode = "timecode"
         self._sync_view_to_fit()
 
@@ -128,10 +136,16 @@ class VideoPreviewScrubber(QWidget):
             self.valueChanged.emit(frame)
         self.update()
 
-    def set_frame_count(self, total: int) -> None:
-        self._total_frames = max(1, int(total))
+    def set_frame_count(self, total: int, *, refit_view: bool = False) -> None:
+        total = max(1, int(total))
+        changed = total != self._total_frames
+        self._total_frames = total
         self._playhead_frame = max(0, min(self._playhead_frame, self.maximum()))
-        self.reset_view()
+        if refit_view or changed:
+            self.reset_view()
+        else:
+            self._clamp_view()
+            self.update()
 
     def reset_view(self) -> None:
         self._sync_view_to_fit()
@@ -206,6 +220,69 @@ class VideoPreviewScrubber(QWidget):
             self._time_display_mode = mode
             self.update()
 
+    def set_proxy_full_timeline(self, *, ready: bool) -> None:
+        if self._proxy_full_timeline != ready:
+            self._proxy_full_timeline = ready
+            self.update()
+
+    def set_proxy_spans(self, spans: list[tuple[int, int]]) -> None:
+        self._proxy_spans = list(spans)
+        self.update()
+
+    def set_proxy_build_progress(self, in_frame: int, out_frame: int, fraction: float) -> None:
+        lo, hi = sorted((int(in_frame), int(out_frame)))
+        self._proxy_build_span = (lo, hi)
+        self._proxy_build_fraction = max(0.0, min(1.0, float(fraction)))
+        self.update()
+
+    def set_proxy_build_fraction(self, fraction: float) -> None:
+        if self._proxy_build_span is None:
+            return
+        self._proxy_build_fraction = max(0.0, min(1.0, float(fraction)))
+        self.update()
+
+    def clear_proxy_build_progress(self) -> None:
+        if self._proxy_build_span is None and self._proxy_build_fraction <= 0.0:
+            return
+        self._proxy_build_span = None
+        self._proxy_build_fraction = 0.0
+        self.update()
+
+    def _proxy_ruler_bar_y(self, ruler_y: int) -> int:
+        return max(0, ruler_y - self._PROXY_RULER_BAR_H + 1)
+
+    def _draw_proxy_ruler_overlay(self, painter: QPainter, ruler_y: int) -> None:
+        bar_y = self._proxy_ruler_bar_y(ruler_y)
+        bar_h = self._PROXY_RULER_BAR_H
+        if self._proxy_full_timeline:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(34, 197, 94, 90))
+            painter.drawRect(self._MARGIN_H, bar_y, self.width() - 2 * self._MARGIN_H, bar_h)
+            return
+        if self._proxy_spans:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(34, 197, 94, 90))
+            for in_f, out_f in self._proxy_spans:
+                x1 = self._x_for_frame(in_f)
+                x2 = self._x_for_frame(out_f)
+                if x2 < x1:
+                    x1, x2 = x2, x1
+                painter.drawRect(x1, bar_y, max(2, x2 - x1), bar_h)
+        if self._proxy_build_span is not None:
+            lo, hi = self._proxy_build_span
+            x1 = self._x_for_frame(lo)
+            x2 = self._x_for_frame(hi)
+            if x2 < x1:
+                x1, x2 = x2, x1
+            span_w = max(2, x2 - x1)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(34, 197, 94, 36))
+            painter.drawRect(x1, bar_y, span_w, bar_h)
+            if self._proxy_build_fraction > 0.0:
+                prog_w = max(2, int(span_w * self._proxy_build_fraction))
+                painter.setBrush(QColor(34, 197, 94, 155))
+                painter.drawRect(x1, bar_y, prog_w, bar_h)
+
     def set_timeline_list_mode(self, mode: TimelineListMode) -> None:
         if mode not in ("ranges", "markers"):
             return
@@ -251,15 +328,24 @@ class VideoPreviewScrubber(QWidget):
     def x_for_frame(self, frame: int) -> int:
         return self._x_for_frame(frame)
 
+    def _ruler_h(self) -> int:
+        h = max(self._RULER_H + self._GAP + self._TRACK_H, self.height())
+        base = self._RULER_H + self._GAP + self._TRACK_H
+        if h <= base:
+            return self._RULER_H
+        extra = h - base
+        return self._RULER_H + (extra + 1) // 2
+
     def _track_rect(self):
         w = max(1, self.width() - 2 * self._MARGIN_H)
-        top = self._RULER_H + self._GAP
+        top = self._ruler_h() + self._GAP
         h = max(self._TRACK_H, self.height() - top)
         return QRect(self._MARGIN_H, top, w, h)
 
     def _band_metrics(self, track: QRect) -> tuple[int, int]:
-        inset = 1
-        return track.top() + inset, max(4, track.height() - 2 * inset)
+        band_h = min(self._RANGE_BAND_H, max(4, track.height()))
+        band_top = track.top() + (track.height() - band_h) // 2
+        return band_top, band_h
 
     def _duration_sec(self) -> float:
         return self._total_frames / self._fps if self._fps > 0 else 0.0
@@ -292,7 +378,7 @@ class VideoPreviewScrubber(QWidget):
         duration = self._duration_sec()
         if duration <= 0:
             return
-        ruler_y = self._RULER_H - 1
+        ruler_y = self._ruler_h() - 1
         minor_sec = self._minor_tick_interval_sec(track.width(), major_sec)
         t_start = self._view_start / self._fps
         t_end = self._view_end() / self._fps
@@ -416,7 +502,7 @@ class VideoPreviewScrubber(QWidget):
             color = QColor("#fafafa") if active else _MARKER_COLOR
             painter.setPen(QPen(color, 2 if active else 1))
             painter.drawLine(px, 0, px, track.bottom())
-            cy = max(8, self._RULER_H // 2)
+            cy = max(8, self._ruler_h() // 2)
             size = 7 if active else 5
             painter.setBrush(color if active else QColor(244, 114, 182, 210))
             painter.drawPolygon(
@@ -450,6 +536,25 @@ class VideoPreviewScrubber(QWidget):
         self._overlap_cycle_frame = frame
         self._overlap_cycle_ids = ids
         return hits[0]
+
+    def _hit_range_bar_at(self, x: int, y: int) -> VideoFrameRange | None:
+        """Range under the colored bar band (not ruler / empty track row)."""
+        if self._timeline_list_mode != "ranges":
+            return None
+        track = self._track_rect()
+        if not track.contains(x, y):
+            return None
+        band_top, band_h = self._band_metrics(track)
+        if not (band_top <= y <= band_top + band_h - 1):
+            return None
+        return self._pick_range_at(self._frame_at_x(x))
+
+    def _frame_in_range(self, frame: int, range_id: str) -> bool:
+        rng = next((r for r in self._ranges if r.id == range_id), None)
+        if rng is None:
+            return False
+        lo, hi = sorted((rng.in_frame, rng.out_frame))
+        return lo <= int(frame) <= hi
 
     def _hit_handle(self, x: int, y: int) -> str | None:
         if self._timeline_list_mode == "markers" or self._edit_id is None:
@@ -605,8 +710,9 @@ class VideoPreviewScrubber(QWidget):
         bg = QColor(MONOS_COLORS.get("bg_elevated", "#1b1b1b"))
         painter.fillRect(self.rect(), bg)
 
-        # Ruler baseline
-        ruler_y = self._RULER_H - 1
+        # Ruler baseline — proxy cache (solid) + in-progress build (growing green)
+        ruler_y = self._ruler_h() - 1
+        self._draw_proxy_ruler_overlay(painter, ruler_y)
         painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
         painter.drawLine(self._MARGIN_H, ruler_y, w - self._MARGIN_H, ruler_y)
 
@@ -629,10 +735,12 @@ class VideoPreviewScrubber(QWidget):
             painter.drawText(x + 3, ruler_y - 9, label)
             t += major_sec
 
-        # Track background
+        # Track background (range band row only — scrubber chrome height unchanged)
+        band_top, band_h = self._band_metrics(track)
+        band_row = QRect(track.left(), band_top, track.width(), band_h)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(255, 255, 255, 14))
-        painter.drawRoundedRect(track, 4, 4)
+        painter.drawRoundedRect(band_row, 3, 3)
 
         if self._timeline_list_mode == "markers":
             self._draw_markers(painter, track)
@@ -972,9 +1080,8 @@ class VideoPreviewScrubber(QWidget):
 
         track = self._track_rect()
         if track.contains(x, y):
-            frame = self._frame_at_x(x)
             if self._timeline_list_mode == "ranges":
-                hit = self._pick_range_at(frame)
+                hit = self._hit_range_bar_at(x, y)
                 if hit is not None:
                     self.range_highlighted.emit(hit.id)
                     event.accept()
@@ -982,12 +1089,9 @@ class VideoPreviewScrubber(QWidget):
 
         self.clear_overlap_cycle()
 
+        press_zone = self._footer_zone_at(x, y)
         self._press_x = x
-        self._press_outside_range = bool(
-            self._timeline_list_mode == "ranges"
-            and (self._highlight_id or self._edit_id)
-            and not self._ranges_at_frame(self._frame_at_x(x))
-        )
+        self._press_frame = self._frame_at_x(x)
         self._press_outside_marker = bool(
             self._timeline_list_mode == "markers"
             and self._marker_highlight_id
@@ -1013,6 +1117,14 @@ class VideoPreviewScrubber(QWidget):
             super().mouseDoubleClickEvent(event)
             return
         frame = self._frame_at_x(x)
+        if self._timeline_list_mode == "ranges":
+            sel_id = self._edit_id or self._highlight_id
+            if sel_id and self._hit_range_bar_at(x, y) is None:
+                if not self._frame_in_range(frame, sel_id):
+                    self.clear_overlap_cycle()
+                    self.range_deselected.emit()
+                    event.accept()
+                    return
         hits = self._ranges_at_frame(frame)
         if not hits:
             super().mouseDoubleClickEvent(event)
@@ -1114,18 +1226,9 @@ class VideoPreviewScrubber(QWidget):
         self.unsetCursor()
         if was_dragging and handle is None:
             rx = int(event.position().x()) if hasattr(event, "position") else event.x()
-            if (
-                self._press_outside_range
-                and abs(rx - self._press_x) <= self._CLICK_DRAG_THRESHOLD_PX
-            ):
-                self.clear_overlap_cycle()
-                self.range_deselected.emit()
-            if (
-                self._press_outside_marker
-                and abs(rx - self._press_x) <= self._CLICK_DRAG_THRESHOLD_PX
-            ):
+            small_click = abs(rx - self._press_x) <= self._CLICK_DRAG_THRESHOLD_PX
+            if self._press_outside_marker and small_click:
                 self.marker_deselected.emit()
             self.seek_released.emit(float(self.value()))
-        self._press_outside_range = False
         self._press_outside_marker = False
         super().mouseReleaseEvent(event)

@@ -155,7 +155,9 @@ from monostudio.core.ffmpeg_resolve import (
     validate_ffmpeg_executable,
     write_ffmpeg_executable_path,
 )
+from monostudio.core.video_proxy_cache import clear_all_proxy_cache, proxy_cache_disk_usage
 from monostudio.core.version import get_app_version
+from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.force_rename_project_id_dialog import ForceRenameProjectIdDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
@@ -1997,8 +1999,10 @@ class SettingsDialog(MonosDialog):
 
         self._build_ffmpeg_update_row(list_container, list_layout)
         self._build_mpv_update_row(list_container, list_layout)
+        self._build_video_proxy_cache_row(list_container, list_layout)
         self._refresh_ffmpeg_update_row()
         self._refresh_mpv_update_row()
+        self._refresh_video_proxy_cache_row()
 
         layout.addWidget(list_container)
 
@@ -2140,7 +2144,6 @@ class SettingsDialog(MonosDialog):
         """libmpv row: Get → download .7z → Install (extract to LocalAppData) + locate folder."""
         row = QWidget(list_container)
         row.setObjectName("UpdateProductListRow")
-        row.setProperty("last", "true")
         row.setFixedHeight(44)
         row_l = QHBoxLayout(row)
         row_l.setContentsMargins(12, 0, 12, 0)
@@ -2238,6 +2241,74 @@ class SettingsDialog(MonosDialog):
         self._mpv_install_btn = install_btn
         stack.setCurrentIndex(0)
         list_layout.addWidget(row)
+
+    def _build_video_proxy_cache_row(self, list_container: QWidget, list_layout: QVBoxLayout) -> None:
+        """Video preview proxy cache — disk usage + clear all."""
+        row = QWidget(list_container)
+        row.setObjectName("UpdateProductListRow")
+        row.setProperty("last", "true")
+        row.setFixedHeight(44)
+        row_l = QHBoxLayout(row)
+        row_l.setContentsMargins(12, 0, 12, 0)
+        row_l.setSpacing(12)
+
+        icon_l = QLabel(row)
+        icon_l.setFixedSize(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
+        icon_l.setScaledContents(True)
+        ic = lucide_icon("film", size=_UPDATE_ROW_ICON_SIZE, color_hex="#a1a1aa")
+        pm = ic.pixmap(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
+        if not pm.isNull():
+            icon_l.setPixmap(pm)
+        row_l.addWidget(icon_l)
+
+        name_l = QLabel("Video proxy cache", row)
+        name_l.setObjectName("UpdateProductListName")
+        row_l.addWidget(name_l)
+
+        ver_l = QLabel("—", row)
+        ver_l.setObjectName("UpdateProductListVersion")
+        ver_l.setProperty("mono", True)
+        row_l.addWidget(ver_l)
+        self._video_proxy_cache_size_label = ver_l
+
+        row_l.addStretch(1)
+
+        clear_btn = QPushButton("Clear cache", row)
+        clear_btn.setObjectName("UpdateProductListAction")
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setToolTip("Delete all cached review proxies on this machine")
+        clear_btn.clicked.connect(self._on_clear_video_proxy_cache_clicked)
+        row_l.addWidget(clear_btn)
+
+        list_layout.addWidget(row)
+
+    def _refresh_video_proxy_cache_row(self) -> None:
+        lab = getattr(self, "_video_proxy_cache_size_label", None)
+        if lab is None:
+            return
+        nbytes = proxy_cache_disk_usage()
+        if nbytes <= 0:
+            lab.setText("Empty")
+            return
+        if nbytes >= 1024 * 1024 * 1024:
+            lab.setText(f"{nbytes / (1024 ** 3):.1f} GB")
+        elif nbytes >= 1024 * 1024:
+            lab.setText(f"{nbytes / (1024 ** 2):.0f} MB")
+        else:
+            lab.setText(f"{nbytes // 1024} KB")
+
+    def _on_clear_video_proxy_cache_clicked(self) -> None:
+        size_hint = self._video_proxy_cache_size_label.text() if getattr(
+            self, "_video_proxy_cache_size_label", None
+        ) else "—"
+        msg = (
+            f"Delete all cached review proxies on this machine? ({size_hint})\n\n"
+            "Open Video Preview windows will rebuild proxies on next use."
+        )
+        if not ask_delete(self, "Clear video proxy cache", msg):
+            return
+        clear_all_proxy_cache()
+        self._refresh_video_proxy_cache_row()
 
     def _refresh_mpv_update_row(self) -> None:
         lab = getattr(self, "_mpv_version_label", None)
