@@ -6,9 +6,10 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QKeyEvent
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QFont, QFontMetrics, QKeyEvent, QShowEvent
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -30,9 +31,21 @@ from monostudio.core.item_comments import (
 )
 from monostudio.core.mention_inbox import append_mentions
 from monostudio.core.user_identity import get_current_user
-from monostudio.core.video_media import format_frame_label, format_timecode
+from monostudio.core.note_time_anchors import (
+    format_marker_pill_label,
+    format_range_pill_label,
+    time_href_for_marker,
+    time_href_for_range,
+)
+from monostudio.core.video_media import (
+    VideoFrameRange,
+    VideoReviewMarker,
+    format_frame_label,
+    format_range_span_display,
+    format_timecode,
+)
 from monostudio.ui_qt.note_author_row import NoteAuthorRow
-from monostudio.ui_qt.note_body_browser import NoteListPreviewLabel
+from monostudio.ui_qt.note_body_browser import NoteListPreviewLabel, make_note_card_preview
 from monostudio.ui_qt.note_compose_editor import NoteComposeEditor
 from monostudio.ui_qt.note_done_toggle import NoteDoneToggleButton
 from monostudio.ui_qt.note_seen_by_label import note_seen_by_label
@@ -42,6 +55,14 @@ from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def format_range_note_reference(rng: VideoFrameRange, fps: float) -> str:
+    span = format_range_span_display(rng, fps, mode="frame")
+    label = (rng.label or "").strip()
+    if label:
+        return f"[{span} · {label}]"
+    return f"[{span}]"
 
 
 def _format_local_time(iso_at: str) -> str:
@@ -57,6 +78,32 @@ def _format_local_time(iso_at: str) -> str:
         return dt.astimezone().strftime("%H:%M %d/%m/%Y")
     except ValueError:
         return s[:16] if len(s) >= 16 else s
+
+
+class _ElidedMetaLabel(QLabel):
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_text = text
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        self._apply_elide()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        text = self._full_text or ""
+        if not text:
+            self.setText("")
+            self.setToolTip("")
+            return
+        fm = QFontMetrics(self.font())
+        max_w = max(8, self.contentsRect().width())
+        elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, max_w)
+        self.setText(elided)
+        self.setToolTip(text if elided != text else "")
 
 
 class _ReviewNoteCard(QFrame):
@@ -89,6 +136,7 @@ class VideoReviewNotePanel(QWidget):
 
     open_all_notes_requested = Signal()
     note_added = Signal()
+    time_anchor_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -103,6 +151,7 @@ class VideoReviewNotePanel(QWidget):
         self._fps = 24.0
         self._frame_hint = ""
         self._entries: list[ItemCommentEntry] = []
+        self._compose_active = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 12)
@@ -113,44 +162,18 @@ class VideoReviewNotePanel(QWidget):
         self._context_label = QLabel("", self)
         self._context_label.setObjectName("VideoReviewDrawSectionTitle")
         self._context_label.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
+        self._context_label.setWordWrap(True)
         header.addWidget(self._context_label)
         self._frame_label = QLabel("", self)
+        self._frame_label.setWordWrap(True)
         self._frame_label.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
         self._frame_label.setStyleSheet(f"color: {MONOS_COLORS.get('text_label', '#a1a1aa')};")
         header.addWidget(self._frame_label)
         self._summary_label = QLabel("", self)
         self._summary_label.setObjectName("DialogHint")
+        self._summary_label.setWordWrap(True)
         header.addWidget(self._summary_label)
         lay.addLayout(header)
-
-        compose_title = QLabel("New note", self)
-        compose_title.setObjectName("DialogHint")
-        compose_title.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
-        lay.addWidget(compose_title)
-
-        self._compose_host = QWidget(self)
-        compose_lay = QVBoxLayout(self._compose_host)
-        compose_lay.setContentsMargins(0, 0, 0, 0)
-        compose_lay.setSpacing(6)
-        self._editor = NoteComposeEditor(item_root=Path("."), workspace_root=None, parent=self._compose_host)
-        self._editor.setMinimumHeight(88)
-        self._editor.setMaximumHeight(160)
-        self._editor.setPlaceholderText("Note at playhead… (@mention · paste images)")
-        compose_lay.addWidget(self._editor)
-        lay.addWidget(self._compose_host)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        self._btn_add = QPushButton("Add note", self)
-        self._btn_add.setObjectName("DialogPrimaryButton")
-        self._btn_add.clicked.connect(self._on_add)
-        self._btn_all = QPushButton("All notes…", self)
-        self._btn_all.setObjectName("DialogSecondaryButton")
-        self._btn_all.clicked.connect(self.open_all_notes_requested.emit)
-        btn_row.addWidget(self._btn_add)
-        btn_row.addWidget(self._btn_all)
-        btn_row.addStretch(1)
-        lay.addLayout(btn_row)
 
         list_title = QLabel("Notes", self)
         list_title.setObjectName("VideoReviewDrawSectionTitle")
@@ -163,19 +186,91 @@ class VideoReviewNotePanel(QWidget):
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._list_host = QWidget(self._scroll)
         self._list_host.setObjectName("VideoReviewNoteListHost")
+        self._list_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._list_layout = QVBoxLayout(self._list_host)
         self._list_layout.setContentsMargins(0, 0, 0, 0)
         self._list_layout.setSpacing(6)
         self._list_layout.addStretch(1)
         self._scroll.setWidget(self._list_host)
+        self._scroll.viewport().installEventFilter(self)
         lay.addWidget(self._scroll, 1)
 
-        hint = QLabel("Ctrl+Enter add · Notes tag current frame", self)
-        hint.setObjectName("DialogHint")
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
+        self._compose_host = QWidget(self)
+        compose_lay = QVBoxLayout(self._compose_host)
+        compose_lay.setContentsMargins(0, 0, 0, 0)
+        compose_lay.setSpacing(6)
+        compose_title = QLabel("New note", self._compose_host)
+        compose_title.setObjectName("DialogHint")
+        compose_title.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
+        compose_lay.addWidget(compose_title)
+        self._editor = NoteComposeEditor(item_root=Path("."), workspace_root=None, parent=self._compose_host)
+        self._editor.setMinimumHeight(88)
+        self._editor.setMaximumHeight(160)
+        self._editor.setPlaceholderText("Note at playhead… (@mention · paste images)")
+        self._editor.time_anchor_clicked.connect(self.time_anchor_requested.emit)
+        compose_lay.addWidget(self._editor)
+        compose_btn_row = QHBoxLayout()
+        compose_btn_row.setSpacing(8)
+        self._chk_auto_add = QCheckBox("Auto add", self._compose_host)
+        self._chk_auto_add.setObjectName("VideoReviewNoteAutoAddCheck")
+        self._chk_auto_add.setChecked(True)
+        self._chk_auto_add.setToolTip("Click ranges and markers to insert pills into the note")
+        compose_btn_row.addWidget(self._chk_auto_add)
+        self._btn_add = QPushButton("Add note", self._compose_host)
+        self._btn_add.setObjectName("DialogPrimaryButton")
+        self._btn_add.clicked.connect(self._on_add)
+        self._btn_cancel = QPushButton("Cancel", self._compose_host)
+        self._btn_cancel.setObjectName("DialogSecondaryButton")
+        self._btn_cancel.clicked.connect(self.cancel_compose)
+        compose_btn_row.addWidget(self._btn_add)
+        compose_btn_row.addWidget(self._btn_cancel)
+        compose_btn_row.addStretch(1)
+        compose_lay.addLayout(compose_btn_row)
+        self._compose_host.setVisible(False)
+        lay.addWidget(self._compose_host)
+
+        self._hint = QLabel("New note captures playhead · Esc cancels compose", self)
+        self._hint.setObjectName("DialogHint")
+        self._hint.setWordWrap(True)
+        lay.addWidget(self._hint)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        self._btn_new_note = QPushButton("New note", self)
+        self._btn_new_note.setObjectName("DialogPrimaryButton")
+        self._btn_new_note.setToolTip("Compose a note at the current playhead")
+        self._btn_new_note.clicked.connect(self._start_compose)
+        self._btn_all = QPushButton("All notes…", self)
+        self._btn_all.setObjectName("DialogSecondaryButton")
+        self._btn_all.clicked.connect(self.open_all_notes_requested.emit)
+        action_row.addWidget(self._btn_new_note)
+        action_row.addWidget(self._btn_all)
+        action_row.addStretch(1)
+        lay.addLayout(action_row)
 
         self._refresh_compose_enabled()
+
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._sync_list_host_width()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self._scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._sync_list_host_width()
+        return super().eventFilter(obj, event)
+
+    def _sync_list_host_width(self) -> None:
+        w = max(1, self._scroll.viewport().width())
+        self._list_host.setMinimumWidth(w)
+        self._list_host.setMaximumWidth(w)
+
+    def compose_active(self) -> bool:
+        return self._compose_active
+
+    def cancel_compose(self) -> None:
+        if not self._compose_active:
+            return
+        self._finish_compose()
 
     def set_entity(self, entity_path: Path | None) -> None:
         self.set_context(
@@ -197,6 +292,7 @@ class VideoReviewNotePanel(QWidget):
         project_root: Path | None = None,
         item_display_name: str = "",
     ) -> None:
+        self._finish_compose()
         self._entity_path = Path(entity_path) if entity_path else None
         self._department_id = normalize_note_department_id(department_id) or None
         self._department_label = (department_label or "").strip() or (
@@ -220,9 +316,31 @@ class VideoReviewNotePanel(QWidget):
         self._refresh_compose_enabled()
         self.reload_notes()
 
+    def entries(self) -> list[ItemCommentEntry]:
+        return list(self._entries)
+
     def set_frame_hint(self, text: str) -> None:
         self._frame_hint = (text or "").strip()
         self._frame_label.setText(self._frame_hint or "—")
+
+    def auto_add_enabled(self) -> bool:
+        return self._compose_active and self._chk_auto_add.isChecked()
+
+    def insert_range_reference(self, rng: VideoFrameRange, fps: float) -> bool:
+        if not self._compose_active or self._entity_path is None or not self._compose_host.isEnabled():
+            return False
+        label = format_range_pill_label(rng, fps)
+        href = time_href_for_range(rng.id, rng.in_frame)
+        self._editor.insert_time_pill(label, href, kind="range")
+        return True
+
+    def insert_marker_reference(self, marker: VideoReviewMarker, fps: float) -> bool:
+        if not self._compose_active or self._entity_path is None or not self._compose_host.isEnabled():
+            return False
+        label = format_marker_pill_label(marker, fps)
+        href = time_href_for_marker(marker.id, marker.frame)
+        self._editor.insert_time_pill(label, href, kind="marker")
+        return True
 
     def set_playhead(self, frame: int, fps: float) -> None:
         self._frame = max(0, int(frame))
@@ -250,7 +368,8 @@ class VideoReviewNotePanel(QWidget):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if (
-            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            self._compose_active
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
             and event.modifiers() & Qt.KeyboardModifier.ControlModifier
         ):
             self._on_add()
@@ -258,10 +377,35 @@ class VideoReviewNotePanel(QWidget):
             return
         super().keyPressEvent(event)
 
+    def _start_compose(self) -> None:
+        if self._entity_path is None or not self._entity_path.is_dir():
+            return
+        self._compose_active = True
+        self._editor.reset_draft()
+        self._editor.sync_playhead_pill(self._frame, self._fps)
+        self._editor.set_playhead_pill_locked(True)
+        self._compose_host.setVisible(True)
+        self._hint.setText("Playhead locked · Ctrl+Enter add · Esc cancel")
+        self._refresh_compose_enabled()
+        self._editor.setFocus()
+
+    def _finish_compose(self) -> None:
+        if not self._compose_active and not self._compose_host.isVisible():
+            self._editor.reset_draft()
+            return
+        self._compose_active = False
+        self._editor.set_playhead_pill_locked(False)
+        self._editor.reset_draft()
+        self._compose_host.setVisible(False)
+        self._hint.setText("New note captures playhead · Esc cancels compose")
+        self._refresh_compose_enabled()
+
     def _refresh_compose_enabled(self) -> None:
         ready = self._entity_path is not None and self._entity_path.is_dir()
         self._compose_host.setEnabled(ready)
-        self._btn_add.setEnabled(ready)
+        self._btn_new_note.setEnabled(ready and not self._compose_active)
+        self._btn_add.setEnabled(ready and self._compose_active)
+        self._btn_cancel.setEnabled(ready and self._compose_active)
 
     def _update_summary(self) -> None:
         n_open = sum(1 for e in self._entries if not e.done)
@@ -280,13 +424,6 @@ class VideoReviewNotePanel(QWidget):
             return True
         frame_lbl = format_frame_label(self._frame)
         return f"F{frame_lbl}" in text or frame_lbl in text
-
-    def _frame_prefix(self) -> str:
-        if self._frame_hint:
-            return f"[{self._frame_hint}]"
-        frame_lbl = format_frame_label(self._frame)
-        tc = format_timecode(self._frame / self._fps, fps=self._fps)
-        return f"[F{frame_lbl} · {tc}]"
 
     def _item_rel_path(self) -> str:
         if self._project_root is None or self._entity_path is None:
@@ -323,19 +460,14 @@ class VideoReviewNotePanel(QWidget):
         write_item_comments_for_department(self._entity_path, self._department_id, entries)
 
     def _on_add(self) -> None:
-        if self._entity_path is None or not self._entity_path.is_dir():
+        if not self._compose_active or self._entity_path is None or not self._entity_path.is_dir():
             return
         if not self._editor.has_content():
             return
         current = get_current_user(self._workspace_root)
-        prefix = self._frame_prefix()
         body_plain = self._editor.plain_text().strip()
-        plain = f"{prefix} {body_plain}".strip()
+        plain = body_plain
         body_html = self._editor.body_html()
-        if prefix:
-            body_html = (
-                f'<p style="color:#71717a; margin-bottom:6px;">{prefix}</p>{body_html}'
-            )
         try:
             entry = new_comment_entry(
                 plain,
@@ -356,7 +488,7 @@ class VideoReviewNotePanel(QWidget):
             return
         self._entries = entries
         self._dispatch_mentions(entry)
-        self._editor.reset_draft()
+        self._finish_compose()
         self._update_summary()
         self._rebuild_list()
         self.note_added.emit()
@@ -409,6 +541,7 @@ class VideoReviewNotePanel(QWidget):
             workspace_root=self._workspace_root,
             parent=self.window(),
         )
+        dlg.time_anchor_clicked.connect(self.time_anchor_requested.emit)
         dlg.exec()
         self.reload_notes()
 
@@ -435,13 +568,16 @@ class VideoReviewNotePanel(QWidget):
 
         for entry in ordered:
             self._list_layout.insertWidget(0, self._make_note_card(entry))
+        self._sync_list_host_width()
 
     def _make_note_card(self, entry: ItemCommentEntry) -> QFrame:
         frame_match = self._entry_matches_playhead(entry)
         card = _ReviewNoteCard(entry, frame_match=frame_match, parent=self._list_host)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        card.setMinimumWidth(0)
         card.open_requested.connect(self._open_note_view)
         row = QHBoxLayout(card)
-        row.setContentsMargins(10, 8, 8, 8)
+        row.setContentsMargins(10, 8, 10, 8)
         row.setSpacing(8)
 
         done_btn = NoteDoneToggleButton(checked=entry.done, parent=card)
@@ -453,28 +589,57 @@ class VideoReviewNotePanel(QWidget):
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(4)
-        text_col.addWidget(
-            NoteAuthorRow.for_entry(
-                entry,
-                self._workspace_root,
-                avatar_size=22,
-                time_text=_format_local_time(entry.at),
-                parent=card,
-            )
-        )
-        preview = NoteListPreviewLabel(card)
-        preview.set_preview(entry_preview_text(entry), done=entry.done)
-        preview.open_requested.connect(lambda eid=entry.id: self._open_note_view(eid))
-        text_col.addWidget(preview, 1)
-        seen = note_seen_by_label(entry, self._workspace_root, card)
-        if seen is not None:
-            text_col.addWidget(seen)
-        row.addLayout(text_col, 1)
 
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setSpacing(6)
+        author = NoteAuthorRow.for_entry(
+            entry,
+            self._workspace_root,
+            avatar_size=22,
+            name_only=True,
+            parent=card,
+        )
+        author.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        author.setMinimumWidth(0)
+        meta_row.addWidget(author, 1)
         if frame_match:
             badge = QLabel("FRAME", card)
             badge.setObjectName("VideoReviewNoteFrameBadge")
             badge.setFont(monos_font("Inter", 9, QFont.Weight.Bold))
-            row.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+            meta_row.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+        text_col.addLayout(meta_row)
+
+        time_l = _ElidedMetaLabel(_format_local_time(entry.at), card)
+        time_l.setObjectName("ItemNotesMetaTime")
+        time_l.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
+        text_col.addWidget(time_l)
+
+        preview = self._make_note_preview(entry, card)
+        text_col.addWidget(preview, 1)
+        seen = note_seen_by_label(entry, self._workspace_root, card)
+        if seen is not None:
+            text_col.addWidget(seen)
+        text_wrap = QWidget(card)
+        text_wrap.setObjectName("VideoReviewNoteCardBody")
+        text_wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        text_wrap.setMinimumWidth(0)
+        text_wrap.setLayout(text_col)
+        row.addWidget(text_wrap, 1)
 
         return card
+
+    def _make_note_preview(self, entry: ItemCommentEntry, card: QWidget) -> QWidget:
+        if self._entity_path is None:
+            plain = NoteListPreviewLabel(card)
+            plain.set_preview(entry_preview_text(entry), done=entry.done)
+            plain.open_requested.connect(lambda eid=entry.id: self._open_note_view(eid))
+            return plain
+        return make_note_card_preview(
+            entry,
+            item_root=self._entity_path,
+            workspace_root=self._workspace_root,
+            parent=card,
+            on_time_anchor=self.time_anchor_requested.emit,
+            on_plain_open=lambda eid=entry.id: self._open_note_view(eid),
+        )

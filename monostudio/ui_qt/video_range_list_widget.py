@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -118,7 +118,7 @@ class _RangeListRowWidget(QWidget):
 class VideoRangeListWidget(QWidget):
     """List of marked frame ranges with selection."""
 
-    range_selected = Signal(str)  # range id
+    range_selected = Signal(str, bool)  # range id, shift_held
     range_delete_requested = Signal(str)
     range_delete_all_requested = Signal()
     range_duplicate_requested = Signal(str)
@@ -156,6 +156,7 @@ class VideoRangeListWidget(QWidget):
         self._list.customContextMenuRequested.connect(self._on_context_menu)
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._list.installEventFilter(self)
         lay.addWidget(self._list, 1)
 
         self._placeholder = QLabel(
@@ -179,6 +180,15 @@ class VideoRangeListWidget(QWidget):
         self._draft_in: int | None = None
         self._draft_out: int | None = None
         self._block_row_signal = False
+        self._last_click_shift = False
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self._list and event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._last_click_shift = bool(
+                    event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                )
+        return super().eventFilter(obj, event)
 
     def sort_mode(self) -> ListSortMode:
         return self._sort_mode
@@ -414,7 +424,9 @@ class VideoRangeListWidget(QWidget):
             return
         rid = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(rid, str):
-            self.range_selected.emit(rid)
+            shift = self._last_click_shift
+            self._last_click_shift = False
+            self.range_selected.emit(rid, shift)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_F2:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QMouseEvent, QPainter, QPen, QPolygon, QWheelEvent
 from PySide6.QtWidgets import QInputDialog, QSizePolicy, QWidget
 
@@ -19,6 +19,7 @@ from monostudio.core.video_media import (
     format_timecode,
     TimeDisplayMode,
 )
+from monostudio.ui_qt.review_note_timeline import ReviewTimelineNoteMarker
 from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, monos_font
 from monostudio.ui_qt.video_range_colors import range_color_qcolor
 
@@ -38,10 +39,10 @@ class VideoPreviewScrubber(QWidget):
     footer_context_changed = Signal(str)
     in_out_changed = Signal(int, int)
     range_handles_drag_started = Signal()
-    range_highlighted = Signal(str)
+    range_highlighted = Signal(str, bool, bool)  # id, shift_held, insert_note
     range_edit_requested = Signal(str)
     range_deselected = Signal()
-    marker_highlighted = Signal(str)
+    marker_highlighted = Signal(str, bool)  # id, shift_held
     marker_deselected = Signal()
     go_to_in_requested = Signal(str)
     go_to_out_requested = Signal(str)
@@ -58,10 +59,14 @@ class VideoPreviewScrubber(QWidget):
     draw_keyframe_move_finished = Signal()
     fit_timeline_requested = Signal()
     timeline_display_force_toggled = Signal(str, bool)
+    note_marker_clicked = Signal(str)
 
     _MARGIN_H = 12
     _RULER_H = 26
     _TRACK_H = 32
+    _NOTE_AVATAR_PX = 18
+    _NOTE_AVATAR_INNER_PX = 14
+    _NOTE_AVATAR_MAX_STACK = 3
     _RANGE_BAND_H = 18
     _GAP = 0
     _HANDLE_W = 11
@@ -102,6 +107,7 @@ class VideoPreviewScrubber(QWidget):
         self._display_force_markers = False
         self._display_force_draw_keys = False
         self._display_draw_keys_enabled = False
+        self._note_markers: list[ReviewTimelineNoteMarker] = []
         self._drag_draw_key_origin_frame = 0
         self._timeline_list_mode: TimelineListMode = "ranges"
         self._marker_highlight_id: str | None = None
@@ -311,6 +317,53 @@ class VideoPreviewScrubber(QWidget):
             return
         self._timeline_list_mode = mode
         self.update()
+
+    def set_note_markers(self, markers: list[ReviewTimelineNoteMarker]) -> None:
+        markers = list(markers)
+        if markers == self._note_markers:
+            return
+        self._note_markers = markers
+        self.update()
+
+    def _ruler_center_y(self) -> int:
+        return max(self._NOTE_AVATAR_PX // 2 + 2, self._ruler_h() // 2)
+
+    def _note_marker_layout(self, track: QRect) -> list[tuple[ReviewTimelineNoteMarker, int, int]]:
+        """(marker, center_x, center_y) for each visible avatar."""
+        if not self._note_markers:
+            return []
+        cy = self._ruler_center_y()
+        by_frame: dict[int, list[ReviewTimelineNoteMarker]] = {}
+        for marker in self._note_markers:
+            by_frame.setdefault(int(marker.frame), []).append(marker)
+        placed: list[tuple[ReviewTimelineNoteMarker, int, int]] = []
+        step = max(12, self._NOTE_AVATAR_PX - 2)
+        for frame, items in by_frame.items():
+            px = self._x_for_frame(frame)
+            visible = items[: self._NOTE_AVATAR_MAX_STACK]
+            for i, marker in enumerate(visible):
+                offset = int(round((i - (len(visible) - 1) / 2.0) * step))
+                placed.append((marker, px + offset, cy))
+        return placed
+
+    def _hit_note_marker_at(self, x: int, y: int) -> ReviewTimelineNoteMarker | None:
+        if not self._note_markers:
+            return None
+        cy = self._ruler_center_y()
+        hit_r = self._NOTE_AVATAR_PX // 2 + 3
+        if y < cy - hit_r or y > cy + hit_r:
+            return None
+        track = self._track_rect()
+        best: ReviewTimelineNoteMarker | None = None
+        best_d2 = (hit_r + 1) ** 2
+        for marker, cx, marker_cy in self._note_marker_layout(track):
+            dx = x - cx
+            dy = y - marker_cy
+            d2 = dx * dx + dy * dy
+            if d2 <= hit_r * hit_r and d2 < best_d2:
+                best_d2 = d2
+                best = marker
+        return best
 
     def set_markers(
         self,
@@ -764,7 +817,10 @@ class VideoPreviewScrubber(QWidget):
     def _hit_marker_at(self, x: int, y: int, *, px_tolerance: int = 10) -> VideoReviewMarker | None:
         if not self._markers:
             return None
-        if y < 0 or y > self._track_rect().bottom():
+        track = self._track_rect()
+        band_top, band_h = self._band_metrics(track)
+        pad = 6
+        if y < band_top - pad or y > band_top + band_h + pad:
             return None
         best: VideoReviewMarker | None = None
         best_dx = px_tolerance + 1
@@ -779,14 +835,14 @@ class VideoPreviewScrubber(QWidget):
     def _draw_markers(self, painter: QPainter, track: QRect) -> None:
         if not self._markers:
             return
+        band_top, band_h = self._band_metrics(track)
+        cy = band_top + band_h // 2
         for m in self._markers:
             px = self._x_for_frame(m.frame)
             active = m.id == self._marker_highlight_id
             color = QColor("#fafafa") if active else _MARKER_COLOR
-            painter.setPen(QPen(color, 2 if active else 1))
-            painter.drawLine(px, 0, px, track.bottom())
-            cy = max(8, self._ruler_h() // 2)
             size = 7 if active else 5
+            painter.setPen(QPen(color, 2 if active else 1))
             painter.setBrush(color if active else QColor(244, 114, 182, 210))
             painter.drawPolygon(
                 QPolygon(
@@ -798,6 +854,27 @@ class VideoPreviewScrubber(QWidget):
                     ]
                 )
             )
+
+    def _draw_note_markers(self, painter: QPainter, track: QRect) -> None:
+        if not self._note_markers:
+            return
+        outer = self._NOTE_AVATAR_PX
+        for marker, cx, cy in self._note_marker_layout(track):
+            if marker.done:
+                painter.save()
+                painter.setOpacity(0.42)
+            pm = marker.pixmap
+            dpr = max(1.0, float(pm.devicePixelRatio()))
+            pw = pm.width() / dpr
+            ph = pm.height() / dpr
+            ring = marker.ring_color
+            painter.setPen(QPen(ring, 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QRectF(cx - outer / 2, cy - outer / 2, outer, outer))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPixmap(int(round(cx - pw / 2)), int(round(cy - ph / 2)), pm)
+            if marker.done:
+                painter.restore()
 
     def _pick_range_at(self, frame: int) -> VideoFrameRange | None:
         hits = self._ranges_at_frame(frame)
@@ -1118,6 +1195,9 @@ class VideoPreviewScrubber(QWidget):
             painter.drawText(x + 3, ruler_y - 9, label)
             t += major_sec
 
+        if self._note_markers:
+            self._draw_note_markers(painter, track)
+
         # Track background (range band row only — scrubber chrome height unchanged)
         band_top, band_h = self._band_metrics(track)
         band_row = QRect(track.left(), band_top, track.width(), band_h)
@@ -1125,11 +1205,11 @@ class VideoPreviewScrubber(QWidget):
         painter.setBrush(QColor(255, 255, 255, 14))
         painter.drawRoundedRect(band_row, 3, 3)
 
-        if self._display_markers:
-            self._draw_markers(painter, track)
-
         if self._display_ranges:
             self._paint_range_bars(painter, track, w)
+
+        if self._display_markers:
+            self._draw_markers(painter, track)
 
         if self._display_draw_keyframes:
             self._paint_draw_keyframes(painter, track)
@@ -1236,7 +1316,7 @@ class VideoPreviewScrubber(QWidget):
         if on_track:
             rng = self._pick_range_at(frame)
             if rng is not None:
-                self.range_highlighted.emit(rng.id)
+                self.range_highlighted.emit(rng.id, False, False)
 
         menu = MonosMenu(self)
         act_seek = act_min = act_mout = act_add = act_fit = act_zoom_view = act_clear = None
@@ -1350,7 +1430,8 @@ class VideoPreviewScrubber(QWidget):
             if self._interact_markers:
                 hit_m = self._hit_marker_at(x, y)
                 if hit_m is not None:
-                    self.marker_highlighted.emit(hit_m.id)
+                    shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                    self.marker_highlighted.emit(hit_m.id, shift)
                     event.accept()
                     return
             hit_draw = self._hit_draw_keyframe_at(x, y)
@@ -1382,10 +1463,17 @@ class VideoPreviewScrubber(QWidget):
             super().mousePressEvent(event)
             return
 
+        note_hit = self._hit_note_marker_at(x, y)
+        if note_hit is not None:
+            self.note_marker_clicked.emit(note_hit.note_id)
+            event.accept()
+            return
+
         if self._interact_markers:
             hit_m = self._hit_marker_at(x, y)
             if hit_m is not None:
-                self.marker_highlighted.emit(hit_m.id)
+                shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                self.marker_highlighted.emit(hit_m.id, shift)
                 event.accept()
                 return
 
@@ -1437,7 +1525,8 @@ class VideoPreviewScrubber(QWidget):
             if self._interact_ranges:
                 hit = self._hit_range_bar_at(x, y)
                 if hit is not None:
-                    self.range_highlighted.emit(hit.id)
+                    shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                    self.range_highlighted.emit(hit.id, shift, True)
                     event.accept()
                     return
 
@@ -1513,12 +1602,19 @@ class VideoPreviewScrubber(QWidget):
                 self._last_hover_frame = frame
                 self.hover_frame.emit(frame)
             self._emit_footer_context(x, y)
-            if self._edit_id and self._hit_edit_body(x, y) is not None:
-                self.setCursor(Qt.CursorShape.OpenHandCursor)
-            elif self._edit_id and self._hit_handle(x, y) is not None:
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            note_hit = self._hit_note_marker_at(x, y)
+            if note_hit is not None:
+                self.setToolTip(note_hit.tooltip)
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
             else:
-                self.unsetCursor()
+                if self.toolTip():
+                    self.setToolTip("")
+                if self._edit_id and self._hit_edit_body(x, y) is not None:
+                    self.setCursor(Qt.CursorShape.OpenHandCursor)
+                elif self._edit_id and self._hit_handle(x, y) is not None:
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                else:
+                    self.unsetCursor()
             super().mouseMoveEvent(event)
             return
 

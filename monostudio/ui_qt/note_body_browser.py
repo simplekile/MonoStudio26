@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt, QUrl, Signal
@@ -12,9 +13,20 @@ from PySide6.QtGui import (
     QMouseEvent,
     QColor,
 )
-from PySide6.QtWidgets import QLabel, QSizePolicy, QTextBrowser
+from PySide6.QtWidgets import QLabel, QSizePolicy, QTextBrowser, QWidget
 
-from monostudio.core.item_comments import is_mention_note_href, user_id_from_mention_href
+
+def resolve_note_jump_host(widget: QWidget | None) -> QWidget | None:
+    """Find MainWindow (or any widget exposing jump_to_note_time_anchor)."""
+    w = widget
+    while w is not None:
+        if callable(getattr(w, "jump_to_note_time_anchor", None)):
+            return w
+        w = w.parentWidget()
+    return None
+
+from monostudio.core.item_comments import ItemCommentEntry, entry_preview_text, is_mention_note_href, user_id_from_mention_href
+from monostudio.core.note_time_anchors import is_time_note_href, parse_time_href, parse_time_href_from_html
 from monostudio.ui_qt.note_compose_editor import (
     NOTE_BODY_FONT,
     NOTE_RICH_TEXT_STYLESHEET,
@@ -39,6 +51,8 @@ def _open_note_image(item_root: Path, href: str, *, parent) -> bool:
 
 
 class NoteBodyBrowser(QTextBrowser):
+    time_anchor_clicked = Signal(str)
+
     def __init__(self, *, item_root: Path, workspace_root: Path | None = None, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("ItemNotesBodyBrowser")
@@ -79,10 +93,10 @@ class NoteBodyBrowser(QTextBrowser):
 
     def _handle_mouse_move(self, viewport_pos) -> None:
         href = self.anchorAt(viewport_pos)
-        if href and is_mention_note_href(href):
+        if href and (is_mention_note_href(href) or is_time_note_href(href)):
             self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
-        else:
-            self._handle_image_mouse_move(viewport_pos)
+            return
+        self._handle_image_mouse_move(viewport_pos)
 
     def _handle_image_mouse_move(self, viewport_pos) -> None:
         href = image_href_at_widget_pos(self, viewport_pos)
@@ -155,13 +169,18 @@ class NoteBodyBrowser(QTextBrowser):
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
     def setSource(self, url: QUrl) -> None:  # type: ignore[override]
-        """Block Qt from loading custom mention: anchors as documents."""
-        if is_mention_note_href(url.toString()):
+        """Block Qt from loading custom mention/time anchors as documents."""
+        href = url.toString()
+        if is_mention_note_href(href) or is_time_note_href(href):
             return
         super().setSource(url)
 
     def _on_anchor(self, url: QUrl) -> None:
         href = url.toString()
+        if is_time_note_href(href):
+            if parse_time_href(href) is not None:
+                self.time_anchor_clicked.emit(href)
+            return
         if is_mention_note_href(href):
             uid = user_id_from_mention_href(href)
             if uid:
@@ -219,3 +238,42 @@ class NoteListPreviewLabel(QLabel):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+def note_has_time_pill_html(html: str) -> bool:
+    body = (html or "").strip()
+    if not body:
+        return False
+    if parse_time_href_from_html(body) is not None:
+        return True
+    return 'href="monos-time:' in body or is_time_note_href(body)
+
+
+def make_note_card_preview(
+    entry: ItemCommentEntry,
+    *,
+    item_root: Path,
+    workspace_root: Path | None,
+    parent,
+    on_time_anchor: Callable[[str], None] | None = None,
+    on_plain_open: Callable[[], None] | None = None,
+) -> QWidget:
+    """Compact list preview — rich browser when note has timeline pills."""
+    html = (entry.body_html or "").strip()
+    if note_has_time_pill_html(html):
+        preview = NoteBodyBrowser(
+            item_root=item_root,
+            workspace_root=workspace_root,
+            parent=parent,
+        )
+        preview.setMaximumHeight(52)
+        preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        preview.set_body(html, plain_fallback=entry_preview_text(entry), done=entry.done)
+        if on_time_anchor is not None:
+            preview.time_anchor_clicked.connect(on_time_anchor)
+        return preview
+    plain = NoteListPreviewLabel(parent)
+    plain.set_preview(entry_preview_text(entry), done=entry.done)
+    if on_plain_open is not None:
+        plain.open_requested.connect(on_plain_open)
+    return plain

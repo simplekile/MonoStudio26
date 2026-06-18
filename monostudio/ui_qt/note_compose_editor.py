@@ -7,7 +7,7 @@ import re
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QUrl
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -37,6 +37,13 @@ from monostudio.core.item_comments import (
     parse_mentions_from_html,
     strip_html_preview,
 )
+from monostudio.core.note_time_anchors import (
+    NoteTimeKind,
+    format_frame_pill_label,
+    is_playhead_time_href,
+    is_time_note_href,
+    time_href_for_playhead,
+)
 from monostudio.core.user_identity import StudioUser, read_roster
 from monostudio.ui_qt.note_mention_popup import NoteMentionPopup
 from monostudio.ui_qt.note_image_hit_test import image_href_at_widget_pos
@@ -45,8 +52,6 @@ from monostudio.ui_qt.popup_position import position_child_popup_near_global_poi
 from monostudio.ui_qt.style import monos_font
 
 _FULL_IMG_MAX_PX = 1920
-NOTE_LINE_MIN_H = NOTE_IMG_BOX_SIZE + 6
-NOTE_BLOCK_BOTTOM_MARGIN = 6
 NOTE_BODY_FONT_SIZE = 11
 NOTE_BODY_FONT = monos_font("Inter", NOTE_BODY_FONT_SIZE, QFont.Weight.Normal)
 NOTE_BODY_COLOR = "#e4e4e7"
@@ -55,12 +60,32 @@ NOTE_RICH_TEXT_STYLESHEET = (
     f"body, p, li, a, span {{ font-family: Inter; font-size: {NOTE_BODY_FONT_SIZE}pt; }}"
     f"body, p, li {{ margin-top: 0px; margin-bottom: 6px; line-height: 1.5; color: {NOTE_BODY_COLOR}; }}"
     "a { text-decoration: none; }"
+    "a[href^=\"monos-time:range\"] {"
+    "  font-family: \"JetBrains Mono\";"
+    "  color: #93c5fd; background-color: rgba(37, 99, 235, 0.28);"
+    "  border-radius: 4px; padding: 1px 5px;"
+    "}"
+    "a[href^=\"monos-time:marker\"] {"
+    "  font-family: \"JetBrains Mono\";"
+    "  color: #f9a8d4; background-color: rgba(244, 114, 182, 0.22);"
+    "  border-radius: 4px; padding: 1px 5px;"
+    "}"
+    "a[href^=\"monos-time:frame\"] {"
+    "  font-family: \"JetBrains Mono\";"
+    "  color: #d4d4d8; background-color: rgba(63, 63, 70, 0.55);"
+    "  border-radius: 4px; padding: 1px 5px;"
+    "}"
+    "a[href^=\"monos-time:playhead\"] {"
+    "  font-family: \"JetBrains Mono\";"
+    "  color: #fde68a; background-color: rgba(245, 158, 11, 0.24);"
+    "  border-radius: 4px; padding: 1px 5px;"
+    "}"
     "img { vertical-align: top; }"
 )
 
 
 def normalize_note_document_spacing(doc: QTextDocument) -> None:
-    """Ensure blocks with inline images have enough line height and paragraph gap."""
+    """Image rows: fixed line height. Text rows: rely on stylesheet (no block margins)."""
     block = doc.firstBlock()
     while block.isValid():
         has_image = False
@@ -72,15 +97,20 @@ def normalize_note_document_spacing(doc: QTextDocument) -> None:
                 break
             it += 1
         cursor = QTextCursor(block)
-        bf = block.blockFormat()
+        bf = QTextBlockFormat(block.blockFormat())
         changed = False
         if has_image:
-            min_h = float(NOTE_LINE_MIN_H)
-            if bf.lineHeightType() != _LH_MINIMUM or bf.lineHeight() < min_h:
+            min_h = float(NOTE_IMG_BOX_SIZE)
+            if bf.lineHeightType() != _LH_MINIMUM or bf.lineHeight() < min_h - 0.01:
                 bf.setLineHeight(min_h, _LH_MINIMUM)
                 changed = True
-        if bf.bottomMargin() < NOTE_BLOCK_BOTTOM_MARGIN:
-            bf.setBottomMargin(NOTE_BLOCK_BOTTOM_MARGIN)
+        else:
+            if bf.lineHeightType() == _LH_MINIMUM:
+                bf.setLineHeight(150, QTextBlockFormat.LineHeightTypes.ProportionalHeight)
+                changed = True
+        if bf.bottomMargin() > 0 or bf.topMargin() > 0:
+            bf.setTopMargin(0)
+            bf.setBottomMargin(0)
             changed = True
         if changed:
             cursor.setBlockFormat(bf)
@@ -129,6 +159,8 @@ def _scale_image(img: QImage, max_px: int) -> QImage:
 
 
 class NoteComposeEditor(QTextEdit):
+    time_anchor_clicked = Signal(str)
+
     def __init__(
         self,
         *,
@@ -159,6 +191,7 @@ class NoteComposeEditor(QTextEdit):
         self._mention_popup.set_users(read_roster(self._workspace_root))
         self._mention_start = -1
         self._mention_key_capture_host: QObject | None = None
+        self._playhead_pill_locked = False
         self.installEventFilter(self)
         self.document().setBaseUrl(QUrl.fromLocalFile(str(self._monostudio_dir) + os.sep))
         self.document().setDefaultFont(NOTE_BODY_FONT)
@@ -253,9 +286,16 @@ class NoteComposeEditor(QTextEdit):
 
     def reset_draft(self) -> None:
         self.clear()
+        self._playhead_pill_locked = False
         self._apply_default_cursor_format()
         self._entry_id = uuid.uuid4().hex[:16]
         self._media_dir = note_media_entry_dir(self._item_root, self._entry_id)
+
+    def set_playhead_pill_locked(self, locked: bool) -> None:
+        self._playhead_pill_locked = bool(locked)
+
+    def playhead_pill_locked(self) -> bool:
+        return self._playhead_pill_locked
 
     def load_entry_for_edit(self, entry_id: str, *, body_html: str, plain_fallback: str = "") -> None:
         """Reuse an existing note id (and media folder) when editing."""
@@ -278,7 +318,111 @@ class NoteComposeEditor(QTextEdit):
         return self._entry_id
 
     def has_content(self) -> bool:
-        return bool(self.toPlainText().strip())
+        plain = self.toPlainText().strip()
+        if not plain:
+            return False
+        span = self._playhead_span()
+        if span is None:
+            return True
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(span[0])
+        cursor.setPosition(span[1], QTextCursor.MoveMode.KeepAnchor)
+        playhead_plain = cursor.selectedText().replace("\u2029", "\n").strip()
+        rest = plain
+        if playhead_plain and rest.startswith(playhead_plain):
+            rest = rest[len(playhead_plain) :].strip()
+        elif playhead_plain:
+            rest = rest.replace(playhead_plain, "", 1).strip()
+        return bool(rest)
+
+    def sync_playhead_pill(self, frame: int, fps: float) -> None:
+        if self._playhead_pill_locked:
+            return
+        label = format_frame_pill_label(frame, fps)
+        href = time_href_for_playhead(frame)
+        snippet = f" {label} "
+        fmt = self._time_pill_char_format(href, kind="playhead")
+        spans = self._iter_playhead_spans()
+        cursor = QTextCursor(self.document())
+        if spans:
+            start, end = spans[0]
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            cursor.insertText(snippet, fmt)
+            for extra_start, extra_end in reversed(self._iter_playhead_spans()[1:]):
+                extra = QTextCursor(self.document())
+                extra.setPosition(extra_start)
+                extra.setPosition(extra_end, QTextCursor.MoveMode.KeepAnchor)
+                extra.removeSelectedText()
+        else:
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.insertText(snippet, fmt)
+            cursor.insertText(" ", self._body_char_format())
+        self._apply_default_cursor_format()
+        self._clamp_cursor_outside_playhead()
+
+    def _iter_playhead_spans(self) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        block = self.document().firstBlock()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    href = frag.charFormat().anchorHref()
+                    if is_playhead_time_href(href):
+                        out.append((frag.position(), frag.position() + frag.length()))
+                it += 1
+            block = block.next()
+        return out
+
+    def _playhead_span(self) -> tuple[int, int] | None:
+        spans = self._iter_playhead_spans()
+        return spans[0] if spans else None
+
+    def _clamp_cursor_outside_playhead(self) -> None:
+        span = self._playhead_span()
+        if span is None:
+            return
+        pstart, pend = span
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return
+        pos = cursor.position()
+        if pstart < pos < pend:
+            cursor.setPosition(pend)
+            self.setTextCursor(cursor)
+
+    def _selection_overlaps_playhead(self) -> bool:
+        span = self._playhead_span()
+        if span is None:
+            return False
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return False
+        s, e = sorted((cursor.selectionStart(), cursor.selectionEnd()))
+        pstart, pend = span
+        return s < pend and e > pstart
+
+    def _key_would_damage_playhead(self, event: QKeyEvent) -> bool:
+        span = self._playhead_span()
+        if span is None:
+            return False
+        pstart, pend = span
+        key = event.key()
+        mods = event.modifiers()
+        if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            if self._selection_overlaps_playhead():
+                return True
+            pos = self.textCursor().position()
+            if key == Qt.Key.Key_Backspace and pstart < pos <= pend:
+                return True
+            if key == Qt.Key.Key_Delete and pstart <= pos < pend:
+                return True
+        if key == Qt.Key.Key_X and mods & Qt.KeyboardModifier.ControlModifier:
+            if self._selection_overlaps_playhead():
+                return True
+        return False
 
     def body_html(self) -> str:
         return self.document().toHtml().strip()
@@ -418,6 +562,9 @@ class NoteComposeEditor(QTextEdit):
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
         if self._try_handle_mention_key(event):
             return
+        if self._key_would_damage_playhead(event):
+            event.accept()
+            return
         if event.text() and event.text().isprintable():
             cursor = self.textCursor()
             if not cursor.charFormat().isAnchor():
@@ -425,6 +572,7 @@ class NoteComposeEditor(QTextEdit):
                 self.setTextCursor(cursor)
         super().keyPressEvent(event)
         self._maybe_show_mention_popup()
+        self._clamp_cursor_outside_playhead()
 
     def _body_char_format(self, *, weight: QFont.Weight = QFont.Weight.Normal) -> QTextCharFormat:
         fmt = QTextCharFormat()
@@ -479,6 +627,60 @@ class NoteComposeEditor(QTextEdit):
             gap=2,
         )
         popup.raise_()
+
+    def insert_time_pill(self, label: str, href: str, *, kind: NoteTimeKind = "frame") -> None:
+        snippet = (label or "").strip()
+        href = (href or "").strip()
+        if not snippet or not href:
+            return
+        cursor = self.textCursor()
+        fmt = self._time_pill_char_format(href, kind=kind)
+        cursor.insertText(f" {snippet} ", fmt)
+        cursor.setCharFormat(self._body_char_format())
+        cursor.insertText(" ")
+        self.setTextCursor(cursor)
+
+    def insert_inline_reference(self, text: str) -> None:
+        """Legacy plain reference — prefer insert_time_pill with structured href."""
+        snippet = (text or "").strip()
+        if not snippet:
+            return
+        cursor = self.textCursor()
+        fmt = self._body_char_format()
+        fmt.setFontFamilies(["JetBrains Mono"])
+        fmt.setForeground(QColor("#a1a1aa"))
+        cursor.insertText(snippet, fmt)
+        cursor.setCharFormat(self._body_char_format())
+        cursor.insertText(" ")
+        self.setTextCursor(cursor)
+
+    def _time_pill_char_format(self, href: str, *, kind: NoteTimeKind) -> QTextCharFormat:
+        fmt = self._body_char_format(weight=QFont.Weight.DemiBold)
+        fmt.setFontFamilies(["JetBrains Mono"])
+        fmt.setAnchor(True)
+        fmt.setAnchorHref(href)
+        if kind == "range":
+            fmt.setForeground(QColor("#93c5fd"))
+            fmt.setBackground(QColor(37, 99, 235, 72))
+        elif kind == "marker":
+            fmt.setForeground(QColor("#f9a8d4"))
+            fmt.setBackground(QColor(244, 114, 182, 56))
+        elif kind == "playhead":
+            fmt.setForeground(QColor("#fde68a"))
+            fmt.setBackground(QColor(245, 158, 11, 62))
+        else:
+            fmt.setForeground(QColor("#e4e4e7"))
+            fmt.setBackground(QColor(63, 63, 70, 96))
+        return fmt
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            href = self.anchorAt(event.position().toPoint() if hasattr(event, "position") else event.pos())
+            if href and is_time_note_href(href):
+                self.time_anchor_clicked.emit(href)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
 
     def _insert_mention(self, user: StudioUser) -> None:
         self._hide_mention_popup()

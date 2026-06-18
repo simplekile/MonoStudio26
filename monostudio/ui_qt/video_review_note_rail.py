@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal, QRectF
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QSizePolicy, QVBoxLayout, QWidget
 
 from monostudio.ui_qt.video_preview_context import PreviewContext
 from monostudio.ui_qt.video_review_note_panel import VideoReviewNotePanel
 
-_NOTE_RAIL_W = 260
+_NOTE_RAIL_DEFAULT_W = 260
+NOTE_RAIL_MIN_W = 200
+NOTE_RAIL_MAX_W = 480
+NOTE_RAIL_DEFAULT_W = _NOTE_RAIL_DEFAULT_W
 _RAIL_RADIUS = 12
 _RAIL_BG = "#1e2124"
 
@@ -57,7 +60,10 @@ class VideoReviewNoteRail(QWidget):
 
         self._body = _NoteRailBody(self)
         self._body.setObjectName("VideoReviewNoteBody")
-        self._body.setFixedWidth(_NOTE_RAIL_W)
+        self._body.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         body_lay = QVBoxLayout(self._body)
         body_lay.setContentsMargins(0, 0, 0, 0)
         body_lay.setSpacing(0)
@@ -65,6 +71,7 @@ class VideoReviewNoteRail(QWidget):
         self._panel = VideoReviewNotePanel(self._body)
         body_lay.addWidget(self._panel, 1)
         root.addWidget(self._body)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._apply_open_layout()
 
     def panel(self) -> VideoReviewNotePanel:
@@ -93,5 +100,10 @@ class VideoReviewNoteRail(QWidget):
     def _apply_open_layout(self) -> None:
         show = self._open
         self._body.setVisible(show)
-        self.setFixedWidth(_NOTE_RAIL_W if show else 0)
+        if show:
+            self.setMinimumWidth(NOTE_RAIL_MIN_W)
+            self.setMaximumWidth(NOTE_RAIL_MAX_W)
+        else:
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(0)
         self.updateGeometry()

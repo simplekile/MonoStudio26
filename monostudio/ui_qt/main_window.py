@@ -6277,6 +6277,113 @@ class MainWindow(FramelessMainWindow):
         if resolved.action == ReviewResolveAction.open_player and resolved.request is not None:
             self._open_review_player(resolved.request)
 
+    def _review_player_matches_entity(
+        self,
+        dlg: VideoPreviewDialog,
+        entity_path: Path | None,
+        department_id: str | None,
+    ) -> bool:
+        if entity_path is None:
+            return False
+        ep = getattr(dlg, "_entity_path", None)
+        if ep is None:
+            return False
+        try:
+            if Path(ep).resolve() != Path(entity_path).resolve():
+                return False
+        except OSError:
+            return False
+        dep_a = (getattr(dlg, "_department_id", None) or "").strip()
+        dep_b = (department_id or "").strip()
+        return dep_a == dep_b
+
+    def _resolve_review_request_for_entity_path(
+        self,
+        entity_path: Path,
+        *,
+        department_id: str | None,
+        department_label: str | None,
+    ) -> ReviewOpenRequest | None:
+        from monostudio.core.review_media import ReviewResolveAction, resolve_entity_review_media
+        from monostudio.ui_qt.inspector_preview_settings import read_sequence_preview_fps
+        from monostudio.ui_qt.thumbnail_source_resolve import (
+            primary_work_file_for_department,
+            resolve_department_work_path_for_preview,
+        )
+        from monostudio.ui_qt.thumbnails import resolve_thumbnail_path
+
+        dep = (department_id or "").strip()
+        if not dep:
+            dep = (getattr(self._inspector, "_last_focused_department", None) or "").strip()
+        if not dep:
+            dep, _ = self._notes_department_for_dialog()
+        if not dep:
+            return None
+
+        ref = self._pipeline_ref_for_path(entity_path, "asset")
+        if ref is None:
+            ref = self._pipeline_ref_for_path(entity_path, "shot")
+        if ref is None:
+            return None
+
+        active_dcc = self._main_view.get_active_dcc(str(entity_path), dep)
+        wf = primary_work_file_for_department(ref, dep, active_dcc)
+        wp = resolve_department_work_path_for_preview(
+            ref,
+            dep,
+            work_file_path=wf,
+            item_root=entity_path,
+            active_dcc_id=active_dcc,
+        )
+        thumb = resolve_thumbnail_path(entity_path, department=dep)
+        fps = read_sequence_preview_fps(self._settings)
+        label = (department_label or "").strip() or self._department_display_label(dep) or dep
+        resolved = resolve_entity_review_media(
+            thumb_path=thumb,
+            work_path=wp,
+            work_file_path=wf,
+            sequence_frames=None,
+            sequence_folder=None,
+            fps=fps,
+            context=PreviewContext.entity,
+            entity_path=entity_path,
+            department_id=dep,
+            department_label=label,
+        )
+        if resolved.action == ReviewResolveAction.open_player and resolved.request is not None:
+            return resolved.request
+        return None
+
+    def jump_to_note_time_anchor(
+        self,
+        *,
+        entity_path: Path,
+        department_id: str | None = None,
+        department_label: str | None = None,
+        href: str,
+    ) -> None:
+        from monostudio.core.note_time_anchors import parse_time_href
+
+        if parse_time_href(href) is None:
+            return
+
+        dep = (department_id or "").strip() or None
+        existing = self._alive_review_player()
+        if existing is not None and self._review_player_matches_entity(existing, entity_path, dep):
+            existing.apply_time_anchor(href)
+            self._bring_review_player_to_front(existing)
+            return
+
+        request = self._resolve_review_request_for_entity_path(
+            entity_path,
+            department_id=dep,
+            department_label=department_label,
+        )
+        if request is None:
+            notification_service.warning("No review video found for this department.")
+            return
+        self._open_review_player(request, pending_time_anchor=href)
+
     def _alive_review_player(self) -> VideoPreviewDialog | None:
         dlg = self._review_player_dialog
         if dlg is None:
@@ -6292,11 +6399,26 @@ class MainWindow(FramelessMainWindow):
             return None
         return dlg
 
-    def _open_review_player(self, request: object) -> None:
+    def _open_review_player(self, request: object, *, pending_time_anchor: str | None = None) -> None:
         if isinstance(request, VideoPreviewOpenRequest):
             request = request.to_review_request()
         if not isinstance(request, ReviewOpenRequest):
             return
+        href = (pending_time_anchor or "").strip() or None
+        if href:
+            existing = self._alive_review_player()
+            if (
+                existing is not None
+                and existing.isVisible()
+                and self._review_player_matches_entity(
+                    existing,
+                    request.entity_path,
+                    request.department_id,
+                )
+            ):
+                existing.apply_time_anchor(href)
+                self._bring_review_player_to_front(existing)
+                return
         existing = self._alive_review_player()
         if existing is not None and existing.isVisible():
             try:
@@ -6312,6 +6434,8 @@ class MainWindow(FramelessMainWindow):
             parent=None,
             geometry_anchor=self,
         )
+        if href:
+            dlg.set_pending_time_anchor(href)
         self._review_player_dialog = dlg
         dlg.destroyed.connect(lambda *_: setattr(self, "_review_player_dialog", None))
         dlg.closed.connect(self._on_review_player_closed)
@@ -6319,16 +6443,63 @@ class MainWindow(FramelessMainWindow):
         dlg.open_all_notes_requested.connect(self._on_video_preview_open_all_notes)
         dlg.notes_changed.connect(lambda: self._on_review_player_notes_changed())
         dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        self._bring_review_player_to_front(dlg)
+
+    def _bring_review_player_to_front(self, dlg: VideoPreviewDialog | None = None) -> None:
+        player = dlg if dlg is not None else self._alive_review_player()
+        if player is None:
+            return
+        player.showNormal()
+        player.raise_()
+        player.activateWindow()
+        QTimer.singleShot(0, lambda p=player: self._raise_review_player_once(p))
+        QTimer.singleShot(80, lambda p=player: self._raise_review_player_once(p))
+
+    def _raise_review_player_once(self, player: VideoPreviewDialog) -> None:
+        try:
+            from shiboken6 import isValid
+
+            if not isValid(player) or not player.isVisible():
+                return
+        except Exception:
+            return
+        player.raise_()
+        player.activateWindow()
+        wh = player.windowHandle()
+        if wh is not None:
+            wh.requestActivate()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                hwnd = int(player.winId())
+                if hwnd:
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        bring = getattr(player, "_raise_video_chrome_overlays", None)
+        if callable(bring):
+            bring()
+
+    def _item_notes_dialog_awaiting_restore(self) -> bool:
+        from monostudio.ui_qt.item_notes_dialog import ItemNotesDialog
+
+        app = QApplication.instance()
+        if app is None:
+            return False
+        for w in app.topLevelWidgets():
+            if isinstance(w, ItemNotesDialog) and getattr(w, "_hidden_for_review_jump", False):
+                return True
+        return False
 
     def _on_review_player_closed(self) -> None:
         self._review_player_dialog = None
         from monostudio.ui_qt.style import release_stuck_mouse_grab, resync_hover_at_cursor
 
         release_stuck_mouse_grab(force=True)
-        self.activateWindow()
-        self.raise_()
+        if not self._item_notes_dialog_awaiting_restore():
+            self.activateWindow()
+            self.raise_()
         QTimer.singleShot(0, resync_hover_at_cursor)
 
     def _open_video_preview_with_request(self, request: VideoPreviewOpenRequest) -> None:

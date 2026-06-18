@@ -887,6 +887,8 @@ class _InspectorRefSection(QWidget):
         tab = self._owner_ref_tab()
         if tab is not None:
             tab.set_selected_path(entry.path)
+        if tab is not None and tab.open_review_video(entry.path):
+            return
         self._open_file(entry.path)
 
     def _open_file(self, path: Path) -> None:
@@ -1338,6 +1340,22 @@ class InspectorRefTab(QWidget):
     def _repaint_all_sections(self) -> None:
         for sec in (self._concept, self._reference):
             sec._list.viewport().update()
+
+    def open_review_video(self, path: Path) -> bool:
+        from monostudio.ui_qt.thumbnails import is_video_preview_path
+
+        if not is_video_preview_path(path):
+            return False
+        host = self.window()
+        opener = getattr(host, "_open_video_preview_from_inspector", None)
+        if not callable(opener):
+            return False
+        opener(path)
+        bring = getattr(host, "_bring_review_player_to_front", None)
+        if callable(bring):
+            QTimer.singleShot(0, bring)
+            QTimer.singleShot(80, bring)
+        return True
 
     def set_show_placeholder(self, show: bool, message: str = "Select an item to view details") -> None:
         """Hide concept/reference UI when Main View has no asset/shot selection."""

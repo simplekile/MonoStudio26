@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout
 
@@ -33,6 +33,8 @@ def _format_local_time(iso_at: str) -> str:
 
 
 class NoteViewDialog(MonosDialog):
+    time_anchor_clicked = Signal(str)
+
     def __init__(
         self,
         *,
@@ -78,6 +80,8 @@ class NoteViewDialog(MonosDialog):
                 workspace_root,
                 avatar_size=36,
                 time_text=time_meta,
+                elide_name=False,
+                time_on_right=True,
                 on_author_click=on_author,
                 parent=self,
             )
@@ -101,6 +105,7 @@ class NoteViewDialog(MonosDialog):
         )
         body.set_body(entry.body_html, plain_fallback=entry.text, done=entry.done)
         body.setMinimumHeight(max(120, body.document().size().height()))
+        body.time_anchor_clicked.connect(self.time_anchor_clicked.emit)
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
 

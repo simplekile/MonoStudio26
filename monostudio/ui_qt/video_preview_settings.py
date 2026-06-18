@@ -99,6 +99,10 @@ def tool_mode_key_for_profile(profile: str) -> str:
     return f"ui/video_preview_last_tool_mode/{(profile or 'entity').strip().lower()}"
 
 
+def note_rail_open_key_for_profile(profile: str) -> str:
+    return f"ui/video_preview_note_rail_open/{(profile or 'entity').strip().lower()}"
+
+
 def read_video_player_backend(settings: QSettings | None) -> str:
     if settings is None:
         return BACKEND_MPV
@@ -250,6 +254,99 @@ def write_review_tool_mode(settings: QSettings, profile: str, mode: str) -> None
     m = (mode or "ranges").strip().lower()
     if m in _VALID_TOOL_MODES:
         settings.setValue(tool_mode_key_for_profile(profile), m)
+
+
+def read_review_note_rail_open(settings: QSettings | None, *, profile: str, default: bool = False) -> bool:
+    if settings is None:
+        return default
+    for key in _review_profile_keys(profile, note_rail_open_key_for_profile):
+        if not settings.contains(key):
+            continue
+        v = settings.value(key)
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("1", "true", "yes")
+    return default
+
+
+def write_review_note_rail_open(settings: QSettings, profile: str, open: bool) -> None:  # noqa: A003
+    settings.setValue(note_rail_open_key_for_profile(profile), bool(open))
+
+
+def _side_panel_width_key(kind: str, profile: str) -> str:
+    return f"ui/video_preview_{kind}_width/{(profile or 'entity').strip().lower()}"
+
+
+def _clamp_side_panel_width(width: int, *, default: int, min_w: int, max_w: int) -> int:
+    try:
+        w = int(width)
+    except (TypeError, ValueError):
+        w = default
+    return max(min_w, min(max_w, w))
+
+
+def read_review_note_rail_width(
+    settings: QSettings | None,
+    *,
+    profile: str,
+    default: int = 260,
+    min_w: int = 200,
+    max_w: int = 480,
+) -> int:
+    if settings is None:
+        return default
+    for key in _review_profile_keys(profile, lambda p: _side_panel_width_key("note_rail", p)):
+        if not settings.contains(key):
+            continue
+        return _clamp_side_panel_width(settings.value(key, default), default=default, min_w=min_w, max_w=max_w)
+    return default
+
+
+def write_review_note_rail_width(
+    settings: QSettings,
+    profile: str,
+    width: int,
+    *,
+    default: int = 260,
+    min_w: int = 200,
+    max_w: int = 480,
+) -> None:
+    settings.setValue(
+        _side_panel_width_key("note_rail", profile),
+        _clamp_side_panel_width(width, default=default, min_w=min_w, max_w=max_w),
+    )
+
+
+def read_review_tools_panel_width(
+    settings: QSettings | None,
+    *,
+    profile: str,
+    default: int = 260,
+    min_w: int = 200,
+    max_w: int = 480,
+) -> int:
+    if settings is None:
+        return default
+    for key in _review_profile_keys(profile, lambda p: _side_panel_width_key("tools_panel", p)):
+        if not settings.contains(key):
+            continue
+        return _clamp_side_panel_width(settings.value(key, default), default=default, min_w=min_w, max_w=max_w)
+    return default
+
+
+def write_review_tools_panel_width(
+    settings: QSettings,
+    profile: str,
+    width: int,
+    *,
+    default: int = 260,
+    min_w: int = 200,
+    max_w: int = 480,
+) -> None:
+    settings.setValue(
+        _side_panel_width_key("tools_panel", profile),
+        _clamp_side_panel_width(width, default=default, min_w=min_w, max_w=max_w),
+    )
 
 
 def read_video_preview_precise_scrub_drag(settings: QSettings | None) -> bool:

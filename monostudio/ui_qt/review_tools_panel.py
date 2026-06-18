@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLineEdit,
+    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -37,7 +38,10 @@ class ReviewToolMode(StrEnum):
     draw = "draw"
 
 
-_BODY_W = 260
+_TOOLS_BODY_DEFAULT_W = 260
+TOOLS_PANEL_MIN_W = 200
+TOOLS_PANEL_MAX_W = 480
+TOOLS_PANEL_DEFAULT_W = _TOOLS_BODY_DEFAULT_W
 _TOOLS_BODY_RADIUS = 12
 _TOOLS_BODY_BG = "#1e2124"
 
@@ -70,7 +74,7 @@ class _ReviewToolsBodyFrame(QFrame):
 class ReviewToolsPanel(QWidget):
     workspace_changed = Signal(str)
     tool_mode_changed = Signal(str)
-    range_selected = Signal(str)
+    range_selected = Signal(str, bool)
     range_delete_requested = Signal(str)
     range_delete_all_requested = Signal()
     range_duplicate_requested = Signal(str)
@@ -109,7 +113,10 @@ class ReviewToolsPanel(QWidget):
 
         self._body_wrap = _ReviewToolsBodyFrame(self)
         self._body_wrap.setObjectName("VideoReviewToolsBody")
-        self._body_wrap.setFixedWidth(_BODY_W)
+        self._body_wrap.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         body_lay = QVBoxLayout(self._body_wrap)
         body_lay.setContentsMargins(0, 0, 0, 0)
         body_lay.setSpacing(8)
@@ -187,6 +194,7 @@ class ReviewToolsPanel(QWidget):
         body_lay.addWidget(self._stack, 1)
         root.addWidget(self._body_wrap)
 
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._active_range_id: str | None = None
         self._active_marker_id: str | None = None
         self.apply_context(self._context)
@@ -315,7 +323,12 @@ class ReviewToolsPanel(QWidget):
     def _apply_workspace_layout(self) -> None:
         show_body = self._workspace == ReviewWorkspace.tools
         self._body_wrap.setVisible(show_body)
-        self.setFixedWidth(_BODY_W if show_body else 0)
+        if show_body:
+            self.setMinimumWidth(TOOLS_PANEL_MIN_W)
+            self.setMaximumWidth(TOOLS_PANEL_MAX_W)
+        else:
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(0)
         self._sync_mode_pills()
         if show_body:
             if self._tool_mode == ReviewToolMode.ranges:

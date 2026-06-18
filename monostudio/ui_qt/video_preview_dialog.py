@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QSplitter,
     QTextEdit,
     QToolButton,
     QToolTip,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from monostudio.core.note_time_anchors import parse_time_href
 from monostudio.core.review_draw import (
     ReviewDrawLayer,
     ReviewDrawLayerKeyframe,
@@ -115,11 +117,17 @@ from monostudio.core.video_media import (
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.inspector_preview_settings import write_sequence_preview_fps
 from monostudio.ui_qt.review_draw_overlay import ReviewDrawOverlay
+from monostudio.ui_qt.review_onion_layer import ReviewOnionLayer
 from monostudio.ui_qt.video_review_draw_panel import VideoReviewDrawTransportActions
 from monostudio.ui_qt.video_review_draw_brush_strip import VideoReviewDrawBrushStrip
 from monostudio.ui_qt.video_review_draw_quick_popup import VideoReviewDrawQuickPopup
-from monostudio.ui_qt.video_review_note_rail import VideoReviewNoteRail
-from monostudio.ui_qt.review_onion_layer import ReviewOnionLayer
+from monostudio.ui_qt.video_review_note_rail import (
+    NOTE_RAIL_DEFAULT_W,
+    NOTE_RAIL_MAX_W,
+    NOTE_RAIL_MIN_W,
+    VideoReviewNoteRail,
+)
+from monostudio.ui_qt.review_note_timeline import build_timeline_note_markers, parse_note_anchor_frame
 from monostudio.ui_qt.review_playback_backend import SequenceDecodeBackend
 from monostudio.ui_qt.dialog_geometry import (
     apply_dialog_geometry,
@@ -132,6 +140,9 @@ from monostudio.ui_qt.review_tools_panel import (
     ReviewToolMode,
     ReviewToolsPanel,
     ReviewWorkspace,
+    TOOLS_PANEL_DEFAULT_W,
+    TOOLS_PANEL_MAX_W,
+    TOOLS_PANEL_MIN_W,
 )
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, MonosMenu, monos_font
 from monostudio.ui_qt.video_export_dialog import VideoExportDialog
@@ -154,14 +165,20 @@ from monostudio.ui_qt.video_preview_context import (
 from monostudio.ui_qt.video_preview_scrubber import VideoPreviewScrubber
 from monostudio.ui_qt.video_preview_settings import (
     PROXY_SCALE_STEPS,
+    read_review_note_rail_open,
+    read_review_note_rail_width,
     read_review_tool_mode,
+    read_review_tools_panel_width,
     read_review_workspace,
     read_video_preview_loop,
     read_video_preview_playback_speed,
     read_video_preview_precise_scrub_drag,
     read_video_preview_time_display,
     read_video_preview_volume,
+    write_review_note_rail_open,
+    write_review_note_rail_width,
     write_review_tool_mode,
+    write_review_tools_panel_width,
     write_review_workspace,
     write_video_preview_loop,
     write_video_preview_playback_speed,
@@ -539,6 +556,7 @@ class VideoPreviewDialog(MonosDialog):
         super().__init__(parent)
         self.setObjectName("VideoPreviewDialog")
         self.set_host_dim_overlay_enabled(False)
+        self.set_dialog_border_overlay_enabled(False)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowModality(Qt.WindowModality.NonModal)
         self._geometry_anchor = geometry_anchor or parent
@@ -722,6 +740,7 @@ class VideoPreviewDialog(MonosDialog):
         )
 
         self._restore_frame: int | None = None
+        self._pending_time_anchor: str | None = None
         self._session_persist_timer = QTimer(self)
         self._session_persist_timer.setSingleShot(True)
         self._session_persist_timer.setInterval(400)
@@ -825,12 +844,33 @@ class VideoPreviewDialog(MonosDialog):
         self._btn_close.setToolTip("Close")
         self._btn_close.clicked.connect(self.close)
 
-        body = QHBoxLayout()
-        body.setSpacing(0)
+        body = QSplitter(Qt.Orientation.Horizontal, self)
+        body.setObjectName("VideoPreviewBodySplit")
+        body.setChildrenCollapsible(False)
+        body.setHandleWidth(6)
+        self._body_splitter = body
+        self._note_rail_saved_w = read_review_note_rail_width(
+            self._settings,
+            profile=self._profile_key,
+            default=NOTE_RAIL_DEFAULT_W,
+            min_w=NOTE_RAIL_MIN_W,
+            max_w=NOTE_RAIL_MAX_W,
+        )
+        self._tools_panel_saved_w = read_review_tools_panel_width(
+            self._settings,
+            profile=self._profile_key,
+            default=TOOLS_PANEL_DEFAULT_W,
+            min_w=TOOLS_PANEL_MIN_W,
+            max_w=TOOLS_PANEL_MAX_W,
+        )
+        self._note_rail_open_pref = read_review_note_rail_open(
+            self._settings,
+            profile=self._profile_key,
+        )
 
         self._note_rail = VideoReviewNoteRail(self)
         self._note_rail.apply_context(self._context)
-        body.addWidget(self._note_rail, 0)
+        body.addWidget(self._note_rail)
 
         self._main_column = QWidget(self)
         self._main_column.setObjectName("VideoPreviewMainColumn")
@@ -948,9 +988,10 @@ class VideoPreviewDialog(MonosDialog):
         self._scrubber.in_out_changed.connect(self._on_scrub_in_out)
         self._scrubber.range_handles_drag_started.connect(self._push_range_undo)
         self._scrubber.range_highlighted.connect(self._on_range_highlighted)
+        self._scrubber.note_marker_clicked.connect(self._on_timeline_note_clicked)
         self._scrubber.range_edit_requested.connect(self._on_range_edit_requested)
         self._scrubber.range_deselected.connect(self._on_range_deselected)
-        self._scrubber.marker_highlighted.connect(self._on_marker_selected)
+        self._scrubber.marker_highlighted.connect(self._on_marker_highlighted)
         self._scrubber.marker_deselected.connect(self._on_marker_deselected)
         self._scrubber.go_to_in_requested.connect(self._go_to_range_in)
         self._scrubber.go_to_out_requested.connect(self._go_to_range_out)
@@ -1231,7 +1272,7 @@ class VideoPreviewDialog(MonosDialog):
         self._footer.setFixedHeight(42)
         self._footer_label.setFixedHeight(24)
 
-        body.addWidget(self._main_column, 1)
+        body.addWidget(self._main_column)
 
         self._tools_panel = ReviewToolsPanel(self)
         self._tools_panel.workspace_changed.connect(self._on_tools_workspace_changed)
@@ -1251,6 +1292,7 @@ class VideoPreviewDialog(MonosDialog):
         self._tools_panel.marker_export_requested.connect(self._export_markers_png)
         self._note_rail.panel().open_all_notes_requested.connect(self.open_all_notes_requested.emit)
         self._note_rail.panel().note_added.connect(self._on_review_note_added)
+        self._note_rail.panel().time_anchor_requested.connect(self._on_note_time_anchor)
         self._tools_panel.draw_keyframe_selected.connect(self._on_draw_keyframe_selected)
         self._tools_panel.draw_layer_selected.connect(self._on_draw_layer_selected)
         self._tools_panel.draw_keyframe_add_requested.connect(self._add_draw_keyframe_at_playhead)
@@ -1274,14 +1316,86 @@ class VideoPreviewDialog(MonosDialog):
         self._tools_panel.draw_keyframe_visibility_toggle_requested.connect(
             self._toggle_active_draw_keyframe_visibility
         )
-        body.addWidget(self._tools_panel, 0)
+        body.addWidget(self._tools_panel)
+        body.setStretchFactor(0, 0)
+        body.setStretchFactor(1, 1)
+        body.setStretchFactor(2, 0)
+        body.splitterMoved.connect(self._on_body_splitter_moved)
+        self._note_rail.open_changed.connect(self._on_note_rail_open_changed)
+        self._side_panel_layout_persist_timer = QTimer(self)
+        self._side_panel_layout_persist_timer.setSingleShot(True)
+        self._side_panel_layout_persist_timer.setInterval(400)
+        self._side_panel_layout_persist_timer.timeout.connect(self._persist_side_panel_layout)
 
         self._root_layout.addWidget(self._top_bar, 0)
-        self._root_layout.addLayout(body, 1)
+        self._root_layout.addWidget(body, 1)
 
         self._sync_tools_panel_button()
         self._sync_shell_corner_radius()
         self._sync_media_capabilities()
+        QTimer.singleShot(0, self._sync_body_splitter_sizes)
+
+    def _on_note_rail_open_changed(self, open: bool) -> None:
+        self._sync_body_splitter_sizes()
+        if self._context == PreviewContext.entity:
+            self._note_rail_open_pref = open
+            self._schedule_side_panel_layout_persist()
+
+    def _on_body_splitter_moved(self, _pos: int, _index: int) -> None:
+        sizes = self._body_splitter.sizes()
+        if len(sizes) < 3:
+            return
+        if self._note_rail.is_open() and sizes[0] >= NOTE_RAIL_MIN_W:
+            self._note_rail_saved_w = sizes[0]
+        if self._tools_panel.workspace() == ReviewWorkspace.tools and sizes[2] >= TOOLS_PANEL_MIN_W:
+            self._tools_panel_saved_w = sizes[2]
+        self._schedule_side_panel_layout_persist()
+
+    def _schedule_side_panel_layout_persist(self) -> None:
+        if self._settings is None:
+            return
+        self._side_panel_layout_persist_timer.start()
+
+    def _persist_side_panel_layout(self) -> None:
+        if self._settings is None:
+            return
+        write_review_note_rail_width(
+            self._settings,
+            self._profile_key,
+            self._note_rail_saved_w,
+            min_w=NOTE_RAIL_MIN_W,
+            max_w=NOTE_RAIL_MAX_W,
+        )
+        write_review_tools_panel_width(
+            self._settings,
+            self._profile_key,
+            self._tools_panel_saved_w,
+            min_w=TOOLS_PANEL_MIN_W,
+            max_w=TOOLS_PANEL_MAX_W,
+        )
+        if self._context == PreviewContext.entity:
+            write_review_note_rail_open(
+                self._settings,
+                self._profile_key,
+                bool(getattr(self, "_note_rail_open_pref", self._note_rail.is_open())),
+            )
+
+    def _sync_body_splitter_sizes(self) -> None:
+        splitter = getattr(self, "_body_splitter", None)
+        if splitter is None:
+            return
+        sizes = splitter.sizes()
+        total = max(sum(sizes), splitter.width(), 800)
+        left = self._note_rail_saved_w if self._note_rail.is_open() else 0
+        right = (
+            self._tools_panel_saved_w
+            if self._tools_panel.workspace() == ReviewWorkspace.tools
+            else 0
+        )
+        center = max(240, total - left - right)
+        splitter.blockSignals(True)
+        splitter.setSizes([left, center, right])
+        splitter.blockSignals(False)
 
     def _is_sequence_mode(self) -> bool:
         return self._media_kind == ReviewMediaKind.sequence
@@ -1523,9 +1637,10 @@ class VideoPreviewDialog(MonosDialog):
         if self._markers and self._active_marker_id is None:
             self._active_marker_id = self._markers[0].id
         self._load_draw_keyframes_from_sidecar()
-        saved_frame = load_sequence_preview_session_local_draft(folder, total_frames=total)
-        if saved_frame is not None and saved_frame != self._current_frame():
-            self._seek_frame(saved_frame)
+        if not self._consume_pending_time_anchor():
+            saved_frame = load_sequence_preview_session_local_draft(folder, total_frames=total)
+            if saved_frame is not None and saved_frame != self._current_frame():
+                self._seek_frame(saved_frame)
         self._sync_range_ui()
         QTimer.singleShot(0, lambda: self._open_review_tools_panel(ReviewToolMode.ranges))
         self._update_top_bar()
@@ -1849,6 +1964,7 @@ class VideoPreviewDialog(MonosDialog):
             self._backend.attach_to_widget(self._surface)
             self._video_attached = True
         self._backend.layout_video()
+        QTimer.singleShot(0, self._sync_native_video_zorder)
 
     def _apply_dialog_content_inset(self) -> None:
         if self._fullscreen:
@@ -1862,14 +1978,60 @@ class VideoPreviewDialog(MonosDialog):
         return
 
     def raise_border_overlay(self) -> None:
-        """Sync border stripe geometry but keep it under Qt widgets (raising blocks clicks)."""
-        if self._border_overlay is None:
+        """No full-dialog border widget — it occludes embedded mpv on Windows."""
+        self._raise_video_chrome_overlays()
+
+    def _raise_video_chrome_overlays(self) -> None:
+        if self._hud:
+            self._hud.raise_()
+        if hasattr(self, "_draw_brush_strip") and self._draw_brush_strip.isVisible():
+            self._position_draw_brush_strip()
+            self._draw_brush_strip.raise_()
+        if hasattr(self, "_onion_layer"):
+            self._sync_viewport_overlay_geometry()
+            self._onion_layer.raise_()
+        if hasattr(self, "_draw_overlay"):
+            self._sync_viewport_overlay_geometry()
+            self._draw_overlay.raise_()
+        overlay = getattr(self, "_proxy_build_overlay", None)
+        if overlay and overlay.isVisible():
+            overlay.raise_()
+        seq_overlay = getattr(self, "_sequence_loading_overlay", None)
+        if seq_overlay and seq_overlay.isVisible():
+            self._position_sequence_loading_overlay()
+            seq_overlay.raise_()
+        btn = getattr(self, "_btn_close", None)
+        if btn is not None and btn.isVisible():
+            btn.raise_()
+        self._sync_native_video_zorder()
+
+    def _sync_native_video_zorder(self) -> None:
+        if sys.platform != "win32" or self._is_sequence_mode():
             return
-        self._border_overlay.setGeometry(self.rect())
-        self._border_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._border_overlay.lower()
-        if getattr(self, "_main_column", None) is not None:
-            self._main_column.raise_()
+        surface = getattr(self, "_surface", None)
+        if surface is None or not surface.isVisible():
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            hwnd_top = wintypes.HWND(0)
+            flags = 0x0002 | 0x0001 | 0x0010 | 0x0040  # NOMOVE | NOSIZE | NOACTIVATE | SHOWWINDOW
+
+            def _raise_hwnd(hwnd: int, _lparam: int) -> bool:
+                if user32.IsWindowVisible(hwnd):
+                    user32.SetWindowPos(hwnd, hwnd_top, 0, 0, 0, 0, flags)
+                return True
+
+            parent = int(surface.winId())
+            if not parent:
+                return
+            user32.SetWindowPos(parent, hwnd_top, 0, 0, 0, 0, flags)
+            enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(_raise_hwnd)
+            user32.EnumChildWindows(parent, enum_proc, 0)
+        except Exception:
+            pass
 
     def _deferred_video_attach(self) -> None:
         if self._closing or not self.isVisible():
@@ -1878,8 +2040,9 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_video_backend()
         self._position_hud()
         self._position_sequence_loading_overlay()
-        self._raise_video_overlays()
-        self.raise_border_overlay()
+        self._raise_video_chrome_overlays()
+        QTimer.singleShot(0, self._sync_native_video_zorder)
+        QTimer.singleShot(80, self._raise_video_chrome_overlays)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if self._fullscreen and event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
@@ -2227,6 +2390,8 @@ class VideoPreviewDialog(MonosDialog):
         self._tools_panel.apply_context(context)
         if hasattr(self, "_note_rail"):
             self._note_rail.apply_context(context)
+            if context == PreviewContext.entity:
+                self._note_rail.set_open(bool(getattr(self, "_note_rail_open_pref", False)))
         show_sync = context != PreviewContext.inbox
         self._btn_sync.setVisible(show_sync)
         self._btn_sync.setEnabled(show_sync)
@@ -2249,8 +2414,44 @@ class VideoPreviewDialog(MonosDialog):
             item_display_name=display_name,
         )
         self._update_note_frame_hint()
+        self._sync_timeline_note_markers()
+
+    def _sync_timeline_note_markers(self) -> None:
+        if not hasattr(self, "_scrubber"):
+            return
+        if self._context != PreviewContext.entity or self._entity_path is None:
+            self._scrubber.set_note_markers([])
+            return
+        panel = self._note_rail.panel()
+        anchor = self._geometry_anchor
+        workspace_root = getattr(anchor, "_workspace_root", None) if anchor is not None else None
+        max_frame = max(0, self._total_frames() - 1)
+        markers = build_timeline_note_markers(
+            panel.entries(),
+            workspace_root,
+            widget_for_dpr=self,
+            avatar_px=VideoPreviewScrubber._NOTE_AVATAR_INNER_PX,
+            max_frame=max_frame,
+        )
+        self._scrubber.set_note_markers(markers)
+
+    def _on_timeline_note_clicked(self, note_id: str) -> None:
+        if self._context != PreviewContext.entity:
+            return
+        panel = self._note_rail.panel()
+        entry = next((e for e in panel.entries() if e.id == note_id), None)
+        if entry is None:
+            return
+        frame = parse_note_anchor_frame(entry.text, body_html=entry.body_html)
+        if frame is not None:
+            self._seek_frame(frame)
+        if not self._note_rail_open():
+            self._note_rail.set_open(True)
+            self._sync_note_panel_context()
+        panel._open_note_view(note_id)
 
     def _on_review_note_added(self) -> None:
+        self._sync_timeline_note_markers()
         self.notes_changed.emit()
 
     def _restore_workspace_from_settings(self) -> None:
@@ -2262,23 +2463,32 @@ class VideoPreviewDialog(MonosDialog):
         except ValueError:
             ws = ReviewWorkspace.tools
         self._tools_panel.set_workspace(ws)
+        saved_mode_name = read_review_tool_mode(self._settings, profile=self._profile_key)
+        legacy_note_mode = saved_mode_name == ReviewToolMode.note.value
         if ws == ReviewWorkspace.tools:
-            mode_name = read_review_tool_mode(self._settings, profile=self._profile_key)
             try:
-                mode = ReviewToolMode(mode_name)
+                mode = ReviewToolMode(saved_mode_name)
             except ValueError:
                 mode = ReviewToolMode.ranges
             if mode == ReviewToolMode.note:
-                self._note_rail.set_open(True)
                 mode = ReviewToolMode.ranges
             self._tools_panel.activate_tool_mode(mode)
+        if self._context == PreviewContext.entity:
+            rail_open = read_review_note_rail_open(self._settings, profile=self._profile_key)
+            if legacy_note_mode:
+                rail_open = True
+            self._note_rail_open_pref = rail_open
+            self._note_rail.set_open(rail_open)
         self._sync_tools_panel_button()
+        QTimer.singleShot(0, self._sync_body_splitter_sizes)
 
     def _on_tools_workspace_changed(self, ws_name: str) -> None:
         if self._settings is not None:
             write_review_workspace(self._settings, self._profile_key, ws_name)
         self._sync_shell_corner_radius()
         self._sync_tools_panel_button()
+        self._sync_body_splitter_sizes()
+        self._schedule_side_panel_layout_persist()
 
     def _on_tools_mode_changed(self, mode_name: str) -> None:
         if self._settings is not None:
@@ -2375,12 +2585,22 @@ class VideoPreviewDialog(MonosDialog):
     def _toggle_note_rail(self) -> None:
         if self._context != PreviewContext.entity:
             return
-        opening = not self._note_rail_open()
         self._note_rail.toggle()
-        if opening:
+        if self._note_rail.is_open():
             self._sync_note_panel_context()
-            self._note_rail.panel()._editor.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self._refresh_footer_hint()
+
+    def _note_compose_focused(self) -> bool:
+        if not self._note_rail_open():
+            return False
+        editor = self._note_rail.panel()._editor
+        fw = self.focusWidget()
+        if fw is None:
+            return False
+        if fw is editor or editor.isAncestorOf(fw):
+            return True
+        popup = editor._mention_popup
+        return popup.isVisible() and (fw is popup or popup.isAncestorOf(fw))
 
     def _notes_tool_active(self) -> bool:
         return self._note_rail_open()
@@ -2785,7 +3005,7 @@ class VideoPreviewDialog(MonosDialog):
             parts = self._footer_timeline_navigation_hints(zone)
         else:
             parts = ["Space — Play/Pause"]
-        parts += ["Ctrl+Enter — Add note", "N — Close notes"]
+        parts += ["Ctrl+Enter — Add note", "Click range — Insert", "Shift+click — Keep focus", "N — Close notes"]
         return parts
 
     def _footer_hints_ranges(self, zone: str) -> list[str]:
@@ -3005,10 +3225,27 @@ class VideoPreviewDialog(MonosDialog):
         self._update_sync_button()
 
     def _on_escape(self) -> None:
-        if self._text_editing_focused():
+        panel = self._note_rail.panel()
+        if panel.compose_active():
+            editor = panel._editor
+            if self._note_compose_focused() and editor._mention_popup.isVisible():
+                editor._hide_mention_popup()
+                return
+            panel.cancel_compose()
+            return
+        if self._note_compose_focused():
             editor = self._note_rail.panel()._editor
             if editor._mention_popup.isVisible():
                 editor._hide_mention_popup()
+                return
+            editor.clearFocus()
+            if hasattr(self, "_surface_wrap"):
+                self._surface_wrap.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        if self._text_editing_focused():
+            fw = self.focusWidget()
+            if fw is not None:
+                fw.clearFocus()
             return
         popup = self._draw_quick_popup
         if popup is not None:
@@ -3048,13 +3285,6 @@ class VideoPreviewDialog(MonosDialog):
         if self._scrubber.is_zoomed():
             self._fit_timeline_view()
             return
-        if self._note_rail_open():
-            self._note_rail.set_open(False)
-            self._refresh_footer_hint()
-            return
-        if self._tools_panel.workspace() == ReviewWorkspace.tools:
-            self._tools_panel.set_workspace(ReviewWorkspace.focus)
-            return
 
     def _toggle_fullscreen(self) -> None:
         if self._fullscreen:
@@ -3073,6 +3303,7 @@ class VideoPreviewDialog(MonosDialog):
             self._tools_panel.show()
             self._note_rail.show()
             self._restore_locked_size()
+            self._sync_body_splitter_sizes()
         else:
             self._fullscreen = True
             self._fs_bottom_revealed = False
@@ -3216,6 +3447,24 @@ class VideoPreviewDialog(MonosDialog):
             margin=4,
         )
 
+    def set_pending_time_anchor(self, href: str | None) -> None:
+        h = (href or "").strip()
+        self._pending_time_anchor = h or None
+
+    def apply_time_anchor(self, href: str) -> bool:
+        anchor = parse_time_href(href)
+        if anchor is None:
+            return False
+        self._on_note_time_anchor(href)
+        return True
+
+    def _consume_pending_time_anchor(self) -> bool:
+        href = self._pending_time_anchor
+        if not href:
+            return False
+        self._pending_time_anchor = None
+        return self.apply_time_anchor(href)
+
     def _prime_playback(self) -> None:
         if self._closing or not self.isVisible():
             return
@@ -3224,6 +3473,9 @@ class VideoPreviewDialog(MonosDialog):
         if self._playback_primed:
             return
         self._playback_primed = True
+        if self._consume_pending_time_anchor():
+            self._sync_playback_loop()
+            return
         frame = self._restore_frame if self._restore_frame is not None else 0
         self._restore_frame = None
         sec = frame / max(1e-6, self._fps())
@@ -3233,6 +3485,8 @@ class VideoPreviewDialog(MonosDialog):
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
+        if self._border_overlay is not None:
+            self._border_overlay.hide()
         self._install_app_event_filter()
         self._apply_dialog_geometry_once()
         self._update_scrub_seek_interval()
@@ -3252,6 +3506,7 @@ class VideoPreviewDialog(MonosDialog):
             y = top_inset + max(0, (_PREVIEW_TOPBAR_H - self._btn_close.height()) // 2)
         self._btn_close.move(x, y)
         self._btn_close.show()
+        self.raise_border_overlay()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -3320,18 +3575,7 @@ class VideoPreviewDialog(MonosDialog):
         return
 
     def _raise_video_overlays(self) -> None:
-        if self._hud:
-            self._hud.raise_()
-        if hasattr(self, "_draw_brush_strip") and self._draw_brush_strip.isVisible():
-            self._position_draw_brush_strip()
-        if hasattr(self, "_onion_layer"):
-            self._sync_viewport_overlay_geometry()
-        if hasattr(self, "_draw_overlay"):
-            self._sync_viewport_overlay_geometry()
-            self._draw_overlay.raise_()
-        overlay = getattr(self, "_proxy_build_overlay", None)
-        if overlay and overlay.isVisible():
-            overlay.raise_()
+        self._raise_video_chrome_overlays()
 
     def _shutdown_embedded_video(self) -> None:
         if self._is_sequence_mode():
@@ -3382,6 +3626,7 @@ class VideoPreviewDialog(MonosDialog):
         if self._settings is not None:
             write_review_workspace(self._settings, self._profile_key, self._tools_panel.workspace().value)
             write_review_tool_mode(self._settings, self._profile_key, self._tools_panel.tool_mode().value)
+            self._persist_side_panel_layout()
             write_video_preview_precise_scrub_drag(self._settings, self._precise_scrub_drag())
             write_video_preview_time_display(self._settings, self._time_display_mode)
             write_video_preview_playback_speed(self._settings, self._speed)
@@ -4399,7 +4644,29 @@ class VideoPreviewDialog(MonosDialog):
         self._persist_draw_local()
         self._sync_draw_ui()
 
-    def _on_range_selected(self, range_id: str) -> None:
+    def _on_range_selected(self, range_id: str, shift_held: bool = False) -> None:
+        self._try_insert_range_into_note(range_id)
+        self._apply_range_selection(range_id)
+
+    def _on_range_highlighted(
+        self, range_id: str, shift_held: bool = False, insert_note: bool = True
+    ) -> None:
+        if insert_note:
+            self._try_insert_range_into_note(range_id)
+        self._apply_range_highlight(range_id)
+
+    def _try_insert_range_into_note(self, range_id: str) -> bool:
+        if self._context != PreviewContext.entity or not self._note_rail_open():
+            return False
+        panel = self._note_rail.panel()
+        if not panel.compose_active() or not panel.auto_add_enabled():
+            return False
+        rng = next((r for r in self._ranges if r.id == range_id), None)
+        if rng is None:
+            return False
+        return panel.insert_range_reference(rng, self._fps())
+
+    def _apply_range_selection(self, range_id: str) -> None:
         self._scrubber.clear_overlap_cycle()
         self._active_range_id = range_id
         self._range_edit_unlocked = False
@@ -4410,7 +4677,7 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_proxy_state()
         self._sync_playback_loop()
 
-    def _on_range_highlighted(self, range_id: str) -> None:
+    def _apply_range_highlight(self, range_id: str) -> None:
         self._active_range_id = range_id
         self._range_edit_unlocked = False
         rng = next((r for r in self._ranges if r.id == range_id), None)
@@ -4481,7 +4748,7 @@ class VideoPreviewDialog(MonosDialog):
         self._persist_ranges_local()
 
     def _go_to_range_in(self, range_id: str) -> None:
-        self._on_range_selected(range_id)
+        self._apply_range_selection(range_id)
 
     def _go_to_range_out(self, range_id: str) -> None:
         self._active_range_id = range_id
@@ -4637,12 +4904,40 @@ class VideoPreviewDialog(MonosDialog):
         self._persist_markers_local()
         self._activate_tool(ReviewToolMode.markers)
 
-    def _on_marker_selected(self, marker_id: str) -> None:
+    def _try_insert_marker_into_note(self, marker_id: str) -> bool:
+        if self._context != PreviewContext.entity or not self._note_rail_open():
+            return False
+        panel = self._note_rail.panel()
+        if not panel.compose_active() or not panel.auto_add_enabled():
+            return False
+        marker = next((m for m in self._markers if m.id == marker_id), None)
+        if marker is None:
+            return False
+        return panel.insert_marker_reference(marker, self._fps())
+
+    def _apply_marker_selection(self, marker_id: str) -> None:
         self._active_marker_id = marker_id
         self._sync_range_ui()
         marker = next((m for m in self._markers if m.id == marker_id), None)
         if marker is not None:
             self._seek_frame(marker.frame)
+
+    def _on_marker_highlighted(self, marker_id: str, shift_held: bool = False) -> None:
+        self._try_insert_marker_into_note(marker_id)
+        self._apply_marker_selection(marker_id)
+
+    def _on_marker_selected(self, marker_id: str) -> None:
+        self._on_marker_highlighted(marker_id, shift_held=False)
+
+    def _on_note_time_anchor(self, href: str) -> None:
+        anchor = parse_time_href(href)
+        if anchor is None:
+            return
+        self._seek_frame(anchor.frame)
+        if anchor.kind == "range" and anchor.ref_id:
+            self._apply_range_selection(anchor.ref_id)
+        elif anchor.kind == "marker" and anchor.ref_id:
+            self._apply_marker_selection(anchor.ref_id)
 
     def _on_marker_deselected(self) -> None:
         if self._active_marker_id is None:
@@ -5045,6 +5340,7 @@ class VideoPreviewDialog(MonosDialog):
             save_draw_local_draft(key, self._draw_layers, sequence=self._is_sequence_mode())
         except Exception:
             pass
+        self._update_sync_button()
 
     def _export_markers_png(self) -> None:
         if not self._markers:
@@ -5141,10 +5437,10 @@ class VideoPreviewDialog(MonosDialog):
             return
         ids = [r.id for r in ordered]
         if self._active_range_id not in ids:
-            self._on_range_selected(ids[0])
+            self._apply_range_selection(ids[0])
             return
         idx = max(0, ids.index(self._active_range_id) - 1)
-        self._on_range_selected(ids[idx])
+        self._apply_range_selection(ids[idx])
 
     def _select_next_range(self) -> None:
         if not self._ranges_tool_active():
@@ -5154,10 +5450,10 @@ class VideoPreviewDialog(MonosDialog):
             return
         ids = [r.id for r in ordered]
         if self._active_range_id not in ids:
-            self._on_range_selected(ids[0])
+            self._apply_range_selection(ids[0])
             return
         idx = min(len(ids) - 1, ids.index(self._active_range_id) + 1)
-        self._on_range_selected(ids[idx])
+        self._apply_range_selection(ids[idx])
 
     def _active_range(self) -> VideoFrameRange | None:
         if not self._active_range_id:

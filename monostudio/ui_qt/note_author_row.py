@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QMouseEvent
+from PySide6.QtGui import QFont, QFontMetrics, QMouseEvent
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 from monostudio.core.item_comments import ItemCommentEntry, NoteAuthorVisual, entry_author_visual
@@ -22,10 +22,12 @@ class _AuthorNameLabel(QLabel):
         text: str,
         *,
         on_click: Callable[[], None] | None = None,
+        elide: bool = True,
         parent=None,
     ) -> None:
         super().__init__(text, parent)
         self._on_click = on_click
+        self._elide = elide
         if on_click is not None:
             self.setObjectName("NoteAuthorNameLink")
             self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -34,6 +36,36 @@ class _AuthorNameLabel(QLabel):
             self.setObjectName("ItemNotesMeta")
         self.setFont(monos_font("Inter", 11, QFont.Weight.DemiBold))
         self.setWordWrap(False)
+        self._full_text = text
+        if elide:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.setMinimumWidth(0)
+            self._apply_elide()
+        else:
+            self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            self.setText(text)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._elide:
+            self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        if not self._elide:
+            return
+        text = self._full_text or ""
+        if not text:
+            self.setText("")
+            return
+        fm = QFontMetrics(self.font())
+        max_w = max(8, self.contentsRect().width())
+        elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, max_w)
+        self.setText(elided)
+        tip = text if elided != text else ""
+        if self._on_click is not None and tip:
+            self.setToolTip(tip)
+        elif self._on_click is None:
+            self.setToolTip(tip)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         if self._on_click is not None and event.button() == Qt.MouseButton.LeftButton:
@@ -54,6 +86,8 @@ class NoteAuthorRow(QWidget):
         time_text: str = "",
         name_only: bool = False,
         avatar_only: bool = False,
+        elide_name: bool = True,
+        time_on_right: bool = False,
         on_author_click: Callable[[], None] | None = None,
         parent=None,
     ) -> None:
@@ -61,9 +95,10 @@ class NoteAuthorRow(QWidget):
         self.setObjectName("NoteAuthorRow")
         self._on_author_click = on_author_click
         self.setSizePolicy(
-            QSizePolicy.Policy.Fixed if avatar_only else QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding if not avatar_only else QSizePolicy.Policy.Fixed,
             QSizePolicy.Policy.Fixed,
         )
+        self.setMinimumWidth(0 if not avatar_only else avatar_size)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -98,13 +133,15 @@ class NoteAuthorRow(QWidget):
             _AuthorNameLabel(
                 visual.name,
                 on_click=on_author_click,
+                elide=elide_name,
                 parent=self,
             ),
             0,
             Qt.AlignmentFlag.AlignVCenter,
         )
 
-        if not name_only and time_text:
+        show_inline_time = bool(time_text) and not name_only and not time_on_right
+        if show_inline_time:
             time_l = QLabel(f"· {time_text}", self)
             time_l.setObjectName("ItemNotesMetaTime")
             time_l.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
@@ -112,6 +149,13 @@ class NoteAuthorRow(QWidget):
 
         name_col.addStretch(1)
         layout.addLayout(name_col, 1)
+
+        if time_text and not name_only and time_on_right:
+            time_r = QLabel(time_text, self)
+            time_r.setObjectName("ItemNotesMetaTime")
+            time_r.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
+            time_r.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            layout.addWidget(time_r, 0, Qt.AlignmentFlag.AlignVCenter)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         if (
@@ -134,6 +178,8 @@ class NoteAuthorRow(QWidget):
         time_text: str = "",
         name_only: bool = False,
         avatar_only: bool = False,
+        elide_name: bool = True,
+        time_on_right: bool = False,
         on_author_click: Callable[[], None] | None = None,
         parent=None,
     ) -> NoteAuthorRow:
@@ -143,6 +189,8 @@ class NoteAuthorRow(QWidget):
             time_text=time_text,
             name_only=name_only,
             avatar_only=avatar_only,
+            elide_name=elide_name,
+            time_on_right=time_on_right,
             on_author_click=on_author_click,
             parent=parent,
         )
@@ -156,6 +204,8 @@ class NoteAuthorRow(QWidget):
         time_text: str = "",
         name_only: bool = False,
         avatar_only: bool = False,
+        elide_name: bool = True,
+        time_on_right: bool = False,
         on_author_click: Callable[[], None] | None = None,
         parent=None,
     ) -> NoteAuthorRow:
@@ -165,6 +215,8 @@ class NoteAuthorRow(QWidget):
             time_text=time_text,
             name_only=name_only,
             avatar_only=avatar_only,
+            elide_name=elide_name,
+            time_on_right=time_on_right,
             on_author_click=on_author_click,
             parent=parent,
         )

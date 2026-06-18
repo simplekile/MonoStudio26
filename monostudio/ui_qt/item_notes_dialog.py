@@ -26,7 +26,6 @@ from monostudio.core.item_comments import (
     ItemCommentEntry,
     NoteEditRevision,
     delete_note_media,
-    entry_preview_text,
     new_comment_entry,
     normalize_note_department_id,
     read_item_comments_for_department,
@@ -38,7 +37,7 @@ from monostudio.core.mention_inbox import append_mentions
 from monostudio.core.user_identity import get_current_user
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.note_author_row import NoteAuthorRow
-from monostudio.ui_qt.note_body_browser import NoteListPreviewLabel
+from monostudio.ui_qt.note_body_browser import NoteBodyBrowser, make_note_card_preview, resolve_note_jump_host
 from monostudio.ui_qt.note_compose_editor import NoteComposeEditor
 from monostudio.ui_qt.note_context_menu import build_note_context_menu
 from monostudio.ui_qt.note_done_toggle import NoteDoneToggleButton
@@ -91,6 +90,8 @@ def _entries_fingerprint(entries: list[ItemCommentEntry]) -> tuple:
 def _click_target_blocks_card(w: QWidget | None) -> bool:
     while w is not None:
         if isinstance(w, QToolButton):
+            return True
+        if isinstance(w, NoteBodyBrowser):
             return True
         if isinstance(w, QLabel) and w.objectName() in (
             "NoteAuthorNameLink",
@@ -169,6 +170,7 @@ class ItemNotesDialog(MonosDialog):
         self._initial_mentions_by_id = {e.id: frozenset(e.mentions) for e in self._draft}
         self._initial_done_by_id = {e.id: bool(e.done) for e in self._draft}
         self._editing_note_id: str | None = None
+        self._hidden_for_review_jump = False
 
         self.setWindowTitle("Notes")
         self.setModal(True)
@@ -218,6 +220,7 @@ class ItemNotesDialog(MonosDialog):
             parent=compose_panel,
         )
         compose_l.addWidget(self._add_edit, 1)
+        self._add_edit.time_anchor_clicked.connect(self._on_time_anchor_clicked)
 
         add_row = QHBoxLayout()
         add_row.setContentsMargins(0, 0, 0, 0)
@@ -477,8 +480,64 @@ class ItemNotesDialog(MonosDialog):
             workspace_root=self._workspace_root,
             parent=self,
         )
+        dlg.time_anchor_clicked.connect(self._on_time_anchor_clicked)
         dlg.exec()
         self._rebuild_list()
+
+    def _on_time_anchor_clicked(self, href: str) -> None:
+        host = resolve_note_jump_host(self)
+        jump = getattr(host, "jump_to_note_time_anchor", None) if host is not None else None
+        if not callable(jump):
+            return
+        self._prepare_review_jump()
+        jump(
+            entity_path=self._item_path,
+            department_id=self._department_id,
+            department_label=self._department_label,
+            href=href,
+        )
+        self._finish_review_jump(host)
+
+    def _prepare_review_jump(self) -> None:
+        from monostudio.ui_qt.note_view_dialog import NoteViewDialog
+
+        for child in list(self.findChildren(NoteViewDialog)):
+            if child.isVisible():
+                child.done(0)
+        if self.isVisible():
+            self._hidden_for_review_jump = True
+            self.hide()
+
+    def _finish_review_jump(self, host) -> None:
+        alive = getattr(host, "_alive_review_player", None)
+        player = alive() if callable(alive) else getattr(host, "_review_player_dialog", None)
+        if player is not None and player.isVisible():
+            bring = getattr(host, "_bring_review_player_to_front", None)
+            if callable(bring):
+                bring(player)
+            self._watch_review_player_restore(host)
+        else:
+            self._restore_after_review_jump()
+
+    def _watch_review_player_restore(self, host) -> None:
+        alive = getattr(host, "_alive_review_player", None)
+        player = alive() if callable(alive) else getattr(host, "_review_player_dialog", None)
+        if player is None:
+            self._restore_after_review_jump()
+            return
+        closed = getattr(player, "closed", None)
+        if closed is None:
+            self._restore_after_review_jump()
+            return
+        closed.connect(self._restore_after_review_jump, Qt.ConnectionType.SingleShotConnection)
+
+    def _restore_after_review_jump(self) -> None:
+        if not self._hidden_for_review_jump:
+            return
+        self._hidden_for_review_jump = False
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _make_h_sep(self) -> QFrame:
         line = QFrame(self)
@@ -542,9 +601,14 @@ class ItemNotesDialog(MonosDialog):
             )
         )
 
-        preview = NoteListPreviewLabel(card)
-        preview.set_preview(entry_preview_text(entry), done=entry.done)
-        preview.open_requested.connect(lambda eid=entry.id: self._open_note_view(eid))
+        preview = make_note_card_preview(
+            entry,
+            item_root=self._item_path,
+            workspace_root=self._workspace_root,
+            parent=card,
+            on_time_anchor=self._on_time_anchor_clicked,
+            on_plain_open=lambda eid=entry.id: self._open_note_view(eid),
+        )
         text_col.addWidget(preview, 1)
         seen_lab = note_seen_by_label(entry, self._workspace_root, card)
         if seen_lab is not None:

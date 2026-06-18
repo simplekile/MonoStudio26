@@ -301,6 +301,7 @@ class MonosDialog(QDialog):
         self._border_overlay: _DialogBorderOverlay | None = None
         self._dismiss_on_overlay_click = False
         self._host_dim_overlay_enabled = True
+        self._dialog_border_overlay_enabled = True
         flags = self.windowFlags()
         self.setWindowFlags(
             (flags | Qt.FramelessWindowHint) & ~Qt.WindowContextHelpButtonHint
@@ -318,6 +319,12 @@ class MonosDialog(QDialog):
     def set_host_dim_overlay_enabled(self, enabled: bool = True) -> None:
         """When False, skip the dim layer on the parent window (Spotlight uses its own backdrop)."""
         self._host_dim_overlay_enabled = enabled
+
+    def set_dialog_border_overlay_enabled(self, enabled: bool = True) -> None:
+        """When False, skip the full-dialog border QWidget (required for embedded mpv on Windows)."""
+        self._dialog_border_overlay_enabled = bool(enabled)
+        if not enabled and self._border_overlay is not None:
+            self._border_overlay.hide()
 
     def set_dismiss_on_overlay_click(self, enabled: bool = True) -> None:
         """When True, clicking the dimmed backdrop closes the dialog (Spotlight-style)."""
@@ -403,6 +410,8 @@ class MonosDialog(QDialog):
 
     def raise_border_overlay(self) -> None:
         """Re-stack border above content (native video HWND can paint over Qt widgets)."""
+        if not self._dialog_border_overlay_enabled:
+            return
         if self._border_overlay is not None:
             self._border_overlay.setGeometry(self.rect())
             self._border_overlay.raise_()
@@ -411,11 +420,14 @@ class MonosDialog(QDialog):
         super().showEvent(event)
         self._update_rounded_mask()
         # Viền vẽ bằng overlay luôn nằm trên content, không bị repaint đè
-        if self._border_overlay is None:
-            self._border_overlay = _DialogBorderOverlay(self)
-        self._border_overlay.setGeometry(self.rect())
-        self.raise_border_overlay()
-        self._border_overlay.show()
+        if self._dialog_border_overlay_enabled:
+            if self._border_overlay is None:
+                self._border_overlay = _DialogBorderOverlay(self)
+            self._border_overlay.setGeometry(self.rect())
+            self.raise_border_overlay()
+            self._border_overlay.show()
+        elif self._border_overlay is not None:
+            self._border_overlay.hide()
         host = self._resolve_overlay_host()
         self._overlay_host = host
         if self._host_dim_overlay_enabled and host is not None:
@@ -436,6 +448,10 @@ class MonosDialog(QDialog):
             app = QApplication.instance()
             if app is not None:
                 app.installEventFilter(self)
+
+    def hideEvent(self, event) -> None:
+        self._hide_overlay()
+        super().hideEvent(event)
 
     def _hide_overlay(self) -> None:
         if self._dismiss_on_overlay_click:
@@ -3399,6 +3415,14 @@ def apply_dark_theme(app: QApplication) -> None:
            L3 panel  #18181b  shell, timeline strip
            L2 stage  #121214  viewer frame, tool strip
            L1 pit    #09090b  video letterbox */
+        QSplitter#VideoPreviewBodySplit::handle {
+            background: rgba(63, 63, 70, 0.55);
+            width: 6px;
+            margin: 0 1px;
+        }
+        QSplitter#VideoPreviewBodySplit::handle:hover {
+            background: rgba(113, 113, 122, 0.75);
+        }
         QDialog#VideoPreviewDialog {
             background: transparent;
         }
@@ -3798,7 +3822,8 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QCheckBox#VideoPreviewPreciseScrubCheck,
         QCheckBox#VideoPreviewLoopCheck,
-        QCheckBox#VideoPreviewProxyCheck {
+        QCheckBox#VideoPreviewProxyCheck,
+        QCheckBox#VideoReviewNoteAutoAddCheck {
             color: #a1a1aa;
             font-family: "Inter";
             font-size: 12px;
@@ -3807,7 +3832,8 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QCheckBox#VideoPreviewPreciseScrubCheck::indicator,
         QCheckBox#VideoPreviewLoopCheck::indicator,
-        QCheckBox#VideoPreviewProxyCheck::indicator {
+        QCheckBox#VideoPreviewProxyCheck::indicator,
+        QCheckBox#VideoReviewNoteAutoAddCheck::indicator {
             width: 14px;
             height: 14px;
             border-radius: 3px;
@@ -3816,13 +3842,15 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QCheckBox#VideoPreviewPreciseScrubCheck::indicator:checked,
         QCheckBox#VideoPreviewLoopCheck::indicator:checked,
-        QCheckBox#VideoPreviewProxyCheck::indicator:checked {
+        QCheckBox#VideoPreviewProxyCheck::indicator:checked,
+        QCheckBox#VideoReviewNoteAutoAddCheck::indicator:checked {
             background: #3b82f6;
             border-color: #3b82f6;
         }
         QCheckBox#VideoPreviewPreciseScrubCheck:hover,
         QCheckBox#VideoPreviewLoopCheck:hover,
-        QCheckBox#VideoPreviewProxyCheck:hover {
+        QCheckBox#VideoPreviewProxyCheck:hover,
+        QCheckBox#VideoReviewNoteAutoAddCheck:hover {
             color: #e4e4e7;
         }
         QComboBox#VideoPreviewTimeDisplayCombo {
