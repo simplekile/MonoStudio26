@@ -34,7 +34,8 @@ from monostudio.core.inbox_date_folder import (
     sanitize_date_folder_suffix,
 )
 from monostudio.core.inbox_reader import scan_inbox
-from monostudio.core.outbox_reader import scan_outbox
+from monostudio.core.internal_check_reader import scan_internal_check
+from monostudio.core.delivery_reader import scan_delivery
 from monostudio.ui_qt.calendar_date_picker import run_date_picker_dialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
@@ -43,21 +44,35 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 def _get_date_folders_for_source(
     project_root: Path | None, source: str, *, target: str = "inbox"
 ) -> list[tuple[str, Path]]:
-    """Return list of (date_str, path) for the given source (client/freelancer), newest first. target: 'inbox' | 'outbox'."""
-    if not project_root or not source:
+    """Return list of (date_str, path), newest first. target: inbox | internal_check | delivery."""
+    if not project_root:
         return []
+    key = (target or "inbox").strip().lower()
+    if key == "outbox":
+        key = "delivery"
     try:
-        nodes = scan_outbox(project_root) if target == "outbox" else scan_inbox(project_root)
+        if key == "delivery":
+            nodes = scan_delivery(project_root)
+        elif key == "internal_check":
+            nodes = scan_internal_check(project_root)
+        else:
+            nodes = scan_inbox(project_root)
     except Exception:
         return []
-    source_lower = source.strip().lower()
+    if key in ("inbox", "internal_check"):
+        out: list[tuple[str, Path]] = []
+        for node in nodes:
+            if getattr(node, "is_dir", True) and getattr(node, "path", None) and getattr(node, "name", None):
+                out.append((node.name, node.path))
+        out.sort(key=lambda x: date_folder_sort_key(x[0]), reverse=True)
+        return out
+    source_lower = (source or "").strip().lower()
     for node in nodes:
         if (node.name or "").lower() == source_lower and getattr(node, "children", None):
-            out: list[tuple[str, Path]] = []
+            out = []
             for child in node.children:
                 if getattr(child, "is_dir", True) and getattr(child, "path", None) and getattr(child, "name", None):
                     out.append((child.name, child.path))
-            # Sort by parsed date descending (newest first); legacy YYYY-MM-DD still works.
             out.sort(key=lambda x: date_folder_sort_key(x[0]), reverse=True)
             return out
     return []
@@ -89,12 +104,19 @@ class InboxDropDialog(MonosDialog):
         if self._initial_source not in ("client", "freelancer"):
             self._initial_source = "client"
         self._target = (target or "inbox").strip().lower() if target else "inbox"
-        if self._target not in ("inbox", "outbox"):
+        if self._target == "outbox":
+            self._target = "delivery"
+        if self._target not in ("inbox", "delivery", "internal_check"):
             self._target = "inbox"
+        self._hide_source = self._target in ("inbox", "internal_check")
         self._initial_date_str = (initial_date_str or "").strip() or None
         self._prefer_existing_date = bool(prefer_existing_date and self._initial_date_str)
 
-        self.setWindowTitle("Add to Outbox" if self._target == "outbox" else "Add to Inbox")
+        titles = {
+            "delivery": "Add to Delivery",
+            "internal_check": "Add to Internal check",
+        }
+        self.setWindowTitle(titles.get(self._target, "Add to Inbox"))
         self.setModal(True)
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -130,11 +152,12 @@ class InboxDropDialog(MonosDialog):
         list_lay.addWidget(list_widget)
         form_layout.addWidget(list_frame, 0)
 
-        # Source: Client | Freelancer
-        source_label = QLabel("Source", self)
+        # Source: Client | Freelancer (Delivery only)
+        source_label = QLabel("Recipient", self)
         source_label.setObjectName("DialogSectionTitle")
         source_label.setFont(monos_font("Inter", 11, QFont.Weight.Bold))
         form_layout.addWidget(source_label, 0)
+        self._source_label = source_label
         self._source_client = QRadioButton("Client", self)
         self._source_freelancer = QRadioButton("Freelancer", self)
         self._source_group = QButtonGroup(self)
@@ -144,13 +167,20 @@ class InboxDropDialog(MonosDialog):
         source_row.addWidget(self._source_client)
         source_row.addWidget(self._source_freelancer)
         source_row.addStretch(1)
-        form_layout.addLayout(source_row, 0)
         if self._initial_source == "freelancer":
             self._source_freelancer.setChecked(True)
         else:
             self._source_client.setChecked(True)
         self._source_client.toggled.connect(self._on_source_changed)
         self._source_freelancer.toggled.connect(self._on_source_changed)
+        self._source_row_widget = QWidget(self)
+        source_row_wrap = QVBoxLayout(self._source_row_widget)
+        source_row_wrap.setContentsMargins(0, 0, 0, 0)
+        source_row_wrap.addLayout(source_row)
+        form_layout.addWidget(self._source_row_widget, 0)
+        if self._hide_source:
+            source_label.hide()
+            self._source_row_widget.hide()
 
         # Date folder: Existing vs New
         date_label = QLabel("Date folder", self)
@@ -244,7 +274,8 @@ class InboxDropDialog(MonosDialog):
         buttons.setObjectName("InboxDropDialogButtons")
         ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
         if ok_btn:
-            ok_btn.setText("Add to Inbox")
+            ok_labels = {"delivery": "Add to Delivery", "internal_check": "Add to Internal check"}
+            ok_btn.setText(ok_labels.get(self._target, "Add to Inbox"))
             ok_btn.setDefault(True)
             ok_btn.setObjectName("DialogPrimaryButton")
             # Force primary (blue) look: QDialogButtonBox can ignore global QSS, so set on widget
@@ -343,7 +374,8 @@ class InboxDropDialog(MonosDialog):
         source = self._current_source()
         date_str = self._get_date_str()
         if not date_str or not date_str.strip():
-            title = "Add to Outbox" if self._target == "outbox" else "Add to Inbox"
+            titles = {"delivery": "Add to Delivery", "internal_check": "Add to Internal check"}
+            title = titles.get(self._target, "Add to Inbox")
             if self._radio_existing.isChecked() and self._existing_combo.count() == 0:
                 QMessageBox.warning(
                     self,

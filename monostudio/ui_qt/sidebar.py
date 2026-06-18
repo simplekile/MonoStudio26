@@ -50,6 +50,8 @@ from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.project_guide_tags import (
     ALL_TAG_IDS,
     DEFAULT_TAG_DEFINITIONS,
+    PROJECT_GUIDE_DEPARTMENT_ICONS,
+    PROJECT_GUIDE_TAG_DEPARTMENTS,
     TAG_COLOR_BY_ID,
     TAG_COLOR_PALETTE,
     TAG_LABEL_BY_ID,
@@ -105,11 +107,13 @@ class SidebarContext(str, Enum):
     INBOX = "Inbox"
     PROJECT_GUIDE = "Project Guide"
     SCHEDULE = "Schedule"
-    OUTBOX = "Outbox"
+    OUTBOX = "Outbox"  # legacy settings only — nav uses Delivery
+    INTERNAL_CHECK = "Internal check"
+    DELIVERY = "Delivery"
     TRASH = "Trash"
 
 
-# Single nav item that holds the scope pill (Project | Shot | Asset).
+INTERNAL_CHECK_NAV_ICON = "clipboard-check"
 _NAV_SCOPE_ITEM_ROLE = "_scope"
 
 # Tag list: UserRole = tag_id, UserRole+1 = item count for badge
@@ -132,7 +136,12 @@ def _filter_mode_for_nav_context(context_name: str) -> str | None:
         return "schedule"
     if ctx == SidebarContext.DASHBOARD.value:
         return None
-    if ctx in (SidebarContext.INBOX.value, SidebarContext.OUTBOX.value):
+    if ctx in (
+        SidebarContext.INBOX.value,
+        SidebarContext.OUTBOX.value,
+        SidebarContext.INTERNAL_CHECK.value,
+        SidebarContext.DELIVERY.value,
+    ):
         return "inbox"
     if ctx == SidebarContext.PROJECT_GUIDE.value:
         return "reference"
@@ -142,8 +151,10 @@ def _filter_mode_for_nav_context(context_name: str) -> str | None:
 def _filter_page_kind_for_nav_context(context_name: str, *, mode: str = "") -> str:
     """Breadcrumb page family for sidebar filter accent colors."""
     ctx = (context_name or "").strip()
-    if ctx == SidebarContext.OUTBOX.value:
-        return "outbox"
+    if ctx in (SidebarContext.OUTBOX.value, SidebarContext.DELIVERY.value):
+        return "delivery"
+    if ctx == SidebarContext.INTERNAL_CHECK.value:
+        return "internal_check"
     if ctx == SidebarContext.INBOX.value:
         return "inbox"
     if ctx == SidebarContext.PROJECT_GUIDE.value:
@@ -1155,6 +1166,7 @@ class SidebarWidget(QWidget):
         type_header = QLabel("TYPES", type_header_row)
         type_header.setObjectName("SidebarSectionHeader")
         type_header.setFont(f_h)
+        self._type_section_title = type_header
 
         self._btn_type_pick = QToolButton(type_header_row)
         self._btn_type_pick.setObjectName("SidebarFilterAddButton")
@@ -1300,34 +1312,44 @@ class SidebarWidget(QWidget):
         For mode "inbox": only Source (Client/Freelancer); no departments.
         """
         if self._mode == "inbox":
-            self._all_types = ["client", "freelancer"]
-            self._type_label_by_id = {"client": "Client", "freelancer": "Freelancer"}
-            self._type_icon_by_id = {"client": "package", "freelancer": "user"}
+            page_kind = (self._filter_page_kind or "").strip().lower()
+            if page_kind == "delivery":
+                self._all_types = ["client", "freelancer"]
+                self._type_label_by_id = {"client": "Client", "freelancer": "Freelancer"}
+                self._type_icon_by_id = {"client": "package", "freelancer": "user"}
+                if self._active_type is not None and self._active_type not in set(self._all_types):
+                    self._active_type = None
+                if self._active_type is None and self._all_types:
+                    self._active_type = self._all_types[0]
+                self._visible_types = None
+                self._type_section.setVisible(True)
+            else:
+                # Inbox + Review: flat date folders — no client/freelancer filter.
+                self._all_types = []
+                self._type_label_by_id = {}
+                self._type_icon_by_id = {}
+                self._active_type = None
+                self._type_section.setVisible(False)
             self._all_departments = []
             self._dept_label_by_id = {}
             self._dept_icon_by_id = {}
             self._dept_parent = {}
-            if self._active_type is not None and self._active_type not in set(self._all_types):
-                self._active_type = None
-            # Inbox: bắt buộc chọn một trong hai (Client/Freelancer), không cho unselect.
-            if self._active_type is None and self._all_types:
-                self._active_type = self._all_types[0]
             self._active_department = None
             self.set_departments([])
             self.set_types(self._all_types)
             self._dept_section.setVisible(False)
-            self._type_section.setVisible(True)
             self._scope_section.setVisible(False)
             self._tag_section.setVisible(False)
+            self._sync_inbox_type_section_title()
             self._notify_filters_layout()
             return
 
         if self._mode == "reference":
             # Reference page: departments only (reference, script, storyboard, guideline, concept).
-            ref_depts = ["reference", "script", "storyboard", "guideline", "concept"]
+            ref_depts = list(PROJECT_GUIDE_TAG_DEPARTMENTS)
             self._all_departments = ref_depts
             self._dept_label_by_id = {d: d.replace("_", " ").title() for d in ref_depts}
-            self._dept_icon_by_id = {}
+            self._dept_icon_by_id = dict(PROJECT_GUIDE_DEPARTMENT_ICONS)
             self._dept_parent = {}
             self._all_types = []
             self._type_label_by_id = {}
@@ -1791,6 +1813,10 @@ class SidebarWidget(QWidget):
         if not force and k == self._filter_page_kind:
             return
         self._filter_page_kind = k
+        self._sync_inbox_type_section_title()
+        if self._mode == "inbox":
+            self.reload_from_pipeline_metadata()
+            self._notify_filters_layout()
         for list_w in (self._type_list, self._dept_list, self._scope_list):
             deleg = list_w.itemDelegate()
             if isinstance(deleg, _SidebarFilterTreeDelegate):
@@ -1807,6 +1833,22 @@ class SidebarWidget(QWidget):
         role = sidebar_filter_accent_role(self._filter_page_kind, scope)
         accent = sidebar_filter_accent_colors(role)
         return str(accent.get("accent_hex", MONOS_COLORS["blue_400"]))
+
+    def _sync_inbox_type_section_title(self) -> None:
+        title = getattr(self, "_type_section_title", None)
+        if title is None:
+            return
+        if self._mode != "inbox":
+            title.setText("TYPES")
+            self._btn_type_pick.setVisible(self._type_section_expanded)
+            return
+        if self._filter_page_kind == "delivery":
+            title.setText("RECIPIENT")
+        elif self._filter_page_kind == "inbox":
+            title.setText("SOURCE")
+        else:
+            title.setText("SOURCE")
+        self._btn_type_pick.setVisible(False)
 
     def set_mode(self, mode: str) -> None:
         """
@@ -2017,7 +2059,7 @@ class SidebarWidget(QWidget):
     def _toggle_type_section_expanded(self, _checked: bool = False) -> None:
         self._type_section_expanded = not self._type_section_expanded
         self._type_list_container.setVisible(self._type_section_expanded)
-        self._btn_type_pick.setVisible(self._type_section_expanded)
+        self._sync_inbox_type_section_title()
         _update_filter_section_chevron(self._btn_type_section_chevron, expanded=self._type_section_expanded)
         self._notify_filters_layout()
 
@@ -2309,6 +2351,9 @@ class SidebarWidget(QWidget):
             self._visible_types = cleaned[: self._max_visible]
 
         visible = self._visible_types or []
+        if not visible and cleaned:
+            visible = cleaned[: self._max_visible]
+            self._visible_types = visible[:]
         if self._mode == "schedule":
             scoped: list[str] = []
             for type_id in visible:
@@ -4355,6 +4400,8 @@ class Sidebar(QWidget):
             SidebarContext.PROJECT_GUIDE.value,
             SidebarContext.SCHEDULE.value,
             SidebarContext.OUTBOX.value,
+            SidebarContext.INTERNAL_CHECK.value,
+            SidebarContext.DELIVERY.value,
             SidebarContext.TRASH.value,
         ):
             self._footer_context = context_name
@@ -4375,6 +4422,12 @@ class Sidebar(QWidget):
                 self._filters.set_mode("schedule")
                 self._push_filter_counts()
             elif context_name == SidebarContext.OUTBOX.value:
+                self._filters.setVisible(True)
+                self._filters.set_mode("inbox")
+            elif context_name == SidebarContext.INTERNAL_CHECK.value:
+                self._filters.setVisible(True)
+                self._filters.set_mode("inbox")
+            elif context_name == SidebarContext.DELIVERY.value:
                 self._filters.setVisible(True)
                 self._filters.set_mode("inbox")
             elif context_name == SidebarContext.TRASH.value:
@@ -4621,18 +4674,20 @@ class SidebarCompact(QWidget):
         self._scope_buttons = scope_btns
         root.addWidget(_sep_line(self), 0)
 
-        # Footer nav: Inbox, Project Guide, Outbox, Trash (Dashboard/Schedule → title bar)
+        # Footer nav: Review, Delivery, Inbox, Project Guide, Trash
         footer_btns: dict[str, QToolButton] = {}
         _footer_tooltips = {
+            SidebarContext.INTERNAL_CHECK.value: "Internal check",
+            SidebarContext.DELIVERY.value: "Delivery",
             SidebarContext.INBOX.value: "Inbox",
             SidebarContext.PROJECT_GUIDE.value: "Project Guide",
-            SidebarContext.OUTBOX.value: "Outbox",
             SidebarContext.TRASH.value: "Trash",
         }
         for ctx_name, icon_name in [
+            (SidebarContext.INTERNAL_CHECK.value, INTERNAL_CHECK_NAV_ICON),
+            (SidebarContext.DELIVERY.value, "send"),
             (SidebarContext.INBOX.value, "inbox"),
-            (SidebarContext.PROJECT_GUIDE.value, "folder-open"),
-            (SidebarContext.OUTBOX.value, "send"),
+            (SidebarContext.PROJECT_GUIDE.value, "library"),
             (SidebarContext.TRASH.value, "trash-2"),
         ]:
             btn = QToolButton(self)
@@ -4757,6 +4812,8 @@ class SidebarCompact(QWidget):
             SidebarContext.PROJECT_GUIDE.value,
             SidebarContext.SCHEDULE.value,
             SidebarContext.OUTBOX.value,
+            SidebarContext.INTERNAL_CHECK.value,
+            SidebarContext.DELIVERY.value,
             SidebarContext.TRASH.value,
         ):
             self._footer_context = context_name
@@ -4784,9 +4841,10 @@ class SidebarCompact(QWidget):
                 btn.style().unpolish(btn)
                 btn.style().polish(btn)
         _fi = {
+            SidebarContext.INTERNAL_CHECK.value: INTERNAL_CHECK_NAV_ICON,
+            SidebarContext.DELIVERY.value: "send",
             SidebarContext.INBOX.value: "inbox",
-            SidebarContext.PROJECT_GUIDE.value: "folder-open",
-            SidebarContext.OUTBOX.value: "send",
+            SidebarContext.PROJECT_GUIDE.value: "library",
             SidebarContext.TRASH.value: "trash-2",
         }
         for name, btn in self._footer_buttons.items():

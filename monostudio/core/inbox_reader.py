@@ -125,23 +125,20 @@ def _build_inbox_item(
     )
 
 
-def resolve_inbox_location(project_root: Path, path: Path) -> tuple[str, Path] | None:
-    """Return (source client|freelancer, date_folder_path) for an inbox path."""
+def resolve_inbox_location(project_root: Path, path: Path) -> Path | None:
+    """Return date-folder path for an inbox path (flat inbox/<date>/… layout)."""
     root = get_inbox_root(project_root)
     try:
         rel = Path(path).resolve().relative_to(root.resolve())
     except (OSError, ValueError):
         return None
     parts = rel.parts
-    if len(parts) < 2:
+    if not parts:
         return None
-    source = (parts[0] or "").strip().lower()
-    if source not in ("client", "freelancer"):
-        return None
-    date_folder = (root / parts[0] / parts[1]).resolve()
+    date_folder = (root / parts[0]).resolve()
     if not date_folder.is_dir():
         return None
-    return source, date_folder
+    return date_folder
 
 
 def flatten_inbox_for_palette(project_root: Path) -> list[dict[str, Any]]:
@@ -312,15 +309,13 @@ def add_to_inbox(
     description: str | None,
 ) -> InboxItem | None:
     """
-    Copy source_path (file or folder) into inbox under <source_label>/<date_folder>/.
-    date_str: folder name (DDMMYY_suffix, e.g. 260515_Stb) or legacy YYYY-MM-DD.
-    Default: today with project suffix. Writes meta for the copied root.
-    Returns InboxItem for the new root node, or None on failure.
+    Copy source_path into inbox under <date_folder>/ (flat layout, no client/freelancer).
+    source_label is kept for meta/history compatibility only.
     """
     root = get_inbox_root(project_root)
     root.mkdir(parents=True, exist_ok=True)
     folder_name = resolve_date_folder_name(date_str, project_root=project_root)
-    dest_dir = root / source_label / folder_name
+    dest_dir = root / folder_name
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / source_path.name
     if dest_path.exists():
@@ -335,7 +330,7 @@ def add_to_inbox(
     relative_path = dest_path.relative_to(root).as_posix()
     meta = read_inbox_meta(project_root)
     meta[relative_path] = {
-        META_KEY_SOURCE: source_label,
+        META_KEY_SOURCE: (source_label or "").strip() or None,
         META_KEY_ADDED_AT: _meta_added_at_iso(),
         META_KEY_DESCRIPTION: (description or "").strip() or None,
     }

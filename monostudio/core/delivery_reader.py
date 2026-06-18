@@ -1,6 +1,6 @@
 """
-Outbox: scan and manage outbox folder (deliverables to client; client/freelancer, source/date structure).
-Metadata in .monostudio/outbox_meta.json. Same schema as InboxItem; used for Outbox page (review metadata only).
+Delivery: outbound deliverables to client/freelancer (outbox/delivery/<recipient>/<date>/).
+Metadata in .monostudio/delivery_meta.json.
 """
 from __future__ import annotations
 
@@ -12,50 +12,36 @@ from typing import Any
 
 from monostudio.core.inbox_date_folder import resolve_date_folder_name
 from monostudio.core.models import InboxItem
+from monostudio.core.outbox_reader import (
+    META_KEY_ADDED_AT,
+    META_KEY_DESCRIPTION,
+    META_KEY_SOURCE,
+    ensure_source_folders,
+    get_outbox_root,
+)
 
-OUTBOX_META_FILENAME = "outbox_meta.json"
-_OUTBOX_DEFAULT_FOLDER = "outbox"
-META_KEY_SOURCE = "source"
-META_KEY_ADDED_AT = "added_at"
-META_KEY_DESCRIPTION = "description"
-SOURCE_FOLDER_NAMES = ("client", "freelancer")
-
-
-def ensure_source_folders(root: Path) -> None:
-    """Ensure client/ and freelancer/ exist under an inbox/outbox-style root."""
-    root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    for name in SOURCE_FOLDER_NAMES:
-        (root / name).mkdir(parents=True, exist_ok=True)
-
-
-def ensure_outbox_source_folders(project_root: Path) -> None:
-    """Ensure outbox/internal_check and outbox/delivery/{client,freelancer} exist."""
-    root = get_outbox_root(project_root)
-    root.mkdir(parents=True, exist_ok=True)
-    from monostudio.core.internal_check_reader import ensure_internal_check_root
-
-    ensure_internal_check_root(project_root)
-    ensure_source_folders(root / "delivery")
+DELIVERY_SUBFOLDER = "delivery"
+DELIVERY_META_FILENAME = "delivery_meta.json"
 
 
 def _meta_added_at_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def get_outbox_root(project_root: Path) -> Path:
-    """Return <project_root>/<outbox_folder> using StructureRegistry."""
-    from monostudio.core.structure_registry import StructureRegistry
-    struct_reg = StructureRegistry.for_project(project_root)
-    return Path(project_root) / struct_reg.get_folder("outbox")
+def get_delivery_root(project_root: Path) -> Path:
+    """Return <outbox_root>/delivery."""
+    return get_outbox_root(project_root) / DELIVERY_SUBFOLDER
+
+
+def ensure_delivery_source_folders(project_root: Path) -> None:
+    ensure_source_folders(get_delivery_root(project_root))
 
 
 def _meta_path(project_root: Path) -> Path:
-    return Path(project_root) / ".monostudio" / OUTBOX_META_FILENAME
+    return Path(project_root) / ".monostudio" / DELIVERY_META_FILENAME
 
 
-def read_outbox_meta(project_root: Path) -> dict:
-    """Read .monostudio/outbox_meta.json. Keys are relative paths from outbox root; values are { source, added_at, description }."""
+def read_delivery_meta(project_root: Path) -> dict:
     path = _meta_path(project_root)
     try:
         if not path.is_file():
@@ -66,8 +52,7 @@ def read_outbox_meta(project_root: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def write_outbox_meta(project_root: Path, data: dict) -> bool:
-    """Write .monostudio/outbox_meta.json."""
+def write_delivery_meta(project_root: Path, data: dict) -> bool:
     path = _meta_path(project_root)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +63,6 @@ def write_outbox_meta(project_root: Path, data: dict) -> bool:
 
 
 def _infer_source_from_relative_path(relative_path: str) -> str | None:
-    """Infer client/freelancer from path like client/2025-02-07/... or freelancer/..."""
     parts = (relative_path or "").strip().replace("\\", "/").strip("/").split("/")
     if not parts:
         return None
@@ -90,16 +74,15 @@ def _infer_source_from_relative_path(relative_path: str) -> str | None:
     return None
 
 
-def _build_outbox_item(
+def _build_delivery_item(
     full_path: Path,
-    outbox_root: Path,
+    delivery_root: Path,
     meta: dict,
     *,
     recurse: bool = True,
 ) -> InboxItem:
-    """Build InboxItem (same schema) for outbox path."""
     try:
-        rel = full_path.relative_to(outbox_root)
+        rel = full_path.relative_to(delivery_root)
     except ValueError:
         rel = full_path
     relative_path = rel.as_posix()
@@ -116,7 +99,7 @@ def _build_outbox_item(
             for p in sorted(full_path.iterdir()):
                 if p.name.startswith("."):
                     continue
-                children.append(_build_outbox_item(p, outbox_root, meta, recurse=True))
+                children.append(_build_delivery_item(p, delivery_root, meta, recurse=True))
         except OSError:
             pass
 
@@ -132,13 +115,9 @@ def _build_outbox_item(
     )
 
 
-def load_outbox_history(project_root: Path, type_filter: str | None) -> list[dict]:
-    """
-    Load outbox meta entries for a source type, newest first.
-    Each entry: { "path", "relative_path", "added_at", "description" }.
-    """
-    root = get_outbox_root(project_root)
-    meta = read_outbox_meta(project_root)
+def load_delivery_history(project_root: Path, type_filter: str | None) -> list[dict]:
+    root = get_delivery_root(project_root)
+    meta = read_delivery_meta(project_root)
     want = (type_filter or "").strip().lower() or None
     entries: list[dict] = []
     for rel, info in meta.items():
@@ -160,21 +139,17 @@ def load_outbox_history(project_root: Path, type_filter: str | None) -> list[dic
     return entries
 
 
-def scan_outbox(project_root: Path) -> list[InboxItem]:
-    """
-    Scan outbox folder recursively. Returns top-level nodes (client/, freelancer/, or direct children).
-    Each node has children populated for directories. Uses InboxItem (same schema).
-    """
-    root = get_outbox_root(project_root)
+def scan_delivery(project_root: Path) -> list[InboxItem]:
+    root = get_delivery_root(project_root)
     if not root.is_dir():
         return []
-    meta = read_outbox_meta(project_root)
+    meta = read_delivery_meta(project_root)
     out: list[InboxItem] = []
     try:
         for p in sorted(root.iterdir()):
             if p.name.startswith("."):
                 continue
-            out.append(_build_outbox_item(p, root, meta, recurse=True))
+            out.append(_build_delivery_item(p, root, meta, recurse=True))
     except OSError:
         pass
     return out
@@ -193,19 +168,18 @@ def _relocate_meta_keys(meta: dict, old_rel: str, new_rel: str) -> None:
         meta[new_key] = value
 
 
-def move_into_outbox_folder(
+def move_into_delivery_folder(
     project_root: Path,
     source_path: Path,
     dest_dir: Path,
 ) -> bool:
-    """Move a file/folder into another outbox directory; relocate meta keys."""
-    outbox_root = get_outbox_root(project_root)
+    delivery_root = get_delivery_root(project_root)
     try:
-        outbox_res = outbox_root.resolve()
+        delivery_res = delivery_root.resolve()
         dest_dir = Path(dest_dir).resolve()
-        dest_dir.relative_to(outbox_res)
+        dest_dir.relative_to(delivery_res)
         source_path = Path(source_path).resolve()
-        source_path.relative_to(outbox_res)
+        source_path.relative_to(delivery_res)
     except (ValueError, OSError):
         return False
     if not dest_dir.is_dir() or not source_path.exists():
@@ -223,26 +197,25 @@ def move_into_outbox_folder(
         shutil.move(str(source_path), str(dest_path))
     except OSError:
         return False
-    old_rel = source_path.relative_to(outbox_res).as_posix()
-    new_rel = dest_path.relative_to(outbox_res).as_posix()
-    meta = read_outbox_meta(project_root)
+    old_rel = source_path.relative_to(delivery_res).as_posix()
+    new_rel = dest_path.relative_to(delivery_res).as_posix()
+    meta = read_delivery_meta(project_root)
     _relocate_meta_keys(meta, old_rel, new_rel)
-    write_outbox_meta(project_root, meta)
+    write_delivery_meta(project_root, meta)
     return True
 
 
-def copy_into_outbox_folder(
+def copy_into_delivery_folder(
     project_root: Path,
     source_path: Path,
     dest_dir: Path,
     *,
     description: str | None = None,
 ) -> bool:
-    """Copy a file/folder into an existing outbox directory; write meta for the new item."""
-    outbox_root = get_outbox_root(project_root)
+    delivery_root = get_delivery_root(project_root)
     try:
         dest_dir = Path(dest_dir).resolve()
-        dest_dir.relative_to(outbox_root.resolve())
+        dest_dir.relative_to(delivery_root.resolve())
     except (ValueError, OSError):
         return False
     if not dest_dir.is_dir():
@@ -261,35 +234,29 @@ def copy_into_outbox_folder(
     except OSError:
         return False
     try:
-        rel_parts = dest_dir.relative_to(outbox_root.resolve()).parts
+        rel_parts = dest_dir.relative_to(delivery_root.resolve()).parts
         source_label = rel_parts[0] if rel_parts else ""
     except ValueError:
         source_label = ""
-    relative_path = dest_path.relative_to(outbox_root).as_posix()
-    meta = read_outbox_meta(project_root)
+    relative_path = dest_path.relative_to(delivery_root).as_posix()
+    meta = read_delivery_meta(project_root)
     meta[relative_path] = {
         META_KEY_SOURCE: source_label,
         META_KEY_ADDED_AT: _meta_added_at_iso(),
         META_KEY_DESCRIPTION: (description or "").strip() or None,
     }
-    write_outbox_meta(project_root, meta)
+    write_delivery_meta(project_root, meta)
     return True
 
 
-def add_to_outbox(
+def add_to_delivery(
     project_root: Path,
     source_path: Path,
     source_label: str,
     date_str: str | None,
     description: str | None,
 ) -> InboxItem | None:
-    """
-    Copy source_path (file or folder) into outbox under <source_label>/<date_folder>/.
-    date_str: folder name (DDMMYY_suffix, e.g. 260515_Stb) or legacy YYYY-MM-DD.
-    Default: today with project suffix. Writes meta for the copied root.
-    Returns InboxItem for the new root node, or None on failure.
-    """
-    root = get_outbox_root(project_root)
+    root = get_delivery_root(project_root)
     root.mkdir(parents=True, exist_ok=True)
     folder_name = resolve_date_folder_name(date_str, project_root=project_root)
     dest_dir = root / source_label / folder_name
@@ -305,11 +272,11 @@ def add_to_outbox(
     except OSError:
         return None
     relative_path = dest_path.relative_to(root).as_posix()
-    meta = read_outbox_meta(project_root)
+    meta = read_delivery_meta(project_root)
     meta[relative_path] = {
         META_KEY_SOURCE: source_label,
         META_KEY_ADDED_AT: _meta_added_at_iso(),
         META_KEY_DESCRIPTION: (description or "").strip() or None,
     }
-    write_outbox_meta(project_root, meta)
-    return _build_outbox_item(dest_path, root, meta, recurse=False)
+    write_delivery_meta(project_root, meta)
+    return _build_delivery_item(dest_path, root, meta, recurse=False)

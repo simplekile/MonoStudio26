@@ -17,6 +17,14 @@ _TAGS_FILENAME = "project_guide_tags.json"
 
 PROJECT_GUIDE_TAG_DEPARTMENTS = ("reference", "script", "storyboard", "guideline", "concept")
 
+PROJECT_GUIDE_DEPARTMENT_ICONS: dict[str, str] = {
+    "reference": "eye",
+    "script": "file-text",
+    "storyboard": "layout-dashboard",
+    "guideline": "library",
+    "concept": "lightbulb",
+}
+
 DEFAULT_TAG_DEFINITIONS: list[dict[str, str]] = [
     {"id": "red", "color": "#FF3B30", "label": "Red"},
     {"id": "orange", "color": "#FF9500", "label": "Orange"},

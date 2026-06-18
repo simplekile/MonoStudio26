@@ -80,22 +80,20 @@ class _MarkerListRowWidget(QWidget):
         text_col.addWidget(detail)
         root.addLayout(text_col, 1)
 
-        if synced:
-            sync_lab = QLabel(self)
-            sync_lab.setPixmap(
-                lucide_icon("sync", size=12, color_hex="#4ade80").pixmap(12, 12)
-            )
-            sync_lab.setFixedSize(12, 12)
-            sync_lab.setToolTip("Matches project sidecar")
-            root.addWidget(sync_lab, 0, Qt.AlignmentFlag.AlignTop)
-        else:
-            local_lab = QLabel(self)
-            local_lab.setPixmap(
-                lucide_icon("local", size=12, color_hex="#fbbf24").pixmap(12, 12)
-            )
-            local_lab.setFixedSize(12, 12)
-            local_lab.setToolTip("Changed locally — use Sync to save")
-            root.addWidget(local_lab, 0, Qt.AlignmentFlag.AlignTop)
+        self._sync_label = QLabel(self)
+        root.addWidget(self._sync_label, 0, Qt.AlignmentFlag.AlignTop)
+        self.set_synced(synced)
+
+    def set_synced(self, synced: bool) -> None:
+        color = "#4ade80" if synced else "#fbbf24"
+        icon_name = "sync" if synced else "local"
+        self._sync_label.setPixmap(
+            lucide_icon(icon_name, size=12, color_hex=color).pixmap(12, 12)
+        )
+        self._sync_label.setFixedSize(12, 12)
+        self._sync_label.setToolTip(
+            "Matches project sidecar" if synced else "Changed locally — use Sync to save"
+        )
 
     @classmethod
     def size_hint(cls) -> QSize:
@@ -213,8 +211,22 @@ class VideoMarkerListWidget(QWidget):
         if pub == self._published_markers:
             return
         self._published_markers = pub
-        if self._markers:
-            self.set_markers(self._markers, active_id=self._active_id)
+        self._refresh_sync_icons()
+
+    def _refresh_sync_icons(self) -> None:
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is None:
+                continue
+            mid = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(mid, str):
+                continue
+            marker = next((m for m in self._markers if m.id == mid), None)
+            if marker is None:
+                continue
+            row_w = self._list.itemWidget(item)
+            if isinstance(row_w, _MarkerListRowWidget):
+                row_w.set_synced(marker_is_synced(marker, self._published_markers))
 
     def ordered_markers(self) -> list[VideoReviewMarker]:
         return sort_video_markers(self._markers, self._sort_mode)

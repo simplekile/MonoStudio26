@@ -299,10 +299,15 @@ def _purge_inbox_outbox_meta(project_root: Path, deleted_path: Path) -> None:
         read_inbox_meta,
         write_inbox_meta,
     )
-    from monostudio.core.outbox_reader import (
-        get_outbox_root,
-        read_outbox_meta,
-        write_outbox_meta,
+    from monostudio.core.internal_check_reader import (
+        get_internal_check_root,
+        read_internal_check_meta,
+        write_internal_check_meta,
+    )
+    from monostudio.core.delivery_reader import (
+        get_delivery_root,
+        read_delivery_meta,
+        write_delivery_meta,
     )
 
     try:
@@ -312,7 +317,8 @@ def _purge_inbox_outbox_meta(project_root: Path, deleted_path: Path) -> None:
 
     for get_root, read_meta, write_meta in (
         (get_inbox_root, read_inbox_meta, write_inbox_meta),
-        (get_outbox_root, read_outbox_meta, write_outbox_meta),
+        (get_internal_check_root, read_internal_check_meta, write_internal_check_meta),
+        (get_delivery_root, read_delivery_meta, write_delivery_meta),
     ):
         try:
             root = get_root(project_root).resolve()
@@ -640,7 +646,11 @@ def _inbox_outbox_root_badge_kind(root_title: str) -> str:
     key = (root_title or "").strip().casefold()
     return {
         "inbox": "inbox",
-        "outbox": "outbox",
+        "internal check": "internal_check",
+        "internal_check": "internal_check",
+        "internal check": "review",
+        "outbox": "delivery",
+        "delivery": "delivery",
         "project guide": "guide",
     }.get(key, "")
 
@@ -2212,10 +2222,14 @@ class InboxTreePane(QWidget):
         if project_root is None:
             return None
         from monostudio.core.inbox_reader import get_inbox_root
-        from monostudio.core.outbox_reader import get_outbox_root
+        from monostudio.core.internal_check_reader import get_internal_check_root
+        from monostudio.core.delivery_reader import get_delivery_root
 
-        if str(self._view_settings_key).startswith("outbox"):
-            return get_outbox_root(project_root)
+        key = str(self._view_settings_key)
+        if key.startswith("internal_check"):
+            return get_internal_check_root(project_root)
+        if key.startswith("delivery"):
+            return get_delivery_root(project_root)
         return get_inbox_root(project_root)
 
     def _is_internal_storage_drag(self, paths: list[Path]) -> bool:

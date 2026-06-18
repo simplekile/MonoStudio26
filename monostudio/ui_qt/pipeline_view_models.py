@@ -201,7 +201,11 @@ class PipelineTableModel(QAbstractTableModel):
         if parent.isValid():
             return 0
         ctx = getattr(self._mv, "_browser_context", "asset")
-        return 8 if ctx == "project" else 13
+        if ctx == "project":
+            return 8
+        if ctx == "shot" and getattr(self._mv, "_browser_mode", "work") == "review":
+            return 9
+        return 13
 
     def notify_insert_rows(self, row: int, count: int = 1) -> None:
         if count <= 0:
@@ -316,6 +320,55 @@ class PipelineTableModel(QAbstractTableModel):
                     return str(vi.path)
                 if role == Qt.ItemDataRole.FontRole:
                     return monos_font("JetBrains Mono", 11)
+                return None
+            return None
+
+        mode = getattr(self._mv, "_browser_mode", "work")
+        if ctx == "shot" and mode == "review":
+            if col == 0:
+                return str(row + 1) if role == Qt.ItemDataRole.DisplayRole else None
+            if col == 1:
+                if role == Qt.ItemDataRole.DecorationRole:
+                    tix = self._tile_model.index(row, 0)
+                    return self._tile_model.data(tix, Qt.ItemDataRole.DecorationRole)
+                return None
+            if col == 2:
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return display_name_for_item(vi)
+                if role == Qt.ItemDataRole.FontRole:
+                    return monos_font("Inter", 13, QFont.Weight.Bold)
+                return None
+            if col in (3,):
+                return "" if role == Qt.ItemDataRole.DisplayRole else None
+            if col == 4:
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return self._mv._list_review_render_text(vi)
+                return None
+            if col == 5:
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return self._mv._list_review_review_text(vi)
+                return None
+            if col == 6:
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return self._mv._list_review_render_date_text(vi)
+                if role == Qt.ItemDataRole.FontRole:
+                    return monos_font("JetBrains Mono", 11)
+                return None
+            if col == 7:
+                if role == Qt.ItemDataRole.DisplayRole:
+                    return self._mv._list_review_review_date_text(vi)
+                if role == Qt.ItemDataRole.FontRole:
+                    return monos_font("JetBrains Mono", 11)
+                return None
+            if col == 8:
+                if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.ForegroundRole:
+                    if isinstance(vi.ref, (Asset, Shot)):
+                        st_lbl, st_col = self._mv._list_asset_shot_status_label_and_color(vi.ref)
+                    else:
+                        st_lbl, st_col = "Waiting", QColor("#71717a")
+                    if role == Qt.ItemDataRole.DisplayRole:
+                        return st_lbl
+                    return st_col
                 return None
             return None
 

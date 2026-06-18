@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.core.outbox_reader import get_outbox_root
+from monostudio.core.delivery_reader import ensure_delivery_source_folders, get_delivery_root
 from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
 from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, InboxTreePane
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -42,7 +42,7 @@ def _source_folder_path(project_root: Path | None, source_type: str) -> Path | N
     if project_root is None:
         return None
     source = _normalize_source_type(source_type)
-    root = get_outbox_root(project_root)
+    root = get_delivery_root(project_root)
     candidate = root / source
     if candidate.is_dir():
         return candidate
@@ -54,7 +54,7 @@ def _source_folder_path(project_root: Path | None, source_type: str) -> Path | N
 
 
 class OutboxPageWidget(QWidget):
-    """Outbox: sidebar Client/Freelancer + one explorer tree for that source."""
+    """Delivery (send out): client/freelancer recipient trees under outbox/delivery/."""
 
     tree_selection_changed = Signal(object)  # Path | None
     tree_distribute_paths_changed = Signal(object)  # list[Path]
@@ -88,7 +88,7 @@ class OutboxPageWidget(QWidget):
         hlay.setContentsMargins(0, 0, 0, 0)
         hlay.setSpacing(12)
 
-        self._title_row = InboxOutboxTitleRow("Outbox", root_icon="send", parent=top_row)
+        self._title_row = InboxOutboxTitleRow("Delivery", root_icon="send", parent=top_row)
         hlay.addWidget(self._title_row, 0, Qt.AlignmentFlag.AlignVCenter)
         hlay.addStretch(1)
 
@@ -168,7 +168,7 @@ class OutboxPageWidget(QWidget):
                 self._content_host,
                 show_history_action=True,
                 show_toolbar=True,
-                view_settings_key="outbox/view_mode",
+                view_settings_key="delivery/view_mode",
                 source_filter=self._type_filter,
             )
             self._tree_pane.tree_selection_changed.connect(self._on_tree_selection)
@@ -220,6 +220,8 @@ class OutboxPageWidget(QWidget):
 
     def set_project_root(self, path: Path | None) -> None:
         self._project_root = Path(path) if path else None
+        if self._project_root is not None:
+            ensure_delivery_source_folders(self._project_root)
         self._ensure_tree_pane()
         if self._tree_pane is not None:
             self._tree_pane.refresh_content()

@@ -28,7 +28,8 @@ VALID_NAV_CONTEXTS = frozenset(
         "Inbox",
         "Project Guide",
         "Schedule",
-        "Outbox",
+        "Internal check",
+        "Delivery",
         "Trash",
     }
 )
@@ -69,9 +70,19 @@ def load_nav_quick_slot(settings: QSettings, slot: int) -> dict[str, Any] | None
             return None
         if isinstance(data, dict):
             ctx = (data.get("context") or "").strip()
+            if ctx == "Outbox":
+                ctx = "Delivery"
+            if ctx == "Review":
+                ctx = "Internal check"
             if ctx in VALID_NAV_CONTEXTS:
+                data = dict(data)
+                data["context"] = ctx
                 return data
         return None
+    if raw == "Outbox":
+        raw = "Delivery"
+    if raw == "Review":
+        raw = "Internal check"
     if raw in VALID_NAV_CONTEXTS:
         return {"context": raw, "filters": None}
     return None

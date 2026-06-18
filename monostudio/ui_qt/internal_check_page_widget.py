@@ -1,24 +1,28 @@
 """
-Inbox page: header + unified file tree (client/freelancer → date folders → files).
+Internal check page: staging before sending deliverables out.
+Explorer tree under outbox/internal_check (date folders → files).
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
+    QLabel,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
-from monostudio.core.inbox_reader import get_inbox_root, resolve_inbox_location
-from monostudio.ui_qt.inbox_history_dialog import InboxHistoryDialog
+from monostudio.core.internal_check_reader import ensure_internal_check_root, get_internal_check_root
 from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
+from monostudio.ui_qt.sidebar import INTERNAL_CHECK_NAV_ICON
 from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, InboxTreePane
+from monostudio.ui_qt.internal_check_history_dialog import InternalCheckHistoryDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS
+from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 
 
 def _header_tool_button(parent: QWidget, text: str, icon_name: str, *, primary: bool = False) -> QPushButton:
@@ -33,34 +37,22 @@ def _header_tool_button(parent: QWidget, text: str, icon_name: str, *, primary: 
     return btn
 
 
-def _inbox_tree_root(project_root: Path | None) -> Path | None:
-    if project_root is None:
-        return None
-    root = get_inbox_root(project_root)
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        return root
-    except OSError:
-        return root if root.is_dir() else None
+class InternalCheckPageWidget(QWidget):
+    """Internal check staging before moving to Delivery (send out)."""
 
-
-class InboxPageWidget(QWidget):
-    """Inbox: incoming files by date folder (no client/freelancer layer)."""
-
-    tree_selection_changed = Signal(object)  # Path | None
-    tree_distribute_paths_changed = Signal(object)  # list[Path]
-    open_folder_requested = Signal(object)  # Path
-    drop_requested = Signal(object, object, bool)  # list[Path], drop target, copy_only
-    import_requested = Signal(object)  # Path | None
-    date_folder_entered = Signal(str, object)  # (type_filter, browse path)
-    video_preview_requested = Signal(object)  # Path
+    tree_selection_changed = Signal(object)
+    tree_distribute_paths_changed = Signal(object)
+    open_folder_requested = Signal(object)
+    drop_requested = Signal(object, object, bool)
+    import_requested = Signal(object)
+    date_folder_entered = Signal(str, object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setAcceptDrops(False)
         self._project_root: Path | None = None
         self._tree_state_cache: dict | None = None
-        self._history_dialog: InboxHistoryDialog | None = None
+        self._history_dialog: InternalCheckHistoryDialog | None = None
         self._tree_pane: InboxTreePane | None = None
 
         root_lay = QVBoxLayout(self)
@@ -79,7 +71,7 @@ class InboxPageWidget(QWidget):
         hlay.setContentsMargins(0, 0, 0, 0)
         hlay.setSpacing(12)
 
-        self._title_row = InboxOutboxTitleRow("Inbox", root_icon="inbox", parent=top_row)
+        self._title_row = InboxOutboxTitleRow("Internal check", root_icon=INTERNAL_CHECK_NAV_ICON, parent=top_row)
         hlay.addWidget(self._title_row, 0, Qt.AlignmentFlag.AlignVCenter)
         hlay.addStretch(1)
 
@@ -91,10 +83,17 @@ class InboxPageWidget(QWidget):
         self._open_folder_btn.clicked.connect(self._on_open_folder_clicked)
         hlay.addWidget(self._open_folder_btn, 0)
 
-        self._import_btn = _header_tool_button(top_row, "Import", "upload", primary=True)
+        self._import_btn = _header_tool_button(top_row, "Add", "upload", primary=True)
+        self._import_btn.setToolTip("Add deliverables for internal check")
         self._import_btn.clicked.connect(self._on_import_clicked)
         hlay.addWidget(self._import_btn, 0)
         header_v.addWidget(top_row, 0)
+
+        hint = QLabel("Check deliverables internally before sending them out via Delivery.", header)
+        hint.setObjectName("DialogHint")
+        hint.setFont(monos_font("Inter", 12, QFont.Weight.Medium))
+        hint.setWordWrap(True)
+        header_v.addWidget(hint, 0)
 
         self._path_bar_row = QWidget(header)
         self._path_bar_row.setObjectName("InboxPathBarRow")
@@ -113,6 +112,16 @@ class InboxPageWidget(QWidget):
         root_lay.addWidget(self._content_host, 1)
         self._refresh_chrome()
         self._bound_hotkeys = bind_explorer_view_mode_tab_shortcut(self, lambda: self._tree_pane)
+
+    def _internal_check_root(self) -> Path | None:
+        if self._project_root is None:
+            return None
+        root = get_internal_check_root(self._project_root)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            return root
+        except OSError:
+            return root if root.is_dir() else None
 
     def _mount_explorer_path_bar(self) -> None:
         if self._tree_pane is None:
@@ -138,12 +147,10 @@ class InboxPageWidget(QWidget):
 
     def _refresh_chrome(self) -> None:
         self._title_row.set_context(type_filter="", date_path=None, unified_tree=True)
-        self._history_btn.setVisible(True)
-        self._open_folder_btn.setVisible(True)
         self._mount_explorer_path_bar()
 
     def _ensure_tree_pane(self) -> None:
-        root = _inbox_tree_root(self._project_root)
+        root = self._internal_check_root()
         if root is None:
             return
         if self._tree_pane is None:
@@ -152,16 +159,15 @@ class InboxPageWidget(QWidget):
                 self._content_host,
                 show_history_action=True,
                 show_toolbar=True,
-                view_settings_key="inbox/view_mode",
+                view_settings_key="internal_check/view_mode",
                 source_filter="",
             )
             self._tree_pane.tree_selection_changed.connect(self._on_tree_selection)
             self._tree_pane.open_folder_requested.connect(self.open_folder_requested.emit)
-            self._tree_pane.import_requested.connect(self._on_tree_import_requested)
+            self._tree_pane.import_requested.connect(self._on_import_clicked)
             self._tree_pane.history_requested.connect(self._on_history_clicked)
             self._tree_pane.browse_path_changed.connect(self._on_browse_path_changed)
             self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
-            self._tree_pane.video_preview_requested.connect(self.video_preview_requested.emit)
             self._content_lay.addWidget(self._tree_pane, 1)
         else:
             self._tree_pane.set_date_folder_path(root)
@@ -173,30 +179,18 @@ class InboxPageWidget(QWidget):
     def _on_browse_path_changed(self, path: Path) -> None:
         self.date_folder_entered.emit("", path)
 
-    def _inbox_open_target(self) -> Path | None:
-        if self._tree_pane is not None:
-            return self._tree_pane.current_browse_path()
-        return _inbox_tree_root(self._project_root)
-
     def _on_open_folder_clicked(self) -> None:
-        target = self._inbox_open_target()
+        target = self._tree_pane.current_browse_path() if self._tree_pane else self._internal_check_root()
         if target is not None:
             self.open_folder_requested.emit(target)
 
     def _on_import_clicked(self) -> None:
         self.import_requested.emit(self.current_date_folder_path())
 
-    def _on_tree_import_requested(self) -> None:
-        self.import_requested.emit(self.current_date_folder_path())
-
     def _on_history_clicked(self) -> None:
         if self._history_dialog is None:
-            self._history_dialog = InboxHistoryDialog(
-                self._project_root,
-                "",
-                self.window(),
-            )
-        self._history_dialog.set_context(self._project_root, "")
+            self._history_dialog = InternalCheckHistoryDialog(self._project_root, self.window())
+        self._history_dialog.set_context(self._project_root)
         self._history_dialog.show()
         self._history_dialog.raise_()
         self._history_dialog.activateWindow()
@@ -205,12 +199,14 @@ class InboxPageWidget(QWidget):
         if self._tree_pane is not None:
             self._tree_state_cache = self._tree_pane.get_tree_state()
         self._project_root = Path(path) if path else None
+        if self._project_root is not None:
+            ensure_internal_check_root(self._project_root)
         self._ensure_tree_pane()
         if self._tree_pane is not None:
             self._tree_pane.refresh_content()
 
     def set_type_filter(self, _source_type: str) -> None:
-        """No-op — Inbox has no client/freelancer filter."""
+        """No-op — internal check has no client/freelancer filter."""
 
     def _on_tree_selection(self, path) -> None:
         self.tree_selection_changed.emit(path)
@@ -220,20 +216,9 @@ class InboxPageWidget(QWidget):
         self.tree_distribute_paths_changed.emit(paths)
 
     def restore_browse_path(self, path: Path) -> None:
-        """Restore last browsed folder within the current source tree."""
         self._ensure_tree_pane()
         if self._tree_pane is not None:
             self._tree_pane.navigate_to_path(path)
-
-    def open_item_path(self, project_root: Path, item_path: Path) -> bool:
-        date_folder = resolve_inbox_location(project_root, item_path)
-        if date_folder is None:
-            return False
-        self._ensure_tree_pane()
-        if self._tree_pane is None:
-            return False
-        self._tree_pane.set_date_folder_path(date_folder)
-        return self._tree_pane.reveal_path(Path(item_path))
 
     def refresh_tree(self) -> None:
         if self._tree_pane is not None:
@@ -241,13 +226,9 @@ class InboxPageWidget(QWidget):
 
     def refresh_history_dialog_if_open(self) -> None:
         if self._history_dialog is not None and self._history_dialog.isVisible():
-            self._history_dialog.set_context(self._project_root, "")
-
-    def is_showing_tree(self) -> bool:
-        return self._tree_pane is not None
+            self._history_dialog.set_context(self._project_root)
 
     def current_date_folder_path(self) -> Path | None:
         if self._tree_pane is None:
             return None
         return self._tree_pane.current_browse_path()
-

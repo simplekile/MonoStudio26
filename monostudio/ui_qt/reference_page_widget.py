@@ -88,7 +88,7 @@ class ReferencePageWidget(QWidget):
         hlay.setContentsMargins(0, 0, 0, 0)
         hlay.setSpacing(12)
 
-        self._title_row = InboxOutboxTitleRow("Project Guide", root_icon="folder-open", parent=top_row)
+        self._title_row = InboxOutboxTitleRow("Project Guide", root_icon="library", parent=top_row)
         self._title_row.tag_filter_clicked.connect(self.tag_filter_badge_clicked.emit)
         hlay.addWidget(self._title_row, 0, Qt.AlignmentFlag.AlignVCenter)
         hlay.addStretch(1)

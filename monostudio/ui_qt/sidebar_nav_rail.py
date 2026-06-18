@@ -34,6 +34,7 @@ from monostudio.ui_qt.nav_rail_expand_item import (
 from monostudio.ui_qt.popup_position import max_popup_height_for_anchor, position_popup_near_anchor
 from monostudio.ui_qt.recent_tasks_store import RecentTask
 from monostudio.ui_qt.sidebar import (
+    INTERNAL_CHECK_NAV_ICON,
     Sidebar,
     SidebarContext,
     SidebarWidget,
@@ -49,7 +50,7 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, project_accent_color
 class SidebarNavRail(QWidget):
     """
     Icon-only vertical nav rail (68px): project switcher, Home (Dashboard),
-    Assets/Shots, Inbox/Guide/Outbox/Trash, filter popup trigger, recent tasks.
+    Assets/Shots, Review/Delivery (+ Inbox in home group), filter popup, recent tasks.
     Nav items expand on hover (Linear / Discord style) — rail width stays fixed.
     """
 
@@ -76,6 +77,7 @@ class SidebarNavRail(QWidget):
         self._home_button: NavRailExpandItem | None = None
         self._home_group_buttons: dict[str, NavRailExpandItem] = {}
         self._scope_buttons: dict[str, NavRailExpandItem] = {}
+        self._delivery_buttons: dict[str, NavRailExpandItem] = {}
         self._footer_buttons: dict[str, NavRailExpandItem] = {}
         self._filter_btn: NavRailExpandItem | None = None
         self._filter_popup_active = False
@@ -169,7 +171,7 @@ class SidebarNavRail(QWidget):
         self._dashboard_unread_dot.hide()
 
         _guide_btn = self._make_expand_item(
-            "folder-open",
+            "library",
             "Project Guide",
             nav_group="home",
         )
@@ -177,6 +179,9 @@ class SidebarNavRail(QWidget):
             lambda: self._on_page_clicked(SidebarContext.PROJECT_GUIDE.value)
         )
         self._home_group_buttons[SidebarContext.PROJECT_GUIDE.value] = home_group.add_item(_guide_btn)
+        _inbox_btn = self._make_expand_item("inbox", "Inbox", nav_group="home")
+        _inbox_btn.clicked.connect(lambda: self._on_page_clicked(SidebarContext.INBOX.value))
+        self._home_group_buttons[SidebarContext.INBOX.value] = home_group.add_item(_inbox_btn)
         middle_layout.addWidget(home_group, 0, Qt.AlignmentFlag.AlignHCenter)
 
         middle_layout.addWidget(_sep_line(middle), 0)
@@ -192,15 +197,16 @@ class SidebarNavRail(QWidget):
         middle_layout.addWidget(scope_group, 0, Qt.AlignmentFlag.AlignHCenter)
         middle_layout.addWidget(_sep_line(middle), 0)
 
-        workflow_group = NavRailGroup(middle, nav_group="workflow")
-        for ctx_name, icon_name, label in [
-            (SidebarContext.INBOX.value, "inbox", "Inbox"),
-            (SidebarContext.OUTBOX.value, "send", "Outbox"),
+        delivery_group = NavRailGroup(middle, nav_group="delivery")
+        for ctx_name, icon_name, label, tip in [
+            (SidebarContext.INTERNAL_CHECK.value, INTERNAL_CHECK_NAV_ICON, "Internal check", "Check deliverables internally before sending out"),
+            (SidebarContext.DELIVERY.value, "send", "Delivery", "Send deliverables to client or freelancer"),
         ]:
-            btn = self._make_expand_item(icon_name, label, nav_group="workflow")
+            btn = self._make_expand_item(icon_name, label, nav_group="delivery")
+            btn.setToolTip(tip)
             btn.clicked.connect(lambda checked=False, c=ctx_name: self._on_page_clicked(c))
-            self._footer_buttons[ctx_name] = workflow_group.add_item(btn)
-        middle_layout.addWidget(workflow_group, 0, Qt.AlignmentFlag.AlignHCenter)
+            self._delivery_buttons[ctx_name] = delivery_group.add_item(btn)
+        middle_layout.addWidget(delivery_group, 0, Qt.AlignmentFlag.AlignHCenter)
         middle_layout.addWidget(_sep_line(middle), 0)
 
         utility_group = NavRailGroup(middle, nav_group="utility")
@@ -439,15 +445,24 @@ class SidebarNavRail(QWidget):
                     settings=settings,
                 )
             )
-
-        _footer_labels = {
-            SidebarContext.INBOX.value: "Inbox",
-            SidebarContext.OUTBOX.value: "Outbox",
-        }
-        for ctx_name, btn in self._footer_buttons.items():
+        if SidebarContext.INBOX.value in self._home_group_buttons:
+            btn = self._home_group_buttons[SidebarContext.INBOX.value]
             btn.setToolTip(
                 format_nav_item_tooltip(
-                    _footer_labels.get(ctx_name, ctx_name),
+                    "Inbox",
+                    by_ctx.get(SidebarContext.INBOX.value),
+                    settings=settings,
+                )
+            )
+
+        _delivery_labels = {
+            SidebarContext.INTERNAL_CHECK.value: "Internal check",
+            SidebarContext.DELIVERY.value: "Delivery",
+        }
+        for ctx_name, btn in self._delivery_buttons.items():
+            btn.setToolTip(
+                format_nav_item_tooltip(
+                    _delivery_labels.get(ctx_name, ctx_name),
                     by_ctx.get(ctx_name),
                     settings=settings,
                 )
@@ -485,7 +500,8 @@ class SidebarNavRail(QWidget):
             SidebarContext.INBOX.value,
             SidebarContext.PROJECT_GUIDE.value,
             SidebarContext.SCHEDULE.value,
-            SidebarContext.OUTBOX.value,
+            SidebarContext.INTERNAL_CHECK.value,
+            SidebarContext.DELIVERY.value,
             SidebarContext.TRASH.value,
         ):
             self._footer_context = context_name
@@ -506,13 +522,13 @@ class SidebarNavRail(QWidget):
             icon_name = "clapperboard" if name == SidebarContext.SHOTS.value else "box"
             btn.set_icon_name(icon_name)
             btn.set_active(active)
-        _footer_icons = {
-            SidebarContext.INBOX.value: "inbox",
-            SidebarContext.OUTBOX.value: "send",
+        _delivery_icons = {
+            SidebarContext.INTERNAL_CHECK.value: INTERNAL_CHECK_NAV_ICON,
+            SidebarContext.DELIVERY.value: "send",
         }
-        for name, btn in self._footer_buttons.items():
+        for name, btn in self._delivery_buttons.items():
             active = name == ctx
-            btn.set_icon_name(_footer_icons.get(name, "inbox"))
+            btn.set_icon_name(_delivery_icons.get(name, "send"))
             btn.set_active(active)
         if self._trash_btn is not None:
             self._trash_btn.set_active(ctx == SidebarContext.TRASH.value)

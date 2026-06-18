@@ -7,6 +7,8 @@ from datetime import date
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple
 
+BrowserMode = Literal["work", "publish", "review"]
+
 from PySide6.QtCore import (
     QElapsedTimer,
     QEvent,
@@ -136,6 +138,13 @@ from monostudio.core.entity_folders import (
     entity_special_folder_path,
 )
 from monostudio.core.models import Asset, Department, Shot
+from monostudio.core.shot_review_card import (
+    RenderCardSummary,
+    ReviewCardSummary,
+    format_review_card_date,
+    resolve_render_summary,
+    resolve_review_summary,
+)
 from monostudio.core.project_schedule import ProjectSchedule, entity_rel_path, read_project_schedule
 from monostudio.core.schedule_planner import (
     BarStore,
@@ -448,6 +457,66 @@ def _item_has_work_for_department(ref: Asset | Shot, active_department: str | No
         if isinstance(wp, Path) and wp.is_file():
             return True
     return False
+
+
+def _department_work_path_for_item(ref: Asset | Shot, active_department: str | None) -> Path | None:
+    dep_cf = (active_department or "").strip().casefold()
+    if not dep_cf:
+        return None
+    for d in getattr(ref, "departments", ()) or ():
+        if (d.name or "").strip().casefold() != dep_cf:
+            continue
+        wp = getattr(d, "work_path", None)
+        if isinstance(wp, Path) and wp.is_dir():
+            return wp
+    return None
+
+
+def _work_file_path_for_item(
+    ref: Asset | Shot,
+    active_department: str | None,
+    active_dcc_id: str | None = None,
+) -> Path | None:
+    dep_cf = (active_department or "").strip().casefold()
+    if not dep_cf:
+        return None
+    dcc_pref = (active_dcc_id or "").strip() or None
+    states = getattr(ref, "dcc_work_states", ()) or ()
+    fallback: Path | None = None
+    for (dept_id, dcc_id), state in states:
+        if (dept_id or "").strip().casefold() != dep_cf:
+            continue
+        wp = getattr(state, "work_file_path", None)
+        if not isinstance(wp, Path) or not wp.is_file():
+            continue
+        if dcc_pref and (dcc_id or "").strip() == dcc_pref:
+            return wp
+        if fallback is None:
+            fallback = wp
+    return fallback
+
+
+def _card_bg_colors_for_browser_mode(
+    mode: BrowserMode,
+    context: str,
+    *,
+    hover: bool,
+) -> tuple[QColor, QColor]:
+    """Return (normal_bg, hover_bg) for grid/list card chrome."""
+    if mode == "publish":
+        return (
+            QColor(MONOS_COLORS["card_bg_publish"]),
+            QColor(MONOS_COLORS["card_bg_publish_hover"]),
+        )
+    if mode == "review" and context == "shot":
+        return (
+            QColor(MONOS_COLORS["card_bg_review"]),
+            QColor(MONOS_COLORS["card_bg_review_hover"]),
+        )
+    return (
+        QColor(MONOS_COLORS["card_bg"]),
+        QColor(MONOS_COLORS["card_hover"]),
+    )
 
 
 def _item_has_work_folder_for_department(ref: Asset | Shot, active_department: str | None) -> bool:
@@ -1012,6 +1081,48 @@ def _resolve_work_files_for_drag(ref: Asset | Shot, active_department: str | Non
             seen.add(wp)
             out.append(wp)
     return out
+
+
+def _resolve_review_drag_path(
+    ref: Asset | Shot,
+    active_department: str | None,
+    active_dcc_id: str | None = None,
+) -> Path | None:
+    """
+    Drag target for Review mode — mirrors Inspector preview middle-drag:
+    image sequence folder first, else latest preview/playblast video under work/.
+    """
+    from monostudio.core.review_media import _collect_videos_in_root
+    from monostudio.core.sequence_preview import (
+        _sequence_roots_by_priority,
+        resolve_best_available_sequence_folder,
+        resolve_sequence_folder,
+        sequence_folder_has_frames,
+        work_file_folder_name_candidates,
+    )
+    from monostudio.core.video_media import resolve_work_preview_video
+
+    work_path = _department_work_path_for_item(ref, active_department)
+    work_file = _work_file_path_for_item(ref, active_department, active_dcc_id)
+    if work_path is None or not work_path.is_dir():
+        return None
+
+    sq = resolve_sequence_folder(work_path, work_file)
+    if sq is None or not sq.is_dir():
+        sq = resolve_best_available_sequence_folder(work_path)
+    if sq is not None and sq.is_dir() and sequence_folder_has_frames(sq):
+        return sq
+
+    blast = resolve_work_preview_video(work_path, work_file)
+    if blast is not None and blast.is_file():
+        return blast
+
+    names = work_file_folder_name_candidates(work_file)
+    for root in _sequence_roots_by_priority(work_path):
+        vids = _collect_videos_in_root(root, names)
+        if vids:
+            return vids[0]
+    return None
 
 
 def _resolve_publish_department(ref: Asset | Shot, active_department: str | None):
@@ -2623,6 +2734,17 @@ class _ClearOnEmptyClickTableView(_RubberBandSelectMixin, QTableView):
         m = self.model()
         if m is None or m.rowCount() <= 0:
             return
+        mv = getattr(m, "_mv", None)
+        browser_mode = getattr(mv, "_browser_mode", "work")
+        browser_ctx = getattr(mv, "_browser_context", "asset")
+        use_tint = browser_mode in ("publish", "review") and browser_ctx in ("asset", "shot")
+        if browser_mode == "review" and browser_ctx != "shot":
+            use_tint = False
+        tint_bg, tint_hover = (
+            _card_bg_colors_for_browser_mode(browser_mode, browser_ctx, hover=False)
+            if use_tint
+            else (None, None)
+        )
         top = self.rowAt(exposed.top())
         if top < 0:
             top = 0
@@ -2639,8 +2761,16 @@ class _ClearOnEmptyClickTableView(_RubberBandSelectMixin, QTableView):
                 if h <= 0 or y + h < exposed.top() or y > exposed.bottom():
                     continue
                 opt = self._list_row_bg_option(row)
-                paint_inbox_list_row_chrome(painter, opt, viewport_width=vp_w)
-                if opt.state & QStyle.StateFlag.State_Selected:
+                selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+                hover = bool(opt.state & QStyle.StateFlag.State_MouseOver)
+                if use_tint and tint_bg is not None and tint_hover is not None and not selected:
+                    full_rect = QRect(0, y, max(vp_w, opt.rect.width()), h)
+                    painter.fillRect(full_rect, tint_hover if hover else tint_bg)
+                    painter.setPen(QColor("#2a2a2c"))
+                    painter.drawLine(full_rect.left(), full_rect.bottom(), full_rect.right(), full_rect.bottom())
+                else:
+                    paint_inbox_list_row_chrome(painter, opt, viewport_width=vp_w)
+                if selected:
                     accent = QColor(MONOS_COLORS["blue_600"])
                     painter.fillRect(0, y, 2, h, accent)
         finally:
@@ -2820,6 +2950,10 @@ class _ListRowDelegate(QStyledItemDelegate):
         list_col_dcc = main._list_col_dcc() if hasattr(main, "_list_col_dcc") else -1
         active_dep = getattr(main, "_active_department", None) or ""
         show_publish = getattr(main, "_show_publish", False)
+        is_review_list = (
+            getattr(main, "_browser_context", "") == "shot"
+            and getattr(main, "_browser_mode", "work") == "review"
+        )
 
         # Active project row: 2px left border amber (column 0)
         active = (
@@ -2834,7 +2968,7 @@ class _ListRowDelegate(QStyledItemDelegate):
             painter.fillRect(option.rect.left(), option.rect.top(), 2, option.rect.height(), c)
 
         # DCC column: paint badges (asset/shot, not publish mode)
-        if col == list_col_dcc and list_col_dcc >= 0 and isinstance(item, ViewItem) and not show_publish:
+        if col == list_col_dcc and list_col_dcc >= 0 and isinstance(item, ViewItem) and not show_publish and not is_review_list:
             dept_reg = getattr(main, "_dept_registry", None)
             badge_info = _list_dcc_badge_info(
                 item, active_dep.strip() or None, dept_registry=dept_reg
@@ -3090,7 +3224,8 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._active_department_icon_name: str | None = None  # from pipeline (subdepartment-safe)
         self._active_project_root: str | None = None  # current open project (Projects page)
         self._dept_registry: DepartmentRegistry | None = None
-        self._show_publish: bool = False
+        self._browser_mode: BrowserMode = "work"
+        self._browser_context: str = "asset"
         self._active_dcc_cache: dict[str, str] = {}  # "item_path|department" -> dcc_id
         self._inspector_hidden_departments: frozenset[str] = frozenset()
         self._show_dept_chips: bool = False
@@ -3299,11 +3434,27 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._dept_registry = registry
         self._view.viewport().update()
 
-    def set_show_publish(self, show_publish: bool) -> None:
-        if self._show_publish == show_publish:
+    def set_browser_mode(self, mode: BrowserMode, context: str) -> None:
+        if self._browser_mode == mode and self._browser_context == context:
             return
-        self._show_publish = show_publish
+        self._browser_mode = mode
+        self._browser_context = context
+        bg, hover = _card_bg_colors_for_browser_mode(mode, context, hover=False)
+        self._c_card_bg = bg
+        self._c_card_hover = hover
         self._view.viewport().update()
+
+    def set_show_publish(self, show_publish: bool) -> None:
+        mode: BrowserMode = "publish" if show_publish else "work"
+        self.set_browser_mode(mode, self._browser_context)
+
+    @property
+    def _show_publish(self) -> bool:
+        return self._browser_mode == "publish"
+
+    @property
+    def _is_review_mode(self) -> bool:
+        return self._browser_mode == "review" and self._browser_context == "shot"
 
     def set_inspector_hidden_departments(self, hidden: set[str] | frozenset | None) -> None:
         h = frozenset(hidden or ())
@@ -3447,11 +3598,35 @@ class _GridCardDelegate(QStyledItemDelegate):
             if (
                 not fast
                 and not self._show_publish
+                and not self._is_review_mode
                 and isinstance(item.ref, (Asset, Shot))
                 and not _item_has_work_for_department(item.ref, self._active_department)
             ):
                 _dim_card_work = True
             if _dim_card_work:
+                if selected:
+                    p.setOpacity(1.0)
+                elif hover:
+                    p.setOpacity(0.8)
+                else:
+                    p.setOpacity(0.4)
+            # Review mode (shots): dim when nothing to review yet
+            _dim_card_review = False
+            if (
+                not fast
+                and self._is_review_mode
+                and isinstance(item.ref, (Asset, Shot))
+                and getattr(item, "path", None)
+                and self._main_view is not None
+                and hasattr(self._main_view, "review_card_summary")
+            ):
+                try:
+                    _rs, _rv = self._main_view.review_card_summary(item.path, item.ref)  # type: ignore[attr-defined]
+                    if not _rv.has_review:
+                        _dim_card_review = True
+                except Exception:
+                    _dim_card_review = True
+            if _dim_card_review:
                 if selected:
                     p.setOpacity(1.0)
                 elif hover:
@@ -3741,7 +3916,7 @@ class _GridCardDelegate(QStyledItemDelegate):
                         p.drawRoundedRect(pill_rect, pill_r, pill_r)
                         p.setPen(QColor(255, 255, 255))
                         p.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, pub_label)
-            else:
+            elif not self._is_review_mode:
                 dcc_list = dcc_badges_for_item()
                 if dcc_list:
                     size = 16
@@ -3853,148 +4028,190 @@ class _GridCardDelegate(QStyledItemDelegate):
                 cy = y_meta
                 p.setFont(self._font_meta_mono)
                 p.setPen(self._c_text_meta)
-                active_dep = (self._active_department or "").strip()
-                active_dcc = self.get_active_dcc(getattr(item, "path", None), self._active_department) if getattr(item, "path", None) else None
-                ver_str = (
-                    _card_version_for_display(item.ref, self._active_department, self._show_publish, active_dcc_id=active_dcc)
-                    if isinstance(item.ref, (Asset, Shot))
-                    else None
-                )
-                if self._tile_meta_show_id or self._tile_meta_show_version:
-                    line_top = cy
-                    ico_px = 12
-                    ico_gap = 4
-                    fm = p.fontMetrics()
-                    if (
-                        self._tile_meta_show_id
-                        and self._tile_meta_show_version
-                        and active_dep
-                        and ver_str is not None
+                if (
+                    self._is_review_mode
+                    and isinstance(item.ref, (Asset, Shot))
+                    and getattr(item, "path", None)
+                    and self._main_view is not None
+                    and hasattr(self._main_view, "review_card_summary")
+                ):
+                    try:
+                        render_sum, review_sum = self._main_view.review_card_summary(  # type: ignore[attr-defined]
+                            item.path, item.ref
+                        )
+                    except Exception:
+                        render_sum = RenderCardSummary(False, None)
+                        review_sum = ReviewCardSummary(False, None, False, 0, False, False)
+                    note_line = (
+                        f"Yes ({review_sum.note_count} open)"
+                        if review_sum.has_notes and review_sum.note_count > 0
+                        else ("Yes" if review_sum.has_notes else "No")
+                    )
+                    render_line = (
+                        f"Yes · {format_review_card_date(render_sum.render_date)}"
+                        if render_sum.has_render
+                        else "No"
+                    )
+                    review_line = (
+                        f"Yes · {format_review_card_date(review_sum.review_date)}"
+                        if review_sum.has_review
+                        else "No"
+                    )
+                    for label, text in (
+                        ("Notes", note_line),
+                        ("Render", render_line),
+                        ("Review", review_line),
                     ):
-                        prefix = f"ID {item.name}   "
-                        ver_text = ver_str if ver_str != "—" else "v —"
-                        min_tail = ico_px + ico_gap + min(fm.horizontalAdvance(ver_text), 28)
-                        prefix_max = max(0, w - min_tail)
-                        prefix_draw = fm.elidedText(prefix, Qt.TextElideMode.ElideRight, prefix_max)
-                        pw = fm.horizontalAdvance(prefix_draw)
-                        p.drawText(
-                            QRect(x, line_top, max(1, prefix_max), _GRID_META_LINE_H),
-                            Qt.AlignLeft | Qt.AlignVCenter,
-                            prefix_draw,
-                        )
-                        x_h = x + pw + 4
-                        pix_hash = self._icon_hash_meta.pixmap(ico_px, ico_px)
-                        if not pix_hash.isNull():
-                            iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
-                            p.drawPixmap(x_h, iy, pix_hash)
-                        x_t = x_h + ico_px + ico_gap
-                        tw = max(0, x + w - x_t)
-                        elided = fm.elidedText(ver_text, Qt.TextElideMode.ElideRight, tw)
-                        p.drawText(
-                            QRect(x_t, line_top, tw, _GRID_META_LINE_H),
-                            Qt.AlignLeft | Qt.AlignVCenter,
-                            elided,
-                        )
-                    elif self._tile_meta_show_version and not self._tile_meta_show_id:
-                        ver_text = (ver_str or "—") if isinstance(item.ref, (Asset, Shot)) else "—"
-                        pix_hash = self._icon_hash_meta.pixmap(ico_px, ico_px)
-                        if not pix_hash.isNull():
-                            iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
-                            p.drawPixmap(x, iy, pix_hash)
-                        tx = x + ico_px + ico_gap
-                        tw_line = max(0, w - ico_px - ico_gap)
-                        elided = fm.elidedText(ver_text, Qt.TextElideMode.ElideRight, tw_line)
-                        p.drawText(
-                            QRect(tx, line_top, tw_line, _GRID_META_LINE_H),
-                            Qt.AlignLeft | Qt.AlignVCenter,
-                            elided,
-                        )
-                    else:
+                        line_top = cy
                         p.drawText(
                             QRect(x, line_top, w, _GRID_META_LINE_H),
                             Qt.AlignLeft | Qt.AlignVCenter,
-                            f"ID {item.name}",
+                            f"{label}  {text}",
                         )
-                    cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
-                if self._tile_meta_show_last_updated:
-                    active_dcc = (
-                        self.get_active_dcc(getattr(item, "path", None), self._active_department)
-                        if isinstance(item, ViewItem)
-                        and getattr(item, "path", None)
-                        and self._active_department
+                        cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+                else:
+                    active_dep = (self._active_department or "").strip()
+                    active_dcc = self.get_active_dcc(getattr(item, "path", None), self._active_department) if getattr(item, "path", None) else None
+                    ver_str = (
+                        _card_version_for_display(item.ref, self._active_department, self._show_publish, active_dcc_id=active_dcc)
+                        if isinstance(item.ref, (Asset, Shot))
                         else None
                     )
-                    lu = (
-                        _view_item_last_updated_display(
-                            item,
-                            show_publish=self._show_publish,
-                            active_department=self._active_department,
-                            active_dcc_id=active_dcc,
+                    if self._tile_meta_show_id or self._tile_meta_show_version:
+                        line_top = cy
+                        ico_px = 12
+                        ico_gap = 4
+                        fm = p.fontMetrics()
+                        if (
+                            self._tile_meta_show_id
+                            and self._tile_meta_show_version
+                            and active_dep
+                            and ver_str is not None
+                        ):
+                            prefix = f"ID {item.name}   "
+                            ver_text = ver_str if ver_str != "—" else "v —"
+                            min_tail = ico_px + ico_gap + min(fm.horizontalAdvance(ver_text), 28)
+                            prefix_max = max(0, w - min_tail)
+                            prefix_draw = fm.elidedText(prefix, Qt.TextElideMode.ElideRight, prefix_max)
+                            pw = fm.horizontalAdvance(prefix_draw)
+                            p.drawText(
+                                QRect(x, line_top, max(1, prefix_max), _GRID_META_LINE_H),
+                                Qt.AlignLeft | Qt.AlignVCenter,
+                                prefix_draw,
+                            )
+                            x_h = x + pw + 4
+                            pix_hash = self._icon_hash_meta.pixmap(ico_px, ico_px)
+                            if not pix_hash.isNull():
+                                iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
+                                p.drawPixmap(x_h, iy, pix_hash)
+                            x_t = x_h + ico_px + ico_gap
+                            tw = max(0, x + w - x_t)
+                            elided = fm.elidedText(ver_text, Qt.TextElideMode.ElideRight, tw)
+                            p.drawText(
+                                QRect(x_t, line_top, tw, _GRID_META_LINE_H),
+                                Qt.AlignLeft | Qt.AlignVCenter,
+                                elided,
+                            )
+                        elif self._tile_meta_show_version and not self._tile_meta_show_id:
+                            ver_text = (ver_str or "—") if isinstance(item.ref, (Asset, Shot)) else "—"
+                            pix_hash = self._icon_hash_meta.pixmap(ico_px, ico_px)
+                            if not pix_hash.isNull():
+                                iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
+                                p.drawPixmap(x, iy, pix_hash)
+                            tx = x + ico_px + ico_gap
+                            tw_line = max(0, w - ico_px - ico_gap)
+                            elided = fm.elidedText(ver_text, Qt.TextElideMode.ElideRight, tw_line)
+                            p.drawText(
+                                QRect(tx, line_top, tw_line, _GRID_META_LINE_H),
+                                Qt.AlignLeft | Qt.AlignVCenter,
+                                elided,
+                            )
+                        else:
+                            p.drawText(
+                                QRect(x, line_top, w, _GRID_META_LINE_H),
+                                Qt.AlignLeft | Qt.AlignVCenter,
+                                f"ID {item.name}",
+                            )
+                        cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+                    if self._tile_meta_show_last_updated:
+                        active_dcc = (
+                            self.get_active_dcc(getattr(item, "path", None), self._active_department)
+                            if isinstance(item, ViewItem)
+                            and getattr(item, "path", None)
+                            and self._active_department
+                            else None
                         )
-                        if isinstance(item, ViewItem)
-                        else "—"
-                    )
-                    line_top = cy
-                    ico_px = 12
-                    ico_gap = 4
-                    pix_cal = self._icon_calendar_meta.pixmap(ico_px, ico_px)
-                    if not pix_cal.isNull():
-                        iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
-                        p.drawPixmap(x, iy, pix_cal)
-                    tx = x + ico_px + ico_gap
-                    tw_line = max(0, w - ico_px - ico_gap)
-                    elided = p.fontMetrics().elidedText(lu, Qt.TextElideMode.ElideRight, tw_line)
-                    p.drawText(
-                        QRect(tx, line_top, tw_line, _GRID_META_LINE_H),
-                        Qt.AlignLeft | Qt.AlignVCenter,
-                        elided,
-                    )
-                    cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
-                if self._tile_meta_show_latest_note and isinstance(item.ref, (Asset, Shot)) and getattr(item, "path", None):
-                    from monostudio.core.item_comments import latest_note_preview_line
-
-                    snip, last_done = latest_note_preview_line(
-                        Path(item.path),
-                        self._active_department,
-                    )
-                    note_line = snip if snip else "—"
-                    strike = bool(snip and last_done)
-                    ico_px = 12
-                    ico_gap = 4
-                    line_top = cy
-                    pix_note = self._icon_note_meta.pixmap(ico_px, ico_px)
-                    if not pix_note.isNull():
-                        iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
-                        p.drawPixmap(x, iy, pix_note)
-                    tx = x + ico_px + ico_gap
-                    tw_line = max(0, w - ico_px - ico_gap)
-                    p.save()
-                    try:
-                        f_note = QFont(self._font_meta_mono)
-                        if strike:
-                            f_note.setStrikeOut(True)
-                        p.setFont(f_note)
-                        p.setPen(
-                            QColor(MONOS_COLORS.get("text_muted", "#71717a"))
-                            if strike
-                            else self._c_text_meta
+                        lu = (
+                            _view_item_last_updated_display(
+                                item,
+                                show_publish=self._show_publish,
+                                active_department=self._active_department,
+                                active_dcc_id=active_dcc,
+                            )
+                            if isinstance(item, ViewItem)
+                            else "—"
                         )
-                        elided = QFontMetrics(f_note).elidedText(
-                            note_line, Qt.TextElideMode.ElideRight, tw_line
-                        )
+                        line_top = cy
+                        ico_px = 12
+                        ico_gap = 4
+                        pix_cal = self._icon_calendar_meta.pixmap(ico_px, ico_px)
+                        if not pix_cal.isNull():
+                            iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
+                            p.drawPixmap(x, iy, pix_cal)
+                        tx = x + ico_px + ico_gap
+                        tw_line = max(0, w - ico_px - ico_gap)
+                        elided = p.fontMetrics().elidedText(lu, Qt.TextElideMode.ElideRight, tw_line)
                         p.drawText(
                             QRect(tx, line_top, tw_line, _GRID_META_LINE_H),
                             Qt.AlignLeft | Qt.AlignVCenter,
                             elided,
                         )
-                    finally:
-                        p.restore()
-                    cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
-                if self._tile_meta_show_current_department and active_dep:
-                    dep_disp = (self._active_department_label or active_dep).strip()
-                    dept_line = f"DEPT  {dep_disp.replace('_', ' ').upper()}"
-                    p.drawText(QRect(x, cy, w, _GRID_META_LINE_H), Qt.AlignLeft | Qt.AlignVCenter, dept_line)
-                    cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+                        cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+                    if self._tile_meta_show_latest_note and isinstance(item.ref, (Asset, Shot)) and getattr(item, "path", None):
+                        from monostudio.core.item_comments import latest_note_preview_line
+
+                        snip, last_done = latest_note_preview_line(
+                            Path(item.path),
+                            self._active_department,
+                        )
+                        note_line = snip if snip else "—"
+                        strike = bool(snip and last_done)
+                        ico_px = 12
+                        ico_gap = 4
+                        line_top = cy
+                        pix_note = self._icon_note_meta.pixmap(ico_px, ico_px)
+                        if not pix_note.isNull():
+                            iy = line_top + (_GRID_META_LINE_H - ico_px) // 2
+                            p.drawPixmap(x, iy, pix_note)
+                        tx = x + ico_px + ico_gap
+                        tw_line = max(0, w - ico_px - ico_gap)
+                        p.save()
+                        try:
+                            f_note = QFont(self._font_meta_mono)
+                            if strike:
+                                f_note.setStrikeOut(True)
+                            p.setFont(f_note)
+                            p.setPen(
+                                QColor(MONOS_COLORS.get("text_muted", "#71717a"))
+                                if strike
+                                else self._c_text_meta
+                            )
+                            elided = QFontMetrics(f_note).elidedText(
+                                note_line, Qt.TextElideMode.ElideRight, tw_line
+                            )
+                            p.drawText(
+                                QRect(tx, line_top, tw_line, _GRID_META_LINE_H),
+                                Qt.AlignLeft | Qt.AlignVCenter,
+                                elided,
+                            )
+                        finally:
+                            p.restore()
+                        cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
+                    if self._tile_meta_show_current_department and active_dep:
+                        dep_disp = (self._active_department_label or active_dep).strip()
+                        dept_line = f"DEPT  {dep_disp.replace('_', ' ').upper()}"
+                        p.drawText(QRect(x, cy, w, _GRID_META_LINE_H), Qt.AlignLeft | Qt.AlignVCenter, dept_line)
+                        cy += _GRID_META_LINE_H + _GRID_GAP_BETWEEN_META_LINES
 
             # Dept status pill — only when sidebar department is focused (no multi-dept chips without focus).
             ad_focus = (self._active_department or "").strip()
@@ -4078,20 +4295,34 @@ class _GridCardDelegate(QStyledItemDelegate):
 
 
 class _PublishDragPipelineModel(PipelineTileModel):
-    """PipelineTileModel plus Published/Work middle-drag MIME (URI list)."""
+    """PipelineTileModel plus Work/Publish/Review middle-drag MIME (URI list)."""
 
     def __init__(self, parent=None):
         super().__init__(parent, thumb_state_role=PIPELINE_VIEW_THUMB_STATE_ROLE)
-        self._show_publish = False
+        self._browser_mode: BrowserMode = "work"
         self._active_department: str | None = None
         self._ignore_extensions: frozenset[str] = frozenset()
 
-    def set_publish_state(self, show_publish: bool, active_department: str | None) -> None:
-        self._show_publish = show_publish
+    def set_browser_mode(self, mode: BrowserMode, active_department: str | None) -> None:
+        self._browser_mode = mode
         self._active_department = active_department
+
+    def set_publish_state(self, show_publish: bool, active_department: str | None) -> None:
+        mode: BrowserMode = "publish" if show_publish else "work"
+        self.set_browser_mode(mode, active_department)
 
     def set_publish_ignore_extensions(self, ignore_extensions: frozenset[str]) -> None:
         self._ignore_extensions = ignore_extensions or frozenset()
+
+    def _review_drag_path(self, item: ViewItem) -> Path | None:
+        if not isinstance(item.ref, (Asset, Shot)):
+            return None
+        dcc = (
+            _item_active_dcc(getattr(item, "path", None), self._active_department)
+            if getattr(item, "path", None)
+            else None
+        )
+        return _resolve_review_drag_path(item.ref, self._active_department, dcc)
 
     def flags(self, index):  # type: ignore[override]
         default = super().flags(index)
@@ -4100,8 +4331,11 @@ class _PublishDragPipelineModel(PipelineTileModel):
         item = index.data(Qt.UserRole)
         if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
             return default
-        if self._show_publish:
+        if self._browser_mode == "publish":
             if _item_has_publish_for_department(item.ref, self._active_department):
+                return default | Qt.ItemIsDragEnabled
+        elif self._browser_mode == "review":
+            if self._review_drag_path(item) is not None:
                 return default | Qt.ItemIsDragEnabled
         else:
             if _item_has_work_for_department(item.ref, self._active_department):
@@ -4123,14 +4357,23 @@ class _PublishDragPipelineModel(PipelineTileModel):
             item = idx.data(Qt.UserRole)
             if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
                 continue
-            if self._show_publish:
+            if self._browser_mode == "publish":
                 files = _resolve_all_publish_files(
                     item.ref, self._active_department, ignore_extensions=self._ignore_extensions
                 )
+                for f in files:
+                    urls.append(QUrl.fromLocalFile(str(f)))
+            elif self._browser_mode == "review":
+                target = self._review_drag_path(item)
+                if target is not None:
+                    try:
+                        urls.append(QUrl.fromLocalFile(str(target.resolve())))
+                    except OSError:
+                        urls.append(QUrl.fromLocalFile(str(target)))
             else:
                 files = _resolve_work_files_for_drag(item.ref, self._active_department)
-            for f in files:
-                urls.append(QUrl.fromLocalFile(str(f)))
+                for f in files:
+                    urls.append(QUrl.fromLocalFile(str(f)))
         if urls:
             md.setUrls(urls)
         return md
@@ -4235,6 +4478,7 @@ class MainView(QWidget):
     view_mode_changed = Signal(str)  # "tile" | "list"
     search_query_changed = Signal(str)  # debounced search text; empty string = clear
     show_publish_changed = Signal(bool)  # Work/Published toggle (Assets/Shots only)
+    browser_mode_changed = Signal(str)  # "work" | "publish" | "review"
     thumbnail_source_changed = Signal()  # user / render sequence / user-then-render (grid + Inspector)
     open_publish_folder_requested = Signal(object)  # emits Path (latest publish version folder)
     dcc_open_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
@@ -4251,6 +4495,7 @@ class MainView(QWidget):
 
     _SETTINGS_KEY_VIEW_MODE_PREFIX = "main_view/mode"
     _SETTINGS_KEY_CARD_SIZE_PREFIX = "main_view/card_size"
+    _SETTINGS_KEY_BROWSER_MODE_PREFIX = "main_view/browser_mode"
     _SETTINGS_KEY_SHOW_PUBLISH = "main_view/show_publish"
     _SETTINGS_KEY_SHOW_DEPT_STATUS_CHIPS = "main_view/show_dept_status_chips"
     _SETTINGS_KEY_TILE_META_SHOW_ID = "main_view/tile_meta_show_id"
@@ -4305,7 +4550,7 @@ class MainView(QWidget):
         self._active_department: str | None = None
         self._active_department_label: str | None = None  # pipeline label (subdepartment-safe)
         self._active_department_icon_name: str | None = None  # pipeline icon (subdepartment-safe)
-        self._show_publish: bool = bool(self._settings.value(self._SETTINGS_KEY_SHOW_PUBLISH, False, type=bool))
+        self._browser_mode: BrowserMode = self._load_browser_mode_for_context(self._browser_context)
         self._inspector_hidden_departments: set[str] = set()
         self._show_dept_status_chips: bool = bool(
             self._settings.value(self._SETTINGS_KEY_SHOW_DEPT_STATUS_CHIPS, False, type=bool)
@@ -4349,6 +4594,7 @@ class MainView(QWidget):
         self._cached_prod_reg_key: tuple[str | None, str] | None = None
         self._cached_prod_reg: object | None = None
         self._notes_badge_cache: dict[str, tuple[int, str]] = {}
+        self._review_card_cache: dict[str, tuple[RenderCardSummary, ReviewCardSummary]] = {}
         self._entity_reference_cache: dict[str, bool] = {}
         self._entity_concept_cache: dict[str, bool] = {}
         # Precomputed list Status column width (pill); avoids resizeColumnToContents × N rows.
@@ -4490,15 +4736,14 @@ class MainView(QWidget):
         # Work/Published toggle — pill with text label, right side of header
         self._work_publish_switch = QPushButton("Work", header)
         self._work_publish_switch.setObjectName("WorkPublishPill")
-        self._work_publish_switch.setCheckable(True)
-        self._work_publish_switch.setChecked(self._show_publish)
+        self._work_publish_switch.setCheckable(False)
         self._work_publish_switch.setCursor(Qt.PointingHandCursor)
         self._work_publish_switch.setFlat(True)
-        self._work_publish_switch.toggled.connect(self._on_work_publish_toggled)
+        self._work_publish_switch.clicked.connect(self._on_work_publish_pill_clicked)
         self._work_publish_switch.setVisible(self._browser_context in ("asset", "shot"))
         register_hotkey_tooltip(
             self._work_publish_switch,
-            "Toggle Work / Published",
+            "Cycle Work / Published / Review (Shots) · P: Work/Publish · R: Work/Review",
             self._settings,
             "main_view.toggle_publish",
         )
@@ -4907,7 +5152,7 @@ class MainView(QWidget):
 
         # Tile view (IconMode) skeleton
         self._tile_model = _PublishDragPipelineModel(self)
-        self._tile_model.set_publish_state(self._show_publish, self._active_department)
+        self._tile_model.set_browser_mode(self._browser_mode, self._active_department)
         self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
         self._tile_view = _ClearOnEmptyClickListView()
         self._tile_view.setObjectName("MainViewGrid")
@@ -4939,7 +5184,7 @@ class MainView(QWidget):
 
         self._grid_delegate = _GridCardDelegate(view=self._tile_view, main_view=self)
         self._grid_delegate.set_gap_px(self._GRID_GAP_PX)
-        self._grid_delegate.set_show_publish(self._show_publish)
+        self._grid_delegate.set_browser_mode(self._browser_mode, self._browser_context)
         self._grid_delegate.set_show_dept_chips(self._show_dept_status_chips)
         self._apply_tile_meta_to_delegate()
         self._tile_view.setItemDelegate(self._grid_delegate)
@@ -5063,9 +5308,22 @@ class MainView(QWidget):
             return
         if self._browser_context not in ("asset", "shot"):
             return
-        if getattr(self, "_work_publish_switch", None) is None:
+        if self._browser_mode == "publish":
+            self._set_browser_mode("work")
+        else:
+            self._set_browser_mode("publish")
+
+    def _toggle_review_mode_shortcut(self) -> None:
+        from monostudio.ui_qt.nav_quick_view import keyboard_input_blocks_shortcuts
+
+        if keyboard_input_blocks_shortcuts():
             return
-        self._work_publish_switch.setChecked(not self._show_publish)
+        if self._browser_context != "shot":
+            return
+        if self._browser_mode == "review":
+            self._set_browser_mode("work")
+        else:
+            self._set_browser_mode("review")
 
     def _bind_view_mode_shortcuts(self) -> None:
         from monostudio.ui_qt.app_hotkeys import bind_hotkey
@@ -5089,6 +5347,16 @@ class MainView(QWidget):
                 "main_view.toggle_publish",
                 self,
                 self._toggle_publish_mode_shortcut,
+                context=ctx,
+                auto_repeat=False,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "main_view.toggle_review",
+                self,
+                self._toggle_review_mode_shortcut,
                 context=ctx,
                 auto_repeat=False,
             )
@@ -6235,7 +6503,7 @@ class MainView(QWidget):
         self._active_department_label = (label or "").strip() or None
         self._active_department_icon_name = (icon_name or "").strip() or None
         self.update_title(base_title=self._base_title or "Assets", department=self._active_department)
-        self._tile_model.set_publish_state(self._show_publish, self._active_department)
+        self._tile_model.set_browser_mode(self._browser_mode, self._active_department)
         self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
         try:
             self._grid_delegate.set_active_department(
@@ -6246,6 +6514,7 @@ class MainView(QWidget):
         except Exception:
             pass
         if prev_dept != self._active_department:
+            self.invalidate_review_card_cache()
             self._grid_delegate.set_hovered_pill_row(None)
             self._grid_delegate.set_hovered_health_row(None)
             self._grid_delegate.set_hovered_notes_row(None)
@@ -6396,6 +6665,7 @@ class MainView(QWidget):
             self._notes_badge_cache.pop(k, None)
 
     def invalidate_notes_open_count_cache(self, path: Path | str | None = None) -> None:
+        self.invalidate_review_card_cache(path)
         if path is None:
             self._notes_badge_cache.clear()
             self._entity_reference_cache.clear()
@@ -6566,20 +6836,28 @@ class MainView(QWidget):
         pass
 
     def _sync_work_publish_pill(self) -> None:
-        on = self._show_publish
-        label = "Published" if on else "Work"
+        mode = self._browser_mode
+        labels = {"work": "Work", "publish": "Published", "review": "Review"}
+        label = labels.get(mode, "Work")
         self._work_publish_switch.setText(label)
         _pill_base = (
             "border: none; border-radius: 12px; padding: 4px 14px; "
             "font-family: 'Inter'; font-size: 11px; font-weight: 700; "
-            "min-height: 22px; min-width: 72px; max-width: 72px; "
+            "min-height: 22px; min-width: 72px; max-width: 88px; "
         )
-        if on:
+        if mode == "publish":
             self._work_publish_switch.setStyleSheet(
                 f"QPushButton#WorkPublishPill {{ "
                 f"background: {MONOS_COLORS['blue_600']}; color: #fafafa; "
                 f"{_pill_base} font-style: italic; }}"
                 f"QPushButton#WorkPublishPill:hover {{ background: {MONOS_COLORS['blue_500']}; }}"
+            )
+        elif mode == "review":
+            self._work_publish_switch.setStyleSheet(
+                f"QPushButton#WorkPublishPill {{ "
+                f"background: {MONOS_COLORS['amber_500']}; color: #18181b; "
+                f"{_pill_base} }}"
+                f"QPushButton#WorkPublishPill:hover {{ background: {MONOS_COLORS['amber_400']}; }}"
             )
         else:
             self._work_publish_switch.setStyleSheet(
@@ -6588,6 +6866,126 @@ class MainView(QWidget):
                 f"{_pill_base} }}"
                 f"QPushButton#WorkPublishPill:hover {{ background: #3f3f46; color: #fafafa; }}"
             )
+
+    def _browser_mode_settings_key(self, context: str | None = None) -> str:
+        ctx = context or self._browser_context
+        return f"{self._SETTINGS_KEY_BROWSER_MODE_PREFIX}/{ctx}"
+
+    def _load_browser_mode_for_context(self, context: str) -> BrowserMode:
+        key = f"{self._SETTINGS_KEY_BROWSER_MODE_PREFIX}/{context}"
+        raw = self._settings.value(key)
+        if raw is not None:
+            mode = str(raw).strip().lower()
+            if context == "shot" and mode in ("work", "publish", "review"):
+                return mode  # type: ignore[return-value]
+            if context == "asset" and mode in ("work", "publish"):
+                return mode  # type: ignore[return-value]
+        legacy = bool(self._settings.value(self._SETTINGS_KEY_SHOW_PUBLISH, False, type=bool))
+        return "publish" if legacy else "work"
+
+    @property
+    def _show_publish(self) -> bool:
+        return self._browser_mode == "publish"
+
+    def get_browser_mode(self) -> BrowserMode:
+        return self._browser_mode
+
+    def _on_work_publish_pill_clicked(self) -> None:
+        if self._browser_context == "shot":
+            nxt = {"work": "publish", "publish": "review", "review": "work"}[self._browser_mode]
+            self._set_browser_mode(nxt)  # type: ignore[arg-type]
+        else:
+            self._set_browser_mode("publish" if self._browser_mode == "work" else "work")
+
+    def _apply_browser_mode_side_effects(self, *, prev_mode: BrowserMode) -> None:
+        show_pub = self._browser_mode == "publish"
+        prev_pub = prev_mode == "publish"
+        self._sync_work_publish_pill()
+        self._grid_delegate.set_browser_mode(self._browser_mode, self._browser_context)
+        self._tile_model.set_browser_mode(self._browser_mode, self._active_department)
+        self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
+        self._sync_tile_drag_mode()
+        self._refresh_list_last_updated_column()
+        if self._view_mode == "list" and self._browser_context == "shot":
+            prev_review_cols = prev_mode == "review"
+            new_review_cols = self._browser_mode == "review"
+            if prev_review_cols != new_review_cols:
+                self._list_model.reset_structure()
+                self._apply_list_column_defaults()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+        if self._sort_field == self._SORT_FIELD_DATE and self._items_unfiltered:
+            self._resort_main_view_visible()
+        if show_pub != prev_pub:
+            self.show_publish_changed.emit(show_pub)
+        self.browser_mode_changed.emit(self._browser_mode)
+
+    def _set_browser_mode(self, mode: BrowserMode, *, save: bool = True) -> None:
+        allowed: tuple[str, ...]
+        if self._browser_context == "shot":
+            allowed = ("work", "publish", "review")
+        elif self._browser_context == "asset":
+            allowed = ("work", "publish")
+        else:
+            allowed = ("work",)
+        if mode not in allowed:
+            mode = "work"
+        if mode == self._browser_mode:
+            return
+        prev = self._browser_mode
+        self._browser_mode = mode
+        if save and self._browser_context in ("asset", "shot"):
+            self._settings.setValue(self._browser_mode_settings_key(), mode)
+        self._apply_browser_mode_side_effects(prev_mode=prev)
+
+    def get_show_publish(self) -> bool:
+        return self._browser_mode == "publish"
+
+    def review_card_summary(
+        self,
+        item_path: Path | str,
+        ref: Asset | Shot,
+    ) -> tuple[RenderCardSummary, ReviewCardSummary]:
+        try:
+            path_key = str(Path(item_path).resolve())
+        except (OSError, TypeError, ValueError):
+            path_key = str(item_path)
+        dept = (self._active_department or "").strip() or None
+        dept_key = dept or ""
+        key = f"{path_key}|{dept_key}"
+        hit = self._review_card_cache.get(key)
+        if hit is not None:
+            return hit
+        active_dcc = self.get_active_dcc(Path(item_path), dept) if item_path and dept else None
+        work_path = _department_work_path_for_item(ref, dept)
+        work_file = _work_file_path_for_item(ref, dept, active_dcc)
+        reg = self._production_status_registry_cached()
+        render_sum = resolve_render_summary(work_path, work_file)
+        review_sum = resolve_review_summary(
+            item_root=Path(item_path),
+            work_path=work_path,
+            work_file_path=work_file,
+            department_id=dept,
+            registry=reg,
+            ref=ref,
+            hidden_departments=set(self._inspector_hidden_departments),
+        )
+        out = (render_sum, review_sum)
+        self._review_card_cache[key] = out
+        return out
+
+    def invalidate_review_card_cache(self, path: Path | str | None = None) -> None:
+        if path is None:
+            self._review_card_cache.clear()
+            return
+        try:
+            path_key = str(Path(path).resolve())
+        except (OSError, TypeError, ValueError):
+            return
+        prefix = f"{path_key}|"
+        stale = [k for k in self._review_card_cache if k == path_key or k.startswith(prefix)]
+        for k in stale:
+            self._review_card_cache.pop(k, None)
 
     def _sync_tile_drag_mode(self) -> None:
         # Both modes: drag enabled; model flags control which rows are draggable (has publish / has work file).
@@ -6598,23 +6996,6 @@ class MainView(QWidget):
         else:
             self._tile_view.setDragEnabled(False)
             self._tile_view.setDragDropMode(QAbstractItemView.NoDragDrop)
-
-    def _on_work_publish_toggled(self, checked: bool) -> None:
-        self._show_publish = bool(checked)
-        self._settings.setValue(self._SETTINGS_KEY_SHOW_PUBLISH, self._show_publish)
-        self._sync_work_publish_pill()
-        self._grid_delegate.set_show_publish(self._show_publish)
-        self._tile_model.set_publish_state(self._show_publish, self._active_department)
-        self._tile_model.set_publish_ignore_extensions(get_publish_ignore_extensions(self._settings))
-        self._sync_tile_drag_mode()
-        self._refresh_list_last_updated_column()
-        self._tile_view.viewport().update()
-        if self._sort_field == self._SORT_FIELD_DATE and self._items_unfiltered:
-            self._resort_main_view_visible()
-        self.show_publish_changed.emit(self._show_publish)
-
-    def get_show_publish(self) -> bool:
-        return self._show_publish
 
     def set_browser_context(self, context: str) -> None:
         """
@@ -6642,6 +7023,14 @@ class MainView(QWidget):
         if context == prev:
             return
 
+        prev_mode = self._browser_mode
+        self._browser_mode = self._load_browser_mode_for_context(context)
+        if context == "asset" and self._browser_mode == "review":
+            self._browser_mode = "work"
+        self._sync_work_publish_pill()
+        self._grid_delegate.set_browser_mode(self._browser_mode, self._browser_context)
+        self._tile_model.set_browser_mode(self._browser_mode, self._active_department)
+
         key = self._settings_key_view_mode()
         saved = self._settings.value(key, "", str)
         if saved in ("tile", "list"):
@@ -6649,11 +7038,19 @@ class MainView(QWidget):
         else:
             default_mode = "list" if context == "shot" else "tile"
             self.set_view_mode(default_mode, save=False)
-        # Table column count is 8 (project) vs 10 (asset/shot). Assets↔Shots stays 10 — skip table resetModel.
-        prev_cols = 8 if prev == "project" else 10
-        new_cols = 8 if context == "project" else 10
+        # Table column count: project=8, asset/shot=13, shot review=9
+        def _col_count(ctx: str, mode: BrowserMode) -> int:
+            if ctx == "project":
+                return 8
+            if ctx == "shot" and mode == "review":
+                return 9
+            return 13
+
+        prev_cols = _col_count(prev, prev_mode)
+        new_cols = _col_count(context, self._browser_mode)
         if prev_cols != new_cols:
             self._list_model.reset_structure()
+            self._apply_list_column_defaults()
         self._schedule_grid_layout_sync()
 
     def set_thumbnail_manager(self, manager: object | None) -> None:
@@ -8047,9 +8444,24 @@ class MainView(QWidget):
         self._update_main_view_options_button()
         self._schedule_grid_layout_sync()
 
+    def _is_shot_review_list(self) -> bool:
+        return self._browser_context == "shot" and self._browser_mode == "review"
+
     def _list_headers(self) -> list[str]:
         if self._browser_context == "project":
             return ["", "", "Name", "Status", "Assets", "Shots", "Last Updated", "Path"]
+        if self._is_shot_review_list():
+            return [
+                "",
+                "",
+                "Name",
+                "Notes",
+                "Render",
+                "Review",
+                "Render date",
+                "Review date",
+                "Status",
+            ]
         return [
             "",
             "",
@@ -8072,49 +8484,103 @@ class MainView(QWidget):
             return 3
         return -1
 
+    def _list_col_render(self) -> int:
+        return 4 if self._is_shot_review_list() else -1
+
+    def _list_col_review(self) -> int:
+        return 5 if self._is_shot_review_list() else -1
+
+    def _list_col_render_date(self) -> int:
+        return 6 if self._is_shot_review_list() else -1
+
+    def _list_col_review_date(self) -> int:
+        return 7 if self._is_shot_review_list() else -1
+
     def _list_col_dcc(self) -> int:
         """Column index for DCC badges (asset/shot only); after Notes = 4."""
+        if self._is_shot_review_list():
+            return -1
         if self._browser_context != "project":
             return 4
         return -1
 
     def _list_col_health(self) -> int:
         """Column index for item health icon (asset/shot only); after DCC = 5."""
+        if self._is_shot_review_list():
+            return -1
         if self._browser_context != "project":
             return 5
         return -1
 
     def _list_col_ref(self) -> int:
+        if self._is_shot_review_list():
+            return -1
         if self._browser_context != "project":
             return 6
         return -1
 
     def _list_col_concept(self) -> int:
+        if self._is_shot_review_list():
+            return -1
         if self._browser_context != "project":
             return 7
         return -1
 
     def _list_col_status(self) -> int:
-        """Column index for Status (project: 3, asset/shot: 8)."""
+        """Column index for Status (project: 3, asset/shot: 8, shot review: 8)."""
         if self._browser_context == "project":
             return 3
         return 8
 
     def _list_col_due(self) -> int:
+        if self._is_shot_review_list():
+            return -1
         if self._browser_context != "project":
             return 9
         return -1
 
     def _list_col_last_updated(self) -> int:
         """Column index for Last Updated (project: 6, asset/shot: 11)."""
+        if self._is_shot_review_list():
+            return -1
         if self._browser_context == "project":
             return 6
         return 11
 
     def _list_col_assignee(self) -> int:
+        if self._is_shot_review_list():
+            return -1
         if self._browser_context != "project":
             return 12
         return -1
+
+    def _list_review_render_text(self, item: ViewItem) -> str:
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)) or not getattr(item, "path", None):
+            return "—"
+        rs, _ = self.review_card_summary(item.path, ref)
+        return "Yes" if rs.has_render else "No"
+
+    def _list_review_review_text(self, item: ViewItem) -> str:
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)) or not getattr(item, "path", None):
+            return "—"
+        _, rv = self.review_card_summary(item.path, ref)
+        return "Yes" if rv.has_review else "No"
+
+    def _list_review_render_date_text(self, item: ViewItem) -> str:
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)) or not getattr(item, "path", None):
+            return "—"
+        rs, _ = self.review_card_summary(item.path, ref)
+        return format_review_card_date(rs.render_date) if rs.has_render else "—"
+
+    def _list_review_review_date_text(self, item: ViewItem) -> str:
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)) or not getattr(item, "path", None):
+            return "—"
+        _, rv = self.review_card_summary(item.path, ref)
+        return format_review_card_date(rv.review_date) if rv.has_review else "—"
 
     def _list_version_text(self, item: ViewItem) -> str:
         """Version string for list: work or publish version for active department."""
@@ -8453,6 +8919,9 @@ class MainView(QWidget):
         if not isinstance(item, ViewItem) or self._is_item_dimmed(item):
             return
         if isinstance(item.ref, (Asset, Shot)):
+            if self._browser_mode == "review" and self._browser_context == "shot":
+                self.review_entity_requested.emit(item)
+                return
             if self._show_publish:
                 folder = _resolve_latest_publish_folder(item.ref, self._active_department)
                 if folder is not None:
@@ -8468,6 +8937,9 @@ class MainView(QWidget):
         if not isinstance(item, ViewItem) or self._is_item_dimmed(item):
             return
         if isinstance(item.ref, (Asset, Shot)):
+            if self._browser_mode == "review" and self._browser_context == "shot":
+                self.review_entity_requested.emit(item)
+                return
             if self._show_publish:
                 folder = _resolve_latest_publish_folder(item.ref, self._active_department)
                 if folder is not None:

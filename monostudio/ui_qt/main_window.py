@@ -68,16 +68,29 @@ from monostudio.core.inbox_reader import (
     get_inbox_root,
     move_into_inbox_folder,
 )
+from monostudio.core.internal_check_reader import (
+    add_to_internal_check,
+    copy_into_internal_check_folder,
+    ensure_internal_check_root,
+    get_internal_check_root,
+    move_into_internal_check_folder,
+)
+from monostudio.core.delivery_reader import (
+    add_to_delivery,
+    copy_into_delivery_folder,
+    ensure_delivery_source_folders,
+    get_delivery_root,
+    move_into_delivery_folder,
+)
 from monostudio.core.outbox_reader import (
-    add_to_outbox,
-    copy_into_outbox_folder,
+    ensure_outbox_source_folders,
     get_outbox_root,
-    move_into_outbox_folder,
 )
 from monostudio.ui_qt.external_drop import drop_wants_copy, paths_under_root
 from monostudio.ui_qt.inbox_drop_dialog import InboxDropDialog
 from monostudio.ui_qt.inbox_page_widget import InboxPageWidget
 from monostudio.ui_qt.outbox_page_widget import OutboxPageWidget
+from monostudio.ui_qt.internal_check_page_widget import InternalCheckPageWidget
 from monostudio.ui_qt.trash_page_widget import TrashPageWidget
 from monostudio.ui_qt.dashboard_page_widget import DashboardPageWidget
 from monostudio.ui_qt.user_identity_dialog import UserIdentityDialog
@@ -95,7 +108,7 @@ from monostudio.ui_qt.main_view import MainView
 from monostudio.ui_qt.new_project_dialog import NewProjectDialog
 from monostudio.ui_qt.settings_dialog import SettingsDialog
 from monostudio.ui_qt.project_picker_dialog import ProjectPickerDialog
-from monostudio.ui_qt.sidebar import Sidebar
+from monostudio.ui_qt.sidebar import Sidebar, SidebarContext
 from monostudio.ui_qt.sidebar_nav_rail import SidebarNavRail
 from monostudio.ui_qt.popup_position import max_popup_height_in_widget
 from monostudio.ui_qt.top_bar import TopBar
@@ -438,6 +451,7 @@ class MainWindow(FramelessMainWindow):
         self._content_stack.addWidget(self._main_view)
         self._inbox_page_widget: InboxPageWidget | None = None
         self._outbox_page_widget: OutboxPageWidget | None = None
+        self._internal_check_page_widget: InternalCheckPageWidget | None = None
         self._trash_page_widget: TrashPageWidget | None = None
         self._dashboard_page_widget: DashboardPageWidget | None = None
         self._schedule_page_widget: SchedulePageWidget | None = None
@@ -1312,13 +1326,22 @@ class MainWindow(FramelessMainWindow):
             self._on_inbox_drop_requested(paths, target, copy_only)
         elif current is self._outbox_page_widget and self._outbox_page_widget is not None:
             target = self._inbox_outbox_drop_target_at_global(self._outbox_page_widget, global_pos, pos_in_window)
-            storage_root = get_outbox_root(self._project_root) if self._project_root else None
+            storage_root = get_delivery_root(self._project_root) if self._project_root else None
             copy_only = (
                 drop_wants_copy(drop_event, paths=paths, storage_root=storage_root)
                 if drop_event is not None
                 else not (storage_root is not None and paths_under_root(paths, storage_root))
             )
             self._on_outbox_drop_requested(paths, target, copy_only)
+        elif current is self._internal_check_page_widget and self._internal_check_page_widget is not None:
+            target = self._inbox_outbox_drop_target_at_global(self._internal_check_page_widget, global_pos, pos_in_window)
+            storage_root = get_internal_check_root(self._project_root) if self._project_root else None
+            copy_only = (
+                drop_wants_copy(drop_event, paths=paths, storage_root=storage_root)
+                if drop_event is not None
+                else not (storage_root is not None and paths_under_root(paths, storage_root))
+            )
+            self._on_internal_check_drop_requested(paths, target, copy_only)
 
     def eventFilter(self, obj, event) -> bool:
         et = event.type()
@@ -1565,9 +1588,9 @@ class MainWindow(FramelessMainWindow):
         if getattr(self, "_context_switch_in_progress", False):
             return
         ctx = self._nav_rail.current_context()
-        if ctx not in ("Assets", "Shots", "Inbox", "Project Guide", "Outbox"):
+        if ctx not in ("Assets", "Shots", "Inbox", "Project Guide", SidebarContext.INTERNAL_CHECK.value, "Delivery"):
             return
-        if ctx in ("Inbox", "Outbox") and getattr(self, "_inbox_switch_cooldown", False):
+        if ctx in ("Inbox", SidebarContext.INTERNAL_CHECK.value, "Delivery") and getattr(self, "_inbox_switch_cooldown", False):
             return
         if ctx == "Assets" and self._entered_parent is not None:
             return
@@ -1909,9 +1932,11 @@ class MainWindow(FramelessMainWindow):
             self._inbox_page_widget.set_type_filter(self.current_type or "")
             self._restore_inbox_date_folder_state()
         # When on Outbox, same: restore tree for that type if we had a date folder open.
-        if self._nav_rail.current_context() == "Outbox" and self._outbox_page_widget is not None:
+        if self._nav_rail.current_context() == "Delivery" and self._outbox_page_widget is not None:
             self._outbox_page_widget.set_type_filter(self.current_type or "")
             self._restore_outbox_date_folder_state()
+        if self._nav_rail.current_context() == SidebarContext.INTERNAL_CHECK.value and self._internal_check_page_widget is not None:
+            self._restore_internal_check_date_folder_state()
         self.typeChanged.emit(new)
 
     def _sync_filter_state_from_sidebar(self) -> None:
@@ -1935,7 +1960,7 @@ class MainWindow(FramelessMainWindow):
                 if d is not None:
                     self.current_department = d
                     self._app_state.set_filters(self.current_department, self.current_type)
-            elif ctx == "Outbox":
+            elif ctx in ("Delivery", "Outbox"):
                 filters = self._filter_panel.filters()
                 t = filters.current_type()
                 if t is not None:
@@ -4142,10 +4167,17 @@ class MainWindow(FramelessMainWindow):
         filter_panel: bool = True,
     ) -> None:
         """Restore last selected nav page from QSettings."""
-        _valid = ("Assets", "Shots", "Inbox", "Project Guide", "Dashboard", "Schedule", "Outbox", "Trash")
+        _valid = (
+            "Assets", "Shots", "Inbox", "Project Guide", "Dashboard", "Schedule",
+            SidebarContext.INTERNAL_CHECK.value, "Delivery", "Trash",
+        )
         ctx = (self._settings.value("ui/sidebar_context", "Assets", str) or "Assets").strip()
         if ctx == "Projects":
             ctx = "Dashboard"
+        if ctx == "Outbox":
+            ctx = "Delivery"
+        if ctx == "Review":
+            ctx = SidebarContext.INTERNAL_CHECK.value
         if ctx not in _valid:
             return
         if filter_panel:
@@ -4187,7 +4219,9 @@ class MainWindow(FramelessMainWindow):
 
             self._main_view.set_context_title(context_name)
             self._entered_parent = None
-            if context_name not in ("Inbox", "Project Guide", "Schedule", "Outbox", "Trash", "Dashboard"):
+            if context_name not in (
+                "Inbox", "Project Guide", "Schedule", SidebarContext.INTERNAL_CHECK.value, "Delivery", "Trash", "Dashboard",
+            ):
                 self._content_stack.setCurrentWidget(self._main_view)
                 self._main_view.clear()
                 self._inspector.set_inbox_distribute_paths([], None, None)
@@ -4268,7 +4302,27 @@ class MainWindow(FramelessMainWindow):
                 self._content_stack.setCurrentWidget(self._reference_page_widget)
                 self._restore_project_guide_browse_state()
                 self._inspector.set_inbox_tree_preview(None)
-            elif context_name == "Outbox":
+            elif context_name == SidebarContext.INTERNAL_CHECK.value:
+                self._sync_filter_state_from_sidebar()
+                self._inbox_switch_cooldown = True
+                QTimer.singleShot(120, lambda: setattr(self, "_inbox_switch_cooldown", False))
+                if self._internal_check_page_widget is None:
+                    self._internal_check_page_widget = InternalCheckPageWidget(self)
+                    self._internal_check_page_widget.tree_distribute_paths_changed.connect(
+                        self._on_internal_check_tree_distribute_paths_changed
+                    )
+                    self._internal_check_page_widget.open_folder_requested.connect(self._on_internal_check_open_folder_requested)
+                    self._internal_check_page_widget.drop_requested.connect(self._on_internal_check_drop_requested)
+                    self._internal_check_page_widget.import_requested.connect(self._on_internal_check_import_requested)
+                    self._internal_check_page_widget.date_folder_entered.connect(self._on_internal_check_date_folder_entered)
+                    self._connect_inbox_outbox_title_row(self._internal_check_page_widget._title_row)
+                    self._content_stack.addWidget(self._internal_check_page_widget)
+                self._internal_check_page_widget.set_project_root(self._project_root)
+                self._content_stack.setCurrentWidget(self._internal_check_page_widget)
+                self._inspector.set_inbox_distribute_paths([], None, None)
+                self._inspector.set_inbox_tree_preview(None)
+                self._restore_internal_check_date_folder_state()
+            elif context_name == "Delivery":
                 self._sync_filter_state_from_sidebar()
                 self._inbox_switch_cooldown = True
                 QTimer.singleShot(120, lambda: setattr(self, "_inbox_switch_cooldown", False))
@@ -4289,6 +4343,9 @@ class MainWindow(FramelessMainWindow):
                 self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
                 self._restore_outbox_date_folder_state()
+            elif context_name == "Outbox":
+                self._on_context_switched("Delivery")
+                return
             elif context_name == "Trash":
                 self._sync_filter_state_from_sidebar()
                 if self._trash_page_widget is None:
@@ -4637,8 +4694,10 @@ class MainWindow(FramelessMainWindow):
             self._apply_schedule_sidebar_filters()
         elif ctx == "Inbox" and self._inbox_page_widget is not None:
             self._inbox_page_widget.set_type_filter(panel.current_type() or "")
-        elif ctx == "Outbox" and self._outbox_page_widget is not None:
+        elif ctx in ("Delivery", "Outbox") and self._outbox_page_widget is not None:
             self._outbox_page_widget.set_type_filter(panel.current_type() or "")
+        elif ctx == SidebarContext.INTERNAL_CHECK.value and self._internal_check_page_widget is not None:
+            pass
         elif ctx == "Project Guide" and self._reference_page_widget is not None:
             dept = panel.current_department() or "reference"
             dep_label, dep_icon = panel.get_department_display(dept)
@@ -4682,6 +4741,9 @@ class MainWindow(FramelessMainWindow):
                 self._sync_filter_state_from_sidebar()
                 self._reload_main_view()
             elif context_name == "Outbox":
+                self._sync_filter_state_from_sidebar()
+                self._reload_main_view()
+            elif context_name == "Delivery":
                 self._sync_filter_state_from_sidebar()
                 self._reload_main_view()
             elif context_name == "Project Guide":
@@ -4728,7 +4790,7 @@ class MainWindow(FramelessMainWindow):
             self._inspector.set_item(None)
             return
         ctx = self._nav_rail.current_context()
-        if ctx in ("Inbox", "Project Guide", "Outbox"):
+        if ctx in ("Inbox", "Project Guide", SidebarContext.INTERNAL_CHECK.value, "Delivery", "Outbox"):
             # Explorer tree/grid drives inspector preview on these pages.
             return
         if not has_selection:
@@ -5212,6 +5274,12 @@ class MainWindow(FramelessMainWindow):
         self._inspector.set_project_root(self._project_root)
 
         if self._project_root is not None:
+            try:
+                ensure_outbox_source_folders(self._project_root)
+                ensure_delivery_source_folders(self._project_root)
+                ensure_internal_check_root(self._project_root)
+            except OSError:
+                pass
             try:
                 dept_reg = DepartmentRegistry.for_project(self._project_root)
                 self._inspector.set_department_registry(dept_reg)
@@ -5901,9 +5969,12 @@ class MainWindow(FramelessMainWindow):
             self._inbox_page_widget.set_project_root(self._project_root)
             self._inbox_page_widget.set_type_filter(self._filter_panel.filters().current_type() or "")
             return
-        if context == "Outbox" and self._outbox_page_widget is not None:
+        if context in ("Delivery", "Outbox") and self._outbox_page_widget is not None:
             self._outbox_page_widget.set_project_root(self._project_root)
             self._outbox_page_widget.set_type_filter(self._filter_panel.filters().current_type() or "")
+            return
+        if context == SidebarContext.INTERNAL_CHECK.value and self._internal_check_page_widget is not None:
+            self._internal_check_page_widget.set_project_root(self._project_root)
             return
         if context == "Project Guide" and self._reference_page_widget is not None:
             dept = self._filter_panel.filters().current_department() or "reference"
@@ -6086,10 +6157,48 @@ class MainWindow(FramelessMainWindow):
         key = (source_type or "client").strip().lower()
         if key not in ("client", "freelancer"):
             key = "client"
-        return f"outbox/last_date_folder_path/{key}"
+        return f"delivery/last_date_folder_path/{key}"
 
     def _outbox_restore_split_key(self) -> str:
-        return "outbox/restore_split_view"
+        return "delivery/restore_split_view"
+
+    def _internal_check_date_folder_settings_key(self) -> str:
+        return "internal_check/last_date_folder_path"
+
+    def _internal_check_restore_split_key(self) -> str:
+        return "internal_check/restore_split_view"
+
+    def _on_internal_check_date_folder_entered(self, _source_type: str, path: Path) -> None:
+        self._save_internal_check_date_folder_state(path)
+
+    def _save_internal_check_date_folder_state(self, path: Path) -> None:
+        if not path or not path.is_dir() or not self._project_root:
+            return
+        if not str(path).startswith(str(self._project_root)):
+            return
+        self._settings.setValue(self._internal_check_date_folder_settings_key(), str(path.resolve()))
+
+    def _restore_internal_check_date_folder_state(self) -> bool:
+        if not self._internal_check_page_widget or not self._project_root:
+            return False
+        raw = self._settings.value(self._internal_check_restore_split_key(), True)
+        if raw in (False, "false", "0", 0):
+            raw = self._settings.value("review/restore_split_view", True)
+        if raw in (False, "false", "0", 0):
+            return False
+        path_str = self._settings.value(self._internal_check_date_folder_settings_key(), "", str)
+        if not path_str:
+            path_str = self._settings.value("review/last_date_folder_path", "", str)
+        path = Path(path_str)
+        if not path.is_dir():
+            return False
+        try:
+            if not str(path.resolve()).startswith(str(self._project_root.resolve())):
+                return False
+        except OSError:
+            return False
+        self._internal_check_page_widget.restore_browse_path(path)
+        return True
 
     def _on_outbox_date_folder_entered(self, source_type: str, path: Path) -> None:
         """Persist which date folder is open per Client/Freelancer so we can restore when switching back."""
@@ -6104,7 +6213,7 @@ class MainWindow(FramelessMainWindow):
         self._settings.setValue(key, str(path.resolve()))
 
     def _restore_outbox_date_folder_state(self) -> bool:
-        """Restore Outbox date folder (tree) for current type when user had it open. Returns True if restored."""
+        """Restore Delivery date folder (tree) for current recipient when user had it open."""
         if not self._outbox_page_widget or not self._project_root:
             return False
         raw = self._settings.value(self._outbox_restore_split_key(), True)
@@ -6719,11 +6828,83 @@ class MainWindow(FramelessMainWindow):
     def _on_outbox_open_folder_requested(self, path) -> None:
         self._open_path_in_explorer(path)
 
-    def _on_outbox_import_requested(self, _date_path=None) -> None:
-        """Import (header or context menu): open file dialog, then Outbox drop dialog."""
+    def _on_internal_check_tree_distribute_paths_changed(self, paths: list) -> None:
+        path_list = [Path(p) for p in paths if p] if paths else []
+        self._inspector.set_inbox_distribute_paths([], None, None)
+        self._inspector.set_inbox_tree_preview(path_list[0] if path_list else None)
+
+    def _on_internal_check_open_folder_requested(self, path) -> None:
+        self._open_path_in_explorer(path)
+
+    def _on_internal_check_import_requested(self, _date_path=None) -> None:
         if not self._project_root:
             return
-        files, _ = QFileDialog.getOpenFileNames(self, "Import to Outbox", "", "All Files (*)")
+        files, _ = QFileDialog.getOpenFileNames(self, "Add to Internal check", "", "All Files (*)")
+        if not files:
+            return
+        path_list = [Path(f) for f in files if f and Path(f).exists()]
+        if not path_list:
+            return
+        self._on_internal_check_drop_requested(path_list)
+
+    def _on_internal_check_drop_requested(self, paths: list, target_folder=None, copy_only: bool = True) -> None:
+        if not paths or not self._project_root:
+            return
+        try:
+            path_list = [Path(p) for p in paths if p and Path(p).exists()]
+            if not path_list:
+                return
+            if self._try_direct_inbox_outbox_drop(
+                path_list, target_folder, target="internal_check", copy_only=copy_only
+            ):
+                return
+        except Exception:
+            logging.getLogger(__name__).exception("Review drop failed")
+            notification_service.warning("Could not add items to Internal check.")
+            return
+        initial_date_str, prefer_existing = self._inbox_outbox_dialog_date_defaults(
+            target_folder, page_widget=self._internal_check_page_widget
+        )
+        dialog = InboxDropDialog(
+            path_list,
+            self._project_root,
+            "",
+            self,
+            target="internal_check",
+            initial_date_str=initial_date_str,
+            prefer_existing_date=prefer_existing,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        _source, date_str, description = dialog.result_values()
+        if not date_str:
+            return
+        added = 0
+        dest_paths: list[Path] = []
+        for p in path_list:
+            try:
+                result = add_to_internal_check(self._project_root, p, date_str, description)
+                if result is not None:
+                    added += 1
+                    dest_paths.append(get_internal_check_root(self._project_root) / date_str / p.name)
+            except Exception as e:
+                logging.warning("Add to review failed for %s: %s", p, e)
+        if added > 0:
+            self._reload_main_view()
+            if self._internal_check_page_widget is not None:
+                self._internal_check_page_widget.refresh_tree()
+                self._internal_check_page_widget.refresh_history_dialog_if_open()
+                pane = getattr(self._internal_check_page_widget, "_tree_pane", None)
+                if pane is not None and dest_paths:
+                    pane.select_dropped_paths(dest_paths)
+            notification_service.success(
+                f"Added {added} item{'s' if added != 1 else ''} to Internal check."
+            )
+
+    def _on_outbox_import_requested(self, _date_path=None) -> None:
+        if not self._project_root:
+            return
+        files, _ = QFileDialog.getOpenFileNames(self, "Add to Delivery", "", "All Files (*)")
         if not files:
             return
         path_list = [Path(f) for f in files if f and Path(f).exists()]
@@ -6732,7 +6913,7 @@ class MainWindow(FramelessMainWindow):
         self._on_outbox_drop_requested(path_list)
 
     def _on_outbox_drop_requested(self, paths: list, target_folder=None, copy_only: bool = True) -> None:
-        """Files/folders dropped onto Outbox page: copy into tree target or open date dialog."""
+        """Files/folders dropped onto Delivery page."""
         if not paths or not self._project_root:
             return
         try:
@@ -6740,12 +6921,12 @@ class MainWindow(FramelessMainWindow):
             if not path_list:
                 return
             if self._try_direct_inbox_outbox_drop(
-                path_list, target_folder, target="outbox", copy_only=copy_only
+                path_list, target_folder, target="delivery", copy_only=copy_only
             ):
                 return
         except Exception:
-            logging.getLogger(__name__).exception("Outbox drop failed")
-            notification_service.warning("Could not complete Outbox drop.")
+            logging.getLogger(__name__).exception("Delivery drop failed")
+            notification_service.warning("Could not complete Delivery drop.")
             return
         initial_source = (self._filter_panel.filters().current_type() or "").strip().lower()
         if initial_source not in ("client", "freelancer"):
@@ -6758,7 +6939,7 @@ class MainWindow(FramelessMainWindow):
             self._project_root,
             initial_source,
             self,
-            target="outbox",
+            target="delivery",
             initial_date_str=initial_date_str,
             prefer_existing_date=prefer_existing,
         )
@@ -6772,13 +6953,13 @@ class MainWindow(FramelessMainWindow):
         dest_paths: list[Path] = []
         for p in path_list:
             try:
-                result = add_to_outbox(self._project_root, p, source, date_str, description)
+                result = add_to_delivery(self._project_root, p, source, date_str, description)
                 if result is not None:
                     added += 1
                     added_names.append(p.name)
-                    dest_paths.append(get_outbox_root(self._project_root) / source / date_str / p.name)
+                    dest_paths.append(get_delivery_root(self._project_root) / source / date_str / p.name)
             except Exception as e:
-                logging.warning("Add to outbox failed for %s: %s", p, e)
+                logging.warning("Add to delivery failed for %s: %s", p, e)
         if added > 0:
             self._reload_main_view()
             if self._outbox_page_widget is not None:
@@ -6787,7 +6968,7 @@ class MainWindow(FramelessMainWindow):
                 pane = getattr(self._outbox_page_widget, "_tree_pane", None)
                 if pane is not None and dest_paths:
                     pane.select_dropped_paths(dest_paths)
-            notification_service.success(f"Added {added} item{'s' if added != 1 else ''} to Outbox.")
+            notification_service.success(f"Added {added} item{'s' if added != 1 else ''} to Delivery.")
             self._dispatch_discord_outbox_received(
                 count=added,
                 source=source,
@@ -6807,9 +6988,7 @@ class MainWindow(FramelessMainWindow):
         from datetime import datetime, timezone
         if not payload or not self._project_root:
             return
-        type_filter = (self._filter_panel.filters().current_type() or "client").strip().lower()
-        if type_filter not in ("client", "freelancer"):
-            type_filter = "client"
+        type_filter = ""
         iso_now = datetime.now(timezone.utc).isoformat()
         count = 0
         dest_label = ""
@@ -6942,6 +7121,43 @@ class MainWindow(FramelessMainWindow):
             return None, False
         return rel.parts[0], True
 
+    def _inbox_outbox_page_for_target(self, target: str):
+        key = (target or "inbox").strip().lower()
+        if key == "outbox":
+            key = "delivery"
+        if key == "review":
+            key = "internal_check"
+        if key == "inbox":
+            return self._inbox_page_widget
+        if key == "internal_check":
+            return self._internal_check_page_widget
+        if key == "delivery":
+            return self._outbox_page_widget
+        return self._inbox_page_widget
+
+    def _inbox_outbox_label_for_target(self, target: str) -> str:
+        key = (target or "inbox").strip().lower()
+        if key == "outbox":
+            key = "delivery"
+        if key == "review":
+            key = "internal_check"
+        labels = {"inbox": "Inbox", "delivery": "Delivery", "internal_check": "Internal check"}
+        return labels.get(key, "Inbox")
+
+    def _inbox_outbox_root_for_target(self, target: str) -> Path:
+        key = (target or "inbox").strip().lower()
+        if key == "outbox":
+            key = "delivery"
+        if key == "review":
+            key = "internal_check"
+        if key == "inbox":
+            return get_inbox_root(self._project_root)
+        if key == "internal_check":
+            return get_internal_check_root(self._project_root)
+        if key == "delivery":
+            return get_delivery_root(self._project_root)
+        return get_inbox_root(self._project_root)
+
     def _try_direct_inbox_outbox_drop(
         self,
         path_list: list[Path],
@@ -6950,15 +7166,26 @@ class MainWindow(FramelessMainWindow):
         target: str,
         copy_only: bool = True,
     ) -> bool:
-        page = self._inbox_page_widget if target == "inbox" else self._outbox_page_widget
+        page = self._inbox_outbox_page_for_target(target)
         pane = getattr(page, "_tree_pane", None) if page is not None else None
         if pane is None or target_folder is None:
             return False
         dest_dir = pane.resolve_drop_dest_dir(target_folder)
         if dest_dir is None:
             return False
-        copy_fn = copy_into_inbox_folder if target == "inbox" else copy_into_outbox_folder
-        move_fn = move_into_inbox_folder if target == "inbox" else move_into_outbox_folder
+        copy_fns = {
+            "inbox": copy_into_inbox_folder,
+            "delivery": copy_into_delivery_folder,
+            "internal_check": copy_into_internal_check_folder,
+        }
+        move_fns = {
+            "inbox": move_into_inbox_folder,
+            "delivery": move_into_delivery_folder,
+            "internal_check": move_into_internal_check_folder,
+        }
+        key = (target or "inbox").strip().lower()
+        copy_fn = copy_fns.get(key, copy_into_inbox_folder)
+        move_fn = move_fns.get(key, move_into_inbox_folder)
         op_fn = copy_fn if copy_only else move_fn
         verb = "copied" if copy_only else "moved"
         added = 0
@@ -6976,7 +7203,7 @@ class MainWindow(FramelessMainWindow):
             except Exception as e:
                 logging.warning("Direct %s drop failed for %s: %s", target, p, e)
         if added <= 0:
-            label = "Inbox" if target == "inbox" else "Outbox"
+            label = self._inbox_outbox_label_for_target(target)
             if duplicate_count > 0:
                 folder_label = dest_dir.name
                 if duplicate_count == len(path_list):
@@ -6989,10 +7216,10 @@ class MainWindow(FramelessMainWindow):
                     )
                 return True
             return False
-        label = "Inbox" if target == "inbox" else "Outbox"
+        label = self._inbox_outbox_label_for_target(target)
         try:
-            root = get_inbox_root(self._project_root) if target == "inbox" else get_outbox_root(self._project_root)
-            rel = dest_dir.relative_to(root.resolve())
+            root = self._inbox_outbox_root_for_target(target).resolve()
+            rel = dest_dir.relative_to(root)
             source = rel.parts[0] if rel.parts else ""
             date_str = rel.parts[1] if len(rel.parts) > 1 else dest_dir.name
         except (ValueError, OSError):
@@ -7001,13 +7228,14 @@ class MainWindow(FramelessMainWindow):
         try:
             if page is not None:
                 page.refresh_tree()
-                if target == "outbox":
-                    page.refresh_history_dialog_if_open()
+                refresh_hist = getattr(page, "refresh_history_dialog_if_open", None)
+                if callable(refresh_hist):
+                    refresh_hist()
             if pane is not None and dest_paths:
                 pane.select_dropped_paths(dest_paths)
         except Exception:
             logging.getLogger(__name__).warning(
-                "Inbox/Outbox UI refresh after drop failed", exc_info=True
+                "Inbox/Outbox/Delivery UI refresh after drop failed", exc_info=True
             )
         folder_label = dest_dir.name
         if copy_only:
@@ -7026,7 +7254,7 @@ class MainWindow(FramelessMainWindow):
                     date_str=date_str,
                     file_names=added_names,
                 )
-            elif target == "outbox":
+            elif target == "delivery":
                 self._dispatch_discord_outbox_received(
                     count=added,
                     source=source,
@@ -7835,6 +8063,7 @@ class MainWindow(FramelessMainWindow):
         for page in (
             self._inbox_page_widget,
             self._outbox_page_widget,
+            self._internal_check_page_widget,
             self._reference_page_widget,
         ):
             if page is None:

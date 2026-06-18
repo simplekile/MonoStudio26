@@ -40,14 +40,17 @@ _ROW_RADIUS = 8
 _MARGIN = 12
 _LAYOUT_SPACING = 8
 
+from monostudio.ui_qt.sidebar import INTERNAL_CHECK_NAV_ICON
+
 _PAGE_ICONS: dict[str, str] = {
     "Dashboard": "house",
     "Assets": "box",
     "Shots": "clapperboard",
     "Inbox": "inbox",
-    "Project Guide": "folder-open",
+    "Project Guide": "library",
     "Schedule": "calendar",
-    "Outbox": "send",
+    "Internal check": INTERNAL_CHECK_NAV_ICON,
+    "Delivery": "send",
     "Trash": "trash-2",
 }
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".exr", ".tif", ".tiff", ".bmp"})
@@ -316,7 +319,8 @@ class CommandPaletteDialog(MonosDialog):
             "Inbox",
             "Project Guide",
             "Schedule",
-            "Outbox",
+            "Internal check",
+            "Delivery",
             "Trash",
         ):
             if ctx in VALID_NAV_CONTEXTS:

@@ -40,8 +40,7 @@ _SORT_NAME = "name"
 _SORT_MODIFIED = "modified"
 
 
-def _sync_status_label(parent: QWidget, *, synced: bool) -> QLabel:
-    lab = QLabel(parent)
+def _apply_sync_label(lab: QLabel, *, synced: bool) -> None:
     lab.setObjectName(
         "VideoPreviewRangeRowSynced" if synced else "VideoPreviewRangeRowLocal"
     )
@@ -54,6 +53,11 @@ def _sync_status_label(parent: QWidget, *, synced: bool) -> QLabel:
     lab.setToolTip(
         "Matches project sidecar" if synced else "Changed locally — use Sync to save"
     )
+
+
+def _sync_status_label(parent: QWidget, *, synced: bool) -> QLabel:
+    lab = QLabel(parent)
+    _apply_sync_label(lab, synced=synced)
     return lab
 
 
@@ -97,7 +101,8 @@ class _RangeListRowWidget(QWidget):
         name.setObjectName("VideoPreviewRangeRowName")
         name.setFont(monos_font("Inter", 13, QFont.Weight.DemiBold))
         name_row.addWidget(name, 1)
-        name_row.addWidget(_sync_status_label(self, synced=synced), 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._sync_label = _sync_status_label(self, synced=synced)
+        name_row.addWidget(self._sync_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         text_col.addLayout(name_row)
 
         detail = QLabel(
@@ -109,6 +114,9 @@ class _RangeListRowWidget(QWidget):
         text_col.addWidget(detail)
 
         root.addLayout(text_col, 1)
+
+    def set_synced(self, synced: bool) -> None:
+        _apply_sync_label(self._sync_label, synced=synced)
 
     @classmethod
     def size_hint(cls) -> QSize:
@@ -238,8 +246,22 @@ class VideoRangeListWidget(QWidget):
         if pub == self._published_ranges:
             return
         self._published_ranges = pub
-        if self._ranges:
-            self.set_ranges(self._ranges, active_id=self._active_id)
+        self._refresh_sync_icons()
+
+    def _refresh_sync_icons(self) -> None:
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item is None:
+                continue
+            rid = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(rid, str):
+                continue
+            rng = next((r for r in self._ranges if r.id == rid), None)
+            if rng is None:
+                continue
+            row_w = self._list.itemWidget(item)
+            if isinstance(row_w, _RangeListRowWidget):
+                row_w.set_synced(range_is_synced(rng, self._published_ranges))
 
     def ordered_ranges(self) -> list[VideoFrameRange]:
         return sort_video_ranges(self._ranges, self._sort_mode)

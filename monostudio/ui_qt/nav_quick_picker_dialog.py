@@ -39,14 +39,18 @@ from monostudio.ui_qt.nav_quick_view import (
 )
 from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 
+from monostudio.ui_qt.sidebar import INTERNAL_CHECK_NAV_ICON
+
 _PAGE_ICONS: dict[str, str] = {
     "Dashboard": "house",
     "Assets": "box",
     "Shots": "clapperboard",
     "Inbox": "inbox",
-    "Project Guide": "folder-open",
+    "Project Guide": "library",
     "Schedule": "calendar",
-    "Outbox": "send",
+    "Internal check": INTERNAL_CHECK_NAV_ICON,
+    "Delivery": "send",
+    "Delivery": "package",
     "Trash": "trash-2",
 }
 

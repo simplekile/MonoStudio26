@@ -24,6 +24,7 @@ from monostudio.core.project_create_defaults import (
     resolved_create_default_dcc_map_for_new_project,
 )
 from monostudio.core.structure_registry import StructureRegistry
+from monostudio.core.outbox_reader import SOURCE_FOLDER_NAMES
 
 PROJECT_GUIDE_DEPARTMENTS = ("reference", "script", "storyboard", "guideline", "concept")
 
@@ -154,6 +155,16 @@ def create_new_project(
         outbox_dir = project_root / struct_reg.get_folder("outbox")
         outbox_dir.mkdir(parents=True, exist_ok=False)
         created_paths.append(outbox_dir)
+        from monostudio.core.internal_check_reader import ensure_internal_check_root
+
+        ensure_internal_check_root(project_root)
+        delivery_dir = outbox_dir / "delivery"
+        delivery_dir.mkdir(parents=True, exist_ok=False)
+        created_paths.append(delivery_dir)
+        for name in SOURCE_FOLDER_NAMES:
+            src_dir = delivery_dir / name
+            src_dir.mkdir(parents=True, exist_ok=False)
+            created_paths.append(src_dir)
 
         project_guide_root = project_root / struct_reg.get_folder("project_guide")
         project_guide_root.mkdir(parents=True, exist_ok=False)

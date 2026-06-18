@@ -498,6 +498,10 @@ MONOS_COLORS: dict[str, str] = {
     # Card
     "card_bg": "#191b1e",
     "card_hover": "#1d1f23",
+    "card_bg_publish": "#1a2234",
+    "card_bg_publish_hover": "#1f2a42",
+    "card_bg_review": "#221f1a",
+    "card_bg_review_hover": "#28241c",
     # Segmented pills (scope, inspector tabs, grid/list, settings tier-3)
     "pill_container_bg": "#1c1e22",
     "pill_segment_active_bg": "#2563eb",
@@ -542,7 +546,9 @@ PAGE_BADGE_ACCENT_COLORS: dict[str, str] = {
     "asset": "#10b981",  # Emerald-500
     "shot": "#f59e0b",  # Amber-500
     "inbox": "#3b82f6",  # Blue-500
-    "outbox": "#a855f7",  # Violet-500
+    "internal_check": "#f43f5e",  # Rose-500 — internal check
+    "outbox": "#a855f7",  # legacy alias
+    "delivery": "#a855f7",  # Violet-500 — send out
     "guide": "#14b8a6",  # Teal-500
 }
 
@@ -672,7 +678,9 @@ FILTER_BADGE_ACCENT: dict[str, dict[str, object]] = {
     "type": {"rgb": (16, 185, 129), "accent_hex": "#10b981", "text_hex": "#ffffff"},
     "department": {"rgb": (59, 130, 246), "accent_hex": "#3b82f6", "text_hex": "#ffffff"},
     "inbox": {"rgb": (59, 130, 246), "accent_hex": "#3b82f6", "text_hex": "#ffffff"},
+    "internal_check": {"rgb": (244, 63, 94), "accent_hex": "#f43f5e", "text_hex": "#ffffff"},
     "outbox": {"rgb": (168, 85, 247), "accent_hex": "#a855f7", "text_hex": "#ffffff"},
+    "delivery": {"rgb": (168, 85, 247), "accent_hex": "#a855f7", "text_hex": "#ffffff"},
     "guide": {"rgb": (20, 184, 166), "accent_hex": "#14b8a6", "text_hex": "#ffffff"},
 }
 
@@ -1870,7 +1878,13 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#MainViewTypeBadge[badgeKind="inbox"][navLink="true"]:hover {
             background: rgba(59, 130, 246, 0.24);
         }
+        QWidget#MainViewTypeBadge[badgeKind="internal_check"][navLink="true"]:hover {
+            background: rgba(244, 63, 94, 0.24);
+        }
         QWidget#MainViewTypeBadge[badgeKind="outbox"][navLink="true"]:hover {
+            background: rgba(168, 85, 247, 0.24);
+        }
+        QWidget#MainViewTypeBadge[badgeKind="delivery"][navLink="true"]:hover {
             background: rgba(168, 85, 247, 0.24);
         }
         QWidget#MainViewTypeBadge[badgeKind="guide"][navLink="true"]:hover {
@@ -1933,6 +1947,22 @@ def apply_dark_theme(app: QApplication) -> None:
             background: rgba(147, 51, 234, 0.95);
             border: none;
         }
+        QWidget#MainViewFilterBadge[filterRole="delivery"] {
+            background: rgba(168, 85, 247, 0.86);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="delivery"][navLink="true"]:hover {
+            background: rgba(147, 51, 234, 0.95);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="internal_check"] {
+            background: rgba(244, 63, 94, 0.86);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="internal_check"][navLink="true"]:hover {
+            background: rgba(225, 29, 72, 0.95);
+            border: none;
+        }
         QWidget#MainViewFilterBadge[filterRole="guide"] {
             background: rgba(20, 184, 166, 0.86);
             border: none;
@@ -1942,14 +1972,22 @@ def apply_dark_theme(app: QApplication) -> None:
             border: none;
         }
         QWidget#MainViewFilterBadge[filterRole="inbox_date"],
+        QWidget#MainViewFilterBadge[filterRole="internal_check_date"],
         QWidget#MainViewFilterBadge[filterRole="outbox_date"],
+        QWidget#MainViewFilterBadge[filterRole="delivery_date"],
         QWidget#MainViewFilterBadge[filterRole="guide_date"] {
             border: none;
         }
         QWidget#MainViewFilterBadge[filterRole="inbox_date"] {
             background: rgba(59, 130, 246, 0.55);
         }
+        QWidget#MainViewFilterBadge[filterRole="internal_check_date"] {
+            background: rgba(244, 63, 94, 0.55);
+        }
         QWidget#MainViewFilterBadge[filterRole="outbox_date"] {
+            background: rgba(168, 85, 247, 0.55);
+        }
+        QWidget#MainViewFilterBadge[filterRole="delivery_date"] {
             background: rgba(168, 85, 247, 0.55);
         }
         QWidget#MainViewFilterBadge[filterRole="guide_date"] {
@@ -1961,6 +1999,14 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QWidget#MainViewFilterBadge[filterRole="outbox_date"][navLink="true"]:hover {
             background: rgba(168, 85, 247, 0.68);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="delivery_date"][navLink="true"]:hover {
+            background: rgba(168, 85, 247, 0.68);
+            border: none;
+        }
+        QWidget#MainViewFilterBadge[filterRole="internal_check_date"][navLink="true"]:hover {
+            background: rgba(244, 63, 94, 0.68);
             border: none;
         }
         QWidget#MainViewFilterBadge[filterRole="guide_date"][navLink="true"]:hover {
@@ -1978,9 +2024,13 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#MainViewFilterBadge[filterRole="department"] QLabel#MainViewFilterBadgeLabel,
         QWidget#MainViewFilterBadge[filterRole="inbox"] QLabel#MainViewFilterBadgeLabel,
         QWidget#MainViewFilterBadge[filterRole="outbox"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="internal_check"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="delivery"] QLabel#MainViewFilterBadgeLabel,
         QWidget#MainViewFilterBadge[filterRole="guide"] QLabel#MainViewFilterBadgeLabel,
         QWidget#MainViewFilterBadge[filterRole="inbox_date"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="internal_check_date"] QLabel#MainViewFilterBadgeLabel,
         QWidget#MainViewFilterBadge[filterRole="outbox_date"] QLabel#MainViewFilterBadgeLabel,
+        QWidget#MainViewFilterBadge[filterRole="delivery_date"] QLabel#MainViewFilterBadgeLabel,
         QWidget#MainViewFilterBadge[filterRole="guide_date"] QLabel#MainViewFilterBadgeLabel {
             color: #ffffff;
         }
@@ -1993,7 +2043,13 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#MainViewTypeBadge[badgeKind="inbox"] {
             background: rgba(59, 130, 246, 0.16);
         }
+        QWidget#MainViewTypeBadge[badgeKind="internal_check"] {
+            background: rgba(244, 63, 94, 0.16);
+        }
         QWidget#MainViewTypeBadge[badgeKind="outbox"] {
+            background: rgba(168, 85, 247, 0.16);
+        }
+        QWidget#MainViewTypeBadge[badgeKind="delivery"] {
             background: rgba(168, 85, 247, 0.16);
         }
         QWidget#MainViewTypeBadge[badgeKind="guide"] {
@@ -2012,7 +2068,13 @@ def apply_dark_theme(app: QApplication) -> None:
         QWidget#MainViewTypeBadge[badgeKind="inbox"] QLabel#MainViewTypeBadgeLabel {
             color: #3b82f6;
         }
+        QWidget#MainViewTypeBadge[badgeKind="internal_check"] QLabel#MainViewTypeBadgeLabel {
+            color: #f43f5e;
+        }
         QWidget#MainViewTypeBadge[badgeKind="outbox"] QLabel#MainViewTypeBadgeLabel {
+            color: #a855f7;
+        }
+        QWidget#MainViewTypeBadge[badgeKind="delivery"] QLabel#MainViewTypeBadgeLabel {
             color: #a855f7;
         }
         QWidget#MainViewTypeBadge[badgeKind="guide"] QLabel#MainViewTypeBadgeLabel {
