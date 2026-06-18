@@ -1,4 +1,4 @@
-"""Review tools panel — sidebar body (Ranges / Markers / Note)."""
+"""Review tools panel — sidebar body (Ranges / Markers / Draw)."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from monostudio.ui_qt.video_preview_context import PreviewContext
 from monostudio.ui_qt.video_marker_list_widget import VideoMarkerListWidget
 from monostudio.ui_qt.video_range_list_widget import VideoRangeListWidget
 from monostudio.ui_qt.video_review_draw_panel import VideoReviewDrawPanel
-from monostudio.ui_qt.video_review_note_panel import VideoReviewNotePanel
 
 
 class ReviewWorkspace(StrEnum):
@@ -84,17 +83,11 @@ class ReviewToolsPanel(QWidget):
     marker_delete_all_requested = Signal()
     marker_label_changed = Signal(str, str)
     marker_export_requested = Signal()
-    open_all_notes_requested = Signal()
     draw_keyframe_selected = Signal(str, int)
     draw_layer_selected = Signal(str)
     draw_keyframe_add_requested = Signal()
     draw_layer_add_requested = Signal()
     draw_undo_stroke_requested = Signal()
-    draw_tool_changed = Signal(str)
-    draw_color_changed = Signal(str)
-    draw_width_changed = Signal(float)
-    draw_onion_enabled_changed = Signal(bool)
-    draw_onion_span_changed = Signal(int)
     draw_keyframe_edit_frame_changed = Signal(int)
     draw_keyframe_hold_changed = Signal(int)
     draw_keyframe_delete_requested = Signal()
@@ -130,7 +123,6 @@ class ReviewToolsPanel(QWidget):
             [
                 ("", "Ranges (R)", ReviewToolMode.ranges.value, "sliders-horizontal"),
                 ("", "Markers (M)", ReviewToolMode.markers.value, "flag"),
-                ("", "Note (N)", ReviewToolMode.note.value, "message-circle"),
                 ("", "Draw (D)", ReviewToolMode.draw.value, "pencil"),
             ],
             mode_row,
@@ -169,19 +161,12 @@ class ReviewToolsPanel(QWidget):
         self._marker_panel.marker_delete_all_requested.connect(self.marker_delete_all_requested.emit)
         self._marker_panel.marker_rename_requested.connect(self.marker_label_changed.emit)
         self._marker_panel.export_requested.connect(self.marker_export_requested.emit)
-        self._note_panel = VideoReviewNotePanel()
-        self._note_panel.open_all_notes_requested.connect(self.open_all_notes_requested.emit)
         self._draw_panel = VideoReviewDrawPanel()
         self._draw_panel.keyframe_selected.connect(self.draw_keyframe_selected.emit)
         self._draw_panel.layer_selected.connect(self.draw_layer_selected.emit)
         self._draw_panel.keyframe_add_requested.connect(self.draw_keyframe_add_requested.emit)
         self._draw_panel.layer_add_requested.connect(self.draw_layer_add_requested.emit)
         self._draw_panel.undo_stroke_requested.connect(self.draw_undo_stroke_requested.emit)
-        self._draw_panel.tool_changed.connect(self.draw_tool_changed.emit)
-        self._draw_panel.color_changed.connect(self.draw_color_changed.emit)
-        self._draw_panel.width_changed.connect(self.draw_width_changed.emit)
-        self._draw_panel.onion_enabled_changed.connect(self.draw_onion_enabled_changed.emit)
-        self._draw_panel.onion_span_changed.connect(self.draw_onion_span_changed.emit)
         self._draw_panel.keyframe_edit_frame_changed.connect(self.draw_keyframe_edit_frame_changed.emit)
         self._draw_panel.keyframe_hold_changed.connect(self.draw_keyframe_hold_changed.emit)
         self._draw_panel.keyframe_delete_requested.connect(self.draw_keyframe_delete_requested.emit)
@@ -198,7 +183,6 @@ class ReviewToolsPanel(QWidget):
         self._stack.addWidget(self._empty)
         self._stack.addWidget(self._range_panel)
         self._stack.addWidget(self._marker_panel)
-        self._stack.addWidget(self._note_panel)
         self._stack.addWidget(self._draw_panel)
         body_lay.addWidget(self._stack, 1)
         root.addWidget(self._body_wrap)
@@ -210,12 +194,8 @@ class ReviewToolsPanel(QWidget):
 
     def apply_context(self, context: PreviewContext) -> None:
         self._context = context
-        show_note = context == PreviewContext.entity
         show_draw = context == PreviewContext.entity
-        self._mode_pills.set_segment_visible(ReviewToolMode.note.value, show_note)
         self._mode_pills.set_segment_visible(ReviewToolMode.draw.value, show_draw)
-        if self._tool_mode == ReviewToolMode.note and not show_note:
-            self.activate_tool_mode(ReviewToolMode.ranges)
         if self._tool_mode == ReviewToolMode.draw and not show_draw:
             self.activate_tool_mode(ReviewToolMode.ranges)
 
@@ -224,9 +204,6 @@ class ReviewToolsPanel(QWidget):
 
     def marker_list_widget(self) -> VideoMarkerListWidget:
         return self._marker_panel
-
-    def note_panel(self) -> VideoReviewNotePanel:
-        return self._note_panel
 
     def draw_panel(self) -> VideoReviewDrawPanel:
         return self._draw_panel
@@ -258,8 +235,6 @@ class ReviewToolsPanel(QWidget):
                 mode = ReviewToolMode(mode)
             except ValueError:
                 mode = ReviewToolMode.ranges
-        if mode == ReviewToolMode.note and self._context != PreviewContext.entity:
-            mode = ReviewToolMode.ranges
         if mode == ReviewToolMode.draw and self._context != PreviewContext.entity:
             mode = ReviewToolMode.ranges
         prev_mode = self._tool_mode
@@ -278,10 +253,6 @@ class ReviewToolsPanel(QWidget):
 
     def retreat_workspace_or_mode(self) -> bool:
         if self._workspace == ReviewWorkspace.tools:
-            if self._tool_mode == ReviewToolMode.note:
-                self._tool_mode = ReviewToolMode.ranges
-                self._apply_workspace_layout()
-                return True
             if self._tool_mode == ReviewToolMode.markers:
                 self._tool_mode = ReviewToolMode.ranges
                 self._apply_workspace_layout()
@@ -355,9 +326,6 @@ class ReviewToolsPanel(QWidget):
                 self._stack.setCurrentWidget(self._marker_panel)
                 self._name_field.show()
                 self._name_field.setPlaceholderText("Marker label (optional)")
-            elif self._tool_mode == ReviewToolMode.note:
-                self._stack.setCurrentWidget(self._note_panel)
-                self._name_field.hide()
             elif self._tool_mode == ReviewToolMode.draw:
                 self._stack.setCurrentWidget(self._draw_panel)
                 self._name_field.hide()

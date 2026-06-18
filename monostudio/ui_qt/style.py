@@ -3634,6 +3634,17 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid #3f3f46;
             border-radius: 8px;
         }
+        QFrame#VideoReviewDrawBrushStrip {
+            background-color: rgba(24, 24, 27, 0.88);
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+        }
+        QWidget#VideoReviewNoteRail {
+            background: transparent;
+        }
+        QFrame#VideoReviewNoteBody {
+            background: transparent;
+        }
         QLabel#VideoReviewDrawQuickLabel {
             color: #a1a1aa;
             font-family: "Inter";

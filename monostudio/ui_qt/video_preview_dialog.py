@@ -116,7 +116,9 @@ from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.inspector_preview_settings import write_sequence_preview_fps
 from monostudio.ui_qt.review_draw_overlay import ReviewDrawOverlay
 from monostudio.ui_qt.video_review_draw_panel import VideoReviewDrawTransportActions
+from monostudio.ui_qt.video_review_draw_brush_strip import VideoReviewDrawBrushStrip
 from monostudio.ui_qt.video_review_draw_quick_popup import VideoReviewDrawQuickPopup
+from monostudio.ui_qt.video_review_note_rail import VideoReviewNoteRail
 from monostudio.ui_qt.review_onion_layer import ReviewOnionLayer
 from monostudio.ui_qt.review_playback_backend import SequenceDecodeBackend
 from monostudio.ui_qt.dialog_geometry import (
@@ -826,6 +828,10 @@ class VideoPreviewDialog(MonosDialog):
         body = QHBoxLayout()
         body.setSpacing(0)
 
+        self._note_rail = VideoReviewNoteRail(self)
+        self._note_rail.apply_context(self._context)
+        body.addWidget(self._note_rail, 0)
+
         self._main_column = QWidget(self)
         self._main_column.setObjectName("VideoPreviewMainColumn")
         main_lay = QVBoxLayout(self._main_column)
@@ -878,6 +884,9 @@ class VideoPreviewDialog(MonosDialog):
         self._hud.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
         self._hud.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hud.mousePressEvent = lambda _e: self._copy_timecode()  # type: ignore[method-assign]
+
+        self._draw_brush_strip = VideoReviewDrawBrushStrip(self._viewer)
+        self._draw_brush_strip.hide()
 
         self._proxy_build_overlay = QWidget(self._viewer)
         self._proxy_build_overlay.setObjectName("VideoPreviewProxyBuildOverlay")
@@ -1139,8 +1148,6 @@ class VideoPreviewDialog(MonosDialog):
         self._draw_transport.keyframe_add_requested.connect(self._add_draw_keyframe_at_playhead)
         self._draw_transport.layer_add_requested.connect(self._add_draw_layer_on_keyframe)
         self._draw_transport.undo_stroke_requested.connect(self._undo_draw_stroke)
-        self._draw_transport.onion_enabled_changed.connect(self._on_draw_onion_enabled)
-        self._draw_transport.onion_span_changed.connect(self._on_draw_onion_span_changed)
         tlay.addWidget(self._draw_transport)
 
         tlay.addStretch(1)
@@ -1242,18 +1249,18 @@ class VideoPreviewDialog(MonosDialog):
         self._tools_panel.marker_delete_all_requested.connect(self._delete_all_markers)
         self._tools_panel.marker_label_changed.connect(self._on_marker_label_changed)
         self._tools_panel.marker_export_requested.connect(self._export_markers_png)
-        self._tools_panel.open_all_notes_requested.connect(self.open_all_notes_requested.emit)
-        self._tools_panel.note_panel().note_added.connect(self._on_review_note_added)
+        self._note_rail.panel().open_all_notes_requested.connect(self.open_all_notes_requested.emit)
+        self._note_rail.panel().note_added.connect(self._on_review_note_added)
         self._tools_panel.draw_keyframe_selected.connect(self._on_draw_keyframe_selected)
         self._tools_panel.draw_layer_selected.connect(self._on_draw_layer_selected)
         self._tools_panel.draw_keyframe_add_requested.connect(self._add_draw_keyframe_at_playhead)
         self._tools_panel.draw_layer_add_requested.connect(self._add_draw_layer_on_keyframe)
         self._tools_panel.draw_undo_stroke_requested.connect(self._undo_draw_stroke)
-        self._tools_panel.draw_tool_changed.connect(self._on_draw_tool_changed)
-        self._tools_panel.draw_color_changed.connect(self._on_draw_color_changed)
-        self._tools_panel.draw_width_changed.connect(self._on_draw_width_changed)
-        self._tools_panel.draw_onion_enabled_changed.connect(self._on_draw_onion_enabled)
-        self._tools_panel.draw_onion_span_changed.connect(self._on_draw_onion_span_changed)
+        self._draw_brush_strip.tool_changed.connect(self._on_draw_tool_changed)
+        self._draw_brush_strip.color_changed.connect(self._on_draw_color_changed)
+        self._draw_brush_strip.width_changed.connect(self._on_draw_width_changed)
+        self._draw_brush_strip.onion_enabled_changed.connect(self._on_draw_onion_enabled)
+        self._draw_brush_strip.onion_span_changed.connect(self._on_draw_onion_span_changed)
         self._tools_panel.draw_keyframe_edit_frame_changed.connect(self._on_draw_keyframe_edit_frame_changed)
         self._tools_panel.draw_keyframe_hold_changed.connect(self._on_draw_keyframe_hold_changed)
         self._tools_panel.draw_keyframe_delete_requested.connect(self._delete_active_draw_keyframe)
@@ -1525,7 +1532,9 @@ class VideoPreviewDialog(MonosDialog):
         self._update_footer()
 
     def _open_review_tools_panel(self, mode: ReviewToolMode = ReviewToolMode.ranges) -> None:
-        """Show sidebar tools (ranges / markers / note)."""
+        """Show sidebar tools (ranges / markers / draw)."""
+        if mode == ReviewToolMode.note:
+            mode = ReviewToolMode.ranges
         self._tools_panel.set_workspace(ReviewWorkspace.tools)
         self._tools_panel.activate_tool_mode(mode)
         self._sync_shell_corner_radius()
@@ -1534,8 +1543,6 @@ class VideoPreviewDialog(MonosDialog):
         self._update_note_frame_hint()
         self._sync_transport_tool_controls()
         self._sync_scrubber_timeline_display()
-        if mode == ReviewToolMode.note:
-            self._sync_note_panel_context()
 
     def _on_sequence_fps_changed(self, value: int) -> None:
         if not self._is_sequence_mode() or self._seq_backend is None:
@@ -2154,7 +2161,7 @@ class VideoPreviewDialog(MonosDialog):
         QShortcut(QKeySequence(Qt.Key.Key_K), self, self._add_marker_at_playhead)
         QShortcut(QKeySequence(Qt.Key.Key_Comma), self, self._select_prev_marker_shortcut)
         QShortcut(QKeySequence(Qt.Key.Key_Period), self, self._select_next_marker_shortcut)
-        QShortcut(QKeySequence(Qt.Key.Key_N), self, lambda: self._activate_tool(ReviewToolMode.note))
+        QShortcut(QKeySequence(Qt.Key.Key_N), self, self._toggle_note_rail)
         QShortcut(QKeySequence(Qt.Key.Key_D), self, self._toggle_draw_tool)
 
     def _fit_viewer_viewport(self) -> None:
@@ -2218,6 +2225,8 @@ class VideoPreviewDialog(MonosDialog):
         self._context = context
         self._profile_key = context.value
         self._tools_panel.apply_context(context)
+        if hasattr(self, "_note_rail"):
+            self._note_rail.apply_context(context)
         show_sync = context != PreviewContext.inbox
         self._btn_sync.setVisible(show_sync)
         self._btn_sync.setEnabled(show_sync)
@@ -2226,7 +2235,7 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_transport_tool_controls()
 
     def _sync_note_panel_context(self) -> None:
-        panel = self._tools_panel.note_panel()
+        panel = self._note_rail.panel()
         anchor = self._geometry_anchor
         workspace_root = getattr(anchor, "_workspace_root", None) if anchor is not None else None
         project_root = getattr(anchor, "_project_root", None) if anchor is not None else None
@@ -2259,6 +2268,9 @@ class VideoPreviewDialog(MonosDialog):
                 mode = ReviewToolMode(mode_name)
             except ValueError:
                 mode = ReviewToolMode.ranges
+            if mode == ReviewToolMode.note:
+                self._note_rail.set_open(True)
+                mode = ReviewToolMode.ranges
             self._tools_panel.activate_tool_mode(mode)
         self._sync_tools_panel_button()
 
@@ -2270,19 +2282,22 @@ class VideoPreviewDialog(MonosDialog):
 
     def _on_tools_mode_changed(self, mode_name: str) -> None:
         if self._settings is not None:
+            if mode_name == ReviewToolMode.note.value:
+                mode_name = ReviewToolMode.ranges.value
             write_review_tool_mode(self._settings, self._profile_key, mode_name)
         self._apply_timeline_list_mode()
         self._sync_range_ui()
         self._sync_draw_overlay_state()
         self._sync_transport_tool_controls()
-        if self._tools_panel.tool_mode() == ReviewToolMode.note:
-            self._sync_note_panel_context()
+        self._refresh_footer_hint()
+        self._sync_scrubber_timeline_display()
 
     def _cycle_workspace(self) -> None:
         self._tools_panel.cycle_workspace()
 
     def _activate_tool(self, mode: ReviewToolMode) -> None:
-        if mode == ReviewToolMode.note and self._context != PreviewContext.entity:
+        if mode == ReviewToolMode.note:
+            self._toggle_note_rail()
             return
         if mode == ReviewToolMode.draw and self._context != PreviewContext.entity:
             return
@@ -2290,8 +2305,6 @@ class VideoPreviewDialog(MonosDialog):
             self._open_review_tools_panel(mode)
             return
         self._tools_panel.activate_tool_mode(mode)
-        if mode == ReviewToolMode.note:
-            self._sync_note_panel_context()
         if mode == ReviewToolMode.draw:
             self._sync_draw_overlay_state()
         self._sync_transport_tool_controls()
@@ -2356,8 +2369,21 @@ class VideoPreviewDialog(MonosDialog):
         elif chosen == act_focus:
             self._focus_timeline_range()
 
+    def _note_rail_open(self) -> bool:
+        return hasattr(self, "_note_rail") and self._note_rail.is_open()
+
+    def _toggle_note_rail(self) -> None:
+        if self._context != PreviewContext.entity:
+            return
+        opening = not self._note_rail_open()
+        self._note_rail.toggle()
+        if opening:
+            self._sync_note_panel_context()
+            self._note_rail.panel()._editor.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self._refresh_footer_hint()
+
     def _notes_tool_active(self) -> bool:
-        return self._tools_panel.tool_mode() == ReviewToolMode.note
+        return self._note_rail_open()
 
     def _sync_transport_tool_controls(self) -> None:
         if not hasattr(self, "_draw_transport"):
@@ -2374,9 +2400,9 @@ class VideoPreviewDialog(MonosDialog):
         self._btn_add_marker.setVisible(markers)
 
         self._draw_transport.setVisible(draw)
-        if draw:
-            self._draw_transport.set_onion_enabled(self._onion_enabled)
-            self._draw_transport.set_onion_span(self._onion_span)
+        if draw and hasattr(self, "_draw_brush_strip"):
+            self._draw_brush_strip.set_onion_enabled(self._onion_enabled)
+            self._draw_brush_strip.set_onion_span(self._onion_span)
 
         show_export = ranges or markers
         self._btn_export.setVisible(show_export)
@@ -2690,8 +2716,8 @@ class VideoPreviewDialog(MonosDialog):
         if mode == ReviewToolMode.markers:
             parts.append("K — Add marker")
             return parts
-        if mode == ReviewToolMode.note and self._context == PreviewContext.entity:
-            parts.append("R — Ranges")
+        if self._note_rail_open():
+            parts.append("N — Close notes")
             return parts
         has_draft = self._draft_in is not None or self._draft_out is not None
         has_sel = self._active_range_id is not None
@@ -2752,15 +2778,15 @@ class VideoPreviewDialog(MonosDialog):
         return parts
 
     def _footer_hints_note(self, zone: str) -> list[str]:
+        parts: list[str] = []
         if zone == "video":
             parts = self._footer_video_navigation_hints()
-            parts.append("R — Ranges")
-            return parts
-        if zone in ("track", "ruler"):
+        elif zone in ("track", "ruler"):
             parts = self._footer_timeline_navigation_hints(zone)
-            parts.append("R — Ranges")
-            return parts
-        return ["Space — Play/Pause", "R — Ranges"]
+        else:
+            parts = ["Space — Play/Pause"]
+        parts += ["Ctrl+Enter — Add note", "N — Close notes"]
+        return parts
 
     def _footer_hints_ranges(self, zone: str) -> list[str]:
         has_draft = self._draft_in is not None or self._draft_out is not None
@@ -2849,12 +2875,15 @@ class VideoPreviewDialog(MonosDialog):
 
         mode = self._tools_panel.tool_mode()
         if mode == ReviewToolMode.draw and self._context == PreviewContext.entity:
-            return self._footer_hints_draw(zone)
-        if mode == ReviewToolMode.markers:
-            return self._footer_hints_markers(zone)
-        if mode == ReviewToolMode.note and self._context == PreviewContext.entity:
-            return self._footer_hints_note(zone)
-        return self._footer_hints_ranges(zone)
+            parts = self._footer_hints_draw(zone)
+        elif mode == ReviewToolMode.markers:
+            parts = self._footer_hints_markers(zone)
+        else:
+            parts = self._footer_hints_ranges(zone)
+        if self._note_rail_open():
+            note_bits = self._footer_hints_note(zone)
+            parts = note_bits[:2] + parts
+        return parts
 
     def _show_title_picker_menu(self) -> None:
         if self._context == PreviewContext.entity and self._work_path is not None:
@@ -2900,8 +2929,8 @@ class VideoPreviewDialog(MonosDialog):
             return False
         if isinstance(fw, (QLineEdit, QTextEdit)):
             return True
-        if self._notes_tool_active() and hasattr(self, "_tools_panel"):
-            editor = self._tools_panel.note_panel()._editor
+        if self._notes_tool_active() and hasattr(self, "_note_rail"):
+            editor = self._note_rail.panel()._editor
             popup = editor._mention_popup
             if popup.isVisible() and (fw is popup or popup.isAncestorOf(fw)):
                 return True
@@ -2977,7 +3006,7 @@ class VideoPreviewDialog(MonosDialog):
 
     def _on_escape(self) -> None:
         if self._text_editing_focused():
-            editor = self._tools_panel.note_panel()._editor
+            editor = self._note_rail.panel()._editor
             if editor._mention_popup.isVisible():
                 editor._hide_mention_popup()
             return
@@ -3019,6 +3048,10 @@ class VideoPreviewDialog(MonosDialog):
         if self._scrubber.is_zoomed():
             self._fit_timeline_view()
             return
+        if self._note_rail_open():
+            self._note_rail.set_open(False)
+            self._refresh_footer_hint()
+            return
         if self._tools_panel.workspace() == ReviewWorkspace.tools:
             self._tools_panel.set_workspace(ReviewWorkspace.focus)
             return
@@ -3038,6 +3071,7 @@ class VideoPreviewDialog(MonosDialog):
             self._footer.show()
             self._refresh_footer_hint()
             self._tools_panel.show()
+            self._note_rail.show()
             self._restore_locked_size()
         else:
             self._fullscreen = True
@@ -3049,6 +3083,7 @@ class VideoPreviewDialog(MonosDialog):
             self._transport.hide()
             self._footer.hide()
             self._tools_panel.hide()
+            self._note_rail.hide()
             self._apply_dialog_content_inset()
             self.showFullScreen()
             self._setup_fullscreen_chrome_tracking()
@@ -3258,6 +3293,19 @@ class VideoPreviewDialog(MonosDialog):
             area.left() + m,
             area.top() + max(m, area.height() - clip - self._hud.height() - m),
         )
+        self._position_draw_brush_strip()
+
+    def _position_draw_brush_strip(self) -> None:
+        strip = getattr(self, "_draw_brush_strip", None)
+        if strip is None or not self._viewer:
+            return
+        if not strip.isVisible():
+            return
+        strip.adjustSize()
+        area = self._video_overlay_rect()
+        m = 8
+        strip.move(area.left() + m, area.top() + m)
+        strip.raise_()
 
     def _onion_decode_max_side(self) -> int:
         if not hasattr(self, "_surface"):
@@ -3274,6 +3322,8 @@ class VideoPreviewDialog(MonosDialog):
     def _raise_video_overlays(self) -> None:
         if self._hud:
             self._hud.raise_()
+        if hasattr(self, "_draw_brush_strip") and self._draw_brush_strip.isVisible():
+            self._position_draw_brush_strip()
         if hasattr(self, "_onion_layer"):
             self._sync_viewport_overlay_geometry()
         if hasattr(self, "_draw_overlay"):
@@ -3573,7 +3623,7 @@ class VideoPreviewDialog(MonosDialog):
         if self._context != PreviewContext.entity:
             return
         f = self._current_frame() if frame is None else int(frame)
-        panel = self._tools_panel.note_panel()
+        panel = self._note_rail.panel()
         panel.set_playhead(f, self._fps())
 
     def _update_sync_button(self) -> None:
@@ -4148,7 +4198,7 @@ class VideoPreviewDialog(MonosDialog):
         if zone == "video" and self._draw_tool_active():
             if self._draw_keyframe_edit_unlocked:
                 self._exit_draw_keyframe_edit()
-            self._tools_panel.draw_panel().set_active_tool("eraser")
+            self._draw_brush_strip.set_active_tool("eraser")
             return
         if not self._pointer_over_scrubber(zone):
             return
@@ -4695,7 +4745,7 @@ class VideoPreviewDialog(MonosDialog):
         self._update_position_display(sec)
         if (
             self._context == PreviewContext.entity
-            and self._tools_panel.tool_mode() == ReviewToolMode.note
+            and self._note_rail_open()
         ):
             self._update_note_frame_hint(frame)
         if self._draw_playhead_sync_needed(frame):
@@ -4770,6 +4820,10 @@ class VideoPreviewDialog(MonosDialog):
         active = self._draw_tool_active()
         self._draw_overlay.set_draw_active(active)
         self._draw_overlay.set_onion(enabled=self._onion_enabled, span=self._onion_span)
+        if hasattr(self, "_draw_brush_strip"):
+            self._draw_brush_strip.setVisible(active)
+            if active:
+                self._position_draw_brush_strip()
         self._sync_draw_playhead(frame)
         if hasattr(self, "_surface"):
             self._sync_viewport_overlay_geometry()
@@ -4804,8 +4858,8 @@ class VideoPreviewDialog(MonosDialog):
         if not self._draw_tool_active():
             return
         self._onion_enabled = not self._onion_enabled
-        if hasattr(self, "_draw_transport"):
-            self._draw_transport.set_onion_enabled(self._onion_enabled)
+        if hasattr(self, "_draw_brush_strip"):
+            self._draw_brush_strip.set_onion_enabled(self._onion_enabled)
         self._schedule_onion_refresh()
 
     def _add_draw_keyframe_at_playhead(self) -> None:
@@ -4909,9 +4963,8 @@ class VideoPreviewDialog(MonosDialog):
                 pass
             self._draw_quick_popup = None
         popup = VideoReviewDrawQuickPopup(self)
-        draw_panel = self._tools_panel.draw_panel()
         popup.set_state(
-            tool=draw_panel.active_tool(),
+            tool=self._draw_brush_strip.active_tool(),
             color=self._draw_overlay.color(),
             width=self._draw_overlay.width_px(),
         )
@@ -4925,17 +4978,17 @@ class VideoPreviewDialog(MonosDialog):
     def _on_draw_quick_tool_changed(self, tool: str) -> None:
         if not self._draw_tool_active():
             self._activate_tool(ReviewToolMode.draw)
-        self._tools_panel.draw_panel().set_active_tool(tool)
+        self._draw_brush_strip.set_active_tool(tool)
 
     def _on_draw_quick_color_changed(self, color: str) -> None:
         if not self._draw_tool_active():
             self._activate_tool(ReviewToolMode.draw)
-        self._tools_panel.draw_panel().set_active_color(color)
+        self._draw_brush_strip.set_active_color(color)
 
     def _on_draw_quick_width_changed(self, width: float) -> None:
         if not self._draw_tool_active():
             self._activate_tool(ReviewToolMode.draw)
-        self._tools_panel.draw_panel().set_active_width(width)
+        self._draw_brush_strip.set_active_width(width)
 
     def _on_draw_tool_changed(self, tool: str) -> None:
         if tool in ("pen", "arrow", "rect", "eraser"):
@@ -4949,14 +5002,14 @@ class VideoPreviewDialog(MonosDialog):
 
     def _on_draw_onion_enabled(self, enabled: bool) -> None:
         self._onion_enabled = bool(enabled)
-        if hasattr(self, "_draw_transport"):
-            self._draw_transport.set_onion_enabled(self._onion_enabled)
+        if hasattr(self, "_draw_brush_strip"):
+            self._draw_brush_strip.set_onion_enabled(self._onion_enabled)
         self._schedule_onion_refresh()
 
     def _on_draw_onion_span_changed(self, span: int) -> None:
         self._onion_span = max(1, min(5, int(span)))
-        if hasattr(self, "_draw_transport"):
-            self._draw_transport.set_onion_span(self._onion_span)
+        if hasattr(self, "_draw_brush_strip"):
+            self._draw_brush_strip.set_onion_span(self._onion_span)
         self._schedule_onion_refresh()
 
     def _schedule_onion_refresh(self) -> None:
