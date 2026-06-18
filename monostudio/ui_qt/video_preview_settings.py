@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Callable, Literal
 
 from PySide6.QtCore import QSettings, QByteArray
 
@@ -73,6 +73,11 @@ _VALID_EXPORT_FORMAT = frozenset({
 _VALID_WORKSPACES = frozenset({"focus", "review", "tools", "theater"})
 _VALID_TOOL_MODES = frozenset({"ranges", "markers", "note", "draw"})
 _VALID_TIME_DISPLAY = frozenset({TIME_DISPLAY_FRAME, TIME_DISPLAY_TIMECODE})
+
+# Shared QSettings profile for review player workspace / tool mode (all PreviewContext values).
+REVIEW_PLAYER_SETTINGS_PROFILE = "review"
+REVIEW_PLAYER_GEOMETRY_FRACTION = 0.95
+_LEGACY_REVIEW_SETTINGS_PROFILES = ("entity", "project_guide", "inbox")
 
 
 def default_qsettings() -> QSettings:
@@ -145,6 +150,13 @@ def read_video_preview_geometry(settings: QSettings | None, *, profile: str | No
         v = settings.value(key)
         if isinstance(v, QByteArray) and len(v) > 0:
             return bytes(v)
+    # Legacy: sequence preview stored geometry separately before unified player.
+    legacy = settings.value(KEY_SEQUENCE_PREVIEW_GEOMETRY)
+    if isinstance(legacy, QByteArray) and len(legacy) > 0:
+        data = bytes(legacy)
+        if profile:
+            write_video_preview_geometry(settings, data, profile=profile)
+        return data
     return None
 
 
@@ -195,12 +207,24 @@ def write_video_export_format(settings: QSettings, fmt: str) -> None:
         settings.setValue(KEY_VIDEO_EXPORT_FORMAT, f)
 
 
+def _review_profile_keys(profile: str, key_for: Callable[[str], str]) -> list[str]:
+    keys = [key_for(profile)]
+    if (profile or "").strip().lower() == REVIEW_PLAYER_SETTINGS_PROFILE:
+        keys.extend(key_for(p) for p in _LEGACY_REVIEW_SETTINGS_PROFILES)
+    return keys
+
+
 def read_review_workspace(settings: QSettings | None, *, profile: str) -> str:
     if settings is None:
         return "focus"
-    v = settings.value(workspace_key_for_profile(profile), "focus")
-    s = (v or "focus").strip().lower() if isinstance(v, str) else "focus"
-    return s if s in _VALID_WORKSPACES else "focus"
+    for key in _review_profile_keys(profile, workspace_key_for_profile):
+        if not settings.contains(key):
+            continue
+        v = settings.value(key)
+        s = (v or "focus").strip().lower() if isinstance(v, str) else "focus"
+        if s in _VALID_WORKSPACES:
+            return s
+    return "focus"
 
 
 def write_review_workspace(settings: QSettings, profile: str, workspace: str) -> None:
@@ -212,9 +236,14 @@ def write_review_workspace(settings: QSettings, profile: str, workspace: str) ->
 def read_review_tool_mode(settings: QSettings | None, *, profile: str) -> str:
     if settings is None:
         return "ranges"
-    v = settings.value(tool_mode_key_for_profile(profile), "ranges")
-    s = (v or "ranges").strip().lower() if isinstance(v, str) else "ranges"
-    return s if s in _VALID_TOOL_MODES else "ranges"
+    for key in _review_profile_keys(profile, tool_mode_key_for_profile):
+        if not settings.contains(key):
+            continue
+        v = settings.value(key)
+        s = (v or "ranges").strip().lower() if isinstance(v, str) else "ranges"
+        if s in _VALID_TOOL_MODES:
+            return s
+    return "ranges"
 
 
 def write_review_tool_mode(settings: QSettings, profile: str, mode: str) -> None:

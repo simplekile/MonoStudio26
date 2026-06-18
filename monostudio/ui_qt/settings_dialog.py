@@ -903,8 +903,8 @@ class SettingsDialog(MonosDialog):
         qv_card, qv_l = add_settings_section(
             inner,
             "Quick view",
-            "Houdini-style page bookmarks: Ctrl+1–9 assigns the current page and filters; "
-            "press 1–9 to return. Slots are stored per machine.",
+            "Houdini-style page bookmarks: Ctrl+` opens the picker grid; Ctrl+1–9 assigns "
+            "the current page and filters; press 1–9 to return. Slots are stored per machine.",
         )
         from monostudio.ui_qt.nav_quick_view import SLOT_COUNT
 

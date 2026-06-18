@@ -100,6 +100,27 @@ def clear_nav_quick_slot(settings: QSettings, slot: int) -> None:
     settings.remove(_slot_settings_key(slot))
 
 
+def exchange_nav_quick_slots(settings: QSettings, slot_a: int, slot_b: int) -> None:
+    """Swap or move bookmark payloads between two slot positions."""
+    a = int(slot_a)
+    b = int(slot_b)
+    if a == b:
+        return
+    pa = load_nav_quick_slot(settings, a)
+    pb = load_nav_quick_slot(settings, b)
+    if pa is None and pb is None:
+        return
+    if pa is None:
+        save_nav_quick_slot(settings, a, pb)  # type: ignore[arg-type]
+        clear_nav_quick_slot(settings, b)
+    elif pb is None:
+        save_nav_quick_slot(settings, b, pa)
+        clear_nav_quick_slot(settings, a)
+    else:
+        save_nav_quick_slot(settings, a, pb)
+        save_nav_quick_slot(settings, b, pa)
+
+
 def clear_all_nav_quick_slots(settings: QSettings) -> None:
     for slot in range(1, _SLOT_COUNT + 1):
         settings.remove(_slot_settings_key(slot))
@@ -131,13 +152,23 @@ def describe_nav_quick_slot(payload: dict[str, Any] | None) -> str:
     return " · ".join(parts)
 
 
-def format_nav_item_tooltip(label: str, slots: list[int] | None, *, include_hint: bool = True) -> str:
+def format_nav_item_tooltip(
+    label: str,
+    slots: list[int] | None,
+    *,
+    include_hint: bool = True,
+    settings: QSettings | None = None,
+) -> str:
     line = (label or "").strip()
     if slots:
         nums = ", ".join(str(s) for s in slots)
         line = f"{line} (Quick view {nums})"
     if include_hint:
-        return f"{line}\nCtrl+1–9 assign · 1–9 go"
+        if settings is not None:
+            from monostudio.ui_qt.app_hotkeys import format_nav_quick_hint
+
+            return f"{line}\n{format_nav_quick_hint(settings)}"
+        return f"{line}\nCtrl+` picker · Ctrl+1–9 assign · 1–9 go"
     return line
 
 

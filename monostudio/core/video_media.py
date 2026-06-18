@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
@@ -839,6 +840,358 @@ def load_sequence_ranges_for_preview(
     if local is not None:
         return published, local, True
     return published, list(published), False
+
+
+def sequence_markers_sidecar_path(sequence_folder: Path) -> Path:
+    return sequence_folder / ".monos.markers.json"
+
+
+def sequence_markers_local_draft_path(sequence_folder: Path) -> Path:
+    try:
+        key_src = str(sequence_folder.resolve()).casefold()
+    except OSError:
+        key_src = str(sequence_folder).casefold()
+    digest = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:32]
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if localappdata:
+        base = Path(localappdata) / "MonoStudio" / "cache" / "video_markers" / "seq"
+    else:
+        from monostudio.core.app_paths import get_app_base_path
+
+        base = get_app_base_path() / "monostudio_data" / "cache" / "video_markers" / "seq"
+    return base / f"{digest}.json"
+
+
+def _sequence_markers_payload(sequence_folder: Path, markers: Sequence[VideoReviewMarker]) -> dict:
+    try:
+        source_path = str(sequence_folder.resolve())
+    except OSError:
+        source_path = str(sequence_folder)
+    return {
+        "version": 1,
+        "source": sequence_folder.name,
+        "source_path": source_path,
+        "markers": [
+            {
+                "id": m.id,
+                "frame": m.frame,
+                "label": m.label,
+                "created_at": float(m.created_at or 0.0),
+            }
+            for m in markers
+        ],
+    }
+
+
+def _write_sequence_markers_file(
+    path: Path,
+    sequence_folder: Path,
+    markers: Sequence[VideoReviewMarker],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _sequence_markers_payload(sequence_folder, markers)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_sequence_markers_sidecar(
+    sequence_folder: Path,
+    *,
+    total_frames: int,
+) -> list[VideoReviewMarker]:
+    return _read_markers_file(sequence_markers_sidecar_path(sequence_folder), total_frames=total_frames)
+
+
+def load_sequence_markers_local_draft(
+    sequence_folder: Path,
+    *,
+    total_frames: int,
+) -> list[VideoReviewMarker] | None:
+    path = sequence_markers_local_draft_path(sequence_folder)
+    if not path.is_file():
+        return None
+    return _read_markers_file(path, total_frames=total_frames)
+
+
+def save_sequence_markers_local_draft(
+    sequence_folder: Path,
+    markers: Sequence[VideoReviewMarker],
+) -> None:
+    try:
+        _write_sequence_markers_file(
+            sequence_markers_local_draft_path(sequence_folder),
+            sequence_folder,
+            markers,
+        )
+    except OSError as e:
+        logger.debug("save seq marker draft %s: %s", sequence_folder, e)
+
+
+def save_sequence_markers_sidecar(
+    sequence_folder: Path,
+    markers: Sequence[VideoReviewMarker],
+) -> None:
+    path = sequence_markers_sidecar_path(sequence_folder)
+    if not markers:
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError as e:
+            logger.debug("remove seq marker sidecar %s: %s", path, e)
+        return
+    try:
+        _write_sequence_markers_file(path, sequence_folder, markers)
+    except OSError as e:
+        logger.debug("save seq marker sidecar %s: %s", path, e)
+
+
+def load_sequence_markers_for_preview(
+    sequence_folder: Path,
+    *,
+    total_frames: int,
+) -> tuple[list[VideoReviewMarker], list[VideoReviewMarker], bool]:
+    published = load_sequence_markers_sidecar(sequence_folder, total_frames=total_frames)
+    local = load_sequence_markers_local_draft(sequence_folder, total_frames=total_frames)
+    if local is not None:
+        return published, local, True
+    return published, list(published), False
+
+
+def sequence_preview_session_local_draft_path(sequence_folder: Path) -> Path:
+    try:
+        key_src = str(sequence_folder.resolve()).casefold()
+    except OSError:
+        key_src = str(sequence_folder).casefold()
+    digest = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:32]
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if localappdata:
+        base = Path(localappdata) / "MonoStudio" / "cache" / "video_preview_session" / "seq"
+    else:
+        from monostudio.core.app_paths import get_app_base_path
+
+        base = get_app_base_path() / "monostudio_data" / "cache" / "video_preview_session" / "seq"
+    return base / f"{digest}.json"
+
+
+def load_sequence_preview_session_local_draft(
+    sequence_folder: Path,
+    *,
+    total_frames: int,
+) -> int | None:
+    path = sequence_preview_session_local_draft_path(sequence_folder)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.debug("load seq preview session %s: %s", path, e)
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        frame = int(data.get("frame", 0))
+    except (TypeError, ValueError):
+        return None
+    max_f = max(0, int(total_frames) - 1)
+    return max(0, min(frame, max_f))
+
+
+def save_sequence_preview_session_local_draft(
+    sequence_folder: Path,
+    *,
+    frame: int,
+) -> None:
+    try:
+        path = sequence_preview_session_local_draft_path(sequence_folder)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            source_path = str(sequence_folder.resolve())
+        except OSError:
+            source_path = str(sequence_folder)
+        payload = {
+            "version": 1,
+            "source": sequence_folder.name,
+            "source_path": source_path,
+            "frame": max(0, int(frame)),
+        }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as e:
+        logger.debug("save seq preview session %s: %s", sequence_folder, e)
+
+
+def export_sequence_markers_png(
+    frames: Sequence[Path],
+    markers: Sequence[VideoReviewMarker],
+    output_dir: Path,
+    *,
+    progress_callback=None,
+) -> list[Path]:
+    if not markers or not frames:
+        return []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    folder_stem = frames[0].parent.name if frames else "sequence"
+    outputs: list[Path] = []
+    total = len(markers)
+    for i, marker in enumerate(markers, start=1):
+        if progress_callback:
+            progress_callback(i - 1, total, None)
+        idx = max(0, min(len(frames) - 1, int(marker.frame)))
+        src = frames[idx]
+        safe_label = re.sub(r"[^\w\-]+", "_", (marker.label or "").strip())[:32].strip("_")
+        label_part = f"_{safe_label}" if safe_label else ""
+        out_name = f"{folder_stem}_mk_{i:03d}_f{marker.frame:04d}{label_part}.png"
+        dst = output_dir / out_name
+        shutil.copy2(src, dst)
+        outputs.append(dst)
+        if progress_callback:
+            progress_callback(i, total, dst)
+    return outputs
+
+
+def export_sequence_ranges(
+    frames: Sequence[Path],
+    ranges: Sequence[VideoFrameRange],
+    output_dir: Path,
+    *,
+    fps: float,
+    mode: ExportMode = "separate",
+    reencode: bool = True,
+    output_format: str = EXPORT_FORMAT_MP4,
+    name_template: str = "{stem}_{index:03d}{suffix}",
+    naming_mode: str | None = None,
+    progress_callback=None,
+    cancel_check=None,
+) -> list[Path]:
+    if not ranges or not frames:
+        return []
+    ffmpeg = resolve_ffmpeg_executable()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg not found. Configure it in Settings → Tools.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = resolve_export_suffix(output_format, frames[0] if frames else Path("out.mp4"))
+    stem = frames[0].parent.name if frames else "sequence"
+    outputs: list[Path] = []
+    if naming_mode:
+        name_template = export_naming_template_for_mode(naming_mode)
+    used_names: set[str] = set()
+
+    def _frame_path_for_index(frame_idx: int) -> Path | None:
+        if frame_idx < 0 or frame_idx >= len(frames):
+            return None
+        return frames[frame_idx]
+
+    def _export_range_to_video(rng: VideoFrameRange, dst: Path) -> None:
+        in_f = max(0, min(len(frames) - 1, rng.in_frame))
+        out_f = max(in_f, min(len(frames) - 1, rng.out_frame))
+        seg_dir = output_dir / f".{dst.stem}_frames"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        list_file = seg_dir / "concat.txt"
+        lines: list[str] = []
+        for fi in range(in_f, out_f + 1):
+            fp = _frame_path_for_index(fi)
+            if fp is None:
+                continue
+            lines.append(f"file '{fp.resolve().as_posix()}'")
+            lines.append(f"duration {1.0 / max(1e-6, fps)}")
+        if not lines:
+            raise RuntimeError(f"No frames for range {rng.in_frame}-{rng.out_frame}")
+        last_fp = _frame_path_for_index(out_f)
+        if last_fp is not None:
+            lines.append(f"file '{last_fp.resolve().as_posix()}'")
+        list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        args = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-r",
+            str(fps),
+        ]
+        args.extend(_ffmpeg_output_args(dst, reencode=reencode, src=frames[0]))
+        args.append(str(dst))
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            timeout=600,
+            check=False,
+            **hide_console_subprocess_kwargs(),
+        )
+        if proc.returncode != 0 or not dst.is_file():
+            err = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(err or f"FFmpeg export failed for range {rng.in_frame}-{rng.out_frame}")
+
+    if mode == "separate":
+        total = len(ranges)
+        for i, rng in enumerate(ranges, start=1):
+            if cancel_check and cancel_check():
+                break
+            if progress_callback:
+                progress_callback(i - 1, total, None)
+            out_name = _output_name_for_range(stem, suffix, i, rng, name_template, used_names=used_names)
+            dst = output_dir / out_name
+            _export_range_to_video(rng, dst)
+            outputs.append(dst)
+            if progress_callback:
+                progress_callback(i, total, dst)
+        return outputs
+
+    total = len(ranges) + 1
+    seg_paths: list[Path] = []
+    seg_dir = output_dir / f".{stem}_segments"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    for i, rng in enumerate(ranges, start=1):
+        if cancel_check and cancel_check():
+            break
+        if progress_callback:
+            progress_callback(i - 1, total, None)
+        seg = seg_dir / f"seg_{i:03d}{suffix}"
+        _export_range_to_video(rng, seg)
+        seg_paths.append(seg)
+        if progress_callback:
+            progress_callback(i, total, seg)
+    if not seg_paths:
+        return []
+    list_file = seg_dir / "concat.txt"
+    list_file.write_text(
+        "\n".join(f"file '{p.resolve().as_posix()}'" for p in seg_paths) + "\n",
+        encoding="utf-8",
+    )
+    final = output_dir / f"{stem}_concat{suffix}"
+    if progress_callback:
+        progress_callback(len(ranges), total, None)
+    args = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
+    ]
+    args.extend(_ffmpeg_output_args(final, reencode=reencode, src=frames[0]))
+    args.append(str(final))
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        timeout=600,
+        check=False,
+        **hide_console_subprocess_kwargs(),
+    )
+    if proc.returncode != 0 or not final.is_file():
+        err = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(err or "FFmpeg concat export failed")
+    outputs.append(final)
+    if progress_callback:
+        progress_callback(total, total, final)
+    return outputs
 
 
 def markers_sidecar_path(video_path: Path) -> Path:

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+from PySide6.QtCore import QPointF
 from typing import Callable
 
 from PySide6.QtCore import QSettings, Qt, QTimer, Signal, QUrl
@@ -124,6 +127,16 @@ class VideoPlayerBackend(ABC):
 
     def layout_video(self) -> None:
         """Reposition embedded video after the host widget resizes."""
+
+    def set_viewport_transform(
+        self,
+        zoom: float,
+        pan: QPointF,
+        host_w: int,
+        host_h: int,
+        aspect: float,
+    ) -> None:
+        """Zoom/pan inside the host widget without resizing the native surface."""
 
     def configure_position_poll(self, fps: float) -> None:
         """Tune how often the backend reports position (playhead sync)."""
@@ -331,6 +344,32 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
             self._attached_wid = wid
         except Exception as e:
             logger.debug("mpv layout wid: %s", e)
+
+    def set_viewport_transform(
+        self,
+        zoom: float,
+        pan: QPointF,
+        host_w: int,
+        host_h: int,
+        aspect: float,
+    ) -> None:
+        if self._player is None:
+            return
+        _ = aspect
+        try:
+            z = max(1.0, float(zoom))
+            if z <= 1.001:
+                self._player.video_zoom = 0
+                self._player.video_pan_x = 0
+                self._player.video_pan_y = 0
+                return
+            self._player.video_zoom = 2.0 * math.log2(z)
+            w = max(1.0, float(host_w))
+            h = max(1.0, float(host_h))
+            self._player.video_pan_x = float(pan.x()) / w * 2.0
+            self._player.video_pan_y = float(pan.y()) / h * 2.0
+        except Exception as e:
+            logger.debug("mpv viewport transform: %s", e)
 
     def _load_path(self, path: Path) -> None:
         if self._player is None:
@@ -898,13 +937,17 @@ class QtMultimediaBackend(VideoPlayerBackend):
         self.seek(self.position() + (step if direction >= 0 else -step))
 
     def release(self) -> None:
+        if self._video is not None:
+            self._video.hide()
         if self._player:
             self._player.stop()
             self._player.deleteLater()
             self._player = None
         if self._video:
+            self._video.setParent(None)
             self._video.deleteLater()
             self._video = None
+        self._widget = None
 
 
 class ExternalPlayerBackend(VideoPlayerBackend):
@@ -971,6 +1014,67 @@ class ExternalPlayerBackend(VideoPlayerBackend):
 
     def release(self) -> None:
         pass
+
+    def prime_for_scrub(self, *, initial_sec: float | None = None) -> None:
+        pass
+
+
+class NoopVideoBackend(VideoPlayerBackend):
+    """Placeholder until real backend is needed (sequence review opens without mpv init)."""
+
+    name = "noop"
+
+    def supports_embed(self) -> bool:
+        return False
+
+    def attach_to_widget(self, widget: QWidget) -> None:
+        pass
+
+    def layout_video(self) -> None:
+        pass
+
+    def load(self, path: Path, *, start_sec: float = 0.0) -> None:
+        pass
+
+    def play(self) -> None:
+        pass
+
+    def pause(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def seek(self, sec: float, *, precise: bool = False) -> None:
+        pass
+
+    def duration(self) -> float:
+        return 0.0
+
+    def position(self) -> float:
+        return 0.0
+
+    def set_volume(self, volume: int) -> None:
+        pass
+
+    def set_speed(self, speed: float) -> None:
+        pass
+
+    def is_playing(self) -> bool:
+        return False
+
+    def frame_step(self, direction: int) -> None:
+        pass
+
+    def release(self) -> None:
+        pass
+
+    def prime_for_scrub(self, *, initial_sec: float | None = None) -> None:
+        pass
+
+
+def create_sequence_placeholder_backend() -> VideoPlayerBackend:
+    return NoopVideoBackend()
 
 
 def create_video_player_backend(settings: QSettings | None) -> VideoPlayerBackend:

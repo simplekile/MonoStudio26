@@ -11,6 +11,10 @@ OUT = ROOT / "monostudio_data" / "icons" / "lucide"
 ICONS = {
     "sync": "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/cloud-check.svg",
     "local": "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/hard-drive.svg",
+    "eraser": "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/eraser.svg",
+    "diamond": "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/diamond.svg",
+    "move-up-right": "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/move-up-right.svg",
+    "layers-2": "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/layers-2.svg",
 }
 
 

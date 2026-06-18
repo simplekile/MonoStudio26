@@ -184,19 +184,19 @@ class _UpdateBadge(QWidget):
         p.end()
 
 
-class _NotiCountBadge(QLabel):
-    """Unread count badge on the notification bell."""
+class _NotiCountBadge(QWidget):
+    """Unread count badge on the notification bell (compact pill, auto-width)."""
 
-    _PAD_X = 8
+    _MIN = 12
+    _PAD_X = 5
+    _FONT_SIZE = 8
+    _BG = "#ef4444"
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setFont(monos_font("JetBrains Mono", 8, QFont.Weight.Bold))
-        self.setStyleSheet(
-            "background-color: #2563eb; color: #fafafa; border-radius: 7px; padding: 0 4px;"
-        )
+        self._text = ""
+        self._font = monos_font("JetBrains Mono", self._FONT_SIZE, QFont.Weight.Bold)
         self.hide()
 
     def _reposition(self) -> None:
@@ -204,27 +204,38 @@ class _NotiCountBadge(QLabel):
         if parent is None:
             return
         # Keep the pill inside the bell button so Qt does not clip trailing digits.
-        x = max(0, parent.width() - self.width() - 1)
-        self.move(x, 2)
+        x = max(0, parent.width() - self.width())
+        self.move(x, 1)
 
     def set_count(self, n: int) -> None:
         if n <= 0:
+            self._text = ""
             self.hide()
             return
         label = str(n) if n < 100 else "99+"
-        self.setText(label)
-        fm = self.fontMetrics()
-        w = max(14, fm.horizontalAdvance(label) + self._PAD_X)
-        h = max(14, fm.height() + 4)
+        self._text = label
+        fm = QFontMetrics(self._font)
+        h = self._MIN
+        w = max(h, fm.horizontalAdvance(label) + self._PAD_X)
         self.setFixedSize(w, h)
-        radius = h // 2
-        self.setStyleSheet(
-            "background-color: #2563eb; color: #fafafa;"
-            f"border-radius: {radius}px; padding: 0 4px;"
-        )
         self._reposition()
         self.show()
         self.raise_()
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
+        if not self._text:
+            return
+        radius = self.height() // 2
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(self._BG))
+        p.drawRoundedRect(self.rect(), radius, radius)
+        p.setFont(self._font)
+        p.setPen(QColor("#fafafa"))
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
+        p.end()
 
 
 class TopBar(QWidget):

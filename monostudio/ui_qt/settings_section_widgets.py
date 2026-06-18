@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -22,8 +22,7 @@ from PySide6.QtWidgets import (
 
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import monos_font
-from monostudio.ui_qt.toolbar_separators import apply_pill_segment_positions
+from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 from monostudio.ui_qt.toolbar_separators import apply_pill_segment_positions
 
 
@@ -201,17 +200,18 @@ def add_settings_helper(layout: QVBoxLayout, text: str) -> QLabel:
 
 
 class SettingsSegmentedControl(QWidget):
-    """Three-way segmented control (Tier3 pill style)."""
+    """Segmented control (Tier3 pill style). Options may be icon-only."""
 
     value_changed = Signal()
 
     def __init__(
         self,
-        options: list[tuple[str, str, str]],
+        options: list[tuple[str, str, str] | tuple[str, str, str, str]],
         parent: QWidget | None = None,
     ) -> None:
         """
-        options: (label, tooltip, value_key) — value_key is stored in button property.
+        options: (label, tooltip, value_key) or (label, tooltip, value_key, lucide_icon_name).
+        When icon_name is set, label may be empty for icon-only pills.
         """
         super().__init__(parent)
         self.setObjectName("SettingsFieldControl")
@@ -229,7 +229,12 @@ class SettingsSegmentedControl(QWidget):
 
         self._group = QButtonGroup(self)
         self._buttons: list[QPushButton] = []
-        for label, tooltip, key in options:
+        for opt in options:
+            if len(opt) >= 4:
+                label, tooltip, key, icon_name = opt[0], opt[1], opt[2], opt[3]
+            else:
+                label, tooltip, key = opt[0], opt[1], opt[2]
+                icon_name = ""
             btn = QPushButton(label, bar)
             btn.setObjectName("Tier3Pill")
             btn.setCheckable(True)
@@ -237,16 +242,46 @@ class SettingsSegmentedControl(QWidget):
             btn.setToolTip(tooltip)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setProperty("segment_value", key)
+            if icon_name:
+                btn.setText("")
+                btn.setProperty("icon_name", icon_name)
+                btn.setFixedSize(32, 32)
+                btn.setIconSize(QSize(16, 16))
+                self._apply_segment_icon(btn)
+                btn.toggled.connect(lambda checked, b=btn: self._on_icon_toggled(b, checked))
             self._value_keys.append(key)
             self._group.addButton(btn)
             self._buttons.append(btn)
             bar_l.addWidget(btn, 0)
-            btn.toggled.connect(self._on_toggled)
+            if not icon_name:
+                btn.toggled.connect(self._on_toggled)
 
         apply_pill_segment_positions(self._buttons)
 
         outer.addWidget(bar, 0, Qt.AlignmentFlag.AlignLeft)
         outer.addStretch(1)
+
+    def _segment_icon_color(self, checked: bool) -> str:
+        if checked:
+            return MONOS_COLORS["pill_segment_active_fg"]
+        return MONOS_COLORS["pill_segment_inactive_fg"]
+
+    def _apply_segment_icon(self, btn: QPushButton) -> None:
+        icon_name = btn.property("icon_name")
+        if not icon_name:
+            return
+        btn.setIcon(
+            lucide_icon(
+                str(icon_name),
+                size=16,
+                color_hex=self._segment_icon_color(btn.isChecked()),
+            )
+        )
+
+    def _on_icon_toggled(self, btn: QPushButton, checked: bool) -> None:
+        self._apply_segment_icon(btn)
+        if checked:
+            self.value_changed.emit()
 
     def _on_toggled(self, checked: bool) -> None:
         if checked:
@@ -257,9 +292,13 @@ class SettingsSegmentedControl(QWidget):
         for btn in self._buttons:
             if btn.property("segment_value") == want:
                 btn.setChecked(True)
+                if btn.property("icon_name"):
+                    self._apply_segment_icon(btn)
                 return
         if self._buttons:
             self._buttons[-1].setChecked(True)
+            if self._buttons[-1].property("icon_name"):
+                self._apply_segment_icon(self._buttons[-1])
 
     def value(self) -> str:
         for btn in self._buttons:
@@ -267,3 +306,16 @@ class SettingsSegmentedControl(QWidget):
                 v = btn.property("segment_value")
                 return str(v) if v is not None else ""
         return self._value_keys[-1] if self._value_keys else ""
+
+    def set_segment_visible(self, key: str, visible: bool) -> None:
+        want = (key or "").strip()
+        for btn in self._buttons:
+            if btn.property("segment_value") == want:
+                btn.setVisible(bool(visible))
+                break
+        apply_pill_segment_positions([b for b in self._buttons if b.isVisible()])
+        if not visible and self.value() == want:
+            for btn in self._buttons:
+                if btn.isVisible():
+                    btn.setChecked(True)
+                    break

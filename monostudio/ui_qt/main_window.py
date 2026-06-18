@@ -84,10 +84,9 @@ from monostudio.ui_qt.user_identity_dialog import UserIdentityDialog
 from monostudio.ui_qt.schedule_page_widget import SchedulePageWidget
 from monostudio.ui_qt.reference_page_widget import ReferencePageWidget
 from monostudio.ui_qt.video_preview_dialog import VideoPreviewDialog
-from monostudio.ui_qt.sequence_preview_dialog import SequencePreviewDialog
 from monostudio.ui_qt.video_preview_context import (
     PreviewContext,
-    SequencePreviewOpenRequest,
+    ReviewOpenRequest,
     VideoPreviewOpenRequest,
 )
 from monostudio.core.video_media import is_video_path, list_video_siblings, paths_under_project_root
@@ -449,8 +448,8 @@ class MainWindow(FramelessMainWindow):
         self._pending_overdue_entities: list[tuple[str, str]] | None = None
         self._active_nav_context: str | None = None
         self._reference_page_widget: ReferencePageWidget | None = None
-        self._video_preview_dialog: VideoPreviewDialog | None = None
-        self._sequence_preview_dialog: SequencePreviewDialog | None = None
+        self._review_player_dialog: VideoPreviewDialog | None = None
+        self._nav_quick_picker_dialog: object | None = None
         self._inspector = InspectorPanel()
         self._inspector.set_app_settings(self._settings)
         self._inspector.set_thumbnail_manager(self._thumbnail_manager)
@@ -595,6 +594,7 @@ class MainWindow(FramelessMainWindow):
         self._main_view.root_context_menu_requested.connect(self._on_root_context_menu_requested)
         self._main_view.copy_inventory_requested.connect(self._on_copy_item_inventory_requested)
         self._main_view.open_requested.connect(self._on_open_requested)
+        self._main_view.review_entity_requested.connect(self._on_review_entity_requested)
         self._main_view.open_with_requested.connect(self._on_open_with_requested)
         self._main_view.create_new_requested.connect(self._on_create_new_requested)
         self._main_view.selection_id_changed.connect(self._on_main_view_selection_id_changed)
@@ -641,7 +641,7 @@ class MainWindow(FramelessMainWindow):
         self._inspector.assignee_changed.connect(self._on_inspector_assignee_changed)
         self._inspector.assignment_confirmed.connect(self._refresh_noti_unread_badge)
         self._inspector.video_preview_requested.connect(self._open_video_preview_from_inspector)
-        self._inspector.sequence_preview_requested.connect(self._open_sequence_preview)
+        self._inspector.review_open_requested.connect(self._open_review_player)
         self._bound_hotkeys: list[QShortcut] = []
         from monostudio.ui_qt.app_hotkeys import bind_hotkey
 
@@ -703,6 +703,15 @@ class MainWindow(FramelessMainWindow):
                 "global.command_palette",
                 self,
                 self._open_command_palette,
+                context=Qt.ShortcutContext.WindowShortcut,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "global.nav_quick_picker",
+                self,
+                self._open_nav_quick_picker,
                 context=Qt.ShortcutContext.WindowShortcut,
             )
         )
@@ -3815,6 +3824,18 @@ class MainWindow(FramelessMainWindow):
         self._main_view.invalidate_notes_open_count_cache(item_path)
         self._inspector.refresh_notes_badge()
 
+    def _on_review_player_notes_changed(self) -> None:
+        dlg = self._alive_review_player()
+        entity_path = getattr(dlg, "_entity_path", None) if dlg is not None else None
+        if entity_path is not None:
+            try:
+                self._main_view.invalidate_notes_open_count_cache(Path(entity_path))
+            except (TypeError, ValueError, OSError):
+                pass
+        self._inspector.refresh_notes_badge()
+        self._refresh_dashboard_if_visible()
+        self._sync_user_inbox_alerts()
+
     def _on_dashboard_open_notes_entity(self, target: object) -> None:
         from monostudio.core.project_dashboard_stats import DashboardNoteRow
 
@@ -4524,6 +4545,26 @@ class MainWindow(FramelessMainWindow):
             self._nav_rail.set_current_context("Inbox")
         if self._inbox_page_widget is not None:
             self._inbox_page_widget.open_item_path(self._project_root, item_path_p)
+
+    def _open_nav_quick_picker(self) -> None:
+        from monostudio.ui_qt.nav_quick_picker_dialog import NavQuickPickerDialog
+        from monostudio.ui_qt.nav_quick_view import keyboard_input_blocks_shortcuts
+
+        if keyboard_input_blocks_shortcuts():
+            return
+        existing = self._nav_quick_picker_dialog
+        if existing is not None and existing.isVisible():
+            existing.reject()
+            return
+        dialog = NavQuickPickerDialog(settings=self._settings, parent=self)
+        self._nav_quick_picker_dialog = dialog
+        dialog.finished.connect(lambda _=0: setattr(self, "_nav_quick_picker_dialog", None))
+        dialog.slot_selected.connect(self._recall_nav_quick_slot)
+        dialog.slots_changed.connect(self._on_nav_quick_picker_slots_changed)
+        dialog.exec()
+
+    def _on_nav_quick_picker_slots_changed(self) -> None:
+        self._nav_rail.refresh_quick_view_tooltips(self._settings)
 
     def _open_command_palette(self) -> None:
         from monostudio.ui_qt.command_palette_dialog import CommandPaletteDialog
@@ -6126,7 +6167,7 @@ class MainWindow(FramelessMainWindow):
         return True
 
     def _release_video_preview(self) -> None:
-        dlg = self._video_preview_dialog
+        dlg = self._alive_review_player()
         if dlg is None:
             return
         try:
@@ -6134,7 +6175,7 @@ class MainWindow(FramelessMainWindow):
             dlg.close()
         except Exception:
             pass
-        self._video_preview_dialog = None
+        self._review_player_dialog = None
 
     def _open_video_preview_from_inbox(self, path) -> None:
         p = Path(path) if path is not None else None
@@ -6179,28 +6220,119 @@ class MainWindow(FramelessMainWindow):
             )
         )
 
-    def _open_video_preview_with_request(self, request: VideoPreviewOpenRequest) -> None:
-        existing = self._video_preview_dialog
+    def _department_display_label(self, department_id: str | None) -> str | None:
+        dep = (department_id or "").strip()
+        if not dep:
+            return None
+        resolver = getattr(self._inspector, "_department_label_resolver", None)
+        if callable(resolver):
+            try:
+                lab = resolver(dep)
+            except Exception:
+                lab = None
+            if lab:
+                return str(lab).strip() or None
+        return dep.replace("_", " ").title()
+
+    def _on_review_entity_requested(self, item: object) -> None:
+        from monostudio.core.review_media import ReviewResolveAction, resolve_entity_review_media
+        from monostudio.ui_qt.inspector_preview_settings import read_sequence_preview_fps
+        from monostudio.ui_qt.thumbnail_source_resolve import (
+            primary_work_file_for_department,
+            resolve_department_work_path_for_preview,
+        )
+        from monostudio.ui_qt.thumbnails import resolve_thumbnail_path
+
+        if not isinstance(item, ViewItem) or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        ref = getattr(item, "ref", None)
+        if not isinstance(ref, (Asset, Shot)):
+            return
+        dep = (self._main_view._active_department or "").strip()
+        if not dep:
+            return
+        active_dcc = self._main_view.get_active_dcc(item.path, dep)
+        wf = primary_work_file_for_department(ref, dep, active_dcc)
+        wp = resolve_department_work_path_for_preview(
+            ref,
+            dep,
+            work_file_path=wf,
+            item_root=Path(item.path),
+            active_dcc_id=active_dcc,
+        )
+        thumb = resolve_thumbnail_path(Path(item.path), department=dep)
+        fps = read_sequence_preview_fps(self._settings)
+        resolved = resolve_entity_review_media(
+            thumb_path=thumb,
+            work_path=wp,
+            work_file_path=wf,
+            sequence_frames=None,
+            sequence_folder=None,
+            fps=fps,
+            context=PreviewContext.entity,
+            entity_path=Path(item.path),
+            department_id=dep,
+            department_label=self._department_display_label(dep),
+        )
+        if resolved.action == ReviewResolveAction.open_player and resolved.request is not None:
+            self._open_review_player(resolved.request)
+
+    def _alive_review_player(self) -> VideoPreviewDialog | None:
+        dlg = self._review_player_dialog
+        if dlg is None:
+            return None
+        try:
+            from shiboken6 import isValid
+
+            if not isValid(dlg):
+                self._review_player_dialog = None
+                return None
+        except Exception:
+            self._review_player_dialog = None
+            return None
+        return dlg
+
+    def _open_review_player(self, request: object) -> None:
+        if isinstance(request, VideoPreviewOpenRequest):
+            request = request.to_review_request()
+        if not isinstance(request, ReviewOpenRequest):
+            return
+        existing = self._alive_review_player()
         if existing is not None and existing.isVisible():
             try:
                 existing.release_player()
                 existing.close()
             except Exception:
                 pass
+        path_arg = request.path if request.media_kind.value == "video" else None
         dlg = VideoPreviewDialog(
-            request.path,
+            path_arg,
             request=request,
-            sibling_paths=request.sibling_paths,
             settings=self._settings,
-            parent=self,
+            parent=None,
+            geometry_anchor=self,
         )
-        self._video_preview_dialog = dlg
-        dlg.closed.connect(lambda: setattr(self, "_video_preview_dialog", None))
+        self._review_player_dialog = dlg
+        dlg.destroyed.connect(lambda *_: setattr(self, "_review_player_dialog", None))
+        dlg.closed.connect(self._on_review_player_closed)
         dlg.export_completed.connect(self._on_video_export_completed)
         dlg.open_all_notes_requested.connect(self._on_video_preview_open_all_notes)
+        dlg.notes_changed.connect(lambda: self._on_review_player_notes_changed())
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    def _on_review_player_closed(self) -> None:
+        self._review_player_dialog = None
+        from monostudio.ui_qt.style import release_stuck_mouse_grab, resync_hover_at_cursor
+
+        release_stuck_mouse_grab(force=True)
+        self.activateWindow()
+        self.raise_()
+        QTimer.singleShot(0, resync_hover_at_cursor)
+
+    def _open_video_preview_with_request(self, request: VideoPreviewOpenRequest) -> None:
+        self._open_review_player(request.to_review_request())
 
     def _on_video_preview_open_all_notes(self) -> None:
         item = getattr(self._inspector, "_current_item", None)
@@ -6209,27 +6341,19 @@ class MainWindow(FramelessMainWindow):
         self._on_item_notes_dialog_requested(item)
 
     def _open_sequence_preview(self, request: object) -> None:
-        if not isinstance(request, SequencePreviewOpenRequest):
-            return
-        existing = self._sequence_preview_dialog
-        if existing is not None and existing.isVisible():
-            try:
-                existing.close()
-            except Exception:
-                pass
-        dlg = SequencePreviewDialog(
-            request.frames,
-            sequence_folder=request.sequence_folder,
-            fps=request.fps,
-            entity_path=request.entity_path,
-            settings=self._settings,
-            parent=self,
-        )
-        self._sequence_preview_dialog = dlg
-        dlg.closed.connect(lambda: setattr(self, "_sequence_preview_dialog", None))
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        """Legacy entry — redirects to unified review player."""
+        from monostudio.ui_qt.video_preview_context import ReviewMediaKind
+
+        if hasattr(request, "frames") and hasattr(request, "sequence_folder"):
+            rev = ReviewOpenRequest(
+                media_kind=ReviewMediaKind.sequence,
+                context=PreviewContext.entity,
+                frames=list(getattr(request, "frames", []) or []),
+                sequence_folder=getattr(request, "sequence_folder"),
+                fps=int(getattr(request, "fps", 24) or 24),
+                entity_path=getattr(request, "entity_path", None),
+            )
+            self._open_review_player(rev)
 
     def _open_video_preview(self, path) -> None:
         """Legacy entry — treat as entity context."""

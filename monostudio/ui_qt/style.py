@@ -63,6 +63,21 @@ class _DialogDismissOverlay(QWidget):
             return
         super().mousePressEvent(event)
 
+
+class _DialogBlockOverlay(QWidget):
+    """Dimmed backdrop that absorbs clicks without closing the dialog."""
+
+    def __init__(self, host: QWidget) -> None:
+        super().__init__(host)
+        self.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        event.accept()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        event.accept()
+
 # Menu popup: same round-corner standard (radius 12, border lighter than bg)
 _MONOS_MENU_BG = "#1c1c1f"
 _MONOS_MENU_RADIUS = 12
@@ -408,9 +423,7 @@ class MonosDialog(QDialog):
                 if self._dismiss_on_overlay_click:
                     self._overlay = _DialogDismissOverlay(host, self.reject)
                 else:
-                    self._overlay = QWidget(host)
-                    self._overlay.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
-                    self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+                    self._overlay = _DialogBlockOverlay(host)
             host.installEventFilter(self)
             self._sync_overlay_geometry()
             self._overlay.show()
@@ -2137,6 +2150,72 @@ def apply_dark_theme(app: QApplication) -> None:
         QListWidget#CommandPaletteList::item:selected {
             background: transparent;
         }
+        QWidget#NavQuickPickerPanel {
+            background-color: rgba(24, 24, 27, 0.82);
+            border: 1px solid rgba(63, 63, 70, 0.75);
+            border-radius: 12px;
+        }
+        QLabel#NavQuickPickerTitle {
+            color: #fafafa;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        QFrame#NavQuickTile {
+            background-color: rgba(30, 33, 36, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 8px;
+        }
+        QFrame#NavQuickTile[filled="true"]:hover {
+            background-color: rgba(37, 40, 44, 0.85);
+            border-color: rgba(255, 255, 255, 0.10);
+        }
+        QFrame#NavQuickTile[dragging="true"] {
+            background-color: rgba(30, 33, 36, 0.35);
+            border: 1px dashed rgba(255, 255, 255, 0.14);
+        }
+        QFrame#NavQuickTile[dropTarget="true"] {
+            background-color: rgba(37, 99, 235, 0.14);
+            border: 1px solid rgba(96, 165, 250, 0.75);
+        }
+        QFrame#NavQuickTile[filled="false"] {
+            background-color: rgba(24, 24, 27, 0.42);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        QToolButton#NavQuickTileClearBtn {
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+            padding: 2px;
+            min-width: 20px;
+            min-height: 20px;
+        }
+        QToolButton#NavQuickTileClearBtn:hover {
+            background-color: rgba(239, 68, 68, 0.28);
+        }
+        QLabel#NavQuickTileSlot {
+            color: #71717a;
+            font-family: "JetBrains Mono", "Consolas", monospace;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        QFrame#NavQuickTile[filled="false"] QLabel#NavQuickTileSlot,
+        QFrame#NavQuickTile[filled="false"] QLabel#NavQuickTileTitle,
+        QFrame#NavQuickTile[filled="false"] QLabel#NavQuickTileSubtitle {
+            color: #52525b;
+        }
+        QLabel#NavQuickTileTitle {
+            color: #e4e4e7;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        QLabel#NavQuickTileSubtitle {
+            color: #a1a1aa;
+            font-family: "Inter", "Inter UI", "Segoe UI", sans-serif;
+            font-size: 11px;
+            font-weight: 500;
+        }
         QPushButton#TrayMiniPopupOpenButton {
             background: transparent;
             border: none;
@@ -3321,14 +3400,16 @@ def apply_dark_theme(app: QApplication) -> None:
            L2 stage  #121214  viewer frame, tool strip
            L1 pit    #09090b  video letterbox */
         QDialog#VideoPreviewDialog {
-            background-color: #18181b;
+            background: transparent;
         }
         QWidget#VideoPreviewMainColumn {
-            background-color: #18181b;
+            background: transparent;
         }
         QWidget#VideoPreviewTopBar {
             background-color: #1e2124;
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            border-top-left-radius: 12px;
+            border-top-right-radius: 12px;
         }
         QToolButton#VideoPreviewDialogCloseBtn {
             padding: 0px;
@@ -3363,16 +3444,35 @@ def apply_dark_theme(app: QApplication) -> None:
             background: transparent;
         }
         QWidget#VideoPreviewFooter {
-            background-color: #1e2124;
-            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            background: transparent;
+            border: none;
         }
         QLabel#VideoPreviewFooterLog {
             color: #71717a;
             background: transparent;
         }
-        QLabel#VideoPreviewFooterHint {
+        QWidget#VideoPreviewFooterHintBar {
+            background: transparent;
+        }
+        QWidget#VideoPreviewHintGroup {
+            background: transparent;
+        }
+        QWidget#VideoPreviewHintCap {
+            background: transparent;
+        }
+        QLabel#VideoPreviewHintAction {
             color: #a1a1aa;
             background: transparent;
+            font-family: "Inter";
+            font-size: 11px;
+            font-weight: 500;
+        }
+        QLabel#VideoPreviewHintPlain {
+            color: #a1a1aa;
+            background: transparent;
+            font-family: "Inter";
+            font-size: 11px;
+            font-weight: 500;
         }
         QLabel#VideoPreviewCurrentFrame {
             color: #fafafa;
@@ -3413,6 +3513,145 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QToolButton#VideoPreviewTransportTool:pressed {
             background-color: rgba(255, 255, 255, 0.1);
+        }
+        QToolButton#VideoReviewDrawTool {
+            padding: 0px;
+            margin: 0px;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            background-color: transparent;
+        }
+        QToolButton#VideoReviewDrawTool:hover {
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+        QToolButton#VideoReviewDrawTool:checked {
+            background-color: rgba(96, 165, 250, 0.18);
+            border: 1px solid rgba(96, 165, 250, 0.5);
+        }
+        QToolButton#VideoReviewDrawTool:checked:hover {
+            background-color: rgba(96, 165, 250, 0.24);
+        }
+        QToolButton#VideoReviewDrawTool:pressed {
+            background-color: rgba(255, 255, 255, 0.1);
+        }
+        QLabel#VideoReviewDrawSectionTitle {
+            color: #71717a;
+            font-family: "Inter";
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            padding: 0px;
+            margin: 0px;
+        }
+        QWidget#VideoReviewDrawStackHeader {
+            background-color: rgba(255, 255, 255, 0.05);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            min-height: 22px;
+            max-height: 22px;
+        }
+        QLabel#VideoReviewDrawStackHeaderLabel {
+            color: #71717a;
+            font-family: "Inter";
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        QLabel#VideoReviewDrawStackHeaderIcon {
+            min-height: 22px;
+            max-height: 22px;
+        }
+        QTreeWidget#VideoReviewDrawStack {
+            background-color: #1f2226;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+            outline: none;
+        }
+        QTreeWidget#VideoReviewDrawStack::item {
+            border: none;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 0px;
+            margin: 0px;
+        }
+        QTreeWidget#VideoReviewDrawStack::item:selected {
+            background-color: rgba(96, 165, 250, 0.12);
+        }
+        QTreeWidget#VideoReviewDrawStack::item:hover {
+            background-color: rgba(255, 255, 255, 0.04);
+        }
+        QTreeWidget#VideoReviewDrawStack::branch {
+            background: transparent;
+            image: none;
+        }
+        QToolButton#VideoReviewDrawStackDisclosure {
+            border: none;
+            border-radius: 4px;
+            background: transparent;
+            padding: 0px;
+        }
+        QToolButton#VideoReviewDrawStackDisclosure:hover:enabled {
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+        QToolButton#VideoReviewDrawStackDisclosure:disabled {
+            opacity: 0.35;
+        }
+        QLabel#VideoReviewDrawStackRowTitle {
+            color: #e4e4e7;
+        }
+        QLabel#VideoReviewDrawStackRowDetail {
+            color: #71717a;
+        }
+        QToolButton#VideoReviewDrawStackEye {
+            border: none;
+            border-radius: 4px;
+            background: transparent;
+            padding: 0px;
+        }
+        QToolButton#VideoReviewDrawStackEye:hover {
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+        QToolButton#VideoReviewDrawStackDelete {
+            padding: 0px;
+            margin: 0px;
+            border: none;
+            border-radius: 6px;
+            background-color: transparent;
+        }
+        QToolButton#VideoReviewDrawStackDelete:hover:enabled {
+            background-color: rgba(248, 113, 113, 0.14);
+        }
+        QToolButton#VideoReviewDrawStackDelete:disabled {
+            opacity: 0.35;
+        }
+        QFrame#VideoReviewDrawKeyframeHoldPopup {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+        }
+        QFrame#VideoReviewDrawQuickPopup {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+        }
+        QLabel#VideoReviewDrawQuickLabel {
+            color: #a1a1aa;
+            font-family: "Inter";
+            font-size: 12px;
+            font-weight: 500;
+        }
+        QToolButton#VideoReviewDrawQuickColor:hover {
+            border: 1px solid rgba(255, 255, 255, 0.35);
+        }
+        QSpinBox#VideoReviewDrawStackHoldSpin {
+            color: #e4e4e7;
+            background-color: #27272a;
+            border: 1px solid rgba(63, 63, 70, 0.55);
+            border-radius: 6px;
+            padding: 2px 4px;
+            font-family: "JetBrains Mono";
+            font-size: 11px;
+            min-height: 24px;
         }
         QComboBox#VideoPreviewSpeedCombo {
             color: #a1a1aa;
@@ -3631,8 +3870,12 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 0;
         }
         QWidget#VideoReviewToolsPanel {
-            background-color: #18181b;
-            border-left: 1px solid rgba(255, 255, 255, 0.06);
+            background: transparent;
+            border: none;
+        }
+        QWidget#VideoReviewToolsBody {
+            background: transparent;
+            border: none;
         }
         QWidget#VideoReviewToolStrip {
             background-color: #121214;
@@ -3657,15 +3900,28 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #fafafa;
             border-color: rgba(255, 255, 255, 0.12);
         }
-        QWidget#VideoReviewToolsBody {
-            background-color: #1e2124;
-        }
         QWidget#VideoPreviewRangePanel {
             background: transparent;
             border: none;
         }
         QWidget#VideoReviewNotePanel {
             background: transparent;
+        }
+        QWidget#VideoReviewNoteListScroll {
+            background: transparent;
+            border: none;
+        }
+        QWidget#VideoReviewNoteListHost {
+            background: transparent;
+        }
+        QFrame#ItemNotesCard[frameMatch="true"] {
+            border: 1px solid rgba(96, 165, 250, 0.35);
+            background-color: rgba(37, 99, 235, 0.08);
+            border-radius: 8px;
+        }
+        QLabel#VideoReviewNoteFrameBadge {
+            color: #60a5fa;
+            letter-spacing: 0.06em;
         }
         QLabel#VideoPreviewRangeTitle {
             color: #71717a;
@@ -3747,7 +4003,119 @@ def apply_dark_theme(app: QApplication) -> None:
             padding: 4px;
         }
         QDialog#VideoExportDialog {
+            background: transparent;
+        }
+        QFrame#VideoExportHeader {
+            background-color: #0b0c12;
+            border: none;
+            border-top-left-radius: 12px;
+            border-top-right-radius: 12px;
+        }
+        QFrame#VideoExportBody {
+            background-color: #161821;
+            border: none;
+        }
+        QFrame#VideoExportFooter {
+            background-color: #0b0c12;
+            border: none;
+            border-top: 1px solid rgba(39, 39, 42, 0.55);
+            border-bottom-left-radius: 12px;
+            border-bottom-right-radius: 12px;
+        }
+        QLabel#VideoExportDialogTitle {
+            color: #fafafa;
+        }
+        QLabel#VideoExportBreadcrumb {
+            color: #71717a;
+        }
+        QFrame#VideoExportDestRow {
+            background-color: rgba(168, 85, 247, 0.06);
+            border: 1px solid rgba(168, 85, 247, 0.35);
+            border-radius: 10px;
+        }
+        QLabel#VideoExportDestPrefix {
+            color: #c4b5fd;
+        }
+        QFrame#VideoExportRowIcon {
+            background-color: rgba(168, 85, 247, 0.12);
+            border: 1px solid rgba(168, 85, 247, 0.22);
+            border-radius: 10px;
+        }
+        QWidget#VideoExportRow,
+        QWidget#VideoExportRowText,
+        QWidget#VideoExportScrollBody {
+            background: transparent;
+        }
+        QLabel#VideoExportRowTitle {
+            color: #fafafa;
+        }
+        QLabel#VideoExportRowDesc {
+            color: #71717a;
+        }
+        QLabel#VideoExportDestSummary {
+            color: #e4e4e7;
+        }
+        QLabel#VideoExportPreviewLine {
+            color: #a1a1aa;
+        }
+        QLabel#VideoExportBadge {
+            color: #c4b5fd;
+            background-color: rgba(168, 85, 247, 0.14);
+            border: 1px solid rgba(168, 85, 247, 0.28);
+            border-radius: 6px;
+            padding: 2px 8px;
+        }
+        QFrame#VideoExportDivider {
+            background-color: rgba(39, 39, 42, 0.45);
+            border: none;
+            max-height: 1px;
+        }
+        QScrollArea#VideoExportScroll {
+            background: transparent;
+            border: none;
+        }
+        QScrollArea#VideoExportScroll > QWidget > QWidget {
+            background: transparent;
+        }
+        QDialog#VideoExportDialog QComboBox#SettingsComboBox {
+            padding: 6px 10px;
+            padding-right: 28px;
+            border: 1px solid rgba(39, 39, 42, 0.65);
+            border-radius: 8px;
+            background-color: #1f2129;
+            color: #fafafa;
+            font-size: 13px;
+            font-weight: 500;
+            min-height: 32px;
+            max-height: 32px;
+        }
+        QDialog#VideoExportDialog QComboBox#SettingsComboBox:hover {
+            border-color: rgba(63, 63, 70, 0.90);
+            background-color: #252830;
+        }
+        QDialog#VideoExportDialog QComboBox#SettingsComboBox:focus {
+            border: 1px solid #2563eb;
+        }
+        QDialog#VideoExportDialog QComboBox#SettingsComboBox:disabled {
+            color: #71717a;
+            background-color: #1f1f22;
+        }
+        QDialog#VideoExportDialog QComboBox#SettingsComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 26px;
+            border: none;
+            border-left: 1px solid rgba(39, 39, 42, 0.55);
+            border-top-right-radius: 7px;
+            border-bottom-right-radius: 7px;
+            background-color: #1f1f22;
+        }
+        QDialog#VideoExportDialog QComboBox#SettingsComboBox QAbstractItemView {
             background-color: #18181b;
+            color: #fafafa;
+            border: 1px solid #27272a;
+            selection-background-color: rgba(37, 99, 235, 0.35);
+            outline: none;
         }
         QLabel#VideoExportProgressTitle {
             color: #fafafa;

@@ -422,12 +422,22 @@ class SidebarNavRail(QWidget):
             SidebarContext.SHOTS.value: "Shots",
         }
         for ctx_name, btn in self._scope_buttons.items():
-            btn.setToolTip(format_nav_item_tooltip(_scope_labels.get(ctx_name, ctx_name), by_ctx.get(ctx_name)))
+            btn.setToolTip(
+                format_nav_item_tooltip(
+                    _scope_labels.get(ctx_name, ctx_name),
+                    by_ctx.get(ctx_name),
+                    settings=settings,
+                )
+            )
 
         if SidebarContext.PROJECT_GUIDE.value in self._home_group_buttons:
             btn = self._home_group_buttons[SidebarContext.PROJECT_GUIDE.value]
             btn.setToolTip(
-                format_nav_item_tooltip("Project Guide", by_ctx.get(SidebarContext.PROJECT_GUIDE.value))
+                format_nav_item_tooltip(
+                    "Project Guide",
+                    by_ctx.get(SidebarContext.PROJECT_GUIDE.value),
+                    settings=settings,
+                )
             )
 
         _footer_labels = {
@@ -435,11 +445,21 @@ class SidebarNavRail(QWidget):
             SidebarContext.OUTBOX.value: "Outbox",
         }
         for ctx_name, btn in self._footer_buttons.items():
-            btn.setToolTip(format_nav_item_tooltip(_footer_labels.get(ctx_name, ctx_name), by_ctx.get(ctx_name)))
+            btn.setToolTip(
+                format_nav_item_tooltip(
+                    _footer_labels.get(ctx_name, ctx_name),
+                    by_ctx.get(ctx_name),
+                    settings=settings,
+                )
+            )
 
         if self._trash_btn is not None:
             self._trash_btn.setToolTip(
-                format_nav_item_tooltip("Trash", by_ctx.get(SidebarContext.TRASH.value))
+                format_nav_item_tooltip(
+                    "Trash",
+                    by_ctx.get(SidebarContext.TRASH.value),
+                    settings=settings,
+                )
             )
 
         if self._recent_tasks_btn is not None:

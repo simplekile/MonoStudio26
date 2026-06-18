@@ -168,6 +168,16 @@ class NoteComposeEditor(QTextEdit):
         self.viewport().setMouseTracking(True)
         self._hover_img_href: str | None = None
 
+    def set_item_root(self, item_root: Path) -> None:
+        self._item_root = Path(item_root)
+        self._monostudio_dir = self._item_root / ".monostudio"
+        self.document().setBaseUrl(QUrl.fromLocalFile(str(self._monostudio_dir) + os.sep))
+        self.reset_draft()
+
+    def set_workspace_root(self, workspace_root: Path | None) -> None:
+        self._workspace_root = Path(workspace_root) if workspace_root else None
+        self._mention_popup.set_users(read_roster(self._workspace_root))
+
     def _thumb_dpr(self) -> float:
         return max(2.0, float(self.devicePixelRatioF()))
 

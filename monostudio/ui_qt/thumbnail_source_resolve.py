@@ -115,8 +115,7 @@ def resolve_entity_thumbnail_source_path(
     sequence_ignore_name_tokens: frozenset[str] | None = None,
 ) -> Path | None:
     from monostudio.core.sequence_preview import (
-        list_sequence_frames,
-        representative_frame_path,
+        quick_sequence_preview_frame,
         resolve_best_available_sequence_folder,
         resolve_sequence_folder,
     )
@@ -136,22 +135,19 @@ def resolve_entity_thumbnail_source_path(
     if work_path is not None and work_path.is_dir():
         seq_folder = resolve_sequence_folder(work_path, work_file_path)
         if seq_folder is not None:
-            frames = list_sequence_frames(
+            rep = quick_sequence_preview_frame(
                 seq_folder,
                 ignore_extensions=sequence_ignore_extensions,
                 ignore_name_tokens=sequence_ignore_name_tokens,
             )
-            rep = representative_frame_path(frames)
         if rep is None:
-            # Fallback: latest work may not have a sequence yet; use best available old sequence.
             best = resolve_best_available_sequence_folder(work_path)
             if best is not None:
-                frames = list_sequence_frames(
+                rep = quick_sequence_preview_frame(
                     best,
                     ignore_extensions=sequence_ignore_extensions,
                     ignore_name_tokens=sequence_ignore_name_tokens,
                 )
-                rep = representative_frame_path(frames)
 
     if mode == THUMB_SOURCE_RENDER_SEQUENCE:
         return rep

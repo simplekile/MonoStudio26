@@ -16,6 +16,7 @@ Supported frame extensions include common plate formats (e.g. ``.dpx``) plus png
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Iterable
@@ -148,11 +149,8 @@ def resolve_best_available_sequence_folder(work_path: Path) -> Path | None:
             continue
         candidates: list[Path] = []
         for c in children:
-            try:
-                if list_sequence_frames(c):
-                    candidates.append(c)
-            except Exception:
-                continue
+            if sequence_folder_has_frames(c):
+                candidates.append(c)
         if not candidates:
             continue
         # Prefer highest v### when available; otherwise newest mtime.
@@ -195,25 +193,87 @@ def list_sequence_frames(
     ign_tok = {str(s).strip().casefold() for s in (ignore_name_tokens or ()) if str(s).strip()}
     out: list[Path] = []
     try:
-        for p in sequence_folder.iterdir():
-            if not p.is_file():
-                continue
-            suf = p.suffix.lower()
-            if suf in _SEQUENCE_SUFFIXES:
+        with os.scandir(sequence_folder) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                suf = Path(entry.name).suffix.lower()
+                if suf not in _SEQUENCE_SUFFIXES:
+                    continue
                 if ign_ext and suf in ign_ext:
                     continue
                 if ign_tok:
-                    name_cf = p.name.casefold()
+                    name_cf = entry.name.casefold()
                     if any(t in name_cf for t in ign_tok):
                         continue
-                out.append(p)
+                out.append(Path(entry.path))
     except OSError:
         return []
     out.sort(key=_natural_frame_sort_key)
     return out
 
 
+def sequence_folder_has_frames(sequence_folder: Path) -> bool:
+    """Fast existence check — does not sort or collect all paths."""
+    if not sequence_folder.is_dir():
+        return False
+    try:
+        with os.scandir(sequence_folder) as it:
+            for entry in it:
+                if entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in _SEQUENCE_SUFFIXES:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def count_sequence_frames(sequence_folder: Path) -> int:
+    """Frame count without sorting (for labels / picker)."""
+    if not sequence_folder.is_dir():
+        return 0
+    n = 0
+    try:
+        with os.scandir(sequence_folder) as it:
+            for entry in it:
+                if entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in _SEQUENCE_SUFFIXES:
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
 def representative_frame_path(frames: list[Path]) -> Path | None:
     if not frames:
         return None
     return frames[len(frames) // 2]
+
+
+def quick_sequence_preview_frame(
+    sequence_folder: Path,
+    *,
+    ignore_extensions: Iterable[str] | None = None,
+    ignore_name_tokens: Iterable[str] | None = None,
+) -> Path | None:
+    """First suitable frame for thumbnail — no full list or sort."""
+    if not sequence_folder.is_dir():
+        return None
+    ign_ext = {str(s).strip().lower() for s in (ignore_extensions or ()) if str(s).strip()}
+    ign_tok = {str(s).strip().casefold() for s in (ignore_name_tokens or ()) if str(s).strip()}
+    try:
+        with os.scandir(sequence_folder) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                suf = Path(entry.name).suffix.lower()
+                if suf not in _SEQUENCE_SUFFIXES:
+                    continue
+                if ign_ext and suf in ign_ext:
+                    continue
+                if ign_tok:
+                    name_cf = entry.name.casefold()
+                    if any(t in name_cf for t in ign_tok):
+                        continue
+                return Path(entry.path)
+    except OSError:
+        return None
+    return None

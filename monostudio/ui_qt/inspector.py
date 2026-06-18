@@ -108,9 +108,9 @@ from monostudio.ui_qt.thumbnail_source_resolve import (
     resolve_department_work_path_for_preview,
     resolve_entity_thumbnail_source_path,
 )
-from monostudio.core.video_media import resolve_work_preview_video
+from monostudio.core.review_media import ReviewResolveAction, resolve_entity_review_media
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
-from monostudio.ui_qt.video_preview_context import SequencePreviewOpenRequest
+from monostudio.ui_qt.video_preview_context import PreviewContext, ReviewOpenRequest
 from monostudio.ui_qt.view_item_mtime import view_item_last_updated_display
 from monostudio.core.fs_reader import work_file_prefix
 from monostudio.ui_qt.main_view import (
@@ -247,6 +247,26 @@ def _inspector_work_and_publish_paths(
     return None
 
 
+def _inspector_preview_resolve_sequence_folder(
+    work_path: Path | None,
+    work_file_path: Path | None,
+) -> Path | None:
+    from monostudio.core.sequence_preview import (
+        resolve_best_available_sequence_folder,
+        resolve_sequence_folder,
+        sequence_folder_has_frames,
+    )
+
+    if work_path is None or not work_path.is_dir():
+        return None
+    sq = resolve_sequence_folder(work_path, work_file_path)
+    if sq is None or not sq.is_dir():
+        sq = resolve_best_available_sequence_folder(work_path)
+    if sq is None or not sq.is_dir() or not sequence_folder_has_frames(sq):
+        return None
+    return sq
+
+
 def _inspector_preview_resolve_sequence(
     work_path: Path | None,
     work_file_path: Path | None,
@@ -254,20 +274,13 @@ def _inspector_preview_resolve_sequence(
     ignore_extensions: frozenset[str] | None = None,
     ignore_name_tokens: frozenset[str] | None = None,
 ) -> tuple[Path | None, list[Path]]:
-    from monostudio.core.sequence_preview import (
-        list_sequence_frames,
-        resolve_best_available_sequence_folder,
-        resolve_sequence_folder,
-    )
+    from monostudio.core.sequence_preview import list_sequence_frames
 
     if work_path is None or not work_path.is_dir():
         return (None, [])
-    sq = resolve_sequence_folder(work_path, work_file_path)
-    if sq is None or not sq.is_dir():
-        # Fallback: latest work may have no sequence yet; use best available older sequence folder.
-        sq = resolve_best_available_sequence_folder(work_path)
-        if sq is None or not sq.is_dir():
-            return (None, [])
+    sq = _inspector_preview_resolve_sequence_folder(work_path, work_file_path)
+    if sq is None:
+        return (None, [])
     return (
         sq,
         list_sequence_frames(
@@ -452,8 +465,9 @@ class InspectorPanel(QWidget):
     edit_allocation_requested = Signal()
     assignee_changed = Signal(str, str, str, object)
     assignment_confirmed = Signal()
-    video_preview_requested = Signal(object)  # Path
-    sequence_preview_requested = Signal(object)  # SequencePreviewOpenRequest
+    video_preview_requested = Signal(object)  # Path — legacy
+    sequence_preview_requested = Signal(object)  # legacy
+    review_open_requested = Signal(object)  # ReviewOpenRequest
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -510,6 +524,7 @@ class InspectorPanel(QWidget):
         self._preview.paste_requested.connect(self._on_paste_requested)
         self._preview.remove_requested.connect(self._on_remove_requested)
         self._preview.video_preview_requested.connect(self.video_preview_requested.emit)
+        self._preview.review_open_requested.connect(self.review_open_requested.emit)
         self._preview.sequence_preview_requested.connect(self.sequence_preview_requested.emit)
         self._show_publish: bool = False
         self._last_focused_department: str | None = None
@@ -2480,6 +2495,41 @@ class _InspectorSeqDecodeSignaler(QObject):
     frame_ready = Signal(int, object)
 
 
+class _InspectorSeqListSignaler(QObject):
+    ready = Signal(int, object)  # token, list[Path]
+
+
+class _InspectorSeqListRunnable(QRunnable):
+    def __init__(
+        self,
+        token: int,
+        folder: Path,
+        ignore_extensions: frozenset[str] | None,
+        ignore_name_tokens: frozenset[str] | None,
+        signaler: _InspectorSeqListSignaler,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._token = token
+        self._folder = folder
+        self._ign_ext = ignore_extensions
+        self._ign_tok = ignore_name_tokens
+        self._signaler = signaler
+
+    def run(self) -> None:
+        from monostudio.core.sequence_preview import list_sequence_frames
+
+        try:
+            frames = list_sequence_frames(
+                self._folder,
+                ignore_extensions=self._ign_ext,
+                ignore_name_tokens=self._ign_tok,
+            )
+        except Exception:
+            frames = []
+        self._signaler.ready.emit(self._token, frames)
+
+
 class _InspectorSeqDecodeRunnable(QRunnable):
     def __init__(self, idx: int, path: Path, max_side: int, signaler: _InspectorSeqDecodeSignaler) -> None:
         super().__init__()
@@ -2499,8 +2549,9 @@ class _InspectorSeqDecodeRunnable(QRunnable):
 class _InspectorPreview(QWidget):
     paste_requested = Signal()
     remove_requested = Signal(object)  # emits ViewItem (asset/shot only)
-    video_preview_requested = Signal(object)  # Path
-    sequence_preview_requested = Signal(object)  # SequencePreviewOpenRequest
+    video_preview_requested = Signal(object)  # Path — legacy
+    sequence_preview_requested = Signal(object)  # legacy
+    review_open_requested = Signal(object)  # ReviewOpenRequest
 
     _PREVIEW_CACHE_MAX = 50
     _PREVIEW_RESIZE_DEBOUNCE_MS = 200
@@ -2532,6 +2583,12 @@ class _InspectorPreview(QWidget):
         self._seq_pool: QThreadPool | None = None
         self._seq_sig = _InspectorSeqDecodeSignaler(self)
         self._seq_sig.frame_ready.connect(self._on_inspector_seq_frame_ready, Qt.ConnectionType.QueuedConnection)
+        self._seq_list_token = 0
+        self._seq_list_sig = _InspectorSeqListSignaler(self)
+        self._seq_list_sig.ready.connect(
+            self._on_inspector_sequence_frames_listed,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._seq_tick = QTimer(self)
         self._seq_tick.setSingleShot(True)
         self._seq_tick.timeout.connect(self._on_inspector_seq_tick)
@@ -2745,6 +2802,8 @@ class _InspectorPreview(QWidget):
                 pass
 
     def _sync_sequence_context_for_inspector_preview(self) -> None:
+        self._seq_list_token += 1
+        list_token = self._seq_list_token
         self._sequence_folder = None
         self._sequence_frames = []
         try:
@@ -2760,12 +2819,9 @@ class _InspectorPreview(QWidget):
         wp, wf = self._work_paths_for_preview_item(item)
         ign_ext = get_thumbnail_sequence_ignore_extensions(self._qsettings)
         ign_tok = get_thumbnail_sequence_ignore_tokens(self._qsettings)
-        sq, frames = _inspector_preview_resolve_sequence(
-            wp, wf, ignore_extensions=ign_ext, ignore_name_tokens=ign_tok
-        )
+        sq = _inspector_preview_resolve_sequence_folder(wp, wf)
         self._sequence_folder = sq
-        self._sequence_frames = frames
-        self._seq_index = (len(frames) // 2) if frames else 0
+        self._seq_index = 0
 
         # Version badge: always show when latest work version is known.
         # Color encodes whether we're showing a sequence folder for the latest work (green) or an older fallback (red).
@@ -2821,6 +2877,21 @@ class _InspectorPreview(QWidget):
                 self._container._w.set_version_badge(text=badge_text, bg=badge_bg, tooltip=tooltip)
         except Exception:
             pass
+        if sq is not None:
+            self._ensure_inspector_seq_pool()
+            assert self._seq_pool is not None
+            self._seq_pool.start(
+                _InspectorSeqListRunnable(list_token, sq, ign_ext, ign_tok, self._seq_list_sig)
+            )
+        self._update_sequence_play_button()
+        self._sync_inspector_thumb_tooltip()
+
+    def _on_inspector_sequence_frames_listed(self, token: int, frames: object) -> None:
+        if token != self._seq_list_token:
+            return
+        listed = frames if isinstance(frames, list) else []
+        self._sequence_frames = listed
+        self._seq_index = (len(listed) // 2) if listed else 0
         self._update_sequence_play_button()
         self._sync_inspector_thumb_tooltip()
 
@@ -3072,7 +3143,12 @@ class _InspectorPreview(QWidget):
 
     def _inspector_seq_is_heavy(self) -> bool:
         heavy = {".exr", ".hdr"}
-        return bool(self._sequence_frames) and all(p.suffix.lower() in heavy for p in self._sequence_frames)
+        if not self._sequence_frames:
+            return False
+        for p in (self._sequence_frames[0], self._sequence_frames[-1]):
+            if p.suffix.lower() not in heavy:
+                return False
+        return True
 
     def _inspector_seq_prefetch_n(self) -> int:
         return 1 if self._inspector_seq_is_heavy() else 3
@@ -3223,6 +3299,59 @@ class _InspectorPreview(QWidget):
                 j = (self._seq_index + k) % n
                 self._request_inspector_seq_decode(j)
 
+    def _department_label_for_active(self) -> str | None:
+        dept_id = self._active_department
+        if not dept_id:
+            return None
+        w = self.parent()
+        while w is not None:
+            resolver = getattr(w, "_department_label_resolver", None)
+            if callable(resolver):
+                try:
+                    lab = resolver(dept_id)
+                except Exception:
+                    lab = None
+                if lab:
+                    return str(lab).strip() or None
+            w = w.parent()
+        return dept_id.replace("_", " ").title()
+
+    def _try_emit_review_open(self) -> bool:
+        thumb_path = self._resolve_inspector_thumbnail_disk_path()
+        if thumb_path is None:
+            return False
+        item = self._item
+        entity_path = Path(item.path) if item is not None and getattr(item, "path", None) else None
+        wp, wf = (None, None)
+        if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            wp, wf = self._work_paths_for_preview_item(item)
+        fps = read_sequence_preview_fps(self._qsettings)
+        resolved = resolve_entity_review_media(
+            thumb_path=thumb_path,
+            work_path=wp,
+            work_file_path=wf,
+            sequence_frames=None,
+            sequence_folder=self._sequence_folder,
+            fps=fps,
+            context=PreviewContext.entity,
+            entity_path=entity_path,
+            department_id=self._active_department,
+            department_label=self._department_label_for_active(),
+        )
+        if resolved.action == ReviewResolveAction.open_player and resolved.request is not None:
+            self.review_open_requested.emit(resolved.request)
+            return True
+        if resolved.action == ReviewResolveAction.open_external:
+            if self._seq_playing:
+                self._seq_playing = False
+                self._seq_tick.stop()
+                self._seq_poll.stop()
+                self._restore_static_thumb_from_cache()
+            self._open_inspector_thumbnail_externally()
+            self._update_sequence_play_button()
+            return True
+        return False
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if watched is not self._container._w:
             return super().eventFilter(watched, event)
@@ -3235,42 +3364,9 @@ class _InspectorPreview(QWidget):
             return False
         if et == QEvent.Type.MouseButtonDblClick and isinstance(event, QMouseEvent):
             if event.button() == Qt.MouseButton.LeftButton:
-                thumb_path = self._resolve_inspector_thumbnail_disk_path()
-                if thumb_path is None:
-                    return False
-                item = self._item
-                if thumb_path is not None and is_video_preview_path(thumb_path):
-                    self.video_preview_requested.emit(thumb_path)
+                if self._try_emit_review_open():
                     return True
-                if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
-                    wp, wf = self._work_paths_for_preview_item(item)
-                    if wp is not None:
-                        blast = resolve_work_preview_video(wp, wf)
-                        if blast is not None:
-                            self.video_preview_requested.emit(blast)
-                            return True
-                if self._sequence_frames and self._sequence_folder is not None:
-                    fps = read_sequence_preview_fps(self._qsettings)
-                    entity_path = None
-                    if item is not None and getattr(item, "path", None):
-                        entity_path = Path(item.path)
-                    self.sequence_preview_requested.emit(
-                        SequencePreviewOpenRequest(
-                            frames=list(self._sequence_frames),
-                            sequence_folder=self._sequence_folder,
-                            fps=max(1, min(60, int(fps))),
-                            entity_path=entity_path,
-                        )
-                    )
-                    return True
-                if self._seq_playing:
-                    self._seq_playing = False
-                    self._seq_tick.stop()
-                    self._seq_poll.stop()
-                    self._restore_static_thumb_from_cache()
-                self._open_inspector_thumbnail_externally()
-                self._update_sequence_play_button()
-                return True
+                return False
         if et == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
             try:
                 mpos = event.position().toPoint() if hasattr(event, "position") else event.pos()
@@ -3712,17 +3808,13 @@ class _InspectorPreview(QWidget):
                 menu.insertAction(act_open, act_play)
 
         if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
-            wp, wf = self._work_paths_for_preview_item(item)
-            if wp is not None:
-                blast = resolve_work_preview_video(wp, wf)
-                if blast is not None:
-                    act_blast = QAction(
-                        lucide_icon("play", size=16, color_hex=MONOS_COLORS["text_label"]),
-                        "Play playblast…",
-                        menu,
-                    )
-                    act_blast.triggered.connect(lambda p=blast: self.video_preview_requested.emit(p))
-                    menu.insertAction(act_open, act_blast)
+            act_review = QAction(
+                lucide_icon("play", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Review latest preview…",
+                menu,
+            )
+            act_review.triggered.connect(self._try_emit_review_open)
+            menu.insertAction(act_open, act_review)
 
         seq_dir = self._sequence_folder if (self._sequence_folder is not None and self._sequence_folder.is_dir()) else None
         act_open_render = QAction(

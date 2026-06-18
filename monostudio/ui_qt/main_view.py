@@ -4242,6 +4242,7 @@ class MainView(QWidget):
     dcc_copy_path_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
     dcc_delete_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
     dcc_open_version_requested = Signal(object, str, str, object)  # (ViewItem, dcc_id, department, file_path: Path)
+    review_entity_requested = Signal(object)  # ViewItem (asset/shot) — review latest preview
     active_dcc_changed = Signal(object, str, str)  # (path, department, dcc_id) — đồng bộ Inspector
     production_status_override_chosen = Signal(object, str, object)  # (Path | list[Path], department, status_id | None)
     project_status_chosen = Signal(object, object)  # Path, status_key | None (None = automatic)
@@ -8860,6 +8861,13 @@ class MainView(QWidget):
                     open_action.setToolTip("No work file in this department.")
                     open_with_action.setEnabled(False)
                     open_with_action.setToolTip("No work file in this department.")
+            act_review = menu.addAction(
+                lucide_icon("play", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim),
+                "Review latest preview…",
+            )
+            if not has_dept_filter:
+                act_review.setEnabled(False)
+                act_review.setToolTip(_no_dept_hint)
             # "Open older version" submenu when right-click on thumbnail: use same active_dcc as icon (already resolved above).
             if has_dept_filter and isinstance(item.ref, (Asset, Shot)) and self._project_root and active_dcc:
                 dep_norm = (self._active_department or "").strip().casefold()
@@ -8991,6 +8999,9 @@ class MainView(QWidget):
         # Compare by label text; labels are fixed by spec.
         text = getattr(chosen, "text", lambda: "")()
 
+        if text == "Review latest preview…":
+            self.review_entity_requested.emit(item)
+            return
         if text == "Switch to Project":
             self.switch_project_requested.emit(item)
             return

@@ -68,6 +68,7 @@ def _nav_quick_actions() -> list[HotkeyAction]:
 
 HOTKEY_ACTIONS: tuple[HotkeyAction, ...] = (
     HotkeyAction("global.command_palette", "Command palette", "Global", "`"),
+    HotkeyAction("global.nav_quick_picker", "Quick view picker", "Navigation", "Ctrl+`"),
     HotkeyAction("inspector.tab_pipeline", "Inspector — Pipeline tab", "Inspector", "Alt+1"),
     HotkeyAction("inspector.tab_reference", "Inspector — Reference tab", "Inspector", "Alt+2"),
     HotkeyAction("inspector.tab_details", "Inspector — Details tab", "Inspector", "Alt+3"),
@@ -212,7 +213,8 @@ def format_nav_quick_hint(settings: QSettings | None) -> str:
         recall_range = recall_first
     else:
         recall_range = f"{recall_first} … {recall_last}"
-    return f"{assign_range} assign · {recall_range} go"
+    picker = format_hotkey_display(settings, "global.nav_quick_picker")
+    return f"{picker} picker · {assign_range} assign · {recall_range} go"
 
 
 def bind_hotkey(
