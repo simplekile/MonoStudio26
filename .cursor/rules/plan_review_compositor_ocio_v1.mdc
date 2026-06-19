@@ -12,6 +12,7 @@ alwaysApply: false
 - **Video mpv FAIL (Win)**: `MpvEmbeddedBackend` dùng `wid` + `WA_NativeWindow` trên `_surface` → mpv HWND **che** overlay Qt; `_sync_native_video_zorder()` đẩy mpv lên `HWND_TOP` sau mỗi `raise_()`.
 - **Data model draw OK** (`review_draw`, sidecar video/sequence) — lỗi **render/hit-test**, không phải thiếu sidecar.
 - **Workaround tạm** (flipbook pause → QLabel): ship nhanh, **không** kiến trúc cuối.
+- **Phase 1 interim (dev)**: `win32_video_overlay.py` + `read_review_video_draw_overlay_fix` — overlay trên mpv, mouse pass-through khi draw active. Flag tắt = z-order cũ.
 
 ## Kiến trúc mục tiêu (chuẩn + xịn + OCIO)
 

@@ -90,7 +90,9 @@ from monostudio.ui_qt.video_preview_settings import (
     read_mpv_directory,
     read_video_external_player_exe,
     read_video_player_backend,
+    read_review_video_draw_overlay_fix,
     write_mpv_directory,
+    write_review_video_draw_overlay_fix,
     write_video_external_player_exe,
     write_video_player_backend,
 )
@@ -1065,6 +1067,22 @@ class SettingsDialog(MonosDialog):
         except Exception:
             pass
         add_settings_field_row(insp_l, "Playback backend", self._video_player_backend_combo)
+
+        self._review_draw_overlay_fix_cb = QCheckBox(
+            "Draw overlay above embedded mpv (Windows)",
+            insp_card,
+        )
+        self._review_draw_overlay_fix_cb.setToolTip(
+            "Keeps review draw strokes visible and clickable over mpv video. "
+            "Disable only if video preview stacking regresses on your GPU."
+        )
+        try:
+            self._review_draw_overlay_fix_cb.setChecked(
+                read_review_video_draw_overlay_fix(self._settings)
+            )
+        except Exception:
+            self._review_draw_overlay_fix_cb.setChecked(True)
+        add_settings_field_row(insp_l, "Review draw on video", self._review_draw_overlay_fix_cb)
 
         mpv_row = QWidget(insp_card)
         mpv_row_l = QHBoxLayout(mpv_row)
@@ -3920,6 +3938,11 @@ class SettingsDialog(MonosDialog):
                 backend = self._video_player_backend_combo.currentData()
                 if isinstance(backend, str):
                     write_video_player_backend(self._settings, backend)
+            if self._settings is not None and getattr(self, "_review_draw_overlay_fix_cb", None) is not None:
+                write_review_video_draw_overlay_fix(
+                    self._settings,
+                    self._review_draw_overlay_fix_cb.isChecked(),
+                )
             if self._settings is not None and getattr(self, "_mpv_dir_field", None) is not None:
                 write_mpv_directory(self._settings, (self._mpv_dir_field.text() or "").strip())
             if self._settings is not None and getattr(self, "_video_external_player_field", None) is not None:

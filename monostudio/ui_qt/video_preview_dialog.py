@@ -175,6 +175,7 @@ from monostudio.ui_qt.video_preview_settings import (
     read_video_preview_precise_scrub_drag,
     read_video_preview_time_display,
     read_video_preview_volume,
+    read_review_video_draw_overlay_fix,
     write_review_note_rail_open,
     write_review_note_rail_width,
     write_review_tool_mode,
@@ -2005,31 +2006,41 @@ class VideoPreviewDialog(MonosDialog):
             btn.raise_()
         self._sync_native_video_zorder()
 
+    def _review_video_draw_overlay_fix_enabled(self) -> bool:
+        return read_review_video_draw_overlay_fix(self._settings)
+
+    def _draw_overlay_above_video(self) -> bool:
+        if self._is_sequence_mode() or not self._review_video_draw_overlay_fix_enabled():
+            return False
+        overlay = getattr(self, "_draw_overlay", None)
+        return overlay is not None and overlay.isVisible()
+
+    def _mpv_mouse_pass_through_for_draw(self) -> bool:
+        return self._draw_overlay_above_video() and self._draw_tool_active()
+
     def _sync_native_video_zorder(self) -> None:
         if sys.platform != "win32" or self._is_sequence_mode():
             return
         surface = getattr(self, "_surface", None)
         if surface is None or not surface.isVisible():
             return
+        if self._draw_overlay_above_video():
+            from monostudio.ui_qt.win32_video_overlay import sync_video_draw_overlay_zorder
+
+            sync_video_draw_overlay_zorder(
+                surface,
+                self._draw_overlay,
+                mouse_pass_through=self._mpv_mouse_pass_through_for_draw(),
+            )
+            return
         try:
-            import ctypes
-            from ctypes import wintypes
+            from monostudio.ui_qt.win32_video_overlay import (
+                raise_embedded_video_surface,
+                restore_embedded_video_input,
+            )
 
-            user32 = ctypes.windll.user32
-            hwnd_top = wintypes.HWND(0)
-            flags = 0x0002 | 0x0001 | 0x0010 | 0x0040  # NOMOVE | NOSIZE | NOACTIVATE | SHOWWINDOW
-
-            def _raise_hwnd(hwnd: int, _lparam: int) -> bool:
-                if user32.IsWindowVisible(hwnd):
-                    user32.SetWindowPos(hwnd, hwnd_top, 0, 0, 0, 0, flags)
-                return True
-
-            parent = int(surface.winId())
-            if not parent:
-                return
-            user32.SetWindowPos(parent, hwnd_top, 0, 0, 0, 0, flags)
-            enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(_raise_hwnd)
-            user32.EnumChildWindows(parent, enum_proc, 0)
+            restore_embedded_video_input(surface)
+            raise_embedded_video_surface(surface)
         except Exception:
             pass
 
@@ -5102,6 +5113,7 @@ class VideoPreviewDialog(MonosDialog):
         if self._onion_enabled:
             self._draw_overlay.set_onion(enabled=True, span=self._onion_span)
             self._schedule_onion_refresh()
+        self._sync_native_video_zorder()
 
     def _sync_draw_viewport(self) -> None:
         if not hasattr(self, "_draw_overlay"):
@@ -5131,6 +5143,7 @@ class VideoPreviewDialog(MonosDialog):
                     "Wheel — Zoom · MMB drag — Scrub · Alt+MMB — Pan"
                 )
         self._schedule_onion_refresh()
+        self._sync_native_video_zorder()
 
     def _sync_viewport_overlay_geometry(self) -> None:
         self._apply_viewer_plate_geometry()

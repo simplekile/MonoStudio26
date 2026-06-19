@@ -24,6 +24,8 @@ KEY_VIDEO_PREVIEW_VOLUME = "ui/video_preview_volume"
 KEY_VIDEO_PREVIEW_LOOP = "ui/video_preview_loop"
 KEY_VIDEO_PREVIEW_PROXY_ENABLED = "ui/video_preview_proxy_enabled"
 KEY_VIDEO_PREVIEW_PROXY_SCALE = "ui/video_preview_proxy_scale"
+KEY_REVIEW_VIDEO_DRAW_OVERLAY_FIX = "ui/review_video_draw_overlay_fix"
+KEY_REVIEW_USE_GPU_COMPOSITOR = "ui/review_use_gpu_compositor"
 
 PROXY_SCALE_FULL = 1.0
 PROXY_SCALE_HALF = 0.5
@@ -457,3 +459,31 @@ def write_video_preview_proxy_scale(settings: QSettings, scale: float) -> None:
     if s not in PROXY_SCALE_STEPS:
         s = PROXY_SCALE_FULL
     settings.setValue(KEY_VIDEO_PREVIEW_PROXY_SCALE, s)
+
+
+def read_review_video_draw_overlay_fix(settings: QSettings | None) -> bool:
+    """Win32: keep ReviewDrawOverlay above mpv HWND (default on)."""
+    if settings is None:
+        return True
+    v = settings.value(KEY_REVIEW_VIDEO_DRAW_OVERLAY_FIX, True)
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() not in ("0", "false", "no")
+
+
+def write_review_video_draw_overlay_fix(settings: QSettings, enabled: bool) -> None:
+    settings.setValue(KEY_REVIEW_VIDEO_DRAW_OVERLAY_FIX, bool(enabled))
+
+
+def read_review_use_gpu_compositor(settings: QSettings | None) -> bool:
+    """Future libmpv render-to-texture path (default off)."""
+    if settings is None:
+        return False
+    v = settings.value(KEY_REVIEW_USE_GPU_COMPOSITOR, False)
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes")
+
+
+def write_review_use_gpu_compositor(settings: QSettings, enabled: bool) -> None:
+    settings.setValue(KEY_REVIEW_USE_GPU_COMPOSITOR, bool(enabled))
