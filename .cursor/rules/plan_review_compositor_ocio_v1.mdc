@@ -1,0 +1,74 @@
+---
+description: Review compositor + OCIO — mpv draw fix, GPU pipeline, phases, risks. Read before video preview / draw / color work.
+globs: monostudio/ui_qt/video_preview_dialog.py, monostudio/ui_qt/video_player_backend.py, monostudio/ui_qt/review_draw_overlay.py, monostudio/ui_qt/review_playback_backend.py, monostudio/core/review_draw.py
+alwaysApply: false
+---
+
+# Plan — Review Compositor + OCIO (v1)
+
+## Vấn đề hiện tại (draw trên mpv)
+
+- **Sequence OK**: `SequenceDecodeBackend` → `QLabel`, `ReviewDrawOverlay` trên `_surface_wrap`, không native HWND.
+- **Video mpv FAIL (Win)**: `MpvEmbeddedBackend` dùng `wid` + `WA_NativeWindow` trên `_surface` → mpv HWND **che** overlay Qt; `_sync_native_video_zorder()` đẩy mpv lên `HWND_TOP` sau mỗi `raise_()`.
+- **Data model draw OK** (`review_draw`, sidecar video/sequence) — lỗi **render/hit-test**, không phải thiếu sidecar.
+- **Workaround tạm** (flipbook pause → QLabel): ship nhanh, **không** kiến trúc cuối.
+
+## Kiến trúc mục tiêu (chuẩn + xịn + OCIO)
+
+```
+Source (libmpv render | OIIO float EXR) → GPU texture
+  → OCIO GPU processor (scene → display)  [optional / passthrough]
+  → Vector strokes (display-referred, sau OCIO)
+  → 1 compositor framebuffer
+```
+
+- Bỏ `wid` embed; bỏ `_sync_native_video_zorder` khi compositor active.
+- Strokes: giữ normalized UV + `ReviewDrawLayer` sidecar; vẽ **display-referred** (sau display transform).
+- Module đích: `ColorPipeline` / `OcioSession` (core), `ReviewCompositorWidget` (ui_qt).
+
+## Phases (merge master từng phase)
+
+| Phase | Nội dung | Merge khi |
+|-------|----------|-----------|
+| 0 | `ColorPipeline` + Settings (config path, display view); passthrough nếu không OCIO | Flag tắt = hành vi cũ |
+| 1 | libmpv **render context** → texture; draw (QPainter hoặc GL stroke tạm) | Draw video OK + flag |
+| 2 | OCIO GPU cho sequence **EXR/DPX** (OIIO float) | Golden EXR + CPU fallback |
+| 3 | OCIO video + stroke GPU + export burn-in cùng pipeline | WYSIWYG export |
+
+## OCIO rules
+
+- Video H.264: display-referred (Rec.709) — **không** linearize như scene EXR.
+- Per-clip sidecar: `input_colorspace`, `display_view`, exposure (cạnh draw/ranges).
+- Thumbnail/proxy: gắn tag SDR hoặc cùng config — tránh lệch Inspector vs Preview.
+- Dependency: `PyOpenColorIO`; EXR float: **OpenImageIO** (thay ffmpeg 8-bit cho path OCIO).
+
+## Rủi ro top & giảm thiểu
+
+| Rủi ro | Giảm thiểu |
+|--------|-------------|
+| Big-bang merge | Phase + feature flag `embed_wid` / `compositor` / `ocio` |
+| Sai input colorspace | Passthrough default; sidecar per-clip; golden EXR tests |
+| GL/driver Win | CPU OCIO fallback; POC widget tách trước khi đụng full dialog |
+| Regression scrub/proxy | Smoke script; giữ proxy logic, chỉ đổi display path |
+| Proxy vs full-res màu | UI nói rõ; full-res mới OCIO |
+
+## Không làm
+
+- OCIO trên stack `wid` + QPainter (refactor 2 lần).
+- mpv `overlay-add` duplicate stroke model (trừ POC nhỏ).
+- Merge dev → master một cục không flag.
+
+## Touch points hiện tại
+
+- `video_player_backend.py` — `MpvEmbeddedBackend` (`wid`, `vo=gpu`)
+- `video_preview_dialog.py` — `_draw_overlay`, `_sync_native_video_zorder`, `_set_surface_native_for_mode`
+- `review_draw_overlay.py` — QPainter overlay (migrate → compositor)
+- `sequence_preview_decode.py` — ffmpeg 8-bit EXR (path OCIO cần float)
+
+## Agent checklist (mọi thay đổi preview/draw/color)
+
+- [ ] Đọc rule Git: đúng nhánh `dev/review-compositor`?
+- [ ] Còn phụ thuộc `wid` / `HWND_TOP`?
+- [ ] Draw sequence regression?
+- [ ] Feature flag / passthrough khi OCIO off?
+- [ ] Không copy z-order hack sang file mới.

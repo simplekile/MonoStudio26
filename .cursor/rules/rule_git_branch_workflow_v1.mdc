@@ -1,0 +1,45 @@
+---
+description: Git branch workflow — master shippable, dev/review-compositor for playback/compositor work, phased merge.
+alwaysApply: true
+---
+
+# MONOS — Git Branch Workflow (v1)
+
+## Nguồn truth
+
+- **`master`**: luôn **shippable** (release 26.x). Fix nhỏ, UI/copy, bug không đụng playback sâu.
+- **`dev/review-compositor`**: integration dài hạn cho libmpv render, GPU compositor, OCIO, draw-on-video.
+- **Feature ngắn**: `feat/*` từ dev → merge vào dev (không thẳng `master` trừ hotfix).
+
+## Khi làm việc ở đâu
+
+| Việc | Nhánh |
+|------|--------|
+| Compositor, OCIO, mpv render, draw video fix sâu | `dev/review-compositor` (+ `feat/*` con) |
+| Hotfix release, settings/inbox nhỏ | `master` |
+| POC tách | `feat/mpv-render-poc` → merge `dev/review-compositor` |
+
+## Trước khi đổi nhánh
+
+- `git status` — commit hoặc `git stash` trước `checkout`.
+- Dev **sync `master` hàng tuần** (hoặc sau mỗi release): `git merge origin/master` trên dev — tránh conflict `video_preview_dialog.py`.
+
+## Gộp vào master
+
+- **Có**, nhưng **theo phase + PR** — không merge một cục cả compositor + OCIO + bỏ `wid`.
+- Mỗi phase: smoke test (video, sequence, draw sequence, scrub/proxy/loop) + **feature flag** rollback.
+- Ưu tiên **PR / `gh pr create`**; tag release chỉ trên `master`.
+- Sau release trên `master`: merge `master` lại **dev**.
+
+## Không làm
+
+- Refactor playback lớn trực tiếp trên `master` (master không build/run ổn nhiều tuần).
+- Force-push `master`.
+- Merge dev → master không test, không flag.
+
+## Checklist agent (trước commit/PR playback)
+
+- [ ] Đúng nhánh? (lớn → dev, nhỏ release → master)
+- [ ] Dev đã sync `master` gần đây?
+- [ ] Phase merge có feature flag / passthrough khi tắt?
+- [ ] Không commit secret (.env, credentials).
