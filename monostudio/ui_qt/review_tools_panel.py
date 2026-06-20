@@ -202,10 +202,7 @@ class ReviewToolsPanel(QWidget):
 
     def apply_context(self, context: PreviewContext) -> None:
         self._context = context
-        show_draw = context == PreviewContext.entity
-        self._mode_pills.set_segment_visible(ReviewToolMode.draw.value, show_draw)
-        if self._tool_mode == ReviewToolMode.draw and not show_draw:
-            self.activate_tool_mode(ReviewToolMode.ranges)
+        self._mode_pills.set_segment_visible(ReviewToolMode.draw.value, True)
 
     def range_list_widget(self) -> VideoRangeListWidget:
         return self._range_panel
@@ -243,8 +240,6 @@ class ReviewToolsPanel(QWidget):
                 mode = ReviewToolMode(mode)
             except ValueError:
                 mode = ReviewToolMode.ranges
-        if mode == ReviewToolMode.draw and self._context != PreviewContext.entity:
-            mode = ReviewToolMode.ranges
         prev_mode = self._tool_mode
         prev_ws = self._workspace
         self._tool_mode = mode

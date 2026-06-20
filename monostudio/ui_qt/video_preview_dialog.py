@@ -2095,7 +2095,6 @@ class VideoPreviewDialog(MonosDialog):
             if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
                 if (
                     event.button() == Qt.MouseButton.RightButton
-                    and self._context == PreviewContext.entity
                 ):
                     self._show_draw_quick_popup(event.globalPosition().toPoint())
                     return True
@@ -2520,8 +2519,6 @@ class VideoPreviewDialog(MonosDialog):
         if mode == ReviewToolMode.note:
             self._toggle_note_rail()
             return
-        if mode == ReviewToolMode.draw and self._context != PreviewContext.entity:
-            return
         if self._tools_panel.workspace() != ReviewWorkspace.tools:
             self._open_review_tools_panel(mode)
             return
@@ -2535,10 +2532,9 @@ class VideoPreviewDialog(MonosDialog):
     def _scrubber_mode_timeline_defaults(self) -> tuple[bool, bool, bool, bool, bool, bool]:
         """Mode defaults: show ranges, markers, draw keys, interact ranges, markers, draw keys."""
         mode = self._tools_panel.tool_mode()
-        entity = self._context == PreviewContext.entity
         if mode == ReviewToolMode.markers:
             return (False, True, False, False, True, False)
-        if mode == ReviewToolMode.draw and entity:
+        if mode == ReviewToolMode.draw:
             return (False, False, True, False, False, True)
         return (True, False, False, True, False, False)
 
@@ -2561,7 +2557,7 @@ class VideoPreviewDialog(MonosDialog):
             force_ranges=self._scrubber_display_force_ranges,
             force_markers=self._scrubber_display_force_markers,
             force_draw_keys=self._scrubber_display_force_draw_keys,
-            draw_keys_enabled=self._context == PreviewContext.entity,
+            draw_keys_enabled=True,
         )
 
     def _on_scrubber_display_force_toggled(self, key: str, checked: bool) -> None:
@@ -2620,10 +2616,9 @@ class VideoPreviewDialog(MonosDialog):
         if not hasattr(self, "_draw_transport"):
             return
         mode = self._tools_panel.tool_mode()
-        entity = self._context == PreviewContext.entity
         ranges = mode == ReviewToolMode.ranges
         markers = mode == ReviewToolMode.markers
-        draw = mode == ReviewToolMode.draw and entity
+        draw = mode == ReviewToolMode.draw
 
         self._btn_in.setVisible(ranges)
         self._btn_out.setVisible(ranges)
@@ -2941,7 +2936,7 @@ class VideoPreviewDialog(MonosDialog):
     def _footer_hints_proxy(self) -> list[str]:
         parts = ["Space — Play/Pause", "Scrub/play use proxy when cached"]
         mode = self._tools_panel.tool_mode()
-        if mode == ReviewToolMode.draw and self._context == PreviewContext.entity:
+        if mode == ReviewToolMode.draw:
             parts.append("D — Exit draw")
             return parts
         if mode == ReviewToolMode.markers:
@@ -3105,7 +3100,7 @@ class VideoPreviewDialog(MonosDialog):
             return self._footer_hints_proxy()
 
         mode = self._tools_panel.tool_mode()
-        if mode == ReviewToolMode.draw and self._context == PreviewContext.entity:
+        if mode == ReviewToolMode.draw:
             parts = self._footer_hints_draw(zone)
         elif mode == ReviewToolMode.markers:
             parts = self._footer_hints_markers(zone)
@@ -4467,8 +4462,6 @@ class VideoPreviewDialog(MonosDialog):
         self._edit_highlighted_range()
 
     def _can_edit_draw_keyframe(self) -> bool:
-        if self._context != PreviewContext.entity:
-            return False
         layer = self._active_draw_layer()
         if layer is None:
             return False
@@ -5154,8 +5147,6 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_draw_ui()
 
     def _toggle_draw_tool(self) -> None:
-        if self._context != PreviewContext.entity:
-            return
         if self._draw_tool_active():
             self._activate_tool(ReviewToolMode.ranges)
         else:
