@@ -1,0 +1,197 @@
+---
+description: Plan thay toàn bộ List View Main View — Pipeline List Row, selection ổn định, parity Grid, multi-select.
+alwaysApply: false
+---
+
+# Plan — Thay toàn bộ List View (Main View v2)
+
+Main View có Grid (Tile) và List. Plan này **thay hẳn** List hiện tại (`QTableView` + `PipelineTableModel`) bằng **Pipeline List Row** (Finder-style): `QListView` ListMode + một delegate vẽ cả hàng, selection store dùng chung với Grid.
+
+Plan cũ `plan_list_mode_completion_v1.mdc` **lỗi thời** — không áp dụng.
+
+---
+
+## 1. Hiện trạng & vấn đề
+
+### Đã có
+- `PipelineTileModel` + `PipelineTableModel` dùng chung `_all_items`
+- Multi-select: Ctrl / Shift / rubber band (`_RubberBandSelectMixin`)
+- Cột tương đương Grid: thumb, Name, Notes, DCC, Health, Ref, Concept, Status, Due, Version, Last Updated, Assignee
+- Context menu, status pill batch, DCC badge menu, Work/Publish tint, dimmed items
+- `interaction_fast_paint()` + ẩn cột khi marquee (`_list_marquee_simplify_*`)
+
+### Điểm yếu
+| Vấn đề | Biểu hiện |
+|--------|-----------|
+| Kiến trúc | `QTableView` + delegate từng ô + `paintEvent` custom → 3 lớp vẽ |
+| Selection | `set_view_mode()` không sync multi-select Grid ↔ List |
+| Hiệu năng | Marquee phải ẩn 10 cột — layout không scale |
+| Maintainability | ~121 chỗ `_list_*` trong `main_view.py` |
+| UX | Chưa Enter activate; column width chưa persist đầy đủ |
+
+---
+
+## 2. Mục tiêu
+
+1. **UI/UX ổn định** — một hàng = một đơn vị vẽ; không ẩn/hiện cột khi drag.
+2. **Multi-select đầy đủ** — parity Grid.
+3. **Feature parity Grid** — mọi affordance trên card có trên list row.
+4. **Tách module** — list không còn phụ thuộc khối lớn trong `main_view.py`.
+5. **Selection nhất quán** — chuyển Grid ↔ List giữ nguyên tập path.
+
+**Không v1:** sort cột, Inspector multi-select, drag-drop reorder.
+
+---
+
+## 3. Kiến trúc: Pipeline List Row
+
+```
+PipelineListHeader (cột, resize, QSettings)
+PipelineListView (QListView ListMode + rubber band mixin)
+  └── PipelineListRowDelegate (vẽ cả hàng theo x-offset)
+PipelineListModel (wrap PipelineTileModel, 1 cột)
+PipelineSelectionStore (set[Path] — sync grid + list)
+```
+
+### Module mới
+
+| File | Trách nhiệm |
+|------|-------------|
+| `monostudio/ui_qt/pipeline_list_view.py` | View, rubber band, keyboard |
+| `monostudio/ui_qt/pipeline_list_delegate.py` | Vẽ row, hit regions, fast-paint |
+| `monostudio/ui_qt/pipeline_list_header.py` | Header + resize + scroll sync |
+| `monostudio/ui_qt/pipeline_list_layout.py` | Column spec theo context |
+| `monostudio/ui_qt/pipeline_selection.py` | Selection theo `set[Path]` |
+| `monostudio/ui_qt/pipeline_row_paint.py` | Paint helpers dùng chung grid + list |
+
+### Model
+- Giữ `PipelineTileModel`.
+- `PipelineListModel` — `rowCount` = tile model; `UserRole` = `ViewItem`.
+- Xóa `PipelineTableModel` sau migration.
+
+### Layout cột (asset/shot)
+X-offset từ `PipelineListLayout` (không Qt column index):
+
+| Slot | Tier | Nội dung |
+|------|------|----------|
+| Index | 3 | `#` mono |
+| Thumb | 1 | 40px |
+| Name | 1 | Inter 13 Bold |
+| Notes / DCC / Health / Ref / Concept | 4 | chips (reuse grid paint) |
+| Status | 2 | production pill |
+| Due / Version / Last Updated | 3 | mono meta |
+| Assignee | 2 | màu user |
+
+Project: Name, Status, Assets, Shots, Last Updated, Path (ẩn mặc định).
+
+Typography: `table_deep_dark_monos_v1.mdc`, `typography_font_stack_v1.mdc`.
+
+---
+
+## 4. PipelineSelectionStore
+
+```python
+paths: set[Path]      # multi-select
+current: Path | None  # focus (Inspector)
+anchor: Path | None   # Shift-range
+```
+
+- View đổi selection → store → mirror view còn lại.
+- `selection_id_changed` vẫn 1 path (`current`) cho Inspector.
+- API mới: `selected_paths() -> list[Path]`.
+- `set_view_mode()` → apply store lên view active.
+
+| Thao tác | Hành vi |
+|----------|---------|
+| Click | Chọn 1 |
+| Ctrl+Click | Toggle |
+| Shift+Click | Range |
+| Rubber band | Nhiều row; skip dimmed |
+| Click empty | Clear (trừ Ctrl) |
+
+---
+
+## 5. Feature parity Grid ↔ List
+
+| Tính năng | List mới |
+|-----------|----------|
+| Thumbnail + prefetch | ✓ |
+| Multi-select + sync mode | ✓ |
+| Status / DCC / Health / Notes / Ref / Concept | ✓ |
+| Work/Publish tint, dimmed | ✓ |
+| Context menu | `_build_item_context_menu` chung |
+| Double-click + Enter activate | ✓ |
+| Fast paint marquee | Delegate `Minimal` (index+thumb+name) |
+
+---
+
+## 6. UI visual
+
+- Row height: 56px.
+- Chrome: `paint_inbox_list_row_chrome` + vạch trái 2px selected.
+- QSS: `QListView#MainViewList` trong `style.py`.
+- Column widths: QSettings `main_view/list_columns/{context}`.
+
+---
+
+## 7. Tách khỏi main_view.py
+
+Chuyển: `_ListRowDelegate`, `_ClearOnEmptyClickTableView`, hit-test list, `_list_col_*`, list event filter.
+
+Giữ MainView: orchestration, signals, browser context, thumbnails, empty state.
+
+---
+
+## 8. Thứ tự triển khai
+
+### Phase 0
+- [ ] `PipelineListLayout` + tests
+- [ ] `PipelineSelectionStore` + tests
+- [ ] `pipeline_row_paint.py` extract từ grid delegate
+
+### Phase 1
+- [ ] `PipelineListModel` + `PipelineListView` + delegate (cột đủ, chưa chip interactive)
+- [ ] Wire MainView; selection store; QSS
+- [ ] Empty state, thumbnail prefetch
+
+### Phase 2
+- [ ] Hit-test chips; mouse handling; context menu; Enter
+- [ ] Fast-paint minimal marquee
+
+### Phase 3
+- [ ] `PipelineListHeader` + resize persist
+- [ ] Tooltip; xóa TableView code
+- [ ] QA checklist
+
+### Phase 4 (tùy chọn)
+- [ ] Sort, sticky columns, row density
+
+---
+
+## 9. File liên quan
+
+| Khu vực | File |
+|---------|------|
+| List mới | `pipeline_list_*.py`, `pipeline_selection.py`, `pipeline_row_paint.py` |
+| Model | `pipeline_view_models.py` |
+| Integration | `main_view.py`, `style.py` |
+| Tests | `tests/test_pipeline_selection.py`, `tests/test_pipeline_list_layout.py` |
+
+---
+
+## 10. QA checklist
+
+- [ ] Multi-select List → Grid giữ paths
+- [ ] Rubber band 20+ không flicker
+- [ ] Batch status pill multi-select
+- [ ] Enter = double-click
+- [ ] 500 rows scroll mượt
+- [ ] Column widths persist
+
+---
+
+## 11. Quyết định
+
+**Phương án A (khuyến nghị):** QListView row — thay hẳn TableView.
+
+**Không:** refactor incremental QTableView.
