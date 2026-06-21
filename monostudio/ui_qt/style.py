@@ -1509,25 +1509,30 @@ def apply_dark_theme(app: QApplication) -> None:
             background: transparent;
             border: none;
         }
-        QTableView#MainViewList {
+        QTableView#MainViewList,
+        QListView#MainViewList {
             background: #151618;
             solid #27272a;
             selection-background-color: transparent;
         }
-        QTableView#MainViewList::item {
+        QTableView#MainViewList::item,
+        QListView#MainViewList::item {
             background: transparent;
             color: #a1a1aa;
             border: none;
         }
-        QTableView#MainViewList::item:hover {
+        QTableView#MainViewList::item:hover,
+        QListView#MainViewList::item:hover {
             background: transparent;
             color: #fafafa;
         }
-        QTableView#MainViewList::item:selected {
+        QTableView#MainViewList::item:selected,
+        QListView#MainViewList::item:selected {
             background: transparent;
             color: #60a5fa;
         }
-        QTableView#MainViewList::item:selected:!active {
+        QTableView#MainViewList::item:selected:!active,
+        QListView#MainViewList::item:selected:!active {
             color: #a1a1aa;
         }
 
