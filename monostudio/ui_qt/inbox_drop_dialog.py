@@ -95,6 +95,7 @@ class InboxDropDialog(MonosDialog):
         target: str = "inbox",
         initial_date_str: str | None = None,
         prefer_existing_date: bool = False,
+        dialog_title: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("InboxDropDialog")
@@ -116,7 +117,7 @@ class InboxDropDialog(MonosDialog):
             "delivery": "Add to Delivery",
             "internal_check": "Add to Internal check",
         }
-        self.setWindowTitle(titles.get(self._target, "Add to Inbox"))
+        self.setWindowTitle((dialog_title or "").strip() or titles.get(self._target, "Add to Inbox"))
         self.setModal(True)
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)

@@ -89,6 +89,15 @@ class RubberBandSelectMixin:
         anchor = getattr(self, "_shift_anchor_index", None)
         if anchor is not None and anchor.isValid():
             return anchor
+        m = self.model()
+        mv = m.parent() if m is not None else None
+        if mv is not None and hasattr(mv, "_model_index_for_store_path"):
+            store = getattr(mv, "_pipeline_selection_store", None)
+            store_anchor = store.anchor() if store is not None else None
+            if store_anchor is not None:
+                idx = mv._model_index_for_store_path(store_anchor, view=self)
+                if idx.isValid():
+                    return idx
         sm = self.selectionModel()
         if sm is not None:
             cur = sm.currentIndex()
@@ -208,8 +217,14 @@ class RubberBandSelectMixin:
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
-            event.accept()
-            return
+            idx = self.indexAt(event.pos())
+            if idx.isValid() and self._row_passes_selection_filter(idx):
+                self._last_click_index = None
+                self._last_click_time = 0.0
+                self._rb_force_cleanup()
+                self.doubleClicked.emit(idx)
+                event.accept()
+                return
         super().mouseDoubleClickEvent(event)
 
     def rubber_band_selecting(self) -> bool:

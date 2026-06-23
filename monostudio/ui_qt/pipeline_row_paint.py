@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
 from PySide6.QtWidgets import QStyleOptionViewItem
 
 from monostudio.ui_qt.lucide_icons import lucide_icon
@@ -221,9 +221,252 @@ def paint_note_icon_chip(
         painter.drawPixmap(dest, pix)
 
 
+def list_dcc_badge_info(
+    item,
+    active_department: str | None,
+    *,
+    dept_registry=None,
+) -> list[tuple[QIcon | None, str, str]]:
+    """Return [(icon or None, dcc_id, status), ...] for list DCC column. status: exists|creating."""
+    from monostudio.core.models import Asset, Shot
+    from monostudio.core.dcc_registry import get_default_dcc_registry
+    from monostudio.ui_qt.brand_icons import brand_icon
+    from monostudio.ui_qt.main_view import _dcc_ids_for_item
+
+    out: list[tuple[QIcon | None, str, str]] = []
+    ref = getattr(item, "ref", None)
+    if not isinstance(ref, (Asset, Shot)):
+        return out
+    try:
+        reg = get_default_dcc_registry()
+    except Exception:
+        return out
+    ids_with_status = _dcc_ids_for_item(item, active_department, dept_registry=dept_registry)
+    for dcc_id, status in ids_with_status:
+        if status == "creating":
+            out.append((None, dcc_id, "creating"))
+            continue
+        try:
+            info = reg.get_dcc_info(dcc_id) if dcc_id else None
+        except Exception:
+            info = None
+        slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+        color = info.get("brand_color_hex") if isinstance(info, dict) else None
+        if isinstance(slug, str) and slug.strip():
+            ic = brand_icon(slug.strip(), size=14, color_hex=(color if isinstance(color, str) else None))
+        else:
+            ic = lucide_icon("layers", size=14, color_hex=MONOS_COLORS["text_label"])
+        out.append((ic, dcc_id, "exists"))
+    return out
+
+
+_LIST_ROW_SELECTION_OVERLAY = QColor(59, 130, 246, 42)
+
+
+def paint_list_row_selection_overlay(painter: QPainter, rect: QRect) -> None:
+    """Blue wash on top of publish/review row tint — distinct from mode background."""
+    painter.fillRect(rect, _LIST_ROW_SELECTION_OVERLAY)
+
+
+def list_row_dim_opacity(
+    item,
+    *,
+    show_publish: bool,
+    active_department: str | None,
+    hover: bool,
+) -> float:
+    """Content/row opacity for dimmed pipeline items (parity with grid cards)."""
+    ref = getattr(item, "ref", None)
+    from monostudio.core.models import Asset, Shot
+
+    if not isinstance(ref, (Asset, Shot)):
+        return 1.0
+    from monostudio.ui_qt.main_view import (
+        _item_has_publish_for_department,
+        _item_has_work_for_department,
+    )
+
+    if show_publish and not _item_has_publish_for_department(ref, active_department):
+        return 0.45 if hover else 0.1
+    if not show_publish and not _item_has_work_for_department(ref, active_department):
+        return 0.8 if hover else 0.4
+    return 1.0
+
+
 def notes_badge_tooltip_text(open_n: int, visual_mode: str) -> str:
     if visual_mode == "open" or open_n > 0:
         return f"Notes ({open_n} open)"
     if visual_mode == "all_done":
         return "Notes (all completed)"
     return "Notes"
+
+
+def _painter_device_pixel_ratio(painter: QPainter) -> float:
+    dev = painter.device()
+    if dev is not None:
+        return max(1.0, float(dev.devicePixelRatioF()))
+    return 1.0
+
+
+def list_thumb_cover_paint(
+    painter: QPainter, cell_rect: QRect, icon: QIcon, *, fast: bool = False
+) -> bool:
+    """Draw list thumb with object-fit: cover — HiDPI-sharp, center-crop."""
+    if icon.isNull() or cell_rect.width() <= 0 or cell_rect.height() <= 0:
+        return False
+    cell_w = cell_rect.width()
+    cell_h = cell_rect.height()
+    dpr = _painter_device_pixel_ratio(painter)
+    tw = max(1, int(round(cell_w * dpr)))
+    th = max(1, int(round(cell_h * dpr)))
+
+    cache = getattr(list_thumb_cover_paint, "_pix_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(list_thumb_cover_paint, "_pix_cache", cache)
+    key = (int(icon.cacheKey()), tw, th)
+    pix = cache.get(key)
+    if pix is None:
+        from monostudio.ui_qt.thumbnails import explorer_list_icon_decode_px
+
+        decode_side = explorer_list_icon_decode_px(dpr=dpr, icon_logical=max(cell_w, cell_h))
+        src = icon.pixmap(decode_side, decode_side)
+        if src.isNull() or src.width() <= 0 or src.height() <= 0:
+            return False
+        mode = (
+            Qt.TransformationMode.FastTransformation
+            if fast
+            else Qt.TransformationMode.SmoothTransformation
+        )
+        scaled = src.scaled(
+            QSize(tw, th),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            mode,
+        )
+        if scaled.isNull():
+            return False
+        sx = max(0, (scaled.width() - tw) // 2)
+        sy = max(0, (scaled.height() - th) // 2)
+        scaled.setDevicePixelRatio(dpr)
+        pix = scaled
+        cache[key] = (pix, sx, sy, tw, th)
+        if len(cache) > 512:
+            cache.clear()
+    else:
+        pix, sx, sy, tw, th = pix
+
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, not fast)
+    painter.setClipRect(cell_rect, Qt.ClipOperation.IntersectClip)
+    painter.drawPixmap(cell_rect, pix, QRect(sx, sy, tw, th))
+    painter.restore()
+    return True
+
+
+LIST_ASSIGNEE_AVATAR_PX = 24
+LIST_ASSIGNEE_STACK_STEP_PX = 16
+
+
+def list_assignee_avatar_stack_width(count: int, *, max_show: int = 3) -> int:
+    """Horizontal width for stacked assignee avatars in a list cell."""
+    if count <= 0:
+        return LIST_ASSIGNEE_AVATAR_PX
+    shown = min(count, max_show)
+    extra = 1 if count > max_show else 0
+    n = shown + extra
+    if n <= 1:
+        return LIST_ASSIGNEE_AVATAR_PX
+    return LIST_ASSIGNEE_AVATAR_PX + (n - 1) * LIST_ASSIGNEE_STACK_STEP_PX
+
+
+def paint_list_assignee_avatars(
+    painter: QPainter,
+    cell_rect: QRect,
+    users: list,
+    workspace_root,
+    *,
+    dpr: float = 1.0,
+    pixmap_cache: dict | None = None,
+) -> None:
+    """Paint stacked circular assignee avatars (up to 3 + overflow badge)."""
+    from monostudio.core.user_identity import avatar_path
+    from monostudio.ui_qt.user_avatar import avatar_pixmap_for
+
+    size = LIST_ASSIGNEE_AVATAR_PX
+    cache = pixmap_cache if pixmap_cache is not None else {}
+
+    if not users:
+        icon = lucide_icon("user", size=14, color_hex=MONOS_COLORS["text_meta"])
+        chip = QRect(
+            cell_rect.left() + max(0, (cell_rect.width() - size) // 2),
+            cell_rect.top() + max(0, (cell_rect.height() - size) // 2),
+            size,
+            size,
+        )
+        icon.paint(painter, chip, Qt.AlignmentFlag.AlignCenter)
+        return
+
+    max_show = 3
+    shown = users[:max_show]
+    extra = len(users) - max_show
+    total_w = list_assignee_avatar_stack_width(len(users))
+    x0 = cell_rect.left() + max(0, (cell_rect.width() - total_w) // 2)
+    y0 = cell_rect.top() + max(0, (cell_rect.height() - size) // 2)
+
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+    for i, user in enumerate(shown):
+        x = x0 + i * LIST_ASSIGNEE_STACK_STEP_PX
+        rect = QRect(x, y0, size, size)
+        key = (user.id, dpr)
+        pm = cache.get(key)
+        if pm is None:
+            pm = avatar_pixmap_for(
+                avatar_path(workspace_root, user),
+                user.initials,
+                user.color_hex,
+                size,
+                dpr=dpr,
+            )
+            cache[key] = pm
+            if len(cache) > 256:
+                cache.clear()
+        painter.drawPixmap(rect, pm)
+
+    if extra > 0:
+        x = x0 + max_show * LIST_ASSIGNEE_STACK_STEP_PX
+        badge = QRect(x, y0, size, size)
+        painter.setPen(QPen(QColor("#3f3f46")))
+        painter.setBrush(QColor(63, 63, 70, 140))
+        painter.drawEllipse(badge)
+        painter.setPen(QColor(MONOS_COLORS["text_meta"]))
+        painter.setFont(monos_font("Inter", 9, QFont.Weight.DemiBold))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, f"+{extra}")
+
+
+def list_dcc_badge_rects(
+    cell_rect: QRect,
+    dcc_list: list[tuple[str, str]],
+) -> list[tuple[QRect, str]]:
+    """DCC badge hit/layout rects inside a list row cell (horizontal chips)."""
+    if not dcc_list:
+        return []
+    size = 14
+    pad = 4
+    gap = 3
+    max_show = 6
+    chip_h = size + pad * 2
+    chip_w = chip_h
+    creating_w = 44
+    entries = dcc_list[:max_show]
+    widths = [creating_w if st == "creating" else chip_w for (_, st) in entries]
+    base_x = cell_rect.left() + 4
+    base_y = cell_rect.top() + max(0, (cell_rect.height() - chip_h) // 2)
+    result: list[tuple[QRect, str]] = []
+    x_cursor = base_x
+    for i, (dcc_id, _st) in enumerate(entries):
+        w = widths[i]
+        result.append((QRect(x_cursor, base_y, w, chip_h), dcc_id))
+        x_cursor += w + gap
+    return result

@@ -11,6 +11,8 @@ class PreviewContext(StrEnum):
     inbox = "inbox"
     project_guide = "project_guide"
     entity = "entity"
+    internal_check = "internal_check"
+    delivery = "delivery"
 
 
 class ReviewMediaKind(StrEnum):

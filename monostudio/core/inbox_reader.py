@@ -13,6 +13,7 @@ from typing import Any
 from monostudio.core.app_paths import get_app_base_path
 from monostudio.core.inbox_date_folder import resolve_date_folder_name
 from monostudio.core.models import Asset, InboxItem, Shot
+from monostudio.core.outbox_reader import ensure_source_folders
 from monostudio.core.structure_registry import StructureRegistry
 
 INBOX_META_FILENAME = "inbox_meta.json"
@@ -31,6 +32,11 @@ def get_inbox_root(project_root: Path) -> Path:
     from monostudio.core.structure_registry import StructureRegistry
     struct_reg = StructureRegistry.for_project(project_root)
     return Path(project_root) / struct_reg.get_folder("inbox")
+
+
+def ensure_inbox_source_folders(project_root: Path) -> None:
+    """Ensure inbox/client and inbox/freelancer exist."""
+    ensure_source_folders(get_inbox_root(project_root))
 
 
 def _meta_path(project_root: Path) -> Path:
@@ -125,8 +131,28 @@ def _build_inbox_item(
     )
 
 
+def infer_inbox_source_from_path(project_root: Path, path: Path) -> str | None:
+    """Infer client/freelancer from inbox/<source>/… path or meta."""
+    root = get_inbox_root(project_root)
+    try:
+        rel = Path(path).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    rel_str = rel.as_posix()
+    from_path = _infer_source_from_relative_path(rel_str)
+    if from_path in ("client", "freelancer"):
+        return from_path
+    meta = read_inbox_meta(project_root)
+    entry = meta.get(rel_str) if isinstance(meta.get(rel_str), dict) else None
+    if entry is not None:
+        source = (entry.get(META_KEY_SOURCE) or "").strip().lower()
+        if source in ("client", "freelancer"):
+            return source
+    return None
+
+
 def resolve_inbox_location(project_root: Path, path: Path) -> Path | None:
-    """Return date-folder path for an inbox path (flat inbox/<date>/… layout)."""
+    """Return date-folder path for an inbox item (inbox/<source>/<date>/… or legacy inbox/<date>/…)."""
     root = get_inbox_root(project_root)
     try:
         rel = Path(path).resolve().relative_to(root.resolve())
@@ -135,7 +161,11 @@ def resolve_inbox_location(project_root: Path, path: Path) -> Path | None:
     parts = rel.parts
     if not parts:
         return None
-    date_folder = (root / parts[0]).resolve()
+    first = parts[0].lower()
+    if first in ("client", "freelancer") and len(parts) >= 2:
+        date_folder = (root / parts[0] / parts[1]).resolve()
+    else:
+        date_folder = (root / parts[0]).resolve()
     if not date_folder.is_dir():
         return None
     return date_folder
@@ -308,14 +338,14 @@ def add_to_inbox(
     date_str: str | None,
     description: str | None,
 ) -> InboxItem | None:
-    """
-    Copy source_path into inbox under <date_folder>/ (flat layout, no client/freelancer).
-    source_label is kept for meta/history compatibility only.
-    """
+    """Copy source_path into inbox under <source>/<date_folder>/."""
     root = get_inbox_root(project_root)
     root.mkdir(parents=True, exist_ok=True)
+    source_key = (source_label or "client").strip().lower()
+    if source_key not in ("client", "freelancer"):
+        source_key = "client"
     folder_name = resolve_date_folder_name(date_str, project_root=project_root)
-    dest_dir = root / folder_name
+    dest_dir = root / source_key / folder_name
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / source_path.name
     if dest_path.exists():
@@ -330,7 +360,7 @@ def add_to_inbox(
     relative_path = dest_path.relative_to(root).as_posix()
     meta = read_inbox_meta(project_root)
     meta[relative_path] = {
-        META_KEY_SOURCE: (source_label or "").strip() or None,
+        META_KEY_SOURCE: source_key,
         META_KEY_ADDED_AT: _meta_added_at_iso(),
         META_KEY_DESCRIPTION: (description or "").strip() or None,
     }

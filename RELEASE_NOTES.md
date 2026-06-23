@@ -1,18 +1,18 @@
-# MonoStudio 26 — Release v26.16.2
+# MonoStudio 26 — Release v26.16.3
 
 ## Highlights
 
-- **Unified review player**: Một dialog review — draw layers (brush/eraser/onion), note rail, timeline pills, seek theo time anchor; export mở rộng.
-- **Main View review mode**: Shot cards hiển thị render/review summary; pipeline review browsing.
-- **Internal check**: Trang staging `outbox/internal_check` (date folders) trước khi gửi; migrate legacy `review` folder.
-- **Delivery**: Core reader cho `outbox/delivery/<recipient>/<date>/`.
-- **Inbox / Outbox / Guide**: Drop dialog, readers, sidebar nav cập nhật; command palette & hotkeys.
+- **Main View list v2**: Pipeline List Row (`QListView`) — delegate, layout, rubber-band selection, row paint, sortable header, drag preview.
+- **Review mode badges**: Grid thumb badges — render version state (current/outdated) + schedule deadline trên thumbnail.
+- **Internal check / delivery**: Reader & inbox drop cải thiện; tests coverage.
+- **mpv render widget**: Widget render mpv tách riêng cho preview embed.
+- **Inspector / Main View**: Tích hợp list mới; shot review card mở rộng.
 
 ## Changes in this release
 
-- feat: `review_draw.py`, `review_media.py`, `video_review_draw_*`, `review_playback_backend.py`, `note_time_anchors.py`.
-- feat: `internal_check_reader.py`, `internal_check_page_widget.py`, `delivery_reader.py`, `shot_review_card.py`.
-- fix: `video_preview_dialog.py`, `main_view.py`, `main_window.py`, `sidebar.py`, `inbox_page_widget.py`.
+- feat: `pipeline_list_view.py`, `pipeline_list_delegate.py`, `pipeline_list_header.py`, `pipeline_list_hit.py`, `pipeline_drag_preview.py`.
+- feat: `grid_review_thumb_badges.py`, `mpv_render_widget.py`.
+- fix: `main_view.py`, `pipeline_view_models.py`, `shot_review_card.py`, `internal_check_reader.py`, `inspector.py`.
 
 ## Install
 

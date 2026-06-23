@@ -648,7 +648,7 @@ def _inbox_outbox_root_badge_kind(root_title: str) -> str:
         "inbox": "inbox",
         "internal check": "internal_check",
         "internal_check": "internal_check",
-        "internal check": "review",
+        "review": "internal_check",  # legacy nav title
         "outbox": "delivery",
         "delivery": "delivery",
         "project guide": "guide",
@@ -1348,6 +1348,16 @@ def _collect_tag_filtered_file_entries(
     return out
 
 
+def inbox_tree_selection_hint_text(mode: str, count: int) -> str | None:
+    """Footer hint for explorer tree selection; None when hint bar should hide."""
+    if count <= 0:
+        return None
+    noun = "item" if count == 1 else "items"
+    if (mode or "inbox").strip().lower() == "inbox":
+        return f"{count} {noun} selected — choose destination in Inspector, then Distribute"
+    return f"{count} {noun} selected"
+
+
 class InboxTreePane(QWidget):
     """Breadcrumb + file tree for one date folder. Emits back_requested, tree_selection_changed, open_folder_requested, import_requested, history_requested (if show_history_action)."""
 
@@ -1360,6 +1370,7 @@ class InboxTreePane(QWidget):
     browse_path_changed = Signal(object)  # Path
     external_drop_requested = Signal(object, object, bool)  # list[Path], target folder, copy_only
     video_preview_requested = Signal(object)  # Path
+    send_to_delivery_requested = Signal(object)  # list[Path]
 
     def __init__(
         self,
@@ -1374,6 +1385,7 @@ class InboxTreePane(QWidget):
         show_breadcrumb: bool = False,
         allow_root_drop: bool = False,
         storage_root_override: Path | None = None,
+        selection_hint_mode: str = "inbox",
     ) -> None:
         super().__init__(parent)
         self._drop_hover_tree_index = QModelIndex()
@@ -1386,6 +1398,7 @@ class InboxTreePane(QWidget):
         self._view_settings_key = view_settings_key
         self._source_filter = (source_filter or "").strip().lower()
         self._breadcrumb_title = breadcrumb_title or "Inbox"
+        self._selection_hint_mode = (selection_hint_mode or "inbox").strip().lower()
         self._allow_root_drop = bool(allow_root_drop)
         self._storage_root_override = (
             Path(storage_root_override).resolve() if storage_root_override else None
@@ -1635,7 +1648,10 @@ class InboxTreePane(QWidget):
     def _sync_content_toolbar(self) -> None:
         if self._content_toolbar is None:
             return
-        hint = "Double-click folder to browse · Double-click file to open · Select files to distribute"
+        if getattr(self, "_selection_hint_mode", "inbox") == "inbox":
+            hint = "Double-click folder to browse · Double-click file to open · Select files to distribute"
+        else:
+            hint = "Double-click folder to browse · Double-click file to open"
         self._content_toolbar.set_context(hint=hint, show_toggle=True)
         self._sync_browse_bar()
 
@@ -1740,11 +1756,12 @@ class InboxTreePane(QWidget):
         count = len(self.get_selected_paths())
         self.selection_count_changed.emit(count)
         if self._hint_label is not None and self._hint_bar is not None:
-            if count > 0:
-                noun = "item" if count == 1 else "items"
-                self._hint_label.setText(
-                    f"{count} {noun} selected — choose destination in Inspector, then Distribute"
-                )
+            hint_text = inbox_tree_selection_hint_text(
+                getattr(self, "_selection_hint_mode", "inbox"),
+                count,
+            )
+            if hint_text:
+                self._hint_label.setText(hint_text)
                 self._hint_bar.setVisible(True)
             else:
                 self._hint_bar.setVisible(False)
@@ -1930,6 +1947,12 @@ class InboxTreePane(QWidget):
         rename_act = None
         if not multi and tree_index is not None:
             rename_act = menu.addAction(icon("copy"), "Rename")
+        send_delivery_act = None
+        if (
+            getattr(self, "_selection_hint_mode", "inbox") == "internal_check"
+            and targets
+        ):
+            send_delivery_act = menu.addAction(icon("send"), "Send to Delivery…")
         menu.addSeparator()
         delete_label = f"Delete {len(targets)} items" if multi else "Delete"
         delete_act = menu.addAction(icon_red("x"), delete_label)
@@ -1973,6 +1996,8 @@ class InboxTreePane(QWidget):
             self._tree_open_folder(path)
         elif action == rename_act and tree_index is not None:
             self._tree.edit(tree_index)
+        elif action == send_delivery_act:
+            self.send_to_delivery_requested.emit(targets)
         elif action == delete_act:
             self._tree_delete_paths(targets)
         elif action == import_act:

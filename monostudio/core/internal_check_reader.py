@@ -15,6 +15,7 @@ from monostudio.core.models import InboxItem
 from monostudio.core.outbox_reader import (
     META_KEY_ADDED_AT,
     META_KEY_DESCRIPTION,
+    META_KEY_SOURCE,
     get_outbox_root,
 )
 
@@ -164,6 +165,86 @@ def _relocate_meta_keys(meta: dict, old_rel: str, new_rel: str) -> None:
             to_write.append((new_rel + suffix, meta.pop(key)))
     for new_key, value in to_write:
         meta[new_key] = value
+
+
+def _remove_meta_keys(meta: dict, rel: str) -> None:
+    rel = rel.replace("\\", "/").rstrip("/")
+    for key in list(meta.keys()):
+        kn = key.replace("\\", "/")
+        if kn == rel or kn.startswith(rel + "/"):
+            meta.pop(key, None)
+
+
+def send_internal_check_to_delivery(
+    project_root: Path,
+    source_path: Path,
+    recipient: str,
+    date_str: str | None,
+    description: str | None,
+) -> Path | None:
+    """Move item from internal check staging into delivery; update both meta files."""
+    from monostudio.core.delivery_reader import (
+        get_delivery_root,
+        read_delivery_meta,
+        write_delivery_meta,
+    )
+
+    check_root = get_internal_check_root(project_root)
+    delivery_root = get_delivery_root(project_root)
+    recipient_key = (recipient or "client").strip().lower()
+    if recipient_key not in ("client", "freelancer"):
+        recipient_key = "client"
+    try:
+        check_res = check_root.resolve()
+        source_path = Path(source_path).resolve()
+        source_path.relative_to(check_res)
+    except (ValueError, OSError):
+        return None
+    if not source_path.exists():
+        return None
+    folder_name = resolve_date_folder_name(date_str, project_root=project_root)
+    dest_dir = delivery_root / recipient_key / folder_name
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    dest_path = dest_dir / source_path.name
+    if dest_path.exists():
+        return None
+    old_rel = source_path.relative_to(check_res).as_posix()
+    ic_meta = read_internal_check_meta(project_root)
+    old_entry = ic_meta.get(old_rel) if isinstance(ic_meta.get(old_rel), dict) else {}
+    desc = (description or "").strip() or old_entry.get(META_KEY_DESCRIPTION) or None
+    try:
+        shutil.move(str(source_path), str(dest_path))
+    except OSError:
+        return None
+    _remove_meta_keys(ic_meta, old_rel)
+    if not write_internal_check_meta(project_root, ic_meta):
+        try:
+            shutil.move(str(dest_path), str(source_path))
+        except OSError:
+            pass
+        return None
+    new_rel = dest_path.relative_to(delivery_root.resolve()).as_posix()
+    dl_meta = read_delivery_meta(project_root)
+    dl_meta[new_rel] = {
+        META_KEY_SOURCE: recipient_key,
+        META_KEY_ADDED_AT: _meta_added_at_iso(),
+        META_KEY_DESCRIPTION: desc,
+    }
+    if not write_delivery_meta(project_root, dl_meta):
+        try:
+            shutil.move(str(dest_path), str(source_path))
+            ic_meta[old_rel] = old_entry
+            for key in list(ic_meta.keys()):
+                if key.replace("\\", "/").startswith(old_rel + "/"):
+                    pass  # child keys already removed; best-effort restore root only
+            write_internal_check_meta(project_root, ic_meta)
+        except OSError:
+            pass
+        return None
+    return dest_path
 
 
 def move_into_internal_check_folder(project_root: Path, source_path: Path, dest_dir: Path) -> bool:

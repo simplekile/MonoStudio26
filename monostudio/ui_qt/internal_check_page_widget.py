@@ -7,10 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
-    QLabel,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -22,7 +20,7 @@ from monostudio.ui_qt.sidebar import INTERNAL_CHECK_NAV_ICON
 from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, InboxTreePane
 from monostudio.ui_qt.internal_check_history_dialog import InternalCheckHistoryDialog
 from monostudio.ui_qt.lucide_icons import lucide_icon
-from monostudio.ui_qt.style import MONOS_COLORS, monos_font
+from monostudio.ui_qt.style import MONOS_COLORS
 
 
 def _header_tool_button(parent: QWidget, text: str, icon_name: str, *, primary: bool = False) -> QPushButton:
@@ -46,6 +44,8 @@ class InternalCheckPageWidget(QWidget):
     drop_requested = Signal(object, object, bool)
     import_requested = Signal(object)
     date_folder_entered = Signal(str, object)
+    video_preview_requested = Signal(object)
+    send_to_delivery_requested = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -83,17 +83,11 @@ class InternalCheckPageWidget(QWidget):
         self._open_folder_btn.clicked.connect(self._on_open_folder_clicked)
         hlay.addWidget(self._open_folder_btn, 0)
 
-        self._import_btn = _header_tool_button(top_row, "Add", "upload", primary=True)
-        self._import_btn.setToolTip("Add deliverables for internal check")
+        self._import_btn = _header_tool_button(top_row, "Import", "upload", primary=True)
+        self._import_btn.setToolTip("Import deliverables for internal check")
         self._import_btn.clicked.connect(self._on_import_clicked)
         hlay.addWidget(self._import_btn, 0)
         header_v.addWidget(top_row, 0)
-
-        hint = QLabel("Check deliverables internally before sending them out via Delivery.", header)
-        hint.setObjectName("DialogHint")
-        hint.setFont(monos_font("Inter", 12, QFont.Weight.Medium))
-        hint.setWordWrap(True)
-        header_v.addWidget(hint, 0)
 
         self._path_bar_row = QWidget(header)
         self._path_bar_row.setObjectName("InboxPathBarRow")
@@ -161,6 +155,7 @@ class InternalCheckPageWidget(QWidget):
                 show_toolbar=True,
                 view_settings_key="internal_check/view_mode",
                 source_filter="",
+                selection_hint_mode="internal_check",
             )
             self._tree_pane.tree_selection_changed.connect(self._on_tree_selection)
             self._tree_pane.open_folder_requested.connect(self.open_folder_requested.emit)
@@ -168,6 +163,8 @@ class InternalCheckPageWidget(QWidget):
             self._tree_pane.history_requested.connect(self._on_history_clicked)
             self._tree_pane.browse_path_changed.connect(self._on_browse_path_changed)
             self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
+            self._tree_pane.video_preview_requested.connect(self.video_preview_requested.emit)
+            self._tree_pane.send_to_delivery_requested.connect(self.send_to_delivery_requested.emit)
             self._content_lay.addWidget(self._tree_pane, 1)
         else:
             self._tree_pane.set_date_folder_path(root)

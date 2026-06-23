@@ -1509,31 +1509,30 @@ def apply_dark_theme(app: QApplication) -> None:
             background: transparent;
             border: none;
         }
-        QTableView#MainViewList,
         QListView#MainViewList {
             background: #151618;
-            solid #27272a;
+            border: none;
             selection-background-color: transparent;
         }
-        QTableView#MainViewList::item,
         QListView#MainViewList::item {
             background: transparent;
             color: #a1a1aa;
             border: none;
         }
-        QTableView#MainViewList::item:hover,
         QListView#MainViewList::item:hover {
             background: transparent;
             color: #fafafa;
         }
-        QTableView#MainViewList::item:selected,
         QListView#MainViewList::item:selected {
             background: transparent;
             color: #60a5fa;
         }
-        QTableView#MainViewList::item:selected:!active,
         QListView#MainViewList::item:selected:!active {
             color: #a1a1aa;
+        }
+        QWidget#PipelineListHeader {
+            background: #0d0d0f;
+            border: none;
         }
 
         /* --- Inbox tree pane: file tree (modern flat look, full-row selection) --- */

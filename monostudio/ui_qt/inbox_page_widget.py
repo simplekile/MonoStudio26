@@ -13,7 +13,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.core.inbox_reader import get_inbox_root, resolve_inbox_location
+from monostudio.core.inbox_reader import (
+    ensure_inbox_source_folders,
+    get_inbox_root,
+    infer_inbox_source_from_path,
+)
 from monostudio.ui_qt.inbox_history_dialog import InboxHistoryDialog
 from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
 from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, InboxTreePane
@@ -33,19 +37,28 @@ def _header_tool_button(parent: QWidget, text: str, icon_name: str, *, primary: 
     return btn
 
 
-def _inbox_tree_root(project_root: Path | None) -> Path | None:
+def _normalize_source_type(source_type: str) -> str:
+    key = (source_type or "client").strip().lower()
+    return key if key in ("client", "freelancer") else "client"
+
+
+def _source_folder_path(project_root: Path | None, source_type: str) -> Path | None:
     if project_root is None:
         return None
+    source = _normalize_source_type(source_type)
     root = get_inbox_root(project_root)
+    candidate = root / source
+    if candidate.is_dir():
+        return candidate
     try:
-        root.mkdir(parents=True, exist_ok=True)
-        return root
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
     except OSError:
         return root if root.is_dir() else None
 
 
 class InboxPageWidget(QWidget):
-    """Inbox: incoming files by date folder (no client/freelancer layer)."""
+    """Inbox: incoming files by source (client/freelancer) and date folder."""
 
     tree_selection_changed = Signal(object)  # Path | None
     tree_distribute_paths_changed = Signal(object)  # list[Path]
@@ -59,7 +72,8 @@ class InboxPageWidget(QWidget):
         super().__init__(parent)
         self.setAcceptDrops(False)
         self._project_root: Path | None = None
-        self._tree_state_cache: dict | None = None
+        self._type_filter: str = ""
+        self._tree_state_cache: dict[str, dict] = {}
         self._history_dialog: InboxHistoryDialog | None = None
         self._tree_pane: InboxTreePane | None = None
 
@@ -137,13 +151,20 @@ class InboxPageWidget(QWidget):
         self._path_bar_row.show()
 
     def _refresh_chrome(self) -> None:
-        self._title_row.set_context(type_filter="", date_path=None, unified_tree=True)
+        self._title_row.set_context(
+            type_filter=self._type_filter,
+            date_path=None,
+            unified_tree=True,
+        )
         self._history_btn.setVisible(True)
         self._open_folder_btn.setVisible(True)
         self._mount_explorer_path_bar()
 
+    def _tree_state_key(self, source_type: str) -> str:
+        return _normalize_source_type(source_type)
+
     def _ensure_tree_pane(self) -> None:
-        root = _inbox_tree_root(self._project_root)
+        root = _source_folder_path(self._project_root, self._type_filter)
         if root is None:
             return
         if self._tree_pane is None:
@@ -153,7 +174,7 @@ class InboxPageWidget(QWidget):
                 show_history_action=True,
                 show_toolbar=True,
                 view_settings_key="inbox/view_mode",
-                source_filter="",
+                source_filter=self._type_filter,
             )
             self._tree_pane.tree_selection_changed.connect(self._on_tree_selection)
             self._tree_pane.open_folder_requested.connect(self.open_folder_requested.emit)
@@ -165,18 +186,20 @@ class InboxPageWidget(QWidget):
             self._content_lay.addWidget(self._tree_pane, 1)
         else:
             self._tree_pane.set_date_folder_path(root)
-            self._tree_pane.set_chrome_context("", None)
-        if self._tree_state_cache:
-            self._tree_pane.set_tree_state(self._tree_state_cache)
+            self._tree_pane.set_chrome_context(self._type_filter, None)
+        key = self._tree_state_key(self._type_filter)
+        saved = self._tree_state_cache.get(key)
+        if saved:
+            self._tree_pane.set_tree_state(saved)
         self._refresh_chrome()
 
     def _on_browse_path_changed(self, path: Path) -> None:
-        self.date_folder_entered.emit("", path)
+        self.date_folder_entered.emit(self._type_filter or "", path)
 
     def _inbox_open_target(self) -> Path | None:
         if self._tree_pane is not None:
             return self._tree_pane.current_browse_path()
-        return _inbox_tree_root(self._project_root)
+        return _source_folder_path(self._project_root, self._type_filter)
 
     def _on_open_folder_clicked(self) -> None:
         target = self._inbox_open_target()
@@ -193,24 +216,30 @@ class InboxPageWidget(QWidget):
         if self._history_dialog is None:
             self._history_dialog = InboxHistoryDialog(
                 self._project_root,
-                "",
+                self._type_filter or "",
                 self.window(),
             )
-        self._history_dialog.set_context(self._project_root, "")
+        self._history_dialog.set_context(self._project_root, self._type_filter or "")
         self._history_dialog.show()
         self._history_dialog.raise_()
         self._history_dialog.activateWindow()
 
     def set_project_root(self, path: Path | None) -> None:
-        if self._tree_pane is not None:
-            self._tree_state_cache = self._tree_pane.get_tree_state()
         self._project_root = Path(path) if path else None
+        if self._project_root is not None:
+            ensure_inbox_source_folders(self._project_root)
         self._ensure_tree_pane()
         if self._tree_pane is not None:
             self._tree_pane.refresh_content()
 
-    def set_type_filter(self, _source_type: str) -> None:
-        """No-op — Inbox has no client/freelancer filter."""
+    def set_type_filter(self, source_type: str) -> None:
+        new_type = _normalize_source_type(source_type)
+        type_changed = new_type != self._type_filter
+        if type_changed and self._tree_pane is not None:
+            self._tree_state_cache[self._tree_state_key(self._type_filter)] = self._tree_pane.get_tree_state()
+        self._type_filter = new_type
+        self._ensure_tree_pane()
+        self._refresh_chrome()
 
     def _on_tree_selection(self, path) -> None:
         self.tree_selection_changed.emit(path)
@@ -226,13 +255,12 @@ class InboxPageWidget(QWidget):
             self._tree_pane.navigate_to_path(path)
 
     def open_item_path(self, project_root: Path, item_path: Path) -> bool:
-        date_folder = resolve_inbox_location(project_root, item_path)
-        if date_folder is None:
-            return False
+        source = infer_inbox_source_from_path(project_root, item_path)
+        if source:
+            self.set_type_filter(source)
         self._ensure_tree_pane()
         if self._tree_pane is None:
             return False
-        self._tree_pane.set_date_folder_path(date_folder)
         return self._tree_pane.reveal_path(Path(item_path))
 
     def refresh_tree(self) -> None:
@@ -241,7 +269,7 @@ class InboxPageWidget(QWidget):
 
     def refresh_history_dialog_if_open(self) -> None:
         if self._history_dialog is not None and self._history_dialog.isVisible():
-            self._history_dialog.set_context(self._project_root, "")
+            self._history_dialog.set_context(self._project_root, self._type_filter or "")
 
     def is_showing_tree(self) -> bool:
         return self._tree_pane is not None
@@ -250,4 +278,3 @@ class InboxPageWidget(QWidget):
         if self._tree_pane is None:
             return None
         return self._tree_pane.current_browse_path()
-

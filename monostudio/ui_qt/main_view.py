@@ -66,7 +66,6 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStackedWidget,
-    QTableView,
     QSlider,
     QStyleOptionViewItem,
     QToolButton,
@@ -81,13 +80,16 @@ from monostudio.ui_qt.pipeline_view_models import (
     PipelineTileModel,
 )
 from monostudio.ui_qt.pipeline_list_delegate import PipelineListRowDelegate
+from monostudio.ui_qt.pipeline_list_header import PipelineListHeader
+from monostudio.ui_qt.pipeline_list_hit import PipelineListHitTest
 from monostudio.ui_qt.pipeline_list_layout import ListSlot, PipelineListLayout
+from monostudio.ui_qt.pipeline_drag_preview import start_pipeline_item_drag
 from monostudio.ui_qt.pipeline_list_view import PipelineListRowView
 from monostudio.ui_qt.pipeline_rubber_band import (
     RUBBER_BAND_THRESHOLD as _RUBBER_BAND_THRESHOLD,
     RubberBandSelectMixin as _RubberBandSelectMixin,
 )
-from monostudio.ui_qt.pipeline_selection import PipelineSelectionStore
+from monostudio.ui_qt.pipeline_selection import PipelineSelectionStore, path_key
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 from monostudio.ui_qt.view_item_mtime import (
     format_mtime_ts as _format_mtime,
@@ -151,6 +153,16 @@ from monostudio.core.shot_review_card import (
     ReviewCardSummary,
     review_summaries_from_index,
 )
+from monostudio.ui_qt.grid_review_thumb_badges import (
+    GridReviewRenderBadge,
+    GridScheduleDeadlineBadge,
+    layout_grid_review_thumb_badges,
+    paint_grid_review_render_pill,
+    paint_grid_schedule_deadline_chip,
+    resolve_grid_review_render_badge,
+    resolve_grid_schedule_deadline_badge,
+    review_badge_font,
+)
 from monostudio.core.project_schedule import ProjectSchedule, entity_rel_path, read_project_schedule
 from monostudio.core.schedule_planner import (
     BarStore,
@@ -160,7 +172,7 @@ from monostudio.core.schedule_planner import (
     primary_bar_for_row,
     summarize_entity_schedule,
 )
-from monostudio.core.user_identity import resolve_assignee_display
+from monostudio.core.user_identity import get_user, resolve_assignee_display
 from monostudio.core.department_status_registry import load_status_registry_for_department
 from monostudio.core.production_status import (
     ProductionStatusRegistry,
@@ -473,23 +485,6 @@ def _department_review_index(ref: Asset | Shot, active_department: str | None):
         if (d.name or "").strip().casefold() != dep:
             continue
         return getattr(d, "review_index", None)
-    return None
-
-
-def _review_corner_badge_label(ref: Asset | Shot, active_department: str | None) -> str | None:
-    """Short label for review-mode thumb corner pill (grid cards)."""
-    idx = _department_review_index(ref, active_department)
-    if idx is None:
-        return None
-    if idx.open_note_count > 0:
-        n = idx.open_note_count
-        return f"{n} note" if n == 1 else f"{n} notes"
-    if idx.has_review_status:
-        return "Review"
-    if idx.has_notes:
-        return "Notes"
-    if idx.has_render or idx.has_media:
-        return "Render"
     return None
 
 
@@ -1447,6 +1442,22 @@ def _thumb_note_chip_rect(thumb: QRect, health_chip_rect: QRect | None) -> QRect
     return QRect(thumb.right() - 12 - chip, thumb.top() + 12, chip, chip)
 
 
+def _grid_review_thumb_badge_rects(
+    cell_rect: QRect,
+    gap_px: int,
+    *,
+    render_label: str,
+    schedule_label: str | None,
+) -> tuple[QRect, QRect | None]:
+    thumb = _thumb_rect_from_cell(cell_rect, gap_px)
+    return layout_grid_review_thumb_badges(
+        thumb,
+        render_label=render_label,
+        schedule_label=schedule_label,
+        font=review_badge_font(),
+    )
+
+
 def _list_thumb_dest_rect(cell_rect: QRect, icon: QIcon) -> QRect | None:
     """Thumbnail hit area: full thumb column cell (cover paint fills the rect)."""
     if icon.isNull() or cell_rect.width() <= 0 or cell_rect.height() <= 0:
@@ -1516,51 +1527,6 @@ def _list_health_chip_rect(cell_rect: QRect) -> QRect:
         chip,
         chip,
     )
-
-
-def _list_header_column_width(header_label: str, *, min_content_px: int = 0) -> int:
-    """Width for a fixed list column — fits uppercase header text (global QHeaderView QSS)."""
-    font = monos_font("Inter", 12, QFont.Weight.ExtraBold)
-    fm = QFontMetrics(font)
-    text = header_label.upper()
-    text_w = fm.horizontalAdvance(text) + max(0, len(text) - 1)  # letter-spacing: 1px
-    # QHeaderView::section uses padding 10px 15px; +6 for section edge/grip.
-    return max(min_content_px, text_w + 30 + 6)
-
-
-_LIST_SPECIAL_FOLDER_ICON_PX = 16
-_LIST_SPECIAL_FOLDER_CHIP_PAD_PX = 6
-
-
-def _list_special_folder_chip_rect(cell_rect: QRect) -> QRect:
-    chip = _LIST_SPECIAL_FOLDER_ICON_PX + _LIST_SPECIAL_FOLDER_CHIP_PAD_PX * 2
-    return QRect(
-        cell_rect.left() + max(0, (cell_rect.width() - chip) // 2),
-        cell_rect.top() + max(0, (cell_rect.height() - chip) // 2),
-        chip,
-        chip,
-    )
-
-
-def _paint_list_special_folder_icon(
-    painter: QPainter,
-    chip_rect: QRect,
-    icon_name: str,
-    *,
-    has_files: bool,
-    hovered: bool,
-) -> None:
-    if hovered:
-        painter.fillRect(chip_rect, QColor(255, 255, 255, 18))
-    color = MONOS_COLORS["text_label"] if has_files else MONOS_COLORS["text_meta"]
-    pix = lucide_icon(icon_name, size=_LIST_SPECIAL_FOLDER_ICON_PX, color_hex=color).pixmap(
-        _LIST_SPECIAL_FOLDER_ICON_PX, _LIST_SPECIAL_FOLDER_ICON_PX
-    )
-    if pix.isNull():
-        return
-    x = chip_rect.x() + (chip_rect.width() - pix.width()) // 2
-    y = chip_rect.y() + (chip_rect.height() - pix.height()) // 2
-    painter.drawPixmap(x, y, pix)
 
 
 def _paint_health_icon_chip(
@@ -2234,713 +2200,7 @@ class _ClearOnEmptyClickListView(_RubberBandSelectMixin, QListView):
         super().mouseReleaseEvent(event)
 
     def startDrag(self, supportedActions) -> None:  # type: ignore[override]
-        buttons = QApplication.mouseButtons()
-        # Only allow dragging with middle button (disable left-drag).
-        if not (buttons & Qt.MouseButton.MiddleButton) or (buttons & Qt.MouseButton.LeftButton):
-            return
-        model = self.model()
-        if model is None:
-            return
-        indexes = self.selectedIndexes()
-        if not indexes:
-            return
-        mime = model.mimeData(indexes)
-        if mime is None:
-            return
-
-        dpr = float(getattr(self, "devicePixelRatioF", lambda: 1.0)())
-        if dpr <= 0:
-            dpr = 1.0
-
-        def render_card(index, *, logical_size: QSize) -> QPixmap | None:
-            if not index.isValid():
-                return None
-            w = max(1, int(logical_size.width() * dpr))
-            h = max(1, int(logical_size.height() * dpr))
-            pm = QPixmap(w, h)
-            pm.setDevicePixelRatio(dpr)
-            pm.fill(QColor(0, 0, 0, 0))
-            p2 = QPainter(pm)
-            try:
-                p2.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                p2.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-                # Lightweight drag preview: thumbnail + name only (no status/id/ver overlays).
-                r = QRect(0, 0, logical_size.width(), logical_size.height())
-                # Background card
-                bg = QColor("#18181b")
-                border = QColor("#3f3f46")
-                p2.setPen(QPen(border, 1))
-                p2.setBrush(bg)
-                p2.drawRoundedRect(r.adjusted(0, 0, -1, -1), 12, 12)
-
-                inner = r.adjusted(8, 8, -8, -8)
-                if inner.width() > 0 and inner.height() > 0:
-                    # 16:9 thumb region
-                    thumb_w = inner.width()
-                    thumb_h = max(1, int(thumb_w * 9 / 16))
-                    thumb = QRect(inner.left(), inner.top(), thumb_w, min(thumb_h, inner.height()))
-                    icon = index.data(Qt.DecorationRole)
-                    if isinstance(icon, QIcon):
-                        src = icon.pixmap(256, 256)
-                        if not src.isNull():
-                            scaled = src.scaled(
-                                thumb.size(),
-                                Qt.KeepAspectRatioByExpanding,
-                                Qt.SmoothTransformation,
-                            )
-                            sx = max(0, (scaled.width() - thumb.width()) // 2)
-                            sy = max(0, (scaled.height() - thumb.height()) // 2)
-                            crop = scaled.copy(QRect(QPoint(sx, sy), thumb.size()))
-                            p2.drawPixmap(thumb, crop)
-
-                    # Name (single line)
-                    item = index.data(Qt.UserRole)
-                    name = display_name_for_item(item) if isinstance(item, ViewItem) else None
-                    name = (name or "").strip() or "—"
-                    text_rect = QRect(inner.left(), thumb.bottom() + 8, inner.width(), max(1, inner.bottom() - (thumb.bottom() + 8)))
-                    f = QFont("Inter")
-                    f.setPointSize(11)
-                    f.setWeight(QFont.Weight.DemiBold)
-                    p2.setFont(f)
-                    p2.setPen(QColor("#e4e4e7"))
-                    p2.drawText(text_rect, Qt.AlignLeft | Qt.AlignTop, name)
-            finally:
-                p2.end()
-            return pm if not pm.isNull() else None
-
-        # Base card size from the live view cell (logical px).
-        try:
-            base_rect = self.visualRect(indexes[0])
-        except Exception:
-            return
-        if not base_rect.isValid() or base_rect.isEmpty():
-            return
-
-        max_w = 220
-        base_logical_w = int(base_rect.width())
-        target_w = min(max_w, max(120, int(base_logical_w * 0.62)))
-        # Compute a compact height for drag preview (thumb 16:9 + single-line name).
-        inner_pad = 8
-        gap_thumb_text = 8
-        name_font = QFont("Inter")
-        name_font.setPointSize(11)
-        name_font.setWeight(QFont.Weight.DemiBold)
-        name_fm = QFontMetrics(name_font)
-        name_h = max(14, name_fm.height())
-        inner_w = max(1, target_w - inner_pad * 2)
-        thumb_h = max(1, int(inner_w * 9 / 16))
-        content_h = inner_pad + thumb_h + gap_thumb_text + name_h + inner_pad
-        # Ensure we don't exceed the original cell height too much.
-        max_h = max(1, int(base_rect.height() * (target_w / max(1, base_logical_w))))
-        target_h = min(max_h, content_h)
-        target_size = QSize(target_w, max(1, target_h))
-
-        scaled_cards: list[QPixmap] = []
-        for idx in indexes[:3]:  # Keep stack shallow for readability/perf.
-            pm = render_card(idx, logical_size=target_size)
-            if pm is not None:
-                scaled_cards.append(pm)
-        if not scaled_cards:
-            return
-
-        # Composite as a small stack + count badge.
-        offset = 10
-        layers = len(scaled_cards)
-        w = int(scaled_cards[0].width() / dpr) + offset * (layers - 1)
-        h = int(scaled_cards[0].height() / dpr) + offset * (layers - 1)
-        out = QPixmap(max(1, int(w * dpr)), max(1, int(h * dpr)))
-        out.setDevicePixelRatio(dpr)
-        out.fill(QColor(0, 0, 0, 0))
-        p = QPainter(out)
-        try:
-            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            # Back-to-front
-            for i in range(layers - 1, -1, -1):
-                pm = scaled_cards[i]
-                dx = offset * i
-                dy = offset * i
-                if i > 0:
-                    p.setOpacity(0.78)
-                else:
-                    p.setOpacity(1.0)
-                p.drawPixmap(dx, dy, pm)
-            p.setOpacity(1.0)
-
-            total = len(indexes)
-            if total > 1:
-                badge = f"{total}"
-                f = QFont("Inter")
-                f.setPointSize(10)
-                f.setWeight(QFont.Weight.DemiBold)
-                p.setFont(f)
-                fm = QFontMetrics(f)
-                tw = fm.horizontalAdvance(badge)
-                pad_x = 8
-                pad_y = 4
-                bw = tw + pad_x * 2
-                bh = fm.height() + pad_y * 2
-                # HiDPI: painter uses logical coords when pixmap has devicePixelRatio.
-                out_w = int(out.width() / max(dpr, 1.0))
-                bx = out_w - bw - 6
-                by = 6
-                br = 9
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(37, 99, 235, 220))  # blue-600-ish
-                p.drawRoundedRect(QRect(bx, by, bw, bh), br, br)
-                p.setPen(QColor("#fafafa"))
-                p.drawText(QRect(bx, by, bw, bh), Qt.AlignmentFlag.AlignCenter, badge)
-        finally:
-            p.end()
-
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        drag.setPixmap(out)
-        drag.setHotSpot(QPoint(24, 24))
-        delegate = self.itemDelegate()
-        if hasattr(delegate, "set_fast_paint"):
-            delegate.set_fast_paint(True)
-        try:
-            drag.exec(supportedActions)
-        finally:
-            if hasattr(delegate, "set_fast_paint"):
-                delegate.set_fast_paint(False)
-
-
-class _ClearOnEmptyClickTableView(_RubberBandSelectMixin, QTableView):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._rb_init()
-        self._shift_anchor_index: QPersistentModelIndex | None = None
-
-    def _list_row_bg_option(self, row: int) -> QStyleOptionViewItem:
-        m = self.model()
-        vp = self.viewport()
-        y = self.rowViewportPosition(row)
-        h = self.rowHeight(row)
-        opt = QStyleOptionViewItem()
-        opt.rect = QRect(0, y, vp.width(), h)
-        opt.state = QStyle.StateFlag.State_Enabled
-        sm = self.selectionModel()
-        idx0 = m.index(row, 0) if m is not None else QModelIndex()
-        if sm is not None and idx0.isValid() and sm.isSelected(idx0):
-            opt.state |= QStyle.StateFlag.State_Selected
-        if not self._rb_interaction_busy():
-            hover = self.indexAt(vp.mapFromGlobal(QCursor.pos()))
-            if hover.isValid() and hover.row() == row:
-                opt.state |= QStyle.StateFlag.State_MouseOver
-        return opt
-
-    def _paint_list_row_backgrounds(self, painter: QPainter, exposed: QRect) -> None:
-        m = self.model()
-        if m is None or m.rowCount() <= 0:
-            return
-        fast_bg = self._rb_interaction_busy()
-        mv = getattr(m, "_mv", None)
-        browser_mode = getattr(mv, "_browser_mode", "work")
-        browser_ctx = getattr(mv, "_browser_context", "asset")
-        # List row tint only for publish — review uses grid card color + thumb badge (no double-paint).
-        use_tint = (
-            not fast_bg
-            and browser_mode == "publish"
-            and browser_ctx in ("asset", "shot")
-        )
-        tint_bg, tint_hover = (
-            _card_bg_colors_for_browser_mode(browser_mode, browser_ctx, hover=False)
-            if use_tint
-            else (None, None)
-        )
-        top = self.rowAt(exposed.top())
-        if top < 0:
-            top = 0
-        bottom = self.rowAt(exposed.bottom())
-        if bottom < 0:
-            bottom = m.rowCount() - 1
-        vp_w = self.viewport().width()
-        painter.save()
-        try:
-            painter.setClipping(False)
-            for row in range(top, bottom + 1):
-                y = self.rowViewportPosition(row)
-                h = self.rowHeight(row)
-                if h <= 0 or y + h < exposed.top() or y > exposed.bottom():
-                    continue
-                opt = self._list_row_bg_option(row)
-                selected = bool(opt.state & QStyle.StateFlag.State_Selected)
-                hover = bool(opt.state & QStyle.StateFlag.State_MouseOver)
-                if use_tint and tint_bg is not None and tint_hover is not None and not selected:
-                    full_rect = QRect(0, y, max(vp_w, opt.rect.width()), h)
-                    painter.fillRect(full_rect, tint_hover if hover else tint_bg)
-                    painter.setPen(QColor("#2a2a2c"))
-                    painter.drawLine(full_rect.left(), full_rect.bottom(), full_rect.right(), full_rect.bottom())
-                else:
-                    paint_inbox_list_row_chrome(painter, opt, viewport_width=vp_w)
-                if selected:
-                    accent = QColor(MONOS_COLORS["blue_600"])
-                    painter.fillRect(0, y, 2, h, accent)
-        finally:
-            painter.restore()
-
-    def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
-        if not self._rb_interaction_busy():
-            vp = self.viewport()
-            painter = QPainter(vp)
-            try:
-                self._paint_list_row_backgrounds(painter, event.rect())
-            finally:
-                painter.end()
-        super().paintEvent(event)
-
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._rb_on_left_press(event.pos(), event.modifiers())
-        if event.button() == Qt.MouseButton.MiddleButton:
-            event.accept()
-            return
-        if event.button() == Qt.MouseButton.LeftButton and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
-            if self.indexAt(event.pos()).isValid():
-                self._shift_click_pending = True
-                event.accept()
-                return
-        if event.button() == Qt.MouseButton.LeftButton and not self.indexAt(event.pos()).isValid():
-            self._shift_anchor_index = None
-            event.accept()
-            return
-        if event.button() == Qt.MouseButton.LeftButton:
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        self._rb_on_move(event)
-        if bool(event.buttons() & Qt.MouseButton.LeftButton) and self._left_press_pos is not None:
-            if self._shift_click_pending:
-                if self._rb_selecting:
-                    self._apply_shift_range_to_pos(event.pos())
-                event.accept()
-                return
-            if self._rb_selecting:
-                self._rb_update_rubber_band(event.pos())
-                self._apply_rubber_band_row_selection(event.pos())
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.LeftButton:
-            if self._shift_click_pending:
-                self._handle_shift_left_release(event)
-                event.accept()
-                return
-            self._rb_promote_to_marquee(event.pos())
-            was_rubber = bool(self._rb_selecting)
-            self._finish_left_button_release(event)
-            if not was_rubber:
-                sm = self.selectionModel()
-                if sm is not None and sm.currentIndex().isValid():
-                    self._shift_anchor_index = QPersistentModelIndex(sm.currentIndex())
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-
-class _ListRowDelegate(QStyledItemDelegate):
-    """Paints thumbnail column, DCC badges column, active-project row (Projects), and status color is via item foreground."""
-
-    _LIST_THUMB_SIZE = 40
-    _DCC_BADGE_SIZE = 14
-    _DCC_BADGE_PAD = 4
-    _DCC_BADGE_GAP = 3
-    _DCC_MAX = 6
-
-    def __init__(self, *, view: QTableView, main_view: QWidget) -> None:
-        super().__init__(view)
-        self._view = view
-        self._main_view = main_view  # MainView: for _active_department, _show_publish, _list_col_dcc
-        self._active_project_root: str | None = None
-        self._hovered_status_row: int | None = None
-        self._hovered_health_row: int | None = None
-        self._hovered_notes_row: int | None = None
-        self._hovered_ref_row: int | None = None
-        self._hovered_concept_row: int | None = None
-        self._fast_paint = False
-
-    def set_fast_paint(self, enabled: bool) -> None:
-        if self._fast_paint == bool(enabled):
-            return
-        self._fast_paint = bool(enabled)
-        self._view.viewport().update()
-
-    def _should_fast_paint(self) -> bool:
-        if self._fast_paint:
-            return True
-        view = self._view
-        return bool(hasattr(view, "rubber_band_selecting") and view.rubber_band_selecting())
-
-    def set_hovered_status_row(self, row: int | None) -> None:
-        if self._hovered_status_row == row:
-            return
-        self._hovered_status_row = row
-        self._view.viewport().update()
-
-    def set_hovered_health_row(self, row: int | None) -> None:
-        if self._hovered_health_row == row:
-            return
-        self._hovered_health_row = row
-        self._view.viewport().update()
-
-    def set_hovered_notes_row(self, row: int | None) -> None:
-        if self._hovered_notes_row == row:
-            return
-        self._hovered_notes_row = row
-        self._view.viewport().update()
-
-    def set_hovered_ref_row(self, row: int | None) -> None:
-        if self._hovered_ref_row == row:
-            return
-        self._hovered_ref_row = row
-        self._view.viewport().update()
-
-    def set_hovered_concept_row(self, row: int | None) -> None:
-        if self._hovered_concept_row == row:
-            return
-        self._hovered_concept_row = row
-        self._view.viewport().update()
-
-    def set_active_project_root(self, path: str | None) -> None:
-        p = path or None
-        if p == self._active_project_root:
-            return
-        self._active_project_root = p
-        self._view.viewport().update()
-
-    def sizeHint(self, option, index) -> QSize:  # type: ignore[override]
-        """Widen Status column to fit production pill (ResizeToContents uses delegate hint)."""
-        main = self._main_view
-        col = index.column()
-        list_col_status = main._list_col_status() if hasattr(main, "_list_col_status") else -1
-        if col == list_col_status and list_col_status >= 0:
-            ctx = getattr(main, "_browser_context", "")
-            item = index.data(Qt.UserRole)
-            chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
-            fm = QFontMetrics(chip_font)
-            chip_h = max(16, fm.height() + 4)
-            lw = int(getattr(main, "_list_status_pill_layout_width", 0) or 0)
-            base = super().sizeHint(option, index)
-            if ctx == "project" and isinstance(item, ViewItem) and item.kind == ViewItemKind.PROJECT:
-                if lw > 0:
-                    return QSize(max(base.width(), lw), max(base.height(), chip_h))
-                return QSize(max(base.width(), 120), max(base.height(), chip_h))
-            if ctx in ("asset", "shot"):
-                dep = (getattr(main, "_active_department", None) or "").strip()
-                root = getattr(main, "_project_root", None)
-                if dep and root and isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
-                    if lw > 0:
-                        return QSize(max(base.width(), lw), max(base.height(), chip_h))
-                    return QSize(max(base.width(), 120), max(base.height(), chip_h))
-        list_col_notes = main._list_col_notes() if hasattr(main, "_list_col_notes") else -1
-        if col == list_col_notes and list_col_notes >= 0:
-            chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
-            base = super().sizeHint(option, index)
-            return QSize(max(base.width(), chip + 12), max(base.height(), chip + 8))
-        list_col_health = main._list_col_health() if hasattr(main, "_list_col_health") else -1
-        if col == list_col_health and list_col_health >= 0:
-            chip = _THUMB_HEALTH_ICON_PX + _THUMB_HEALTH_CHIP_PAD_PX * 2
-            base = super().sizeHint(option, index)
-            return QSize(max(base.width(), chip + 12), max(base.height(), chip + 8))
-        list_col_ref = main._list_col_ref() if hasattr(main, "_list_col_ref") else -1
-        list_col_concept = main._list_col_concept() if hasattr(main, "_list_col_concept") else -1
-        if col in (list_col_ref, list_col_concept) and col >= 0:
-            chip = _LIST_SPECIAL_FOLDER_ICON_PX + _LIST_SPECIAL_FOLDER_CHIP_PAD_PX * 2
-            base = super().sizeHint(option, index)
-            return QSize(max(base.width(), chip + 12), max(base.height(), chip + 8))
-        return super().sizeHint(option, index)
-
-    def _paint_default_cell(self, painter: QPainter, option, index) -> None:
-        opt = QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        opt.showDecorationSelected = False
-        super().paint(painter, opt, index)
-
-    def paint(self, painter: QPainter, option, index) -> None:
-        fast = self._should_fast_paint()
-        if fast:
-            col = index.column()
-            if col == 1:
-                icon = index.data(Qt.DecorationRole)
-                if isinstance(icon, QIcon) and not icon.isNull():
-                    if _list_thumb_cover_paint(painter, option.rect, icon, fast=True):
-                        return
-            if col == 2:
-                text = index.data(Qt.DisplayRole)
-                if text:
-                    painter.save()
-                    try:
-                        if option.state & QStyle.StateFlag.State_Selected:
-                            painter.setPen(QColor(MONOS_COLORS["text_primary_selected"]))
-                        else:
-                            painter.setPen(QColor(MONOS_COLORS["text_primary"]))
-                        f = monos_font("Inter", 13, QFont.Weight.Bold)
-                        painter.setFont(f)
-                        painter.drawText(
-                            option.rect.adjusted(8, 0, -8, 0),
-                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                            str(text),
-                        )
-                    finally:
-                        painter.restore()
-                return
-            return
-
-        item = index.data(Qt.UserRole)
-        col = index.column()
-        main = self._main_view
-        list_col_dcc = main._list_col_dcc() if hasattr(main, "_list_col_dcc") else -1
-        active_dep = getattr(main, "_active_department", None) or ""
-        show_publish = getattr(main, "_show_publish", False)
-        # Active project row: 2px left border amber (column 0)
-        active = (
-            isinstance(item, ViewItem)
-            and item.kind == ViewItemKind.PROJECT
-            and self._active_project_root is not None
-            and str(item.path) == self._active_project_root
-        )
-        if active and col == 0:
-            c = QColor(MONOS_COLORS["amber_400"])
-            c.setAlphaF(0.7)
-            painter.fillRect(option.rect.left(), option.rect.top(), 2, option.rect.height(), c)
-
-        # DCC column: paint badges (asset/shot, not publish mode)
-        if col == list_col_dcc and list_col_dcc >= 0 and isinstance(item, ViewItem) and not show_publish:
-            dept_reg = getattr(main, "_dept_registry", None)
-            badge_info = _list_dcc_badge_info(
-                item, active_dep.strip() or None, dept_registry=dept_reg
-            )
-            if badge_info:
-                rects = _list_dcc_badge_rects(option.rect, [(dcc_id, st) for (_, dcc_id, st) in badge_info])
-                chip_h = self._DCC_BADGE_SIZE + self._DCC_BADGE_PAD * 2
-                chip_r = chip_h // 2
-                dcc_bg = QColor(0, 0, 0, 160)
-                active_dcc = _item_active_dcc(getattr(item, "path", None), active_dep) if getattr(item, "path", None) else None
-                existing_ids = {dcc_id for (_, dcc_id, st) in badge_info if st == "exists"}
-                if not active_dcc or active_dcc not in existing_ids:
-                    active_dcc = next((dcc_id for (_, dcc_id, st) in badge_info if st == "exists"), None)
-                c_active = QColor(MONOS_COLORS["amber_400"])
-                c_active.setAlphaF(0.7)
-                pen_active = QPen(c_active, 2)
-                creating_font = monos_font("Inter", 9)
-                for i, (dcc_icon, dcc_id, badge_status) in enumerate(badge_info):
-                    if i >= len(rects):
-                        break
-                    r, _ = rects[i]
-                    is_active = bool(active_dcc and (dcc_id or "").strip() == active_dcc)
-                    if badge_status == "creating":
-                        painter.setPen(Qt.NoPen)
-                        painter.setBrush(dcc_bg)
-                        painter.drawRoundedRect(r, chip_r, chip_r)
-                        if is_active:
-                            painter.setPen(pen_active)
-                            painter.setBrush(Qt.NoBrush)
-                            painter.drawRoundedRect(r, chip_r, chip_r)
-                        painter.setFont(creating_font)
-                        painter.setPen(QColor(255, 255, 255))
-                        painter.drawText(r, Qt.AlignmentFlag.AlignCenter, "Creating…")
-                    else:
-                        cx, cy = r.x() + chip_r, r.y() + chip_r
-                        painter.setPen(Qt.NoPen)
-                        painter.setBrush(dcc_bg)
-                        painter.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
-                        if is_active:
-                            painter.setPen(pen_active)
-                            painter.setBrush(Qt.NoBrush)
-                            painter.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
-                        if dcc_icon is not None and not dcc_icon.isNull():
-                            pix = dcc_icon.pixmap(self._DCC_BADGE_SIZE, self._DCC_BADGE_SIZE)
-                            if not pix.isNull():
-                                painter.drawPixmap(r.x() + self._DCC_BADGE_PAD, r.y() + self._DCC_BADGE_PAD, pix)
-                return
-
-        # Thumbnail column (col 1): cover-fit — fill cell, center-crop
-        if col == 1:
-            icon = index.data(Qt.DecorationRole)
-            if isinstance(icon, QIcon) and not icon.isNull():
-                if _list_thumb_cover_paint(painter, option.rect, icon):
-                    return
-            self._paint_default_cell(painter, option, index)
-            return
-
-        list_col_notes = main._list_col_notes() if hasattr(main, "_list_col_notes") else -1
-        if (
-            col == list_col_notes
-            and list_col_notes >= 0
-            and getattr(main, "_browser_context", "") in ("asset", "shot")
-        ):
-            item = index.data(Qt.UserRole)
-            if (
-                isinstance(item, ViewItem)
-                and isinstance(item.ref, (Asset, Shot))
-                and getattr(item, "path", None)
-            ):
-                n, nmode = (0, "empty")
-                if hasattr(main, "notes_badge_state"):
-                    try:
-                        n, nmode = main.notes_badge_state(item.path)  # type: ignore[attr-defined]
-                    except Exception:
-                        n, nmode = 0, "empty"
-                painter.save()
-                try:
-                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                    chip_rect = _list_health_chip_rect(option.rect)
-                    _paint_note_icon_chip(
-                        painter,
-                        chip_rect,
-                        n,
-                        visual_mode=nmode,
-                        hovered=self._hovered_notes_row == index.row(),
-                    )
-                finally:
-                    painter.restore()
-                return
-
-        list_col_health = main._list_col_health() if hasattr(main, "_list_col_health") else -1
-        if (
-            col == list_col_health
-            and list_col_health >= 0
-            and getattr(main, "_browser_context", "") in ("asset", "shot")
-        ):
-            dep = (active_dep or "").strip()
-            if dep and isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
-                active_dcc = (
-                    _item_active_dcc(getattr(item, "path", None), dep)
-                    if getattr(item, "path", None)
-                    else None
-                )
-                health = assess_view_item_health(
-                    item.ref, dep, active_dcc_id=active_dcc
-                )
-                if health is not None:
-                    painter.save()
-                    try:
-                        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                        chip_rect = _list_health_chip_rect(option.rect)
-                        health_hover = self._hovered_health_row == index.row()
-                        _paint_health_icon_chip(
-                            painter, chip_rect, health, hovered=health_hover
-                        )
-                    finally:
-                        painter.restore()
-                    return
-
-        list_col_ref = main._list_col_ref() if hasattr(main, "_list_col_ref") else -1
-        list_col_concept = main._list_col_concept() if hasattr(main, "_list_col_concept") else -1
-        if (
-            col in (list_col_ref, list_col_concept)
-            and col >= 0
-            and getattr(main, "_browser_context", "") in ("asset", "shot")
-            and isinstance(item, ViewItem)
-            and isinstance(item.ref, (Asset, Shot))
-        ):
-            has_files = False
-            if col == list_col_ref and hasattr(main, "entity_has_reference_files_cached"):
-                has_files = bool(main.entity_has_reference_files_cached(item))  # type: ignore[attr-defined]
-            elif col == list_col_concept and hasattr(main, "entity_has_concept_files_cached"):
-                has_files = bool(main.entity_has_concept_files_cached(item))  # type: ignore[attr-defined]
-            icon_name = "eye" if col == list_col_ref else "lightbulb"
-            hovered = (
-                (col == list_col_ref and self._hovered_ref_row == index.row())
-                or (col == list_col_concept and self._hovered_concept_row == index.row())
-            )
-            painter.save()
-            try:
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                _paint_list_special_folder_icon(
-                    painter,
-                    _list_special_folder_chip_rect(option.rect),
-                    icon_name,
-                    has_files=has_files,
-                    hovered=hovered,
-                )
-            finally:
-                painter.restore()
-            return
-
-        list_col_status = main._list_col_status() if hasattr(main, "_list_col_status") else -1
-        if (
-            col == list_col_status
-            and list_col_status >= 0
-            and getattr(main, "_browser_context", "") == "project"
-            and isinstance(item, ViewItem)
-            and item.kind == ViewItemKind.PROJECT
-        ):
-            stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
-            status = getattr(stats, "status", None) or "WAITING"
-            line = project_status_label(status)
-            color_hex = project_status_color_hex(status)
-            painter.save()
-            try:
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
-                fm = QFontMetrics(chip_font)
-                pill_rect = _list_status_pill_rect_for_cell(option.rect, line, fm)
-                pill_hover = self._hovered_status_row == index.row()
-                _paint_status_pill_chip(
-                    painter,
-                    pill_rect,
-                    line,
-                    color_hex,
-                    fm=fm,
-                    font=chip_font,
-                    hovered=pill_hover,
-                )
-            finally:
-                painter.restore()
-            return
-
-        if (
-            col == list_col_status
-            and list_col_status >= 0
-            and getattr(main, "_browser_context", "") in ("asset", "shot")
-        ):
-            root = getattr(main, "_project_root", None)
-            dep = (active_dep or "").strip()
-            if (
-                dep
-                and root
-                and isinstance(item, ViewItem)
-                and isinstance(item.ref, (Asset, Shot))
-            ):
-                painter.save()
-                try:
-                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                    reg = main._production_status_registry_cached()
-                    hidden = set(getattr(main, "_inspector_hidden_departments", set()) or ())
-                    sid = aggregate_status_id_for_item(
-                        item.ref,
-                        active_department=dep,
-                        hidden_departments=hidden,
-                        registry=reg,
-                    )
-                    line = reg.label_for(sid)
-                    chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
-                    fm = QFontMetrics(chip_font)
-                    pill_rect = _list_status_pill_rect_for_cell(option.rect, line, fm)
-                    pill_hover = self._hovered_status_row == index.row()
-                    _paint_status_pill_chip(
-                        painter,
-                        pill_rect,
-                        line,
-                        color_hex_for_status_id(sid, reg),
-                        fm=fm,
-                        font=chip_font,
-                        hovered=pill_hover,
-                    )
-                except Exception:
-                    painter.restore()
-                    self._paint_default_cell(painter, option, index)
-                    return
-                painter.restore()
-                return
-
-        self._paint_default_cell(painter, option, index)
+        start_pipeline_item_drag(self, supportedActions)
 
 
 class _GridCardDelegate(QStyledItemDelegate):
@@ -2960,6 +2220,9 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._hovered_pill_row: int | None = None
         self._hovered_health_row: int | None = None
         self._hovered_notes_row: int | None = None
+        self._hovered_review_render_row: int | None = None
+        self._hovered_review_schedule_row: int | None = None
+        self._review_render_badge_cache: dict[tuple[str, str, str], GridReviewRenderBadge] = {}
         self._card_size = QSize(320, 260)
         self._gap_px = 24
         self._active_department: str | None = None
@@ -3085,15 +2348,14 @@ class _GridCardDelegate(QStyledItemDelegate):
     def _cached_thumb_crop(self, icon: QIcon, thumb: QRect, *, fast: bool) -> QPixmap | None:
         if thumb.width() <= 0 or thumb.height() <= 0:
             return None
-        key = (thumb.width(), thumb.height(), int(icon.cacheKey()), bool(fast))
+        key = (thumb.width(), thumb.height(), int(icon.cacheKey()))
         cached = self._thumb_cache.get(key)
         if cached is not None and not cached.isNull():
             return cached
         src = icon.pixmap(256, 256)
         if src.isNull():
             return None
-        mode = Qt.FastTransformation if fast else Qt.SmoothTransformation
-        scaled = src.scaled(thumb.size(), Qt.KeepAspectRatioByExpanding, mode)
+        scaled = src.scaled(thumb.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         sx = max(0, (scaled.width() - thumb.width()) // 2)
         sy = max(0, (scaled.height() - thumb.height()) // 2)
         crop = scaled.copy(QRect(QPoint(sx, sy), thumb.size()))
@@ -3141,11 +2403,52 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._hovered_notes_row = row
         self._repaint_delegate_rows(old_row, row)
 
+    def set_hovered_review_render_row(self, row: int | None) -> None:
+        if self._interaction_busy():
+            return
+        if self._hovered_review_render_row == row:
+            return
+        old_row = self._hovered_review_render_row
+        self._hovered_review_render_row = row
+        self._repaint_delegate_rows(old_row, row)
+
+    def set_hovered_review_schedule_row(self, row: int | None) -> None:
+        if self._interaction_busy():
+            return
+        if self._hovered_review_schedule_row == row:
+            return
+        old_row = self._hovered_review_schedule_row
+        self._hovered_review_schedule_row = row
+        self._repaint_delegate_rows(old_row, row)
+
+    def _cached_review_render_badge(
+        self,
+        ref: Asset | Shot,
+        active_department: str | None,
+        active_dcc_id: str | None,
+    ) -> GridReviewRenderBadge:
+        path_key = str(getattr(ref, "path", "") or "")
+        dep_key = (active_department or "").strip().casefold()
+        dcc_key = (active_dcc_id or "").strip().casefold()
+        cache_key = (path_key, dep_key, dcc_key)
+        hit = self._review_render_badge_cache.get(cache_key)
+        if hit is not None:
+            return hit
+        badge = resolve_grid_review_render_badge(ref, active_department, active_dcc_id)
+        if len(self._review_render_badge_cache) > 512:
+            self._review_render_badge_cache.clear()
+        self._review_render_badge_cache[cache_key] = badge
+        return badge
+
     def set_card_size(self, size: QSize) -> None:
         if size.isValid() and size != self._card_size:
             self._card_size = size
             self._clear_thumb_cache()
             self._view.viewport().update()
+
+    @property
+    def card_size(self) -> QSize:
+        return self._card_size
 
     def set_gap_px(self, gap_px: int) -> None:
         if gap_px > 0 and gap_px != self._gap_px:
@@ -3163,6 +2466,7 @@ class _GridCardDelegate(QStyledItemDelegate):
         self._active_department_label = lab
         self._production_reg_key = None
         self._production_reg_cache = None
+        self._review_render_badge_cache.clear()
         self.invalidate_notes_open_count_cache()
         self._view.viewport().update()
 
@@ -3189,6 +2493,7 @@ class _GridCardDelegate(QStyledItemDelegate):
         bg, hover = _card_bg_colors_for_browser_mode(mode, context, hover=False)
         self._c_card_bg = bg
         self._c_card_hover = hover
+        self._review_render_badge_cache.clear()
         self._view.viewport().update()
 
     def set_show_publish(self, show_publish: bool) -> None:
@@ -3259,6 +2564,7 @@ class _GridCardDelegate(QStyledItemDelegate):
         key = f"{item_path}|{(department or '').strip().casefold()}"
         self._active_dcc_cache[key] = dcc_id
         _write_active_dcc(item_path, department, dcc_id)
+        self._review_render_badge_cache.clear()
         self._view.viewport().update()
 
     @staticmethod
@@ -3323,35 +2629,29 @@ class _GridCardDelegate(QStyledItemDelegate):
                 and str(item.path) == self._active_project_root
             )
 
-            # Dim card when showing Published mode but item has no publish (strong dim, no selection)
+            # Dim card when showing Published mode but item has no publish (strong dim)
             _dim_card = False
             if (
-                not fast
-                and self._show_publish
+                self._show_publish
                 and isinstance(item.ref, (Asset, Shot))
                 and not _item_has_publish_for_department(item.ref, self._active_department)
             ):
                 _dim_card = True
             if _dim_card:
-                if selected:
-                    p.setOpacity(1.0)
-                elif hover:
+                if hover:
                     p.setOpacity(0.45)
                 else:
                     p.setOpacity(0.1)
             # Work / review: lighter dim when item has no work file (card still selectable)
             _dim_card_work = False
             if (
-                not fast
-                and not self._show_publish
+                not self._show_publish
                 and isinstance(item.ref, (Asset, Shot))
                 and not _item_has_work_for_department(item.ref, self._active_department)
             ):
                 _dim_card_work = True
             if _dim_card_work:
-                if selected:
-                    p.setOpacity(1.0)
-                elif hover:
+                if hover:
                     p.setOpacity(0.8)
                 else:
                     p.setOpacity(0.4)
@@ -3640,24 +2940,51 @@ class _GridCardDelegate(QStyledItemDelegate):
                         p.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, pub_label)
             elif self._is_review_mode:
                 if isinstance(item.ref, (Asset, Shot)):
-                    review_label = _review_corner_badge_label(item.ref, self._active_department)
-                    if review_label:
-                        rev_font = monos_font("Inter", 9, QFont.Weight.Bold)
-                        p.setFont(rev_font)
-                        fm = p.fontMetrics()
-                        text_w = fm.horizontalAdvance(review_label)
-                        pill_pad_x = 10
-                        pill_h = 24
-                        pill_w = text_w + pill_pad_x * 2
-                        pill_r = pill_h // 2
-                        pill_x = thumb.right() - 12 - pill_w
-                        pill_y = thumb.bottom() - 12 - pill_h
-                        pill_rect = QRect(pill_x, pill_y, pill_w, pill_h)
-                        p.setPen(Qt.NoPen)
-                        p.setBrush(QColor(MONOS_COLORS["amber_500"]))
-                        p.drawRoundedRect(pill_rect, pill_r, pill_r)
-                        p.setPen(QColor("#18181b"))
-                        p.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, review_label)
+                    dep_rev = (self._active_department or "").strip()
+                    active_dcc_rev = None
+                    if getattr(item, "path", None) and dep_rev:
+                        active_dcc_rev = self.get_active_dcc(item.path, dep_rev)
+                    render_badge = self._cached_review_render_badge(
+                        item.ref,
+                        dep_rev or None,
+                        active_dcc_rev,
+                    )
+                    schedule_badge: GridScheduleDeadlineBadge | None = None
+                    mw = self._main_view
+                    if mw is not None and hasattr(mw, "grid_schedule_deadline_badge_for_item"):
+                        try:
+                            schedule_badge = mw.grid_schedule_deadline_badge_for_item(item)  # type: ignore[attr-defined]
+                        except Exception:
+                            schedule_badge = None
+                    rev_font = review_badge_font()
+                    p.setFont(rev_font)
+                    render_rect, schedule_rect = layout_grid_review_thumb_badges(
+                        thumb,
+                        render_label=render_badge.version_text,
+                        schedule_label=(schedule_badge.label_text if schedule_badge is not None else None),
+                        font=rev_font,
+                    )
+                    render_hover = (
+                        self._hovered_review_render_row is not None
+                        and self._hovered_review_render_row == index.row()
+                    )
+                    paint_grid_review_render_pill(
+                        p,
+                        render_rect,
+                        render_badge,
+                        hovered=render_hover,
+                    )
+                    if schedule_badge is not None and schedule_rect is not None:
+                        sched_hover = (
+                            self._hovered_review_schedule_row is not None
+                            and self._hovered_review_schedule_row == index.row()
+                        )
+                        paint_grid_schedule_deadline_chip(
+                            p,
+                            schedule_rect,
+                            schedule_badge,
+                            hovered=sched_hover,
+                        )
             else:
                 dcc_list = dcc_badges_for_item()
                 if dcc_list:
@@ -4245,6 +3572,7 @@ class MainView(QWidget):
         self._thumbnail_manager: object | None = None
         self._thumb_prefetch_scheduled = False
         self._thumb_prefetch_gen = 0
+        self._pending_thumb_refresh_rows: set[int] = set()
 
         self._view_mode: str = "tile"
         self._browser_context: str = ""  # unset until set_browser_context; "project" | "asset" | "shot"
@@ -4918,7 +4246,6 @@ class MainView(QWidget):
         self._list_view.setModel(self._list_model)
         self._list_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._list_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._list_view.setDragEnabled(False)
         self._list_view.setAcceptDrops(False)
         self._list_view.setDropIndicatorShown(False)
         self._list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -4929,9 +4256,23 @@ class MainView(QWidget):
         self._list_view.customContextMenuRequested.connect(self._on_list_context_menu)
         self._list_row_delegate = PipelineListRowDelegate(view=self._list_view, main_view=self)
         self._list_view.setItemDelegate(self._list_row_delegate)
+        self._list_hit = PipelineListHitTest(self)
+        self._list_header = PipelineListHeader(list_view=self._list_view, main_view=self)
+        self._list_header.column_resized.connect(self._on_list_column_resized)
+        self._list_header.column_resize_finished.connect(self._save_list_column_widths)
         self._list_view.setMouseTracking(True)
         self._list_view.viewport().installEventFilter(self)
         self._list_view.verticalScrollBar().valueChanged.connect(self._schedule_thumbnail_prefetch)
+        self._sync_tile_drag_mode()
+
+        list_body = QWidget()
+        list_body.setObjectName("PipelineListBody")
+        list_body_lay = QVBoxLayout(list_body)
+        list_body_lay.setContentsMargins(0, 0, 0, 0)
+        list_body_lay.setSpacing(0)
+        list_body_lay.addWidget(self._list_header, 0)
+        list_body_lay.addWidget(self._list_view, 1)
+        self._list_body = list_body
 
         self._list_placeholder = MainViewLoadingPlaceholder()
         self._list_placeholder.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -4939,8 +4280,9 @@ class MainView(QWidget):
 
         list_page = QStackedWidget()
         list_page.addWidget(self._list_placeholder)
-        list_page.addWidget(self._list_view)
+        list_page.addWidget(self._list_body)
         list_page.setCurrentIndex(0)
+        self._load_list_column_widths()
         self._list_page = list_page
 
         self._content = QStackedWidget()
@@ -5136,34 +4478,6 @@ class MainView(QWidget):
             self._search_input.blockSignals(False)
         self._btn_search_clear.setVisible(bool((query or "").strip()))
 
-    def _list_dcc_hit(self, pos: QPoint) -> tuple[ViewItem | None, str | None, str | None]:
-        """Hit-test DCC badges in list view at viewport pos. Returns (item, dcc_id, department) or (None, None, None)."""
-        if self._view_mode != "list" or self._show_publish:
-            return None, None, None
-        hit = self._list_slot_at_pos(pos)
-        if hit is None or hit[1] != ListSlot.DCC:
-            return None, None, None
-        row, _ = hit
-        index = self._list_view.indexAt(pos)
-        if not index.isValid():
-            return None, None, None
-        item = index.data(Qt.UserRole)
-        if not isinstance(item, ViewItem):
-            return None, None, None
-        cell_rect = self._list_row_slot_rect(row, ListSlot.DCC)
-        dcc_list = _dcc_ids_for_item(
-            item,
-            (self._active_department or "").strip() or None,
-            dept_registry=getattr(self, "_dept_registry", None),
-        )
-        if not dcc_list:
-            return None, None, None
-        rects = _list_dcc_badge_rects(cell_rect, dcc_list)
-        for r, dcc_id in rects:
-            if r.contains(pos):
-                return item, dcc_id, (self._active_department or "").strip() or ""
-        return None, None, None
-
     def _dcc_badge_hit(self, pos) -> tuple[ViewItem | None, str | None, str | None]:
         """Hit-test DCC badges at viewport pos (grid). Returns (item, dcc_id, department) or (None, None, None)."""
         if self._view_mode != "tile" or self._show_publish:
@@ -5243,39 +4557,6 @@ class MainView(QWidget):
             line=line,
         )
         return item if hit is not None else None
-
-    def _list_status_hit(self, pos: QPoint) -> ViewItem | None:
-        if self._view_mode != "list" or not self._project_root:
-            return None
-        if self._browser_context not in ("asset", "shot"):
-            return None
-        index = self._list_view.indexAt(pos)
-        if not index.isValid() or index.column() != self._list_col_status():
-            return None
-        item = index.data(Qt.UserRole)
-        if isinstance(item, ViewItem) and isinstance(item.ref, (Asset, Shot)):
-            return item
-        return None
-
-    def _list_project_status_hit(self, pos: QPoint) -> ViewItem | None:
-        if self._view_mode != "list" or self._browser_context != "project":
-            return None
-        hit = self._list_slot_at_pos(pos)
-        if hit is None or hit[1] != ListSlot.STATUS:
-            return None
-        row, _ = hit
-        index = self._list_view.indexAt(pos)
-        item = index.data(Qt.UserRole) if index.isValid() else None
-        if not isinstance(item, ViewItem) or item.kind != ViewItemKind.PROJECT:
-            return None
-        stats = item.ref if isinstance(item.ref, ProjectQuickStats) else None
-        status = getattr(stats, "status", None) or "WAITING"
-        line = project_status_label(status)
-        chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
-        fm = QFontMetrics(chip_font)
-        cell_rect = self._list_row_slot_rect(row, ListSlot.STATUS)
-        pill_rect = _list_status_pill_rect_for_cell(cell_rect, line, fm)
-        return item if pill_rect.contains(pos) else None
 
     def _selected_asset_shot_paths_for_batch(self) -> list[Path]:
         """Non-dimmed Asset/Shot paths from current multi-selection (grid or list)."""
@@ -5428,6 +4709,58 @@ class MainView(QWidget):
         note_rect = _thumb_note_chip_rect(thumb, health_rect)
         return index.row() if note_rect.contains(pos) else None
 
+    def _grid_review_render_badge_hit_row(self, pos) -> int | None:
+        if self._view_mode != "tile" or self._browser_mode != "review" or self._browser_context != "shot":
+            return None
+        index = self._tile_view.indexAt(pos)
+        if not index.isValid():
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
+            return None
+        dep = (self._active_department or "").strip()
+        if not dep:
+            return None
+        cell_rect = self._tile_view.visualRect(index)
+        active_dcc = self.get_active_dcc(getattr(item, "path", None), dep)
+        render_badge = resolve_grid_review_render_badge(item.ref, dep, active_dcc)
+        schedule_badge = self.grid_schedule_deadline_badge_for_item(item)
+        render_rect, _schedule_rect = _grid_review_thumb_badge_rects(
+            cell_rect,
+            self._GRID_GAP_PX,
+            render_label=render_badge.version_text,
+            schedule_label=(schedule_badge.label_text if schedule_badge is not None else None),
+        )
+        return index.row() if render_rect.contains(pos) else None
+
+    def _grid_review_schedule_badge_hit_row(self, pos) -> int | None:
+        if self._view_mode != "tile" or self._browser_mode != "review" or self._browser_context != "shot":
+            return None
+        index = self._tile_view.indexAt(pos)
+        if not index.isValid():
+            return None
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
+            return None
+        dep = (self._active_department or "").strip()
+        if not dep:
+            return None
+        schedule_badge = self.grid_schedule_deadline_badge_for_item(item)
+        if schedule_badge is None:
+            return None
+        cell_rect = self._tile_view.visualRect(index)
+        active_dcc = self.get_active_dcc(getattr(item, "path", None), dep)
+        render_badge = resolve_grid_review_render_badge(item.ref, dep, active_dcc)
+        _render_rect, schedule_rect = _grid_review_thumb_badge_rects(
+            cell_rect,
+            self._GRID_GAP_PX,
+            render_label=render_badge.version_text,
+            schedule_label=schedule_badge.label_text,
+        )
+        if schedule_rect is None:
+            return None
+        return index.row() if schedule_rect.contains(pos) else None
+
     def _show_item_health_dialog(self, item: ViewItem, department: str) -> None:
         from monostudio.ui_qt.item_health_dialog import ItemHealthDialog
 
@@ -5489,171 +4822,19 @@ class MainView(QWidget):
         self._grid_delegate.set_hovered_health_row(health_row)
         notes_row = self._grid_note_hit_row(pos)
         self._grid_delegate.set_hovered_notes_row(notes_row)
+        review_render_row = self._grid_review_render_badge_hit_row(pos)
+        self._grid_delegate.set_hovered_review_render_row(review_render_row)
+        review_schedule_row = self._grid_review_schedule_badge_hit_row(pos)
+        self._grid_delegate.set_hovered_review_schedule_row(review_schedule_row)
         vp = self._tile_view.viewport()
-        if health_row is not None or notes_row is not None:
+        if (
+            health_row is not None
+            or notes_row is not None
+            or review_render_row is not None
+            or review_schedule_row is not None
+        ):
             vp.setCursor(Qt.CursorShape.PointingHandCursor)
         elif pill_row is not None:
-            vp.setCursor(Qt.CursorShape.PointingHandCursor)
-        else:
-            vp.unsetCursor()
-
-    def _list_status_pill_hit_row(self, pos: QPoint) -> int | None:
-        """Row index if pos is over list production status pill; else None."""
-        if self._view_mode != "list":
-            return None
-        hit = self._list_slot_at_pos(pos)
-        if hit is None:
-            return None
-        row, slot = hit
-        if slot != ListSlot.STATUS:
-            return None
-        if self._browser_context == "project":
-            return row
-        if not self._project_root or self._browser_context not in ("asset", "shot"):
-            return None
-        dep = (self._active_department or "").strip()
-        if not dep:
-            return None
-        idx = self._list_view.indexAt(pos)
-        if not idx.isValid():
-            return None
-        item = idx.data(Qt.UserRole)
-        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
-            return None
-        try:
-            reg = self._production_status_registry_cached()
-            sid = aggregate_status_id_for_item(
-                item.ref,
-                active_department=dep,
-                hidden_departments=self._inspector_hidden_departments,
-                registry=reg,
-            )
-            line = reg.label_for(sid)
-        except Exception:
-            line = "Waiting"
-        chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
-        fm = QFontMetrics(chip_font)
-        cell_rect = self._list_row_slot_rect(row, ListSlot.STATUS)
-        pill_rect = _list_status_pill_rect_for_cell(cell_rect, line, fm)
-        return row if pill_rect.contains(pos) else None
-
-    def _list_health_hit_row(self, pos: QPoint) -> int | None:
-        if self._view_mode != "list" or self._browser_context not in ("asset", "shot"):
-            return None
-        dep = (self._active_department or "").strip()
-        if not dep:
-            return None
-        hit = self._list_slot_at_pos(pos)
-        if hit is None or hit[1] != ListSlot.HEALTH:
-            return None
-        row, _ = hit
-        idx = self._list_view.indexAt(pos)
-        item = idx.data(Qt.UserRole) if idx.isValid() else None
-        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
-            return None
-        health = assess_view_item_health(
-            item.ref,
-            dep,
-            active_dcc_id=_item_active_dcc(item.path, dep) if item.path else None,
-        )
-        if health is None:
-            return None
-        cell_rect = self._list_row_slot_rect(row, ListSlot.HEALTH)
-        return row if _list_health_chip_rect(cell_rect).contains(pos) else None
-
-    def _list_thumb_note_hit_row(self, pos: QPoint) -> int | None:
-        if self._view_mode != "list" or self._browser_context not in ("asset", "shot"):
-            return None
-        hit = self._list_slot_at_pos(pos)
-        if hit is None or hit[1] != ListSlot.NOTES:
-            return None
-        row, _ = hit
-        idx = self._list_view.indexAt(pos)
-        item = idx.data(Qt.UserRole) if idx.isValid() else None
-        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)) or not item.path:
-            return None
-        cell_rect = self._list_row_slot_rect(row, ListSlot.NOTES)
-        note_rect = _list_health_chip_rect(cell_rect)
-        return row if note_rect.contains(pos) else None
-
-    def _list_thumb_note_hit(self, pos: QPoint) -> ViewItem | None:
-        row = self._list_thumb_note_hit_row(pos)
-        if row is None:
-            return None
-        idx = self._list_model.index(row, 0)
-        item = idx.data(Qt.UserRole)
-        return item if isinstance(item, ViewItem) else None
-
-    def _list_health_hit(self, pos: QPoint) -> ViewItem | None:
-        row = self._list_health_hit_row(pos)
-        if row is None:
-            return None
-        idx = self._list_model.index(row, 0)
-        item = idx.data(Qt.UserRole)
-        return item if isinstance(item, ViewItem) else None
-
-    def _list_special_folder_hit(
-        self, pos: QPoint, slot: ListSlot, folder_id: str
-    ) -> ViewItem | None:
-        if self._view_mode != "list" or self._browser_context not in ("asset", "shot"):
-            return None
-        hit = self._list_slot_at_pos(pos)
-        if hit is None or hit[1] != slot:
-            return None
-        row, _ = hit
-        idx = self._list_view.indexAt(pos)
-        item = idx.data(Qt.UserRole) if idx.isValid() else None
-        if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
-            return None
-        cell_rect = self._list_row_slot_rect(row, slot)
-        if not _list_special_folder_chip_rect(cell_rect).contains(pos):
-            return None
-        return item
-
-    def _list_ref_hit(self, pos: QPoint) -> ViewItem | None:
-        return self._list_special_folder_hit(pos, ListSlot.REF, "reference")
-
-    def _list_concept_hit(self, pos: QPoint) -> ViewItem | None:
-        return self._list_special_folder_hit(pos, ListSlot.CONCEPT, "concept")
-
-    def _list_ref_hit_row(self, pos: QPoint) -> int | None:
-        item = self._list_ref_hit(pos)
-        if item is None:
-            return None
-        index = self._list_view.indexAt(pos)
-        return index.row() if index.isValid() else None
-
-    def _list_concept_hit_row(self, pos: QPoint) -> int | None:
-        item = self._list_concept_hit(pos)
-        if item is None:
-            return None
-        index = self._list_view.indexAt(pos)
-        return index.row() if index.isValid() else None
-
-    def _update_list_status_pill_hover(self, pos: QPoint) -> None:
-        if self._view_mode != "list":
-            return
-        self._list_row_delegate.set_hovered_status_row(self._list_status_pill_hit_row(pos))
-
-    def _update_list_interactive_hover(self, pos: QPoint) -> None:
-        """Hover for list status pill, health icon column, and notes column."""
-        if self._view_mode != "list":
-            return
-        if self.interaction_fast_paint():
-            return
-        self._update_list_status_pill_hover(pos)
-        self._list_row_delegate.set_hovered_health_row(self._list_health_hit_row(pos))
-        self._list_row_delegate.set_hovered_notes_row(self._list_thumb_note_hit_row(pos))
-        self._list_row_delegate.set_hovered_ref_row(self._list_ref_hit_row(pos))
-        self._list_row_delegate.set_hovered_concept_row(self._list_concept_hit_row(pos))
-        vp = self._list_view.viewport()
-        if (
-            self._list_health_hit_row(pos) is not None
-            or self._list_thumb_note_hit_row(pos) is not None
-            or self._list_status_pill_hit_row(pos) is not None
-            or self._list_ref_hit_row(pos) is not None
-            or self._list_concept_hit_row(pos) is not None
-        ):
             vp.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             vp.unsetCursor()
@@ -5718,6 +4899,8 @@ class MainView(QWidget):
                 self._grid_delegate.set_hovered_pill_row(None)
                 self._grid_delegate.set_hovered_health_row(None)
                 self._grid_delegate.set_hovered_notes_row(None)
+                self._grid_delegate.set_hovered_review_render_row(None)
+                self._grid_delegate.set_hovered_review_schedule_row(None)
                 self._tile_view.viewport().unsetCursor()
 
         # Swallow mouse release on grid status pill / health icon so the view does not replace multi-selection.
@@ -5878,6 +5061,35 @@ class MainView(QWidget):
                                 )
                                 event.accept()
                                 return True
+                        # Review mode: render version + schedule deadline badges
+                        if (
+                            self._browser_mode == "review"
+                            and self._browser_context == "shot"
+                            and isinstance(item.ref, (Asset, Shot))
+                        ):
+                            active_dep_rev = (getattr(self._grid_delegate, "_active_department", None) or "").strip()
+                            if active_dep_rev:
+                                active_dcc_rev = self.get_active_dcc(getattr(item, "path", None), active_dep_rev)
+                                render_badge = resolve_grid_review_render_badge(
+                                    item.ref,
+                                    active_dep_rev,
+                                    active_dcc_rev,
+                                )
+                                schedule_badge = self.grid_schedule_deadline_badge_for_item(item)
+                                render_rect, schedule_rect = _grid_review_thumb_badge_rects(
+                                    cell_rect,
+                                    self._GRID_GAP_PX,
+                                    render_label=render_badge.version_text,
+                                    schedule_label=(schedule_badge.label_text if schedule_badge is not None else None),
+                                )
+                                if render_rect.contains(pos):
+                                    QToolTip.showText(event.globalPos(), render_badge.tooltip)
+                                    event.accept()
+                                    return True
+                                if schedule_rect is not None and schedule_rect.contains(pos) and schedule_badge:
+                                    QToolTip.showText(event.globalPos(), schedule_badge.tooltip)
+                                    event.accept()
+                                    return True
                         # DCC badge tooltip: DCC name — Department
                         hit_item, hit_dcc, hit_dep = self._dcc_badge_hit(pos)
                         if hit_item and hit_dcc:
@@ -5909,54 +5121,49 @@ class MainView(QWidget):
                 let = event.type()
                 if let == QEvent.MouseMove:
                     if not (event.buttons() & (Qt.MouseButton.LeftButton | Qt.MouseButton.MiddleButton)):
-                        self._update_list_interactive_hover(event.pos())
+                        self._list_hit.update_interactive_hover(event.pos())
                 elif let == QEvent.Leave:
-                    self._list_row_delegate.set_hovered_status_row(None)
-                    self._list_row_delegate.set_hovered_health_row(None)
-                    self._list_row_delegate.set_hovered_notes_row(None)
-                    self._list_row_delegate.set_hovered_ref_row(None)
-                    self._list_row_delegate.set_hovered_concept_row(None)
-                    list_view.viewport().unsetCursor()
+                    self._list_hit.clear_hover()
             if event.type() == QEvent.MouseButtonRelease and self._view_mode == "list":
                 if event.button() == Qt.MouseButton.LeftButton:
-                    if self._browser_context == "project" and self._list_project_status_hit(event.pos()) is not None:
+                    if self._browser_context == "project" and self._list_hit.project_status_hit(event.pos()) is not None:
                         self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
                     dep = (self._active_department or "").strip()
-                    if dep and self._list_status_hit(event.pos()):
+                    if dep and self._list_hit.status_hit(event.pos()):
                         self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
-                    if self._list_health_hit_row(event.pos()) is not None:
+                    if self._list_hit.health_hit_row(event.pos()) is not None:
                         self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
-                    if self._list_thumb_note_hit_row(event.pos()) is not None:
+                    if self._list_hit.thumb_note_hit_row(event.pos()) is not None:
                         self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
-                    if self._list_ref_hit_row(event.pos()) is not None:
+                    if self._list_hit.ref_hit_row(event.pos()) is not None:
                         self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
-                    if self._list_concept_hit_row(event.pos()) is not None:
+                    if self._list_hit.concept_hit_row(event.pos()) is not None:
                         self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
             if event.type() == QEvent.MouseButtonPress and self._view_mode == "list":
                 if event.button() == Qt.MouseButton.LeftButton:
-                    hit_ref = self._list_ref_hit(event.pos())
+                    hit_ref = self._list_hit.ref_hit(event.pos())
                     if hit_ref:
                         self._open_inspector_ref_tab_for_item(hit_ref, pos=event.pos())
                         event.accept()
                         return True
-                    hit_concept = self._list_concept_hit(event.pos())
+                    hit_concept = self._list_hit.concept_hit(event.pos())
                     if hit_concept:
                         self._open_entity_special_folder_from_item(hit_concept, "concept")
                         event.accept()
                         return True
-                    hit_note = self._list_thumb_note_hit(event.pos())
+                    hit_note = self._list_hit.thumb_note_hit(event.pos())
                     if hit_note and hit_note.path:
                         idx = list_view.indexAt(event.pos())
                         if idx.isValid():
@@ -5966,7 +5173,7 @@ class MainView(QWidget):
                         self.item_notes_requested.emit(hit_note)
                         event.accept()
                         return True
-                    hit_health = self._list_health_hit(event.pos())
+                    hit_health = self._list_hit.health_hit(event.pos())
                     if hit_health:
                         idx = list_view.indexAt(event.pos())
                         if idx.isValid():
@@ -5978,7 +5185,7 @@ class MainView(QWidget):
                             self._show_item_health_dialog(hit_health, dep_h)
                         event.accept()
                         return True
-                    hit_item, hit_dcc, hit_dep = self._list_dcc_hit(event.pos())
+                    hit_item, hit_dcc, hit_dep = self._list_hit.dcc_hit(event.pos())
                     if hit_item and hit_dcc and hit_dep:
                         self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
                         self.active_dcc_changed.emit(hit_item.path, hit_dep, hit_dcc)
@@ -5989,7 +5196,7 @@ class MainView(QWidget):
                         list_view.viewport().update()
                         event.accept()
                         return True
-                    hit_proj = self._list_project_status_hit(event.pos())
+                    hit_proj = self._list_hit.project_status_hit(event.pos())
                     if hit_proj and hit_proj.path:
                         idx = list_view.indexAt(event.pos())
                         if idx.isValid():
@@ -6000,7 +5207,7 @@ class MainView(QWidget):
                         self._run_project_status_menu_for(Path(hit_proj.path), gpos)
                         event.accept()
                         return True
-                    hit_st = self._list_status_hit(event.pos())
+                    hit_st = self._list_hit.status_hit(event.pos())
                     if hit_st and hit_st.path:
                         dep = (self._active_department or "").strip()
                         if not dep:
@@ -6021,8 +5228,16 @@ class MainView(QWidget):
                         event.accept()
                         return True
             if event.type() == QEvent.ToolTip and self._view_mode == "list":
-                if self._list_thumb_note_hit_row(event.pos()) is not None:
-                    n_item = self._list_thumb_note_hit(event.pos())
+                if self._list_hit.assignee_hit_row(event.pos()) is not None:
+                    n_item = self._list_hit.assignee_hit_item(event.pos())
+                    if n_item is not None:
+                        tip = self._list_assignee_tooltip(n_item)
+                        if tip:
+                            QToolTip.showText(event.globalPos(), tip)
+                            event.accept()
+                            return True
+                if self._list_hit.thumb_note_hit_row(event.pos()) is not None:
+                    n_item = self._list_hit.thumb_note_hit(event.pos())
                     if n_item is not None and n_item.path:
                         n_open, nmode = self.notes_badge_state(n_item.path)
                         QToolTip.showText(
@@ -6031,8 +5246,8 @@ class MainView(QWidget):
                         )
                         event.accept()
                         return True
-                if self._list_health_hit_row(event.pos()) is not None:
-                    n_item = self._list_health_hit(event.pos())
+                if self._list_hit.health_hit_row(event.pos()) is not None:
+                    n_item = self._list_hit.health_hit(event.pos())
                     if n_item is not None:
                         dep_tt = (self._active_department or "").strip()
                         if dep_tt and isinstance(n_item.ref, (Asset, Shot)):
@@ -6050,7 +5265,7 @@ class MainView(QWidget):
                                 )
                                 event.accept()
                                 return True
-                ref_item = self._list_ref_hit(event.pos())
+                ref_item = self._list_hit.ref_hit(event.pos())
                 if ref_item is not None:
                     has = self.entity_has_reference_files_cached(ref_item)
                     label = display_name_for_item(ref_item) or ref_item.name
@@ -6062,7 +5277,7 @@ class MainView(QWidget):
                     QToolTip.showText(event.globalPos(), tip)
                     event.accept()
                     return True
-                concept_item = self._list_concept_hit(event.pos())
+                concept_item = self._list_hit.concept_hit(event.pos())
                 if concept_item is not None:
                     has = self.entity_has_concept_files_cached(concept_item)
                     label = display_name_for_item(concept_item) or concept_item.name
@@ -6074,7 +5289,7 @@ class MainView(QWidget):
                     QToolTip.showText(event.globalPos(), tip)
                     event.accept()
                     return True
-                hit_item, hit_dcc, hit_dep = self._list_dcc_hit(event.pos())
+                hit_item, hit_dcc, hit_dep = self._list_hit.dcc_hit(event.pos())
                 if hit_item and hit_dcc:
                     try:
                         reg = get_default_dcc_registry()
@@ -6214,6 +5429,8 @@ class MainView(QWidget):
             self._grid_delegate.set_hovered_pill_row(None)
             self._grid_delegate.set_hovered_health_row(None)
             self._grid_delegate.set_hovered_notes_row(None)
+            self._grid_delegate.set_hovered_review_render_row(None)
+            self._grid_delegate.set_hovered_review_schedule_row(None)
             self._list_row_delegate.set_hovered_status_row(None)
             self._list_row_delegate.set_hovered_health_row(None)
             self._list_row_delegate.set_hovered_notes_row(None)
@@ -6309,9 +5526,7 @@ class MainView(QWidget):
     def refresh_reference_hint_badges(self) -> None:
         self._tile_view.viewport().update()
         if self._browser_context in ("asset", "shot"):
-            for col in (self._list_col_ref(), self._list_col_concept()):
-                if col >= 0:
-                    self._list_model.refresh_column_for_all_rows(col, [])
+            self._repaint_list_derived_columns()
 
     def _view_item_has_reference_files(self, item: ViewItem) -> bool:
         return self.entity_has_reference_files_cached(item)
@@ -6674,11 +5889,41 @@ class MainView(QWidget):
     def invalidate_review_card_cache(self, path: Path | str | None = None) -> None:
         """Review summaries come from scan index; repaint after external edits."""
         del path
+        self._grid_delegate._review_render_badge_cache.clear()
         if self.interaction_fast_paint():
             self._deferred_full_repaint_pending = True
             return
         self._tile_view.viewport().update()
         self._list_view.viewport().update()
+
+    def grid_schedule_deadline_badge_for_item(
+        self,
+        item: ViewItem,
+    ) -> GridScheduleDeadlineBadge | None:
+        ref = item.ref
+        if not isinstance(ref, (Asset, Shot)) or not self._project_root:
+            return None
+        dep = (self._active_department or "").strip()
+        if not dep:
+            return None
+        schedule = self._schedule_data
+        if schedule is None:
+            try:
+                schedule = read_project_schedule(Path(self._project_root))
+            except OSError:
+                schedule = None
+        kind = "shot" if isinstance(ref, Shot) else "asset"
+        try:
+            rel = entity_rel_path(Path(self._project_root), ref.path)
+        except (OSError, ValueError):
+            rel = ref.path.as_posix()
+        return resolve_grid_schedule_deadline_badge(
+            self._schedule_bars,
+            schedule,
+            entity_kind=kind,
+            entity_rel=rel,
+            active_department=dep,
+        )
 
     def _sync_tile_drag_mode(self) -> None:
         # Both modes: drag enabled; model flags control which rows are draggable (has publish / has work file).
@@ -6686,9 +5931,18 @@ class MainView(QWidget):
             self._tile_view.setDragEnabled(True)
             self._tile_view.setDragDropMode(QAbstractItemView.DragOnly)
             self._tile_view.setDefaultDropAction(Qt.CopyAction)
+            list_view = getattr(self, "_list_view", None)
+            if list_view is not None:
+                list_view.setDragEnabled(True)
+                list_view.setDragDropMode(QAbstractItemView.DragOnly)
+                list_view.setDefaultDropAction(Qt.CopyAction)
         else:
             self._tile_view.setDragEnabled(False)
             self._tile_view.setDragDropMode(QAbstractItemView.NoDragDrop)
+            list_view = getattr(self, "_list_view", None)
+            if list_view is not None:
+                list_view.setDragEnabled(False)
+                list_view.setDragDropMode(QAbstractItemView.NoDragDrop)
 
     def set_browser_context(self, context: str) -> None:
         """
@@ -6790,22 +6044,12 @@ class MainView(QWidget):
     def _refresh_list_due_column(self) -> None:
         if self._browser_context not in ("asset", "shot"):
             return
-        col = self._list_col_due()
-        if col < 0:
-            return
-        self._list_model.refresh_column_for_all_rows(
-            col, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole]
-        )
+        self._repaint_list_derived_columns()
 
     def _refresh_list_assignee_column(self) -> None:
         if self._browser_context not in ("asset", "shot"):
             return
-        col = self._list_col_assignee()
-        if col < 0:
-            return
-        self._list_model.refresh_column_for_all_rows(
-            col, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole]
-        )
+        self._repaint_list_derived_columns()
 
     def _list_due_text(self, item: ViewItem) -> tuple[str, bool]:
         ref = item.ref
@@ -6831,28 +6075,52 @@ class MainView(QWidget):
         )
         return list_due_display(summary, active_department=self._active_department)
 
-    def _list_assignee_display(self, item: ViewItem) -> tuple[str, QColor | None]:
+    def _list_assignee_ids_for_item(self, item: ViewItem) -> tuple[str, ...]:
         ref = item.ref
         if not isinstance(ref, (Asset, Shot)) or not self._project_root:
-            return "—", None
+            return ()
         dep = (self._active_department or "").strip()
         if not dep:
-            return "—", None
+            return ()
         kind = "shot" if isinstance(ref, Shot) else "asset"
         try:
             rel = entity_rel_path(Path(self._project_root), ref.path).replace("\\", "/")
         except (OSError, ValueError):
             rel = ref.path.as_posix()
         if self._schedule_bars is None:
-            return "—", None
+            return ()
         row_ids = merged_row_assignee_ids_from_bars(self._schedule_bars, kind, rel, dep)
         if not row_ids:
             bar = primary_bar_for_row(self._schedule_bars, kind, rel, dep)
             if bar is None:
-                return "—", None
+                return ()
             row_ids = tuple(bar.assignee_ids) or (
                 ((bar.assignee_id or "").strip(),) if (bar.assignee_id or "").strip() else ()
             )
+        return row_ids
+
+    def _list_assignee_users_for_item(self, item: ViewItem) -> list:
+        users = []
+        for uid in self._list_assignee_ids_for_item(item):
+            u = get_user(self._workspace_root, uid)
+            if u is not None:
+                users.append(u)
+        return users
+
+    def _list_assignee_tooltip(self, item: ViewItem) -> str:
+        row_ids = self._list_assignee_ids_for_item(item)
+        if not row_ids:
+            return "Unassigned"
+        name, _color = resolve_assignee_display(
+            self._workspace_root,
+            assignee_ids=row_ids,
+        )
+        return name or "Unassigned"
+
+    def _list_assignee_display(self, item: ViewItem) -> tuple[str, QColor | None]:
+        row_ids = self._list_assignee_ids_for_item(item)
+        if not row_ids:
+            return "—", None
         name, color_hex = resolve_assignee_display(
             self._workspace_root,
             assignee_ids=row_ids,
@@ -6900,10 +6168,14 @@ class MainView(QWidget):
             self._pipeline_list_layout.set_status_width(lw)
         self._list_view.viewport().update()
 
-    def _refresh_list_status_column(self) -> None:
-        col = self._list_col_status()
-        if col < 0:
+    def _repaint_list_derived_columns(self) -> None:
+        """Invalidate list rows whose cells are painted from MainView helpers (not model roles)."""
+        if self._list_model.rowCount() <= 0:
             return
+        self._list_model.emit_all_user_role_changed()
+        self._list_view.viewport().update()
+
+    def _refresh_list_status_column(self) -> None:
         chip_font = monos_font("Inter", 10, QFont.Weight.DemiBold)
         fm = QFontMetrics(chip_font)
         if self._browser_context == "project":
@@ -6922,15 +6194,12 @@ class MainView(QWidget):
         else:
             return
         self._apply_list_status_column_width()
-        self._list_model.refresh_column_for_all_rows(col, [Qt.DisplayRole, Qt.ForegroundRole])
+        self._repaint_list_derived_columns()
 
     def _refresh_list_last_updated_column(self) -> None:
         if self._browser_context not in ("asset", "shot"):
             return
-        col = self._list_col_last_updated()
-        if col < 0 or self._list_model.columnCount() <= col:
-            return
-        self._list_model.refresh_column_for_all_rows(col, [Qt.DisplayRole])
+        self._repaint_list_derived_columns()
 
     def set_empty_override(self, message: str | None) -> None:
         # Allows higher-level flows (e.g. workspace discovery) to present a neutral empty state.
@@ -6939,6 +6208,7 @@ class MainView(QWidget):
 
     def clear(self) -> None:
         # Clear Main View (no filesystem scan in this phase).
+        self._pipeline_selection_store.clear()
         self._tile_view.clearSelection()
         self._list_view.clearSelection()
         self._all_items = []
@@ -7321,18 +6591,8 @@ class MainView(QWidget):
                 continue
             item = tile_idx.data(Qt.UserRole)
             if isinstance(item, ViewItem) and self._paths_equal(item.path, path):
-                list_idx = self._list_model.index(row, 0)
-                for view, model_idx in (
-                    (self._tile_view, tile_idx),
-                    (self._list_view, list_idx),
-                ):
-                    sm = view.selectionModel()
-                    if sm is None or not model_idx.isValid():
-                        continue
-                    sm.setCurrentIndex(model_idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
-                    sm.select(model_idx, QItemSelectionModel.SelectionFlag.Select)
-                self._tile_view.viewport().update()
-                self._list_view.viewport().update()
+                self._pipeline_selection_store.set_single(path)
+                self._apply_selection_store_to_views()
                 self.valid_selection_changed.emit(self.has_valid_selection())
                 return True
         return False
@@ -7454,24 +6714,49 @@ class MainView(QWidget):
             if row is None or row in seen_rows:
                 continue
             seen_rows.add(row)
-            idx = self._tile_model.index(row, 0)
-            if not idx.isValid():
+            if self.interaction_fast_paint():
+                self._pending_thumb_refresh_rows.add(row)
                 continue
-            item = idx.data(Qt.UserRole)
-            if not isinstance(item, ViewItem):
-                continue
-            pix = mgr.request_thumbnail(
-                entity_path,
-                department=active_dept,
-                **self._thumbnail_request_extras(item),
-            )
-            if pix is not None:
-                icon = QIcon(pix)
-                self._tile_model.set_row_thumbnail(row, icon, "loaded")
-            else:
-                icon = self._icon_for_item(item)
-                self._tile_model.set_row_thumbnail(row, icon, None)
-            self._list_model.notify_thumb_column(row)
+            self._apply_row_thumbnail_from_manager(row, active_dept=active_dept, mgr=mgr)
+
+    def _apply_row_thumbnail_from_manager(self, row: int, *, active_dept: str | None, mgr) -> None:
+        idx = self._tile_model.index(row, 0)
+        if not idx.isValid():
+            return
+        item = idx.data(Qt.UserRole)
+        if not isinstance(item, ViewItem):
+            return
+        entity_path = str(item.path)
+        pix = mgr.request_thumbnail(
+            entity_path,
+            department=active_dept,
+            **self._thumbnail_request_extras(item),
+        )
+        if pix is not None:
+            icon = QIcon(pix)
+            self._tile_model.set_row_thumbnail(row, icon, "loaded")
+        else:
+            icon = self._icon_for_item(item)
+            self._tile_model.set_row_thumbnail(row, icon, None)
+        self._list_model.notify_thumb_column(row)
+
+    def _flush_pending_thumbnail_updates(self) -> None:
+        pending = getattr(self, "_pending_thumb_refresh_rows", None)
+        if not pending:
+            return
+        rows = sorted(pending)
+        self._pending_thumb_refresh_rows = set()
+        mgr = getattr(self, "_thumbnail_manager", None)
+        if mgr is None or not hasattr(mgr, "request_thumbnail"):
+            return
+        active_dept = (self._active_department or "").strip() or None
+        for row in rows:
+            self._apply_row_thumbnail_from_manager(row, active_dept=active_dept, mgr=mgr)
+        from monostudio.ui_qt.pipeline_row_paint import list_thumb_cover_paint
+
+        cache = getattr(list_thumb_cover_paint, "_pix_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
 
     def _row_for_item_id(self, item_id: str) -> int | None:
         """Return the model row index for the item with the given path id; path-normalized so updated_ids match."""
@@ -7527,6 +6812,7 @@ class MainView(QWidget):
             if sm is not None and len(sm.selectedIndexes()) > 1:
                 return
             if not selection_id or not selection_id.strip():
+                self._pipeline_selection_store.clear()
                 self._tile_view.clearSelection()
                 self._list_view.clearSelection()
             else:
@@ -7946,6 +7232,8 @@ class MainView(QWidget):
         self._grid_delegate.set_hovered_pill_row(None)
         self._grid_delegate.set_hovered_health_row(None)
         self._grid_delegate.set_hovered_notes_row(None)
+        self._grid_delegate.set_hovered_review_render_row(None)
+        self._grid_delegate.set_hovered_review_schedule_row(None)
         self._grid_last = None
         self._schedule_grid_layout_sync()
         self._tile_view.viewport().update()
@@ -8130,91 +7418,100 @@ class MainView(QWidget):
     def pipeline_list_layout(self) -> PipelineListLayout:
         return self._pipeline_list_layout
 
-    def _list_row_slot_rect(self, row: int, slot: ListSlot) -> QRect:
-        idx = self._list_model.index(row, 0)
-        if not idx.isValid():
-            return QRect()
-        row_rect = self._list_view.visualRect(idx)
-        return self._pipeline_list_layout.slot_rect(row_rect, slot)
+    def _settings_key_list_columns(self) -> str:
+        return f"main_view/list_columns/{self._browser_context}"
 
-    def _list_slot_at_pos(self, pos: QPoint) -> tuple[int, ListSlot] | None:
-        idx = self._list_view.indexAt(pos)
-        if not idx.isValid():
-            return None
-        row_rect = self._list_view.visualRect(idx)
-        slot = self._pipeline_list_layout.slot_at(pos.x() - row_rect.left())
-        if slot is None:
-            return None
-        return idx.row(), slot
+    def _load_list_column_widths(self) -> None:
+        raw = self._settings.value(self._settings_key_list_columns())
+        if not raw:
+            return
+        try:
+            if isinstance(raw, str):
+                data = json.loads(raw)
+            elif isinstance(raw, dict):
+                data = raw
+            else:
+                return
+            layout = self._pipeline_list_layout
+            for slot_name, w in data.items():
+                try:
+                    slot = ListSlot(slot_name)
+                except ValueError:
+                    continue
+                if slot in layout.widths:
+                    layout.set_width(slot, int(w))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
 
-    def _list_headers(self) -> list[str]:
-        if self._browser_context == "project":
-            return ["", "", "Name", "Status", "Assets", "Shots", "Last Updated", "Path"]
-        return [
-            "",
-            "",
-            "Name",
-            "Notes",
-            "DCC",
-            "Health",
-            "Ref",
-            "Concept",
-            "Status",
-            "Due",
-            "Version",
-            "Last Updated",
-            "Assignee",
-        ]
+    def _save_list_column_widths(self) -> None:
+        layout = self._pipeline_list_layout
+        data = {slot.value: layout.widths.get(slot, 0) for slot in layout.visible_slots()}
+        self._settings.setValue(self._settings_key_list_columns(), json.dumps(data))
+        self._apply_pipeline_list_layout()
 
-    def _list_col_notes(self) -> int:
-        """Column index for per-item notes chip (asset/shot only); after Name = 3."""
-        if self._browser_context != "project":
-            return 3
-        return -1
+    def _on_list_column_resized(self, slot: object, width: int) -> None:
+        if isinstance(slot, ListSlot):
+            self._pipeline_list_layout.set_width(slot, width)
+            if getattr(self, "_list_header", None) is not None:
+                self._list_header.update()
 
-    def _list_col_dcc(self) -> int:
-        """Column index for DCC badges (asset/shot only); after Notes = 4."""
-        if self._browser_context != "project":
-            return 4
-        return -1
+    def _paths_from_view_selection(self, view) -> tuple[list[Path], Path | None]:
+        paths: list[Path] = []
+        current: Path | None = None
+        sm = view.selectionModel()
+        if sm is None:
+            return paths, current
+        for idx in sm.selectedIndexes():
+            if idx.column() != 0:
+                continue
+            item = idx.data(Qt.UserRole)
+            if isinstance(item, ViewItem) and item.path:
+                paths.append(Path(item.path))
+        cur = sm.currentIndex()
+        if cur.isValid():
+            item = cur.data(Qt.UserRole)
+            if isinstance(item, ViewItem) and item.path:
+                current = Path(item.path)
+        return paths, current
 
-    def _list_col_health(self) -> int:
-        """Column index for item health icon (asset/shot only); after DCC = 5."""
-        if self._browser_context != "project":
-            return 5
-        return -1
+    def _sync_selection_store_from_view(self, view=None) -> None:
+        view = view or self._active_select_view()
+        paths, current = self._paths_from_view_selection(view)
+        self._pipeline_selection_store.select_many(paths, current=current)
 
-    def _list_col_ref(self) -> int:
-        if self._browser_context != "project":
-            return 6
-        return -1
+    def _apply_selection_store_to_views(self) -> None:
+        store = self._pipeline_selection_store
+        paths = store.path_set()
+        current_key = path_key(store.current()) if store.current() else None
+        self._selection_driven_by_state = True
+        try:
+            for view in (self._tile_view, self._list_view):
+                sm = view.selectionModel()
+                if sm is None:
+                    continue
+                sm.clearSelection()
+                current_idx = QModelIndex()
+                for row in range(self._tile_model.rowCount()):
+                    tile_idx = self._tile_model.index(row, 0)
+                    list_idx = self._list_model.index(row, 0)
+                    item = tile_idx.data(Qt.UserRole)
+                    if not isinstance(item, ViewItem) or not item.path:
+                        continue
+                    if path_key(Path(item.path)) in paths:
+                        model_idx = tile_idx if view is self._tile_view else list_idx
+                        sm.select(model_idx, QItemSelectionModel.SelectionFlag.Select)
+                        if current_key and path_key(Path(item.path)) == current_key:
+                            current_idx = model_idx
+                if current_idx.isValid():
+                    sm.setCurrentIndex(current_idx, QItemSelectionModel.SelectionFlag.NoUpdate)
+        finally:
+            self._selection_driven_by_state = False
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
 
-    def _list_col_concept(self) -> int:
-        if self._browser_context != "project":
-            return 7
-        return -1
-
-    def _list_col_status(self) -> int:
-        """Column index for Status (project: 3, asset/shot: 8)."""
-        if self._browser_context == "project":
-            return 3
-        return 8
-
-    def _list_col_due(self) -> int:
-        if self._browser_context != "project":
-            return 9
-        return -1
-
-    def _list_col_last_updated(self) -> int:
-        """Column index for Last Updated (project: 6, asset/shot: 11)."""
-        if self._browser_context == "project":
-            return 6
-        return 11
-
-    def _list_col_assignee(self) -> int:
-        if self._browser_context != "project":
-            return 12
-        return -1
+    def selected_paths(self) -> list[Path]:
+        self._sync_selection_store_from_view()
+        return self._pipeline_selection_store.paths()
 
     def _list_version_text(self, item: ViewItem) -> str:
         """Version string for list: work or publish version for active department."""
@@ -8266,7 +7563,10 @@ class MainView(QWidget):
         self._list_view.viewport().update()
 
     def _apply_list_column_defaults(self) -> None:
+        self._load_list_column_widths()
         self._apply_pipeline_list_layout()
+        if getattr(self, "_list_header", None) is not None:
+            self._list_header.sync_from_list()
 
     def _icon_for_item(self, item: ViewItem):
         # Placeholder by kind when no thumbnail: asset/shot/project get type icon; inbox_item = folder.
@@ -8327,6 +7627,8 @@ class MainView(QWidget):
         self._list_page.setCurrentIndex(1)
         self._list_model.reset_structure()
         self._apply_list_column_defaults()
+        if getattr(self, "_list_header", None) is not None:
+            self._list_header.sync_from_list()
         self._list_view.viewport().update()
 
     def _finish_list_view_layout(self) -> None:
@@ -8339,6 +7641,7 @@ class MainView(QWidget):
             pass
         self._list_view.viewport().update()
         self._schedule_thumbnail_prefetch(force=True)
+        self._apply_selection_store_to_views()
 
     def set_view_mode(self, mode: str, *, save: bool = True) -> None:
         # Persistent per-context (stored in QSettings).
@@ -8351,11 +7654,14 @@ class MainView(QWidget):
             self._btn_grid.setChecked(mode == "tile")
             self._btn_list.setChecked(mode == "list")
             return
+        self._sync_selection_store_from_view()
         self._view_mode = mode
         if mode != "tile":
             self._grid_delegate.set_hovered_pill_row(None)
             self._grid_delegate.set_hovered_health_row(None)
             self._grid_delegate.set_hovered_notes_row(None)
+            self._grid_delegate.set_hovered_review_render_row(None)
+            self._grid_delegate.set_hovered_review_schedule_row(None)
         if mode != "list":
             self._list_row_delegate.set_hovered_status_row(None)
             self._list_row_delegate.set_hovered_health_row(None)
@@ -8380,6 +7686,7 @@ class MainView(QWidget):
         if mode == "list":
             self._show_list_content(force=True)
             QTimer.singleShot(0, self._finish_list_view_layout)
+        self._apply_selection_store_to_views()
 
     def has_valid_selection(self) -> bool:
         if self._view_mode == "list":
@@ -8410,6 +7717,7 @@ class MainView(QWidget):
 
     def clear_selection(self) -> None:
         # Inspector "close" action: clear selection only (no rescan, no data mutation).
+        self._pipeline_selection_store.clear()
         try:
             self._tile_view.clearSelection()
         except Exception:
@@ -8445,6 +7753,7 @@ class MainView(QWidget):
     def _list_marquee_simplify_end(self) -> None:
         self._list_row_delegate.set_fast_paint(False)
         self._apply_pipeline_list_layout()
+        self._flush_pending_thumbnail_updates()
 
     def interaction_fast_paint(self) -> bool:
         """True while rubber-band marquee — not plain click-select."""
@@ -8488,6 +7797,7 @@ class MainView(QWidget):
         if getattr(self, "_deferred_full_repaint_pending", False):
             self._deferred_full_repaint_pending = False
             self.repaint_tile_and_list_views()
+        self._flush_pending_thumbnail_updates()
 
     def _schedule_selection_notify(self) -> None:
         self._selection_notify_timer.start(0)
@@ -8561,7 +7871,9 @@ class MainView(QWidget):
         if self._is_item_dimmed(item):
             view = self._active_select_view()
             view.clearSelection()
+            self._pipeline_selection_store.clear()
             return
+        self._sync_selection_store_from_view()
         if self._view_mode == "tile":
             self._begin_tile_selection_chrome(selected, deselected)
             self._schedule_selection_notify()
@@ -8872,7 +8184,7 @@ class MainView(QWidget):
 
     def _on_list_context_menu(self, pos) -> None:
         # DCC badge right-click takes priority (same as grid)
-        hit_item, hit_dcc, hit_dep = self._list_dcc_hit(pos)
+        hit_item, hit_dcc, hit_dep = self._list_hit.dcc_hit(pos)
         if hit_item and hit_dcc and hit_dep:
             menu = self._build_dcc_badge_context_menu(hit_item, hit_dcc, hit_dep)
             if menu:
@@ -9388,6 +8700,9 @@ class MainView(QWidget):
             state = self._tile_model.thumbnail_state_for_row(row)
             if state in ("loaded", "missing"):
                 self._list_model.notify_thumb_column(row)
+                continue
+
+            if self.interaction_fast_paint():
                 continue
 
             asset_id = str(item.path)

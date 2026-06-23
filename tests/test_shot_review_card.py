@@ -10,8 +10,10 @@ from monostudio.core.item_status import set_department_status_override
 from monostudio.core.production_status import load_production_status_registry
 from monostudio.core.shot_review_card import (
     format_review_card_date,
+    merge_department_review_render,
     resolve_render_summary,
     resolve_review_summary,
+    scan_department_review_light,
 )
 
 
@@ -76,3 +78,24 @@ def test_format_review_card_date_none() -> None:
 def test_format_review_card_date_local() -> None:
     dt = datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc)
     assert format_review_card_date(dt) == "Jun 18"
+
+
+def test_scan_light_then_merge_render(tmp_path: Path) -> None:
+    shot = tmp_path / "shot_030"
+    work = shot / "01_light" / "work"
+    render = work / "render" / "shot_v001"
+    render.mkdir(parents=True)
+    (render / "shot.1001.png").write_bytes(b"x")
+    reg = load_production_status_registry(tmp_path)
+    light = scan_department_review_light(
+        item_root=shot,
+        department_id="light",
+        registry=reg,
+    )
+    assert light.render_scanned is False
+    assert light.has_render is False
+    merged = merge_department_review_render(light, work, None)
+    assert merged.render_scanned is True
+    assert merged.has_render is True
+    assert merged.has_review is True
+    assert merged.has_media is True

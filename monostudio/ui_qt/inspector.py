@@ -119,10 +119,13 @@ from monostudio.ui_qt.main_view import (
     _THUMB_HEALTH_ICON_PX,
     _department_for_item,
     _item_health_tooltip_text,
-    _notes_badge_tooltip_text,
-    _paint_note_icon_chip,
     _thumb_note_chip_rect,
     assess_view_item_health,
+)
+from monostudio.ui_qt.pipeline_row_paint import notes_badge_tooltip_text, paint_note_icon_chip
+from monostudio.ui_qt.pipeline_drag_preview import (
+    build_single_pipeline_drag_pixmap,
+    resolve_grid_card_base_rect,
 )
 from monostudio.ui_qt.production_status_menu import pick_production_status_at
 from monostudio.ui_qt.shell_thumbnail import get_windows_shell_thumbnail
@@ -612,6 +615,8 @@ class InspectorPanel(QWidget):
 
         self._current_item: ViewItem | None = None
         self._previous_item: ViewItem | None = None
+        self._set_item_generation = 0
+        self._pending_set_item_hint: str | None = None
         self._empty_message_override: str | None = None
         self._project_root: Path | None = None
         self._schedule_bars: dict = {}
@@ -778,7 +783,7 @@ class InspectorPanel(QWidget):
         clear_stuck_widget_hover(self._scroll.viewport())
 
     def set_inbox_tree_preview(self, path: Path | None) -> None:
-        """Inbox/Reference: khi chọn file trong tree → hiện thumb + metadata, ẩn block distribute."""
+        """Inbox / Internal check / Delivery / Reference: tree selection → thumb + metadata; hide distribute."""
         self._inbox_destination.setVisible(False)
         self._inbox_action_wrapper.setVisible(False)
         self._inbox_destination.set_data([], None, None)
@@ -797,11 +802,11 @@ class InspectorPanel(QWidget):
         self.load_inbox_tree_preview_thumb()
 
     def load_inbox_tree_preview_thumb(self) -> None:
-        """Load HD preview for the current Inbox / Project Guide file (on item click)."""
+        """Load HD preview for explorer file selection (Inbox, Internal check, Delivery, Project Guide)."""
         self._preview.load_inbox_item_preview()
 
     def set_item(self, item: ViewItem | None, active_department_hint: str | None = None) -> None:
-        # Diff-based: never rebuild layout. Update only changed sections; preserve scroll position.
+        """Shell updates immediately; heavy sections deferred to next event-loop tick."""
         try:
             from monostudio.ui_qt.stress_profiler import enabled, record_inspector_update
             if enabled():
@@ -811,6 +816,13 @@ class InspectorPanel(QWidget):
         prev = self._current_item
         self._previous_item = prev
         self._current_item = item
+        self._apply_item_shell(item)
+        if item is None:
+            return
+        self._pending_set_item_hint = active_department_hint
+        self._schedule_apply_item_body(item, prev)
+
+    def _apply_item_shell(self, item: ViewItem | None) -> None:
         has_item = item is not None
         self._empty.setVisible(not has_item)
         is_asset_or_shot = has_item and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
@@ -823,20 +835,32 @@ class InspectorPanel(QWidget):
         self._stakeholders.setVisible(is_asset_or_shot)
         if has_item:
             self._inbox_action_wrapper.setVisible(False)
-
         self._ref_tab.set_show_placeholder(not is_asset_or_shot)
         self._details_empty.setVisible(not is_asset_or_shot)
-
-        if item is None:
+        if not has_item:
             self._sync_empty_message()
             self.inspector_hidden_departments_changed.emit(set())
             self._preview.set_inspector_notes_chip(False, 0)
             self._sync_ref_tab_paths()
-            return
 
-        # Đồng bộ department từ sidebar (active_department_hint):
-        # - sidebar_focus (vàng) luôn bám theo hint hợp lệ (kể cả department mới chỉ có trong registry)
-        # - _last_focused_department dùng cho logic (Tech row, preview, status, DCC)
+    def _schedule_apply_item_body(self, item: ViewItem, prev: ViewItem | None) -> None:
+        self._set_item_generation += 1
+        gen = self._set_item_generation
+
+        def _run() -> None:
+            if gen != self._set_item_generation or self._current_item is not item:
+                return
+            self._apply_item_body(item, prev, self._pending_set_item_hint)
+
+        QTimer.singleShot(0, _run)
+
+    def _apply_item_body(
+        self,
+        item: ViewItem,
+        prev: ViewItem | None,
+        active_department_hint: str | None,
+    ) -> None:
+        is_asset_or_shot = item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
         ref = getattr(item, "ref", None)
         if isinstance(ref, (Asset, Shot)):
             hint = (active_department_hint or "").strip() or None
@@ -857,7 +881,6 @@ class InspectorPanel(QWidget):
 
         if full_update:
             self._preview.set_item(item)
-            # Inbox: preview chỉ lấy height theo tỉ lệ ảnh (stretch 0)
             try:
                 idx = self._content_layout.indexOf(self._preview)
                 if idx >= 0:
@@ -899,12 +922,10 @@ class InspectorPanel(QWidget):
         if scroll_bar and scroll_bar.value() != scroll_pos:
             scroll_bar.setValue(scroll_pos)
 
-        # Khi có department focus (từ sidebar hoặc Inspector), đảm bảo Tech row + preview
-        # được sync ngay cả lần đầu mở Inspector.
         if self._last_focused_department:
             self._on_department_focused(self._last_focused_department)
 
-        if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+        if is_asset_or_shot:
             self._sync_preview_notes_chip()
             self._sync_ref_tab_paths()
             if self._body_stack.currentIndex() == 1:
@@ -1785,7 +1806,7 @@ class _PreviewWidget(QWidget):
             try:
                 p.setRenderHint(QPainter.Antialiasing, True)
                 note_r = self._note_chip_rect(r)
-                _paint_note_icon_chip(
+                paint_note_icon_chip(
                     p,
                     note_r,
                     self._notes_open_count,
@@ -2021,7 +2042,7 @@ class _PreviewWidget(QWidget):
             if note_hover:
                 QToolTip.showText(
                     gpt,
-                    _notes_badge_tooltip_text(self._notes_open_count, self._notes_visual_mode),
+                    notes_badge_tooltip_text(self._notes_open_count, self._notes_visual_mode),
                 )
             elif health_hover and self._item_health is not None:
                 QToolTip.showText(gpt, _item_health_tooltip_text(self._item_health))
@@ -2904,10 +2925,16 @@ class _InspectorPreview(QWidget):
             self._container.set_preview_help_text("")
             return
         if item.kind == ViewItemKind.INBOX_ITEM:
-            self._container.set_preview_help_text(
-                "Double-click: open file.\n"
-                "Right-click: menu."
-            )
+            if item.path.is_dir():
+                self._container.set_preview_help_text(
+                    "Double-click: browse folder.\n"
+                    "Right-click: menu."
+                )
+            else:
+                self._container.set_preview_help_text(
+                    "Double-click: open file.\n"
+                    "Right-click: menu."
+                )
             return
         if item.kind in (ViewItemKind.PROJECT, ViewItemKind.DEPARTMENT):
             self._container.set_preview_help_text("Right-click: menu.")
@@ -2939,89 +2966,26 @@ class _InspectorPreview(QWidget):
         return False
 
     def _inspector_sequence_folder_drag_pixmap(self) -> tuple[QPixmap | None, QPoint]:
-        """Card-style pixmap under cursor (aligned with grid middle-drag previews)."""
+        """Card-style pixmap under cursor (shared with grid/list middle-drag)."""
         wgt = self._container._w
         item = self._item
-        dpr = float(wgt.devicePixelRatioF())
-        if dpr <= 0:
-            dpr = 1.0
-        target_w = 200
-        inner_pad = 8
-        gap_thumb_text = 8
-        name_font = QFont("Inter")
-        name_font.setPointSize(11)
-        name_font.setWeight(QFont.Weight.DemiBold)
-        name_fm = QFontMetrics(name_font)
-        name_h = max(14, name_fm.height())
-        inner_w = max(1, target_w - inner_pad * 2)
-        thumb_region_h = max(1, int(inner_w * 9 / 16))
-        logical_h = inner_pad + thumb_region_h + gap_thumb_text + name_h + inner_pad
-        logical_size = QSize(target_w, logical_h)
-
-        ww = max(1, int(logical_size.width() * dpr))
-        hh = max(1, int(logical_size.height() * dpr))
-        pm = QPixmap(ww, hh)
-        pm.setDevicePixelRatio(dpr)
-        pm.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(pm)
-        try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-            r = QRect(0, 0, logical_size.width(), logical_size.height())
-            bg = QColor("#18181b")
-            border = QColor("#3f3f46")
-            painter.setPen(QPen(border, 1))
-            painter.setBrush(bg)
-            painter.drawRoundedRect(r.adjusted(0, 0, -1, -1), 12, 12)
-
-            inner = r.adjusted(inner_pad, inner_pad, -inner_pad, -inner_pad)
-            thumb = QRect(inner.left(), inner.top(), inner.width(), thumb_region_h)
-            src_pix: QPixmap | None = getattr(wgt, "_pix", None)
-            has_img = bool(getattr(wgt, "_has_image", False) and src_pix is not None and not src_pix.isNull())
-            clip_path = QPainterPath()
-            clip_path.addRoundedRect(QRectF(thumb), 6, 6)
-            painter.save()
-            painter.setClipPath(clip_path)
-            if has_img and src_pix is not None:
-                scaled = src_pix.scaled(thumb.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-                sx = max(0, (scaled.width() - thumb.width()) // 2)
-                sy = max(0, (scaled.height() - thumb.height()) // 2)
-                crop = scaled.copy(QRect(QPoint(sx, sy), thumb.size()))
-                painter.drawPixmap(thumb, crop)
-            else:
-                painter.fillRect(thumb, QColor(MONOS_COLORS["content_bg"]))
-                fc = lucide_icon("folder", size=44, color_hex=MONOS_COLORS["text_meta"])
-                fp = fc.pixmap(44, 44)
-                if not fp.isNull():
-                    painter.drawPixmap(
-                        thumb.center().x() - 22,
-                        thumb.center().y() - 22,
-                        fp,
-                    )
-            painter.restore()
-
-            name = ""
-            if item is not None:
-                try:
-                    name = (display_name_for_item(item) or "").strip()
-                except Exception:
-                    name = ""
-            folder_fallback = self._sequence_folder.name if self._sequence_folder else "—"
-            name = name or folder_fallback
-            text_rect = QRect(
-                inner.left(),
-                thumb.bottom() + gap_thumb_text,
-                inner.width(),
-                max(1, inner.bottom() - (thumb.bottom() + gap_thumb_text)),
-            )
-            painter.setFont(name_font)
-            painter.setPen(QColor("#e4e4e7"))
-            elided = name_fm.elidedText(name, Qt.TextElideMode.ElideRight, max(1, text_rect.width()))
-            painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignTop, elided)
-        finally:
-            painter.end()
-        hotspot = QPoint(24, 24)
-        return (pm if not pm.isNull() else None), hotspot
+        src_pix: QPixmap | None = getattr(wgt, "_pix", None)
+        has_img = bool(getattr(wgt, "_has_image", False) and src_pix is not None and not src_pix.isNull())
+        name = ""
+        if item is not None:
+            try:
+                name = (display_name_for_item(item) or "").strip()
+            except Exception:
+                name = ""
+        if not name and self._sequence_folder is not None:
+            name = self._sequence_folder.name
+        return build_single_pipeline_drag_pixmap(
+            wgt,
+            base_rect=resolve_grid_card_base_rect(self),
+            name=name or "—",
+            thumb_pixmap=src_pix if has_img else None,
+            folder_fallback=not has_img,
+        )
 
     def _perform_sequence_folder_drag(self) -> None:
         if self._sequence_folder is None or not self._sequence_folder.is_dir():
@@ -3533,7 +3497,6 @@ class _InspectorPreview(QWidget):
         if mgr is not None and hasattr(mgr, "submit_task"):
             w.set_loading(True)
             w.update()
-            QApplication.processEvents()
 
             def submit() -> None:
                 if getattr(self, "_item", None) is not item or str(self._item.path) != path_str:
@@ -3584,11 +3547,24 @@ class _InspectorPreview(QWidget):
         QTimer.singleShot(0, load)
 
     def load_inbox_item_preview(self) -> None:
-        """HD thumb for Inbox / Project Guide — call when user selects a file."""
+        """HD thumb for explorer tree file selection."""
         item = self._item
         if item is None or item.kind != ViewItemKind.INBOX_ITEM:
             return
         path = item.path
+        w = self._container._w
+        if path.is_dir():
+            w.set_loading(False)
+            w.set_pixmap(None)
+            self._seq_live_display = False
+            self._sequence_frames = []
+            w.set_placeholder_file_icon("folder", MONOS_COLORS.get("text_meta", "#71717a"))
+            w.set_unreadable_preview("", str(path))
+            self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
+            self._sync_sequence_context_for_inspector_preview()
+            self._sync_thumbnail_overlay_mode()
+            self._sync_inspector_thumb_tooltip()
+            return
         if not path.is_file():
             return
         if self._defer_thumb_decode_if_resizing():
@@ -3621,7 +3597,6 @@ class _InspectorPreview(QWidget):
 
         if mgr is not None and hasattr(mgr, "submit_task"):
             w.update()
-            QApplication.processEvents()
 
             def submit() -> None:
                 if self._item is not item or str(self._item.path) != path_str:
@@ -3707,11 +3682,10 @@ class _InspectorPreview(QWidget):
         if self._defer_thumb_decode_if_resizing():
             return
 
+        w = self._container._w
         if mgr is not None and hasattr(mgr, "submit_task"):
-            w = self._container._w
             w.set_loading(True)
             w.update()
-            QApplication.processEvents()
             self._sync_thumbnail_overlay_mode()
 
             def submit() -> None:

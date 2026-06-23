@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from monostudio.core.dcc_registry import get_default_dcc_registry
-from monostudio.core.models import Asset, DccWorkState, Department, ProjectIndex, Shot
-from monostudio.core.production_status import load_status_overrides_for_scan
+from monostudio.core.models import Asset, DccWorkState, Department, DepartmentReviewIndex, ProjectIndex, Shot
+from monostudio.core.production_status import load_production_status_registry, load_status_overrides_for_scan
+from monostudio.core.shot_review_card import merge_department_review_render, scan_department_review_light
 
 if TYPE_CHECKING:
     from monostudio.core.department_registry import DepartmentRegistry
@@ -17,6 +19,29 @@ if TYPE_CHECKING:
 def _status_overrides_for_item(item_dir: Path, departments: tuple[Department, ...]) -> tuple[tuple[str, str], ...]:
     names = tuple((d.name or "").strip() for d in departments if (d.name or "").strip())
     return load_status_overrides_for_scan(item_dir, names)
+
+
+def _work_file_path_from_dcc_states(
+    dcc_states: list[tuple[tuple[str, str], DccWorkState]],
+    dept_id: str,
+    preferred_dcc: str | None = None,
+) -> Path | None:
+    dep_cf = (dept_id or "").strip().casefold()
+    if not dep_cf:
+        return None
+    dcc_pref = (preferred_dcc or "").strip() or None
+    fallback: Path | None = None
+    for (did, dcc_id), state in dcc_states:
+        if (did or "").strip().casefold() != dep_cf:
+            continue
+        wp = getattr(state, "work_file_path", None)
+        if not isinstance(wp, Path) or not wp.is_file():
+            continue
+        if dcc_pref and (dcc_id or "").strip() == dcc_pref:
+            return wp
+        if fallback is None:
+            fallback = wp
+    return fallback
 
 
 def _iter_dirs(path: Path) -> list[Path]:
@@ -244,6 +269,8 @@ def _build_shot_departments(
     open_meta: dict,
     use_dcc_folders: bool = False,
     dcc_registry: "DccRegistry | None" = None,
+    *,
+    prod_registry=None,
 ) -> tuple[list[Department], list[tuple[tuple[str, str], DccWorkState]]]:
     """Build department list and per-(dept, dcc) work states for a single shot directory."""
     departments: list[Department] = []
@@ -316,6 +343,21 @@ def _build_shot_departments(
             latest_version, version_count = _scan_publish_versions(publish_path)
         else:
             latest_version, version_count = None, 0
+        dept_dcc_states: list[tuple[tuple[str, str], DccWorkState]] = []
+        if reg_use is not None:
+            dept_dcc_states = _dcc_work_states_for_department(
+                dept_dir, dept_id, prefix, use_dcc_folders, reg_use
+            )
+            all_dcc_states.extend(dept_dcc_states)
+        review_index = (
+            scan_department_review_light(
+                item_root=shot_dir,
+                department_id=dept_id,
+                registry=prod_registry,
+            )
+            if prod_registry is not None
+            else DepartmentReviewIndex()
+        )
         departments.append(
             Department(
                 name=dept_id,
@@ -329,12 +371,9 @@ def _build_shot_departments(
                 publish_exists=publish_exists,
                 latest_publish_version=latest_version,
                 publish_version_count=version_count,
+                review_index=review_index,
             )
         )
-        if reg_use is not None:
-            all_dcc_states.extend(
-                _dcc_work_states_for_department(dept_dir, dept_id, prefix, use_dcc_folders, reg_use)
-            )
     return (departments, all_dcc_states)
 
 
@@ -676,6 +715,34 @@ def _resolve_dcc_for_department(*, dept_name: str, meta: dict, fallback_from_fil
     return fallback_from_file
 
 
+def enrich_shot_review_render(shot: Shot) -> Shot:
+    """Background pass: fill render/sequence fields on each department review_index."""
+    if not shot.departments:
+        return shot
+    dcc_states = list(getattr(shot, "dcc_work_states", ()) or ())
+    new_departments: list[Department] = []
+    changed = False
+    for dept in shot.departments:
+        idx = getattr(dept, "review_index", None)
+        if idx is None or idx.render_scanned:
+            new_departments.append(dept)
+            continue
+        work_file = _work_file_path_from_dcc_states(dcc_states, dept.name, dept.work_file_dcc)
+        merged = merge_department_review_render(idx, dept.work_path, work_file)
+        if merged is idx:
+            new_departments.append(dept)
+            continue
+        changed = True
+        new_departments.append(replace(dept, review_index=merged))
+    if not changed:
+        return shot
+    return replace(shot, departments=tuple(new_departments))
+
+
+def enrich_shots_review_render(shots: list[Shot]) -> list[Shot]:
+    return [enrich_shot_review_render(s) for s in shots]
+
+
 def build_project_index(
     project_root: Path,
     department_registry: "DepartmentRegistry | None" = None,
@@ -698,6 +765,7 @@ def build_project_index(
     struct_reg = StructureRegistry.for_project(project_root)
     use_dcc_folders = read_use_dcc_folders(project_root)
     dcc_reg = get_default_dcc_registry()
+    prod_registry = load_production_status_registry(project_root)
     assets_dir = project_root / struct_reg.get_folder("assets")
     shots_dir = project_root / struct_reg.get_folder("shots")
 
@@ -727,7 +795,7 @@ def build_project_index(
     for shot_dir in _iter_dirs(shots_dir):
         open_meta = _read_item_open_meta(shot_dir)
         departments, dcc_states = _build_shot_departments(
-            shot_dir, dept_registry, open_meta, use_dcc_folders, dcc_reg
+            shot_dir, dept_registry, open_meta, use_dcc_folders, dcc_reg, prod_registry=prod_registry
         )
         dept_tup = tuple(departments)
         shots.append(
@@ -829,9 +897,10 @@ def scan_single_shot(
         return None
     use_dcc_folders = read_use_dcc_folders(project_root)
     dcc_reg = get_default_dcc_registry()
+    prod_registry = load_production_status_registry(project_root)
     open_meta = _read_item_open_meta(shot_dir)
     departments, dcc_states = _build_shot_departments(
-        shot_dir, dept_reg, open_meta, use_dcc_folders, dcc_reg
+        shot_dir, dept_reg, open_meta, use_dcc_folders, dcc_reg, prod_registry=prod_registry
     )
     dept_tup = tuple(departments)
     return Shot(

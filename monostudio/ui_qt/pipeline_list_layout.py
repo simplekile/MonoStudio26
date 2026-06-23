@@ -42,7 +42,7 @@ _DEFAULT_WIDTHS: dict[ListSlot, int] = {
     ListSlot.DUE: 88,
     ListSlot.VERSION: 72,
     ListSlot.LAST_UPDATED: 120,
-    ListSlot.ASSIGNEE: 120,
+    ListSlot.ASSIGNEE: 84,
     ListSlot.ASSETS: 72,
     ListSlot.SHOTS: 72,
     ListSlot.PATH: 200,
@@ -74,6 +74,8 @@ _ASSET_SHOT_SLOTS: tuple[ListSlot, ...] = (
     ListSlot.LAST_UPDATED,
     ListSlot.ASSIGNEE,
 )
+
+_STICKY_SLOTS: tuple[ListSlot, ...] = (ListSlot.INDEX, ListSlot.THUMB, ListSlot.NAME)
 
 _SLOT_HEADERS: dict[ListSlot, str] = {
     ListSlot.INDEX: "",
@@ -120,8 +122,29 @@ class PipelineListLayout:
     def visible_slots(self) -> tuple[ListSlot, ...]:
         return tuple(s for s in self.slots() if s not in self.hidden)
 
+    def sticky_slots(self) -> tuple[ListSlot, ...]:
+        visible = set(self.visible_slots())
+        return tuple(s for s in _STICKY_SLOTS if s in visible)
+
+    def scrollable_slots(self) -> tuple[ListSlot, ...]:
+        sticky = set(self.sticky_slots())
+        return tuple(s for s in self.visible_slots() if s not in sticky)
+
+    def sticky_width(self) -> int:
+        return sum(self.widths.get(s, 0) for s in self.sticky_slots())
+
+    def content_x_for_viewport_pos(self, pos_x: int, row_rect_left: int, *, scroll_x: int) -> int:
+        """Map viewport x to absolute column content x (sticky zone ignores scroll)."""
+        sticky_w = self.sticky_width()
+        if pos_x < sticky_w:
+            return max(0, pos_x)
+        return max(0, scroll_x + pos_x - row_rect_left)
+
     def headers(self) -> list[str]:
         return [_SLOT_HEADERS.get(s, "") for s in self.slots()]
+
+    def header_label(self, slot: ListSlot) -> str:
+        return _SLOT_HEADERS.get(slot, "")
 
     def set_width(self, slot: ListSlot, width: int) -> None:
         if slot in self.widths:
@@ -135,12 +158,16 @@ class PipelineListLayout:
 
     def slot_at(self, x: int, *, scroll_x: int = 0) -> ListSlot | None:
         """Return slot under content x (viewport coords + scroll offset)."""
-        cursor = -scroll_x
+        return self.slot_at_content_x(x + scroll_x if scroll_x else x)
+
+    def slot_at_content_x(self, content_x: int) -> ListSlot | None:
+        """Return slot at absolute x within the row content (0 = first column)."""
+        cursor = 0
         for slot in self.visible_slots():
             w = self.widths.get(slot, 0)
             if w <= 0:
                 continue
-            if cursor <= x < cursor + w:
+            if cursor <= content_x < cursor + w:
                 return slot
             cursor += w
         return None

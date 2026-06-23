@@ -145,26 +145,30 @@ Giữ MainView: orchestration, signals, browser context, thumbnails, empty state
 ## 8. Thứ tự triển khai
 
 ### Phase 0
-- [ ] `PipelineListLayout` + tests
-- [ ] `PipelineSelectionStore` + tests
-- [ ] `pipeline_row_paint.py` extract từ grid delegate
+- [x] `PipelineListLayout` + tests
+- [x] `PipelineSelectionStore` + tests
+- [x] `pipeline_row_paint.py` extract từ grid delegate
 
 ### Phase 1
-- [ ] `PipelineListModel` + `PipelineListView` + delegate (cột đủ, chưa chip interactive)
-- [ ] Wire MainView; selection store; QSS
-- [ ] Empty state, thumbnail prefetch
+- [x] `PipelineListModel` + `PipelineListView` + delegate (cột đủ, chưa chip interactive)
+- [x] Wire MainView; selection store; QSS
+- [x] Empty state, thumbnail prefetch
 
 ### Phase 2
-- [ ] Hit-test chips; mouse handling; context menu; Enter
-- [ ] Fast-paint minimal marquee
+- [x] Hit-test chips; mouse handling; context menu; Enter
+- [x] Fast-paint minimal marquee
+- [x] Double-click + middle-drag parity (shared `pipeline_drag_preview.py`)
 
 ### Phase 3
-- [ ] `PipelineListHeader` + resize persist
-- [ ] Tooltip; xóa TableView code
-- [ ] QA checklist
+- [x] `PipelineListHeader` + resize persist
+- [x] Tooltip (list event filter + `PipelineListHitTest`)
+- [x] Xóa TableView code (`_ClearOnEmptyClickTableView`, `_ListRowDelegate`, `_list_col_*`)
+- [ ] QA checklist (manual)
 
 ### Phase 4 (tùy chọn)
-- [ ] Sort, sticky columns, row density
+- [ ] Sort cột
+- [x] Sticky columns (Index + Thumb + Name)
+- [ ] Row density
 
 ---
 

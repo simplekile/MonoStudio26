@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from monostudio.core.item_comments import count_open_notes, read_item_comments_for_department
 from monostudio.core.item_status import _status_json_path, read_item_status_overrides
+from monostudio.core.models import DepartmentReviewIndex
 from monostudio.core.production_status import ProductionStatusRegistry, aggregate_status_id_for_item
 from monostudio.core.review_media import _collect_sequence_dirs_in_root, _collect_videos_in_root, _mtime_ns
 from monostudio.core.sequence_preview import _sequence_roots_by_priority, work_file_folder_name_candidates
@@ -109,6 +110,125 @@ def _department_status_id(
     )
 
 
+def _status_id_for_department(
+    item_root: Path,
+    department_id: str | None,
+    *,
+    registry: ProductionStatusRegistry,
+    ref: object | None = None,
+    hidden_departments: set[str] | None = None,
+) -> str:
+    dept = (department_id or "").strip() or None
+    if ref is not None:
+        return _department_status_id(
+            ref,
+            dept,
+            registry=registry,
+            hidden_departments=hidden_departments,
+        )
+    if dept:
+        overrides = read_item_status_overrides(item_root, [dept])
+        return overrides.get(dept, "")
+    return ""
+
+
+def scan_department_review_light(
+    *,
+    item_root: Path,
+    department_id: str | None,
+    registry: ProductionStatusRegistry,
+    ref: object | None = None,
+    hidden_departments: set[str] | None = None,
+) -> DepartmentReviewIndex:
+    """Notes + review status only (fast; run during project scan)."""
+    dept = (department_id or "").strip() or None
+    entries = read_item_comments_for_department(item_root, dept)
+    has_notes = bool(entries)
+    note_count = count_open_notes(item_root, dept)
+    note_ts = _latest_note_ts(item_root, dept)
+
+    has_review_status = False
+    status_dt: datetime | None = None
+    sid = _status_id_for_department(
+        item_root,
+        dept,
+        registry=registry,
+        ref=ref,
+        hidden_departments=hidden_departments,
+    )
+    if sid and registry.category_for(sid) == "review":
+        has_review_status = True
+        status_dt = _status_json_mtime(item_root)
+
+    has_review = has_notes or has_review_status
+    candidates: list[datetime] = []
+    if note_ts is not None:
+        candidates.append(note_ts)
+    if has_review_status and status_dt is not None:
+        candidates.append(status_dt)
+    review_date = max(candidates) if candidates else None
+
+    return DepartmentReviewIndex(
+        has_render=False,
+        render_date=None,
+        has_review=has_review,
+        review_date=review_date,
+        has_notes=has_notes,
+        open_note_count=note_count,
+        has_media=False,
+        has_review_status=has_review_status,
+        render_scanned=False,
+    )
+
+
+def merge_department_review_render(
+    index: DepartmentReviewIndex,
+    work_path: Path | None,
+    work_file_path: Path | None,
+) -> DepartmentReviewIndex:
+    """Heavy render/sequence scan; merge into an existing light index."""
+    if index.render_scanned:
+        return index
+    media_ns = _latest_media_mtime_ns(work_path, work_file_path)
+    render_date = _ns_to_local_dt(media_ns)
+    has_render = media_ns > 0
+    has_media = has_render
+
+    candidates: list[datetime] = []
+    if index.review_date is not None:
+        candidates.append(index.review_date)
+    if render_date is not None:
+        candidates.append(render_date)
+    review_date = max(candidates) if candidates else None
+    has_review = index.has_notes or index.has_review_status or has_media
+
+    return replace(
+        index,
+        has_render=has_render,
+        render_date=render_date,
+        has_media=has_media,
+        has_review=has_review,
+        review_date=review_date,
+        render_scanned=True,
+    )
+
+
+def review_summaries_from_index(
+    index: DepartmentReviewIndex,
+) -> tuple[RenderCardSummary, ReviewCardSummary]:
+    return (
+        RenderCardSummary(has_render=index.has_render, render_date=index.render_date),
+        ReviewCardSummary(
+            has_review=index.has_review,
+            review_date=index.review_date,
+            has_notes=index.has_notes,
+            note_count=index.open_note_count,
+            has_media=index.has_media,
+            has_review_status=index.has_review_status,
+        ),
+    )
+
+
 def resolve_render_summary(
     work_path: Path | None,
     work_file_path: Path | None,
@@ -128,49 +248,12 @@ def resolve_review_summary(
     ref: object | None = None,
     hidden_departments: set[str] | None = None,
 ) -> ReviewCardSummary:
-    dept = (department_id or "").strip() or None
-    entries = read_item_comments_for_department(item_root, dept)
-    has_notes = bool(entries)
-    note_count = count_open_notes(item_root, dept)
-    note_ts = _latest_note_ts(item_root, dept)
-
-    media_ns = _latest_media_mtime_ns(work_path, work_file_path)
-    has_media = media_ns > 0
-    media_dt = _ns_to_local_dt(media_ns)
-
-    has_review_status = False
-    status_dt: datetime | None = None
-    sid = ""
-    if ref is not None:
-        sid = _department_status_id(
-            ref,
-            dept,
-            registry=registry,
-            hidden_departments=hidden_departments,
-        )
-    elif dept:
-        overrides = read_item_status_overrides(item_root, [dept])
-        sid = overrides.get(dept, "")
-    if sid and registry.category_for(sid) == "review":
-        has_review_status = True
-        status_dt = _status_json_mtime(item_root)
-
-    has_review = has_notes or has_media or has_review_status
-
-    candidates: list[datetime] = []
-    if note_ts is not None:
-        candidates.append(note_ts)
-    if media_dt is not None:
-        candidates.append(media_dt)
-    if has_review_status and status_dt is not None:
-        candidates.append(status_dt)
-
-    review_date = max(candidates) if candidates else None
-    return ReviewCardSummary(
-        has_review=has_review,
-        review_date=review_date,
-        has_notes=has_notes,
-        note_count=note_count,
-        has_media=has_media,
-        has_review_status=has_review_status,
+    light = scan_department_review_light(
+        item_root=item_root,
+        department_id=department_id,
+        registry=registry,
+        ref=ref,
+        hidden_departments=hidden_departments,
     )
+    merged = merge_department_review_render(light, work_path, work_file_path)
+    return review_summaries_from_index(merged)[1]

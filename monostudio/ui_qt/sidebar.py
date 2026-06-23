@@ -1313,7 +1313,7 @@ class SidebarWidget(QWidget):
         """
         if self._mode == "inbox":
             page_kind = (self._filter_page_kind or "").strip().lower()
-            if page_kind == "delivery":
+            if page_kind in ("delivery", "inbox"):
                 self._all_types = ["client", "freelancer"]
                 self._type_label_by_id = {"client": "Client", "freelancer": "Freelancer"}
                 self._type_icon_by_id = {"client": "package", "freelancer": "user"}
@@ -1324,7 +1324,7 @@ class SidebarWidget(QWidget):
                 self._visible_types = None
                 self._type_section.setVisible(True)
             else:
-                # Inbox + Review: flat date folders — no client/freelancer filter.
+                # Internal check: flat date folders — no client/freelancer filter.
                 self._all_types = []
                 self._type_label_by_id = {}
                 self._type_icon_by_id = {}

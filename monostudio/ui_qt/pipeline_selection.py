@@ -5,11 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def _path_key(path: Path) -> str:
+def path_key(path: Path) -> str:
     try:
         return str(path.resolve())
     except OSError:
         return str(path)
+
+
+_path_key = path_key
 
 
 class PipelineSelectionStore:

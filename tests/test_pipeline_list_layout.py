@@ -34,6 +34,35 @@ class TestPipelineListLayout(unittest.TestCase):
         layout.set_status_width(160)
         self.assertGreaterEqual(layout.widths[ListSlot.STATUS], 160)
 
+    def test_slot_at_content_x(self) -> None:
+        layout = PipelineListLayout.for_context("asset")
+        self.assertEqual(layout.slot_at_content_x(0), ListSlot.INDEX)
+        past_index = layout.widths[ListSlot.INDEX]
+        self.assertEqual(layout.slot_at_content_x(past_index), ListSlot.THUMB)
+
+    def test_sticky_width(self) -> None:
+        layout = PipelineListLayout.for_context("asset")
+        expected = layout.widths[ListSlot.INDEX] + layout.widths[ListSlot.THUMB] + layout.widths[ListSlot.NAME]
+        self.assertEqual(layout.sticky_width(), expected)
+        self.assertIn(ListSlot.NOTES, layout.scrollable_slots())
+
+    def test_content_x_sticky_zone(self) -> None:
+        layout = PipelineListLayout.for_context("asset")
+        sticky_w = layout.sticky_width()
+        self.assertEqual(layout.content_x_for_viewport_pos(20, -100, scroll_x=100), 20)
+        self.assertEqual(layout.content_x_for_viewport_pos(sticky_w + 50, -100, scroll_x=100), 150)
+
+    def test_list_dcc_badge_rects(self) -> None:
+        from PySide6.QtCore import QRect
+
+        from monostudio.ui_qt.pipeline_row_paint import list_dcc_badge_rects
+
+        cell = QRect(0, 0, 200, 56)
+        rects = list_dcc_badge_rects(cell, [("maya", "exists"), ("blender", "exists")])
+        self.assertEqual(len(rects), 2)
+        self.assertEqual(rects[0][1], "maya")
+        self.assertTrue(rects[0][0].left() >= cell.left())
+
 
 class TestPipelineSelectionStore(unittest.TestCase):
     def test_single_select(self) -> None:

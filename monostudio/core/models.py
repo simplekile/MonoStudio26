@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 
@@ -12,6 +13,21 @@ class DccWorkState:
     """
     work_file_path: Path | None  # Path to work file if it exists on disk; None otherwise
     work_folder_exists: bool  # True if the DCC work folder exists (for "empty" vs "new")
+
+
+@dataclass(frozen=True)
+class DepartmentReviewIndex:
+    """Scan-time review summary for shot cards (notes/status sync; render async)."""
+
+    has_render: bool = False
+    render_date: datetime | None = None
+    has_review: bool = False
+    review_date: datetime | None = None
+    has_notes: bool = False
+    open_note_count: int = 0
+    has_media: bool = False
+    has_review_status: bool = False
+    render_scanned: bool = False
 
 
 @dataclass(frozen=True)
@@ -30,6 +46,7 @@ class Department:
     publish_exists: bool
     latest_publish_version: str | None
     publish_version_count: int
+    review_index: DepartmentReviewIndex = field(default_factory=DepartmentReviewIndex)
 
 
 @dataclass(frozen=True)

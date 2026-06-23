@@ -27,6 +27,7 @@ from monostudio.core.dcc_registry import get_default_dcc_registry
 from monostudio.core.fs_move import move_path
 from monostudio.core.fs_reader import (
     build_project_index,
+    enrich_shots_review_render,
     read_use_dcc_folders,
     resolve_work_path,
     run_incremental_scan,
@@ -74,6 +75,7 @@ from monostudio.core.internal_check_reader import (
     ensure_internal_check_root,
     get_internal_check_root,
     move_into_internal_check_folder,
+    send_internal_check_to_delivery,
 )
 from monostudio.core.delivery_reader import (
     add_to_delivery,
@@ -634,6 +636,7 @@ class MainWindow(FramelessMainWindow):
         self._main_view.primary_action_requested.connect(self._on_primary_action_requested)
         self._main_view.search_query_changed.connect(self._on_search_query_changed)
         self._main_view.show_publish_changed.connect(self._on_show_publish_changed)
+        self._main_view.browser_mode_changed.connect(self._on_browser_mode_changed)
         self._main_view.open_publish_folder_requested.connect(self._on_open_publish_folder_requested)
         self._main_view.dcc_open_requested.connect(self._on_dcc_open_requested)
         self._main_view.dcc_folder_requested.connect(self._on_dcc_folder_requested)
@@ -2039,6 +2042,7 @@ class MainWindow(FramelessMainWindow):
 
     _WORKSPACE_STATS_WORKER = "workspace_quick_stats"
     _PRODUCTION_STATUS_BATCH_WORKER = "production_status_batch"
+    _SHOT_REVIEW_RENDER_ENRICH = "shot_review_render_enrich"
     _ASSET_RENAME_WORKER = "asset_rename"
     _SKIP_STATUS_LOADING_MESSAGE = "Updating skip status…"
     _RENAME_LOADING_MESSAGE = "Renaming asset…"
@@ -4248,6 +4252,8 @@ class MainWindow(FramelessMainWindow):
                 # Scan in background to avoid blocking UI when switching between Assets/Shots.
                 self._submit_rescan_task(soft=True)
                 self._reload_main_view()
+                if context_name == "Shots":
+                    self._schedule_shot_review_render_enrich()
             elif context_name == "Inbox":
                 self._sync_filter_state_from_sidebar()
                 self._inbox_switch_cooldown = True
@@ -4315,6 +4321,12 @@ class MainWindow(FramelessMainWindow):
                     self._internal_check_page_widget.drop_requested.connect(self._on_internal_check_drop_requested)
                     self._internal_check_page_widget.import_requested.connect(self._on_internal_check_import_requested)
                     self._internal_check_page_widget.date_folder_entered.connect(self._on_internal_check_date_folder_entered)
+                    self._internal_check_page_widget.video_preview_requested.connect(
+                        self._open_video_preview_from_internal_check
+                    )
+                    self._internal_check_page_widget.send_to_delivery_requested.connect(
+                        self._on_internal_check_send_to_delivery_requested
+                    )
                     self._connect_inbox_outbox_title_row(self._internal_check_page_widget._title_row)
                     self._content_stack.addWidget(self._internal_check_page_widget)
                 self._internal_check_page_widget.set_project_root(self._project_root)
@@ -4335,6 +4347,9 @@ class MainWindow(FramelessMainWindow):
                     self._outbox_page_widget.drop_requested.connect(self._on_outbox_drop_requested)
                     self._outbox_page_widget.import_requested.connect(self._on_outbox_import_requested)
                     self._outbox_page_widget.date_folder_entered.connect(self._on_outbox_date_folder_entered)
+                    self._outbox_page_widget.video_preview_requested.connect(
+                        self._open_video_preview_from_delivery
+                    )
                     self._connect_inbox_outbox_title_row(self._outbox_page_widget._title_row)
                     self._content_stack.addWidget(self._outbox_page_widget)
                 self._outbox_page_widget.set_project_root(self._project_root)
@@ -4794,10 +4809,17 @@ class MainWindow(FramelessMainWindow):
             # Explorer tree/grid drives inspector preview on these pages.
             return
         if not has_selection:
+            if getattr(self._inspector, "_current_item", None) is None:
+                return
             self._inspector.set_item(None)
             return
 
         selected = self._main_view.selected_view_item()
+        cur = getattr(self._inspector, "_current_item", None)
+        sel_path = str(selected.path) if selected is not None and getattr(selected, "path", None) else None
+        cur_path = str(cur.path) if cur is not None and getattr(cur, "path", None) else None
+        if sel_path is not None and sel_path == cur_path:
+            return
         self._inspector.set_item(selected, active_department_hint=self.current_department)
 
     def _asset_passes_filter(self, asset: Asset | None) -> bool:
@@ -5012,6 +5034,11 @@ class MainWindow(FramelessMainWindow):
         if category == self._WORKSPACE_STATS_WORKER:
             self._apply_workspace_stats_worker_result(result)
             return
+        if category == self._SHOT_REVIEW_RENDER_ENRICH and isinstance(result, list):
+            shots = [s for s in result if isinstance(s, Shot)]
+            if shots:
+                self._apply_shot_review_render_enrich(shots)
+            return
         if category == "inspector_preview_thumb" and isinstance(result, tuple) and len(result) >= 3:
             path_str, image_or_none, use_fit = result[0], result[1], result[2]
             self._inspector.apply_preview_thumb(path_str, image_or_none, use_fit)
@@ -5043,6 +5070,7 @@ class MainWindow(FramelessMainWindow):
                 except Exception:
                     pass
                 self._reload_main_view()
+            self._schedule_shot_review_render_enrich()
             self._sync_primary_action()
             self._sync_top_bar()
         elif category == "incremental_scan" and isinstance(result, tuple) and len(result) >= 4:
@@ -5156,6 +5184,8 @@ class MainWindow(FramelessMainWindow):
                     pass
 
             QTimer.singleShot(0, _repaint_after_scan)
+            if new_shots:
+                self._schedule_shot_review_render_enrich()
             self._sync_primary_action()
             self._sync_top_bar()
 
@@ -5227,6 +5257,7 @@ class MainWindow(FramelessMainWindow):
             QTimer.singleShot(2500, self._maybe_discord_schedule_due)
         if self._tray_manager is not None:
             self._tray_manager.refresh_tooltip()
+        self._schedule_shot_review_render_enrich()
 
     def _submit_project_load_task(self) -> None:
         root = self._project_root
@@ -5423,6 +5454,39 @@ class MainWindow(FramelessMainWindow):
         self._app_state.commit_immediate()
         # So watcher includes new/updated asset and shot paths (incl. nested dept work dirs).
         self._update_fs_watcher_paths()
+        self._schedule_shot_review_render_enrich()
+
+    def _schedule_shot_review_render_enrich(self) -> None:
+        """Background render/sequence scan for shot review cards (hybrid — heavy pass)."""
+        if self._project_index is None or not self._project_index.shots:
+            return
+        shots = list(self._project_index.shots)
+
+        def run() -> list[Shot]:
+            return enrich_shots_review_render(shots)
+
+        task = WorkerTask(self._SHOT_REVIEW_RENDER_ENRICH, run, manager=self._worker_manager)
+        self._worker_manager.submit_task(
+            task,
+            category=self._SHOT_REVIEW_RENDER_ENRICH,
+            replace_existing=True,
+        )
+
+    def _apply_shot_review_render_enrich(self, enriched: list[Shot]) -> None:
+        if self._project_index is None or not enriched:
+            return
+        shots = tuple(enriched)
+        self._project_index = ProjectIndex(
+            root=self._project_index.root,
+            assets=self._project_index.assets,
+            shots=shots,
+        )
+        self._app_state.update_shots(list(shots))
+        self._app_state.commit_immediate()
+        try:
+            self._main_view.repaint_tile_and_list_views()
+        except Exception:
+            pass
 
     def _submit_rescan_task(self, *, soft: bool = False) -> None:
         """Submit a filesystem scan to WorkerManager; result is forwarded to AppState in _on_worker_task_finished.
@@ -6294,6 +6358,30 @@ class MainWindow(FramelessMainWindow):
             VideoPreviewOpenRequest(path=p, context=PreviewContext.inbox, sibling_paths=list_video_siblings(p))
         )
 
+    def _open_video_preview_from_internal_check(self, path) -> None:
+        p = Path(path) if path is not None else None
+        if p is None or not is_video_path(p):
+            return
+        self._open_video_preview_with_request(
+            VideoPreviewOpenRequest(
+                path=p,
+                context=PreviewContext.internal_check,
+                sibling_paths=list_video_siblings(p),
+            )
+        )
+
+    def _open_video_preview_from_delivery(self, path) -> None:
+        p = Path(path) if path is not None else None
+        if p is None or not is_video_path(p):
+            return
+        self._open_video_preview_with_request(
+            VideoPreviewOpenRequest(
+                path=p,
+                context=PreviewContext.delivery,
+                sibling_paths=list_video_siblings(p),
+            )
+        )
+
     def _open_video_preview_from_project_guide(self, path) -> None:
         p = Path(path) if path is not None else None
         if p is None or not is_video_path(p):
@@ -6820,7 +6908,7 @@ class MainWindow(FramelessMainWindow):
         self._open_path_in_explorer(path)
 
     def _on_outbox_tree_distribute_paths_changed(self, paths: list) -> None:
-        """Outbox: inspector preview only (no distribute block)."""
+        """Delivery: inspector preview only (no distribute block)."""
         path_list = [Path(p) for p in paths if p] if paths else []
         self._inspector.set_inbox_distribute_paths([], None, None)
         self._inspector.set_inbox_tree_preview(path_list[0] if path_list else None)
@@ -6829,6 +6917,7 @@ class MainWindow(FramelessMainWindow):
         self._open_path_in_explorer(path)
 
     def _on_internal_check_tree_distribute_paths_changed(self, paths: list) -> None:
+        """Internal check: inspector preview only (no distribute block)."""
         path_list = [Path(p) for p in paths if p] if paths else []
         self._inspector.set_inbox_distribute_paths([], None, None)
         self._inspector.set_inbox_tree_preview(path_list[0] if path_list else None)
@@ -6900,6 +6989,62 @@ class MainWindow(FramelessMainWindow):
             notification_service.success(
                 f"Added {added} item{'s' if added != 1 else ''} to Internal check."
             )
+
+    def _on_internal_check_send_to_delivery_requested(self, paths: list) -> None:
+        if not paths or not self._project_root:
+            return
+        path_list = [Path(p) for p in paths if p and Path(p).exists()]
+        if not path_list:
+            return
+        initial_source = (self._filter_panel.filters().current_type() or "client").strip().lower()
+        if initial_source not in ("client", "freelancer"):
+            initial_source = "client"
+        initial_date_str, prefer_existing = self._inbox_outbox_dialog_date_defaults(
+            None, page_widget=self._outbox_page_widget
+        )
+        dialog = InboxDropDialog(
+            path_list,
+            self._project_root,
+            initial_source,
+            self,
+            target="delivery",
+            initial_date_str=initial_date_str,
+            prefer_existing_date=prefer_existing,
+            dialog_title="Send to Delivery",
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        source, date_str, description = dialog.result_values()
+        if not date_str:
+            return
+        sent = 0
+        dest_paths: list[Path] = []
+        for p in path_list:
+            try:
+                dest = send_internal_check_to_delivery(
+                    self._project_root, p, source, date_str, description
+                )
+                if dest is not None:
+                    sent += 1
+                    dest_paths.append(dest)
+            except Exception as e:
+                logging.warning("Send to delivery failed for %s: %s", p, e)
+        if sent > 0:
+            self._reload_main_view()
+            if self._internal_check_page_widget is not None:
+                self._internal_check_page_widget.refresh_tree()
+                self._internal_check_page_widget.refresh_history_dialog_if_open()
+            if self._outbox_page_widget is not None:
+                self._outbox_page_widget.refresh_tree()
+                self._outbox_page_widget.refresh_history_dialog_if_open()
+                pane = getattr(self._outbox_page_widget, "_tree_pane", None)
+                if pane is not None and dest_paths:
+                    pane.select_dropped_paths(dest_paths)
+            notification_service.success(
+                f"Sent {sent} item{'s' if sent != 1 else ''} to Delivery."
+            )
+        elif path_list:
+            notification_service.warning("Could not send selected items to Delivery.")
 
     def _on_outbox_import_requested(self, _date_path=None) -> None:
         if not self._project_root:
@@ -7869,6 +8014,10 @@ class MainWindow(FramelessMainWindow):
             item = self._main_view.selected_view_item()
             if item is not None:
                 self._inspector.set_item(item, active_department_hint=self.current_department)
+
+    def _on_browser_mode_changed(self, mode: str) -> None:
+        if mode == "review" and self._nav_rail.current_context() == "Shots":
+            self._schedule_shot_review_render_enrich()
 
     def _on_recent_task_clicked(self, task: object) -> None:
         from monostudio.ui_qt.recent_tasks_store import RecentTask
