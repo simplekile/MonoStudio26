@@ -1284,60 +1284,6 @@ def apply_dark_theme(app: QApplication) -> None:
             font-weight: 700;
             letter-spacing: -0.01em;
         }
-        QWidget#TopBarPanelGroup {
-            background-color: rgba(39, 39, 42, 0.85);
-            border-radius: 6px;
-        }
-        QWidget#TopBarPanelGroup[autoMode="true"] {
-            background-color: rgba(39, 39, 42, 0.45);
-            border-radius: 4px;
-        }
-        QToolButton#TopBarPanelAutoBtn {
-            border: none;
-            border-radius: 4px;
-            padding: 0 4px;
-            margin: 0;
-            background: transparent;
-            color: #a1a1aa;
-            font-family: "Inter", "Inter UI", "Segoe UI", "San Francisco", sans-serif;
-            font-size: 8px;
-            font-weight: 600;
-        }
-        QToolButton#TopBarPanelAutoBtn:hover {
-            background: rgba(255, 255, 255, 0.06);
-            color: #e4e4e7;
-        }
-        QToolButton#TopBarPanelAutoBtn[active="true"] {
-            background: rgba(37, 99, 235, 0.18);
-            color: #fafafa;
-        }
-        QWidget#TopBarPanelGroup[autoMode="true"] QToolButton#TopBarPanelAutoBtn {
-            color: rgba(161, 161, 170, 0.65);
-            font-size: 7px;
-            padding: 0 3px;
-        }
-        QWidget#TopBarPanelGroup[autoMode="true"] QToolButton#TopBarPanelGlyphBtn {
-            background: transparent;
-        }
-        QWidget#TopBarPanelGroup[autoMode="true"] QToolButton#TopBarPanelAutoBtn[active="true"] {
-            background: rgba(37, 99, 235, 0.12);
-            color: rgba(250, 250, 250, 0.85);
-        }
-        QToolButton#TopBarPanelGlyphBtn {
-            border: none;
-            border-radius: 4px;
-            margin: 0;
-            background: transparent;
-        }
-        QToolButton#TopBarPanelGlyphBtn:hover {
-            background: rgba(255, 255, 255, 0.08);
-        }
-        QToolButton#TopBarPanelGlyphBtn:checked {
-            background: rgba(37, 99, 235, 0.12);
-        }
-        QToolButton#TopBarPanelGlyphBtn:disabled {
-            background: transparent;
-        }
         QToolButton#ProjectSwitch {
             padding: 6px 12px;
             border: none;
@@ -1424,10 +1370,9 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowMaxBtn,
         QToolButton#WindowCloseBtn,
         QToolButton#TopBarNotiBtn,
+        QToolButton#TopBarReviewBtn,
         QToolButton#TopBarUpdateBtn,
         QToolButton#TopBarWatcherBtn,
-        QToolButton#TopBarAlwaysOnTopBtn,
-        QToolButton#TopBarSettingsBtn,
         QToolButton#TopBarUserBtn {
             border: none;
             border-radius: 0;
@@ -1439,10 +1384,9 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowMinBtn:hover,
         QToolButton#WindowMaxBtn:hover,
         QToolButton#TopBarNotiBtn:hover,
+        QToolButton#TopBarReviewBtn:hover,
         QToolButton#TopBarUpdateBtn:hover,
-        QToolButton#TopBarWatcherBtn:hover,
-        QToolButton#TopBarAlwaysOnTopBtn:hover,
-        QToolButton#TopBarSettingsBtn:hover {
+        QToolButton#TopBarWatcherBtn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: #e4e4e7;
             border-radius: 8px;
@@ -3516,6 +3460,68 @@ def apply_dark_theme(app: QApplication) -> None:
         QLabel#VideoPreviewFileCounter {
             color: #71717a;
             background: transparent;
+        }
+        QToolButton#VideoPreviewSwitchBtn {
+            padding: 0px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.04);
+            color: #a1a1aa;
+        }
+        QToolButton#VideoPreviewSwitchBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: #fafafa;
+            border-color: rgba(255, 255, 255, 0.12);
+        }
+        QToolButton#VideoPreviewSwitchBtn:disabled {
+            background: transparent;
+            border-color: rgba(255, 255, 255, 0.04);
+            color: #52525b;
+        }
+        QLabel#VideoPreviewTitleLabel {
+            color: #fafafa;
+            background: transparent;
+        }
+        QFrame#VideoReviewSwitchPopup {
+            background-color: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+        }
+        QScrollArea#VideoReviewSwitchScroll {
+            background: transparent;
+            border: none;
+        }
+        QWidget#VideoReviewSwitchListHost {
+            background: transparent;
+        }
+        QFrame#VideoReviewSwitchRow {
+            background: transparent;
+            border: none;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        QFrame#VideoReviewSwitchRow:hover {
+            background-color: rgba(255, 255, 255, 0.04);
+        }
+        QFrame#VideoReviewSwitchRow[active="true"] {
+            background-color: rgba(37, 99, 235, 0.12);
+        }
+        QLabel#VideoReviewSwitchThumb {
+            background-color: #121214;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 4px;
+        }
+        QLabel#VideoReviewSwitchTitle {
+            color: #fafafa;
+            background: transparent;
+        }
+        QLabel#VideoReviewSwitchSubtitle {
+            color: #71717a;
+            background: transparent;
+        }
+        QLabel#VideoReviewSwitchCheck {
+            color: #60a5fa;
+            background: transparent;
+            font-size: 10px;
         }
         QPushButton#VideoPreviewTitleButton {
             color: #fafafa;

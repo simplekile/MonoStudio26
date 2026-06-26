@@ -101,6 +101,7 @@ from monostudio.ui_qt.reference_page_widget import ReferencePageWidget
 from monostudio.ui_qt.video_preview_dialog import VideoPreviewDialog
 from monostudio.ui_qt.video_preview_context import (
     PreviewContext,
+    ReviewMediaKind,
     ReviewOpenRequest,
     VideoPreviewOpenRequest,
 )
@@ -566,10 +567,11 @@ class MainWindow(FramelessMainWindow):
         self._nav_rail.project_switch_requested.connect(self._switch_project)
         self._nav_rail.browse_projects_requested.connect(self._open_project_picker)
         self._nav_rail.new_project_requested.connect(self._new_project)
-        self._top_bar.settings_clicked.connect(self._open_settings)
+        self._nav_rail.settings_clicked.connect(self._open_settings)
         self._top_bar.layout_auto_clicked.connect(self._on_top_bar_layout_auto_clicked)
         self._top_bar.layout_sidebar_clicked.connect(self._on_top_bar_layout_sidebar_clicked)
         self._top_bar.layout_inspector_clicked.connect(self._on_top_bar_layout_inspector_clicked)
+        self._top_bar.review_player_clicked.connect(self._on_top_bar_review_player_clicked)
         self._nav_rail.recent_task_clicked.connect(self._on_recent_task_clicked)
         self._nav_rail.recent_task_double_clicked.connect(self._on_recent_task_double_clicked)
         self._nav_rail.clear_recent_tasks_requested.connect(self._on_clear_recent_tasks)
@@ -1246,6 +1248,7 @@ class MainWindow(FramelessMainWindow):
         if sys.platform == "win32" and self._window_always_on_top:
             self._apply_win32_always_on_top(True)
         self._apply_panel_layout(full_manual=not self._panel_layout_auto)
+        self._sync_review_player_top_bar_hint()
         QTimer.singleShot(4000, self._maybe_discord_schedule_due)
 
     def resizeEvent(self, event) -> None:
@@ -1260,6 +1263,8 @@ class MainWindow(FramelessMainWindow):
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
             self._top_bar.set_maximized(self.isMaximized())
+        elif event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._stack_review_player_behind_main()
 
     def _external_drop_watch_widget(self, obj: object) -> bool:
         if not isinstance(obj, QWidget):
@@ -6601,6 +6606,7 @@ class MainWindow(FramelessMainWindow):
             request = request.to_review_request()
         if not isinstance(request, ReviewOpenRequest):
             return
+        self._record_last_video_preview_open(request)
         href = (pending_time_anchor or "").strip() or None
         if href:
             existing = self._alive_review_player()
@@ -6631,6 +6637,7 @@ class MainWindow(FramelessMainWindow):
             parent=None,
             geometry_anchor=self,
         )
+        dlg.set_main_window_anchor(self)
         if href:
             dlg.set_pending_time_anchor(href)
         self._review_player_dialog = dlg
@@ -6651,6 +6658,14 @@ class MainWindow(FramelessMainWindow):
         player.activateWindow()
         QTimer.singleShot(0, lambda p=player: self._raise_review_player_once(p))
         QTimer.singleShot(80, lambda p=player: self._raise_review_player_once(p))
+
+    def _stack_review_player_behind_main(self) -> None:
+        player = self._alive_review_player()
+        if player is None:
+            return
+        stack = getattr(player, "stack_under_main", None)
+        if callable(stack):
+            stack(self)
 
     def _raise_review_player_once(self, player: VideoPreviewDialog) -> None:
         try:
@@ -6701,6 +6716,97 @@ class MainWindow(FramelessMainWindow):
 
     def _open_video_preview_with_request(self, request: VideoPreviewOpenRequest) -> None:
         self._open_review_player(request.to_review_request())
+
+    def _record_last_video_preview_open(self, request: ReviewOpenRequest) -> None:
+        if request.media_kind != ReviewMediaKind.video or request.path is None:
+            return
+        from monostudio.ui_qt.video_preview_settings import write_last_video_preview_open
+
+        try:
+            path_str = str(request.path.resolve())
+        except OSError:
+            path_str = str(request.path)
+        entity_str = ""
+        if request.entity_path is not None:
+            try:
+                entity_str = str(request.entity_path.resolve())
+            except OSError:
+                entity_str = str(request.entity_path)
+        write_last_video_preview_open(
+            self._settings,
+            path=path_str,
+            context=request.context.value,
+            entity_path=entity_str,
+            department_id=(request.department_id or "").strip(),
+        )
+        self._sync_review_player_top_bar_hint()
+
+    def _sync_review_player_top_bar_hint(self) -> None:
+        from monostudio.ui_qt.video_preview_settings import read_last_video_preview_open
+
+        saved = read_last_video_preview_open(self._settings)
+        if not saved:
+            self._top_bar.set_review_player_hint(None)
+            return
+        path = Path(saved["path"])
+        if path.is_file() and is_video_path(path):
+            self._top_bar.set_review_player_hint(path)
+        else:
+            self._top_bar.set_review_player_hint(None)
+
+    def _review_player_matches_media_path(self, dlg: VideoPreviewDialog, path: Path) -> bool:
+        req = getattr(dlg, "_review_request", None)
+        if req is None:
+            return False
+        try:
+            return Path(req.media_key).resolve() == Path(path).resolve()
+        except OSError:
+            return False
+
+    def _on_top_bar_review_player_clicked(self) -> None:
+        from monostudio.ui_qt.video_preview_settings import read_last_video_preview_open
+
+        saved = read_last_video_preview_open(self._settings)
+        if not saved:
+            notification_service.warning(
+                "No recent video — open a clip from the browser or Inspector first."
+            )
+            return
+        path = Path(saved["path"])
+        if not path.is_file() or not is_video_path(path):
+            notification_service.warning(
+                f"Recent video not found: {path.name or path}"
+            )
+            self._sync_review_player_top_bar_hint()
+            return
+        existing = self._alive_review_player()
+        if (
+            existing is not None
+            and existing.isVisible()
+            and self._review_player_matches_media_path(existing, path)
+        ):
+            self._bring_review_player_to_front(existing)
+            return
+        ctx_raw = saved.get("context") or PreviewContext.entity.value
+        try:
+            ctx = PreviewContext(ctx_raw)
+        except ValueError:
+            ctx = PreviewContext.entity
+        entity_path: Path | None = None
+        entity_raw = (saved.get("entity_path") or "").strip()
+        if entity_raw:
+            entity_path = Path(entity_raw)
+        dept_id = (saved.get("department_id") or "").strip() or None
+        self._open_review_player(
+            ReviewOpenRequest(
+                media_kind=ReviewMediaKind.video,
+                path=path,
+                context=ctx,
+                sibling_paths=list_video_siblings(path),
+                entity_path=entity_path,
+                department_id=dept_id,
+            )
+        )
 
     def _on_video_preview_open_all_notes(self) -> None:
         item = getattr(self._inspector, "_current_item", None)

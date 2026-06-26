@@ -63,6 +63,7 @@ class SidebarNavRail(QWidget):
     recent_task_clicked = Signal(object)
     recent_task_double_clicked = Signal(object)
     clear_recent_tasks_requested = Signal()
+    settings_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -242,6 +243,15 @@ class SidebarNavRail(QWidget):
             lambda: self._on_page_clicked(SidebarContext.TRASH.value)
         )
         bottom_group.add_item(self._trash_btn)
+
+        _settings_btn = self._make_expand_item(
+            "settings",
+            "Settings",
+            nav_group="utility",
+        )
+        _settings_btn.setToolTip("Settings")
+        _settings_btn.clicked.connect(self.settings_clicked.emit)
+        bottom_group.add_item(_settings_btn)
 
         bottom_wrap = QWidget(self)
         bottom_wrap.setObjectName("SidebarNavRailBottom")

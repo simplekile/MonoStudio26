@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QEvent, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCursor, QFont, QGuiApplication, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QColor, QShortcut, QWheelEvent
+from PySide6.QtGui import QCursor, QFont, QGuiApplication, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QColor, QShortcut, QWheelEvent, QAction
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -134,6 +134,7 @@ from monostudio.ui_qt.dialog_geometry import (
     clamp_dialog_to_bounds,
     main_window_bounds,
 )
+from monostudio.ui_qt.frameless_resize import handle_native_event, resize_edges_at
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.popup_position import position_popup_above_rect, position_popup_near_anchor, position_popup_near_global_point
 from monostudio.ui_qt.review_tools_panel import (
@@ -163,6 +164,7 @@ from monostudio.ui_qt.video_preview_context import (
     VideoPreviewOpenRequest,
 )
 from monostudio.ui_qt.video_preview_scrubber import VideoPreviewScrubber
+from monostudio.ui_qt.video_review_switch_popup import VideoReviewSwitchItem, VideoReviewSwitchPopup
 from monostudio.ui_qt.video_preview_settings import (
     PROXY_SCALE_STEPS,
     read_review_note_rail_open,
@@ -171,6 +173,7 @@ from monostudio.ui_qt.video_preview_settings import (
     read_review_tools_panel_width,
     read_review_workspace,
     read_video_preview_loop,
+    read_video_preview_always_on_top,
     read_video_preview_playback_speed,
     read_video_preview_precise_scrub_drag,
     read_video_preview_time_display,
@@ -181,6 +184,7 @@ from monostudio.ui_qt.video_preview_settings import (
     write_review_tools_panel_width,
     write_review_workspace,
     write_video_preview_loop,
+    write_video_preview_always_on_top,
     write_video_preview_playback_speed,
     write_video_preview_precise_scrub_drag,
     write_video_preview_time_display,
@@ -220,6 +224,7 @@ class _RangeEditSnapshot:
     active_range_id: str | None
     range_edit_unlocked: bool
 _PREVIEW_TOPBAR_H = 40
+_PREVIEW_SWITCH_BTN = 28
 _PREVIEW_CLOSE_BTN = 28
 _PREVIEW_CLOSE_INSET = 8
 _FULLSCREEN_EDGE_PX = 48
@@ -250,6 +255,111 @@ def _hide_native_qt_window(widget: QWidget | None) -> None:
             ctypes.windll.user32.ShowWindow(wid, 0)
     except Exception:
         pass
+
+
+class _VideoPreviewTopBar(QWidget):
+    """Top chrome: compact source switcher, read-only title, drag-to-move, context menu."""
+
+    always_on_top_toggled = Signal(bool)
+    switch_clicked = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("VideoPreviewTopBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(_PREVIEW_TOPBAR_H)
+        self._drag_start: QPoint | None = None
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(_PREVIEW_CHROME_PAD_H, 0, _PREVIEW_CHROME_PAD_H, 0)
+        lay.setSpacing(8)
+
+        self.switch_btn = QToolButton(self)
+        self.switch_btn.setObjectName("VideoPreviewSwitchBtn")
+        self.switch_btn.setAutoRaise(False)
+        self.switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.switch_btn.setFixedSize(_PREVIEW_SWITCH_BTN, _PREVIEW_SWITCH_BTN)
+        self.switch_btn.setIcon(lucide_icon("clapperboard", size=16, color_hex="#a1a1aa"))
+        self.switch_btn.setIconSize(QSize(16, 16))
+        self.switch_btn.setToolTip("Switch video or review source")
+        self.switch_btn.clicked.connect(self.switch_clicked.emit)
+        lay.addWidget(self.switch_btn, 0)
+
+        self.title_label = QLabel("", self)
+        self.title_label.setObjectName("VideoPreviewTitleLabel")
+        self.title_label.setFont(monos_font("Inter", 13, QFont.Weight.DemiBold))
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self.title_label, 1)
+
+        self.file_counter = QLabel("", self)
+        self.file_counter.setObjectName("VideoPreviewFileCounter")
+        self.file_counter.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
+        self.file_counter.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+        self.file_counter.setFixedWidth(52)
+        lay.addWidget(self.file_counter, 0)
+
+        self.close_btn = QToolButton(self)
+        self.close_btn.setObjectName("VideoPreviewDialogCloseBtn")
+        self.close_btn.setAutoRaise(False)
+        self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_btn.setFixedSize(_PREVIEW_CLOSE_BTN, _PREVIEW_CLOSE_BTN)
+        self.close_btn.setIcon(lucide_icon("x", size=16, color_hex="#fafafa"))
+        self.close_btn.setToolTip("Close")
+        lay.addWidget(self.close_btn, 0)
+
+        self._ctx_act_always_on_top = QAction("Always on top", self)
+        self._ctx_act_always_on_top.setCheckable(True)
+        self._ctx_act_always_on_top.toggled.connect(self._on_ctx_always_on_top_toggled)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+    def set_always_on_top(self, on: bool) -> None:
+        self._ctx_act_always_on_top.blockSignals(True)
+        self._ctx_act_always_on_top.setChecked(on)
+        self._ctx_act_always_on_top.blockSignals(False)
+
+    def _on_ctx_always_on_top_toggled(self, checked: bool) -> None:
+        self.always_on_top_toggled.emit(checked)
+
+    def _show_context_menu(self, pos: QPoint) -> None:
+        if self._is_drag_excluded(pos):
+            return
+        menu = MonosMenu(self)
+        menu.addAction(self._ctx_act_always_on_top)
+        menu.exec(self.mapToGlobal(pos))
+
+    def _is_drag_excluded(self, pos: QPoint) -> bool:
+        for btn in (self.switch_btn, self.close_btn):
+            if btn.isVisible() and btn.geometry().contains(pos):
+                return True
+        return False
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self._is_drag_excluded(event.pos())
+        ):
+            self._drag_start = event.globalPosition().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_start is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            win = self.window()
+            if win and win.windowHandle():
+                try:
+                    win.windowHandle().startSystemMove()
+                    self._drag_start = None
+                except AttributeError:
+                    delta = event.globalPosition().toPoint() - self._drag_start
+                    win.move(win.x() + delta.x(), win.y() + delta.y())
+                    self._drag_start = event.globalPosition().toPoint()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = None
+        super().mouseReleaseEvent(event)
 
 
 def _bottom_shell_path(
@@ -754,6 +864,8 @@ class VideoPreviewDialog(MonosDialog):
         self._status_log = ""
         self._footer_pointer_zone = ""
         self._app_event_filter_installed = False
+        self._window_always_on_top = read_video_preview_always_on_top(settings)
+        self._main_window_anchor: QWidget | None = None
         if self._media_kind == ReviewMediaKind.sequence:
             self._backend = create_sequence_placeholder_backend()
         else:
@@ -808,41 +920,17 @@ class VideoPreviewDialog(MonosDialog):
         self._root_layout.setSpacing(0)
         self._apply_dialog_content_inset()
 
-        self._top_bar = QWidget(self)
-        self._top_bar.setObjectName("VideoPreviewTopBar")
-        self._top_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self._top_bar.setFixedHeight(_PREVIEW_TOPBAR_H)
-        top_lay = QHBoxLayout(self._top_bar)
-        top_lay.setContentsMargins(
-            _PREVIEW_CHROME_PAD_H,
-            0,
-            _PREVIEW_CHROME_PAD_H + _PREVIEW_CLOSE_BTN + _PREVIEW_CLOSE_INSET,
-            0,
-        )
-        top_lay.setSpacing(8)
-        self._file_counter = QLabel("", self._top_bar)
-        self._file_counter.setObjectName("VideoPreviewFileCounter")
-        self._file_counter.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
-        self._file_counter.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
-        self._file_counter.setFixedWidth(52)
-        top_lay.addWidget(self._file_counter, 0)
-        self._title_btn = QPushButton("", self._top_bar)
-        self._title_btn.setObjectName("VideoPreviewTitleButton")
-        self._title_btn.setFont(monos_font("Inter", 13, QFont.Weight.DemiBold))
-        self._title_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._title_btn.setFlat(True)
-        self._title_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self._title_btn.clicked.connect(self._show_title_picker_menu)
-        top_lay.addWidget(self._title_btn, 1)
-
-        self._btn_close = QToolButton(self)
-        self._btn_close.setObjectName("VideoPreviewDialogCloseBtn")
-        self._btn_close.setAutoRaise(False)
-        self._btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_close.setFixedSize(_PREVIEW_CLOSE_BTN, _PREVIEW_CLOSE_BTN)
-        self._btn_close.setIcon(lucide_icon("x", size=16, color_hex="#fafafa"))
-        self._btn_close.setToolTip("Close")
+        self._top_bar = _VideoPreviewTopBar(self)
+        self._switch_btn = self._top_bar.switch_btn
+        self._title_label = self._top_bar.title_label
+        self._file_counter = self._top_bar.file_counter
+        self._top_bar.switch_clicked.connect(self._show_title_picker_menu)
+        self._top_bar.always_on_top_toggled.connect(self._on_always_on_top_toggled)
+        self._top_bar.set_always_on_top(self._window_always_on_top)
+        self._btn_close = self._top_bar.close_btn
         self._btn_close.clicked.connect(self.close)
+        self._review_switch_popup: VideoReviewSwitchPopup | None = None
+        self.setMouseTracking(True)
 
         body = QSplitter(Qt.Orientation.Horizontal, self)
         body.setObjectName("VideoPreviewBodySplit")
@@ -1422,7 +1510,7 @@ class VideoPreviewDialog(MonosDialog):
             w.setVisible(not seq)
         self._fps_label.setVisible(seq)
         self._fps_spin.setVisible(seq)
-        self._sync_title_btn_enabled()
+        self._sync_switch_btn_visible()
         if seq:
             self._surface.setToolTip("Middle-drag horizontally to scrub frames")
         else:
@@ -2003,6 +2091,8 @@ class VideoPreviewDialog(MonosDialog):
         btn = getattr(self, "_btn_close", None)
         if btn is not None and btn.isVisible():
             btn.raise_()
+        if self._top_bar.isVisible():
+            self._top_bar.raise_()
         self._sync_native_video_zorder()
 
     def _sync_native_video_zorder(self) -> None:
@@ -2033,6 +2123,183 @@ class VideoPreviewDialog(MonosDialog):
         except Exception:
             pass
 
+    def _preview_caption_rect(self) -> QRect:
+        if self._fullscreen or not self._top_bar.isVisible():
+            return QRect()
+        return QRect(self._top_bar.pos(), self._top_bar.size())
+
+    def _chrome_excluded_hit_rects(self) -> list[QRect]:
+        rects: list[QRect] = []
+        btn = getattr(self, "_btn_close", None)
+        if btn is not None and btn.isVisible():
+            rects.append(QRect(btn.mapTo(self, QPoint(0, 0)), btn.size()))
+        if self._switch_btn.isVisible():
+            rects.append(QRect(self._switch_btn.mapTo(self, QPoint(0, 0)), self._switch_btn.size()))
+        return rects
+
+    def nativeEvent(self, eventType, message):  # noqa: N802
+        if not self._fullscreen:
+            handled = handle_native_event(
+                self,
+                eventType,
+                message,
+                self._preview_caption_rect,
+                excluded_rects_fn=self._chrome_excluded_hit_rects,
+            )
+            if handled is not None:
+                return handled
+        return super().nativeEvent(eventType, message)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if (
+            not self._fullscreen
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            edges = resize_edges_at(self, event.position().toPoint())
+            if edges is not None:
+                wh = self.windowHandle()
+                if wh is not None:
+                    try:
+                        wh.startSystemResize(edges)
+                        return
+                    except Exception:
+                        pass
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if not self._fullscreen:
+            if resize_edges_at(self, event.position().toPoint()) is not None:
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def is_always_on_top(self) -> bool:
+        return self._window_always_on_top
+
+    def set_main_window_anchor(self, main: QWidget | None) -> None:
+        self._main_window_anchor = main
+
+    def stack_under_main(self, main: QWidget | None = None) -> None:
+        if self._window_always_on_top or not self.isVisible():
+            return
+        anchor = main or self._main_window_anchor
+        if anchor is None:
+            self.lower()
+            return
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                hwnd_player = int(self.winId())
+                hwnd_main = int(anchor.winId())
+                if hwnd_player and hwnd_main:
+                    flags = 0x0002 | 0x0001 | 0x0010 | 0x0040
+                    ctypes.windll.user32.SetWindowPos(hwnd_player, hwnd_main, 0, 0, 0, 0, flags)
+                    return
+            except Exception:
+                pass
+        self.stackUnder(anchor)
+
+    def _apply_win32_always_on_top(self, on: bool) -> bool:
+        if sys.platform != "win32":
+            return False
+        try:
+            import win32con
+            import win32gui
+        except ImportError:
+            return False
+        try:
+            wid = self.winId()
+            if not wid:
+                return False
+            hwnd = int(wid)
+            flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+            after = win32con.HWND_TOPMOST if on else win32con.HWND_NOTOPMOST
+            win32gui.SetWindowPos(hwnd, after, 0, 0, 0, 0, flags)
+            return True
+        except Exception:
+            return False
+
+    def _on_always_on_top_toggled(self, on: bool) -> None:
+        self._window_always_on_top = on
+        self._top_bar.set_always_on_top(on)
+        if self._settings is not None:
+            write_video_preview_always_on_top(self._settings, on)
+        if sys.platform == "win32" and self._apply_win32_always_on_top(on):
+            if not on and self._main_window_anchor is not None:
+                self.stack_under_main(self._main_window_anchor)
+            return
+        flags = self.windowFlags()
+        if on:
+            self.setWindowFlags(flags | Qt.WindowType.WindowStaysOnTopHint)
+        else:
+            self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
+        self.show()
+        if not on and self._main_window_anchor is not None:
+            self.stack_under_main(self._main_window_anchor)
+
+    def _cursor_over_player_window(self, gpos: QPoint) -> bool:
+        if not self.isVisible() or self._fullscreen:
+            return False
+        return self.frameGeometry().contains(gpos)
+
+    def _wheel_belongs_to_player_widget(self, watched: QObject) -> bool:
+        if watched is self:
+            return True
+        return isinstance(watched, QWidget) and self.isAncestorOf(watched)
+
+    def _forward_wheel_to_player_at(self, event: QWheelEvent, gpos: QPoint) -> bool:
+        local = self.mapFromGlobal(gpos)
+        target = self.childAt(local)
+        if target is None:
+            return True
+        tlocal = target.mapFromGlobal(gpos)
+        fwd = QWheelEvent(
+            QPointF(tlocal),
+            event.globalPosition(),
+            event.pixelDelta(),
+            event.angleDelta(),
+            event.buttons(),
+            event.modifiers(),
+            event.phase(),
+            event.inverted(),
+            event.source(),
+        )
+        QApplication.sendEvent(target, fwd)
+        return True
+
+    def _main_window_covers_wheel_at(self, gpos: QPoint) -> bool:
+        """True when the main app window should receive the wheel (player must not steal)."""
+        main = self._main_window_anchor
+        if main is None or not main.isVisible() or self._window_always_on_top:
+            return False
+        if not main.frameGeometry().contains(gpos):
+            return False
+        top = QApplication.widgetAt(gpos)
+        if top is not None:
+            player_win = self.window()
+            w: QWidget | None = top
+            while w is not None:
+                if w is main or main.isAncestorOf(w):
+                    return True
+                if w is player_win or player_win.isAncestorOf(w):
+                    return False
+                w = w.parentWidget()
+            return False
+        return main.isActiveWindow()
+
+    def _wheel_should_route_to_player(self, gpos: QPoint, watched: QObject) -> bool:
+        if not self.isVisible() or self._closing or self._fullscreen:
+            return False
+        if self._main_window_covers_wheel_at(gpos):
+            return False
+        if not self.frameGeometry().contains(gpos):
+            return False
+        if self._wheel_belongs_to_player_widget(watched):
+            return self._cursor_in_surface_wrap(gpos)
+        return True
+
     def _deferred_video_attach(self) -> None:
         if self._closing or not self.isVisible():
             return
@@ -2054,10 +2321,14 @@ class VideoPreviewDialog(MonosDialog):
             and not self._closing
             and event.type() == QEvent.Type.Wheel
             and isinstance(event, QWheelEvent)
-            and self._cursor_in_surface_wrap(event.globalPosition().toPoint())
         ):
-            if self._filter_video_surface_wheel(event, self._surface_wrap):
-                return True
+            gpos = event.globalPosition().toPoint()
+            if self._wheel_should_route_to_player(gpos, watched):
+                if self._cursor_in_surface_wrap(gpos):
+                    if self._filter_video_surface_wheel(event, self._surface_wrap):
+                        return True
+                elif not self._wheel_belongs_to_player_widget(watched):
+                    return self._forward_wheel_to_player_at(event, gpos)
         if (
             self._video_pan_active
             and isinstance(event, QMouseEvent)
@@ -2707,19 +2978,72 @@ class VideoPreviewDialog(MonosDialog):
         )
 
     def _title_picker_has_choices(self) -> bool:
-        if self._context == PreviewContext.entity and self._work_path is not None:
-            return True
-        if len(self._entity_sources) > 1:
-            return True
-        return not self._is_sequence_mode() and len(self._paths) > 1
+        return len(self._collect_switch_items()) > 1
 
-    def _sync_title_btn_enabled(self) -> None:
-        if self._title_picker_has_choices():
-            self._title_btn.setEnabled(True)
-        elif self._is_sequence_mode():
-            self._title_btn.setEnabled(bool(self._sequence_folder))
-        else:
-            self._title_btn.setEnabled(self._path is not None)
+    def _collect_switch_items(self) -> list[VideoReviewSwitchItem]:
+        items: list[VideoReviewSwitchItem] = []
+        seen: set[str] = set()
+        current_key = str(self._media_key()).casefold() if self._media_key() is not None else ""
+
+        if self._context == PreviewContext.entity and self._work_path is not None:
+            self._refresh_entity_sources()
+            for src in self._entity_sources:
+                key = str(src.request.media_key).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                req = src.request
+                if req.media_kind == ReviewMediaKind.video:
+                    thumb_path = req.path
+                    seq_folder = None
+                else:
+                    thumb_path = None
+                    seq_folder = req.sequence_folder
+                items.append(
+                    VideoReviewSwitchItem(
+                        label=src.label,
+                        checked=key == current_key,
+                        thumb_path=thumb_path,
+                        sequence_folder=seq_folder,
+                        on_activate=lambda r=req: self.load_media(r),
+                    )
+                )
+
+        if not self._is_sequence_mode():
+            for i, p in enumerate(self._paths):
+                try:
+                    key = str(p.resolve()).casefold()
+                except OSError:
+                    key = str(p).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(
+                    VideoReviewSwitchItem(
+                        label=p.name,
+                        subtitle=str(p.parent.name) if p.parent else "",
+                        checked=key == current_key or i == self._path_index,
+                        thumb_path=p,
+                        on_activate=lambda idx=i: self._switch_to_video_index(idx),
+                    )
+                )
+        return items
+
+    def _show_title_picker_menu(self) -> None:
+        items = self._collect_switch_items()
+        if len(items) <= 1:
+            return
+        popup = self._review_switch_popup
+        if popup is None:
+            popup = VideoReviewSwitchPopup(self)
+            self._review_switch_popup = popup
+        popup.set_items(items)
+        popup.popup_near_anchor(self._switch_btn)
+
+    def _sync_switch_btn_visible(self) -> None:
+        has_choices = self._title_picker_has_choices()
+        self._switch_btn.setVisible(has_choices)
+        self._switch_btn.setEnabled(has_choices)
 
     def _entity_review_title(self) -> str:
         parts: list[str] = []
@@ -2746,90 +3070,93 @@ class VideoPreviewDialog(MonosDialog):
             self._file_counter.setVisible(False)
             tip = self._entity_review_title()
             if n_sources > 1:
-                tip += "\nClick to switch review source"
+                tip += "\nUse the switcher to change review source"
             elif not self._is_sequence_mode() and len(self._paths) > 1:
-                tip += "\nClick to choose another video in this folder"
-            self._title_btn.setToolTip(tip)
+                tip += "\nUse the switcher to choose another video in this folder"
+            self._title_label.setToolTip(tip)
             self._refresh_title_elide()
-            self._sync_title_btn_enabled()
+            self._sync_switch_btn_visible()
             QTimer.singleShot(0, self._refresh_title_elide)
             return
         if self._is_sequence_mode():
             if self._sequence_folder is None:
                 self._file_counter.setText("")
-                self._title_btn.setText("")
-                self._title_btn.setToolTip("")
+                self._title_label.setText("")
+                self._title_label.setToolTip("")
                 return
             n = len(self._sequence_frames)
             self._file_counter.setText(f"{n} fr" if n else "")
             self._file_counter.setVisible(bool(n))
             tip = str(self._sequence_folder)
-            self._title_btn.setToolTip(tip)
+            self._title_label.setToolTip(tip)
             self._refresh_title_elide()
+            self._sync_switch_btn_visible()
             QTimer.singleShot(0, self._refresh_title_elide)
             return
         if self._path is None:
             self._file_counter.setText("")
-            self._title_btn.setText("")
-            self._title_btn.setToolTip("")
+            self._title_label.setText("")
+            self._title_label.setToolTip("")
             return
         n = len(self._paths)
         self._file_counter.setText(f"{self._path_index + 1}/{n}" if n > 1 else "")
         self._file_counter.setVisible(n > 1)
         tip = str(self._path)
         if n > 1:
-            tip += "\nClick to choose another video in this folder"
-        self._title_btn.setToolTip(tip)
+            tip += "\nUse the switcher to choose another video in this folder"
+        self._title_label.setToolTip(tip)
         self._refresh_title_elide()
+        self._sync_switch_btn_visible()
         QTimer.singleShot(0, self._refresh_title_elide)
 
-    def _title_button_available_width(self) -> int:
-        btn_w = self._title_btn.width()
-        if btn_w >= 80:
-            return max(48, btn_w - 12)
+    def _title_label_available_width(self) -> int:
+        label_w = self._title_label.width()
+        if label_w >= 80:
+            return max(48, label_w - 8)
         bar_w = self._top_bar.width() if self._top_bar is not None else 0
         if bar_w < 80:
             bar_w = self.width()
         counter_w = self._file_counter.width() if self._file_counter.isVisible() else 0
+        switch_w = self._switch_btn.width() if self._switch_btn.isVisible() else 0
+        close_w = self._btn_close.width() if self._btn_close.isVisible() else 0
         lay = self._top_bar.layout()
         if lay is not None:
             m = lay.contentsMargins()
-            bar_w -= m.left() + m.right() + lay.spacing()
-        close_reserve = _PREVIEW_CLOSE_BTN + _PREVIEW_CLOSE_INSET
-        return max(48, bar_w - counter_w - close_reserve - 12)
+            bar_w -= m.left() + m.right() + lay.spacing() * 3
+        return max(48, bar_w - counter_w - switch_w - close_w - 16)
 
     def _refresh_title_elide(self) -> None:
         if self._context == PreviewContext.entity and self._entity_path is not None:
-            avail = self._title_button_available_width()
-            text = self._title_btn.fontMetrics().elidedText(
+            avail = self._title_label_available_width()
+            text = self._title_label.fontMetrics().elidedText(
                 self._entity_review_title(),
                 Qt.TextElideMode.ElideMiddle,
                 avail,
             )
-            self._title_btn.setText(text)
+            self._title_label.setText(text)
             return
         if self._is_sequence_mode():
             if self._sequence_folder is None:
-                self._title_btn.setText("")
+                self._title_label.setText("")
                 return
-            avail = self._title_button_available_width()
-            text = self._title_btn.fontMetrics().elidedText(
+            avail = self._title_label_available_width()
+            text = self._title_label.fontMetrics().elidedText(
                 self._sequence_folder.name,
                 Qt.TextElideMode.ElideMiddle,
                 avail,
             )
-            self._title_btn.setText(text)
+            self._title_label.setText(text)
             return
         if self._path is None:
-            self._title_btn.setText("")
+            self._title_label.setText("")
             return
-        avail = self._title_button_available_width()
-        text = self._title_btn.fontMetrics().elidedText(
+        avail = self._title_label_available_width()
+        text = self._title_label.fontMetrics().elidedText(
             self._path.name,
             Qt.TextElideMode.ElideMiddle,
             avail,
         )
-        self._title_btn.setText(text)
+        self._title_label.setText(text)
 
     def _update_footer(self) -> None:
         self._update_footer_meta()
@@ -3105,37 +3432,6 @@ class VideoPreviewDialog(MonosDialog):
             parts = note_bits[:2] + parts
         return parts
 
-    def _show_title_picker_menu(self) -> None:
-        if self._context == PreviewContext.entity and self._work_path is not None:
-            self._refresh_entity_sources()
-            if len(self._entity_sources) > 1:
-                self._show_entity_source_picker(self._entity_sources)
-                return
-        if not self._is_sequence_mode() and len(self._paths) > 1:
-            self._show_video_picker_menu()
-
-    def _show_entity_source_picker(self, sources: list[EntityReviewSource]) -> None:
-        menu = MonosMenu(self)
-        current_key = str(self._media_key()).casefold() if self._media_key() is not None else ""
-        for src in sources:
-            act = menu.addAction(src.label)
-            act.setCheckable(True)
-            act.setChecked(str(src.request.media_key).casefold() == current_key)
-            act.triggered.connect(lambda checked=False, req=src.request: self.load_media(req))
-        position_popup_near_anchor(menu, self._title_btn)
-        menu.popup(menu.mapToGlobal(QPoint(0, 0)))
-
-    def _show_video_picker_menu(self) -> None:
-        if len(self._paths) <= 1:
-            return
-        menu = MonosMenu(self)
-        for i, p in enumerate(self._paths):
-            act = menu.addAction(p.name)
-            act.setCheckable(True)
-            act.setChecked(i == self._path_index)
-            act.triggered.connect(lambda checked=False, idx=i: self._switch_to_video_index(idx))
-        position_popup_near_anchor(menu, self._title_btn)
-        menu.popup(menu.mapToGlobal(QPoint(0, 0)))
 
     def _switch_to_video_index(self, index: int) -> None:
         if index < 0 or index >= len(self._paths) or index == self._path_index:
@@ -3488,6 +3784,11 @@ class VideoPreviewDialog(MonosDialog):
         if self._border_overlay is not None:
             self._border_overlay.hide()
         self._install_app_event_filter()
+        if self._window_always_on_top:
+            if sys.platform == "win32":
+                self._apply_win32_always_on_top(True)
+            else:
+                self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self._apply_dialog_geometry_once()
         self._update_scrub_seek_interval()
         QTimer.singleShot(0, self._deferred_video_attach)
@@ -3496,16 +3797,28 @@ class VideoPreviewDialog(MonosDialog):
         QTimer.singleShot(0, self._position_close_btn)
 
     def _position_close_btn(self) -> None:
-        if not getattr(self, "_btn_close", None):
+        btn = getattr(self, "_btn_close", None)
+        if btn is None:
             return
-        top_inset = 0 if self._fullscreen else _DIALOG_BORDER_INSET
-        x = self.width() - self._btn_close.width() - _PREVIEW_CLOSE_INSET - top_inset
         if self._fullscreen:
+            if btn.parent() is not self:
+                lay = self._top_bar.layout()
+                if lay is not None:
+                    lay.removeWidget(btn)
+                btn.setParent(self)
+            top_inset = 0
+            x = self.width() - btn.width() - _PREVIEW_CLOSE_INSET
             y = _PREVIEW_CLOSE_INSET
-        else:
-            y = top_inset + max(0, (_PREVIEW_TOPBAR_H - self._btn_close.height()) // 2)
-        self._btn_close.move(x, y)
-        self._btn_close.show()
+            btn.move(x, y)
+            btn.show()
+            btn.raise_()
+            return
+        if btn.parent() is not self._top_bar:
+            btn.setParent(self._top_bar)
+            lay = self._top_bar.layout()
+            if lay is not None:
+                lay.addWidget(btn)
+        btn.show()
         self.raise_border_overlay()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -3632,6 +3945,7 @@ class VideoPreviewDialog(MonosDialog):
             write_video_preview_playback_speed(self._settings, self._speed)
             write_video_preview_volume(self._settings, self._volume)
             write_video_preview_loop(self._settings, self._loop_playback)
+            write_video_preview_always_on_top(self._settings, self._window_always_on_top)
         self.hide()
         self._shutdown_embedded_video()
         _hide_native_qt_window(self)

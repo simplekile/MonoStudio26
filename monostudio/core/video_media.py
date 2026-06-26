@@ -15,7 +15,11 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
+
+ExportProgressCallback = Callable[[int, int, Path | None], None]
+ExportCancelCheck = Callable[[], bool]
+ExportSubProgressCallback = Callable[[float], None]
 
 from monostudio.core.ffmpeg_resolve import resolve_ffmpeg_executable, resolve_ffprobe_executable
 from monostudio.core.subprocess_win import hide_console_subprocess_kwargs
@@ -367,6 +371,65 @@ def _ffmpeg_output_args(dst: Path, *, reencode: bool, src: Path) -> list[str]:
     return ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", "-b:a", "192k"]
 
 
+_EXPORT_PROGRESS_SCALE = 100
+
+
+def _run_ffmpeg_with_progress(
+    args: list[str],
+    *,
+    duration_sec: float,
+    progress_callback: ExportSubProgressCallback | None = None,
+    cancel_check: ExportCancelCheck | None = None,
+) -> None:
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        **hide_console_subprocess_kwargs(),
+    )
+    out_time_re = re.compile(r"^out_time_ms=(\d+)")
+    stderr_tail: list[str] = []
+    try:
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        for line in proc.stdout:
+            if cancel_check and cancel_check():
+                proc.terminate()
+                raise RuntimeError("Export cancelled")
+            m = out_time_re.match(line.strip())
+            if m and progress_callback and duration_sec > 0:
+                out_ms = int(m.group(1))
+                progress_callback(min(1.0, (out_ms / 1_000_000.0) / duration_sec))
+        stderr_text = proc.stderr.read() or ""
+        if stderr_text:
+            stderr_tail = [ln.strip() for ln in stderr_text.splitlines() if ln.strip()][-4:]
+        code = proc.wait()
+        if code != 0:
+            detail = stderr_tail[-1] if stderr_tail else f"exit code {code}"
+            raise RuntimeError(detail)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        time.sleep(0.05)
+
+
+def _report_export_progress(
+    progress_callback: ExportProgressCallback | None,
+    *,
+    step_done: float,
+    total_steps: int,
+    path: Path | None,
+) -> None:
+    if not progress_callback:
+        return
+    total_units = max(1, total_steps * _EXPORT_PROGRESS_SCALE)
+    cur_units = min(total_units, max(0, int(step_done * _EXPORT_PROGRESS_SCALE)))
+    progress_callback(cur_units, total_units, path)
+
+
 def export_video_trim(
     src: Path,
     dst: Path,
@@ -375,6 +438,8 @@ def export_video_trim(
     *,
     reencode: bool = False,
     fps: float | None = None,
+    progress_callback: ExportSubProgressCallback | None = None,
+    cancel_check: ExportCancelCheck | None = None,
 ) -> None:
     ffmpeg = resolve_ffmpeg_executable()
     if not ffmpeg:
@@ -382,32 +447,48 @@ def export_video_trim(
     if end_sec <= start_sec:
         raise ValueError("Invalid trim range: end must be after start.")
     dst.parent.mkdir(parents=True, exist_ok=True)
+    duration = max(0.01, end_sec - start_sec)
     if dst.suffix.lower() == ".gif":
         if fps is None:
             raise ValueError("GIF export requires fps.")
-        _export_video_trim_gif(ffmpeg, src, dst, start_sec, end_sec, fps=fps)
+        _export_video_trim_gif(
+            ffmpeg,
+            src,
+            dst,
+            start_sec,
+            end_sec,
+            fps=fps,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
         return
     args = [
         ffmpeg,
         "-y",
-        "-loglevel", "error",
-        "-ss", f"{start_sec:.6f}",
-        "-to", f"{end_sec:.6f}",
-        "-i", str(src),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-progress",
+        "pipe:1",
+        "-ss",
+        f"{start_sec:.6f}",
+        "-to",
+        f"{end_sec:.6f}",
+        "-i",
+        str(src),
     ]
     args.extend(_ffmpeg_output_args(dst, reencode=reencode, src=src))
     args.append(str(dst))
-    proc = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        timeout=3600,
-        check=False,
-        **hide_console_subprocess_kwargs(),
-    )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(err or f"FFmpeg trim failed (code {proc.returncode})")
+    try:
+        _run_ffmpeg_with_progress(
+            args,
+            duration_sec=duration,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+    except RuntimeError as e:
+        msg = str(e).strip()
+        raise RuntimeError(msg or "FFmpeg trim failed") from e
 
 
 def _export_video_trim_gif(
@@ -418,30 +499,41 @@ def _export_video_trim_gif(
     end_sec: float,
     *,
     fps: float,
+    progress_callback: ExportSubProgressCallback | None = None,
+    cancel_check: ExportCancelCheck | None = None,
 ) -> None:
+    duration = max(0.01, end_sec - start_sec)
     args = [
         ffmpeg,
         "-y",
-        "-loglevel", "error",
-        "-ss", f"{start_sec:.6f}",
-        "-to", f"{end_sec:.6f}",
-        "-i", str(src),
-        "-vf", _gif_video_filter(fps),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-progress",
+        "pipe:1",
+        "-ss",
+        f"{start_sec:.6f}",
+        "-to",
+        f"{end_sec:.6f}",
+        "-i",
+        str(src),
+        "-vf",
+        _gif_video_filter(fps),
         "-an",
-        "-loop", "0",
+        "-loop",
+        "0",
         str(dst),
     ]
-    proc = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        timeout=3600,
-        check=False,
-        **hide_console_subprocess_kwargs(),
-    )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(err or f"FFmpeg GIF export failed (code {proc.returncode})")
+    try:
+        _run_ffmpeg_with_progress(
+            args,
+            duration_sec=duration,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+    except RuntimeError as e:
+        msg = str(e).strip()
+        raise RuntimeError(msg or "FFmpeg GIF export failed") from e
 
 
 def _output_name(stem: str, suffix: str, index: int, template: str) -> str:
@@ -534,14 +626,22 @@ def export_video_ranges(
         raise ValueError("GIF export supports separate files only (one GIF per range).")
 
     if mode == "separate":
-        total = len(ranges)
+        total_steps = len(ranges)
         for i, rng in enumerate(ranges, start=1):
             if cancel_check and cancel_check():
                 break
-            if progress_callback:
-                progress_callback(i - 1, total, None)
             out_name = _output_name_for_range(stem, suffix, i, rng, name_template, used_names=used_names)
             dst = output_dir / out_name
+            step_base = float(i - 1)
+
+            def _on_sub(sub: float, _base: float = step_base, _dst: Path = dst) -> None:
+                _report_export_progress(
+                    progress_callback,
+                    step_done=_base + sub,
+                    total_steps=total_steps,
+                    path=_dst,
+                )
+
             export_video_trim(
                 src,
                 dst,
@@ -549,14 +649,20 @@ def export_video_ranges(
                 rng.end_sec_exclusive(fps),
                 reencode=reencode,
                 fps=fps,
+                progress_callback=_on_sub,
+                cancel_check=cancel_check,
             )
             outputs.append(dst)
-            if progress_callback:
-                progress_callback(i, total, dst)
+            _report_export_progress(
+                progress_callback,
+                step_done=float(i),
+                total_steps=total_steps,
+                path=dst,
+            )
         return outputs
 
     # concat: cut segments then concat demuxer
-    total = len(ranges) + 1
+    total_steps = len(ranges) + 1
     seg_dir = output_dir / f".{stem}_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     list_file = seg_dir / "concat.txt"
@@ -564,9 +670,17 @@ def export_video_ranges(
     for i, rng in enumerate(ranges, start=1):
         if cancel_check and cancel_check():
             break
-        if progress_callback:
-            progress_callback(i - 1, total, None)
         seg = seg_dir / f"seg_{i:03d}{seg_suffix}"
+        step_base = float(i - 1)
+
+        def _on_seg_sub(sub: float, _base: float = step_base, _seg: Path = seg) -> None:
+            _report_export_progress(
+                progress_callback,
+                step_done=_base + sub,
+                total_steps=total_steps,
+                path=_seg,
+            )
+
         export_video_trim(
             src,
             seg,
@@ -574,41 +688,67 @@ def export_video_ranges(
             rng.end_sec_exclusive(fps),
             reencode=reencode,
             fps=fps,
+            progress_callback=_on_seg_sub,
+            cancel_check=cancel_check,
         )
         seg_paths.append(seg)
-        if progress_callback:
-            progress_callback(i, total, seg)
+        _report_export_progress(
+            progress_callback,
+            step_done=float(i),
+            total_steps=total_steps,
+            path=seg,
+        )
 
     if not seg_paths:
         return []
     lines = [f"file '{p.resolve().as_posix()}'" for p in seg_paths]
     list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     final = output_dir / f"{stem}_concat{suffix}"
-    if progress_callback:
-        progress_callback(len(ranges), total, None)
+    concat_duration = sum(
+        max(0.01, rng.end_sec_exclusive(fps) - rng.start_sec(fps)) for rng in ranges
+    )
     args = [
         ffmpeg,
         "-y",
-        "-loglevel", "error",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(list_file),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-progress",
+        "pipe:1",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
     ]
     args.extend(_ffmpeg_output_args(final, reencode=reencode, src=src))
     args.append(str(final))
-    proc = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        timeout=3600,
-        check=False,
-        **hide_console_subprocess_kwargs(),
+
+    def _on_concat_sub(sub: float) -> None:
+        _report_export_progress(
+            progress_callback,
+            step_done=float(len(ranges)) + sub,
+            total_steps=total_steps,
+            path=final,
+        )
+
+    try:
+        _run_ffmpeg_with_progress(
+            args,
+            duration_sec=concat_duration,
+            progress_callback=_on_concat_sub,
+            cancel_check=cancel_check,
+        )
+    except RuntimeError as e:
+        msg = str(e).strip()
+        raise RuntimeError(msg or "FFmpeg concat failed") from e
+    _report_export_progress(
+        progress_callback,
+        step_done=float(total_steps),
+        total_steps=total_steps,
+        path=final,
     )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(err or f"FFmpeg concat failed (code {proc.returncode})")
-    if progress_callback:
-        progress_callback(total, total, final)
     return [final]
 
 

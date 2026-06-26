@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Callable, Literal
 
 from PySide6.QtCore import QSettings, QByteArray
@@ -24,6 +25,8 @@ KEY_VIDEO_PREVIEW_VOLUME = "ui/video_preview_volume"
 KEY_VIDEO_PREVIEW_LOOP = "ui/video_preview_loop"
 KEY_VIDEO_PREVIEW_PROXY_ENABLED = "ui/video_preview_proxy_enabled"
 KEY_VIDEO_PREVIEW_PROXY_SCALE = "ui/video_preview_proxy_scale"
+KEY_VIDEO_PREVIEW_LAST_OPEN = "ui/video_preview_last_open"
+KEY_VIDEO_PREVIEW_ALWAYS_ON_TOP = "ui/video_preview_always_on_top"
 
 PROXY_SCALE_FULL = 1.0
 PROXY_SCALE_HALF = 0.5
@@ -426,6 +429,19 @@ def write_video_preview_loop(settings: QSettings, enabled: bool) -> None:
     settings.setValue(KEY_VIDEO_PREVIEW_LOOP, bool(enabled))
 
 
+def read_video_preview_always_on_top(settings: QSettings | None) -> bool:
+    if settings is None:
+        return False
+    v = settings.value(KEY_VIDEO_PREVIEW_ALWAYS_ON_TOP, False)
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes")
+
+
+def write_video_preview_always_on_top(settings: QSettings, enabled: bool) -> None:
+    settings.setValue(KEY_VIDEO_PREVIEW_ALWAYS_ON_TOP, bool(enabled))
+
+
 def read_video_preview_proxy_enabled(settings: QSettings | None) -> bool:
     if settings is None:
         return False
@@ -457,3 +473,46 @@ def write_video_preview_proxy_scale(settings: QSettings, scale: float) -> None:
     if s not in PROXY_SCALE_STEPS:
         s = PROXY_SCALE_FULL
     settings.setValue(KEY_VIDEO_PREVIEW_PROXY_SCALE, s)
+
+
+def write_last_video_preview_open(
+    settings: QSettings,
+    *,
+    path: str,
+    context: str,
+    entity_path: str = "",
+    department_id: str = "",
+) -> None:
+    payload = {
+        "path": (path or "").strip(),
+        "context": (context or "entity").strip().lower(),
+        "entity_path": (entity_path or "").strip(),
+        "department_id": (department_id or "").strip(),
+    }
+    if not payload["path"]:
+        return
+    settings.setValue(KEY_VIDEO_PREVIEW_LAST_OPEN, json.dumps(payload, ensure_ascii=False))
+
+
+def read_last_video_preview_open(settings: QSettings | None) -> dict[str, str] | None:
+    if settings is None:
+        return None
+    raw = settings.value(KEY_VIDEO_PREVIEW_LAST_OPEN, "", str)
+    text = (raw or "").strip() if isinstance(raw, str) else str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    path = str(data.get("path") or "").strip()
+    if not path:
+        return None
+    return {
+        "path": path,
+        "context": str(data.get("context") or "entity").strip().lower() or "entity",
+        "entity_path": str(data.get("entity_path") or "").strip(),
+        "department_id": str(data.get("department_id") or "").strip(),
+    }

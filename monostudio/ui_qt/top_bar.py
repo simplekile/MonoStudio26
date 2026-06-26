@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QFont,
     QFontMetrics,
@@ -32,77 +33,12 @@ from monostudio.ui_qt.toolbar_separators import add_widgets_with_icon_separators
 from monostudio.ui_qt.notification.notification_dropdown import NotificationDropdown
 from monostudio.ui_qt.notification.notification_list_dialog import NotificationListDialog
 from monostudio.ui_qt.popup_position import position_popup_near_anchor
-from monostudio.ui_qt.style import monos_font
+from monostudio.ui_qt.style import MonosMenu, monos_font
 from monostudio.ui_qt.user_avatar import avatar_pixmap, effective_device_pixel_ratio
 
 # TopBar action strip icon buttons (update, watcher, user avatar, …).
 _TOPBAR_ACTION_BTN_W = 32
 _TOPBAR_ACTION_BTN_H = 36
-
-# TopBar panel cluster (Auto + glyphs): ~70% of original 44×28 + 32×32 footprint.
-_PANEL_CLUSTER_SCALE = 0.7
-_PANEL_AUTO_W = max(24, round(44 * _PANEL_CLUSTER_SCALE))
-_PANEL_AUTO_H = max(18, round(28 * _PANEL_CLUSTER_SCALE))
-_PANEL_GLYPH = max(18, round(32 * _PANEL_CLUSTER_SCALE))
-_PANEL_GROUP_MARGIN = max(1, round(2 * _PANEL_CLUSTER_SCALE))
-
-
-class _PanelLayoutGlyphButton(QToolButton):
-    """Cursor-style outline frame with sidebar strip (left) or inspector strip (right)."""
-
-    def __init__(self, kind: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._kind = kind  # "sidebar" | "inspector"
-        self.setCheckable(True)
-        self.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self.setFixedSize(_PANEL_GLYPH, _PANEL_GLYPH)
-        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.setObjectName("TopBarPanelGlyphBtn")
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        super().paintEvent(event)
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        checked = self.isChecked()
-        enabled = self.isEnabled()
-        auto_muted = self.property("autoMuted") is True
-        if not enabled:
-            stroke = QColor("#52525b")
-            fill = QColor("#3f3f46" if checked else "#27272a")
-        elif auto_muted:
-            # Auto on: still clickable, softer than full manual styling.
-            stroke = QColor("#e4e4e7" if checked else "#52525b")
-            fill = QColor("#3b82f6" if checked else "#3f3f46")
-        else:
-            stroke = QColor("#e4e4e7" if checked else "#71717a")
-            fill = QColor("#60a5fa" if checked else "#52525b")
-        side = min(self.width(), self.height())
-        # Proportional to legacy 32px tile (inset 8): keeps glyph scale when cluster is shrunk.
-        inset = max(4, min(8, int(round(side * 8.0 / 32.0))))
-        r = self.rect().adjusted(inset, inset, -inset, -inset)
-        radius = 2.0 if side < 24 else 2.5 if side < 28 else 3.0
-        p.setPen(stroke)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(r).adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(fill)
-        inner_pad = max(1, int(round(3.0 * side / 32.0)))
-        inner = r.adjusted(inner_pad, inner_pad, -inner_pad, -inner_pad)
-        bar_r = 1.2 if side < 24 else 1.5
-        if self._kind == "sidebar":
-            bar_w = max(3, min(5, int(inner.width()) - 2))
-            bar = QRectF(inner.left(), inner.top(), float(bar_w), float(inner.height()))
-            p.drawRoundedRect(bar, bar_r, bar_r)
-        else:
-            # Inspector: mirror of sidebar glyph (right strip)
-            bar_w = max(3, min(5, int(inner.width()) - 2))
-            bar = QRectF(
-                float(inner.right()) - float(bar_w) + 0.5,
-                float(inner.top()),
-                float(bar_w) - 0.5,
-                float(inner.height()),
-            )
-            p.drawRoundedRect(bar, bar_r, bar_r)
 
 
 class _UserAvatarButton(QToolButton):
@@ -239,7 +175,6 @@ class _NotiCountBadge(QWidget):
 
 
 class TopBar(QWidget):
-    settings_clicked = Signal()
     minimize_clicked = Signal()
     maximize_clicked = Signal()
     close_clicked = Signal()
@@ -249,6 +184,7 @@ class TopBar(QWidget):
     layout_auto_clicked = Signal()
     layout_sidebar_clicked = Signal()
     layout_inspector_clicked = Signal()
+    review_player_clicked = Signal()
     always_on_top_toggled = Signal(bool)
     switch_user_requested = Signal()
     edit_profile_requested = Signal()
@@ -315,25 +251,13 @@ class TopBar(QWidget):
         self._watcher_busy_timer.setInterval(400)
         self._watcher_busy_timer.timeout.connect(self._on_watcher_busy_blink)
 
-        # Always on top (pin) — toggle window z-order above other apps
-        self._btn_always_on_top = QToolButton(self)
-        self._btn_always_on_top.setObjectName("TopBarAlwaysOnTopBtn")
-        self._btn_always_on_top.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self._btn_always_on_top.setCheckable(True)
-        self._btn_always_on_top.setChecked(False)
-        self._btn_always_on_top.setIcon(lucide_icon("pin", size=20, color_hex=_win_icon_color))
-        self._btn_always_on_top.setFixedSize(_action_icon_w, _action_icon_h)
-        self._btn_always_on_top.setToolTip("Always on top: off — pin window above other apps")
-        self._btn_always_on_top.toggled.connect(self._on_always_on_top_toggled)
-
-        # Settings button (next to noti)
-        self._btn_settings = QToolButton(self)
-        self._btn_settings.setObjectName("TopBarSettingsBtn")
-        self._btn_settings.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self._btn_settings.setIcon(lucide_icon("settings", size=20, color_hex=_win_icon_color))
-        self._btn_settings.setFixedSize(_action_icon_w, _action_icon_h)
-        self._btn_settings.setToolTip("Settings")
-        self._btn_settings.clicked.connect(self.settings_clicked.emit)
+        self._btn_review = QToolButton(self)
+        self._btn_review.setObjectName("TopBarReviewBtn")
+        self._btn_review.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_review.setIcon(lucide_icon("clapperboard", size=20, color_hex=_win_icon_color))
+        self._btn_review.setFixedSize(_action_icon_w, _action_icon_h)
+        self._btn_review.setToolTip("Review player")
+        self._btn_review.clicked.connect(self.review_player_clicked.emit)
 
         # Current-user avatar + identity menu (Switch user / Clear identity / Forget device)
         self._user_name: str | None = None
@@ -362,36 +286,24 @@ class TopBar(QWidget):
         self._noti_badge = _NotiCountBadge(self._btn_noti)
         self._notification_list_dialog: NotificationListDialog | None = None
 
-        # Panel layout: Auto (responsive) + sidebar + inspector toggles (Cursor-style)
-        self._panel_group = QWidget(self)
-        self._panel_group.setObjectName("TopBarPanelGroup")
-        self._panel_l = QHBoxLayout(self._panel_group)
-        m = _PANEL_GROUP_MARGIN
-        self._panel_l.setContentsMargins(m, m, m, m)
-        self._panel_l.setSpacing(0)
-        self._btn_layout_auto = QToolButton(self._panel_group)
-        self._btn_layout_auto.setObjectName("TopBarPanelAutoBtn")
-        self._btn_layout_auto.setText("Auto")
-        self._btn_layout_auto.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        # Keep geometry stable across Auto/manual to avoid "jumping" layout.
-        self._btn_layout_auto.setFixedSize(_PANEL_AUTO_W, _PANEL_AUTO_H)
-        self._btn_layout_auto.setToolTip("Auto layout — hide sidebar and Inspector when the window is narrow")
-        self._btn_layout_auto.clicked.connect(self._on_layout_auto_clicked)
-        self._btn_layout_sidebar = _PanelLayoutGlyphButton("sidebar", self._panel_group)
-        self._btn_layout_sidebar.setToolTip("Full sidebar or compact rail (68px)")
-        self._btn_layout_sidebar.clicked.connect(self.layout_sidebar_clicked.emit)
-        self._btn_layout_inspector = _PanelLayoutGlyphButton("inspector", self._panel_group)
-        self._btn_layout_inspector.setToolTip("Show or hide Inspector")
-        self._btn_layout_inspector.clicked.connect(self.layout_inspector_clicked.emit)
-        add_widgets_with_icon_separators(
-            self._panel_l,
-            [self._btn_layout_auto, self._btn_layout_sidebar, self._btn_layout_inspector],
-            self._panel_group,
-            sep_height=16,
-        )
+        self._ctx_act_auto = QAction("Auto layout", self)
+        self._ctx_act_auto.setCheckable(True)
+        self._ctx_act_auto.setToolTip("Hide sidebar and Inspector when the window is narrow")
+        self._ctx_act_auto.triggered.connect(self._on_ctx_layout_auto)
+        self._ctx_act_sidebar = QAction("Full sidebar", self)
+        self._ctx_act_sidebar.setCheckable(True)
+        self._ctx_act_sidebar.setToolTip("Full sidebar or compact rail (68px)")
+        self._ctx_act_sidebar.triggered.connect(self.layout_sidebar_clicked.emit)
+        self._ctx_act_inspector = QAction("Inspector", self)
+        self._ctx_act_inspector.setCheckable(True)
+        self._ctx_act_inspector.setToolTip("Show or hide Inspector")
+        self._ctx_act_inspector.triggered.connect(self.layout_inspector_clicked.emit)
+        self._ctx_act_always_on_top = QAction("Always on top", self)
+        self._ctx_act_always_on_top.setCheckable(True)
+        self._ctx_act_always_on_top.toggled.connect(self._on_ctx_always_on_top_toggled)
 
-        # Keep visuals in sync with current layout mode (sizes stay fixed).
-        self._panel_compact = False
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_layout_context_menu)
 
         self._project_display_name_raw: str | None = None
         self._project_name_label = QLabel("SELECT PROJECT", self)
@@ -412,7 +324,6 @@ class TopBar(QWidget):
         layout.setContentsMargins(24, 10, 8, 10)
         layout.setSpacing(0)
         layout.addWidget(self._project_name_label, 1, Qt.AlignLeft | Qt.AlignVCenter)
-        layout.addWidget(self._panel_group, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addSpacing(10)
         self._action_strip = QWidget(self)
         self._action_strip.setObjectName("TopBarActionStrip")
@@ -422,10 +333,9 @@ class TopBar(QWidget):
         add_widgets_with_icon_separators(
             action_l,
             [
+                self._btn_review,
                 self._btn_update,
                 self._btn_watcher,
-                self._btn_always_on_top,
-                self._btn_settings,
                 self._btn_noti,
                 self._btn_user,
             ],
@@ -541,46 +451,41 @@ class TopBar(QWidget):
         menu.exec(btn.mapToGlobal(btn.rect().bottomRight()))
         QTimer.singleShot(0, lambda: self._clear_tool_button_hover(btn))
 
-    def _on_layout_auto_clicked(self) -> None:
-        """Always re-enter auto layout (segment stays active until user uses sidebar/inspector toggles)."""
+    def _on_ctx_layout_auto(self) -> None:
+        """Always re-enter auto layout (stays active until user uses sidebar/inspector toggles)."""
         self.layout_auto_clicked.emit()
 
+    def _show_layout_context_menu(self, pos: QPoint) -> None:
+        if self._is_on_window_buttons(pos):
+            return
+        menu = MonosMenu(self)
+        menu.addAction(self._ctx_act_auto)
+        menu.addSeparator()
+        menu.addAction(self._ctx_act_sidebar)
+        menu.addAction(self._ctx_act_inspector)
+        menu.addSeparator()
+        menu.addAction(self._ctx_act_always_on_top)
+        menu.exec(self.mapToGlobal(pos))
+
     def set_panel_layout_controls(self, *, auto: bool, sidebar_on: bool, inspector_on: bool) -> None:
-        """Sync TopBar panel controls from MainWindow (block signals while updating)."""
-        # Auto on: still allow Sidebar/Inspector clicks (exits Auto → manual) — only visuals are muted.
-        self._set_panel_group_compact(auto)
+        """Sync layout context-menu check states from MainWindow."""
+        for act, val in (
+            (self._ctx_act_auto, auto),
+            (self._ctx_act_sidebar, sidebar_on),
+            (self._ctx_act_inspector, inspector_on),
+        ):
+            act.blockSignals(True)
+            act.setChecked(val)
+            act.blockSignals(False)
 
-        for btn in (self._btn_layout_sidebar, self._btn_layout_inspector):
-            btn.setProperty("autoMuted", auto)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+    def _on_ctx_always_on_top_toggled(self, checked: bool) -> None:
+        self.always_on_top_toggled.emit(checked)
 
-        self._btn_layout_auto.setProperty("active", auto)
-        self._btn_layout_auto.style().unpolish(self._btn_layout_auto)
-        self._btn_layout_auto.style().polish(self._btn_layout_auto)
-        self._btn_layout_auto.update()
-        self._btn_layout_sidebar.blockSignals(True)
-        self._btn_layout_sidebar.setChecked(sidebar_on)
-        self._btn_layout_sidebar.blockSignals(False)
-        self._btn_layout_sidebar.update()
-        self._btn_layout_inspector.blockSignals(True)
-        self._btn_layout_inspector.setChecked(inspector_on)
-        self._btn_layout_inspector.blockSignals(False)
-        self._btn_layout_inspector.update()
-
-    def _set_panel_group_compact(self, compact: bool) -> None:
-        """Auto mode = muted visuals; manual = default visuals (keep sizes fixed)."""
-        if self._panel_compact != compact:
-            self._panel_compact = compact
-            self._panel_group.setProperty("autoMode", "true" if compact else "false")
-            try:
-                st = self._panel_group.style()
-                if st:
-                    st.unpolish(self._panel_group)
-                    st.polish(self._panel_group)
-            except Exception:
-                pass
-        self._panel_group.update()
+    def set_always_on_top(self, on: bool) -> None:
+        """Sync always-on-top from MainWindow; does not emit always_on_top_toggled."""
+        self._ctx_act_always_on_top.blockSignals(True)
+        self._ctx_act_always_on_top.setChecked(on)
+        self._ctx_act_always_on_top.blockSignals(False)
 
     # Grace period (seconds): if popup was closed less than this ago, next button click is treated as "close" not "open"
     _POPUP_REOPEN_GRACE = 0.25
@@ -634,25 +539,13 @@ class TopBar(QWidget):
         self._noti_dropdown_closed_at = time.monotonic()
         QTimer.singleShot(0, lambda: self._clear_tool_button_hover(self._btn_noti))
 
-    def _on_always_on_top_toggled(self, checked: bool) -> None:
-        self._update_always_on_top_appearance(checked)
-        self.always_on_top_toggled.emit(checked)
-
-    def _update_always_on_top_appearance(self, on: bool) -> None:
-        color = "#60a5fa" if on else "#d4d4d8"
-        self._btn_always_on_top.setIcon(lucide_icon("pin", size=20, color_hex=color))
-        self._btn_always_on_top.setToolTip(
-            "Always on top: on — window stays above other apps"
-            if on
-            else "Always on top: off — pin window above other apps"
+    def _is_on_window_buttons(self, pos: QPoint) -> bool:
+        return (
+            self._action_strip.geometry().contains(pos)
+            or self._btn_min.geometry().contains(pos)
+            or self._btn_max.geometry().contains(pos)
+            or self._btn_close.geometry().contains(pos)
         )
-
-    def set_always_on_top(self, on: bool) -> None:
-        """Sync pin button from MainWindow (e.g. restore settings); does not emit always_on_top_toggled."""
-        self._btn_always_on_top.blockSignals(True)
-        self._btn_always_on_top.setChecked(on)
-        self._btn_always_on_top.blockSignals(False)
-        self._update_always_on_top_appearance(on)
 
     def _on_watcher_toggled(self, checked: bool) -> None:
         self.watcher_toggled.emit(checked)
@@ -703,6 +596,13 @@ class TopBar(QWidget):
         """Return the notification toolbar button (for anchoring general toasts below it)."""
         return self._btn_noti
 
+    def set_review_player_hint(self, path: Path | None) -> None:
+        if path is not None:
+            name = path.name.strip() or str(path)
+            self._btn_review.setToolTip(f"Review player — {name}")
+        else:
+            self._btn_review.setToolTip("Review player — open most recent clip")
+
     def get_update_button(self) -> QToolButton:
         """Return the update toolbar button (e.g. for showing tooltip at startup)."""
         return self._btn_update
@@ -749,15 +649,6 @@ class TopBar(QWidget):
             self._btn_max.setIcon(lucide_icon("maximize-2", size=24, color_hex=_c))
         else:
             self._btn_max.setIcon(lucide_icon("square", size=24, color_hex=_c))
-
-    def _is_on_window_buttons(self, pos: QPoint) -> bool:
-        return (
-            self._panel_group.geometry().contains(pos)
-            or self._action_strip.geometry().contains(pos)
-            or self._btn_min.geometry().contains(pos)
-            or self._btn_max.geometry().contains(pos)
-            or self._btn_close.geometry().contains(pos)
-        )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and not self._is_on_window_buttons(event.pos()):

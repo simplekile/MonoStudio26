@@ -636,13 +636,14 @@ class VideoExportDialog(MonosDialog):
         return len(self._ranges) + (1 if mode == "concat" else 0)
 
     def _show_progress_page(self) -> None:
-        total = max(1, self._export_total_steps())
+        total_steps = max(1, self._export_total_steps())
+        total_units = total_steps * 100
         self._stack.setCurrentIndex(1)
         self._progress.setMinimum(0)
-        self._progress.setMaximum(total)
+        self._progress.setMaximum(total_units)
         self._progress.setValue(0)
         self._progress.setFormat("%p%")
-        self._progress_status.setText(f"Starting export (0/{total})…")
+        self._progress_status.setText("Starting export… 0%")
         self._progress_file.setText("")
         self._export_btn.setEnabled(False)
         self._cancel_btn.setText("Cancel")
@@ -748,20 +749,27 @@ class VideoExportDialog(MonosDialog):
 
     def _on_progress(self, cur: int, total: int, path) -> None:
         total = max(1, int(total))
-        cur = max(0, int(cur))
-        if path is None:
-            self._progress.setMinimum(0)
-            self._progress.setMaximum(0)
-            step = min(total, cur + 1)
-            self._progress_status.setText(f"Encoding {step}/{total}…")
-            self._progress_file.setText("")
-        else:
-            self._progress.setMinimum(0)
-            self._progress.setMaximum(total)
-            self._progress.setValue(cur)
-            pct = int(round(100 * cur / total))
-            self._progress_status.setText(f"Completed {cur}/{total} ({pct}%)")
+        cur = max(0, min(int(cur), total))
+        self._progress.setMinimum(0)
+        self._progress.setMaximum(total)
+        self._progress.setValue(cur)
+        pct = int(round(100 * cur / total))
+        range_count = max(1, len(self._ranges))
+        total_steps = max(1, self._export_total_steps())
+        joining = total_steps > range_count and cur >= int(total * range_count / total_steps)
+        if cur >= total:
+            self._progress_status.setText(f"Finishing… {pct}%")
+        elif joining:
+            self._progress_status.setText(f"Joining clips · {pct}%")
+            if path is not None:
+                self._progress_file.setText(Path(path).name)
+        elif path is not None:
+            step_idx = min(range_count, max(1, int(cur * range_count / total) + 1))
+            self._progress_status.setText(f"Encoding {step_idx}/{range_count} · {pct}%")
             self._progress_file.setText(Path(path).name)
+        else:
+            self._progress_status.setText(f"Encoding… {pct}%")
+            self._progress_file.setText("")
 
     def _on_finished(self, outputs: object, error: object) -> None:
         self._exporting = False
