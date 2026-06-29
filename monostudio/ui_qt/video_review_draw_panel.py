@@ -17,6 +17,8 @@ from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.style import MONOS_COLORS
 from monostudio.ui_qt.video_review_draw_stack import VideoReviewDrawStackWidget
 
+_TOOLBAR_ROW_H = 28  # align with range/marker sort row in ReviewToolsPanel
+
 
 def _icon_tool_btn(parent: QWidget, icon: str, tip: str, *, checkable: bool = True) -> QToolButton:
     btn = QToolButton(parent)
@@ -80,31 +82,29 @@ class VideoReviewDrawPanel(QWidget):
         self._active_layer_id: str | None = None
         self._edit_sync_guard = False
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 8, 12, 12)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
-        self._edit_row = QWidget(self)
-        self._edit_row.setObjectName("VideoReviewDrawEditRow")
-        edit_lay = QHBoxLayout(self._edit_row)
+        self._toolbar_row = QWidget(self)
+        self._toolbar_row.setObjectName("VideoReviewDrawToolbarRow")
+        self._toolbar_row.setFixedHeight(_TOOLBAR_ROW_H)
+        edit_lay = QHBoxLayout(self._toolbar_row)
         edit_lay.setContentsMargins(0, 0, 0, 0)
         edit_lay.setSpacing(8)
-        edit_lay.addWidget(QLabel("Edit key", self._edit_row))
-        self._edit_frame_spin = QSpinBox(self._edit_row)
+        self._edit_key_label = QLabel("Edit key", self._toolbar_row)
+        edit_lay.addWidget(self._edit_key_label)
+        self._edit_frame_spin = QSpinBox(self._toolbar_row)
         self._edit_frame_spin.setPrefix("F")
         self._edit_frame_spin.setToolTip("Keyframe frame (or drag diamond on timeline)")
         self._edit_frame_spin.valueChanged.connect(self._on_edit_frame_changed)
         edit_lay.addWidget(self._edit_frame_spin)
-        self._btn_delete_key = _icon_tool_btn(self._edit_row, "trash-2", "Delete keyframe (Del)")
+        self._btn_delete_key = _icon_tool_btn(self._toolbar_row, "trash-2", "Delete keyframe (Del)")
         self._btn_delete_key.setCheckable(False)
         self._btn_delete_key.clicked.connect(self.keyframe_delete_requested.emit)
         edit_lay.addWidget(self._btn_delete_key)
         edit_lay.addStretch(1)
-        self._edit_row.setVisible(False)
-        lay.addWidget(self._edit_row)
-
-        layers_title = QLabel("Layers", self)
-        layers_title.setObjectName("VideoReviewDrawSectionTitle")
-        lay.addWidget(layers_title)
+        lay.addWidget(self._toolbar_row)
+        self._set_keyframe_toolbar_visible(False)
 
         self._stack = VideoReviewDrawStackWidget(self)
         self._stack.layer_selected.connect(self.layer_selected.emit)
@@ -116,10 +116,21 @@ class VideoReviewDrawPanel(QWidget):
         self._stack.keyframe_hold_changed.connect(self.keyframe_hold_changed.emit)
         lay.addWidget(self._stack, 1)
 
-        hint = QLabel("Brush on video · D exit · E edit key on scrubber", self)
+        footer = QWidget(self)
+        footer.setObjectName("VideoPreviewListPanelFooter")
+        footer.setFixedHeight(64)
+        footer_lay = QVBoxLayout(footer)
+        footer_lay.setContentsMargins(0, 0, 0, 0)
+        footer_lay.setSpacing(0)
+        hint = QLabel("Brush on video · D exit · E edit key on scrubber", footer)
         hint.setObjectName("DialogHint")
         hint.setWordWrap(True)
-        lay.addWidget(hint)
+        footer_lay.addWidget(hint, 1, Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(footer, 0)
+
+    def _set_keyframe_toolbar_visible(self, visible: bool) -> None:
+        for w in (self._edit_key_label, self._edit_frame_spin, self._btn_delete_key):
+            w.setVisible(visible)
 
     def set_keyframe_edit_mode(
         self,
@@ -130,7 +141,7 @@ class VideoReviewDrawPanel(QWidget):
         max_frame: int = 0,
         layer_id: str | None = None,
     ) -> None:
-        self._edit_row.setVisible(bool(enabled))
+        self._set_keyframe_toolbar_visible(bool(enabled))
         self._stack.set_keyframe_edit_state(
             enabled=bool(enabled),
             layer_id=layer_id,

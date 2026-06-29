@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QFontMetrics, QKeyEvent, QShowEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -514,6 +514,10 @@ class VideoReviewNotePanel(QWidget):
             return
         self._entries = updated
         self._update_summary()
+        # Defer rebuild — destroying the toggle's parent card inside `toggled` can crash Qt.
+        QTimer.singleShot(0, self._finish_done_toggle)
+
+    def _finish_done_toggle(self) -> None:
         self._rebuild_list()
         self.note_added.emit()
 

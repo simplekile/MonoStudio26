@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QEvent, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCursor, QFont, QGuiApplication, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QColor, QShortcut, QWheelEvent, QAction
+from PySide6.QtCore import QByteArray, QObject, QPoint, QPointF, QRect, QRectF, QEvent, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QCursor, QFont, QGuiApplication, QImageReader, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QColor, QShortcut, QWheelEvent, QAction
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -132,9 +132,17 @@ from monostudio.ui_qt.review_playback_backend import SequenceDecodeBackend
 from monostudio.ui_qt.dialog_geometry import (
     apply_dialog_geometry,
     clamp_dialog_to_bounds,
+    fit_dialog_to_media,
+    geometry_valid_on_screen,
     main_window_bounds,
+    media_window_size_limits,
 )
-from monostudio.ui_qt.frameless_resize import handle_native_event, resize_edges_at
+from monostudio.ui_qt.frameless_resize import (
+    FramelessResizeHandles,
+    _cursor_for_edges,
+    handle_native_event,
+    resize_edges_at,
+)
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.popup_position import position_popup_above_rect, position_popup_near_anchor, position_popup_near_global_point
 from monostudio.ui_qt.review_tools_panel import (
@@ -167,6 +175,7 @@ from monostudio.ui_qt.video_preview_scrubber import VideoPreviewScrubber
 from monostudio.ui_qt.video_review_switch_popup import VideoReviewSwitchItem, VideoReviewSwitchPopup
 from monostudio.ui_qt.video_preview_settings import (
     PROXY_SCALE_STEPS,
+    geometry_key_for_profile,
     read_review_note_rail_open,
     read_review_note_rail_width,
     read_review_tool_mode,
@@ -183,6 +192,7 @@ from monostudio.ui_qt.video_preview_settings import (
     write_review_tool_mode,
     write_review_tools_panel_width,
     write_review_workspace,
+    write_video_preview_geometry,
     write_video_preview_loop,
     write_video_preview_always_on_top,
     write_video_preview_playback_speed,
@@ -232,6 +242,9 @@ _FULLSCREEN_CHROME_HIDE_MS = 700
 _DIALOG_BORDER_INSET = 1  # top-only root inset; sides/bottom flush under raised border
 _VIDEO_NATIVE_CLIP_BOTTOM = 1  # mpv / QVideoWidget HWND bleed above timeline divider
 _PREVIEW_TIMELINE_H = 64  # ~80% of prior 80px chrome — scrubber fills block height
+_PREVIEW_FOOTER_H = 32
+_PREVIEW_TRANSPORT_FALLBACK_H = 44
+_PREVIEW_SPLITTER_HANDLE_TOTAL = 12
 _SHELL_RADIUS = 12  # match MonosDialog outer corner radius
 _FOOTER_CHROME = "#1e2124"
 _SHELL_LINE = QColor(255, 255, 255, 15)
@@ -445,6 +458,26 @@ class _KeyframeProbeSignaler(QObject):
 
 class _SequenceListSignaler(QObject):
     ready = Signal(int, object)  # token, list[Path]
+
+
+class _VideoProbeSignaler(QObject):
+    ready = Signal(int, object, object)  # token, path, VideoInfo | None
+
+
+class _VideoProbeRunnable(QRunnable):
+    def __init__(self, path: Path, token: int, signaler: _VideoProbeSignaler) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._path = path
+        self._token = token
+        self._signaler = signaler
+
+    def run(self) -> None:
+        try:
+            info = probe_video(self._path)
+        except Exception:
+            info = None
+        self._signaler.ready.emit(self._token, self._path, info)
 
 
 class _SequenceListRunnable(QRunnable):
@@ -693,6 +726,10 @@ class VideoPreviewDialog(MonosDialog):
                     fps=review_req.fps,
                     entity_path=review_req.entity_path,
                     department_id=review_req.department_id,
+                    department_label=review_req.department_label,
+                    work_path=review_req.work_path,
+                    work_file_path=review_req.work_file_path,
+                    source_label=review_req.source_label,
                 )
         else:
             review_req = request
@@ -709,8 +746,9 @@ class VideoPreviewDialog(MonosDialog):
         self._entity_sources: list = []
         self._settings = settings
         self._geometry_applied = False
+        self._geometry_restored_from_settings = False
         self._locked_size: QSize | None = None
-        self.setMinimumSize(1280, 720)
+        self.setMinimumSize(640, 480)
         self._sequence_frames: list[Path] = []
         self._sequence_folder: Path | None = None
         self._seq_backend: SequenceDecodeBackend | None = None
@@ -840,12 +878,22 @@ class VideoPreviewDialog(MonosDialog):
         self._onion_plate_signaler.ready.connect(self._on_onion_plates_ready)
 
         self._sequence_load_token = 0
+        self._video_load_token = 0
+        self._pending_initial_load = True
+        self._media_loading_active = False
+        self._viewer_plate_geom_guard = False
+        self._chrome_raise_guard = False
         self._draw_keyframe_select_guard = False
         self._in_programmatic_seek = False
         self._last_playhead_ui_frame: int | None = None
         self._sequence_list_signaler = _SequenceListSignaler(self)
         self._sequence_list_signaler.ready.connect(
             self._on_sequence_frames_listed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._video_probe_signaler = _VideoProbeSignaler(self)
+        self._video_probe_signaler.ready.connect(
+            self._on_video_probe_ready,
             Qt.ConnectionType.QueuedConnection,
         )
 
@@ -889,10 +937,7 @@ class VideoPreviewDialog(MonosDialog):
         self._bind_shortcuts()
         self.apply_profile(self._context)
         self._restore_workspace_from_settings()
-        if self._media_kind == ReviewMediaKind.sequence:
-            QTimer.singleShot(0, self._deferred_initial_sequence_load)
-        else:
-            self.load_media(self._review_request)
+        QTimer.singleShot(0, self._deferred_initial_media_load)
         self._apply_dialog_geometry_once()
         QTimer.singleShot(0, self._refresh_title_elide)
         self.finished.connect(lambda _: self.closed.emit())
@@ -910,7 +955,10 @@ class VideoPreviewDialog(MonosDialog):
         )
         placeholder.release()
 
-    def _deferred_initial_sequence_load(self) -> None:
+    def _deferred_initial_media_load(self) -> None:
+        if self._closing or not self._pending_initial_load:
+            return
+        self._pending_initial_load = False
         if self._review_request is not None:
             self.load_media(self._review_request)
 
@@ -930,6 +978,11 @@ class VideoPreviewDialog(MonosDialog):
         self._btn_close = self._top_bar.close_btn
         self._btn_close.clicked.connect(self.close)
         self._review_switch_popup: VideoReviewSwitchPopup | None = None
+        self._resize_handles = FramelessResizeHandles(
+            self,
+            top_chrome_h=_PREVIEW_TOPBAR_H + _DIALOG_BORDER_INSET,
+            top_right_reserve=_PREVIEW_CLOSE_BTN + _PREVIEW_CLOSE_INSET + _PREVIEW_CHROME_PAD_H,
+        )
         self.setMouseTracking(True)
 
         body = QSplitter(Qt.Orientation.Horizontal, self)
@@ -1338,9 +1391,9 @@ class VideoPreviewDialog(MonosDialog):
         footer_lay = QHBoxLayout(self._footer)
         footer_lay.setContentsMargins(
             _PREVIEW_CHROME_PAD_H,
-            9,
+            7,
             _PREVIEW_CHROME_PAD_H,
-            9,
+            7,
         )
         footer_lay.setSpacing(12)
         footer_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
@@ -1348,7 +1401,7 @@ class VideoPreviewDialog(MonosDialog):
         footer_lay.addWidget(self._footer_hint, 1)
         self._footer_label = QLabel("", self._footer)
         self._footer_label.setObjectName("VideoPreviewFooterLog")
-        self._footer_label.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Medium))
+        self._footer_label.setFont(monos_font("JetBrains Mono", 10, QFont.Weight.Medium))
         self._footer_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._footer_label.setWordWrap(False)
         self._footer_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1356,9 +1409,9 @@ class VideoPreviewDialog(MonosDialog):
         footer_lay.addWidget(self._footer_label, 0)
         main_lay.addWidget(self._footer, 0)
 
-        # Stabilize footer height (24px keycaps + 8px vertical padding).
-        self._footer.setFixedHeight(42)
-        self._footer_label.setFixedHeight(24)
+        # Stabilize footer height (18px keycaps + 7px vertical padding).
+        self._footer.setFixedHeight(_PREVIEW_FOOTER_H)
+        self._footer_label.setFixedHeight(18)
 
         body.addWidget(self._main_column)
 
@@ -1405,6 +1458,7 @@ class VideoPreviewDialog(MonosDialog):
             self._toggle_active_draw_keyframe_visibility
         )
         body.addWidget(self._tools_panel)
+        self._tools_panel.set_layout_width(self._tools_panel_saved_w)
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 1)
         body.setStretchFactor(2, 0)
@@ -1437,6 +1491,8 @@ class VideoPreviewDialog(MonosDialog):
             self._note_rail_saved_w = sizes[0]
         if self._tools_panel.workspace() == ReviewWorkspace.tools and sizes[2] >= TOOLS_PANEL_MIN_W:
             self._tools_panel_saved_w = sizes[2]
+            self._tools_panel.set_layout_width(sizes[2])
+            self._tools_panel.unpin_width()
         self._schedule_side_panel_layout_persist()
 
     def _schedule_side_panel_layout_persist(self) -> None:
@@ -1484,6 +1540,25 @@ class VideoPreviewDialog(MonosDialog):
         splitter.blockSignals(True)
         splitter.setSizes([left, center, right])
         splitter.blockSignals(False)
+        if right >= TOOLS_PANEL_MIN_W:
+            self._tools_panel.set_layout_width(right)
+
+    def _preserve_tools_panel_splitter_width(self) -> None:
+        splitter = getattr(self, "_body_splitter", None)
+        if splitter is None or self._tools_panel.workspace() != ReviewWorkspace.tools:
+            return
+        want = self._tools_panel_saved_w
+        self._tools_panel.pin_width(want)
+        sizes = list(splitter.sizes())
+        if len(sizes) >= 3:
+            total = max(sum(sizes), splitter.width())
+            if sizes[2] != want:
+                sizes[2] = want
+                sizes[1] = max(240, total - sizes[0] - want)
+                splitter.blockSignals(True)
+                splitter.setSizes(sizes)
+                splitter.blockSignals(False)
+        self._tools_panel.unpin_width()
 
     def _is_sequence_mode(self) -> bool:
         return self._media_kind == ReviewMediaKind.sequence
@@ -1520,6 +1595,7 @@ class VideoPreviewDialog(MonosDialog):
 
     def load_media(self, request: ReviewOpenRequest) -> None:
         """Load or switch review media without closing the dialog."""
+        self._pending_initial_load = False
         self._last_playhead_ui_frame = None
         prev_key = self._media_key()
         next_key = request.media_key
@@ -1539,6 +1615,8 @@ class VideoPreviewDialog(MonosDialog):
         self._work_file_path = request.work_file_path
         self._source_label = request.source_label
         if request.media_kind == ReviewMediaKind.sequence:
+            self._video_load_token += 1
+            self._show_media_loading(False)
             self._path = None
             self._paths = []
             self._sequence_frames = list(request.frames or ())
@@ -1547,7 +1625,8 @@ class VideoPreviewDialog(MonosDialog):
             self._load_sequence(request)
         else:
             self._sequence_load_token += 1
-            self._show_sequence_loading(False)
+            self._video_load_token += 1
+            self._show_media_loading(False)
             assert request.path is not None
             self._sequence_frames = []
             self._sequence_folder = None
@@ -1600,7 +1679,7 @@ class VideoPreviewDialog(MonosDialog):
         self._sequence_folder = folder
         self._release_sequence_backend()
         self.setWindowTitle(f"{folder.name} · sequence")
-        self._show_sequence_loading(True)
+        self._show_media_loading(True, "Loading sequence…")
         precached = list(request.frames or ()) or None
         QThreadPool.globalInstance().start(
             _SequenceListRunnable(
@@ -1611,9 +1690,12 @@ class VideoPreviewDialog(MonosDialog):
             )
         )
 
-    def _show_sequence_loading(self, loading: bool) -> None:
+    def _show_media_loading(self, loading: bool, label: str | None = None) -> None:
+        self._media_loading_active = loading
         if not hasattr(self, "_sequence_loading_overlay"):
             return
+        if label and hasattr(self, "_sequence_loading_label"):
+            self._sequence_loading_label.setText(label)
         self._sequence_loading_overlay.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents,
             not loading,
@@ -1636,7 +1718,7 @@ class VideoPreviewDialog(MonosDialog):
         if token != self._sequence_load_token:
             return
         if not isinstance(frames, list) or not frames:
-            self._show_sequence_loading(False)
+            self._show_media_loading(False)
             self._status_log = "No frames in sequence folder"
             self._update_footer()
             return
@@ -1658,7 +1740,7 @@ class VideoPreviewDialog(MonosDialog):
             return
         assert request.sequence_folder is not None
         if not frames:
-            self._show_sequence_loading(False)
+            self._show_media_loading(False)
             return
         self._sequence_frames = frames
         n = len(frames)
@@ -1688,9 +1770,14 @@ class VideoPreviewDialog(MonosDialog):
         self._attach_sequence_display()
         self._sync_sequence_playback_loop()
         self._seek_frame(0)
-        self._show_sequence_loading(False)
+        self._show_media_loading(False)
+        if self._work_path is not None and folder is not None:
+            from monostudio.core.review_media import _sequence_source_label_for_folder
+
+            self._source_label = _sequence_source_label_for_folder(self._work_path, folder, n)
         self._update_top_bar()
         self._update_footer()
+        QTimer.singleShot(0, self._apply_media_geometry_when_ready)
         QTimer.singleShot(
             0,
             lambda t=token, r=request, f=frames: self._complete_sequence_metadata(r, f, t),
@@ -2004,27 +2091,43 @@ class VideoPreviewDialog(MonosDialog):
             )
             self._clamp_viewer_plate_pan()
         self._apply_viewer_plate_geometry()
-        self._refresh_footer_hint()
 
     def _apply_viewer_plate_geometry(self) -> None:
-        if not hasattr(self, "_surface"):
+        if not hasattr(self, "_surface") or self._viewer_plate_geom_guard:
             return
         rect = self._viewer_plate_geometry()
         if rect.isEmpty():
             return
-        self._surface.setGeometry(rect)
-        if hasattr(self, "_onion_layer"):
-            self._onion_layer.setGeometry(rect)
-        if hasattr(self, "_draw_overlay"):
-            self._draw_overlay.setGeometry(rect)
-        self._sync_viewer_viewport_transform()
-        host = self._viewer_wrap_content_rect()
-        host_size = QSize(host.width(), host.height())
-        if self._is_sequence_mode() and self._seq_backend is not None:
-            self._seq_backend.resize_display()
-        elif self._video_attached and host_size != self._viewer_last_host_size:
-            self._viewer_last_host_size = host_size
-            self._backend.layout_video()
+        surface_rect = self._surface.geometry()
+        onion_rect = (
+            self._onion_layer.geometry()
+            if hasattr(self, "_onion_layer") and self._onion_layer is not None
+            else rect
+        )
+        draw_rect = (
+            self._draw_overlay.geometry()
+            if hasattr(self, "_draw_overlay") and self._draw_overlay is not None
+            else rect
+        )
+        if surface_rect == rect and onion_rect == rect and draw_rect == rect:
+            return
+        self._viewer_plate_geom_guard = True
+        try:
+            self._surface.setGeometry(rect)
+            if hasattr(self, "_onion_layer"):
+                self._onion_layer.setGeometry(rect)
+            if hasattr(self, "_draw_overlay"):
+                self._draw_overlay.setGeometry(rect)
+            self._sync_viewer_viewport_transform()
+            host = self._viewer_wrap_content_rect()
+            host_size = QSize(host.width(), host.height())
+            if self._is_sequence_mode() and self._seq_backend is not None:
+                self._seq_backend.resize_display()
+            elif self._video_attached and host_size != self._viewer_last_host_size:
+                self._viewer_last_host_size = host_size
+                self._backend.layout_video()
+        finally:
+            self._viewer_plate_geom_guard = False
 
     def _mouse_event_pos_in_wrap(self, event: QMouseEvent, watched: QObject) -> QPointF:
         if self._video_pan_active or watched is self._surface_wrap:
@@ -2052,7 +2155,6 @@ class VideoPreviewDialog(MonosDialog):
             self._backend.attach_to_widget(self._surface)
             self._video_attached = True
         self._backend.layout_video()
-        QTimer.singleShot(0, self._sync_native_video_zorder)
 
     def _apply_dialog_content_inset(self) -> None:
         if self._fullscreen:
@@ -2069,59 +2171,59 @@ class VideoPreviewDialog(MonosDialog):
         """No full-dialog border widget — it occludes embedded mpv on Windows."""
         self._raise_video_chrome_overlays()
 
-    def _raise_video_chrome_overlays(self) -> None:
-        if self._hud:
-            self._hud.raise_()
-        if hasattr(self, "_draw_brush_strip") and self._draw_brush_strip.isVisible():
-            self._position_draw_brush_strip()
-            self._draw_brush_strip.raise_()
-        if hasattr(self, "_onion_layer"):
-            self._sync_viewport_overlay_geometry()
-            self._onion_layer.raise_()
-        if hasattr(self, "_draw_overlay"):
-            self._sync_viewport_overlay_geometry()
-            self._draw_overlay.raise_()
-        overlay = getattr(self, "_proxy_build_overlay", None)
-        if overlay and overlay.isVisible():
-            overlay.raise_()
-        seq_overlay = getattr(self, "_sequence_loading_overlay", None)
-        if seq_overlay and seq_overlay.isVisible():
-            self._position_sequence_loading_overlay()
-            seq_overlay.raise_()
+    def _raise_interactive_chrome(self) -> None:
+        """Keep controls above edge resize handles and embedded native video."""
+        for w in (
+            getattr(self, "_top_bar", None),
+            getattr(self, "_transport", None),
+            getattr(self, "_timeline_block", None),
+            getattr(self, "_scrubber", None),
+            getattr(self, "_footer", None),
+            getattr(self, "_body_splitter", None),
+        ):
+            if w is not None and w.isVisible():
+                w.raise_()
         btn = getattr(self, "_btn_close", None)
         if btn is not None and btn.isVisible():
             btn.raise_()
-        if self._top_bar.isVisible():
-            self._top_bar.raise_()
-        self._sync_native_video_zorder()
 
-    def _sync_native_video_zorder(self) -> None:
-        if sys.platform != "win32" or self._is_sequence_mode():
+    def _sync_frameless_resize_handles(self) -> None:
+        if not hasattr(self, "_resize_handles"):
             return
-        surface = getattr(self, "_surface", None)
-        if surface is None or not surface.isVisible():
+        if self._is_sequence_mode() or self._fullscreen or self.isMaximized():
+            for handle, _ in self._resize_handles._handles:
+                handle.hide()
             return
+        self._resize_handles.sync_geometry()
+        self._resize_handles.raise_handles()
+
+    def _raise_video_chrome_overlays(self) -> None:
+        if self._chrome_raise_guard:
+            return
+        self._chrome_raise_guard = True
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            hwnd_top = wintypes.HWND(0)
-            flags = 0x0002 | 0x0001 | 0x0010 | 0x0040  # NOMOVE | NOSIZE | NOACTIVATE | SHOWWINDOW
-
-            def _raise_hwnd(hwnd: int, _lparam: int) -> bool:
-                if user32.IsWindowVisible(hwnd):
-                    user32.SetWindowPos(hwnd, hwnd_top, 0, 0, 0, 0, flags)
-                return True
-
-            parent = int(surface.winId())
-            if not parent:
-                return
-            user32.SetWindowPos(parent, hwnd_top, 0, 0, 0, 0, flags)
-            enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(_raise_hwnd)
-            user32.EnumChildWindows(parent, enum_proc, 0)
-        except Exception:
-            pass
+            if self._hud:
+                self._hud.raise_()
+            if hasattr(self, "_draw_brush_strip") and self._draw_brush_strip.isVisible():
+                self._position_draw_brush_strip()
+                self._draw_brush_strip.raise_()
+            if hasattr(self, "_onion_layer") and self._onion_layer.isVisible():
+                self._sync_viewport_overlay_geometry()
+                self._onion_layer.raise_()
+            if hasattr(self, "_draw_overlay") and self._draw_overlay.isVisible():
+                self._sync_viewport_overlay_geometry()
+                self._draw_overlay.raise_()
+            overlay = getattr(self, "_proxy_build_overlay", None)
+            if overlay and overlay.isVisible():
+                overlay.raise_()
+            seq_overlay = getattr(self, "_sequence_loading_overlay", None)
+            if seq_overlay and seq_overlay.isVisible():
+                self._position_sequence_loading_overlay()
+                seq_overlay.raise_()
+            if not self._is_sequence_mode():
+                self._raise_interactive_chrome()
+        finally:
+            self._chrome_raise_guard = False
 
     def _preview_caption_rect(self) -> QRect:
         if self._fullscreen or not self._top_bar.isVisible():
@@ -2138,7 +2240,7 @@ class VideoPreviewDialog(MonosDialog):
         return rects
 
     def nativeEvent(self, eventType, message):  # noqa: N802
-        if not self._fullscreen:
+        if not self._fullscreen and not self._is_sequence_mode():
             handled = handle_native_event(
                 self,
                 eventType,
@@ -2153,6 +2255,7 @@ class VideoPreviewDialog(MonosDialog):
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if (
             not self._fullscreen
+            and not self._is_sequence_mode()
             and event.button() == Qt.MouseButton.LeftButton
         ):
             edges = resize_edges_at(self, event.position().toPoint())
@@ -2167,9 +2270,10 @@ class VideoPreviewDialog(MonosDialog):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if not self._fullscreen:
-            if resize_edges_at(self, event.position().toPoint()) is not None:
-                self.setCursor(Qt.CursorShape.SizeAllCursor)
+        if not self._fullscreen and not self._is_sequence_mode():
+            edges = resize_edges_at(self, event.position().toPoint())
+            if edges is not None:
+                self.setCursor(_cursor_for_edges(edges))
             else:
                 self.unsetCursor()
         super().mouseMoveEvent(event)
@@ -2307,9 +2411,11 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_video_backend()
         self._position_hud()
         self._position_sequence_loading_overlay()
-        self._raise_video_chrome_overlays()
-        QTimer.singleShot(0, self._sync_native_video_zorder)
-        QTimer.singleShot(80, self._raise_video_chrome_overlays)
+        if not self._is_sequence_mode():
+            self._raise_video_chrome_overlays()
+            QTimer.singleShot(80, self._raise_video_chrome_overlays)
+        if not self._is_sequence_mode() and self.isVisible():
+            QTimer.singleShot(0, self._prime_playback)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if self._fullscreen and event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
@@ -2323,7 +2429,11 @@ class VideoPreviewDialog(MonosDialog):
             and isinstance(event, QWheelEvent)
         ):
             gpos = event.globalPosition().toPoint()
-            if self._wheel_should_route_to_player(gpos, watched):
+            if self._is_sequence_mode():
+                if self._cursor_in_surface_wrap(gpos):
+                    if self._filter_video_surface_wheel(event, self._surface_wrap):
+                        return True
+            elif self._wheel_should_route_to_player(gpos, watched):
                 if self._cursor_in_surface_wrap(gpos):
                     if self._filter_video_surface_wheel(event, self._surface_wrap):
                         return True
@@ -2367,12 +2477,13 @@ class VideoPreviewDialog(MonosDialog):
                     self._set_footer_pointer_zone("video")
             elif event.type() == QEvent.Type.Leave:
                 if not self._scrubber.underMouse():
-                    self._set_footer_pointer_zone("")
+                    QTimer.singleShot(0, self._defer_clear_footer_video_zone)
             elif event.type() == QEvent.Type.Resize:
-                self._apply_viewer_plate_geometry()
-                self._sync_video_backend()
-                self._position_hud()
-                self._raise_video_overlays()
+                if self._is_sequence_mode():
+                    self._position_hud()
+                else:
+                    self._apply_viewer_plate_geometry()
+                    self._position_hud()
         vol_slider = getattr(self, "_volume_slider", None)
         vol_icon = getattr(self, "_volume_icon", None)
         if vol_slider is not None and watched in (vol_slider, vol_icon):
@@ -2409,6 +2520,7 @@ class VideoPreviewDialog(MonosDialog):
         factor = math.exp(self._viewer_wheel_log_accum)
         self._viewer_wheel_log_accum = 0.0
         self._zoom_viewer_plate(factor, self._cursor_pos_in_surface_wrap())
+        self._refresh_footer_hint()
 
     def _filter_video_surface_mouse(self, event: QEvent, watched: QObject) -> bool | None:
         surface = self._surface
@@ -2762,6 +2874,7 @@ class VideoPreviewDialog(MonosDialog):
         self._schedule_side_panel_layout_persist()
 
     def _on_tools_mode_changed(self, mode_name: str) -> None:
+        self._preserve_tools_panel_splitter_width()
         if self._settings is not None:
             if mode_name == ReviewToolMode.note.value:
                 mode_name = ReviewToolMode.ranges.value
@@ -2772,6 +2885,7 @@ class VideoPreviewDialog(MonosDialog):
         self._sync_transport_tool_controls()
         self._refresh_footer_hint()
         self._sync_scrubber_timeline_display()
+        QTimer.singleShot(0, self._preserve_tools_panel_splitter_width)
 
     def _cycle_workspace(self) -> None:
         self._tools_panel.cycle_workspace()
@@ -2964,6 +3078,8 @@ class VideoPreviewDialog(MonosDialog):
         return max(1, min(60, int(round(self._fps()))))
 
     def _refresh_entity_sources(self) -> None:
+        if self._media_loading_active:
+            return
         if self._context != PreviewContext.entity or self._work_path is None:
             self._entity_sources = []
             return
@@ -2986,7 +3102,6 @@ class VideoPreviewDialog(MonosDialog):
         current_key = str(self._media_key()).casefold() if self._media_key() is not None else ""
 
         if self._context == PreviewContext.entity and self._work_path is not None:
-            self._refresh_entity_sources()
             for src in self._entity_sources:
                 key = str(src.request.media_key).casefold()
                 if key in seen:
@@ -3030,6 +3145,12 @@ class VideoPreviewDialog(MonosDialog):
         return items
 
     def _show_title_picker_menu(self) -> None:
+        if (
+            self._context == PreviewContext.entity
+            and self._work_path is not None
+            and not self._entity_sources
+        ):
+            self._refresh_entity_sources()
         items = self._collect_switch_items()
         if len(items) <= 1:
             return
@@ -3063,8 +3184,17 @@ class VideoPreviewDialog(MonosDialog):
             parts.append(self._path.name)
         return " · ".join(parts)
 
+    def _schedule_entity_sources_refresh(self) -> None:
+        if self._context != PreviewContext.entity or self._work_path is None:
+            return
+        if self._media_loading_active:
+            return
+        self._refresh_entity_sources()
+
     def _update_top_bar(self) -> None:
         if self._context == PreviewContext.entity and self._entity_path is not None:
+            if self._work_path is not None:
+                self._schedule_entity_sources_refresh()
             n_sources = len(self._entity_sources)
             self._file_counter.setText("")
             self._file_counter.setVisible(False)
@@ -3211,6 +3341,11 @@ class VideoPreviewDialog(MonosDialog):
             return
         self._footer_pointer_zone = zone
         self._refresh_footer_hint()
+
+    def _defer_clear_footer_video_zone(self) -> None:
+        if self._surface_wrap.underMouse() or self._scrubber.underMouse():
+            return
+        self._set_footer_pointer_zone("")
 
     def _refresh_footer_hint(self) -> None:
         if not hasattr(self, "_footer_hint"):
@@ -3601,6 +3736,7 @@ class VideoPreviewDialog(MonosDialog):
             self._restore_locked_size()
             self._sync_body_splitter_sizes()
         else:
+            self._capture_window_size_snapshot()
             self._fullscreen = True
             self._fs_bottom_revealed = False
             self._fs_right_revealed = False
@@ -3617,6 +3753,7 @@ class VideoPreviewDialog(MonosDialog):
         self._position_hud()
         self._position_close_btn()
         self._raise_video_overlays()
+        self._sync_frameless_resize_handles()
 
     def _resolve_overlay_host(self) -> QWidget | None:
         anchor = getattr(self, "_geometry_anchor", None)
@@ -3717,6 +3854,76 @@ class VideoPreviewDialog(MonosDialog):
     def _main_bounds(self) -> QRect:
         return main_window_bounds(self._geometry_anchor)
 
+    def _side_panel_width_extra(self) -> int:
+        extra = _PREVIEW_SPLITTER_HANDLE_TOTAL
+        if hasattr(self, "_note_rail") and self._note_rail.is_open():
+            extra += self._note_rail_saved_w
+        if (
+            hasattr(self, "_tools_panel")
+            and self._tools_panel.workspace() == ReviewWorkspace.tools
+        ):
+            extra += self._tools_panel_saved_w
+        return extra
+
+    def _dialog_chrome_overhead(self) -> tuple[int, int]:
+        transport_h = _PREVIEW_TRANSPORT_FALLBACK_H
+        if hasattr(self, "_transport"):
+            hinted = self._transport.sizeHint().height()
+            if hinted > 0:
+                transport_h = hinted
+        chrome_h = (
+            _DIALOG_BORDER_INSET
+            + _PREVIEW_TOPBAR_H
+            + 1
+            + _PREVIEW_TIMELINE_H
+            + _VIDEO_NATIVE_CLIP_BOTTOM
+            + transport_h
+            + _PREVIEW_FOOTER_H
+        )
+        return self._side_panel_width_extra(), chrome_h
+
+    def _media_pixel_size(self) -> QSize | None:
+        if self._info is not None and self._info.width > 0 and self._info.height > 0:
+            return QSize(self._info.width, self._info.height)
+        if self._sequence_frames:
+            reader = QImageReader(str(self._sequence_frames[0]))
+            size = reader.size()
+            if size.isValid() and size.width() > 0 and size.height() > 0:
+                return size
+        return None
+
+    def _update_window_size_limits(self, bounds: QRect) -> None:
+        media = self._media_pixel_size()
+        chrome_w, chrome_h = self._dialog_chrome_overhead()
+        min_size, max_size = media_window_size_limits(
+            bounds,
+            media_width=media.width() if media is not None else 0,
+            media_height=media.height() if media is not None else 0,
+            chrome_width=chrome_w,
+            chrome_height=chrome_h,
+            margin=4,
+        )
+        self.setMinimumSize(min_size)
+        self.setMaximumSize(max_size.width(), max_size.height())
+
+    def _fit_dialog_to_current_media(self, bounds: QRect | None = None) -> None:
+        media = self._media_pixel_size()
+        if media is None:
+            return
+        host_bounds = bounds or self._main_bounds()
+        self._update_window_size_limits(host_bounds)
+        chrome_w, chrome_h = self._dialog_chrome_overhead()
+        fit_dialog_to_media(
+            self,
+            host_bounds,
+            media_width=media.width(),
+            media_height=media.height(),
+            chrome_width=chrome_w,
+            chrome_height=chrome_h,
+            margin=4,
+        )
+        self._capture_window_size_snapshot()
+
     def _restore_locked_size(self) -> None:
         if self._locked_size is None:
             return
@@ -3725,23 +3932,53 @@ class VideoPreviewDialog(MonosDialog):
         x = bounds.x() + max(0, (bounds.width() - w) // 2)
         y = bounds.y() + max(0, (bounds.height() - h) // 2)
         self.setGeometry(x, y, w, h)
-        self.setFixedSize(self._locked_size)
+        self._update_window_size_limits(bounds)
+
+    def _capture_window_size_snapshot(self) -> None:
+        if not self._fullscreen:
+            self._locked_size = QSize(self.width(), self.height())
 
     def _apply_dialog_geometry_once(self) -> None:
         if self._geometry_applied:
             return
         self._geometry_applied = True
+        if hasattr(self, "_body_splitter"):
+            self._sync_body_splitter_sizes()
         bounds = self._main_bounds()
-        self._locked_size = apply_dialog_geometry(
-            None,
-            "",
-            self,
-            bounds=bounds,
-            default_fraction=self._review_request.geometry_fraction,
-            min_size=QSize(self.minimumWidth(), self.minimumHeight()),
-            lock_size=True,
-            margin=4,
-        )
+        margin = 4
+        geo_key = geometry_key_for_profile(self._profile_key)
+        restored = False
+        if self._settings is not None:
+            raw = self._settings.value(geo_key)
+            if isinstance(raw, QByteArray) and len(raw) > 0:
+                self.restoreGeometry(bytes(raw))
+                restored = True
+        self._geometry_restored_from_settings = restored
+        self._update_window_size_limits(bounds)
+        if restored and geometry_valid_on_screen(self, bounds):
+            clamp_dialog_to_bounds(self, bounds, margin=margin)
+        elif self._media_pixel_size() is not None:
+            self._fit_dialog_to_current_media(bounds)
+            return
+        else:
+            apply_dialog_geometry(
+                self._settings,
+                geo_key,
+                self,
+                bounds=bounds,
+                default_fraction=self._review_request.geometry_fraction,
+                min_size=QSize(self.minimumWidth(), self.minimumHeight()),
+                lock_size=False,
+                margin=margin,
+            )
+        self._capture_window_size_snapshot()
+
+    def _apply_media_geometry_when_ready(self) -> None:
+        """Sequence loads async — fit to first frame once dimensions are known."""
+        if self._geometry_restored_from_settings or self._media_pixel_size() is None:
+            return
+        self._fit_dialog_to_current_media()
+        self._sync_frameless_resize_handles()
 
     def set_pending_time_anchor(self, href: str | None) -> None:
         h = (href or "").strip()
@@ -3790,11 +4027,12 @@ class VideoPreviewDialog(MonosDialog):
             else:
                 self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self._apply_dialog_geometry_once()
+        self._update_window_size_limits(self._main_bounds())
         self._update_scrub_seek_interval()
         QTimer.singleShot(0, self._deferred_video_attach)
-        QTimer.singleShot(0, self._prime_playback)
         self._refresh_title_elide()
         QTimer.singleShot(0, self._position_close_btn)
+        self._sync_frameless_resize_handles()
 
     def _position_close_btn(self) -> None:
         btn = getattr(self, "_btn_close", None)
@@ -3823,6 +4061,7 @@ class VideoPreviewDialog(MonosDialog):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        self._capture_window_size_snapshot()
         if self._is_sequence_mode() and self._seq_backend is not None:
             self._seq_backend.resize_display()
         elif self._video_attached:
@@ -3833,7 +4072,7 @@ class VideoPreviewDialog(MonosDialog):
         self._refresh_title_elide()
         self._sync_viewport_overlay_geometry()
         self._raise_video_overlays()
-        self.raise_border_overlay()
+        self._sync_frameless_resize_handles()
 
     def _position_proxy_overlay(self) -> None:
         overlay = getattr(self, "_proxy_build_overlay", None)
@@ -3946,6 +4185,11 @@ class VideoPreviewDialog(MonosDialog):
             write_video_preview_volume(self._settings, self._volume)
             write_video_preview_loop(self._settings, self._loop_playback)
             write_video_preview_always_on_top(self._settings, self._window_always_on_top)
+            write_video_preview_geometry(
+                self._settings,
+                bytes(self.saveGeometry()),
+                profile=self._profile_key,
+            )
         self.hide()
         self._shutdown_embedded_video()
         _hide_native_qt_window(self)
@@ -3985,7 +4229,6 @@ class VideoPreviewDialog(MonosDialog):
         self._status_log = ""
         self._hover_key_frames = []
         self._reset_viewer_plate_transform()
-        self._info = probe_video(path)
         self._ranges = []
         self._published_ranges = []
         self._markers = []
@@ -4000,8 +4243,28 @@ class VideoPreviewDialog(MonosDialog):
         self._range_edit_unlocked = False
         self._draft_in = None
         self._draft_out = None
+        self._info = None
         parent_hint = path.parent.name
         self.setWindowTitle(f"{path.name} · {parent_hint}")
+        self._update_top_bar()
+        self._update_footer()
+        self._show_media_loading(True, "Loading video…")
+        self._video_load_token += 1
+        token = self._video_load_token
+        self._hover_pool.start(_VideoProbeRunnable(path, token, self._video_probe_signaler))
+
+    def _on_video_probe_ready(self, token: int, path: object, info: object) -> None:
+        if token != self._video_load_token:
+            return
+        if not isinstance(path, Path) or path != self._path:
+            return
+        try:
+            self._apply_video_probe_result(path, info if isinstance(info, VideoInfo) else None)
+        finally:
+            self._show_media_loading(False)
+
+    def _apply_video_probe_result(self, path: Path, info: VideoInfo | None) -> None:
+        self._info = info
         if self._info is None:
             self._hud.setText("Could not probe video")
             self._update_top_bar()
@@ -4044,7 +4307,8 @@ class VideoPreviewDialog(MonosDialog):
         self._backend.set_speed(self._speed)
         self._backend.configure_position_poll(self._info.fps)
         if self.isVisible():
-            QTimer.singleShot(80, self._prime_playback)
+            self._sync_video_backend()
+            QTimer.singleShot(0, self._prime_playback)
         self._sync_range_ui()
         self._update_top_bar()
         self._update_footer()
@@ -4056,6 +4320,9 @@ class VideoPreviewDialog(MonosDialog):
             self._update_position_display(0.0)
         self._sync_proxy_state()
         self._start_keyframe_probe()
+        bounds = self._main_bounds()
+        self._update_window_size_limits(bounds)
+        QTimer.singleShot(0, self._apply_media_geometry_when_ready)
 
     def _start_keyframe_probe(self) -> None:
         if self._is_sequence_mode():
@@ -5447,6 +5714,13 @@ class VideoPreviewDialog(MonosDialog):
         self._schedule_onion_refresh()
 
     def _sync_viewport_overlay_geometry(self) -> None:
+        if self._is_sequence_mode() and not self._viewer_is_zoomed():
+            draw = getattr(self, "_draw_overlay", None)
+            onion = getattr(self, "_onion_layer", None)
+            if not (draw is not None and draw.isVisible()) and not (
+                onion is not None and onion.isVisible()
+            ):
+                return
         self._apply_viewer_plate_geometry()
 
     def _sync_draw_overlay_state(self) -> None:

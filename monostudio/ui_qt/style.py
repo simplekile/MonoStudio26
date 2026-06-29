@@ -3560,14 +3560,14 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #a1a1aa;
             background: transparent;
             font-family: "Inter";
-            font-size: 11px;
+            font-size: 10px;
             font-weight: 500;
         }
         QLabel#VideoPreviewHintPlain {
             color: #a1a1aa;
             background: transparent;
             font-family: "Inter";
-            font-size: 11px;
+            font-size: 10px;
             font-weight: 500;
         }
         QLabel#VideoPreviewCurrentFrame {

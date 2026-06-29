@@ -10,6 +10,10 @@ from monostudio.ui_qt.popup_position import DEFAULT_POPUP_MARGIN
 
 _MIN_RESTORE_W = 400
 _MIN_RESTORE_H = 300
+_MEDIA_MIN_CONTENT_W = 320
+_MEDIA_MIN_CONTENT_H = 180
+_MEDIA_ABS_MIN_W = 640
+_MEDIA_ABS_MIN_H = 480
 
 
 def host_window_for_geometry(anchor: QWidget | None) -> QWidget | None:
@@ -104,6 +108,76 @@ def clamp_dialog_to_bounds(dialog: QWidget, bounds, *, margin: int = DEFAULT_POP
     dialog.setGeometry(x, y, w, h)
 
 
+def geometry_valid_on_screen(dialog: QWidget, bounds) -> bool:
+    return _geometry_valid_on_screen(dialog, bounds)
+
+
+def fit_dialog_to_media(
+    dialog: QWidget,
+    bounds,
+    *,
+    media_width: int,
+    media_height: int,
+    chrome_width: int,
+    chrome_height: int,
+    margin: int = DEFAULT_POPUP_MARGIN,
+) -> None:
+    """Size dialog so the viewer area matches media pixels, scaled down to fit bounds."""
+    if not bounds.isValid() or media_width <= 0 or media_height <= 0:
+        return
+    avail_w = max(_MEDIA_MIN_CONTENT_W, bounds.width() - margin * 2)
+    avail_h = max(_MEDIA_MIN_CONTENT_H, bounds.height() - margin * 2)
+    max_content_w = max(_MEDIA_MIN_CONTENT_W, avail_w - max(0, chrome_width))
+    max_content_h = max(_MEDIA_MIN_CONTENT_H, avail_h - max(0, chrome_height))
+    scale = min(1.0, max_content_w / media_width, max_content_h / media_height)
+    content_w = max(1, int(media_width * scale))
+    content_h = max(1, int(media_height * scale))
+    win_w = content_w + max(0, chrome_width)
+    win_h = content_h + max(0, chrome_height)
+    min_size, max_size = media_window_size_limits(
+        bounds,
+        media_width=media_width,
+        media_height=media_height,
+        chrome_width=chrome_width,
+        chrome_height=chrome_height,
+        margin=margin,
+    )
+    win_w = max(min_size.width(), min(win_w, max_size.width()))
+    win_h = max(min_size.height(), min(win_h, max_size.height()))
+    x = bounds.x() + max(0, (bounds.width() - win_w) // 2)
+    y = bounds.y() + max(0, (bounds.height() - win_h) // 2)
+    dialog.setGeometry(x, y, win_w, win_h)
+
+
+def media_window_size_limits(
+    bounds,
+    *,
+    media_width: int,
+    media_height: int,
+    chrome_width: int,
+    chrome_height: int,
+    margin: int = DEFAULT_POPUP_MARGIN,
+    min_content_width: int = _MEDIA_MIN_CONTENT_W,
+    min_content_height: int = _MEDIA_MIN_CONTENT_H,
+    abs_min_width: int = _MEDIA_ABS_MIN_W,
+    abs_min_height: int = _MEDIA_ABS_MIN_H,
+) -> tuple[QSize, QSize]:
+    """Return (minimumSize, maximumSize) for a review player sized around media pixels."""
+    avail_w = max(_MEDIA_MIN_CONTENT_W, bounds.width() - margin * 2) if bounds.isValid() else 1920
+    avail_h = max(_MEDIA_MIN_CONTENT_H, bounds.height() - margin * 2) if bounds.isValid() else 1080
+    if media_width > 0 and media_height > 0:
+        min_content_w = media_width if media_width < min_content_width else min_content_width
+        min_content_h = media_height if media_height < min_content_height else min_content_height
+    else:
+        min_content_w = min_content_width
+        min_content_h = min_content_height
+    min_w = max(abs_min_width, chrome_width + min_content_w)
+    min_h = max(abs_min_height, chrome_height + min_content_h)
+    max_w = max(min_w, avail_w)
+    max_h = max(min_h, avail_h)
+    return QSize(min_w, min_h), QSize(max_w, max_h)
+
+
 def _geometry_valid_on_screen(dialog: QWidget, bounds) -> bool:
     if not bounds.isValid():
         return False
@@ -147,7 +221,7 @@ def apply_dialog_geometry(
         if isinstance(raw, QByteArray) and len(raw) > 0:
             dialog.restoreGeometry(bytes(raw))
             restored = True
-    if restored and _geometry_valid_on_screen(dialog, bounds):
+    if restored and geometry_valid_on_screen(dialog, bounds):
         clamp_dialog_to_bounds(dialog, bounds)
         return None
     fit_dialog_fraction(dialog, bounds, width_frac=default_fraction, height_frac=default_fraction)

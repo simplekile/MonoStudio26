@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from PySide6.QtCore import Qt, Signal, QRectF
+from PySide6.QtCore import Qt, Signal, QRectF, QSize
 from PySide6.QtGui import QFont, QPainter, QPainterPath, QColor, QPen
 from PySide6.QtWidgets import (
     QFrame,
@@ -44,6 +44,11 @@ TOOLS_PANEL_MAX_W = 480
 TOOLS_PANEL_DEFAULT_W = _TOOLS_BODY_DEFAULT_W
 _TOOLS_BODY_RADIUS = 12
 _TOOLS_BODY_BG = "#1e2124"
+_TOOLS_PANEL_HPAD = 12
+_TOOLS_PANEL_STACK_INSETS = (_TOOLS_PANEL_HPAD, 0, _TOOLS_PANEL_HPAD, _TOOLS_PANEL_HPAD)
+_TOOLS_PANEL_NAME_ROW_H = 32
+_TOOLS_PANEL_TOOLBAR_ROW_H = 28
+_TOOLS_PANEL_FOOTER_H = 64
 
 
 class _ReviewToolsBodyFrame(QFrame):
@@ -69,6 +74,18 @@ class _ReviewToolsBodyFrame(QFrame):
         painter.setPen(QPen(QColor(255, 255, 255, 15), 1))
         painter.drawLine(0, 0, 0, int(h))
         super().paintEvent(event)
+
+
+class _ToolModeStack(QStackedWidget):
+    """Do not let the active page drive splitter width."""
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        h = self.height() if self.height() > 0 else 0
+        return QSize(0, h)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        h = self.height() if self.height() > 0 else super().sizeHint().height()
+        return QSize(0, h)
 
 
 class ReviewToolsPanel(QWidget):
@@ -106,6 +123,7 @@ class ReviewToolsPanel(QWidget):
         self._context = PreviewContext.entity
         self._workspace = ReviewWorkspace.focus
         self._tool_mode = ReviewToolMode.ranges
+        self._layout_width = TOOLS_PANEL_DEFAULT_W
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -123,6 +141,7 @@ class ReviewToolsPanel(QWidget):
 
         mode_row = QWidget(self._body_wrap)
         mode_row.setObjectName("VideoReviewModePillRow")
+        mode_row.setFixedHeight(56)
         mode_lay = QHBoxLayout(mode_row)
         mode_lay.setContentsMargins(12, 12, 12, 0)
         mode_lay.setSpacing(0)
@@ -135,13 +154,17 @@ class ReviewToolsPanel(QWidget):
             mode_row,
         )
         self._mode_pills.value_changed.connect(self._on_mode_pill_changed)
-        mode_lay.addWidget(self._mode_pills, 0, Qt.AlignmentFlag.AlignLeft)
-        mode_lay.addStretch(1)
+        mode_lay.addWidget(self._mode_pills, 1)
+        pill_bar = self._mode_pills.findChild(QWidget, "Tier3Container")
+        if pill_bar is not None:
+            pill_bar.setMinimumWidth(116)
         body_lay.addWidget(mode_row)
 
         name_wrap = QWidget(self._body_wrap)
+        name_wrap.setObjectName("VideoReviewToolsNameRow")
+        name_wrap.setFixedHeight(_TOOLS_PANEL_NAME_ROW_H)
         name_lay = QHBoxLayout(name_wrap)
-        name_lay.setContentsMargins(12, 0, 12, 0)
+        name_lay.setContentsMargins(_TOOLS_PANEL_HPAD, 0, _TOOLS_PANEL_HPAD, 0)
         name_lay.setSpacing(0)
         self._name_field = QLineEdit(name_wrap)
         self._name_field.setObjectName("DialogLineEdit")
@@ -149,9 +172,14 @@ class ReviewToolsPanel(QWidget):
         self._name_field.setFont(monos_font("Inter", 12, QFont.Weight.Normal))
         self._name_field.editingFinished.connect(self._on_name_edited)
         name_lay.addWidget(self._name_field)
+        self._name_row_spacer = QWidget(name_wrap)
+        self._name_row_spacer.setFixedHeight(_TOOLS_PANEL_NAME_ROW_H)
+        name_lay.addWidget(self._name_row_spacer)
+        self._name_row_spacer.hide()
         body_lay.addWidget(name_wrap)
 
-        self._stack = QStackedWidget(self._body_wrap)
+        self._stack = _ToolModeStack(self._body_wrap)
+        self._stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._empty = QWidget()
         self._range_panel = VideoRangeListWidget()
         self._range_panel.range_selected.connect(self.range_selected.emit)
@@ -194,11 +222,64 @@ class ReviewToolsPanel(QWidget):
         body_lay.addWidget(self._stack, 1)
         root.addWidget(self._body_wrap)
 
+        self._apply_stack_panel_insets()
+        for panel in (self._range_panel, self._marker_panel, self._draw_panel):
+            panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            panel.setMinimumWidth(0)
+
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._active_range_id: str | None = None
         self._active_marker_id: str | None = None
         self.apply_context(self._context)
         self._apply_workspace_layout()
+
+    def _apply_stack_panel_insets(self) -> None:
+        l, t, r, b = _TOOLS_PANEL_STACK_INSETS
+        for panel in (self._range_panel, self._marker_panel, self._draw_panel):
+            lay = panel.layout()
+            if lay is not None:
+                lay.setContentsMargins(l, t, r, b)
+
+    def _sync_name_row(self) -> None:
+        draw = self._tool_mode == ReviewToolMode.draw
+        self._name_field.setVisible(not draw)
+        self._name_row_spacer.setVisible(draw)
+
+    def layout_width(self) -> int:
+        return self._layout_width
+
+    def set_layout_width(self, width: int) -> None:
+        w = max(TOOLS_PANEL_MIN_W, min(TOOLS_PANEL_MAX_W, int(width)))
+        if w == self._layout_width:
+            return
+        self._layout_width = w
+        self.updateGeometry()
+
+    def pin_width(self, width: int | None = None) -> None:
+        """Lock splitter column width while pill content swaps."""
+        w = max(TOOLS_PANEL_MIN_W, min(TOOLS_PANEL_MAX_W, int(width or self._layout_width)))
+        self._layout_width = w
+        self.setFixedWidth(w)
+
+    def unpin_width(self) -> None:
+        """Restore resizable range after splitter sync."""
+        if self._workspace != ReviewWorkspace.tools:
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(0)
+            return
+        self.setMinimumWidth(TOOLS_PANEL_MIN_W)
+        self.setMaximumWidth(TOOLS_PANEL_MAX_W)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        hint = super().sizeHint()
+        if self._workspace == ReviewWorkspace.tools:
+            return QSize(self._layout_width, hint.height())
+        return QSize(0, hint.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        if self._workspace == ReviewWorkspace.tools:
+            return QSize(self._layout_width, 0)
+        return QSize(0, 0)
 
     def apply_context(self, context: PreviewContext) -> None:
         self._context = context
@@ -250,9 +331,13 @@ class ReviewToolsPanel(QWidget):
         self._tool_mode = mode
         if self._workspace != ReviewWorkspace.tools:
             self._workspace = ReviewWorkspace.tools
+        if self._workspace == ReviewWorkspace.tools:
+            self.pin_width(self._layout_width)
         self._apply_workspace_layout()
         if mode != prev_mode or self._workspace != prev_ws:
             self.tool_mode_changed.emit(self._tool_mode.value)
+        else:
+            self.unpin_width()
 
     def cycle_workspace(self) -> None:
         order = (ReviewWorkspace.focus, ReviewWorkspace.tools)
@@ -324,24 +409,24 @@ class ReviewToolsPanel(QWidget):
         show_body = self._workspace == ReviewWorkspace.tools
         self._body_wrap.setVisible(show_body)
         if show_body:
+            self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
             self.setMinimumWidth(TOOLS_PANEL_MIN_W)
             self.setMaximumWidth(TOOLS_PANEL_MAX_W)
         else:
+            self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
             self.setMinimumWidth(0)
             self.setMaximumWidth(0)
         self._sync_mode_pills()
         if show_body:
+            self._sync_name_row()
             if self._tool_mode == ReviewToolMode.ranges:
                 self._stack.setCurrentWidget(self._range_panel)
-                self._name_field.show()
                 self._name_field.setPlaceholderText("Range name (optional)")
             elif self._tool_mode == ReviewToolMode.markers:
                 self._stack.setCurrentWidget(self._marker_panel)
-                self._name_field.show()
                 self._name_field.setPlaceholderText("Marker label (optional)")
             elif self._tool_mode == ReviewToolMode.draw:
                 self._stack.setCurrentWidget(self._draw_panel)
-                self._name_field.hide()
             else:
                 self._stack.setCurrentWidget(self._empty)
-        self.updateGeometry()
+        self._stack.updateGeometry()

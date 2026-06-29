@@ -23,6 +23,8 @@ PREVIEW_MAX_SIDE_DEFAULT = 1920
 _MAX_DECODED_FRAME_CACHE = 72
 _decoded_frame_cache: OrderedDict[tuple[str, int, int], QImage] = OrderedDict()
 _decoded_frame_cache_lock = threading.Lock()
+# Parallel QImage ctor/copy deadlocks shiboken on Py3.13 — serialize Qt image work only.
+_qt_image_lock = threading.Lock()
 
 
 def _quantize_decode_max_side(max_side: int) -> int:
@@ -46,13 +48,16 @@ def _decode_cache_get(key: tuple[str, int, int]) -> QImage | None:
         if img is None or img.isNull():
             return None
         _decoded_frame_cache.move_to_end(key)
-        return QImage(img)
+    with _qt_image_lock:
+        copy = QImage(img)
+    return copy if not copy.isNull() else None
 
 
 def _decode_cache_put(key: tuple[str, int, int], img: QImage) -> None:
     if img.isNull():
         return
-    store = QImage(img)
+    with _qt_image_lock:
+        store = QImage(img)
     if store.isNull():
         return
     with _decoded_frame_cache_lock:
@@ -109,9 +114,10 @@ def _load_via_ffmpeg(path: Path, max_side: int) -> QImage | None:
         )
         if proc.returncode != 0 or not proc.stdout:
             return None
-        img = QImage()
-        if not img.loadFromData(proc.stdout):
-            return None
+        with _qt_image_lock:
+            img = QImage()
+            if not img.loadFromData(proc.stdout):
+                return None
         return img
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -119,9 +125,10 @@ def _load_via_ffmpeg(path: Path, max_side: int) -> QImage | None:
 
 def _load_preview_frame_qimage_uncached(path: Path, max_side: int) -> QImage | None:
     ext = path.suffix.lower()
-    img = QImage(str(path))
-    if not img.isNull():
-        return _scale_qimage(img, max_side)
+    with _qt_image_lock:
+        img = QImage(str(path))
+        if not img.isNull():
+            return _scale_qimage(img, max_side)
     if ext in (".dpx", ".exr", ".hdr"):
         return _load_via_ffmpeg(path, max_side)
     return None

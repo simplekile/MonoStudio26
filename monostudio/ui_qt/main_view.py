@@ -5608,6 +5608,46 @@ class MainView(QWidget):
         for k in stale_prev:
             self._note_preview_cache.pop(k, None)
 
+    def _repaint_notes_row_for_path(self, path_key: str) -> None:
+        row = self._row_for_item_id(path_key)
+        if row is not None and row >= 0:
+            if row < self._tile_model.rowCount():
+                ix = self._tile_model.index(row, 0)
+                self._tile_model.dataChanged.emit(ix, ix, [])
+            if row < self._list_model.rowCount():
+                self._list_model.refresh_row(row)
+                self._list_model.notify_thumb_column(row)
+        self._tile_view.viewport().update()
+        lv = getattr(self, "_list_view", None)
+        if lv is not None:
+            lv.viewport().update()
+
+    def prime_notes_badge_cache(
+        self,
+        item_path: Path | str,
+        *,
+        open_count: int,
+        visual_mode: str,
+        department_id: str | None = None,
+    ) -> None:
+        """Seed badge cache after an in-app save (avoids immediate disk re-read)."""
+        try:
+            path_key = str(Path(item_path).resolve())
+        except (OSError, TypeError, ValueError):
+            return
+        from monostudio.core.item_comments import normalize_note_department_id
+
+        dept = department_id if department_id is not None else self._active_department
+        dept_key = normalize_note_department_id(dept)
+        key = f"{path_key}|{dept_key}"
+        self._notes_badge_cache[key] = (int(open_count), str(visual_mode))
+        prefix = f"{path_key}|"
+        stale_prev = [k for k in self._note_preview_cache if k.startswith(prefix)]
+        for k in stale_prev:
+            self._note_preview_cache.pop(k, None)
+        self.invalidate_review_card_cache(item_path)
+        self._repaint_notes_row_for_path(path_key)
+
     def invalidate_notes_open_count_cache(self, path: Path | str | None = None) -> None:
         self.invalidate_review_card_cache(path)
         if path is None:
@@ -5615,24 +5655,17 @@ class MainView(QWidget):
             self._note_preview_cache.clear()
             self._entity_reference_cache.clear()
             self._entity_concept_cache.clear()
-        else:
-            try:
-                path_key = str(Path(path).resolve())
-            except (OSError, TypeError, ValueError):
-                return
-            self._drop_notes_badge_cache_for_path(path_key)
-            row = self._row_for_item_id(path_key)
-            if row is not None and row >= 0:
-                if row < self._tile_model.rowCount():
-                    ix = self._tile_model.index(row, 0)
-                    self._tile_model.dataChanged.emit(ix, ix, [])
-                if row < self._list_model.rowCount():
-                    self._list_model.refresh_row(row)
-                    self._list_model.notify_thumb_column(row)
-        self._tile_view.viewport().update()
-        lv = getattr(self, "_list_view", None)
-        if lv is not None:
-            lv.viewport().update()
+            self._tile_view.viewport().update()
+            lv = getattr(self, "_list_view", None)
+            if lv is not None:
+                lv.viewport().update()
+            return
+        try:
+            path_key = str(Path(path).resolve())
+        except (OSError, TypeError, ValueError):
+            return
+        self._drop_notes_badge_cache_for_path(path_key)
+        self._repaint_notes_row_for_path(path_key)
 
     def update_title(self, *, base_title: str, department: str | None) -> None:
         """

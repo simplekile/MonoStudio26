@@ -11,14 +11,14 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 from monostudio.ui_qt.style import monos_font
 
-_CAP_PX = 24
-_CAP_PAD_X = 6
-_ICON_PX = 16
-_CAP_GAP = 4
-_KEYS_ACTION_GAP = 6
-_GROUP_GAP = 20
-_BORDER_W = 2
-_CAP_RADIUS = 6
+_CAP_PX = 18
+_CAP_PAD_X = 4
+_ICON_PX = 12
+_CAP_GAP = 3
+_KEYS_ACTION_GAP = 5
+_GROUP_GAP = 14
+_BORDER_W = 1.5
+_CAP_RADIUS = 4
 
 
 class _CapKind(Enum):
@@ -143,7 +143,7 @@ def _cap_width_for_spec(spec: _CapSpec, font: QFont) -> int:
     if spec.kind in (_CapKind.MOUSE_LEFT, _CapKind.MOUSE_RIGHT, _CapKind.WHEEL):
         return _CAP_PX
     if spec.label == "␣":
-        return max(_CAP_PX, 20)
+        return max(_CAP_PX, 16)
     fm = QFontMetrics(font)
     text_w = fm.horizontalAdvance(spec.label)
     return max(_CAP_PX, text_w + _CAP_PAD_X * 2)
@@ -157,7 +157,7 @@ class _HintCap(QWidget):
         self.setObjectName("VideoPreviewHintCap")
         self.setFixedHeight(_CAP_PX)
         self._spec: _CapSpec | None = None
-        self._font = monos_font("JetBrains Mono", 11, QFont.Weight.Bold)
+        self._font = monos_font("JetBrains Mono", 10, QFont.Weight.Bold)
 
     def set_spec(self, spec: _CapSpec) -> None:
         self._spec = spec
@@ -188,7 +188,7 @@ class _HintCap(QWidget):
         if spec.label == "␣":
             painter.setPen(QPen(QColor("#e4e4e7"), 2))
             mid_y = self.height() / 2.0
-            painter.drawLine(int(5), int(mid_y), int(self.width() - 5), int(mid_y))
+            painter.drawLine(int(4), int(mid_y), int(self.width() - 4), int(mid_y))
             return
 
         painter.setFont(self._font)
@@ -201,6 +201,7 @@ class _HintGroup(QWidget):
         super().__init__(parent)
         self.setObjectName("VideoPreviewHintGroup")
         self.setFixedHeight(_CAP_PX)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self._lay = QHBoxLayout(self)
         self._lay.setContentsMargins(0, 0, 0, 0)
         self._lay.setSpacing(_CAP_GAP)
@@ -210,7 +211,7 @@ class _HintGroup(QWidget):
         self._clear()
         lab = QLabel(text, self)
         lab.setObjectName("VideoPreviewHintPlain")
-        lab.setFont(monos_font("Inter", 11, QFont.Weight.Medium))
+        lab.setFont(monos_font("Inter", 10, QFont.Weight.Medium))
         self._lay.addWidget(lab)
 
     def set_shortcut(self, token: str, action: str) -> None:
@@ -222,7 +223,7 @@ class _HintGroup(QWidget):
         self._lay.addSpacing(_KEYS_ACTION_GAP)
         act = QLabel(action, self)
         act.setObjectName("VideoPreviewHintAction")
-        act.setFont(monos_font("Inter", 11, QFont.Weight.Medium))
+        act.setFont(monos_font("Inter", 10, QFont.Weight.Medium))
         act.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self._lay.addWidget(act)
 
@@ -242,26 +243,36 @@ class VideoPreviewFooterHintBar(QWidget):
         self.setObjectName("VideoPreviewFooterHintBar")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(_CAP_PX)
+        self._parts: tuple[str, ...] = ()
+        self._groups: list[_HintGroup] = []
         self._lay = QHBoxLayout(self)
         self._lay.setContentsMargins(0, 0, 0, 0)
         self._lay.setSpacing(_GROUP_GAP)
         self._lay.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._lay.addStretch(1)
+
+    def _apply_part(self, group: _HintGroup, part: str) -> None:
+        if " — " in part:
+            token, action = (s.strip() for s in part.split(" — ", 1))
+            group.set_shortcut(token, action)
+        else:
+            group.set_plain(part)
 
     def set_parts(self, parts: list[str]) -> None:
-        while self._lay.count():
-            item = self._lay.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        for part in parts:
-            p = (part or "").strip()
-            if not p:
-                continue
+        normalized = tuple(p.strip() for p in parts if (p or "").strip())
+        if normalized == self._parts:
+            return
+        self._parts = normalized
+
+        while len(self._groups) < len(normalized):
             group = _HintGroup(self)
-            if " — " in p:
-                token, action = (s.strip() for s in p.split(" — ", 1))
-                group.set_shortcut(token, action)
-            else:
-                group.set_plain(p)
-            self._lay.addWidget(group)
-        self._lay.addStretch(1)
+            self._groups.append(group)
+            self._lay.insertWidget(self._lay.count() - 1, group)
+
+        for i, part in enumerate(normalized):
+            group = self._groups[i]
+            self._apply_part(group, part)
+            group.show()
+
+        for i in range(len(normalized), len(self._groups)):
+            self._groups[i].hide()

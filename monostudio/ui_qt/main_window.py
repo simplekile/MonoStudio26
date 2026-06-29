@@ -416,7 +416,7 @@ class MainWindow(FramelessMainWindow):
         self._fs_event_collector.metaThumbnailsStale.connect(self._on_fs_meta_thumbnails_stale)
         self._fs_event_collector.itemNotesStale.connect(self._on_fs_item_notes_stale)
         self._fs_event_collector.entitySpecialFoldersStale.connect(self._on_fs_entity_special_folders_stale)
-        self._fs_event_collector.mentionInboxStale.connect(self._sync_user_inbox_alerts)
+        self._fs_event_collector.mentionInboxStale.connect(self._schedule_sync_user_inbox_alerts)
         self._entered_parent: Asset | Shot | None = None
 
         # Centralized filter state (UI-only; no filtering engine yet)
@@ -768,6 +768,11 @@ class MainWindow(FramelessMainWindow):
         self._mention_sync_timer.setInterval(45000)
         self._mention_sync_timer.timeout.connect(self._sync_user_inbox_alerts)
         self._mention_sync_timer.start()
+        self._inbox_sync_debounce = QTimer(self)
+        self._inbox_sync_debounce.setSingleShot(True)
+        self._inbox_sync_debounce.setInterval(400)
+        self._inbox_sync_debounce.timeout.connect(self._sync_user_inbox_alerts)
+        self._notes_self_save_mono: dict[str, float] = {}
         self._discord_schedule_due_timer = QTimer(self)
         self._discord_schedule_due_timer.setInterval(86_400_000)
         self._discord_schedule_due_timer.timeout.connect(self._maybe_discord_schedule_due)
@@ -3847,15 +3852,56 @@ class MainWindow(FramelessMainWindow):
             department_label=dept_label,
             highlight_note_id=highlight_note_id,
         )
-        dlg.notes_changed.connect(lambda: self._on_item_notes_saved(p))
-        dlg.notes_changed.connect(lambda: self._ensure_entity_monostudio_watched(p))
-        dlg.notes_changed.connect(self._refresh_dashboard_if_visible)
-        dlg.notes_changed.connect(self._sync_user_inbox_alerts)
+        dlg.notes_changed.connect(self._on_item_notes_saved)
+        dlg.notes_changed.connect(lambda _payload, ep=p: self._ensure_entity_monostudio_watched(ep))
+        dlg.notes_changed.connect(lambda _payload: self._refresh_dashboard_if_visible())
+        dlg.notes_changed.connect(lambda _payload: self._schedule_sync_user_inbox_alerts())
         dlg.exec()
 
-    def _on_item_notes_saved(self, item_path: Path) -> None:
+    _NOTES_SELF_SAVE_GRACE_S = 2.5
+
+    def _mark_notes_self_saved(self, item_path: Path) -> None:
+        try:
+            key = str(Path(item_path).resolve())
+        except (OSError, TypeError, ValueError):
+            return
+        self._notes_self_save_mono[key] = time.monotonic()
+
+    def _notes_self_save_suppresses(self, entity_path: str) -> bool:
+        try:
+            key = str(Path(entity_path.strip()).resolve())
+        except (OSError, TypeError, ValueError):
+            return False
+        saved_at = self._notes_self_save_mono.get(key)
+        if saved_at is None:
+            return False
+        if time.monotonic() - saved_at > self._NOTES_SELF_SAVE_GRACE_S:
+            self._notes_self_save_mono.pop(key, None)
+            return False
+        return True
+
+    def _schedule_sync_user_inbox_alerts(self) -> None:
+        self._inbox_sync_debounce.start()
+
+    def _on_item_notes_saved(self, payload: object) -> None:
         """Refresh main view note badges / metadata after Notes dialog save."""
-        self._main_view.invalidate_notes_open_count_cache(item_path)
+        from monostudio.ui_qt.item_notes_dialog import NotesSavedPayload
+
+        if isinstance(payload, NotesSavedPayload):
+            self._mark_notes_self_saved(payload.item_path)
+            self._main_view.prime_notes_badge_cache(
+                payload.item_path,
+                open_count=payload.open_count,
+                visual_mode=payload.visual_mode,
+                department_id=payload.department_id or self.current_department,
+            )
+        else:
+            try:
+                p = Path(getattr(payload, "item_path", payload))
+            except (TypeError, ValueError):
+                return
+            self._mark_notes_self_saved(p)
+            self._main_view.invalidate_notes_open_count_cache(p)
         self._inspector.refresh_notes_badge()
 
     def _on_review_player_notes_changed(self) -> None:
@@ -3868,7 +3914,7 @@ class MainWindow(FramelessMainWindow):
                 pass
         self._inspector.refresh_notes_badge()
         self._refresh_dashboard_if_visible()
-        self._sync_user_inbox_alerts()
+        self._schedule_sync_user_inbox_alerts()
 
     def _on_dashboard_open_notes_entity(self, target: object) -> None:
         from monostudio.core.project_dashboard_stats import DashboardNoteRow
@@ -5543,11 +5589,18 @@ class MainWindow(FramelessMainWindow):
         """External edits to ``.monostudio/item_comments.json``: refresh note badges."""
         if not isinstance(entities, list):
             return
+        pending: list[str] = []
         for ep in entities:
             if not isinstance(ep, str) or not ep.strip():
                 continue
+            if self._notes_self_save_suppresses(ep):
+                continue
+            pending.append(ep.strip())
+        if not pending:
+            return
+        for ep in pending:
             try:
-                self._main_view.invalidate_notes_open_count_cache(Path(ep.strip()))
+                self._main_view.invalidate_notes_open_count_cache(Path(ep))
             except Exception:
                 pass
         try:
@@ -6403,13 +6456,38 @@ class MainWindow(FramelessMainWindow):
         p = Path(path) if path is not None else None
         if p is None or not is_video_path(p):
             return
+        from monostudio.core.models import Asset, Shot
+
         entity_path = None
         dept_id = None
+        dept_label = None
+        work_path = None
+        work_file_path = None
         try:
             item = getattr(self._inspector, "_current_item", None)
             if item is not None and getattr(item, "path", None):
                 entity_path = Path(item.path)
             dept_id = getattr(self._inspector, "_last_focused_department", None)
+            if not (dept_id or "").strip():
+                dept_id = (self._main_view._active_department or "").strip() or None
+            ref = getattr(item, "ref", None) if item is not None else None
+            dep = (dept_id or "").strip()
+            if isinstance(ref, (Asset, Shot)) and dep and entity_path is not None:
+                from monostudio.ui_qt.thumbnail_source_resolve import (
+                    primary_work_file_for_department,
+                    resolve_department_work_path_for_preview,
+                )
+
+                active_dcc = self._main_view.get_active_dcc(entity_path, dep)
+                work_file_path = primary_work_file_for_department(ref, dep, active_dcc)
+                work_path = resolve_department_work_path_for_preview(
+                    ref,
+                    dep,
+                    work_file_path=work_file_path,
+                    item_root=entity_path,
+                    active_dcc_id=active_dcc,
+                )
+                dept_label = self._department_display_label(dep)
         except Exception:
             pass
         self._open_video_preview_with_request(
@@ -6419,6 +6497,9 @@ class MainWindow(FramelessMainWindow):
                 sibling_paths=list_video_siblings(p),
                 entity_path=entity_path,
                 department_id=dept_id,
+                department_label=dept_label,
+                work_path=work_path,
+                work_file_path=work_file_path,
             )
         )
 
@@ -6478,6 +6559,8 @@ class MainWindow(FramelessMainWindow):
         )
         if resolved.action == ReviewResolveAction.open_player and resolved.request is not None:
             self._open_review_player(resolved.request)
+            return
+        notification_service.warning("No review media found for this department.")
 
     def _review_player_matches_entity(
         self,
@@ -6620,6 +6703,20 @@ class MainWindow(FramelessMainWindow):
                 )
             ):
                 existing.apply_time_anchor(href)
+                self._bring_review_player_to_front(existing)
+                return
+        if not href and request.entity_path is not None:
+            existing = self._alive_review_player()
+            if (
+                existing is not None
+                and existing.isVisible()
+                and self._review_player_matches_entity(
+                    existing,
+                    request.entity_path,
+                    request.department_id,
+                )
+            ):
+                existing.load_media(request)
                 self._bring_review_player_to_front(existing)
                 return
         existing = self._alive_review_player()

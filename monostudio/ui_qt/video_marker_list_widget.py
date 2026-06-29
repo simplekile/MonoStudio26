@@ -129,9 +129,13 @@ class VideoMarkerListWidget(QWidget):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
 
-        header = QHBoxLayout()
+        header_wrap = QWidget(self)
+        header_wrap.setObjectName("VideoPreviewListToolbarRow")
+        header_wrap.setFixedHeight(28)
+        header = QHBoxLayout(header_wrap)
+        header.setContentsMargins(0, 0, 0, 0)
         header.addStretch(1)
-        self._sort_combo = QComboBox(self)
+        self._sort_combo = QComboBox(header_wrap)
         self._sort_combo.setObjectName("VideoPreviewTimeDisplayCombo")
         self._sort_combo.addItem("Timeline", _SORT_TIMELINE)
         self._sort_combo.addItem("Name", _SORT_NAME)
@@ -139,7 +143,7 @@ class VideoMarkerListWidget(QWidget):
         self._sort_combo.setToolTip("List sort order for , . navigation")
         self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         header.addWidget(self._sort_combo)
-        lay.addLayout(header)
+        lay.addWidget(header_wrap)
 
         self._list = QListWidget(self)
         self._list.setObjectName("VideoPreviewRangeList")
@@ -152,22 +156,29 @@ class VideoMarkerListWidget(QWidget):
         self._list.viewport().installEventFilter(self)
         lay.addWidget(self._list, 1)
 
+        footer = QWidget(self)
+        footer.setObjectName("VideoPreviewListPanelFooter")
+        footer.setFixedHeight(64)
+        footer_lay = QVBoxLayout(footer)
+        footer_lay.setContentsMargins(0, 0, 0, 0)
+        footer_lay.setSpacing(4)
         self._placeholder = QLabel(
             "K — add marker at playhead · , . — jump markers",
-            self,
+            footer,
         )
         self._placeholder.setObjectName("DialogHint")
         self._placeholder.setWordWrap(True)
         self._placeholder.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
-        lay.addWidget(self._placeholder, 0)
+        footer_lay.addWidget(self._placeholder, 1)
 
-        self._btn_export = QPushButton("Export PNG…", self)
+        self._btn_export = QPushButton("Export PNG…", footer)
         self._btn_export.setObjectName("DialogSecondaryButton")
         self._btn_export.setIcon(
             lucide_icon("download", size=16, color_hex=MONOS_COLORS["text_label"])
         )
         self._btn_export.clicked.connect(self.export_requested.emit)
-        lay.addWidget(self._btn_export, 0)
+        footer_lay.addWidget(self._btn_export, 0)
+        lay.addWidget(footer, 0)
 
         self._markers: list[VideoReviewMarker] = []
         self._published_markers: list[VideoReviewMarker] = []

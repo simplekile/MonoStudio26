@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
-from PySide6.QtCore import Qt, Signal, QSize, QTimer
+from PySide6.QtCore import QObject, Qt, QRunnable, QThreadPool, Signal, QSize, QTimer
 from PySide6.QtGui import QCloseEvent, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
@@ -26,6 +27,7 @@ from monostudio.core.item_comments import (
     ItemCommentEntry,
     NoteEditRevision,
     delete_note_media,
+    entry_preview_text,
     new_comment_entry,
     normalize_note_department_id,
     read_item_comments_for_department,
@@ -37,7 +39,12 @@ from monostudio.core.mention_inbox import append_mentions
 from monostudio.core.user_identity import get_current_user
 from monostudio.ui_qt.lucide_icons import lucide_icon
 from monostudio.ui_qt.note_author_row import NoteAuthorRow
-from monostudio.ui_qt.note_body_browser import NoteBodyBrowser, make_note_card_preview, resolve_note_jump_host
+from monostudio.ui_qt.note_body_browser import (
+    NoteBodyBrowser,
+    NoteListPreviewLabel,
+    make_note_card_preview,
+    resolve_note_jump_host,
+)
 from monostudio.ui_qt.note_compose_editor import NoteComposeEditor
 from monostudio.ui_qt.note_context_menu import build_note_context_menu
 from monostudio.ui_qt.note_done_toggle import NoteDoneToggleButton
@@ -128,12 +135,61 @@ class _NoteListCard(QFrame):
         super().mouseReleaseEvent(event)
 
 
+_SAVE_LABEL = "Save changes"
+_SAVE_BUSY_LABEL = "Saving…"
+
+
+class NotesSavedPayload(NamedTuple):
+    """Passed with ``notes_changed`` so MainWindow can refresh UI without re-reading disk."""
+
+    item_path: Path
+    department_id: str
+    open_count: int
+    visual_mode: str
+
+
+class _NotesSaveSignaler(QObject):
+    finished = Signal()
+    failed = Signal(str)
+
+
+class _NotesSaveTask(QRunnable):
+    """Write ``item_comments.json`` off the UI thread."""
+
+    def __init__(
+        self,
+        *,
+        item_path: Path,
+        department_id: str | None,
+        draft: list[ItemCommentEntry],
+        signaler: _NotesSaveSignaler,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._item_path = Path(item_path)
+        self._department_id = department_id
+        self._draft = list(draft)
+        self._signaler = signaler
+
+    def run(self) -> None:
+        try:
+            write_item_comments_for_department(
+                self._item_path,
+                self._department_id or None,
+                self._draft,
+            )
+        except OSError as ex:
+            self._signaler.failed.emit(str(ex) or "Could not save notes.")
+            return
+        self._signaler.finished.emit()
+
+
 class ItemNotesDialog(MonosDialog):
     """
     Notes editor: draft in memory — header + rich compose + checklist rows + Cancel / Save changes.
     """
 
-    notes_changed = Signal()
+    notes_changed = Signal(object)  # NotesSavedPayload
 
     def __init__(
         self,
@@ -171,6 +227,10 @@ class ItemNotesDialog(MonosDialog):
         self._initial_done_by_id = {e.id: bool(e.done) for e in self._draft}
         self._editing_note_id: str | None = None
         self._hidden_for_review_jump = False
+        self._saving = False
+        self._save_signaler = _NotesSaveSignaler(self)
+        self._save_signaler.finished.connect(self._on_save_write_finished)
+        self._save_signaler.failed.connect(self._on_save_write_failed)
 
         self.setWindowTitle("Notes")
         self.setModal(True)
@@ -274,16 +334,16 @@ class ItemNotesDialog(MonosDialog):
         footer.setSpacing(12)
         footer.addStretch(1)
 
-        cancel_btn = QPushButton("Cancel", self)
-        cancel_btn.setObjectName("DialogSecondaryButton")
-        cancel_btn.clicked.connect(self.reject)
-        footer.addWidget(cancel_btn, 0)
+        self._cancel_btn = QPushButton("Cancel", self)
+        self._cancel_btn.setObjectName("DialogSecondaryButton")
+        self._cancel_btn.clicked.connect(self.reject)
+        footer.addWidget(self._cancel_btn, 0)
 
-        save_btn = QPushButton("Save changes", self)
-        save_btn.setObjectName("DialogPrimaryButton")
-        save_btn.setDefault(True)
-        save_btn.clicked.connect(self._on_save)
-        footer.addWidget(save_btn, 0)
+        self._save_btn = QPushButton(_SAVE_LABEL, self)
+        self._save_btn.setObjectName("DialogPrimaryButton")
+        self._save_btn.setDefault(True)
+        self._save_btn.clicked.connect(self._on_save)
+        footer.addWidget(self._save_btn, 0)
 
         root.addLayout(footer)
 
@@ -694,18 +754,45 @@ class ItemNotesDialog(MonosDialog):
 
     def _on_done_toggled(self, eid: str, checked: bool) -> None:
         now_iso = _utc_stamp()
+        updated: ItemCommentEntry | None = None
         new_list: list[ItemCommentEntry] = []
         for e in self._draft:
             if e.id != eid:
                 new_list.append(e)
                 continue
             if checked:
-                new_list.append(replace(e, done=True, done_at=now_iso))
+                updated = replace(e, done=True, done_at=now_iso)
             else:
-                new_list.append(replace(e, done=False, done_at=None))
+                updated = replace(e, done=False, done_at=None)
+            new_list.append(updated)
         self._draft = new_list
         self._update_summary()
-        self._rebuild_list()
+        if updated is not None:
+            self._refresh_note_card_done(eid, updated)
+
+    def _refresh_note_card_done(self, eid: str, entry: ItemCommentEntry) -> None:
+        """Update one row in place — avoid rebuilding while the done toggle is handling input."""
+        for card in self._list_host.findChildren(QFrame):
+            if card.property("noteCardId") != eid:
+                continue
+            card.setObjectName("ItemNotesCardDone" if entry.done else "ItemNotesCard")
+            card.style().unpolish(card)
+            card.style().polish(card)
+            btn = card.findChild(NoteDoneToggleButton)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(entry.done)
+                btn.blockSignals(False)
+            preview_text = entry_preview_text(entry)
+            for preview in card.findChildren(NoteListPreviewLabel):
+                preview.set_preview(preview_text, done=entry.done)
+            for browser in card.findChildren(NoteBodyBrowser):
+                browser.set_body(
+                    (entry.body_html or "").strip(),
+                    plain_fallback=preview_text,
+                    done=entry.done,
+                )
+            break
 
     def _item_rel_path(self) -> str:
         if self._project_root is None:
@@ -810,28 +897,75 @@ class ItemNotesDialog(MonosDialog):
         if self._add_edit.has_content():
             self._on_add_draft()
 
+    def _set_save_busy(self, busy: bool) -> None:
+        self._saving = busy
+        self._save_btn.setEnabled(not busy)
+        self._cancel_btn.setEnabled(not busy)
+        self._save_btn.setText(_SAVE_BUSY_LABEL if busy else _SAVE_LABEL)
+
     def _on_save(self) -> None:
-        self._flush_compose_into_draft()
-        try:
-            write_item_comments_for_department(
-                self._item_path,
-                self._department_id or None,
-                self._draft,
-            )
-        except OSError as ex:
-            QMessageBox.warning(self, "Notes", str(ex) or "Could not save notes.")
+        if self._saving:
             return
-        self._dispatch_mentions_for_new_entries()
-        self._dispatch_note_done_for_changed_entries()
-        self._initial_fp = _entries_fingerprint(self._draft)
-        self._known_ids = {e.id for e in self._draft}
-        self._initial_by_id = {e.id: e for e in self._draft}
-        self._initial_done_by_id = {e.id: bool(e.done) for e in self._draft}
-        self.notes_changed.emit()
-        self.accept()
+        self._flush_compose_into_draft()
+        self._set_save_busy(True)
+        QTimer.singleShot(0, self._save_step_write_disk)
+
+    def _save_step_write_disk(self) -> None:
+        QThreadPool.globalInstance().start(
+            _NotesSaveTask(
+                item_path=self._item_path,
+                department_id=self._department_id,
+                draft=self._draft,
+                signaler=self._save_signaler,
+            )
+        )
+
+    def _on_save_write_failed(self, message: str) -> None:
+        self._set_save_busy(False)
+        QMessageBox.warning(self, "Notes", message)
+
+    def _on_save_write_finished(self) -> None:
+        QTimer.singleShot(0, self._save_finish_after_write)
+
+    def _save_finish_after_write(self) -> None:
+        try:
+            self._dispatch_mentions_for_new_entries()
+            self._dispatch_note_done_for_changed_entries()
+            self._initial_fp = _entries_fingerprint(self._draft)
+            self._known_ids = {e.id for e in self._draft}
+            self._initial_by_id = {e.id: e for e in self._draft}
+            self._initial_done_by_id = {e.id: bool(e.done) for e in self._draft}
+            open_n = sum(1 for e in self._draft if not e.done)
+            if not self._draft:
+                mode = "empty"
+            elif open_n > 0:
+                mode = "open"
+            else:
+                mode = "all_done"
+            self.notes_changed.emit(
+                NotesSavedPayload(
+                    item_path=self._item_path,
+                    department_id=self._department_id or "",
+                    open_count=open_n,
+                    visual_mode=mode,
+                )
+            )
+            self.accept()
+        except Exception as ex:
+            self._set_save_busy(False)
+            QMessageBox.warning(
+                self,
+                "Notes",
+                str(ex) or "Could not finish saving notes.",
+            )
 
     def reject(self) -> None:  # type: ignore[override]
+        if self._saving:
+            return
         super().reject()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        if self._saving:
+            event.ignore()
+            return
         super().closeEvent(event)

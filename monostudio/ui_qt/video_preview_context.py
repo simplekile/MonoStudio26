@@ -49,7 +49,7 @@ class ReviewOpenRequest:
 
     @property
     def geometry_fraction(self) -> float:
-        """Share of main-window client area used when the dialog opens (then size is locked)."""
+        """Fallback fraction of main-window area when media size is unknown."""
         if self.context == PreviewContext.entity:
             return 0.95
         return 0.92
@@ -77,6 +77,10 @@ class VideoPreviewOpenRequest:
     sibling_paths: list[Path] | None = None
     entity_path: Path | None = None
     department_id: str | None = None
+    department_label: str | None = None
+    work_path: Path | None = None
+    work_file_path: Path | None = None
+    source_label: str | None = None
 
     @property
     def geometry_fraction(self) -> float:
@@ -96,4 +100,8 @@ class VideoPreviewOpenRequest:
             sibling_paths=self.sibling_paths,
             entity_path=self.entity_path,
             department_id=self.department_id,
+            department_label=self.department_label,
+            work_path=self.work_path,
+            work_file_path=self.work_file_path,
+            source_label=self.source_label,
         )

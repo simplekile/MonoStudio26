@@ -33,18 +33,48 @@ class _DecodeSignaler(QObject):
     frame_ready = Signal(int, object)  # index, QImage | None
 
 
+class _DecodeGeneration:
+    """Outlives backend QObject so pool runnables can drop stale work after release()."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = 0
+
+    def bump(self) -> int:
+        self.value += 1
+        return self.value
+
+
 class _DecodeRunnable(QRunnable):
-    def __init__(self, idx: int, path: Path, max_side: int, signaler: _DecodeSignaler) -> None:
+    def __init__(
+        self,
+        idx: int,
+        path: Path,
+        max_side: int,
+        signaler: _DecodeSignaler,
+        generation: _DecodeGeneration,
+        gen_at_start: int,
+    ) -> None:
         super().__init__()
         self.setAutoDelete(True)
         self._idx = idx
         self._path = path
         self._max_side = max_side
         self._signaler = signaler
+        self._generation = generation
+        self._gen_at_start = gen_at_start
 
     def run(self) -> None:
+        if self._generation.value != self._gen_at_start:
+            return
         img = load_preview_frame_qimage(self._path, self._max_side)
-        self._signaler.frame_ready.emit(self._idx, img)
+        if self._generation.value != self._gen_at_start:
+            return
+        try:
+            self._signaler.frame_ready.emit(self._idx, img)
+        except RuntimeError:
+            pass
 
 
 class SequenceDecodeBackend(QObject):
@@ -74,6 +104,8 @@ class SequenceDecodeBackend(QObject):
         self._buffer: dict[int, QPixmap] = {}
         self._scaled_cache: dict[tuple[int, int, int], QPixmap] = {}
         self._in_flight: set[int] = set()
+        self._decode_generation = _DecodeGeneration()
+        self._decode_live = True
         self._signaler = _DecodeSignaler(self)
         self._signaler.frame_ready.connect(self._on_frame_ready, Qt.ConnectionType.QueuedConnection)
         self._pool = QThreadPool(self)
@@ -155,6 +187,12 @@ class SequenceDecodeBackend(QObject):
 
     def release(self) -> None:
         self.pause()
+        self._decode_live = False
+        self._decode_generation.bump()
+        try:
+            self._signaler.frame_ready.disconnect(self._on_frame_ready)
+        except (TypeError, RuntimeError):
+            pass
         self._pool.clear()
         self._buffer.clear()
         self._scaled_cache.clear()
@@ -192,16 +230,29 @@ class SequenceDecodeBackend(QObject):
         return max(256, min(PREVIEW_MAX_SIDE_DEFAULT, ((side + 31) // 32) * 32))
 
     def _request_decode(self, idx: int) -> None:
+        if not self._decode_live:
+            return
         if idx < 0 or idx >= self._n:
             return
         if idx in self._buffer or idx in self._in_flight:
             return
         self._in_flight.add(idx)
+        gen = self._decode_generation.value
         self._pool.start(
-            _DecodeRunnable(idx, self._frames[idx], self._decode_max_side(), self._signaler)
+            _DecodeRunnable(
+                idx,
+                self._frames[idx],
+                self._decode_max_side(),
+                self._signaler,
+                self._decode_generation,
+                gen,
+            )
         )
 
     def _on_frame_ready(self, idx: int, image: object) -> None:
+        if not self._decode_live:
+            self._in_flight.discard(idx)
+            return
         self._in_flight.discard(idx)
         if idx < 0 or idx >= self._n:
             return

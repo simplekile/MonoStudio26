@@ -144,9 +144,13 @@ class VideoRangeListWidget(QWidget):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
 
-        header = QHBoxLayout()
+        header_wrap = QWidget(self)
+        header_wrap.setObjectName("VideoPreviewListToolbarRow")
+        header_wrap.setFixedHeight(28)
+        header = QHBoxLayout(header_wrap)
+        header.setContentsMargins(0, 0, 0, 0)
         header.addStretch(1)
-        self._sort_combo = QComboBox(self)
+        self._sort_combo = QComboBox(header_wrap)
         self._sort_combo.setObjectName("VideoPreviewTimeDisplayCombo")
         self._sort_combo.addItem("Timeline", _SORT_TIMELINE)
         self._sort_combo.addItem("Name", _SORT_NAME)
@@ -154,7 +158,7 @@ class VideoRangeListWidget(QWidget):
         self._sort_combo.setToolTip("List sort order for [ ] navigation")
         self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         header.addWidget(self._sort_combo)
-        lay.addLayout(header)
+        lay.addWidget(header_wrap)
 
         self._list = QListWidget(self)
         self._list.setObjectName("VideoPreviewRangeList")
@@ -167,19 +171,26 @@ class VideoRangeListWidget(QWidget):
         self._list.installEventFilter(self)
         lay.addWidget(self._list, 1)
 
+        footer = QWidget(self)
+        footer.setObjectName("VideoPreviewListPanelFooter")
+        footer.setFixedHeight(64)
+        footer_lay = QVBoxLayout(footer)
+        footer_lay.setContentsMargins(0, 0, 0, 0)
+        footer_lay.setSpacing(4)
         self._placeholder = QLabel(
             "Click overlap to cycle · E or double-click (single range) to edit",
-            self,
+            footer,
         )
         self._placeholder.setObjectName("DialogHint")
         self._placeholder.setWordWrap(True)
         self._placeholder.setFont(monos_font("Inter", 11, QFont.Weight.Normal))
-        lay.addWidget(self._placeholder, 0)
+        footer_lay.addWidget(self._placeholder, 1)
 
-        self._draft = QLabel("", self)
+        self._draft = QLabel("", footer)
         self._draft.setObjectName("VideoPreviewDraftHint")
         self._draft.setFont(monos_font("JetBrains Mono", 11, QFont.Weight.Normal))
-        lay.addWidget(self._draft, 0)
+        footer_lay.addWidget(self._draft, 0)
+        lay.addWidget(footer, 0)
 
         self._ranges: list[VideoFrameRange] = []
         self._published_ranges: list[VideoFrameRange] = []

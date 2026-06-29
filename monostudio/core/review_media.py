@@ -8,7 +8,6 @@ from pathlib import Path
 
 from monostudio.core.sequence_preview import (
     _sequence_roots_by_priority,
-    count_sequence_frames,
     list_sequence_frames,
     resolve_sequence_folder,
     sequence_folder_has_frames,
@@ -172,8 +171,7 @@ def list_entity_review_sources(
         for folder in _collect_sequence_dirs_in_root(root, names):
             if not sequence_folder_has_frames(folder):
                 continue
-            n = count_sequence_frames(folder)
-            label = f"{rd} · {folder.name} · {n} fr" if n else f"{rd} · {folder.name}"
+            label = f"{rd} · {folder.name}"
             add(
                 ReviewOpenRequest(
                     media_kind=ReviewMediaKind.sequence,
@@ -203,14 +201,24 @@ def _video_source_label_for_path(work_path: Path, path: Path) -> str:
     return path.name
 
 
-def _sequence_source_label_for_folder(work_path: Path, folder: Path, frame_count: int) -> str:
+def _sequence_source_label_for_folder(
+    work_path: Path,
+    folder: Path,
+    frame_count: int | None = None,
+) -> str:
     for root in _sequence_roots_by_priority(work_path):
         try:
             folder.relative_to(root)
         except ValueError:
             continue
-        return f"{_root_display_name(root)} · {folder.name} · {frame_count} fr"
-    return f"{folder.name} · {frame_count} fr"
+        base = f"{_root_display_name(root)} · {folder.name}"
+        if frame_count is not None and frame_count > 0:
+            return f"{base} · {frame_count} fr"
+        return base
+    base = folder.name
+    if frame_count is not None and frame_count > 0:
+        return f"{base} · {frame_count} fr"
+    return base
 
 
 def resolve_entity_review_media(
@@ -288,16 +296,22 @@ def resolve_entity_review_media(
         if not frames:
             if not sequence_folder_has_frames(folder):
                 folder = None
-            else:
-                n = count_sequence_frames(folder)
         else:
             n = len(frames)
 
     if folder is not None:
         src = (
-            _sequence_source_label_for_folder(work_path, folder, n)
+            _sequence_source_label_for_folder(
+                work_path,
+                folder,
+                n if frames else None,
+            )
             if work_path is not None
-            else f"{folder.name} · {n} fr"
+            else (
+                f"{folder.name} · {n} fr"
+                if frames and n > 0
+                else folder.name
+            )
         )
         return ReviewResolveResult(
             action=ReviewResolveAction.open_player,
