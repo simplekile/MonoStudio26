@@ -3,16 +3,31 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QRect, QSize, Qt, QRegularExpression, QSettings, Signal, QStandardPaths, QThread, QUrl
+from PySide6.QtCore import (
+    QByteArray,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QRegularExpression,
+    QSettings,
+    Signal,
+    QStandardPaths,
+    QThread,
+    QTimer,
+    QUrl,
+)
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
     QPainter,
+    QPainterPath,
     QPixmap,
     QRegularExpressionValidator,
     QShowEvent,
@@ -88,12 +103,15 @@ from monostudio.ui_qt.video_preview_settings import (
     BACKEND_MPV,
     BACKEND_QT,
     read_mpv_directory,
+    read_openrv_executable,
     read_video_external_player_exe,
     read_video_player_backend,
     write_mpv_directory,
+    write_openrv_executable,
     write_video_external_player_exe,
     write_video_player_backend,
 )
+from monostudio.core.openrv_launch import is_openrv_available, validate_openrv_executable
 from monostudio.core.mpv_resolve import format_mpv_detect_status, resolve_mpv_dll
 from monostudio.core.mpv_install import (
     MPV_BUILDS_PAGE,
@@ -120,7 +138,9 @@ from monostudio.core.update_checker import (
     get_cached_check_result,
     get_cached_extra_repos,
     run_full_update_check,
+    should_auto_check_updates,
     download_installer,
+    DownloadAbortHandle,
     get_extra_tool_installed_version,
     is_newer_than,
     launch_installer,
@@ -164,23 +184,172 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosDialog, monos_font
 
 # Icon size for update list rows
 _UPDATE_ROW_ICON_SIZE = 24
-# Download/Latest action button — width from label (loading bar matches button width)
+# Download/Latest action button — shared width across Updates product list rows
 _UPDATE_ACTION_HEIGHT = 28
 _UPDATE_ACTION_PADDING_X = 24  # matches QSS padding 6px 12px on update action buttons
 _UPDATE_ACTION_WIDTH_MIN = 88  # "Latest"
-_UPDATE_CANCEL_GAP = 4
-_UPDATE_CANCEL_BTN_WIDTH = 20
-_UPDATE_CANCEL_ICON_SIZE = 16
 _UPDATE_STATUS_ICON_SIZE = 32
+_UPDATE_BTN_LABEL_LATEST = "Latest"
+_UPDATE_BTN_LABEL_REDOWNLOAD = "Redownload"
+_UPDATE_DOWNLOAD_PROGRESS_RADIUS = 8
+_UPDATE_DOWNLOAD_TRACK_COLOR = QColor("#27272a")
+_UPDATE_DOWNLOAD_CHUNK_COLOR = QColor("#6366f1")
+_UPDATE_DOWNLOAD_CANCEL_OVERLAY = QColor(239, 68, 68, 128)
+_UPDATE_DOWNLOAD_CANCEL_TEXT = QColor("#fafafa")
 
 
-def _configure_update_cancel_btn(btn: QToolButton) -> None:
-    btn.setObjectName("UpdateDownloadCancelBtn")
-    btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-    btn.setIconSize(QSize(_UPDATE_CANCEL_ICON_SIZE, _UPDATE_CANCEL_ICON_SIZE))
-    btn.setIcon(lucide_icon("x", size=_UPDATE_CANCEL_ICON_SIZE, color_hex="#a1a1aa"))
-    btn.setFixedSize(_UPDATE_CANCEL_BTN_WIDTH, _UPDATE_ACTION_HEIGHT)
-    btn.setToolTip("Cancel download")
+def _update_download_action_font() -> QFont:
+    """Match UpdateProductListBtnDownload QSS: Inter 12px weight 600."""
+    font = monos_font("Inter", 12, QFont.Weight.DemiBold)
+    font.setPixelSize(12)
+    return font
+
+
+def _repolish_widget(w: QWidget) -> None:
+    w.setStyleSheet("")
+    w.style().unpolish(w)
+    w.style().polish(w)
+
+
+class _UpdateLatestActionButton(QPushButton):
+    """Product-list action: Latest when up to date; hover reveals Redownload."""
+
+    def __init__(self, text: str = _UPDATE_BTN_LABEL_LATEST, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._latest_idle = False
+        self._can_redownload = False
+
+    def set_download_mode(self, label: str) -> None:
+        self._latest_idle = False
+        self._can_redownload = False
+        self.setProperty("updateLatestIdle", False)
+        self.setText(label)
+        self.setObjectName("UpdateProductListBtnDownload")
+        self.setEnabled(True)
+        _repolish_widget(self)
+
+    def set_latest_idle(self, *, can_redownload: bool) -> None:
+        self._latest_idle = True
+        self._can_redownload = can_redownload
+        self.setProperty("updateLatestIdle", can_redownload)
+        self.setText(_UPDATE_BTN_LABEL_LATEST)
+        self.setObjectName("UpdateProductListBtnLatest")
+        self.setEnabled(can_redownload)
+        _repolish_widget(self)
+
+    def set_secondary_mode(self, label: str, object_name: str = "SettingsCategoryActionButton") -> None:
+        self._latest_idle = False
+        self._can_redownload = False
+        self.setProperty("updateLatestIdle", False)
+        self.setText(label)
+        self.setObjectName(object_name)
+        self.setEnabled(True)
+        _repolish_widget(self)
+
+    def is_redownload_hover(self) -> bool:
+        return self._latest_idle and self._can_redownload and self.text() == _UPDATE_BTN_LABEL_REDOWNLOAD
+
+    def enterEvent(self, event) -> None:
+        if self._latest_idle and self._can_redownload:
+            self.setText(_UPDATE_BTN_LABEL_REDOWNLOAD)
+            self.setObjectName("UpdateProductListBtnDownload")
+            _repolish_widget(self)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self._latest_idle and self._can_redownload:
+            self.setText(_UPDATE_BTN_LABEL_LATEST)
+            self.setObjectName("UpdateProductListBtnLatest")
+            _repolish_widget(self)
+        super().leaveEvent(event)
+
+
+class _UpdateDownloadProgressBar(QProgressBar):
+    """Button-sized download progress; hover shows Cancel with red overlay."""
+
+    cancel_requested = Signal()
+
+    _LABEL_CANCEL = "Cancel"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("UpdateDownloadProgress")
+        self.setTextVisible(False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hovering = False
+
+    def enterEvent(self, event) -> None:
+        self._hovering = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovering = False
+        self.update()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._hovering = False
+        super().hideEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._hovering:
+            self.cancel_requested.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _track_rect(self) -> QRectF:
+        return QRectF(0, 0, self.width(), self.height())
+
+    def _progress_percent_label(self) -> str:
+        min_v, max_v, val = self.minimum(), self.maximum(), self.value()
+        if max_v <= min_v:
+            return ""
+        pct = int(round(100 * (val - min_v) / (max_v - min_v)))
+        return f"{pct}%"
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        if not painter.isActive():
+            return
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            full = self._track_rect()
+            if full.width() <= 0 or full.height() <= 0:
+                return
+            radius = float(_UPDATE_DOWNLOAD_PROGRESS_RADIUS)
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(_UPDATE_DOWNLOAD_TRACK_COLOR)
+            painter.drawRoundedRect(full, radius, radius)
+
+            min_v, max_v, val = self.minimum(), self.maximum(), self.value()
+            if max_v > min_v and val > min_v:
+                ratio = max(0.0, min(1.0, (val - min_v) / (max_v - min_v)))
+                clip = QPainterPath()
+                clip.addRoundedRect(full, radius, radius)
+                painter.setClipPath(clip)
+                painter.setBrush(_UPDATE_DOWNLOAD_CHUNK_COLOR)
+                painter.drawRect(QRectF(0, 0, full.width() * ratio, full.height()))
+                painter.setClipping(False)
+
+            if self._hovering:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(_UPDATE_DOWNLOAD_CANCEL_OVERLAY)
+                painter.drawRoundedRect(full, radius, radius)
+                painter.setPen(_UPDATE_DOWNLOAD_CANCEL_TEXT)
+                painter.setFont(_update_download_action_font())
+                painter.drawText(full, Qt.AlignmentFlag.AlignCenter, self._LABEL_CANCEL)
+            else:
+                label = self._progress_percent_label()
+                if label:
+                    painter.setPen(QColor("#ffffff"))
+                    painter.setFont(_update_download_action_font())
+                    painter.drawText(full, Qt.AlignmentFlag.AlignCenter, label)
+        finally:
+            painter.end()
 
 
 def _measure_update_action_width(btn: QPushButton) -> int:
@@ -194,6 +363,8 @@ def _measure_update_action_width(btn: QPushButton) -> int:
     w = fm.horizontalAdvance(btn.text()) + _UPDATE_ACTION_PADDING_X + 4
     if not btn.icon().isNull():
         w += btn.iconSize().width() + 4
+    if btn.property("updateLatestIdle"):
+        w = max(w, fm.horizontalAdvance(_UPDATE_BTN_LABEL_REDOWNLOAD) + _UPDATE_ACTION_PADDING_X + 4)
     return max(_UPDATE_ACTION_WIDTH_MIN, w)
 
 
@@ -206,15 +377,18 @@ def _apply_update_tool_action_slot(
     *,
     leading_width: int = 28,
     leading_gap: int = 6,
+    width: int | None = None,
 ) -> int:
     """Size Get/Install stacked action slot (+ leading locate button) on Updates tool rows."""
-    action_w = max(_measure_update_action_width(get_btn), _measure_update_action_width(install_btn))
-    slot_w = action_w + _UPDATE_CANCEL_GAP + _UPDATE_CANCEL_BTN_WIDTH
+    if width is None:
+        action_w = max(_measure_update_action_width(get_btn), _measure_update_action_width(install_btn))
+    else:
+        action_w = width
     for btn in (get_btn, install_btn):
         btn.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
     prog.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
-    stack.setFixedSize(slot_w, _UPDATE_ACTION_HEIGHT)
-    outer.setFixedSize(leading_width + leading_gap + slot_w, _UPDATE_ACTION_HEIGHT)
+    stack.setFixedSize(action_w, _UPDATE_ACTION_HEIGHT)
+    outer.setFixedSize(leading_width + leading_gap + action_w, _UPDATE_ACTION_HEIGHT)
     return action_w
 
 
@@ -222,19 +396,16 @@ def _apply_update_action_width(
     action_btn: QPushButton,
     *,
     loading_widget: QWidget | None = None,
-    progress_bar: QProgressBar | None = None,
+    width: int | None = None,
 ) -> int:
-    """Size action button and its loading slot so Download labels are not clipped."""
-    width = _measure_update_action_width(action_btn)
+    """Size action button and loading progress bar to the same width."""
+    width = width if width is not None else _measure_update_action_width(action_btn)
     action_btn.setFixedSize(width, _UPDATE_ACTION_HEIGHT)
-    slot_w = width + _UPDATE_CANCEL_GAP + _UPDATE_CANCEL_BTN_WIDTH
     if loading_widget is not None:
-        loading_widget.setFixedSize(slot_w, _UPDATE_ACTION_HEIGHT)
-    if progress_bar is not None:
-        progress_bar.setFixedSize(width, _UPDATE_ACTION_HEIGHT)
+        loading_widget.setFixedSize(width, _UPDATE_ACTION_HEIGHT)
     container = action_btn.parentWidget()
     if container is not None and loading_widget is not None:
-        container.setFixedSize(slot_w, _UPDATE_ACTION_HEIGHT)
+        container.setFixedSize(width, _UPDATE_ACTION_HEIGHT)
     return width
 
 
@@ -309,15 +480,20 @@ class _DownloadWorker(QThread):
         self._url = url
         self._dest_path = dest_path
         self._fallback_url = (fallback_url or "").strip() or None
-        self._cancelled = False
+        self._abort = DownloadAbortHandle()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._abort.cancel()
 
     def _progress_callback(self, read: int, total: int | None) -> None:
-        if self._cancelled:
-            raise RuntimeError("Cancelled")
+        self._abort.raise_if_cancelled()
         self.progress.emit(read, total or 0)
+
+    def _cleanup_partial(self) -> None:
+        try:
+            self._dest_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def run(self) -> None:
         try:
@@ -326,11 +502,19 @@ class _DownloadWorker(QThread):
                 self._dest_path,
                 fallback_url=self._fallback_url,
                 progress_callback=self._progress_callback,
+                abort=self._abort,
             )
-            if self._cancelled:
+            if self._abort.is_cancelled():
+                self._cleanup_partial()
                 self.download_finished.emit(False, str(self._dest_path), "Cancelled")
             else:
                 self.download_finished.emit(True, str(self._dest_path), "")
+        except RuntimeError as e:
+            if "Cancelled" in str(e):
+                self._cleanup_partial()
+                self.download_finished.emit(False, str(self._dest_path), "Cancelled")
+            else:
+                self.download_finished.emit(False, str(self._dest_path), str(e))
         except Exception as e:
             self.download_finished.emit(False, str(self._dest_path), str(e))
 
@@ -345,23 +529,35 @@ class _FfmpegZipDownloadWorker(QThread):
         super().__init__(parent)
         self._url = url
         self._dest_path = dest_path
-        self._cancelled = False
+        self._abort = DownloadAbortHandle()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._abort.cancel()
 
     def _progress_callback(self, read: int, total: int | None) -> None:
-        if self._cancelled:
-            raise RuntimeError("Cancelled")
+        self._abort.raise_if_cancelled()
         self.progress.emit(read, total or 0)
+
+    def _cleanup_partial(self) -> None:
+        try:
+            self._dest_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def run(self) -> None:
         from monostudio.core.ffmpeg_install import is_plausible_zip
         from monostudio.core.update_checker import download_to_file
 
         try:
-            download_to_file(self._url, self._dest_path, timeout=900, progress_callback=self._progress_callback)
-            if self._cancelled:
+            download_to_file(
+                self._url,
+                self._dest_path,
+                timeout=900,
+                progress_callback=self._progress_callback,
+                abort=self._abort,
+            )
+            if self._abort.is_cancelled():
+                self._cleanup_partial()
                 self.download_finished.emit(False, str(self._dest_path), "Cancelled")
                 return
             if not is_plausible_zip(self._dest_path):
@@ -374,6 +570,7 @@ class _FfmpegZipDownloadWorker(QThread):
             self.download_finished.emit(True, str(self._dest_path), "")
         except RuntimeError as e:
             if "Cancelled" in str(e):
+                self._cleanup_partial()
                 self.download_finished.emit(False, str(self._dest_path), "Cancelled")
             else:
                 self.download_finished.emit(False, str(self._dest_path), str(e))
@@ -410,27 +607,34 @@ class _Mpv7zDownloadWorker(QThread):
     def __init__(self, dest_path: Path, parent=None) -> None:
         super().__init__(parent)
         self._dest_path = dest_path
-        self._cancelled = False
+        self._abort = DownloadAbortHandle()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._abort.cancel()
 
     def _progress_callback(self, read: int, total: int | None) -> None:
-        if self._cancelled:
-            raise RuntimeError("Cancelled")
+        self._abort.raise_if_cancelled()
         self.progress.emit(read, total or 0)
+
+    def _cleanup_partial(self) -> None:
+        try:
+            self._dest_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def run(self) -> None:
         from monostudio.core.mpv_install import download_mpv_win64_7z
 
         try:
-            download_mpv_win64_7z(self._dest_path, progress_callback=self._progress_callback)
-            if self._cancelled:
+            download_mpv_win64_7z(self._dest_path, progress_callback=self._progress_callback, abort=self._abort)
+            if self._abort.is_cancelled():
+                self._cleanup_partial()
                 self.download_finished.emit(False, str(self._dest_path), "Cancelled")
                 return
             self.download_finished.emit(True, str(self._dest_path), "")
         except RuntimeError as e:
             if "Cancelled" in str(e):
+                self._cleanup_partial()
                 self.download_finished.emit(False, str(self._dest_path), "Cancelled")
             else:
                 self.download_finished.emit(False, str(self._dest_path), str(e))
@@ -498,7 +702,7 @@ class SettingsDialog(MonosDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
 
         # Default 16:9 aspect ratio
         self.setMinimumSize(800, 450)
@@ -509,9 +713,16 @@ class SettingsDialog(MonosDialog):
         self._settings = settings
         self._project_root_renamed_to: Path | None = None
 
-        self._vocab = load_department_vocabulary()
-        self._vocab_set = set(self._vocab)
-        self._config: PipelineTypesAndPresets = load_pipeline_types_and_presets_for_project(project_root)
+        self._vocab: list[str] = []
+        self._vocab_set: set[str] = set()
+        self._config: PipelineTypesAndPresets | None = None
+        self._tier2_lazy_builders: dict[int, list[Callable[[], QWidget] | None]] = {}
+        self._scope_builders: list[Callable[[], QWidget] | None] = [
+            None,
+            self._build_pipeline_page,
+            self._build_dccs_page,
+            self._build_project_page,
+        ]
 
         # Optional integrations UI fields.
         self._blender_exe_field: QLineEdit | None = None
@@ -568,12 +779,11 @@ class SettingsDialog(MonosDialog):
         self._discord_stored_url: str = ""
         self._discord_url_editing: bool = False
 
-        # Tier 1: left nav — General | Pipeline | DCCs | Project
+        # Tier 1: left nav — General | Pipeline | DCCs | Project (other scopes lazy-built)
         self._content_stack = QStackedWidget(self)
         self._content_stack.addWidget(self._build_general_page())
-        self._content_stack.addWidget(self._build_pipeline_page())
-        self._content_stack.addWidget(self._build_dccs_page())
-        self._content_stack.addWidget(self._build_project_page())
+        for _ in range(3):
+            self._content_stack.addWidget(QWidget(self))
 
         self._nav = QListWidget(self)
         self._nav.setObjectName("SettingsNav")
@@ -635,9 +845,11 @@ class SettingsDialog(MonosDialog):
         layout.addWidget(button_row, 0)
 
     def open_pipeline_types_and_presets(self) -> None:
+        self._ensure_scope_page_built(1)
         self._nav.setCurrentRow(1)
         self._content_stack.setCurrentIndex(1)
         if getattr(self, "_pipeline_tier2_stack", None) is not None:
+            self._ensure_tier2_page_built(self._pipeline_tier2_stack, 0)
             self._pipeline_tier2_stack.setCurrentIndex(0)
         if getattr(self, "_pipeline_tier2_buttons", None) and len(self._pipeline_tier2_buttons) > 0:
             self._pipeline_tier2_buttons[0].setChecked(True)
@@ -648,12 +860,25 @@ class SettingsDialog(MonosDialog):
         self._content_stack.setCurrentIndex(0)
         stack = getattr(self, "_general_tier2_stack", None)
         buttons = getattr(self, "_general_tier2_buttons", None)
-        if stack is not None and buttons is not None and len(buttons) > 4:
-            stack.setCurrentIndex(4)
+        if stack is not None and buttons is not None and len(buttons) > 5:
+            self._ensure_tier2_page_built(stack, 5)
+            stack.setCurrentIndex(5)
             for i, b in enumerate(buttons):
-                b.setChecked(i == 4)
-        self._apply_cached_update_result(get_cached_check_result())
-        self._refresh_ffmpeg_update_row()
+                b.setChecked(i == 5)
+        self._on_updates_tab_shown()
+
+    def open_to_video_player_tab(self) -> None:
+        """Switch to General → Video player."""
+        self._nav.setCurrentRow(0)
+        self._content_stack.setCurrentIndex(0)
+        stack = getattr(self, "_general_tier2_stack", None)
+        buttons = getattr(self, "_general_tier2_buttons", None)
+        if stack is not None and buttons is not None and len(buttons) > 2:
+            self._ensure_tier2_page_built(stack, 2)
+            stack.setCurrentIndex(2)
+            for i, b in enumerate(buttons):
+                b.setChecked(i == 2)
+            self._refresh_video_player_tab_status()
 
     def open_to_ui_tab(self) -> None:
         """Switch to General → UI (system tray and notification options)."""
@@ -662,9 +887,11 @@ class SettingsDialog(MonosDialog):
         stack = getattr(self, "_general_tier2_stack", None)
         buttons = getattr(self, "_general_tier2_buttons", None)
         if stack is not None and buttons is not None and len(buttons) > 1:
+            self._ensure_tier2_page_built(stack, 1)
             stack.setCurrentIndex(1)
             for i, b in enumerate(buttons):
                 b.setChecked(i == 1)
+            self._refresh_ui_tab_status()
 
     def _load_persisted_last_check_time(self) -> None:
         """Load last check time from settings so 'Last checked' is visible across sessions."""
@@ -690,6 +917,7 @@ class SettingsDialog(MonosDialog):
                 self._update_changelog.setPlainText("No release notes for this version.")
             self._apply_changelog_line_height()
             self._update_latest_html_url = result.latest_html_url
+            self._latest_install_info = result.latest_install_info
             if result.update_available and result.update_info is not None:
                 self._pending_update_info = result.update_info
             else:
@@ -701,9 +929,45 @@ class SettingsDialog(MonosDialog):
         msg, icon_name, icon_color = self._compute_update_summary(result, extra)
         self._set_update_status_display(msg, icon_name, icon_color)
 
+    def _ensure_pipeline_config(self) -> PipelineTypesAndPresets:
+        if self._config is None:
+            self._config = load_pipeline_types_and_presets_for_project(self._project_root)
+        if not self._vocab:
+            self._vocab = load_department_vocabulary()
+            self._vocab_set = set(self._vocab)
+        return self._config
+
+    def _ensure_scope_page_built(self, row: int) -> None:
+        if row < 0 or row >= len(self._scope_builders):
+            return
+        builder = self._scope_builders[row]
+        if builder is None:
+            return
+        placeholder = self._content_stack.widget(row)
+        page = builder()
+        idx = self._content_stack.indexOf(placeholder)
+        self._content_stack.removeWidget(placeholder)
+        placeholder.deleteLater()
+        self._content_stack.insertWidget(idx, page)
+        self._scope_builders[row] = None
+
+    def _ensure_tier2_page_built(self, stack: QStackedWidget, index: int) -> None:
+        builders = self._tier2_lazy_builders.get(id(stack))
+        if not builders or index < 0 or index >= len(builders):
+            return
+        builder = builders[index]
+        if builder is None:
+            return
+        placeholder = stack.widget(index)
+        page = builder()
+        stack.removeWidget(placeholder)
+        placeholder.deleteLater()
+        stack.insertWidget(index, page)
+        builders[index] = None
+
     def _build_tier2_page_buttons(
         self,
-        items: list[tuple[str, QWidget]],
+        items: list[tuple[str, Callable[[], QWidget]]],
         *,
         store_stack: str | None = None,
         store_buttons: str | None = None,
@@ -724,9 +988,17 @@ class SettingsDialog(MonosDialog):
         stack = QStackedWidget(container)
         stack.setObjectName("SettingsPageStack")
         buttons: list[QPushButton] = []
+        lazy_builders: list[Callable[[], QWidget] | None] = []
 
-        for i, (label, page) in enumerate(items):
-            stack.addWidget(page)
+        for i, (label, builder) in enumerate(items):
+            if i == 0:
+                stack.addWidget(builder())
+                lazy_builders.append(None)
+            else:
+                placeholder = QWidget(stack)
+                placeholder.setObjectName("SettingsLazyPlaceholder")
+                stack.addWidget(placeholder)
+                lazy_builders.append(builder)
             btn = QPushButton(label, btn_row)
             btn.setObjectName("Tier2Tab")
             btn.setCheckable(True)
@@ -735,6 +1007,9 @@ class SettingsDialog(MonosDialog):
             group.addButton(btn)
             btn_l.addWidget(btn, 0)
             buttons.append(btn)
+
+        if any(b is not None for b in lazy_builders):
+            self._tier2_lazy_builders[id(stack)] = lazy_builders
 
         btn_l.addStretch(1)
         layout.addWidget(btn_row, 0)
@@ -755,19 +1030,79 @@ class SettingsDialog(MonosDialog):
 
     def _on_general_tier2_changed(self, index: int) -> None:
         """When General → Updates tab is shown, apply cached result; if no extra repos yet, fetch in background."""
-        if index == 4:
-            self._apply_cached_update_result(get_cached_check_result())
-            self._refresh_ffmpeg_update_row()
-            if not get_cached_extra_repos() and not getattr(self, "_extra_repos_fetch_worker", None):
-                w = _ExtraReposFetchWorker(self)
-                self._extra_repos_fetch_worker = w
-                w.extra_repos_fetched.connect(self._on_extra_repos_fetched)
-                w.finished.connect(lambda: setattr(self, "_extra_repos_fetch_worker", None))
-                w.start()
+        if index == 1:
+            QTimer.singleShot(0, self._refresh_ui_tab_status)
+        if index == 2:
+            QTimer.singleShot(0, self._refresh_video_player_tab_status)
+        if index == 5:
+            self._on_updates_tab_shown()
+
+    def _on_updates_tab_shown(self) -> None:
+        """Updates tab visible: show cache, refresh tool rows, auto-check if stale."""
+        self._apply_cached_update_result(get_cached_check_result())
+        self._refresh_ffmpeg_update_row()
+        self._refresh_mpv_update_row()
+        self._apply_update_list_action_width()
+        self._maybe_auto_check_for_updates()
+
+    def _maybe_auto_check_for_updates(self) -> None:
+        if getattr(self, "_update_check_worker", None) is not None:
+            return
+        last_check_iso: str | None = None
+        if self._settings is not None:
+            last_check_iso = self._settings.value("updates/last_check_time", None, str)
+        if should_auto_check_updates(last_check_iso=last_check_iso):
+            self._start_update_check(skip_cache=False, reset_ui=False)
+            return
+        if not get_cached_extra_repos() and not getattr(self, "_extra_repos_fetch_worker", None):
+            w = _ExtraReposFetchWorker(self)
+            self._extra_repos_fetch_worker = w
+            w.extra_repos_fetched.connect(self._on_extra_repos_fetched)
+            w.finished.connect(lambda: setattr(self, "_extra_repos_fetch_worker", None))
+            w.start()
 
     def _on_extra_repos_fetched(self, extra_repos: dict) -> None:
         """Apply extra repos data from background fetch (so Download/Latest shows without clicking Check)."""
         self._apply_extra_repos_ui(extra_repos)
+
+    def _refresh_ui_tab_status(self) -> None:
+        """Deferred refresh for General → UI (quick view slot summaries)."""
+        nav_labels = getattr(self, "_nav_quick_slot_labels", None)
+        if nav_labels:
+            self._refresh_nav_quick_slot_labels()
+
+    def _refresh_video_player_tab_status(self) -> None:
+        """Deferred disk/path probes for General → Video player."""
+        openrv_helper = getattr(self, "_openrv_helper", None)
+        if openrv_helper is not None:
+            openrv_status = "not configured"
+            try:
+                if is_openrv_available(self._settings):
+                    openrv_status = "available"
+                elif getattr(self, "_openrv_exe_field", None) is not None and (
+                    self._openrv_exe_field.text() or ""
+                ).strip():
+                    openrv_status = "path invalid"
+            except Exception:
+                pass
+            openrv_helper.setText(
+                "Pro review in OpenRV (sidecar). Install from github.com/AcademySoftwareFoundation/OpenRV "
+                "or point to rv.exe. MONOS in-app player remains the default. "
+                f"Detected: {openrv_status}"
+            )
+        mpv_helper = getattr(self, "_mpv_detect_helper", None)
+        if mpv_helper is not None:
+            mpv_status = "not found"
+            try:
+                mpv_status = format_mpv_detect_status(self._settings)
+            except Exception:
+                pass
+            mpv_helper.setText(
+                "Embedded playback uses libmpv (mpv-2.dll). Install via Settings → Updates → libmpv, "
+                "or bundle at build time. Double-click a video in Inbox or Project Guide to preview. "
+                f"Detected: {mpv_status}"
+            )
+        self._refresh_video_proxy_cache_row()
 
     def _on_page_button_clicked(
         self,
@@ -775,20 +1110,22 @@ class SettingsDialog(MonosDialog):
         buttons: list[QPushButton],
         index: int,
     ) -> None:
+        self._ensure_tier2_page_built(stack, index)
         stack.setCurrentIndex(index)
         for i, b in enumerate(buttons):
             b.setChecked(i == index)
 
     def _build_general_page(self) -> QWidget:
-        """Tier 2: General → Workspace | UI | Behavior | Hotkeys | Updates | Access (nút page ngang)."""
+        """Tier 2: General → Workspace | UI | Video player | Behavior | Hotkeys | Updates | Access."""
         return self._build_tier2_page_buttons(
             [
-                ("Workspace", self._build_app_workspace_tab()),
-                ("UI", self._build_ui_tab()),
-                ("Behavior", self._build_behavior_tab()),
-                ("Hotkeys", self._build_hotkeys_tab()),
-                ("Updates", self._build_updates_tab()),
-                ("Access", self._build_access_tab()),
+                ("Workspace", self._build_app_workspace_tab),
+                ("UI", self._build_ui_tab),
+                ("Video player", self._build_video_player_tab),
+                ("Behavior", self._build_behavior_tab),
+                ("Hotkeys", self._build_hotkeys_tab),
+                ("Updates", self._build_updates_tab),
+                ("Access", self._build_access_tab),
             ],
             store_stack="general",
             store_buttons="general",
@@ -946,7 +1283,6 @@ class SettingsDialog(MonosDialog):
         clear_all_l.addWidget(clear_all_btn, 0)
         clear_all_l.addStretch(1)
         qv_l.addWidget(clear_all_row)
-        self._refresh_nav_quick_slot_labels()
         layout.addWidget(qv_card)
 
         insp_card, insp_l = add_settings_section(
@@ -1044,88 +1380,6 @@ class SettingsDialog(MonosDialog):
             "Hover the preview for sequence play/pause.",
         )
 
-        insp_l.addWidget(settings_divider(insp_card))
-        add_settings_subsection_title(insp_l, "Video preview player")
-
-        self._video_player_backend_combo = QComboBox(insp_card)
-        style_settings_combo(self._video_player_backend_combo, width=220)
-        for label, val in (
-            ("mpv embed (default)", BACKEND_MPV),
-            ("Auto (mpv → Qt → external)", BACKEND_AUTO),
-            ("Qt Multimedia only", BACKEND_QT),
-            ("External app only", BACKEND_EXTERNAL),
-        ):
-            self._video_player_backend_combo.addItem(label, val)
-        try:
-            cur = read_video_player_backend(self._settings)
-            for i in range(self._video_player_backend_combo.count()):
-                if self._video_player_backend_combo.itemData(i) == cur:
-                    self._video_player_backend_combo.setCurrentIndex(i)
-                    break
-        except Exception:
-            pass
-        add_settings_field_row(insp_l, "Playback backend", self._video_player_backend_combo)
-
-        mpv_row = QWidget(insp_card)
-        mpv_row_l = QHBoxLayout(mpv_row)
-        mpv_row_l.setContentsMargins(0, 0, 0, 0)
-        mpv_row_l.setSpacing(8)
-        self._mpv_dir_field = QLineEdit(mpv_row)
-        style_settings_line_edit(self._mpv_dir_field, min_width=200)
-        self._mpv_dir_field.setPlaceholderText("Folder containing mpv-2.dll (optional)")
-        try:
-            self._mpv_dir_field.setText(read_mpv_directory(self._settings))
-        except Exception:
-            self._mpv_dir_field.setText("")
-        btn_mpv_browse = QPushButton("Browse…", mpv_row)
-        btn_mpv_browse.setObjectName("SettingsCategoryActionButton")
-        btn_mpv_browse.clicked.connect(self._browse_mpv_directory)
-        btn_mpv_clear = QPushButton("Clear", mpv_row)
-        btn_mpv_clear.setObjectName("SettingsCategoryActionButton")
-        btn_mpv_clear.clicked.connect(lambda: self._mpv_dir_field.setText(""))
-        mpv_row_l.addWidget(self._mpv_dir_field, 1)
-        mpv_row_l.addWidget(btn_mpv_browse, 0)
-        mpv_row_l.addWidget(btn_mpv_clear, 0)
-        insp_l.addWidget(mpv_row)
-        add_settings_field_row(insp_l, "libmpv folder", mpv_row)
-
-        vid_ext_row = QWidget(insp_card)
-        vid_ext_row_l = QHBoxLayout(vid_ext_row)
-        vid_ext_row_l.setContentsMargins(0, 0, 0, 0)
-        vid_ext_row_l.setSpacing(8)
-        self._video_external_player_field = QLineEdit(vid_ext_row)
-        style_settings_line_edit(self._video_external_player_field, min_width=200)
-        self._video_external_player_field.setPlaceholderText("External player .exe (fallback)")
-        try:
-            self._video_external_player_field.setText(read_video_external_player_exe(self._settings))
-        except Exception:
-            self._video_external_player_field.setText("")
-        btn_vid_browse = QPushButton("Browse…", vid_ext_row)
-        btn_vid_browse.setObjectName("SettingsCategoryActionButton")
-        btn_vid_browse.clicked.connect(self._browse_video_external_player)
-        btn_vid_clear = QPushButton("Clear", vid_ext_row)
-        btn_vid_clear.setObjectName("SettingsCategoryActionButton")
-        btn_vid_clear.clicked.connect(lambda: self._video_external_player_field.setText(""))
-        vid_ext_row_l.addWidget(self._video_external_player_field, 1)
-        vid_ext_row_l.addWidget(btn_vid_browse, 0)
-        vid_ext_row_l.addWidget(btn_vid_clear, 0)
-        insp_l.addWidget(vid_ext_row)
-        add_settings_field_row(insp_l, "External player", vid_ext_row)
-
-        mpv_status = "not found"
-        try:
-            mpv_status = format_mpv_detect_status(self._settings)
-        except Exception:
-            pass
-        self._mpv_detect_helper = QLabel(
-            "Embedded playback uses libmpv (mpv-2.dll). Install via Settings → Updates → libmpv, "
-            "or bundle at build time. Double-click a video in Inbox or Project Guide to preview. "
-            f"Detected: {mpv_status}",
-            insp_card,
-        )
-        self._mpv_detect_helper.setWordWrap(True)
-        self._mpv_detect_helper.setObjectName("DialogHelper")
-        insp_l.addWidget(self._mpv_detect_helper)
         layout.addWidget(insp_card)
 
         tray_card, tray_l = add_settings_section(
@@ -1191,6 +1445,156 @@ class SettingsDialog(MonosDialog):
         self._refresh_tray_autostart_status()
 
         layout.addWidget(tray_card)
+        layout.addStretch(1)
+
+        scroll.setWidget(inner)
+        return scroll
+
+    def _build_video_player_tab(self) -> QWidget:
+        """General → Video player: embedded preview, OpenRV, proxy cache."""
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsPageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(4, 4, 4, 16)
+        layout.setSpacing(16)
+
+        player_card, player_l = add_settings_section(
+            inner,
+            "Video preview",
+            "In-app playback (libmpv), external fallback, OpenRV sidecar, and review proxy cache.",
+        )
+
+        self._video_player_backend_combo = QComboBox(player_card)
+        style_settings_combo(self._video_player_backend_combo, width=220)
+        for label, val in (
+            ("mpv embed (default)", BACKEND_MPV),
+            ("Auto (mpv → Qt → external)", BACKEND_AUTO),
+            ("Qt Multimedia only", BACKEND_QT),
+            ("External app only", BACKEND_EXTERNAL),
+        ):
+            self._video_player_backend_combo.addItem(label, val)
+        try:
+            cur = read_video_player_backend(self._settings)
+            for i in range(self._video_player_backend_combo.count()):
+                if self._video_player_backend_combo.itemData(i) == cur:
+                    self._video_player_backend_combo.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+        add_settings_field_row(player_l, "Playback backend", self._video_player_backend_combo)
+
+        mpv_row = QWidget(player_card)
+        mpv_row_l = QHBoxLayout(mpv_row)
+        mpv_row_l.setContentsMargins(0, 0, 0, 0)
+        mpv_row_l.setSpacing(8)
+        self._mpv_dir_field = QLineEdit(mpv_row)
+        style_settings_line_edit(self._mpv_dir_field, min_width=200)
+        self._mpv_dir_field.setPlaceholderText("Folder containing mpv-2.dll (optional)")
+        try:
+            self._mpv_dir_field.setText(read_mpv_directory(self._settings))
+        except Exception:
+            self._mpv_dir_field.setText("")
+        btn_mpv_browse = QPushButton("Browse…", mpv_row)
+        btn_mpv_browse.setObjectName("SettingsCategoryActionButton")
+        btn_mpv_browse.clicked.connect(self._browse_mpv_directory)
+        btn_mpv_clear = QPushButton("Clear", mpv_row)
+        btn_mpv_clear.setObjectName("SettingsCategoryActionButton")
+        btn_mpv_clear.clicked.connect(lambda: self._mpv_dir_field.setText(""))
+        mpv_row_l.addWidget(self._mpv_dir_field, 1)
+        mpv_row_l.addWidget(btn_mpv_browse, 0)
+        mpv_row_l.addWidget(btn_mpv_clear, 0)
+        add_settings_field_row(player_l, "libmpv folder", mpv_row)
+
+        vid_ext_row = QWidget(player_card)
+        vid_ext_row_l = QHBoxLayout(vid_ext_row)
+        vid_ext_row_l.setContentsMargins(0, 0, 0, 0)
+        vid_ext_row_l.setSpacing(8)
+        self._video_external_player_field = QLineEdit(vid_ext_row)
+        style_settings_line_edit(self._video_external_player_field, min_width=200)
+        self._video_external_player_field.setPlaceholderText("External player .exe (fallback)")
+        try:
+            self._video_external_player_field.setText(read_video_external_player_exe(self._settings))
+        except Exception:
+            self._video_external_player_field.setText("")
+        btn_vid_browse = QPushButton("Browse…", vid_ext_row)
+        btn_vid_browse.setObjectName("SettingsCategoryActionButton")
+        btn_vid_browse.clicked.connect(self._browse_video_external_player)
+        btn_vid_clear = QPushButton("Clear", vid_ext_row)
+        btn_vid_clear.setObjectName("SettingsCategoryActionButton")
+        btn_vid_clear.clicked.connect(lambda: self._video_external_player_field.setText(""))
+        vid_ext_row_l.addWidget(self._video_external_player_field, 1)
+        vid_ext_row_l.addWidget(btn_vid_browse, 0)
+        vid_ext_row_l.addWidget(btn_vid_clear, 0)
+        add_settings_field_row(player_l, "External player", vid_ext_row)
+
+        openrv_row = QWidget(player_card)
+        openrv_row_l = QHBoxLayout(openrv_row)
+        openrv_row_l.setContentsMargins(0, 0, 0, 0)
+        openrv_row_l.setSpacing(8)
+        self._openrv_exe_field = QLineEdit(openrv_row)
+        style_settings_line_edit(self._openrv_exe_field, min_width=200)
+        self._openrv_exe_field.setPlaceholderText("OpenRV rv.exe (optional sidecar)")
+        try:
+            self._openrv_exe_field.setText(read_openrv_executable(self._settings))
+        except Exception:
+            self._openrv_exe_field.setText("")
+        btn_openrv_browse = QPushButton("Browse…", openrv_row)
+        btn_openrv_browse.setObjectName("SettingsCategoryActionButton")
+        btn_openrv_browse.clicked.connect(self._browse_openrv_executable)
+        btn_openrv_clear = QPushButton("Clear", openrv_row)
+        btn_openrv_clear.setObjectName("SettingsCategoryActionButton")
+        btn_openrv_clear.clicked.connect(lambda: self._openrv_exe_field.setText(""))
+        openrv_row_l.addWidget(self._openrv_exe_field, 1)
+        openrv_row_l.addWidget(btn_openrv_browse, 0)
+        openrv_row_l.addWidget(btn_openrv_clear, 0)
+        add_settings_field_row(player_l, "OpenRV", openrv_row)
+
+        self._openrv_helper = QLabel(
+            "Pro review in OpenRV (sidecar). Install from github.com/AcademySoftwareFoundation/OpenRV "
+            "or point to rv.exe. MONOS in-app player remains the default. Detected: …",
+            player_card,
+        )
+        self._openrv_helper.setWordWrap(True)
+        self._openrv_helper.setObjectName("DialogHelper")
+        player_l.addWidget(self._openrv_helper)
+
+        self._mpv_detect_helper = QLabel(
+            "Embedded playback uses libmpv (mpv-2.dll). Install via Settings → Updates → libmpv, "
+            "or bundle at build time. Double-click a video in Inbox or Project Guide to preview. "
+            "Detected: …",
+            player_card,
+        )
+        self._mpv_detect_helper.setWordWrap(True)
+        self._mpv_detect_helper.setObjectName("DialogHelper")
+        player_l.addWidget(self._mpv_detect_helper)
+
+        player_l.addWidget(settings_divider(player_card))
+
+        proxy_cache_row = QWidget(player_card)
+        proxy_cache_row_l = QHBoxLayout(proxy_cache_row)
+        proxy_cache_row_l.setContentsMargins(0, 0, 0, 0)
+        proxy_cache_row_l.setSpacing(8)
+        self._video_proxy_cache_size_label = QLabel("—", proxy_cache_row)
+        self._video_proxy_cache_size_label.setProperty("mono", True)
+        proxy_cache_row_l.addWidget(self._video_proxy_cache_size_label, 0)
+        proxy_cache_row_l.addStretch(1)
+        proxy_clear_btn = QPushButton("Clear cache", proxy_cache_row)
+        proxy_clear_btn.setObjectName("SettingsCategoryActionButton")
+        proxy_clear_btn.setToolTip("Delete all cached review proxies on this machine")
+        proxy_clear_btn.clicked.connect(self._on_clear_video_proxy_cache_clicked)
+        proxy_cache_row_l.addWidget(proxy_clear_btn, 0)
+        add_settings_field_row(player_l, "Proxy cache", proxy_cache_row)
+        add_settings_helper(
+            player_l,
+            "Disk cache for review proxies (faster scrub). Open Video Preview windows rebuild after clear.",
+        )
+
+        layout.addWidget(player_card)
         layout.addStretch(1)
 
         scroll.setWidget(inner)
@@ -1369,6 +1773,26 @@ class SettingsDialog(MonosDialog):
         if path and self._video_external_player_field is not None:
             self._video_external_player_field.setText(path.strip())
 
+    def _browse_openrv_executable(self) -> None:
+        start = ""
+        try:
+            if self._openrv_exe_field is not None:
+                t = (self._openrv_exe_field.text() or "").strip()
+                if t:
+                    p = Path(t)
+                    if p.parent.is_dir():
+                        start = str(p.parent)
+        except Exception:
+            start = ""
+        path, _flt = QFileDialog.getOpenFileName(
+            self,
+            "Select OpenRV executable",
+            start,
+            "Executable (rv.exe);;All files (*.*)",
+        )
+        if path and self._openrv_exe_field is not None:
+            self._openrv_exe_field.setText(path.strip())
+
     def _build_behavior_tab(self) -> QWidget:
         """General → Behavior: global pipeline options (create asset/shot)."""
         root = QWidget()
@@ -1505,6 +1929,7 @@ class SettingsDialog(MonosDialog):
         return root
 
     def _on_settings_nav_row_changed(self, row: int) -> None:
+        self._ensure_scope_page_built(row)
         self._content_stack.setCurrentIndex(row)
         if row == 1:
             self._refresh_pipeline_access_lock()
@@ -1872,7 +2297,7 @@ class SettingsDialog(MonosDialog):
         self._update_monostudio_link_btn: QPushButton | None = None
         self._update_monostudio_action_btn: QPushButton | None = None
         self._update_extra_cards: dict[str, tuple[QLabel, QPushButton, QPushButton]] = {}
-        self._update_extra_loading: dict[str, tuple[QWidget, QProgressBar, QToolButton]] = {}
+        self._update_extra_loading: dict[str, _UpdateDownloadProgressBar] = {}
         self._update_extra_html_url: dict[str, str] = {}
         self._update_extra_fallback_url: dict[str, str] = {}
         self._update_extra_download_url: dict[str, str] = {}
@@ -1915,46 +2340,31 @@ class SettingsDialog(MonosDialog):
             if product_id == "monostudio":
                 self._update_monostudio_version_label = ver_l
                 self._update_monostudio_link_btn = link_btn
-                action_btn = QPushButton("Latest", row)
-                action_btn.setObjectName("UpdateProductListBtnLatest")
-                action_btn.clicked.connect(self._on_download_and_install)
+                action_btn = _UpdateLatestActionButton(_UPDATE_BTN_LABEL_LATEST, row)
+                action_btn.set_latest_idle(can_redownload=False)
+                action_btn.clicked.connect(self._on_monostudio_action_clicked)
                 link_btn.clicked.connect(self._on_view_release_on_github)
                 self._update_monostudio_action_btn = action_btn
 
-                loading_widget = QWidget(row)
-                loading_widget.setObjectName("UpdateDownloadLoading")
-                loading_l = QHBoxLayout(loading_widget)
-                loading_l.setContentsMargins(0, 0, 0, 0)
-                loading_l.setSpacing(_UPDATE_CANCEL_GAP)
-                progress_bar = QProgressBar(loading_widget)
-                progress_bar.setObjectName("UpdateDownloadProgress")
+                progress_bar = _UpdateDownloadProgressBar(row)
                 progress_bar.setMinimum(0)
                 progress_bar.setMaximum(0)
-                loading_l.addWidget(progress_bar)
-                cancel_btn = QToolButton(loading_widget)
-                _configure_update_cancel_btn(cancel_btn)
-                loading_l.addWidget(cancel_btn)
-                loading_widget.hide()
+                progress_bar.cancel_requested.connect(self._on_cancel_download)
+                progress_bar.hide()
 
-                self._update_monostudio_loading_widget = loading_widget
+                self._update_monostudio_loading_widget = progress_bar
                 self._update_monostudio_progress_bar = progress_bar
-                self._update_monostudio_cancel_btn = cancel_btn
 
                 action_container = QWidget(row)
                 action_container_l = QHBoxLayout(action_container)
                 action_container_l.setContentsMargins(0, 0, 0, 0)
                 action_container_l.setSpacing(0)
                 action_container_l.addWidget(action_btn)
-                action_container_l.addWidget(loading_widget)
-                _apply_update_action_width(
-                    action_btn,
-                    loading_widget=loading_widget,
-                    progress_bar=progress_bar,
-                )
+                action_container_l.addWidget(progress_bar)
                 row_l.addWidget(action_container)
             else:
-                action_btn = QPushButton("View on GitHub", row)
-                action_btn.setObjectName("SettingsCategoryActionButton")
+                action_btn = _UpdateLatestActionButton("View on GitHub", row)
+                action_btn.set_secondary_mode("View on GitHub")
                 if repo:
                     fallback_url = f"https://github.com/{repo}/releases"
                     self._update_extra_fallback_url[display_name] = fallback_url
@@ -1966,43 +2376,25 @@ class SettingsDialog(MonosDialog):
                 link_btn.clicked.connect(lambda checked=False, n=display_name: self._on_extra_repo_release_link_clicked(n))
                 self._update_extra_cards[display_name] = (ver_l, link_btn, action_btn)
 
-                loading_widget = QWidget(row)
-                loading_widget.setObjectName("UpdateDownloadLoading")
-                loading_l = QHBoxLayout(loading_widget)
-                loading_l.setContentsMargins(0, 0, 0, 0)
-                loading_l.setSpacing(_UPDATE_CANCEL_GAP)
-                progress_bar = QProgressBar(loading_widget)
-                progress_bar.setObjectName("UpdateDownloadProgress")
+                progress_bar = _UpdateDownloadProgressBar(row)
                 progress_bar.setMinimum(0)
                 progress_bar.setMaximum(0)
-                loading_l.addWidget(progress_bar)
-                cancel_btn = QToolButton(loading_widget)
-                _configure_update_cancel_btn(cancel_btn)
-                loading_l.addWidget(cancel_btn)
-                loading_widget.hide()
-                self._update_extra_loading[display_name] = (loading_widget, progress_bar, cancel_btn)
+                progress_bar.cancel_requested.connect(self._on_cancel_download)
+                progress_bar.hide()
+                self._update_extra_loading[display_name] = progress_bar
 
                 action_container = QWidget(row)
                 action_container_l = QHBoxLayout(action_container)
                 action_container_l.setContentsMargins(0, 0, 0, 0)
                 action_container_l.setSpacing(0)
                 action_container_l.addWidget(action_btn)
-                action_container_l.addWidget(loading_widget)
-                _apply_update_action_width(
-                    action_btn,
-                    loading_widget=loading_widget,
-                    progress_bar=progress_bar,
-                )
+                action_container_l.addWidget(progress_bar)
                 row_l.addWidget(action_container)
 
             list_layout.addWidget(row)
 
         self._build_ffmpeg_update_row(list_container, list_layout)
         self._build_mpv_update_row(list_container, list_layout)
-        self._build_video_proxy_cache_row(list_container, list_layout)
-        self._refresh_ffmpeg_update_row()
-        self._refresh_mpv_update_row()
-        self._refresh_video_proxy_cache_row()
 
         layout.addWidget(list_container)
 
@@ -2028,7 +2420,11 @@ class SettingsDialog(MonosDialog):
         layout.addWidget(hint, 0)
 
         self._pending_update_info: UpdateInfo | None = None
+        self._latest_install_info: UpdateInfo | None = None
         self._update_latest_html_url: str = ""
+        self._update_download_user_cancelled = False
+        self._ffmpeg_download_user_cancelled = False
+        self._mpv_download_user_cancelled = False
         self._update_check_worker: _UpdateCheckWorker | None = None
         self._update_download_worker: _DownloadWorker | None = None
         return root
@@ -2104,15 +2500,11 @@ class SettingsDialog(MonosDialog):
         page_load = QWidget(stack)
         pl_l = QHBoxLayout(page_load)
         pl_l.setContentsMargins(0, 0, 0, 0)
-        pl_l.setSpacing(_UPDATE_CANCEL_GAP)
-        prog = QProgressBar(page_load)
-        prog.setObjectName("UpdateDownloadProgress")
+        prog = _UpdateDownloadProgressBar(page_load)
         prog.setMinimum(0)
         prog.setMaximum(0)
-        cancel_tb = QToolButton(page_load)
-        _configure_update_cancel_btn(cancel_tb)
+        prog.cancel_requested.connect(self._on_ffmpeg_download_cancel_clicked)
         pl_l.addWidget(prog)
-        pl_l.addWidget(cancel_tb)
         stack.addWidget(page_load)
 
         page_inst = QWidget(stack)
@@ -2132,10 +2524,10 @@ class SettingsDialog(MonosDialog):
         outer_l.addWidget(stack)
         row_l.addWidget(outer)
 
+        self._ffmpeg_action_outer = outer
         self._ffmpeg_action_stack = stack
         self._ffmpeg_get_btn = get_btn
         self._ffmpeg_progress_bar = prog
-        self._ffmpeg_cancel_btn = cancel_tb
         self._ffmpeg_install_btn = install_btn
         stack.setCurrentIndex(0)
         list_layout.addWidget(row)
@@ -2144,6 +2536,7 @@ class SettingsDialog(MonosDialog):
         """libmpv row: Get → download .7z → Install (extract to LocalAppData) + locate folder."""
         row = QWidget(list_container)
         row.setObjectName("UpdateProductListRow")
+        row.setProperty("last", "true")
         row.setFixedHeight(44)
         row_l = QHBoxLayout(row)
         row_l.setContentsMargins(12, 0, 12, 0)
@@ -2206,15 +2599,11 @@ class SettingsDialog(MonosDialog):
         page_load = QWidget(stack)
         pl_l = QHBoxLayout(page_load)
         pl_l.setContentsMargins(0, 0, 0, 0)
-        pl_l.setSpacing(_UPDATE_CANCEL_GAP)
-        prog = QProgressBar(page_load)
-        prog.setObjectName("UpdateDownloadProgress")
+        prog = _UpdateDownloadProgressBar(page_load)
         prog.setMinimum(0)
         prog.setMaximum(0)
-        cancel_tb = QToolButton(page_load)
-        _configure_update_cancel_btn(cancel_tb)
+        prog.cancel_requested.connect(self._on_mpv_download_cancel_clicked)
         pl_l.addWidget(prog)
-        pl_l.addWidget(cancel_tb)
         stack.addWidget(page_load)
 
         page_inst = QWidget(stack)
@@ -2234,52 +2623,12 @@ class SettingsDialog(MonosDialog):
         outer_l.addWidget(stack)
         row_l.addWidget(outer)
 
+        self._mpv_action_outer = outer
         self._mpv_action_stack = stack
         self._mpv_get_btn = get_btn
         self._mpv_progress_bar = prog
-        self._mpv_cancel_btn = cancel_tb
         self._mpv_install_btn = install_btn
         stack.setCurrentIndex(0)
-        list_layout.addWidget(row)
-
-    def _build_video_proxy_cache_row(self, list_container: QWidget, list_layout: QVBoxLayout) -> None:
-        """Video preview proxy cache — disk usage + clear all."""
-        row = QWidget(list_container)
-        row.setObjectName("UpdateProductListRow")
-        row.setProperty("last", "true")
-        row.setFixedHeight(44)
-        row_l = QHBoxLayout(row)
-        row_l.setContentsMargins(12, 0, 12, 0)
-        row_l.setSpacing(12)
-
-        icon_l = QLabel(row)
-        icon_l.setFixedSize(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
-        icon_l.setScaledContents(True)
-        ic = lucide_icon("film", size=_UPDATE_ROW_ICON_SIZE, color_hex="#a1a1aa")
-        pm = ic.pixmap(_UPDATE_ROW_ICON_SIZE, _UPDATE_ROW_ICON_SIZE)
-        if not pm.isNull():
-            icon_l.setPixmap(pm)
-        row_l.addWidget(icon_l)
-
-        name_l = QLabel("Video proxy cache", row)
-        name_l.setObjectName("UpdateProductListName")
-        row_l.addWidget(name_l)
-
-        ver_l = QLabel("—", row)
-        ver_l.setObjectName("UpdateProductListVersion")
-        ver_l.setProperty("mono", True)
-        row_l.addWidget(ver_l)
-        self._video_proxy_cache_size_label = ver_l
-
-        row_l.addStretch(1)
-
-        clear_btn = QPushButton("Clear cache", row)
-        clear_btn.setObjectName("UpdateProductListAction")
-        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clear_btn.setToolTip("Delete all cached review proxies on this machine")
-        clear_btn.clicked.connect(self._on_clear_video_proxy_cache_clicked)
-        row_l.addWidget(clear_btn)
-
         list_layout.addWidget(row)
 
     def _refresh_video_proxy_cache_row(self) -> None:
@@ -2377,18 +2726,12 @@ class SettingsDialog(MonosDialog):
         dest = Path(tempfile.gettempdir()) / "MonoStudio26" / "ffmpeg-release-essentials.zip"
         dest.parent.mkdir(parents=True, exist_ok=True)
         stack.setCurrentIndex(1)
+        self._ffmpeg_download_user_cancelled = False
         bar = getattr(self, "_ffmpeg_progress_bar", None)
         if bar is not None:
             bar.setMinimum(0)
             bar.setMaximum(0)
             bar.setValue(0)
-        cancel = getattr(self, "_ffmpeg_cancel_btn", None)
-        if cancel is not None:
-            try:
-                cancel.clicked.disconnect(self._on_ffmpeg_download_cancel_clicked)
-            except (TypeError, RuntimeError):
-                pass
-            cancel.clicked.connect(self._on_ffmpeg_download_cancel_clicked)
         self._ffmpeg_download_worker = _FfmpegZipDownloadWorker(
             FFMPEG_GYAN_RELEASE_ESSENTIALS_ZIP,
             dest,
@@ -2399,8 +2742,18 @@ class SettingsDialog(MonosDialog):
         self._ffmpeg_download_worker.start()
 
     def _on_ffmpeg_download_cancel_clicked(self) -> None:
-        if self._ffmpeg_download_worker is not None:
-            self._ffmpeg_download_worker.cancel()
+        if self._ffmpeg_download_worker is None:
+            return
+        self._ffmpeg_download_user_cancelled = True
+        self._ffmpeg_download_worker.cancel()
+        stack = getattr(self, "_ffmpeg_action_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(0)
+        bar = getattr(self, "_ffmpeg_progress_bar", None)
+        if bar is not None:
+            bar.setMinimum(0)
+            bar.setMaximum(0)
+            bar.setValue(0)
 
     def _on_ffmpeg_zip_download_progress(self, read: int, total: int) -> None:
         bar = getattr(self, "_ffmpeg_progress_bar", None)
@@ -2414,14 +2767,12 @@ class SettingsDialog(MonosDialog):
             bar.setMinimum(0)
 
     def _on_ffmpeg_zip_download_finished(self, success: bool, path_str: str, error_message: str = "") -> None:
+        if getattr(self, "_ffmpeg_download_user_cancelled", False):
+            self._ffmpeg_download_user_cancelled = False
+            self._ffmpeg_download_worker = None
+            return
         self._ffmpeg_download_worker = None
         stack = getattr(self, "_ffmpeg_action_stack", None)
-        cancel = getattr(self, "_ffmpeg_cancel_btn", None)
-        if cancel is not None:
-            try:
-                cancel.clicked.disconnect(self._on_ffmpeg_download_cancel_clicked)
-            except (TypeError, RuntimeError):
-                pass
         bar = getattr(self, "_ffmpeg_progress_bar", None)
         if bar is not None:
             bar.setMinimum(0)
@@ -2517,26 +2868,30 @@ class SettingsDialog(MonosDialog):
         dest = Path(tempfile.gettempdir()) / "MonoStudio26" / MPV_WIN64_7Z_NAME
         dest.parent.mkdir(parents=True, exist_ok=True)
         stack.setCurrentIndex(1)
+        self._mpv_download_user_cancelled = False
         bar = getattr(self, "_mpv_progress_bar", None)
         if bar is not None:
             bar.setMinimum(0)
             bar.setMaximum(0)
             bar.setValue(0)
-        cancel = getattr(self, "_mpv_cancel_btn", None)
-        if cancel is not None:
-            try:
-                cancel.clicked.disconnect(self._on_mpv_download_cancel_clicked)
-            except (TypeError, RuntimeError):
-                pass
-            cancel.clicked.connect(self._on_mpv_download_cancel_clicked)
         self._mpv_download_worker = _Mpv7zDownloadWorker(dest, self)
         self._mpv_download_worker.progress.connect(self._on_mpv_7z_download_progress)
         self._mpv_download_worker.download_finished.connect(self._on_mpv_7z_download_finished)
         self._mpv_download_worker.start()
 
     def _on_mpv_download_cancel_clicked(self) -> None:
-        if self._mpv_download_worker is not None:
-            self._mpv_download_worker.cancel()
+        if self._mpv_download_worker is None:
+            return
+        self._mpv_download_user_cancelled = True
+        self._mpv_download_worker.cancel()
+        stack = getattr(self, "_mpv_action_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(0)
+        bar = getattr(self, "_mpv_progress_bar", None)
+        if bar is not None:
+            bar.setMinimum(0)
+            bar.setMaximum(0)
+            bar.setValue(0)
 
     def _on_mpv_7z_download_progress(self, read: int, total: int) -> None:
         bar = getattr(self, "_mpv_progress_bar", None)
@@ -2550,14 +2905,12 @@ class SettingsDialog(MonosDialog):
             bar.setMinimum(0)
 
     def _on_mpv_7z_download_finished(self, success: bool, path_str: str, error_message: str = "") -> None:
+        if getattr(self, "_mpv_download_user_cancelled", False):
+            self._mpv_download_user_cancelled = False
+            self._mpv_download_worker = None
+            return
         self._mpv_download_worker = None
         stack = getattr(self, "_mpv_action_stack", None)
-        cancel = getattr(self, "_mpv_cancel_btn", None)
-        if cancel is not None:
-            try:
-                cancel.clicked.disconnect(self._on_mpv_download_cancel_clicked)
-            except (TypeError, RuntimeError):
-                pass
         bar = getattr(self, "_mpv_progress_bar", None)
         if bar is not None:
             bar.setMinimum(0)
@@ -2677,17 +3030,23 @@ class SettingsDialog(MonosDialog):
         return ("You're up to date", "square-check", MONOS_COLORS.get("emerald_500", "#10b981"))
 
     def _on_check_for_updates(self) -> None:
+        self._start_update_check(skip_cache=True, reset_ui=True)
+
+    def _start_update_check(self, *, skip_cache: bool = False, reset_ui: bool = False) -> None:
+        if getattr(self, "_update_check_worker", None) is not None:
+            return
         self._update_check_btn.setEnabled(False)
         self._set_update_status_display("Checking…", "loader-2", MONOS_COLORS.get("blue_400", "#60a5fa"))
-        self._update_changelog.clear()
-        self._pending_update_info = None
-        self._apply_monostudio_row(None)
-        self._apply_extra_repos_ui({})
+        if reset_ui:
+            self._update_changelog.clear()
+            self._pending_update_info = None
+            self._apply_monostudio_row(None)
+            self._apply_extra_repos_ui({})
         self._update_check_worker = _UpdateCheckWorker(
             None,  # use default: GitHub Releases API
             get_app_version(),
             self,
-            skip_cache=True,  # user clicked "Check for updates" → always fetch fresh
+            skip_cache=skip_cache,
         )
         self._update_check_worker.check_finished.connect(self._on_update_check_finished)
         self._update_check_worker.finished.connect(self._on_update_check_thread_finished)
@@ -2724,6 +3083,7 @@ class SettingsDialog(MonosDialog):
             self._update_changelog.setPlainText("No release notes for this version.")
         self._apply_changelog_line_height()
         self._update_latest_html_url = result.latest_html_url
+        self._latest_install_info = result.latest_install_info
         if result.update_available and result.update_info is not None:
             self._pending_update_info = result.update_info
         else:
@@ -2749,8 +3109,17 @@ class SettingsDialog(MonosDialog):
         self._update_check_btn.setEnabled(True)
         self._update_check_worker = None
 
+    def _on_monostudio_action_clicked(self) -> None:
+        btn = self._update_monostudio_action_btn
+        if isinstance(btn, _UpdateLatestActionButton) and btn.is_redownload_hover():
+            self._start_monostudio_download(getattr(self, "_latest_install_info", None))
+            return
+        self._on_download_and_install()
+
     def _on_download_and_install(self) -> None:
-        info = self._pending_update_info
+        self._start_monostudio_download(self._pending_update_info)
+
+    def _start_monostudio_download(self, info: UpdateInfo | None) -> None:
         if info is None:
             return
         import tempfile
@@ -2758,6 +3127,7 @@ class SettingsDialog(MonosDialog):
         primary = info.url
         fallback = (info.asset_api_url or "").strip() or None
         self._update_download_product = "monostudio"
+        self._update_download_user_cancelled = False
         if self._update_monostudio_action_btn:
             self._update_monostudio_action_btn.hide()
         if getattr(self, "_update_monostudio_loading_widget", None):
@@ -2769,8 +3139,6 @@ class SettingsDialog(MonosDialog):
         self._update_download_worker = _DownloadWorker(primary, dest, fallback_url=fallback, parent=self)
         self._update_download_worker.progress.connect(self._on_download_progress)
         self._update_download_worker.download_finished.connect(self._on_download_finished)
-        if getattr(self, "_update_monostudio_cancel_btn", None):
-            self._update_monostudio_cancel_btn.clicked.connect(self._on_cancel_download)
         self._update_download_worker.start()
 
     def _on_view_release_on_github(self) -> None:
@@ -2781,6 +3149,68 @@ class SettingsDialog(MonosDialog):
             url = self._update_latest_html_url
         if url:
             QDesktopServices.openUrl(QUrl(url))
+
+    def _iter_update_list_action_buttons(self) -> list[QPushButton]:
+        btns: list[QPushButton] = []
+        mono = getattr(self, "_update_monostudio_action_btn", None)
+        if mono is not None:
+            btns.append(mono)
+        for _, (_, _, btn) in getattr(self, "_update_extra_cards", {}).items():
+            btns.append(btn)
+        for attr in ("_ffmpeg_get_btn", "_ffmpeg_install_btn", "_mpv_get_btn", "_mpv_install_btn"):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btns.append(btn)
+        return btns
+
+    def _collect_update_list_action_width(self) -> int:
+        width = _UPDATE_ACTION_WIDTH_MIN
+        for btn in self._iter_update_list_action_buttons():
+            width = max(width, _measure_update_action_width(btn))
+        return width
+
+    def _apply_update_list_action_width(self, width: int | None = None) -> int:
+        """Apply one shared width to every action button in the Updates product list."""
+        width = width if width is not None else self._collect_update_list_action_width()
+
+        mono = getattr(self, "_update_monostudio_action_btn", None)
+        if mono is not None:
+            _apply_update_action_width(
+                mono,
+                loading_widget=getattr(self, "_update_monostudio_loading_widget", None),
+                width=width,
+            )
+
+        for name, (_, _, btn) in getattr(self, "_update_extra_cards", {}).items():
+            progress_bar = getattr(self, "_update_extra_loading", {}).get(name)
+            if progress_bar is not None:
+                _apply_update_action_width(btn, loading_widget=progress_bar, width=width)
+            else:
+                _apply_update_action_width(btn, width=width)
+
+        ffmpeg_get = getattr(self, "_ffmpeg_get_btn", None)
+        if ffmpeg_get is not None:
+            _apply_update_tool_action_slot(
+                ffmpeg_get,
+                self._ffmpeg_install_btn,
+                self._ffmpeg_progress_bar,
+                self._ffmpeg_action_stack,
+                self._ffmpeg_action_outer,
+                width=width,
+            )
+
+        mpv_get = getattr(self, "_mpv_get_btn", None)
+        if mpv_get is not None:
+            _apply_update_tool_action_slot(
+                mpv_get,
+                self._mpv_install_btn,
+                self._mpv_progress_bar,
+                self._mpv_action_stack,
+                self._mpv_action_outer,
+                width=width,
+            )
+
+        return width
 
     def _apply_monostudio_row(self, result: CheckResult | None) -> None:
         """Update MonoStudio row: version, View release notes link, Download vX.X.X / Latest button."""
@@ -2795,24 +3225,11 @@ class SettingsDialog(MonosDialog):
         else:
             link_btn.setVisible(False)
         if result and result.update_available and result.update_info is not None:
-            action_btn.setText(f"Download {result.latest_version}")
-            action_btn.setObjectName("UpdateProductListBtnDownload")
-            action_btn.setEnabled(True)
-            action_btn.setStyleSheet("")  # force re-apply stylesheet
-            action_btn.style().unpolish(action_btn)
-            action_btn.style().polish(action_btn)
+            action_btn.set_download_mode(f"Download {result.latest_version}")
         else:
-            action_btn.setText("Latest")
-            action_btn.setObjectName("UpdateProductListBtnLatest")
-            action_btn.setEnabled(False)
-            action_btn.setStyleSheet("")
-            action_btn.style().unpolish(action_btn)
-            action_btn.style().polish(action_btn)
-        _apply_update_action_width(
-            action_btn,
-            loading_widget=getattr(self, "_update_monostudio_loading_widget", None),
-            progress_bar=getattr(self, "_update_monostudio_progress_bar", None),
-        )
+            install_info = getattr(result, "latest_install_info", None) if result else None
+            action_btn.set_latest_idle(can_redownload=install_info is not None)
+        self._apply_update_list_action_width()
 
     def _apply_extra_repos_ui(self, extra_repos: dict[str, ExtraRepoRelease]) -> None:
         """Update extra-repo rows: version, release notes link; Download vX.X.X (when update available) or Latest, like MonoStudio."""
@@ -2830,19 +3247,11 @@ class SettingsDialog(MonosDialog):
                 # Like MonoStudio: compare installed vs latest — only show Download when update available
                 update_available = bool(installed and info.version and is_newer_than(installed, info.version))
                 if update_available and download_url:
-                    action_btn.setText(f"Download {info.version}")
-                    action_btn.setObjectName("UpdateProductListBtnDownload")
-                    action_btn.setEnabled(True)
+                    action_btn.set_download_mode(f"Download {info.version}")
                 elif download_url:
-                    action_btn.setText("Latest")
-                    action_btn.setObjectName("UpdateProductListBtnLatest")
-                    action_btn.setEnabled(False)
+                    action_btn.set_latest_idle(can_redownload=True)
                 else:
-                    action_btn.setText("View on GitHub")
-                    action_btn.setObjectName("SettingsCategoryActionButton")
-                    action_btn.setEnabled(True)
-                action_btn.style().unpolish(action_btn)
-                action_btn.style().polish(action_btn)
+                    action_btn.set_secondary_mode("View on GitHub")
             else:
                 # No API data yet (user hasn't clicked Check) — still show installed version
                 ver_l.setText(get_extra_tool_installed_version(name) or "—")
@@ -2850,15 +3259,8 @@ class SettingsDialog(MonosDialog):
                 self._update_extra_download_url[name] = ""
                 link_btn.setVisible(False)
                 action_btn.setVisible(bool(fallbacks.get(name)))
-                action_btn.setText("View on GitHub")
-                action_btn.setObjectName("SettingsCategoryActionButton")
-                action_btn.setEnabled(True)
-            loading_tuple = getattr(self, "_update_extra_loading", {}).get(name)
-            if loading_tuple:
-                lw, pb, _ = loading_tuple
-                _apply_update_action_width(action_btn, loading_widget=lw, progress_bar=pb)
-            else:
-                _apply_update_action_width(action_btn)
+                action_btn.set_secondary_mode("View on GitHub")
+        self._apply_update_list_action_width()
 
     def _on_extra_repo_release_link_clicked(self, name: str) -> None:
         url = self._update_extra_html_url.get(name)
@@ -2867,6 +3269,16 @@ class SettingsDialog(MonosDialog):
 
     def _on_extra_repo_action_clicked(self, name: str) -> None:
         """Download installer if URL available, else open GitHub releases page."""
+        cards = self._update_extra_cards.get(name)
+        if cards:
+            _, _, action_btn = cards
+            if isinstance(action_btn, _UpdateLatestActionButton) and action_btn._latest_idle:
+                if not action_btn.is_redownload_hover():
+                    return
+                download_url = self._update_extra_download_url.get(name)
+                if download_url:
+                    self._start_extra_repo_download(name, download_url)
+                return
         download_url = self._update_extra_download_url.get(name)
         if download_url:
             self._start_extra_repo_download(name, download_url)
@@ -2882,17 +3294,17 @@ class SettingsDialog(MonosDialog):
         safe = re.sub(r"[^\w\-]", "", name)[:32] or "Tool"
         dest = Path(tempfile.gettempdir()) / f"{safe}_Setup.exe"
         self._update_download_product = name
+        self._update_download_user_cancelled = False
         cards = getattr(self, "_update_extra_cards", {})
         loading_map = getattr(self, "_update_extra_loading", {})
         if name in cards:
             _, _, action_btn = cards[name]
             action_btn.hide()
         if name in loading_map:
-            loading_widget, progress_bar, cancel_btn = loading_map[name]
+            progress_bar = loading_map[name]
             progress_bar.setMinimum(0)
             progress_bar.setMaximum(0)
-            loading_widget.show()
-            cancel_btn.clicked.connect(self._on_cancel_download)
+            progress_bar.show()
         self._set_update_status_display(f"Downloading {name}…", "loader-2", MONOS_COLORS.get("blue_400", "#60a5fa"))
         self._update_download_worker = _DownloadWorker(url, dest, parent=self)
         self._update_download_worker.progress.connect(self._on_download_progress)
@@ -2905,12 +3317,14 @@ class SettingsDialog(MonosDialog):
             QDesktopServices.openUrl(QUrl(url))
 
     def _on_download_progress(self, read: int, total: int) -> None:
+        if getattr(self, "_update_download_user_cancelled", False):
+            return
         product = getattr(self, "_update_download_product", "") or "monostudio"
         if product == "monostudio":
             bar = getattr(self, "_update_monostudio_progress_bar", None)
         else:
             loading_map = getattr(self, "_update_extra_loading", {})
-            bar = loading_map.get(product, (None, None, None))[1] if product in loading_map else None
+            bar = loading_map.get(product)
         if not bar:
             return
         if total > 0:
@@ -2921,42 +3335,57 @@ class SettingsDialog(MonosDialog):
             bar.setMinimum(0)
             bar.setMaximum(0)
 
-    def _on_cancel_download(self) -> None:
-        if self._update_download_worker:
-            self._update_download_worker.cancel()
-
-    def _on_download_finished(self, success: bool, path: str, error_message: str = "") -> None:
-        product = getattr(self, "_update_download_product", "") or "monostudio"
+    def _restore_update_download_row_ui(self, product: str) -> None:
+        """Show action button and hide loading bar for a product download row."""
         if product == "monostudio":
             if getattr(self, "_update_monostudio_loading_widget", None):
                 self._update_monostudio_loading_widget.hide()
-            if getattr(self, "_update_monostudio_action_btn", None):
-                self._update_monostudio_action_btn.show()
-                self._update_monostudio_action_btn.setEnabled(True)
-            if getattr(self, "_update_monostudio_cancel_btn", None):
-                try:
-                    self._update_monostudio_cancel_btn.clicked.disconnect(self._on_cancel_download)
-                except Exception:
-                    pass
-        else:
-            cards = getattr(self, "_update_extra_cards", {})
-            loading_map = getattr(self, "_update_extra_loading", {})
-            if product in cards:
-                _, _, action_btn = cards[product]
-                action_btn.show()
-            if product in loading_map:
-                loading_widget, _, cancel_btn = loading_map[product]
-                loading_widget.hide()
-                try:
-                    cancel_btn.clicked.disconnect(self._on_cancel_download)
-                except Exception:
-                    pass
+            btn = getattr(self, "_update_monostudio_action_btn", None)
+            if btn is not None:
+                btn.show()
+                if isinstance(btn, _UpdateLatestActionButton):
+                    if self._pending_update_info is not None:
+                        btn.set_download_mode(f"Download {self._pending_update_info.version}")
+                    else:
+                        btn.set_latest_idle(can_redownload=bool(getattr(self, "_latest_install_info", None)))
+                else:
+                    btn.setEnabled(True)
+            return
+        cards = getattr(self, "_update_extra_cards", {})
+        loading_map = getattr(self, "_update_extra_loading", {})
+        if product in cards:
+            _, _, action_btn = cards[product]
+            action_btn.show()
+            if isinstance(action_btn, _UpdateLatestActionButton) and action_btn._latest_idle:
+                action_btn.set_latest_idle(can_redownload=bool(self._update_extra_download_url.get(product)))
+        if product in loading_map:
+            loading_map[product].hide()
+
+    def _cleanup_update_download_worker(self) -> None:
         if self._update_download_worker:
             try:
                 self._update_download_worker.progress.disconnect(self._on_download_progress)
             except Exception:
                 pass
             self._update_download_worker = None
+
+    def _on_cancel_download(self) -> None:
+        if not self._update_download_worker:
+            return
+        product = getattr(self, "_update_download_product", "") or "monostudio"
+        self._update_download_user_cancelled = True
+        self._update_download_worker.cancel()
+        self._restore_update_download_row_ui(product)
+        zinc = MONOS_COLORS.get("text_meta", "#71717a")
+        self._set_update_status_display("Download cancelled.", "refresh-cw", zinc)
+
+    def _on_download_finished(self, success: bool, path: str, error_message: str = "") -> None:
+        if getattr(self, "_update_download_user_cancelled", False):
+            self._update_download_user_cancelled = False
+            self._cleanup_update_download_worker()
+            return
+        product = getattr(self, "_update_download_product", "") or "monostudio"
+        self._restore_update_download_row_ui(product)
         zinc = MONOS_COLORS.get("text_meta", "#71717a")
         if success:
             self._set_update_status_display("Launching installer…", "loader-2", MONOS_COLORS.get("blue_400", "#60a5fa"))
@@ -2987,6 +3416,7 @@ class SettingsDialog(MonosDialog):
                     "refresh-cw",
                     zinc,
                 )
+        self._cleanup_update_download_worker()
         self._update_download_product = ""
 
     def _build_pipeline_page(self) -> QWidget:
@@ -3002,10 +3432,10 @@ class SettingsDialog(MonosDialog):
         ol.addWidget(self._pipeline_access_banner, 0)
         inner = self._build_tier2_page_buttons(
             [
-                ("Pipeline structure", self._build_pipeline_structure_page()),
-                ("Create defaults", self._build_pipeline_create_defaults_tab()),
-                ("Scan rules", self._build_pipeline_scan_rules_tab()),
-                ("Statuses", self._placeholder("Pipeline → Statuses (placeholder)")),
+                ("Pipeline structure", self._build_pipeline_structure_page),
+                ("Create defaults", self._build_pipeline_create_defaults_tab),
+                ("Scan rules", self._build_pipeline_scan_rules_tab),
+                ("Statuses", lambda: self._placeholder("Pipeline → Statuses (placeholder)")),
             ],
             store_stack="pipeline",
             store_buttons="pipeline",
@@ -3020,9 +3450,9 @@ class SettingsDialog(MonosDialog):
     def _build_project_page(self) -> QWidget:
         """Tier 2: Project → Overview | Integrations | Advanced (nút page ngang)."""
         return self._build_tier2_page_buttons([
-            ("Overview", self._placeholder("Project → Overview (placeholder)")),
-            ("Integrations", self._build_workspace_discord_integrations_tab()),
-            ("Advanced", self._build_project_advanced_tab()),
+            ("Overview", lambda: self._placeholder("Project → Overview (placeholder)")),
+            ("Integrations", self._build_workspace_discord_integrations_tab),
+            ("Advanced", self._build_project_advanced_tab),
         ])
 
     def _build_pipeline_scan_rules_tab(self) -> QWidget:
@@ -3183,6 +3613,7 @@ class SettingsDialog(MonosDialog):
         self._reload_pipeline_editor_for_project()
 
     def _build_pipeline_structure_page(self) -> QWidget:
+        self._ensure_pipeline_config()
         root = QWidget()
         outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -3801,11 +4232,17 @@ class SettingsDialog(MonosDialog):
                     QMessageBox.critical(self, "Settings", "Failed to save pipeline configuration to project.")
                     return
             elif self._project_root is not None:
-                if not save_pipeline_types_and_presets_to_project(self._project_root, self._config):
+                cfg = self._config
+                if cfg is None:
+                    cfg = load_pipeline_types_and_presets_for_project(self._project_root)
+                if not save_pipeline_types_and_presets_to_project(self._project_root, cfg):
                     QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets to project.")
                     return
             else:
-                if not save_pipeline_types_and_presets(self._config):
+                cfg = self._config
+                if cfg is None:
+                    cfg = load_pipeline_types_and_presets()
+                if not save_pipeline_types_and_presets(cfg):
                     QMessageBox.critical(self, "Settings", "Failed to save Pipeline Types & Presets.")
                     return
 
@@ -3927,6 +4364,19 @@ class SettingsDialog(MonosDialog):
                     self._settings,
                     (self._video_external_player_field.text() or "").strip(),
                 )
+            if self._settings is not None and getattr(self, "_openrv_exe_field", None) is not None:
+                openrv_path = (self._openrv_exe_field.text() or "").strip()
+                if openrv_path:
+                    try:
+                        if not validate_openrv_executable(Path(openrv_path)):
+                            QMessageBox.warning(
+                                self,
+                                "OpenRV",
+                                "The selected file does not appear to be a valid OpenRV (rv) executable.",
+                            )
+                    except Exception:
+                        pass
+                write_openrv_executable(self._settings, openrv_path)
         except Exception:
             pass
 

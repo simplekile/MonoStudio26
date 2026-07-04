@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from monostudio.core.project_guide_tags import read_all_tags
@@ -281,6 +281,29 @@ class ReferencePageWidget(QWidget):
         self._ensure_tree_pane()
         if self._tree_pane is not None:
             self._tree_pane.navigate_to_path(path)
+
+    def open_item_path(self, project_root: Path, item_path: Path) -> bool:
+        """Switch department if needed and reveal *item_path* in the Project Guide tree."""
+        item_path = Path(item_path)
+        from monostudio.core.project_guide_reader import resolve_project_guide_department
+
+        dept = resolve_project_guide_department(project_root, item_path)
+        delay_ms = 0
+        if dept and dept != self._department:
+            self.set_department(dept)
+            delay_ms = 80
+        self._ensure_tree_pane()
+        if self._tree_pane is None:
+            return False
+
+        def _reveal() -> None:
+            if self._tree_pane is not None:
+                self._tree_pane.reveal_path(item_path)
+
+        if delay_ms > 0:
+            QTimer.singleShot(delay_ms, _reveal)
+            return True
+        return self._tree_pane.reveal_path(item_path)
 
     def refresh_tree(self) -> None:
         if self._tree_pane is not None:

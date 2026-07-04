@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Slot, QMetaObject, Qt, Q_ARG
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QAbstractItemView, QWidget
 
@@ -23,29 +23,32 @@ def _path_key(path: Path) -> str:
         return str(path)
 
 
-class _ExplorerThumbDecodeBridge(QObject):
-    decoded = Signal(str, int, object)  # path key, generation, QImage | None
-
-
 class _ExplorerThumbDecodeRunnable(QRunnable):
     def __init__(
         self,
         path_key: str,
         size_px: int,
         gen: int,
-        bridge: _ExplorerThumbDecodeBridge,
+        loader: "ExplorerThumbnailLoader",
     ) -> None:
         super().__init__()
         self.setAutoDelete(True)
         self._path_key = path_key
         self._size_px = size_px
         self._gen = gen
-        self._bridge = bridge
+        self._loader = loader
 
     def run(self) -> None:
         result = decode_explorer_preview_qimage_worker(self._path_key, self._size_px)
         image: QImage | None = result[1] if result else None
-        self._bridge.decoded.emit(self._path_key, self._gen, image)
+        QMetaObject.invokeMethod(
+            self._loader,
+            "_apply_decoded",
+            Qt.ConnectionType.QueuedConnection,
+            Q_ARG(str, self._path_key),
+            Q_ARG(int, self._gen),
+            Q_ARG(object, image),
+        )
 
 
 class ExplorerThumbnailLoader(QObject):
@@ -53,8 +56,6 @@ class ExplorerThumbnailLoader(QObject):
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._bridge = _ExplorerThumbDecodeBridge(self)
-        self._bridge.decoded.connect(self._on_decoded)
         self._decode_px = explorer_thumb_decode_px()
         self._disk_cache = ThumbnailCache(
             size_px=self._decode_px,
@@ -130,6 +131,11 @@ class ExplorerThumbnailLoader(QObject):
         self._stop_loading_timer()
         self._repaint_views()
 
+    def shutdown(self) -> None:
+        """Cancel in-flight decodes and stop timers (e.g. when a short-lived dialog closes)."""
+        self.invalidate_all()
+        self._views.clear()
+
     def peek(self, path: Path) -> QPixmap | None:
         if not is_direct_media_preview_path(path):
             return None
@@ -162,7 +168,7 @@ class ExplorerThumbnailLoader(QObject):
         self._pending.add(key)
         self._start_loading_timer()
         QThreadPool.globalInstance().start(
-            _ExplorerThumbDecodeRunnable(key, decode_px, self._gen, self._bridge)
+            _ExplorerThumbDecodeRunnable(key, decode_px, self._gen, self)
         )
 
     def get_or_request(self, path: Path) -> QPixmap | None:
@@ -171,7 +177,8 @@ class ExplorerThumbnailLoader(QObject):
             self.request(path)
         return pm
 
-    def _on_decoded(self, path_key: str, gen: int, image: object) -> None:
+    @Slot(str, int, object)
+    def _apply_decoded(self, path_key: str, gen: int, image: object) -> None:
         if gen != self._gen:
             return
         self._pending.discard(path_key)

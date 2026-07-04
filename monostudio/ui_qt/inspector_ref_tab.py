@@ -1347,7 +1347,7 @@ class InspectorRefTab(QWidget):
         if not is_video_preview_path(path):
             return False
         host = self.window()
-        opener = getattr(host, "_open_video_preview_from_inspector", None)
+        opener = getattr(host, "_open_ref_video_preview", None)
         if not callable(opener):
             return False
         opener(path)

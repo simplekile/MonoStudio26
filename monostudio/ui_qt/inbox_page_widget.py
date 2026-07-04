@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, Signal, QSize
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QPushButton,
@@ -17,6 +17,7 @@ from monostudio.core.inbox_reader import (
     ensure_inbox_source_folders,
     get_inbox_root,
     infer_inbox_source_from_path,
+    resolve_inbox_location,
 )
 from monostudio.ui_qt.inbox_history_dialog import InboxHistoryDialog
 from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
@@ -255,13 +256,33 @@ class InboxPageWidget(QWidget):
             self._tree_pane.navigate_to_path(path)
 
     def open_item_path(self, project_root: Path, item_path: Path) -> bool:
+        item_path = Path(item_path)
         source = infer_inbox_source_from_path(project_root, item_path)
         if source:
             self.set_type_filter(source)
         self._ensure_tree_pane()
         if self._tree_pane is None:
             return False
-        return self._tree_pane.reveal_path(Path(item_path))
+        date_folder = resolve_inbox_location(project_root, item_path)
+        delay_ms = 0
+        if date_folder is not None:
+            current = self._tree_pane.date_folder_path()
+            try:
+                needs_scope = current.resolve() != date_folder.resolve()
+            except OSError:
+                needs_scope = True
+            if needs_scope:
+                self._tree_pane.set_date_folder_path(date_folder)
+                delay_ms = 80
+
+        def _reveal() -> None:
+            if self._tree_pane is not None:
+                self._tree_pane.reveal_path(item_path)
+
+        if delay_ms > 0:
+            QTimer.singleShot(delay_ms, _reveal)
+            return True
+        return self._tree_pane.reveal_path(item_path)
 
     def refresh_tree(self) -> None:
         if self._tree_pane is not None:

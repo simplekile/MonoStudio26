@@ -105,7 +105,7 @@ from monostudio.ui_qt.video_preview_context import (
     ReviewOpenRequest,
     VideoPreviewOpenRequest,
 )
-from monostudio.core.video_media import is_video_path, list_video_siblings, paths_under_project_root
+from monostudio.core.video_media import is_video_path, paths_under_project_root
 from monostudio.ui_qt.inspector import InspectorPanel
 from monostudio.ui_qt.main_view import MainView
 from monostudio.ui_qt.new_project_dialog import NewProjectDialog
@@ -122,6 +122,7 @@ from monostudio.ui_qt.page_loading_bar import PageLoadingBar, SCANNING_EMPTY_MES
 from monostudio.ui_qt.app_controller import AppController
 from monostudio.ui_qt.app_state import AppState
 from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
+from monostudio.ui_qt.palette_stars_store import PaletteStarEntry, PaletteStarsStore
 from monostudio.ui_qt.worker_manager import WorkerManager, WorkerTask
 from monostudio.ui_qt.thumbnails import ThumbnailManager
 from monostudio.ui_qt.fs_watcher import (
@@ -372,6 +373,7 @@ class MainWindow(FramelessMainWindow):
         repo_root = get_app_base_path()
         self._controller = AppController(settings=self._settings, repo_root=repo_root, parent=self)
         self._recent_tasks_store = RecentTasksStore(self._settings)
+        self._palette_stars = PaletteStarsStore(self._settings)
         self._controller.set_recent_tasks_store(self._recent_tasks_store)
         # Guard: context switches must never trigger Open DCC flows or spawn dialogs.
         self._context_switch_in_progress: bool = False
@@ -613,6 +615,7 @@ class MainWindow(FramelessMainWindow):
         self._main_view.copy_inventory_requested.connect(self._on_copy_item_inventory_requested)
         self._main_view.open_requested.connect(self._on_open_requested)
         self._main_view.review_entity_requested.connect(self._on_review_entity_requested)
+        self._main_view.open_in_openrv_entity_requested.connect(self._on_open_in_openrv_entity_requested)
         self._main_view.open_with_requested.connect(self._on_open_with_requested)
         self._main_view.create_new_requested.connect(self._on_create_new_requested)
         self._main_view.selection_id_changed.connect(self._on_main_view_selection_id_changed)
@@ -632,6 +635,8 @@ class MainWindow(FramelessMainWindow):
         self._clipboard_thumbs.thumbnailUpdated.connect(self._on_thumbnail_updated)
         self._main_view.delete_requested.connect(self._on_delete_requested)
         self._main_view.rename_requested.connect(self._on_rename_asset_requested)
+        self._main_view.palette_star_toggle_requested.connect(self._on_palette_star_toggle_requested)
+        self._main_view.set_palette_star_checker(self._is_palette_starred_item)
         self._main_view.item_notes_requested.connect(self._on_item_notes_dialog_requested)
         self._main_view.inspector_ref_tab_requested.connect(self._on_inspector_ref_tab_requested)
         self._main_view.switch_project_requested.connect(self._on_switch_project_requested)
@@ -661,6 +666,7 @@ class MainWindow(FramelessMainWindow):
         self._inspector.assignment_confirmed.connect(self._refresh_noti_unread_badge)
         self._inspector.video_preview_requested.connect(self._open_video_preview_from_inspector)
         self._inspector.review_open_requested.connect(self._open_review_player)
+        self._inspector.open_in_openrv_requested.connect(self._open_in_openrv)
         self._bound_hotkeys: list[QShortcut] = []
         from monostudio.ui_qt.app_hotkeys import bind_hotkey
 
@@ -4563,41 +4569,222 @@ class MainWindow(FramelessMainWindow):
         except Exception:
             return []
 
+    def _command_palette_guide(self) -> list[dict]:
+        if self._project_root is None:
+            return []
+        from monostudio.core.project_guide_reader import flatten_project_guide_for_palette
+
+        try:
+            return flatten_project_guide_for_palette(self._project_root)
+        except Exception:
+            return []
+
     def _command_palette_entities(self) -> list[dict]:
-        pi = self._project_index
-        if pi is None:
+        assets: list = []
+        shots: list = []
+        if self._project_root is not None:
+            assets = self._app_state.get_assets_in_order()
+            shots = self._app_state.get_shots_in_order()
+        if not assets and not shots:
+            pi = self._project_index
+            if pi is not None:
+                assets = list(pi.assets)
+                shots = list(pi.shots)
+        if not assets and not shots:
             return []
         rows: list[dict] = []
-        for asset in sorted(pi.assets, key=lambda a: ((a.name or a.path.name or "").casefold())):
+        for asset in sorted(assets, key=lambda a: ((a.name or a.path.name or "").casefold())):
             name = (asset.name or asset.path.name or "").strip()
             if not name:
                 continue
             typ = (getattr(asset, "asset_type", None) or "").strip()
             _, type_icon = self._filter_panel.filters().get_type_display(typ or None)
+            path_str = str(asset.path)
+            path_bits = " ".join(asset.path.parts[-4:]).casefold()
             rows.append(
                 {
                     "context": "Assets",
-                    "path": str(asset.path),
+                    "path": path_str,
                     "title": name,
                     "subtitle": f"Asset · {typ}" if typ else "Asset",
                     "type_id": typ or None,
                     "icon_name": type_icon or "box",
+                    "search_text": f"{name} {typ} asset {path_bits} {path_str}".casefold(),
                 }
             )
-        for shot in sorted(pi.shots, key=lambda s: ((s.name or s.path.name or "").casefold())):
+        for shot in sorted(shots, key=lambda s: ((s.name or s.path.name or "").casefold())):
             name = (shot.name or shot.path.name or "").strip()
             if not name:
                 continue
+            path_str = str(shot.path)
+            path_bits = " ".join(shot.path.parts[-3:]).casefold()
             rows.append(
                 {
                     "context": "Shots",
-                    "path": str(shot.path),
+                    "path": path_str,
                     "title": name,
                     "subtitle": "Shot",
                     "icon_name": "clapperboard",
+                    "search_text": f"{name} shot seq {path_bits} {path_str}".casefold(),
                 }
             )
         return rows
+
+    def _is_palette_starred_item(self, item: object) -> bool:
+        if self._project_root is None or not isinstance(item, ViewItem):
+            return False
+        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return False
+        if item.path is None:
+            return False
+        return self._palette_stars.is_starred(self._project_root, "entity", item.path)
+
+    def _on_palette_star_toggle_requested(self, item: object) -> None:
+        if self._project_root is None or not isinstance(item, ViewItem):
+            return
+        if item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT) or item.path is None:
+            return
+        ctx = "Assets" if item.kind == ViewItemKind.ASSET else "Shots"
+        name = (item.name or item.path.name or "").strip()
+        if not name:
+            return
+        typ = (item.type_badge or "").strip() if item.kind == ViewItemKind.ASSET else ""
+        subtitle = f"Asset · {typ}" if typ else ("Asset" if ctx == "Assets" else "Shot")
+        icon_name = "clapperboard" if ctx == "Shots" else "box"
+        if typ:
+            _, type_icon = self._filter_panel.filters().get_type_display(typ)
+            if type_icon:
+                icon_name = type_icon
+        entry = PaletteStarEntry(
+            kind="entity",
+            path=str(item.path),
+            project_root=str(self._project_root),
+            title=name,
+            subtitle=subtitle,
+            icon_name=icon_name,
+            context=ctx,
+            type_id=typ,
+        )
+        now_starred = self._palette_stars.toggle(entry)
+        if now_starred:
+            notification_service.info(f"Starred «{name}» for Quick Jump (`)", category="sidebar")
+        else:
+            notification_service.info(f"Unstarred «{name}»", category="sidebar")
+
+    def _command_palette_starred_keys(self) -> frozenset[tuple[str, str, str]]:
+        if self._project_root is None:
+            return frozenset()
+        return frozenset(e.storage_key() for e in self._palette_stars.entries_for_project(self._project_root))
+
+    def _command_palette_star_order(self) -> list[tuple[str, str, str]]:
+        if self._project_root is None:
+            return []
+        return [e.storage_key() for e in self._palette_stars.entries_for_project(self._project_root)]
+
+    def _command_palette_recent_tasks(self) -> list[dict]:
+        from monostudio.ui_qt.recent_tasks_store import RecentTask
+
+        if self._project_root is not None:
+            tasks = self._recent_tasks_store.get_for_project(self._project_root)
+        else:
+            tasks = self._recent_tasks_store.get_all()
+        rows: list[dict] = []
+        for task in tasks[:8]:
+            if not isinstance(task, RecentTask):
+                continue
+            dept = (task.department or "").strip()
+            dcc = (task.dcc or "").strip()
+            subtitle_parts = ["Recent task"]
+            if dept:
+                subtitle_parts.append(dept)
+            if dcc:
+                subtitle_parts.append(dcc)
+            subtitle = " · ".join(subtitle_parts)
+            icon = "clapperboard" if task.item_type == "shot" else "box"
+            if task.item_type == "asset" and task.asset_type:
+                _, type_icon = self._filter_panel.filters().get_type_display(task.asset_type)
+                if type_icon:
+                    icon = type_icon
+            rows.append(
+                {
+                    "title": task.item_name,
+                    "subtitle": subtitle,
+                    "icon_name": icon,
+                    "payload": {"task": task},
+                    "search_text": f"{task.item_name} {dept} {dcc} recent task".casefold(),
+                }
+            )
+        return rows
+
+    def _command_palette_actions(self) -> list[dict]:
+        rows: list[dict] = [
+            {
+                "id": "settings",
+                "title": "Open Settings",
+                "subtitle": "Action",
+                "icon_name": "settings",
+                "search_text": "settings preferences options config hotkeys",
+            },
+            {
+                "id": "quick_view_picker",
+                "title": "Quick View Picker",
+                "subtitle": "Action",
+                "icon_name": "layout-grid",
+                "search_text": "quick view picker slots nav recall",
+            },
+            {
+                "id": "search_view",
+                "title": "Search in Current View",
+                "subtitle": "Action",
+                "icon_name": "search",
+                "search_text": "search filter find current view",
+            },
+        ]
+        if self._workspace_root is not None:
+            rows.append(
+                {
+                    "id": "new_project",
+                    "title": "New Project…",
+                    "subtitle": "Action",
+                    "icon_name": "folder-plus",
+                    "search_text": "new project create workspace",
+                }
+            )
+        if self._project_root is not None:
+            rows.extend(
+                [
+                    {
+                        "id": "create_asset",
+                        "title": "Create Asset…",
+                        "subtitle": "Action",
+                        "icon_name": "box",
+                        "search_text": "create new asset add",
+                    },
+                    {
+                        "id": "create_shot",
+                        "title": "Create Shot…",
+                        "subtitle": "Action",
+                        "icon_name": "clapperboard",
+                        "search_text": "create new shot add sequence",
+                    },
+                ]
+            )
+        return rows
+
+    def _on_command_palette_action(self, action_id: str) -> None:
+        action = (action_id or "").strip()
+        if action == "settings":
+            self._open_settings()
+        elif action == "quick_view_picker":
+            self._open_nav_quick_picker()
+        elif action == "search_view":
+            self._main_view._show_search_popup()
+        elif action == "new_project":
+            self._new_project()
+        elif action == "create_asset":
+            self._create_asset()
+        elif action == "create_shot":
+            self._create_shot()
 
     def _open_pipeline_entity_in_main_view(
         self,
@@ -4620,23 +4807,47 @@ class MainWindow(FramelessMainWindow):
         filter_dept = active_dept
         if filter_dept and ref is not None and not self._entity_has_department(ref, filter_dept):
             filter_dept = None
+
+        self._entered_parent = None
+        self._clear_main_view_search()
+
+        switching_context = self._nav_rail.current_context() != ctx
         self._nav_rail.set_current_context(ctx)
+        if not switching_context:
+            self._content_stack.setCurrentWidget(self._main_view)
+            self._sync_primary_action()
+
         filters = self._filter_panel.filters()
         if typ:
             filters.set_selected_type(typ, emit=False)
         filters.set_selected_department(filter_dept, emit=False)
         self._controller.sync_filter_state(department=filter_dept, type_id=typ)
         self._sync_filter_state_from_sidebar()
+        self._set_main_view_type()
+        self._set_main_view_department(defer_list_rebuild=True)
         self._reload_main_view()
         self._app_state.set_selection(str(path))
-        if not self._main_view.select_item_by_path(path):
-            return False
-        if active_dept:
-            filters.set_selected_department(active_dept, emit=False)
-            self._controller.sync_filter_state(department=active_dept, type_id=typ)
-        self._set_main_view_department()
-        self._set_main_view_type()
-        self._refresh_inspector_selection()
+
+        target = Path(path)
+
+        def _finish_select() -> None:
+            if not self._main_view.select_item_by_path(target):
+                filters.set_selected_department(None, emit=False)
+                filters.set_selected_type(None, emit=False)
+                self._controller.sync_filter_state(department=None, type_id=None)
+                self._sync_filter_state_from_sidebar()
+                self._set_main_view_type()
+                self._set_main_view_department(defer_list_rebuild=True)
+                self._reload_main_view()
+                self._main_view.select_item_by_path(target)
+            if active_dept:
+                filters.set_selected_department(active_dept, emit=False)
+                self._controller.sync_filter_state(department=active_dept, type_id=typ)
+            self._set_main_view_department()
+            self._set_main_view_type()
+            self._refresh_inspector_selection()
+
+        QTimer.singleShot(0, _finish_select)
         return True
 
     def _on_command_palette_entity(self, payload: object) -> None:
@@ -4666,8 +4877,27 @@ class MainWindow(FramelessMainWindow):
         item_path_p = Path(path_str)
         if self._nav_rail.current_context() != "Inbox":
             self._nav_rail.set_current_context("Inbox")
+        elif self._inbox_page_widget is not None:
+            self._content_stack.setCurrentWidget(self._inbox_page_widget)
         if self._inbox_page_widget is not None:
             self._inbox_page_widget.open_item_path(self._project_root, item_path_p)
+
+    def _on_command_palette_guide(self, item_path: str) -> None:
+        path_str = (item_path or "").strip()
+        if not path_str or self._project_root is None:
+            return
+        item_path_p = Path(path_str)
+        from monostudio.core.project_guide_reader import resolve_project_guide_department
+
+        dept = resolve_project_guide_department(self._project_root, item_path_p)
+        if dept:
+            self._filter_panel.filters().set_selected_department(dept, emit=False)
+        if self._nav_rail.current_context() != "Project Guide":
+            self._nav_rail.set_current_context("Project Guide")
+        elif self._reference_page_widget is not None:
+            self._content_stack.setCurrentWidget(self._reference_page_widget)
+        if self._reference_page_widget is not None:
+            self._reference_page_widget.open_item_path(self._project_root, item_path_p)
 
     def _open_nav_quick_picker(self) -> None:
         from monostudio.ui_qt.nav_quick_picker_dialog import NavQuickPickerDialog
@@ -4695,11 +4925,19 @@ class MainWindow(FramelessMainWindow):
 
         if keyboard_input_blocks_shortcuts():
             return
+        if self._project_root is not None:
+            self._palette_stars.prune_missing_paths(self._project_root)
         dialog = CommandPaletteDialog(
             settings=self._settings,
             entities=self._command_palette_entities(),
             projects=self._command_palette_projects(),
             inbox_items=self._command_palette_inbox(),
+            guide_items=self._command_palette_guide(),
+            recent_tasks=self._command_palette_recent_tasks(),
+            current_context=self._nav_rail.current_context(),
+            project_root=str(self._project_root) if self._project_root else None,
+            starred_keys=self._command_palette_starred_keys(),
+            star_order=self._command_palette_star_order(),
             parent=self,
         )
         dialog.page_selected.connect(self._nav_rail.set_current_context)
@@ -4707,6 +4945,9 @@ class MainWindow(FramelessMainWindow):
         dialog.entity_selected.connect(self._on_command_palette_entity)
         dialog.project_selected.connect(self._on_command_palette_project)
         dialog.inbox_selected.connect(self._on_command_palette_inbox)
+        dialog.guide_selected.connect(self._on_command_palette_guide)
+        dialog.action_selected.connect(self._on_command_palette_action)
+        dialog.recent_task_selected.connect(self._on_recent_task_clicked)
         dialog.exec()
 
     def _recall_nav_quick_slot(self, payload: dict) -> None:
@@ -6413,7 +6654,7 @@ class MainWindow(FramelessMainWindow):
         if p is None or not is_video_path(p):
             return
         self._open_video_preview_with_request(
-            VideoPreviewOpenRequest(path=p, context=PreviewContext.inbox, sibling_paths=list_video_siblings(p))
+            VideoPreviewOpenRequest(path=p, context=PreviewContext.inbox)
         )
 
     def _open_video_preview_from_internal_check(self, path) -> None:
@@ -6424,7 +6665,6 @@ class MainWindow(FramelessMainWindow):
             VideoPreviewOpenRequest(
                 path=p,
                 context=PreviewContext.internal_check,
-                sibling_paths=list_video_siblings(p),
             )
         )
 
@@ -6436,7 +6676,6 @@ class MainWindow(FramelessMainWindow):
             VideoPreviewOpenRequest(
                 path=p,
                 context=PreviewContext.delivery,
-                sibling_paths=list_video_siblings(p),
             )
         )
 
@@ -6448,7 +6687,31 @@ class MainWindow(FramelessMainWindow):
             VideoPreviewOpenRequest(
                 path=p,
                 context=PreviewContext.project_guide,
-                sibling_paths=list_video_siblings(p),
+            )
+        )
+
+    def _inspector_entity_path_for_preview(self) -> Path | None:
+        item = getattr(self._inspector, "_current_item", None)
+        if item is not None and getattr(item, "path", None):
+            return Path(item.path)
+        return None
+
+    def _open_ref_video_preview(self, path) -> None:
+        """Inspector Ref tab — browse reference/concept videos without draw / work review."""
+        from monostudio.core.video_media import list_video_siblings
+
+        p = Path(path) if path is not None else None
+        if p is None or not is_video_path(p):
+            return
+        entity_path = self._inspector_entity_path_for_preview()
+        siblings = list_video_siblings(p)
+        self._open_video_preview_with_request(
+            VideoPreviewOpenRequest(
+                path=p,
+                context=PreviewContext.entity_ref,
+                entity_path=entity_path,
+                sibling_paths=siblings,
+                source_label=p.name,
             )
         )
 
@@ -6458,15 +6721,13 @@ class MainWindow(FramelessMainWindow):
             return
         from monostudio.core.models import Asset, Shot
 
-        entity_path = None
+        entity_path = self._inspector_entity_path_for_preview()
         dept_id = None
         dept_label = None
         work_path = None
         work_file_path = None
         try:
             item = getattr(self._inspector, "_current_item", None)
-            if item is not None and getattr(item, "path", None):
-                entity_path = Path(item.path)
             dept_id = getattr(self._inspector, "_last_focused_department", None)
             if not (dept_id or "").strip():
                 dept_id = (self._main_view._active_department or "").strip() or None
@@ -6494,7 +6755,6 @@ class MainWindow(FramelessMainWindow):
             VideoPreviewOpenRequest(
                 path=p,
                 context=PreviewContext.entity,
-                sibling_paths=list_video_siblings(p),
                 entity_path=entity_path,
                 department_id=dept_id,
                 department_label=dept_label,
@@ -6561,6 +6821,58 @@ class MainWindow(FramelessMainWindow):
             self._open_review_player(resolved.request)
             return
         notification_service.warning("No review media found for this department.")
+
+    def _on_open_in_openrv_entity_requested(self, item: object) -> None:
+        from monostudio.core.models import Asset, Shot
+
+        if not isinstance(item, ViewItem) or item.kind not in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+            return
+        dep = (self._main_view._active_department or "").strip()
+        if not dep:
+            notification_service.warning("Select a department first.")
+            return
+        request = self._resolve_review_request_for_entity_path(
+            Path(item.path),
+            department_id=dep,
+            department_label=self._department_display_label(dep),
+        )
+        if request is None:
+            notification_service.warning("No review media found for this department.")
+            return
+        self._open_in_openrv(request)
+
+    def _open_in_openrv(self, request_or_path: object) -> None:
+        from monostudio.core.openrv_launch import (
+            is_openrv_available,
+            launch_openrv,
+            launch_openrv_review,
+        )
+        from monostudio.ui_qt.video_preview_context import ReviewOpenRequest
+
+        if not is_openrv_available(self._settings):
+            notification_service.warning(
+                "OpenRV is not configured. Set the rv.exe path in Settings → General → Video player."
+            )
+            return
+        if isinstance(request_or_path, ReviewOpenRequest):
+            result = launch_openrv_review(self._settings, request_or_path)
+        else:
+            try:
+                path = Path(request_or_path)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return
+            result = launch_openrv(self._settings, path)
+        if not result.ok and result.error:
+            notification_service.warning(result.error)
+
+    def _open_in_openrv_from_player(self, dlg: VideoPreviewDialog) -> None:
+        req = getattr(dlg, "_review_request", None)
+        if req is not None:
+            self._open_in_openrv(req)
+            return
+        path = getattr(dlg, "_path", None)
+        if path is not None:
+            self._open_in_openrv(Path(path))
 
     def _review_player_matches_entity(
         self,
@@ -6726,6 +7038,13 @@ class MainWindow(FramelessMainWindow):
                 existing.close()
             except Exception:
                 pass
+        QTimer.singleShot(0, lambda: self._spawn_review_player_dialog(request, href))
+
+    def _spawn_review_player_dialog(
+        self,
+        request: ReviewOpenRequest,
+        href: str | None,
+    ) -> None:
         path_arg = request.path if request.media_kind.value == "video" else None
         dlg = VideoPreviewDialog(
             path_arg,
@@ -6742,6 +7061,7 @@ class MainWindow(FramelessMainWindow):
         dlg.closed.connect(self._on_review_player_closed)
         dlg.export_completed.connect(self._on_video_export_completed)
         dlg.open_all_notes_requested.connect(self._on_video_preview_open_all_notes)
+        dlg.open_in_openrv_requested.connect(lambda d=dlg: self._open_in_openrv_from_player(d))
         dlg.notes_changed.connect(lambda: self._on_review_player_notes_changed())
         dlg.show()
         self._bring_review_player_to_front(dlg)
@@ -6899,7 +7219,6 @@ class MainWindow(FramelessMainWindow):
                 media_kind=ReviewMediaKind.video,
                 path=path,
                 context=ctx,
-                sibling_paths=list_video_siblings(path),
                 entity_path=entity_path,
                 department_id=dept_id,
             )
@@ -6935,7 +7254,6 @@ class MainWindow(FramelessMainWindow):
             VideoPreviewOpenRequest(
                 path=p,
                 context=PreviewContext.entity,
-                sibling_paths=list_video_siblings(p),
             )
         )
 

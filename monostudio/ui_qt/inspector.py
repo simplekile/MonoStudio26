@@ -471,6 +471,7 @@ class InspectorPanel(QWidget):
     video_preview_requested = Signal(object)  # Path — legacy
     sequence_preview_requested = Signal(object)  # legacy
     review_open_requested = Signal(object)  # ReviewOpenRequest
+    open_in_openrv_requested = Signal(object)  # ReviewOpenRequest
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -528,6 +529,7 @@ class InspectorPanel(QWidget):
         self._preview.remove_requested.connect(self._on_remove_requested)
         self._preview.video_preview_requested.connect(self.video_preview_requested.emit)
         self._preview.review_open_requested.connect(self.review_open_requested.emit)
+        self._preview.open_in_openrv_requested.connect(self.open_in_openrv_requested.emit)
         self._preview.sequence_preview_requested.connect(self.sequence_preview_requested.emit)
         self._show_publish: bool = False
         self._last_focused_department: str | None = None
@@ -2573,6 +2575,7 @@ class _InspectorPreview(QWidget):
     video_preview_requested = Signal(object)  # Path — legacy
     sequence_preview_requested = Signal(object)  # legacy
     review_open_requested = Signal(object)  # ReviewOpenRequest
+    open_in_openrv_requested = Signal(object)  # ReviewOpenRequest
 
     _PREVIEW_CACHE_MAX = 50
     _PREVIEW_RESIZE_DEBOUNCE_MS = 200
@@ -3280,17 +3283,17 @@ class _InspectorPreview(QWidget):
             w = w.parent()
         return dept_id.replace("_", " ").title()
 
-    def _try_emit_review_open(self) -> bool:
+    def _resolve_entity_review_media(self):
         thumb_path = self._resolve_inspector_thumbnail_disk_path()
         if thumb_path is None:
-            return False
+            return None
         item = self._item
         entity_path = Path(item.path) if item is not None and getattr(item, "path", None) else None
         wp, wf = (None, None)
         if item is not None and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
             wp, wf = self._work_paths_for_preview_item(item)
         fps = read_sequence_preview_fps(self._qsettings)
-        resolved = resolve_entity_review_media(
+        return resolve_entity_review_media(
             thumb_path=thumb_path,
             work_path=wp,
             work_file_path=wf,
@@ -3302,6 +3305,19 @@ class _InspectorPreview(QWidget):
             department_id=self._active_department,
             department_label=self._department_label_for_active(),
         )
+
+    def _resolve_review_open_request(self):
+        resolved = self._resolve_entity_review_media()
+        if resolved is None:
+            return None
+        if resolved.action == ReviewResolveAction.open_player and resolved.request is not None:
+            return resolved.request
+        return None
+
+    def _try_emit_review_open(self) -> bool:
+        resolved = self._resolve_entity_review_media()
+        if resolved is None:
+            return False
         if resolved.action == ReviewResolveAction.open_player and resolved.request is not None:
             self.review_open_requested.emit(resolved.request)
             return True
@@ -3315,6 +3331,11 @@ class _InspectorPreview(QWidget):
             self._update_sequence_play_button()
             return True
         return False
+
+    def _emit_open_in_openrv(self) -> None:
+        request = self._resolve_review_open_request()
+        if request is not None:
+            self.open_in_openrv_requested.emit(request)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if watched is not self._container._w:
@@ -3789,6 +3810,19 @@ class _InspectorPreview(QWidget):
             )
             act_review.triggered.connect(self._try_emit_review_open)
             menu.insertAction(act_open, act_review)
+            from monostudio.core.openrv_launch import is_openrv_available
+
+            act_openrv = QAction(
+                lucide_icon("external-link", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Open in OpenRV…",
+                menu,
+            )
+            rv_available = is_openrv_available(self._qsettings)
+            act_openrv.setEnabled(rv_available)
+            if not rv_available:
+                act_openrv.setToolTip("Configure OpenRV path in Settings → General → Video player.")
+            act_openrv.triggered.connect(self._emit_open_in_openrv)
+            menu.insertAction(act_open, act_openrv)
 
         seq_dir = self._sequence_folder if (self._sequence_folder is not None and self._sequence_folder.is_dir()) else None
         act_open_render = QAction(

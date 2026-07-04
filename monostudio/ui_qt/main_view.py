@@ -3359,7 +3359,7 @@ class _PublishDragPipelineModel(PipelineTileModel):
         default = super().flags(index)
         if not index.isValid():
             return default
-        item = index.data(Qt.UserRole)
+        item = self.data(index, Qt.ItemDataRole.UserRole)
         if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
             return default
         if self._browser_mode == "publish":
@@ -3385,7 +3385,7 @@ class _PublishDragPipelineModel(PipelineTileModel):
         for idx in indexes:
             if not idx.isValid():
                 continue
-            item = idx.data(Qt.UserRole)
+            item = self.data(idx, Qt.ItemDataRole.UserRole)
             if not isinstance(item, ViewItem) or not isinstance(item.ref, (Asset, Shot)):
                 continue
             if self._browser_mode == "publish":
@@ -3498,6 +3498,7 @@ class MainView(QWidget):
     root_context_menu_requested = Signal(object)  # emits global QPoint
     copy_inventory_requested = Signal(object)  # emits ViewItem (asset/shot only)
     rename_requested = Signal(object)  # emits ViewItem (asset only)
+    palette_star_toggle_requested = Signal(object)  # emits ViewItem (asset / shot)
     item_notes_requested = Signal(object)  # emits ViewItem (asset / shot)
     inspector_ref_tab_requested = Signal(object)  # emits ViewItem (asset / shot)
     delete_requested = Signal(object)  # emits ViewItem (asset/shot only)
@@ -3518,6 +3519,7 @@ class MainView(QWidget):
     dcc_delete_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
     dcc_open_version_requested = Signal(object, str, str, object)  # (ViewItem, dcc_id, department, file_path: Path)
     review_entity_requested = Signal(object)  # ViewItem (asset/shot) — review latest preview
+    open_in_openrv_entity_requested = Signal(object)  # ViewItem (asset/shot)
     active_dcc_changed = Signal(object, str, str)  # (path, department, dcc_id) — đồng bộ Inspector
     production_status_override_chosen = Signal(object, str, object)  # (Path | list[Path], department, status_id | None)
     project_status_chosen = Signal(object, object)  # Path, status_key | None (None = automatic)
@@ -3564,6 +3566,7 @@ class MainView(QWidget):
         super().__init__(parent)
 
         self._settings = QSettings("MonoStudio26", "MonoStudio26")
+        self._palette_star_is_starred = None  # Callable[[ViewItem], bool] | None
         self._project_root: str | None = None
         self._dept_registry: DepartmentRegistry | None = None
         self._empty_override: str | None = None
@@ -4469,6 +4472,10 @@ class MainView(QWidget):
         """Set placeholder text for the search input (e.g. context-aware: Search assets, Search shots)."""
         self._search_input.setPlaceholderText(placeholder or "Search…")
 
+    def set_palette_star_checker(self, checker) -> None:
+        """Optional `(ViewItem) -> bool` — starred state for context menu label."""
+        self._palette_star_is_starred = checker
+
     def set_search_query(self, query: str) -> None:
         """Set search input text without emitting (e.g. when clearing on context switch)."""
         self._search_input.blockSignals(True)
@@ -4636,8 +4643,8 @@ class MainView(QWidget):
         self.project_status_chosen.emit(project_path, res)
 
     def _workspace_project_stats_for_path(self, project_path: Path) -> ProjectQuickStats | None:
-        for row in range(self._tile_model.rowCount()):
-            idx = self._tile_model.index(row, 0)
+        for row in range(self._tile_row_count()):
+            idx = self._tile_model._model_index(row, 0)
             if not idx.isValid():
                 continue
             item = idx.data(Qt.UserRole)
@@ -5611,10 +5618,10 @@ class MainView(QWidget):
     def _repaint_notes_row_for_path(self, path_key: str) -> None:
         row = self._row_for_item_id(path_key)
         if row is not None and row >= 0:
-            if row < self._tile_model.rowCount():
-                ix = self._tile_model.index(row, 0)
+            if row < self._tile_row_count():
+                ix = self._tile_model._model_index(row, 0)
                 self._tile_model.dataChanged.emit(ix, ix, [])
-            if row < self._list_model.rowCount():
+            if row < self._tile_row_count():
                 self._list_model.refresh_row(row)
                 self._list_model.notify_thumb_column(row)
         self._tile_view.viewport().update()
@@ -6203,7 +6210,7 @@ class MainView(QWidget):
 
     def _repaint_list_derived_columns(self) -> None:
         """Invalidate list rows whose cells are painted from MainView helpers (not model roles)."""
-        if self._list_model.rowCount() <= 0:
+        if self._tile_row_count() <= 0:
             return
         self._list_model.emit_all_user_role_changed()
         self._list_view.viewport().update()
@@ -6618,8 +6625,8 @@ class MainView(QWidget):
     def select_item_by_path(self, path: Path) -> bool:
         """Select the row whose item has the given path; returns True if found and selected."""
         path = Path(path)
-        for row in range(self._tile_model.rowCount()):
-            tile_idx = self._tile_model.index(row, 0)
+        for row in range(self._tile_row_count()):
+            tile_idx = self._tile_model._model_index(row, 0)
             if not tile_idx.isValid():
                 continue
             item = tile_idx.data(Qt.UserRole)
@@ -6642,8 +6649,8 @@ class MainView(QWidget):
 
     def invalidate_all_thumbnails_for_source_change(self) -> None:
         """After global thumbnail-source setting change: reset row state so grid reloads with new resolver."""
-        for row in range(self._tile_model.rowCount()):
-            idx = self._tile_model.index(row, 0)
+        for row in range(self._tile_row_count()):
+            idx = self._tile_model._model_index(row, 0)
             if not idx.isValid():
                 continue
             item = idx.data(Qt.UserRole)
@@ -6670,11 +6677,11 @@ class MainView(QWidget):
 
         # Reset row state and re-request or prefetch.
         try:
-            rows = int(self._tile_model.rowCount())
+            rows = int(self._tile_row_count())
         except Exception:
             rows = 0
         for row in range(rows):
-            idx = self._tile_model.index(row, 0)
+            idx = self._tile_model._model_index(row, 0)
             if not idx.isValid():
                 continue
             item = idx.data(Qt.UserRole)
@@ -6715,10 +6722,10 @@ class MainView(QWidget):
             self._deferred_full_repaint_pending = True
             return
         self._deferred_full_repaint_pending = False
-        rc = self._tile_model.rowCount()
+        rc = self._tile_row_count()
         if rc > 0:
-            tl = self._tile_model.index(0, 0)
-            br = self._tile_model.index(rc - 1, 0)
+            tl = self._tile_model._model_index(0, 0)
+            br = self._tile_model._model_index(rc - 1, 0)
             self._tile_model.dataChanged.emit(tl, br, [Qt.UserRole])
             self._list_model.emit_all_user_role_changed()
         self._refresh_list_last_updated_column()
@@ -6753,7 +6760,7 @@ class MainView(QWidget):
             self._apply_row_thumbnail_from_manager(row, active_dept=active_dept, mgr=mgr)
 
     def _apply_row_thumbnail_from_manager(self, row: int, *, active_dept: str | None, mgr) -> None:
-        idx = self._tile_model.index(row, 0)
+        idx = self._tile_model._model_index(row, 0)
         if not idx.isValid():
             return
         item = idx.data(Qt.UserRole)
@@ -6795,14 +6802,14 @@ class MainView(QWidget):
         """Return the model row index for the item with the given path id; path-normalized so updated_ids match."""
         if self._items and item_id in self._items:
             row = self._items[item_id]
-            if row < self._tile_model.rowCount():
+            if row < self._tile_row_count():
                 return row
         try:
             target = Path(item_id).resolve()
         except Exception:
             return None
-        for row in range(self._tile_model.rowCount()):
-            idx = self._tile_model.index(row, 0)
+        for row in range(self._tile_row_count()):
+            idx = self._tile_model._model_index(row, 0)
             if not idx.isValid():
                 continue
             item = idx.data(Qt.UserRole)
@@ -6827,10 +6834,15 @@ class MainView(QWidget):
         """Rebuild _items from _order so _items[asset_id] = row index."""
         self._items = {aid: row for row, aid in enumerate(self._order)}
 
+    def _tile_row_count(self) -> int:
+        return self._tile_model.row_count()
+
     def _insert_row_at(self, row: int, item: ViewItem, one_based_index: int) -> None:
-        """Notify views after `_all_items.insert(row, …)` (caller mutates `_all_items`)."""
-        self._tile_model.notify_insert_rows(row, 1)
-        self._list_model.notify_insert_rows(row, 1)
+        """Insert into shared backing store and refresh models (full rebind — reliable on PySide6)."""
+        row = max(0, min(row, len(self._all_items)))
+        self._all_items.insert(row, item)
+        self._tile_model.bind_rows(self._all_items)
+        self._list_model.reset_structure()
 
     def set_selection_from_state(self, selection_id: str | None) -> None:
         """Drive selection from AppState only; does not emit selection_id_changed back."""
@@ -6905,6 +6917,7 @@ class MainView(QWidget):
         view_item_resolver: Callable[[str], ViewItem | None],
     ) -> None:
         removed_set = set(removed_ids)
+        structure_changed = False
 
         # 1. Remove: reverse row order so indices stay valid.
         rows_to_remove = []
@@ -6913,16 +6926,18 @@ class MainView(QWidget):
             if r is not None:
                 rows_to_remove.append(r)
         rows_to_remove = sorted(set(rows_to_remove), reverse=True)
-        for r in rows_to_remove:
-            self._tile_model.before_remove_row(r)
-            del self._all_items[r]
-            self._tile_model.notify_remove_rows(r, 1)
-            self._list_model.notify_remove_rows(r, 1)
+        if rows_to_remove:
+            structure_changed = True
+            for r in rows_to_remove:
+                self._tile_model.before_remove_row(r)
+            for r in rows_to_remove:
+                del self._all_items[r]
         self._order = [aid for aid in self._order if aid not in removed_set]
         self._items_unfiltered = [vi for vi in self._items_unfiltered if str(vi.path) not in removed_set]
         self._rebuild_items_from_order()
 
-        # 2. Update in place: only affected visuals (label, status, thumbnail). Use path-normalized row lookup.
+        # 2. Update in place: mutate backing store; defer model signals until end.
+        had_updates = False
         for uid in updated_ids:
             vi = view_item_resolver(uid)
             if vi is None:
@@ -6930,14 +6945,11 @@ class MainView(QWidget):
             if not self._replace_view_item_in_list_by_path(self._items_unfiltered, vi):
                 self._insert_view_item_sorted(self._items_unfiltered, vi)
             row = self._row_for_item_id(uid)
-            if row is None or row >= self._tile_model.rowCount():
-                _dcc_debug_log.debug("apply_assets_diff_impl skip update uid=%r row=%s model_rows=%d _order[:5]=%s", uid, row, self._tile_model.rowCount(), (self._order[:5] if self._order else []))
+            if row is None or row >= len(self._all_items):
+                _dcc_debug_log.debug("apply_assets_diff_impl skip update uid=%r row=%s model_rows=%d _order[:5]=%s", uid, row, self._tile_row_count(), (self._order[:5] if self._order else []))
                 continue
             _dcc_debug_log.debug("apply_assets_diff_impl updating row=%d uid=%r", row, uid)
-            self._tile_model.replace_row_view_item(row, vi)
-            self._tile_model.reset_thumbnail_slot_row(row)
-            self._list_model.refresh_row(row)
-            self._list_model.notify_thumb_column(row)
+            had_updates = True
             if row < len(self._order):
                 self._order[row] = uid
             if row < len(self._all_items):
@@ -6951,6 +6963,7 @@ class MainView(QWidget):
             vi = view_item_resolver(aid)
             if vi is None:
                 continue
+            structure_changed = True
             self._items_unfiltered = [u for u in self._items_unfiltered if str(u.path) != str(vi.path)]
             self._insert_view_item_sorted(self._items_unfiltered, vi)
             insert_row = len(self._all_items)
@@ -6970,8 +6983,14 @@ class MainView(QWidget):
                         break
             self._order.insert(insert_row, aid)
             self._all_items.insert(insert_row, vi)
-            self._insert_row_at(insert_row, vi, insert_row + 1)
             self._rebuild_items_from_order()
+
+        if structure_changed:
+            self._tile_model.bind_rows(self._all_items)
+            self._list_model.reset_structure()
+        elif had_updates:
+            self._tile_model.refresh_preserving_thumbs()
+            self._list_model.reset_structure()
 
     def apply_assets_diff_from_assets(
         self,
@@ -7524,8 +7543,8 @@ class MainView(QWidget):
                     continue
                 sm.clearSelection()
                 current_idx = QModelIndex()
-                for row in range(self._tile_model.rowCount()):
-                    tile_idx = self._tile_model.index(row, 0)
+                for row in range(self._tile_row_count()):
+                    tile_idx = self._tile_model._model_index(row, 0)
                     list_idx = self._list_model.index(row, 0)
                     item = tile_idx.data(Qt.UserRole)
                     if not isinstance(item, ViewItem) or not item.path:
@@ -7642,7 +7661,7 @@ class MainView(QWidget):
         if getattr(self, "_in_batch_set_items", False) and not force:
             return
         tile_has_rows = self._tile_model.row_count() > 0
-        list_has_rows = self._list_model.rowCount() > 0
+        list_has_rows = self._tile_row_count() > 0
         idx_tile = 1 if tile_has_rows else 0
         idx_list = 1 if list_has_rows else 0
         self._tile_page.setCurrentIndex(idx_tile)
@@ -7655,7 +7674,7 @@ class MainView(QWidget):
     def _show_list_content(self, *, force: bool = False) -> None:
         """List table is often populated while hidden (grid mode); sync stack + model before show."""
         self._sync_content_stack_pages(force=force)
-        if self._tile_model.rowCount() <= 0:
+        if self._tile_row_count() <= 0:
             return
         self._list_page.setCurrentIndex(1)
         self._list_model.reset_structure()
@@ -7856,7 +7875,7 @@ class MainView(QWidget):
         self._grid_delegate.set_selection_fast_paint(False)
         rows = getattr(self, "_tile_selection_chrome_rows", set())
         for row in rows:
-            idx = self._tile_model.index(row, 0)
+            idx = self._tile_model._model_index(row, 0)
             if idx.isValid():
                 self._tile_view.update(idx)
         self._tile_selection_chrome_rows = set()
@@ -7885,7 +7904,7 @@ class MainView(QWidget):
             return
         rows = sorted({idx.row() for idx in sm.selectedIndexes()})
         for row in rows:
-            idx = self._tile_model.index(row, 0)
+            idx = self._tile_model._model_index(row, 0)
             if idx.isValid():
                 self._tile_view.update(idx)
         self._tile_view.viewport().update()
@@ -8355,6 +8374,18 @@ class MainView(QWidget):
             if not has_dept_filter:
                 act_review.setEnabled(False)
                 act_review.setToolTip(_no_dept_hint)
+            from monostudio.core.openrv_launch import is_openrv_available
+
+            act_openrv = menu.addAction(
+                lucide_icon("external-link", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim),
+                "Open in OpenRV…",
+            )
+            if not has_dept_filter:
+                act_openrv.setEnabled(False)
+                act_openrv.setToolTip(_no_dept_hint)
+            elif not is_openrv_available(getattr(self, "_settings", None)):
+                act_openrv.setEnabled(False)
+                act_openrv.setToolTip("Configure OpenRV path in Settings → General → Video player.")
             # "Open older version" submenu when right-click on thumbnail: use same active_dcc as icon (already resolved above).
             if has_dept_filter and isinstance(item.ref, (Asset, Shot)) and self._project_root and active_dcc:
                 dep_norm = (self._active_department or "").strip().casefold()
@@ -8435,10 +8466,22 @@ class MainView(QWidget):
         delete_action = None
         rename_action = None
         refresh_action = None
+        star_action = None
         open_work = None
         open_publish = None
 
         if item.kind.value in ("asset", "shot"):
+            starred = False
+            if self._palette_star_is_starred is not None:
+                try:
+                    starred = bool(self._palette_star_is_starred(item))
+                except Exception:
+                    starred = False
+            star_action = menu.addAction(
+                lucide_icon("star", size=16, color_hex="#fbbf24" if starred else MONOS_COLORS["text_label"]),
+                "Unstar" if starred else "Star for Quick Jump",
+            )
+            menu.addSeparator()
             menu.addAction(
                 lucide_icon("message-circle", size=16, color_hex=MONOS_COLORS["text_label"]),
                 "Notes…",
@@ -8463,6 +8506,7 @@ class MainView(QWidget):
         menu.setProperty("_act_open_with", open_with_action)
         menu.setProperty("_act_create_new", create_new_action)
         menu.setProperty("_act_refresh", refresh_action)
+        menu.setProperty("_act_palette_star", star_action)
         menu.setProperty("_act_rename", rename_action)
         menu.setProperty("_act_delete", delete_action)
         menu.setProperty("_act_open_work", open_work)
@@ -8488,6 +8532,9 @@ class MainView(QWidget):
 
         if text == "Review latest preview…":
             self.review_entity_requested.emit(item)
+            return
+        if text == "Open in OpenRV…":
+            self.open_in_openrv_entity_requested.emit(item)
             return
         if text == "Switch to Project":
             self.switch_project_requested.emit(item)
@@ -8569,6 +8616,9 @@ class MainView(QWidget):
             return
         if text == "Open Concept Folder":
             self._open_entity_special_folder_from_item(item, "concept")
+            return
+        if text in ("Star for Quick Jump", "Unstar"):
+            self.palette_star_toggle_requested.emit(item)
             return
         if text == "Notes…":
             self.item_notes_requested.emit(item)
@@ -8673,7 +8723,7 @@ class MainView(QWidget):
 
     def _refresh_thumbnails_for_department_change(self) -> None:
         """Invalidate row thumb slots so prefetch loads the new department — without rebuilding rows."""
-        rc = self._tile_model.rowCount()
+        rc = self._tile_row_count()
         if rc <= 0:
             return
         for row in range(rc):
@@ -8697,7 +8747,7 @@ class MainView(QWidget):
         self._thumb_prefetch_gen += 1
         gen = self._thumb_prefetch_gen
 
-        if self._tile_model.rowCount() == 0:
+        if self._tile_row_count() == 0:
             return
         active_dept = (self._active_department or "").strip() or None
 
@@ -8715,16 +8765,12 @@ class MainView(QWidget):
         if gen != self._thumb_prefetch_gen:
             return
 
-        rc = self._tile_model.rowCount()
+        rc = self._tile_row_count()
         chunk = max(1, int(self._THUMB_PREFETCH_CHUNK_ROWS))
         end = min(start_row + chunk, rc)
 
         for row in range(start_row, end):
-            index = self._tile_model.index(row, 0)
-            if not index.isValid():
-                continue
-
-            item = index.data(Qt.UserRole)
+            item = self._tile_model.view_item_at(row)
             if not isinstance(item, ViewItem):
                 continue
             if item.kind.value not in ("asset", "shot", "project"):

@@ -11,6 +11,7 @@ class PreviewContext(StrEnum):
     inbox = "inbox"
     project_guide = "project_guide"
     entity = "entity"
+    entity_ref = "entity_ref"  # Inspector Ref tab — reference/concept browse, no draw
     internal_check = "internal_check"
     delivery = "delivery"
 

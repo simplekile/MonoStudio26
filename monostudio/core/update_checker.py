@@ -36,6 +36,24 @@ from monostudio.core.version import get_app_version
 # Cache kết quả check 1 giờ để tránh vượt rate limit GitHub (60 request/giờ khi không token)
 CACHE_TTL_SECONDS = 3600
 
+
+def should_auto_check_updates(*, last_check_iso: str | None = None) -> bool:
+    """True when no successful check within CACHE_TTL_SECONDS (session cache or persisted time)."""
+    from datetime import datetime
+
+    ages: list[float] = []
+    if _cached_check_time > 0:
+        ages.append(time.time() - _cached_check_time)
+    if last_check_iso:
+        try:
+            last_dt = datetime.fromisoformat(last_check_iso)
+            ages.append((datetime.now() - last_dt).total_seconds())
+        except (ValueError, TypeError):
+            pass
+    if not ages:
+        return True
+    return min(ages) >= CACHE_TTL_SECONDS
+
 # GitHub repo for releases: "owner/repo"
 GITHUB_REPO = "simplekile/MonoStudio26"
 
@@ -79,6 +97,7 @@ class CheckResult:
     latest_version: str
     latest_notes: str
     latest_html_url: str = ""
+    latest_install_info: UpdateInfo | None = None  # latest release installer (for redownload when up to date)
 
 
 @dataclass
@@ -454,12 +473,14 @@ def check_for_update(
     if not skip_cache and _cached_check_result is not None and (_cached_check_time > 0 and (time.time() - _cached_check_time) < CACHE_TTL_SECONDS):
         c = _cached_check_result
         update_available = os.environ.get("MONOSTUDIO_FAKE_UPDATE", "").strip() in ("1", "true", "yes") or is_newer_than(current_version, c.latest_version)
+        latest_install = getattr(c, "latest_install_info", None) or c.update_info
         return CheckResult(
             update_available=update_available,
             update_info=c.update_info if update_available else None,
             latest_version=c.latest_version,
             latest_notes=c.latest_notes,
             latest_html_url=c.latest_html_url or "",
+            latest_install_info=latest_install,
         )
     data = fetch_manifest(manifest_url, timeout=timeout)
     info = parse_manifest(data)
@@ -479,6 +500,7 @@ def check_for_update(
         latest_version=info.version,
         latest_notes=notes,
         latest_html_url=info.html_url or "",
+        latest_install_info=info,
     )
     set_cached_check_result(result)
     return result
@@ -490,6 +512,44 @@ _DOWNLOAD_HEADERS = {
     "User-Agent": "MonoStudio26-UpdateCheck/1.0 (Windows; Python)",
 }
 
+_DOWNLOAD_CHUNK_SIZE = 8192
+
+
+class DownloadAbortHandle:
+    """Cooperative download cancel: close active HTTP response from any thread."""
+
+    __slots__ = ("_cancelled", "_response")
+
+    def __init__(self) -> None:
+        self._cancelled = False
+        self._response: Any = None
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self) -> None:
+        if self._cancelled:
+            return
+        self._cancelled = True
+        resp = self._response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def bind(self, response: Any) -> None:
+        self._response = response
+        if self._cancelled:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def raise_if_cancelled(self) -> None:
+        if self._cancelled:
+            raise RuntimeError("Cancelled")
+
 
 class _RedirectWithHeadersHandler(urllib.request.HTTPRedirectHandler):
     """Follow redirects but re-send our headers on the new request (GitHub CDN needs User-Agent)."""
@@ -499,25 +559,47 @@ class _RedirectWithHeadersHandler(urllib.request.HTTPRedirectHandler):
         return urllib.request.Request(fullurl, headers=_DOWNLOAD_HEADERS, method="GET")
 
 
-def _download_with_urllib(url: str, dest_path: Path, timeout: int, progress_callback: Any) -> None:
+def _download_with_urllib(
+    url: str,
+    dest_path: Path,
+    timeout: int,
+    progress_callback: Any,
+    abort: DownloadAbortHandle | None = None,
+) -> None:
     """Download using urllib with redirect handler that re-sends headers."""
     opener = urllib.request.build_opener(_RedirectWithHeadersHandler())
     req = urllib.request.Request(url, headers=_DOWNLOAD_HEADERS, method="GET")
     resp = opener.open(req, timeout=timeout)
+    if abort is not None:
+        abort.bind(resp)
     total = resp.headers.get("Content-Length")
     total = int(total) if total else None
     read = 0
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest_path, "wb") as f:
-        while True:
-            chunk = resp.read(65536)
-            if not chunk:
-                break
-            f.write(chunk)
-            read += len(chunk)
-            if progress_callback:
-                progress_callback(read, total)
-    resp.close()
+    try:
+        with open(dest_path, "wb") as f:
+            while True:
+                if abort is not None:
+                    abort.raise_if_cancelled()
+                try:
+                    chunk = resp.read(_DOWNLOAD_CHUNK_SIZE)
+                except Exception as e:
+                    if abort is not None and abort.is_cancelled():
+                        raise RuntimeError("Cancelled") from e
+                    raise
+                if not chunk:
+                    break
+                f.write(chunk)
+                read += len(chunk)
+                if progress_callback:
+                    progress_callback(read, total)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    if abort is not None:
+        abort.raise_if_cancelled()
 
 
 def _download_with_powershell(url: str, dest_path: Path, timeout: int) -> None:
@@ -549,36 +631,66 @@ Invoke-WebRequest -Uri $args[0] -OutFile $args[1] -UseBasicParsing -UserAgent $a
             pass
 
 
-def _do_download(url: str, dest_path: Path, timeout: int, progress_callback: Any) -> None:
+def _do_download(
+    url: str,
+    dest_path: Path,
+    timeout: int,
+    progress_callback: Any,
+    abort: DownloadAbortHandle | None = None,
+) -> None:
     """Single attempt: requests -> urllib -> PowerShell. Raises on failure."""
+    if abort is not None:
+        abort.raise_if_cancelled()
     last_error: Exception | None = None
     try:
         import requests
         r = requests.get(url, headers=_DOWNLOAD_HEADERS, timeout=timeout, stream=True, allow_redirects=True)
+        if abort is not None:
+            abort.bind(r)
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", 0)) or None
         read = 0
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
+            for chunk in r.iter_content(chunk_size=_DOWNLOAD_CHUNK_SIZE):
+                if abort is not None:
+                    abort.raise_if_cancelled()
                 if chunk:
                     f.write(chunk)
                     read += len(chunk)
                     if progress_callback:
                         progress_callback(read, total)
+        try:
+            r.close()
+        except Exception:
+            pass
+        if abort is not None:
+            abort.raise_if_cancelled()
         return
-    except ImportError:
-        pass
+    except RuntimeError:
+        raise
     except Exception as e:
+        if abort is not None and abort.is_cancelled():
+            raise RuntimeError("Cancelled") from e
         last_error = e
+    if abort is not None:
+        abort.raise_if_cancelled()
     try:
-        _download_with_urllib(url, dest_path, timeout, progress_callback)
+        _download_with_urllib(url, dest_path, timeout, progress_callback, abort=abort)
         return
+    except RuntimeError:
+        raise
     except Exception as e:
+        if abort is not None and abort.is_cancelled():
+            raise RuntimeError("Cancelled") from e
         last_error = e
+    if abort is not None:
+        abort.raise_if_cancelled()
     if sys.platform == "win32":
         try:
             _download_with_powershell(url, dest_path, timeout)
+            if abort is not None:
+                abort.raise_if_cancelled()
             return
         except Exception as e:
             last_error = e
@@ -590,10 +702,11 @@ def download_to_file(
     dest_path: Path,
     timeout: int = 900,
     progress_callback: Any = None,
+    abort: DownloadAbortHandle | None = None,
 ) -> None:
     """Download a generic file (e.g. zip). No PE / installer validation."""
     print(f"[MonoStudio] Download URL: {url}", flush=True)
-    _do_download(url, dest_path, timeout, progress_callback)
+    _do_download(url, dest_path, timeout, progress_callback, abort=abort)
 
 
 def download_installer(
@@ -602,6 +715,7 @@ def download_installer(
     timeout: int = 300,
     progress_callback: Any = None,
     fallback_url: str | None = None,
+    abort: DownloadAbortHandle | None = None,
 ) -> None:
     """
     Download installer from url to dest_path. If fallback_url is set and the file is invalid
@@ -611,14 +725,18 @@ def download_installer(
     if fallback_url == url:
         fallback_url = None
     print(f"[MonoStudio] Download URL: {url}", flush=True)
-    _do_download(url, dest_path, timeout, progress_callback)
+    _do_download(url, dest_path, timeout, progress_callback, abort=abort)
+    if abort is not None:
+        abort.raise_if_cancelled()
     if fallback_url and not is_valid_installer(dest_path):
         try:
             dest_path.unlink(missing_ok=True)
         except OSError:
             pass
+        if abort is not None:
+            abort.raise_if_cancelled()
         print(f"[MonoStudio] Retry download (fallback): {fallback_url}", flush=True)
-        _do_download(fallback_url, dest_path, timeout, progress_callback)
+        _do_download(fallback_url, dest_path, timeout, progress_callback, abort=abort)
 
 
 # Minimum size for a valid installer (bytes); smaller likely HTML/error page

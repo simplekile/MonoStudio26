@@ -1,7 +1,5 @@
 # Virtual Qt models for MainView: shared row list (`_all_items`); tile model = grid, list model = list rows.
 
-from __future__ import annotations
-
 from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QWidget
@@ -25,10 +23,36 @@ class PipelineTileModel(QAbstractListModel):
     def thumb_state_role(self) -> int:
         return self._thumb_state_role
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # type: ignore[override]
+    def rowCount(self, parent=QModelIndex()) -> int:  # type: ignore[override]  # noqa: N802
         if parent.isValid():
             return 0
         return len(self._rows)
+
+    def _emit_data_changed(self, top_row: int, bottom_row: int, roles: list[int]) -> None:
+        """Notify views; fall back to reset when Qt C++ rowCount binding fails during emit."""
+        if not self._rows or top_row < 0 or bottom_row < top_row:
+            return
+        bottom_row = min(bottom_row, len(self._rows) - 1)
+        if top_row > bottom_row:
+            return
+        tl = self.createIndex(top_row, 0)
+        br = self.createIndex(bottom_row, 0)
+        try:
+            self.dataChanged.emit(tl, br, roles)
+        except NotImplementedError:
+            self.beginResetModel()
+            self.endResetModel()
+
+    def refresh_preserving_thumbs(self) -> None:
+        """Full view refresh without clearing thumbnail slot state."""
+        self.beginResetModel()
+        self.endResetModel()
+
+    def _model_index(self, row: int, column: int = 0) -> QModelIndex:
+        """createIndex path — avoids QAbstractItemModel.index() when rowCount binding is flaky."""
+        if row < 0 or row >= len(self._rows):
+            return QModelIndex()
+        return self.createIndex(row, column)
 
     def view_item_at(self, row: int) -> ViewItem | None:
         if row < 0 or row >= len(self._rows):
@@ -55,16 +79,28 @@ class PipelineTileModel(QAbstractListModel):
         self._icon_override_by_path.pop(k, None)
 
     def notify_insert_rows(self, row: int, count: int = 1) -> None:
-        if count <= 0:
+        """No-op — structural changes use bind_rows()."""
+        return
+
+    def insert_rows_at(self, row: int, items: list[ViewItem]) -> None:
+        if not items:
             return
-        self.beginInsertRows(QModelIndex(), row, row + count - 1)
-        self.endInsertRows()
+        row = max(0, min(row, len(self._rows)))
+        for offset, vi in enumerate(items):
+            self._rows.insert(row + offset, vi)
+        self.beginResetModel()
+        self.endResetModel()
+
+    def remove_row_at(self, row: int) -> None:
+        if row < 0 or row >= len(self._rows):
+            return
+        del self._rows[row]
+        self.beginResetModel()
+        self.endResetModel()
 
     def notify_remove_rows(self, row: int, count: int = 1) -> None:
-        if count <= 0:
-            return
-        self.beginRemoveRows(QModelIndex(), row, row + count - 1)
-        self.endRemoveRows()
+        """No-op — structural changes use bind_rows()."""
+        return
 
     def replace_row_view_item(self, row: int, vi: ViewItem) -> None:
         if row < 0 or row >= len(self._rows):
@@ -76,10 +112,9 @@ class PipelineTileModel(QAbstractListModel):
             self._thumb_state_by_path.pop(old_k, None)
             self._icon_override_by_path.pop(old_k, None)
         self._rows[row] = vi
-        ix = self.index(row, 0)
-        self.dataChanged.emit(
-            ix,
-            ix,
+        self._emit_data_changed(
+            row,
+            row,
             [
                 Qt.ItemDataRole.DisplayRole,
                 Qt.ItemDataRole.DecorationRole,
@@ -95,10 +130,9 @@ class PipelineTileModel(QAbstractListModel):
         k = str(vi.path)
         self._thumb_state_by_path.pop(k, None)
         self._icon_override_by_path.pop(k, None)
-        ix = self.index(row, 0)
-        self.dataChanged.emit(
-            ix,
-            ix,
+        self._emit_data_changed(
+            row,
+            row,
             [Qt.ItemDataRole.DecorationRole, self._thumb_state_role],
         )
 
@@ -109,10 +143,9 @@ class PipelineTileModel(QAbstractListModel):
         k = str(vi.path)
         self._icon_override_by_path[k] = icon
         self._thumb_state_by_path[k] = state
-        ix = self.index(row, 0)
-        self.dataChanged.emit(
-            ix,
-            ix,
+        self._emit_data_changed(
+            row,
+            row,
             [Qt.ItemDataRole.DecorationRole, self._thumb_state_role],
         )
 
@@ -121,8 +154,7 @@ class PipelineTileModel(QAbstractListModel):
         if vi is None:
             return
         self._thumb_state_by_path[str(vi.path)] = state
-        ix = self.index(row, 0)
-        self.dataChanged.emit(ix, ix, [self._thumb_state_role])
+        self._emit_data_changed(row, row, [self._thumb_state_role])
 
     def thumbnail_state_for_row(self, row: int) -> str | None:
         vi = self.view_item_at(row)
@@ -136,17 +168,13 @@ class PipelineTileModel(QAbstractListModel):
         rc = self.row_count()
         if rc <= 0:
             return
-        tl = self.index(0, 0)
-        br = self.index(rc - 1, 0)
-        self.dataChanged.emit(tl, br, [self._thumb_state_role])
+        self._emit_data_changed(0, rc - 1, [self._thumb_state_role])
 
     def emit_all_rows_user_role_changed(self) -> None:
         rc = self.row_count()
         if rc <= 0:
             return
-        tl = self.index(0, 0)
-        br = self.index(rc - 1, 0)
-        self.dataChanged.emit(tl, br, [Qt.ItemDataRole.UserRole])
+        self._emit_data_changed(0, rc - 1, [Qt.ItemDataRole.UserRole])
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # type: ignore[override]
         if not index.isValid() or index.column() != 0:
@@ -188,36 +216,50 @@ class PipelineListModel(QAbstractListModel):
         self.beginResetModel()
         self.endResetModel()
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # type: ignore[override]
+    def rowCount(self, parent=QModelIndex()) -> int:  # type: ignore[override]  # noqa: N802
         if parent.isValid():
             return 0
         return self._tile_model.row_count()
 
+    def _model_index(self, row: int, column: int = 0) -> QModelIndex:
+        if row < 0 or row >= self._tile_model.row_count():
+            return QModelIndex()
+        return self.createIndex(row, column)
+
     def notify_insert_rows(self, row: int, count: int = 1) -> None:
-        if count <= 0:
-            return
-        self.beginInsertRows(QModelIndex(), row, row + count - 1)
-        self.endInsertRows()
+        """No-op — tile model bind_rows() + reset_structure() refresh both views."""
+        return
 
     def notify_remove_rows(self, row: int, count: int = 1) -> None:
-        if count <= 0:
+        """No-op — tile model bind_rows() + reset_structure() refresh both views."""
+        return
+
+    def _emit_data_changed(self, top_row: int, bottom_row: int, roles: list[int]) -> None:
+        rc = self._tile_model.row_count()
+        if rc <= 0 or top_row < 0 or bottom_row < top_row:
             return
-        self.beginRemoveRows(QModelIndex(), row, row + count - 1)
-        self.endRemoveRows()
+        bottom_row = min(bottom_row, rc - 1)
+        if top_row > bottom_row:
+            return
+        tl = self.createIndex(top_row, 0)
+        br = self.createIndex(bottom_row, 0)
+        try:
+            self.dataChanged.emit(tl, br, roles)
+        except NotImplementedError:
+            self.beginResetModel()
+            self.endResetModel()
 
     def notify_thumb_column(self, row: int) -> None:
-        if row < 0 or row >= self.rowCount():
+        if row < 0 or row >= self._tile_model.row_count():
             return
-        ix = self.index(row)
-        self.dataChanged.emit(ix, ix, [Qt.ItemDataRole.DecorationRole])
+        self._emit_data_changed(row, row, [Qt.ItemDataRole.DecorationRole])
 
     def refresh_row(self, row: int) -> None:
-        if row < 0 or row >= self.rowCount():
+        if row < 0 or row >= self._tile_model.row_count():
             return
-        ix = self.index(row)
-        self.dataChanged.emit(
-            ix,
-            ix,
+        self._emit_data_changed(
+            row,
+            row,
             [
                 Qt.ItemDataRole.DisplayRole,
                 Qt.ItemDataRole.DecorationRole,
@@ -226,18 +268,16 @@ class PipelineListModel(QAbstractListModel):
         )
 
     def refresh_index_column(self) -> None:
-        rc = self.rowCount()
+        rc = self._tile_model.row_count()
         if rc <= 0:
             return
-        self.dataChanged.emit(self.index(0), self.index(rc - 1), [Qt.ItemDataRole.DisplayRole])
+        self._emit_data_changed(0, rc - 1, [Qt.ItemDataRole.DisplayRole])
 
     def emit_all_user_role_changed(self) -> None:
-        rc = self.rowCount()
+        rc = self._tile_model.row_count()
         if rc <= 0:
             return
-        self.dataChanged.emit(
-            self.index(0), self.index(rc - 1), [Qt.ItemDataRole.UserRole]
-        )
+        self._emit_data_changed(0, rc - 1, [Qt.ItemDataRole.UserRole])
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # type: ignore[override]
         if not index.isValid() or index.column() != 0:
@@ -251,7 +291,7 @@ class PipelineListModel(QAbstractListModel):
         if role == Qt.ItemDataRole.DisplayRole:
             return display_name_for_item(vi)
         if role == Qt.ItemDataRole.DecorationRole:
-            tix = self._tile_model.index(row, 0)
+            tix = self._tile_model._model_index(row, 0)
             return self._tile_model.data(tix, Qt.ItemDataRole.DecorationRole)
         return None
 

@@ -86,6 +86,7 @@ def download_mpv_win64_7z(
     *,
     timeout: int = 900,
     progress_callback=None,
+    abort=None,
 ) -> None:
     """Download portable mpv ``.7z``; tries current release then one version back."""
     from monostudio.core.update_checker import download_to_file
@@ -93,16 +94,20 @@ def download_mpv_win64_7z(
     urls = [MPV_WIN64_7Z_URL, MPV_WIN64_7Z_FALLBACK_URL]
     last_error = ""
     for url in urls:
+        if abort is not None and abort.is_cancelled():
+            raise RuntimeError("Cancelled")
         try:
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             if dest_path.is_file():
                 dest_path.unlink(missing_ok=True)
-            download_to_file(url, dest_path, timeout=timeout, progress_callback=progress_callback)
+            download_to_file(url, dest_path, timeout=timeout, progress_callback=progress_callback, abort=abort)
             if is_plausible_7z(dest_path):
                 return
             hint = invalid_archive_hint(dest_path)
             last_error = hint or "Downloaded file is not a valid 7z (try again or use Official builds)."
             dest_path.unlink(missing_ok=True)
+        except RuntimeError:
+            raise
         except Exception as e:
             last_error = str(e).replace("\n", " ")[:400]
     raise RuntimeError(last_error or "Download failed.")

@@ -449,8 +449,9 @@ class _TagListDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # type: ignore[override]
-        s = super().sizeHint(option, index)
-        return s
+        # Do not call super().sizeHint — Qt routes back through sizeHintForRow → infinite recursion.
+        fm = QFontMetrics(option.font)
+        return QSize(-1, max(28, fm.height() + 12))
 
 
 class _SidebarFilterTreeDelegate(QStyledItemDelegate):
@@ -654,7 +655,13 @@ class _SidebarFilterTreeDelegate(QStyledItemDelegate):
             painter.restore()
 
     def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # type: ignore[override]
-        data = index.data(Qt.UserRole) if index.isValid() else None
+        default_h = int(SIDEBAR_DEPT_LIST_STYLE.get("dept_row_height_px", 28))
+        try:
+            if not index.isValid():
+                return QSize(-1, default_h)
+            data = index.data(Qt.UserRole)
+        except (RuntimeError, NotImplementedError):
+            return QSize(-1, default_h)
         if isinstance(data, dict):
             if data.get("type") == _DEPT_ROW_SECTION:
                 return QSize(-1, int(SIDEBAR_DEPT_LIST_STYLE.get("section_row_height_px", 20)))

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QEvent, QObject
+from PySide6.QtCore import QPointF, QRectF, Qt, QEvent, QObject, QTimer
 
 from monostudio.core.app_paths import get_app_base_path
 from PySide6.QtGui import (
@@ -18,7 +18,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
 )
-from PySide6.QtWidgets import QApplication, QDialog, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu, QWidget
 from PySide6.QtWidgets import QStyle, QProxyStyle
 
 
@@ -43,8 +43,8 @@ _MONOS_DIALOG_RADIUS = 12
 _MONOS_DIALOG_BORDER = "#3f3f46"
 # Inset dialog content so native embed (mpv / QVideoWidget) does not paint over the border overlay.
 _MONOS_DIALOG_BORDER_INSET = 1
-# Overlay behind modal dialog: white 15% opacity
-_MONOS_DIALOG_OVERLAY_CSS = "background: rgba(0, 0, 0, 0.55);"
+# Overlay behind modal dialog (host dim layer)
+_MONOS_DIALOG_DIM_COLOR = QColor(0, 0, 0, 140)
 
 
 class _DialogDismissOverlay(QWidget):
@@ -53,8 +53,12 @@ class _DialogDismissOverlay(QWidget):
     def __init__(self, host: QWidget, dismiss) -> None:
         super().__init__(host)
         self._dismiss = dismiss
-        self.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), _MONOS_DIALOG_DIM_COLOR)
+        painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -69,8 +73,12 @@ class _DialogBlockOverlay(QWidget):
 
     def __init__(self, host: QWidget) -> None:
         super().__init__(host)
-        self.setStyleSheet(_MONOS_DIALOG_OVERLAY_CSS)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), _MONOS_DIALOG_DIM_COLOR)
+        painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         event.accept()
@@ -104,7 +112,7 @@ def clear_stuck_widget_hover(widget: QWidget | None) -> None:
             st.polish(widget)
     except Exception:
         pass
-    widget.update()
+    QWidget.update(widget)
 
 
 def release_stuck_mouse_grab(*, force: bool = False) -> None:
@@ -366,7 +374,7 @@ class MonosDialog(QDialog):
         self.setMask(bitmap)
 
     def _resolve_overlay_host(self) -> QWidget | None:
-        """Dim layer target: outermost parent QDialog (nested modals), else top-level host."""
+        """Dim layer target: nested modal host, else top-level window (incl. frameless title bar)."""
         outermost: QWidget | None = None
         w: QWidget | None = self.parentWidget()
         while isinstance(w, QWidget):
@@ -375,10 +383,21 @@ class MonosDialog(QDialog):
             w = w.parentWidget()
         if outermost is not None:
             return outermost
-        w = self.parentWidget()
-        while isinstance(w, QWidget) and w.parentWidget() is not None:
-            w = w.parentWidget()
-        return w if isinstance(w, QWidget) else None
+        top: QWidget | None = self.parentWidget()
+        while isinstance(top, QWidget) and top.parentWidget() is not None:
+            top = top.parentWidget()
+        return top
+
+    def _ensure_host_overlay_stacked(self) -> None:
+        if self._overlay is None or self._overlay_host is None:
+            return
+        self._sync_overlay_geometry()
+        self._overlay.show()
+        self._overlay.raise_()
+        # FramelessMainWindow keeps titleBar raised — stack dim above chrome too.
+        title_bar = getattr(self._overlay_host, "titleBar", None)
+        if isinstance(title_bar, QWidget) and title_bar.isVisible():
+            self._overlay.raise_()
 
     def _sync_overlay_geometry(self) -> None:
         host = self._overlay_host
@@ -437,13 +456,14 @@ class MonosDialog(QDialog):
                 else:
                     self._overlay = _DialogBlockOverlay(host)
             host.installEventFilter(self)
-            self._sync_overlay_geometry()
-            self._overlay.show()
-            self._overlay.raise_()
+            self._ensure_host_overlay_stacked()
             if self._dismiss_on_overlay_click:
                 self._overlay.installEventFilter(self)
         self.raise_()
         self.activateWindow()
+        if self._host_dim_overlay_enabled:
+            QTimer.singleShot(0, self._ensure_host_overlay_stacked)
+            QTimer.singleShot(50, self._ensure_host_overlay_stacked)
         if self._dismiss_on_overlay_click:
             app = QApplication.instance()
             if app is not None:
@@ -3433,7 +3453,18 @@ def apply_dark_theme(app: QApplication) -> None:
         QSplitter#VideoPreviewBodySplit::handle:hover {
             background: rgba(113, 113, 122, 0.75);
         }
-        QDialog#VideoPreviewDialog {
+        QSplitter#VideoPreviewBodySplit[noSplitterHandles="true"]::handle {
+            width: 0px;
+            margin: 0px;
+            background: transparent;
+        }
+        QSplitter#VideoPreviewBodySplit[noSplitterHandles="true"]::handle:hover {
+            background: transparent;
+        }
+        QMainWindow#VideoPreviewDialog {
+            background: #1e2124;
+        }
+        QWidget#VideoPreviewCentral {
             background: transparent;
         }
         QWidget#VideoPreviewMainColumn {
@@ -3444,18 +3475,6 @@ def apply_dark_theme(app: QApplication) -> None:
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
             border-top-left-radius: 12px;
             border-top-right-radius: 12px;
-        }
-        QToolButton#VideoPreviewDialogCloseBtn {
-            padding: 0px;
-            border: none;
-            border-radius: 8px;
-            background: #ef4444;
-            color: #fafafa;
-        }
-        QToolButton#VideoPreviewDialogCloseBtn:hover {
-            background: #dc2626;
-            border: none;
-            color: #ffffff;
         }
         QLabel#VideoPreviewFileCounter {
             color: #71717a;
@@ -4136,6 +4155,18 @@ def apply_dark_theme(app: QApplication) -> None:
         QLabel#VideoExportDialogTitle {
             color: #fafafa;
         }
+        QDialog#VideoExportDialog QToolButton#VideoPreviewDialogCloseBtn {
+            padding: 0px;
+            border: none;
+            border-radius: 8px;
+            background: #ef4444;
+            color: #fafafa;
+        }
+        QDialog#VideoExportDialog QToolButton#VideoPreviewDialogCloseBtn:hover {
+            background: #dc2626;
+            border: none;
+            color: #ffffff;
+        }
         QLabel#VideoExportBreadcrumb {
             color: #71717a;
         }
@@ -4337,17 +4368,15 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #3f3f46;
             color: #a1a1aa;
         }
-        /* Download loading: progress bar + cancel */
+        /* Download loading: progress bar (button-sized; painted in _UpdateDownloadProgressBar) */
         QProgressBar#UpdateDownloadProgress {
-            background-color: #27272a;
+            background: transparent;
             border: none;
-            border-radius: 4px;
-            text-align: center;
-            min-height: 8px;
+            min-height: 28px;
+            max-height: 28px;
         }
         QProgressBar#UpdateDownloadProgress::chunk {
-            background-color: #6366f1;
-            border-radius: 4px;
+            background: transparent;
         }
         /* Main content: project / page loading strip (4px top edge only) */
         QWidget#PageLoadingBar {
@@ -5182,7 +5211,7 @@ def apply_dark_theme(app: QApplication) -> None:
 
         /* --- Settings dialog: page-style nav (like main UI sidebar) --- */
         QFrame#SettingsNavFrame {
-            background-color: #151618;
+            background-color: #18181b;
             border-right: 1px solid rgba(39, 39, 42, 0.50);
         }
         QListWidget#SettingsNav {
