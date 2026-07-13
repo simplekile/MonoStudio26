@@ -20,6 +20,30 @@ def _gui_launch_executable() -> str:
     return exe
 
 
+def gui_launch_executable() -> str:
+    """Public alias for protocol handlers and shortcuts."""
+    return _gui_launch_executable()
+
+
+def app_deep_link_protocol_command(link_placeholder: str = "%1") -> str:
+    """Windows registry ``shell\\open\\command`` for ``monostudio://`` (no console)."""
+    exe = Path(_gui_launch_executable()).resolve()
+    link = (link_placeholder or "%1").strip() or "%1"
+    if getattr(sys, "frozen", False):
+        return f'"{exe}" {link}'
+    try:
+        from monostudio.core.app_paths import get_app_base_path
+
+        app_py = (get_app_base_path() / "app.py").resolve()
+        if app_py.is_file():
+            return f'"{exe}" "{app_py}" {link}'
+    except Exception:
+        pass
+    repo_root = Path(__file__).resolve().parents[2]
+    app_py = (repo_root / "app.py").resolve()
+    return f'"{exe}" "{app_py}" {link}'
+
+
 def app_launch_target() -> tuple[str, str, str]:
     """Return (executable, arguments, working_directory) for launching MONOS."""
     if getattr(sys, "frozen", False):

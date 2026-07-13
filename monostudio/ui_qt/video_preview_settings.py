@@ -12,7 +12,8 @@ SETTINGS_APP = "MonoStudio26"
 
 KEY_VIDEO_PLAYER_BACKEND = "tools/video_player_backend"
 KEY_VIDEO_EXTERNAL_PLAYER_EXE = "tools/video_external_player_exe"
-KEY_OPENRV_EXECUTABLE = "tools/openrv_executable"
+KEY_DJV_EXECUTABLE = "tools/djv_executable"
+KEY_OPENRV_EXECUTABLE = "tools/openrv_executable"  # legacy — read fallback only
 KEY_MPV_DIRECTORY = "tools/mpv_directory"
 KEY_VIDEO_PREVIEW_GEOMETRY = "ui/video_preview_geometry"
 KEY_VIDEO_PREVIEW_RANGE_PANEL = "ui/video_preview_range_panel_visible"
@@ -132,19 +133,33 @@ def write_video_external_player_exe(settings: QSettings, path: str) -> None:
     settings.setValue(KEY_VIDEO_EXTERNAL_PLAYER_EXE, (path or "").strip())
 
 
-def read_openrv_executable(settings: QSettings | None) -> str:
+def read_djv_executable(settings: QSettings | None) -> str:
     if settings is None:
         return ""
-    v = settings.value(KEY_OPENRV_EXECUTABLE, "")
-    return (v or "").strip() if isinstance(v, str) else str(v or "").strip()
+    v = settings.value(KEY_DJV_EXECUTABLE, "")
+    text = (v or "").strip() if isinstance(v, str) else str(v or "").strip()
+    if text:
+        return text
+    legacy = settings.value(KEY_OPENRV_EXECUTABLE, "")
+    return (legacy or "").strip() if isinstance(legacy, str) else str(legacy or "").strip()
+
+
+def write_djv_executable(settings: QSettings, path: str) -> None:
+    p = (path or "").strip()
+    if p:
+        settings.setValue(KEY_DJV_EXECUTABLE, p)
+    else:
+        settings.remove(KEY_DJV_EXECUTABLE)
+
+
+def read_openrv_executable(settings: QSettings | None) -> str:
+    """Legacy alias — use :func:`read_djv_executable`."""
+    return read_djv_executable(settings)
 
 
 def write_openrv_executable(settings: QSettings, path: str) -> None:
-    p = (path or "").strip()
-    if p:
-        settings.setValue(KEY_OPENRV_EXECUTABLE, p)
-    else:
-        settings.remove(KEY_OPENRV_EXECUTABLE)
+    """Legacy alias — use :func:`write_djv_executable`."""
+    write_djv_executable(settings, path)
 
 
 def read_mpv_directory(settings: QSettings | None) -> str:

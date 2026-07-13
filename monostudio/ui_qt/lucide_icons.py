@@ -25,6 +25,8 @@ def _read_svg_text(name: str) -> str | None:
         "skip-back": "chevron-left",
         "skip-forward": "chevron-right",
         "message-square": "message-circle",
+        "external-link": "move-up-right",
+        "link": "local",
     }
     p = _lucide_svg_path(name)
     if not p.is_file() and name in aliases:

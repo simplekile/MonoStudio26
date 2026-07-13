@@ -102,8 +102,10 @@ class SequenceDecodeBackend(QObject):
         self._current = 0
         self._playing = False
         self._buffer: dict[int, QPixmap] = {}
+        self._buffer_decode_side: dict[int, int] = {}
         self._scaled_cache: dict[tuple[int, int, int], QPixmap] = {}
         self._in_flight: set[int] = set()
+        self._in_flight_decode_side: dict[int, int] = {}
         self._decode_generation = _DecodeGeneration()
         self._decode_live = True
         self._signaler = _DecodeSignaler(self)
@@ -113,10 +115,15 @@ class SequenceDecodeBackend(QObject):
         self._heavy = self._detect_heavy_sequence()
         self._prefetch_n = self._PREFETCH_HEAVY if self._heavy else self._PREFETCH_LIGHT
         self._label_full_pix: QPixmap | None = None
+        self._decode_bucket: int | None = None
+        self._viewport_w = 0
+        self._viewport_h = 0
+        self._viewport_dpr = 0.0
         self._loop_start = 0
         self._loop_end: int | None = None
         self._loop_enabled = False
         self._pending_next: int | None = None
+        self._preview_scale = 1.0
 
         self._label = QLabel()
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -128,10 +135,32 @@ class SequenceDecodeBackend(QObject):
         self._tick_timer.setSingleShot(False)
         self._tick_timer.timeout.connect(self._on_tick)
 
-        if self._n > 0:
-            self._request_decode(0)
-            for k in range(1, min(self._prefetch_n + 1, self._n)):
-                self._request_decode(k)
+    def set_viewport_size(self, width: int, height: int, dpr: float = 0.0) -> None:
+        """Viewer plate size in logical pixels — used for decode + display scaling."""
+        w = max(1, int(width))
+        h = max(1, int(height))
+        d = float(dpr) if dpr > 0 else max(1.0, float(self._label.devicePixelRatioF()))
+        self._viewport_w = w
+        self._viewport_h = h
+        self._viewport_dpr = d
+
+    def prime_display(self) -> None:
+        """Decode first frames after the viewer has its final layout size."""
+        if self._n <= 0:
+            return
+        self._decode_bucket = self._decode_bucket_for_label()
+        self._scaled_cache.clear()
+        self._buffer.clear()
+        self._buffer_decode_side.clear()
+        self._in_flight.clear()
+        self._in_flight_decode_side.clear()
+        self._decode_generation.bump()
+        self._request_decode(self._current)
+        self._prefetch_from(self._current)
+
+    def prepare_for_playback(self) -> None:
+        """Ensure decode bucket matches viewport before play / prefetch."""
+        self._upgrade_decode_if_needed()
 
     def frame_count(self) -> int:
         return max(1, self._n)
@@ -142,6 +171,23 @@ class SequenceDecodeBackend(QObject):
     def set_fps(self, fps: int) -> None:
         self._fps = max(1, min(60, int(fps)))
         self._tick_timer.setInterval(max(1, round(1000 / self._fps)))
+
+    def set_preview_scale(self, scale: float) -> None:
+        """Decode resolution multiplier (1, ½, ¼, …) for heavy plate sequences."""
+        clamped = max(0.125, min(1.0, float(scale)))
+        if abs(clamped - self._preview_scale) < 1e-6:
+            return
+        self._preview_scale = clamped
+        self._invalidate_decode_cache()
+        self._request_decode(self._current)
+        if self._current in self._buffer and self._frame_meets_target(self._current):
+            self._apply_pixmap(self._current, self._buffer[self._current])
+            self.frame_changed.emit(self._current)
+
+    def invalidate_frame_cache(self) -> None:
+        """Drop decoded frames after OCIO / preview settings change."""
+        self._invalidate_decode_cache()
+        self._request_decode(self._current)
 
     def current_frame(self) -> int:
         return self._current
@@ -158,23 +204,31 @@ class SequenceDecodeBackend(QObject):
             return
         idx = max(0, min(self._n - 1, int(frame)))
         if idx == self._current:
-            if idx in self._buffer:
+            if self._frame_meets_target(idx):
                 return
+            if idx in self._buffer:
+                del self._buffer[idx]
+                self._buffer_decode_side.pop(idx, None)
             self._request_decode(idx)
             return
         self._pending_next = None
         self._current = idx
-        if idx in self._buffer:
+        if self._frame_meets_target(idx):
             self._apply_pixmap(idx, self._buffer[idx])
         else:
+            if idx in self._buffer:
+                del self._buffer[idx]
+                self._buffer_decode_side.pop(idx, None)
             self._request_decode(idx)
         self.frame_changed.emit(self._current)
 
     def play(self) -> None:
         if self._n <= 0:
             return
+        self.prepare_for_playback()
         self._playing = True
         self._pending_next = None
+        self._scaled_cache.clear()
         self._tick_timer.setInterval(max(1, round(1000 / self._fps)))
         if not self._tick_timer.isActive():
             self._tick_timer.start()
@@ -195,8 +249,10 @@ class SequenceDecodeBackend(QObject):
             pass
         self._pool.clear()
         self._buffer.clear()
+        self._buffer_decode_side.clear()
         self._scaled_cache.clear()
         self._in_flight.clear()
+        self._in_flight_decode_side.clear()
 
     def set_loop_region(self, start: int, end: int, *, enabled: bool) -> None:
         """Playback loop clamp — when enabled, wraps start..end inclusive."""
@@ -204,7 +260,60 @@ class SequenceDecodeBackend(QObject):
         self._loop_end = max(self._loop_start, int(end))
         self._loop_enabled = bool(enabled)
 
+    def _decode_bucket_for_label(self) -> int:
+        return max(64, (self._decode_max_side() // 64) * 64)
+
+    def _target_decode_side(self) -> int:
+        if self._decode_bucket is not None:
+            return self._decode_bucket
+        return self._decode_bucket_for_label()
+
+    def _buffer_side_for(self, idx: int) -> int:
+        pix = self._buffer.get(idx)
+        if pix is None or pix.isNull():
+            return 0
+        return max(pix.width(), pix.height())
+
+    def _frame_meets_target(self, idx: int) -> bool:
+        if idx not in self._buffer:
+            return False
+        requested = self._buffer_decode_side.get(idx, 0)
+        target = self._target_decode_side()
+        if requested < target - 32:
+            return False
+        actual = self._buffer_side_for(idx)
+        need = min(requested, target)
+        return actual >= max(64, need - 48)
+
+    def _invalidate_decode_cache(self) -> None:
+        self._decode_generation.bump()
+        self._buffer.clear()
+        self._buffer_decode_side.clear()
+        self._in_flight.clear()
+        self._in_flight_decode_side.clear()
+        self._scaled_cache.clear()
+
+    def _upgrade_decode_if_needed(self) -> bool:
+        """Re-decode when the viewer grew or cached frames are below target resolution."""
+        bucket = self._decode_bucket_for_label()
+        prev = self._decode_bucket
+        self._decode_bucket = bucket
+        stale = any(
+            not self._frame_meets_target(k)
+            for k in list(self._buffer)
+        )
+        if prev is not None and bucket == prev and not stale:
+            if self._frame_meets_target(self._current):
+                return False
+        self._invalidate_decode_cache()
+        self._request_decode(self._current)
+        if self._playing:
+            self._prefetch_from(self._current)
+        return True
+
     def resize_display(self) -> None:
+        if self._upgrade_decode_if_needed():
+            return
         self._scaled_cache.clear()
         if self._current in self._buffer:
             self._apply_pixmap(self._current, self._buffer[self._current])
@@ -222,27 +331,50 @@ class SequenceDecodeBackend(QObject):
                 return False
         return True
 
-    def _decode_max_side(self) -> int:
+    def _display_logical_size(self) -> tuple[int, int]:
+        if self._viewport_w > 0 and self._viewport_h > 0:
+            return self._viewport_w, self._viewport_h
         w = max(1, self._label.width())
         h = max(1, self._label.height())
-        dpr = max(1.0, float(self._label.devicePixelRatioF()))
-        side = int(max(w, h) * dpr)
-        return max(256, min(PREVIEW_MAX_SIDE_DEFAULT, ((side + 31) // 32) * 32))
+        parent = self._label.parentWidget()
+        if parent is not None:
+            if w < 32:
+                w = max(w, parent.width())
+            if h < 32:
+                h = max(h, parent.height())
+        return max(1, w), max(1, h)
+
+    def _decode_max_side(self) -> int:
+        w, h = self._display_logical_size()
+        dpr = (
+            self._viewport_dpr
+            if self._viewport_dpr > 0
+            else max(1.0, float(self._label.devicePixelRatioF()))
+        )
+        side = int(max(w, h) * dpr * self._preview_scale)
+        return max(64, min(PREVIEW_MAX_SIDE_DEFAULT, ((side + 31) // 32) * 32))
 
     def _request_decode(self, idx: int) -> None:
         if not self._decode_live:
             return
         if idx < 0 or idx >= self._n:
             return
-        if idx in self._buffer or idx in self._in_flight:
+        if idx in self._buffer:
+            if self._frame_meets_target(idx):
+                return
+            del self._buffer[idx]
+            self._buffer_decode_side.pop(idx, None)
+        if idx in self._in_flight:
             return
         self._in_flight.add(idx)
+        decode_side = self._target_decode_side()
+        self._in_flight_decode_side[idx] = decode_side
         gen = self._decode_generation.value
         self._pool.start(
             _DecodeRunnable(
                 idx,
                 self._frames[idx],
-                self._decode_max_side(),
+                decode_side,
                 self._signaler,
                 self._decode_generation,
                 gen,
@@ -260,17 +392,20 @@ class SequenceDecodeBackend(QObject):
             pix = QPixmap.fromImage(image)
             if not pix.isNull():
                 self._buffer[idx] = pix
+                self._buffer_decode_side[idx] = self._in_flight_decode_side.pop(
+                    idx, self._target_decode_side()
+                )
                 self._trim_buffer()
         if not self._playing:
-            if idx == self._current and idx in self._buffer:
+            if idx == self._current and self._frame_meets_target(idx):
                 self._apply_pixmap(idx, self._buffer[idx])
                 self.frame_changed.emit(self._current)
             return
         pending = self._pending_next
-        if pending is not None and idx == pending and idx in self._buffer:
+        if pending is not None and idx == pending and self._frame_meets_target(idx):
             self._pending_next = None
             self._apply_pixmap(idx, self._buffer[idx])
-        elif idx == self._current and idx in self._buffer:
+        elif idx == self._current and self._frame_meets_target(idx):
             self._apply_pixmap(idx, self._buffer[idx])
 
     def _playback_end_frame(self) -> int:
@@ -301,19 +436,22 @@ class SequenceDecodeBackend(QObject):
         self._playing = False
         self._pending_next = None
         self._tick_timer.stop()
-        if end in self._buffer:
+        if end in self._buffer and self._frame_meets_target(end):
             self._show_frame(end)
         self.playback_ended.emit()
 
     def _advance_to(self, nxt: int) -> None:
         if nxt < 0 or nxt >= self._n:
             return
-        if nxt in self._buffer:
+        if self._frame_meets_target(nxt):
             self._pending_next = None
             self._show_frame(nxt)
             self._prefetch_from(nxt)
             self._prefetch_loop_head_if_near_end(nxt)
             return
+        if nxt in self._buffer:
+            del self._buffer[nxt]
+            self._buffer_decode_side.pop(nxt, None)
         self._pending_next = nxt
         if nxt != self._current:
             self._current = nxt
@@ -333,7 +471,7 @@ class SequenceDecodeBackend(QObject):
             self._request_decode(k)
 
     def _show_frame(self, idx: int) -> None:
-        if idx < 0 or idx >= self._n or idx not in self._buffer:
+        if idx < 0 or idx >= self._n or not self._frame_meets_target(idx):
             return
         self._current = idx
         self._apply_pixmap(idx, self._buffer[idx])
@@ -350,6 +488,7 @@ class SequenceDecodeBackend(QObject):
                     best_k = k
             if best_k is not None:
                 del self._buffer[best_k]
+                self._buffer_decode_side.pop(best_k, None)
             else:
                 break
 
@@ -361,19 +500,20 @@ class SequenceDecodeBackend(QObject):
         self._label_full_pix = pix
         if pix.isNull():
             return
-        lw = max(1, self._label.width())
-        lh = max(1, self._label.height())
-        key = (idx, lw, lh)
+        lw, lh = self._display_logical_size()
+        pix_side = max(pix.width(), pix.height())
+        decode_tag = self._buffer_decode_side.get(idx, 0)
+        key = (idx, lw, lh, pix_side, decode_tag)
         cached = self._scaled_cache.get(key)
         if cached is not None and not cached.isNull():
             self._label.setPixmap(cached)
             return
-        mode = (
-            Qt.TransformationMode.FastTransformation
-            if self._playing
-            else Qt.TransformationMode.SmoothTransformation
+        scaled = pix.scaled(
+            lw,
+            lh,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
-        scaled = pix.scaled(lw, lh, Qt.AspectRatioMode.KeepAspectRatio, mode)
         if scaled.isNull():
             return
         self._scaled_cache[key] = scaled

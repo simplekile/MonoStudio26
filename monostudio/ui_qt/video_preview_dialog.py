@@ -115,7 +115,8 @@ from monostudio.core.video_media import (
     validate_range,
 )
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
-from monostudio.ui_qt.inspector_preview_settings import write_sequence_preview_fps
+from monostudio.ui_qt.video_player_settings_dialog import VideoPlayerSettingsDialog
+from monostudio.ui_qt.inspector_preview_settings import read_sequence_preview_fps, write_sequence_preview_fps
 from monostudio.ui_qt.review_draw_overlay import ReviewDrawOverlay
 from monostudio.ui_qt.review_onion_layer import ReviewOnionLayer
 from monostudio.ui_qt.video_review_draw_panel import VideoReviewDrawTransportActions
@@ -188,6 +189,8 @@ from monostudio.ui_qt.video_preview_settings import (
     read_video_preview_always_on_top,
     read_video_preview_playback_speed,
     read_video_preview_precise_scrub_drag,
+    read_video_preview_proxy_enabled,
+    read_video_preview_proxy_scale,
     read_video_preview_time_display,
     read_video_preview_volume,
     write_review_note_rail_open,
@@ -313,7 +316,8 @@ class _VideoPreviewTopBar(QWidget):
     minimize_clicked = Signal()
     maximize_clicked = Signal()
     close_clicked = Signal()
-    open_in_openrv_clicked = Signal()
+    open_in_djv_clicked = Signal()
+    video_player_settings_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -382,9 +386,11 @@ class _VideoPreviewTopBar(QWidget):
         self._ctx_act_always_on_top = QAction("Always on top", self)
         self._ctx_act_always_on_top.setCheckable(True)
         self._ctx_act_always_on_top.toggled.connect(self._on_ctx_always_on_top_toggled)
-        self._ctx_act_open_rv = QAction("Open in OpenRV…", self)
-        self._ctx_act_open_rv.triggered.connect(self.open_in_openrv_clicked.emit)
-        self._openrv_available = False
+        self._ctx_act_open_djv = QAction("Open in DJV…", self)
+        self._ctx_act_open_djv.triggered.connect(self.open_in_djv_clicked.emit)
+        self._ctx_act_player_settings = QAction("Video player settings…", self)
+        self._ctx_act_player_settings.triggered.connect(self.video_player_settings_requested.emit)
+        self._djv_available = False
         self._drag_start_pos: QPoint | None = None
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
@@ -401,9 +407,9 @@ class _VideoPreviewTopBar(QWidget):
         else:
             self._btn_max.setIcon(lucide_icon("square", size=24, color_hex=_c))
 
-    def set_openrv_available(self, available: bool) -> None:
-        self._openrv_available = bool(available)
-        self._ctx_act_open_rv.setEnabled(self._openrv_available)
+    def set_djv_available(self, available: bool) -> None:
+        self._djv_available = bool(available)
+        self._ctx_act_open_djv.setEnabled(self._djv_available)
 
     def _on_ctx_always_on_top_toggled(self, checked: bool) -> None:
         self.always_on_top_toggled.emit(checked)
@@ -413,9 +419,11 @@ class _VideoPreviewTopBar(QWidget):
             return
         menu = MonosMenu(self)
         menu.addAction(self._ctx_act_always_on_top)
-        if self._openrv_available:
+        menu.addSeparator()
+        menu.addAction(self._ctx_act_player_settings)
+        if self._djv_available:
             menu.addSeparator()
-            menu.addAction(self._ctx_act_open_rv)
+            menu.addAction(self._ctx_act_open_djv)
         menu.exec(self.mapToGlobal(pos))
 
     def _is_on_window_buttons(self, pos: QPoint) -> bool:
@@ -787,7 +795,8 @@ class VideoPreviewDialog(FramelessMainWindow):
     closed = Signal()
     export_completed = Signal(object)  # list[Path]
     open_all_notes_requested = Signal()
-    open_in_openrv_requested = Signal()
+    open_in_djv_requested = Signal()
+    player_settings_saved = Signal()
     notes_changed = Signal()
 
     def __init__(
@@ -907,8 +916,8 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._range_redo_stack: list[_RangeEditSnapshot] = []
         self._applying_range_undo = False
         self._loop_playback = read_video_preview_loop(settings)
-        self._proxy_enabled = False
-        self._proxy_scale = PROXY_SCALE_FULL
+        self._proxy_enabled = read_video_preview_proxy_enabled(settings)
+        self._proxy_scale = read_video_preview_proxy_scale(settings)
         self._proxy_mode: Literal["off", "full", "range"] = "off"
         self._full_proxy_ready = False
         self._full_proxy_manifest: ProxyManifest | None = None
@@ -1127,10 +1136,11 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._top_bar.minimize_clicked.connect(self.showMinimized)
         self._top_bar.maximize_clicked.connect(self._toggle_maximize)
         self._top_bar.close_clicked.connect(self.close)
-        from monostudio.core.openrv_launch import is_openrv_available
+        from monostudio.core.djv_launch import is_djv_available
 
-        self._top_bar.set_openrv_available(is_openrv_available(self._settings))
-        self._top_bar.open_in_openrv_clicked.connect(self.open_in_openrv_requested.emit)
+        self._top_bar.set_djv_available(is_djv_available(self._settings))
+        self._top_bar.open_in_djv_clicked.connect(self.open_in_djv_requested.emit)
+        self._top_bar.video_player_settings_requested.connect(self._open_video_player_settings)
         self._btn_close = self._top_bar.close_btn
         self._root_layout.addWidget(self._top_bar, 0)
         self._review_switch_popup: VideoReviewSwitchPopup | None = None
@@ -1422,6 +1432,10 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._fps_label.hide()
         self._fps_spin.hide()
 
+        self._btn_player_settings = self._tool_btn("settings", "Video player settings…", compact=True)
+        self._btn_player_settings.clicked.connect(self._open_video_player_settings)
+        tlay.addWidget(self._btn_player_settings)
+
         self._chk_proxy = QCheckBox("Proxy", self._transport)
         self._chk_proxy.setObjectName("VideoPreviewProxyCheck")
         self._chk_proxy.setToolTip(
@@ -1548,6 +1562,7 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._chk_proxy,
             self._cmb_proxy_scale,
             self._btn_proxy_menu,
+            self._btn_player_settings,
             self._cmb_time_display,
             self._btn_in,
             self._btn_out,
@@ -1708,7 +1723,6 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._btn_sync,
             self._chk_precise_scrub,
             self._btn_proxy_menu,
-            self._cmb_proxy_scale,
             self._cmb_time_display,
             self._btn_add,
             self._btn_add_marker,
@@ -2033,7 +2047,6 @@ class VideoPreviewDialog(FramelessMainWindow):
         seq = self._is_sequence_mode()
         for w in (
             self._chk_proxy,
-            self._cmb_proxy_scale,
             self._btn_proxy_menu,
             self._chk_precise_scrub,
             self._speed_icon,
@@ -2044,6 +2057,15 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._btn_next_file,
         ):
             w.setVisible(not seq)
+        self._cmb_proxy_scale.setVisible(True)
+        if seq:
+            self._cmb_proxy_scale.setToolTip(
+                "Preview decode resolution — lower is faster for heavy EXR/DPX sequences"
+            )
+        else:
+            self._cmb_proxy_scale.setToolTip("Proxy resolution scale")
+        self._btn_player_settings.setVisible(True)
+        self._cmb_proxy_scale.setEnabled(True)
         self._fps_label.setVisible(seq)
         self._fps_spin.setVisible(seq)
         self._sync_switch_btn_visible()
@@ -2207,6 +2229,10 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._sequence_frames = frames
         n = len(frames)
         fps = max(1, min(60, int(request.fps)))
+        self._set_sequence_video_info(frames, fps)
+        if not self._geometry_restored_from_settings:
+            self._fit_dialog_to_current_media()
+        self._apply_viewer_plate_geometry()
         self._fps_spin.blockSignals(True)
         self._fps_spin.setValue(fps)
         self._fps_spin.blockSignals(False)
@@ -2227,23 +2253,50 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._scrubber.set_frame_count(total, refit_view=True)
         self._scrubber.clear_overlap_cycle()
         self._seq_backend = SequenceDecodeBackend(frames, fps=fps, parent=self)
+        self._seq_backend.set_preview_scale(self._proxy_scale)
         self._seq_backend.frame_changed.connect(self._on_seq_frame_changed)
         self._seq_backend.playback_ended.connect(self._on_seq_playback_ended)
         self._attach_sequence_display()
         self._sync_sequence_playback_loop()
-        self._seek_frame(0)
         self._show_media_loading(False)
+        QTimer.singleShot(0, self._finalize_sequence_viewport)
         if self._work_path is not None and folder is not None:
             from monostudio.core.review_media import _sequence_source_label_for_folder
 
             self._source_label = _sequence_source_label_for_folder(self._work_path, folder, n)
         self._update_top_bar()
         self._update_footer()
-        QTimer.singleShot(0, self._apply_media_geometry_when_ready)
         QTimer.singleShot(
             0,
             lambda t=token, r=request, f=frames: self._complete_sequence_metadata(r, f, t),
         )
+
+    def _finalize_sequence_viewport(self) -> None:
+        if not self._is_sequence_mode() or self._seq_backend is None:
+            return
+        if not self._geometry_restored_from_settings:
+            self._fit_dialog_to_current_media()
+        QTimer.singleShot(0, self._prime_sequence_after_layout)
+
+    def _prime_sequence_after_layout(self) -> None:
+        if not self._is_sequence_mode() or self._seq_backend is None:
+            return
+        self._apply_viewer_plate_geometry()
+        self._sync_sequence_viewport_to_backend(reprime=True)
+        self._seek_frame(0)
+
+    def _sync_sequence_viewport_to_backend(self, *, reprime: bool = False) -> None:
+        if not self._is_sequence_mode() or self._seq_backend is None:
+            return
+        rect = self._viewer_surface_geometry()
+        if rect.isEmpty():
+            return
+        dpr = max(1.0, float(self._surface.devicePixelRatioF()))
+        self._seq_backend.set_viewport_size(rect.width(), rect.height(), dpr)
+        if reprime:
+            self._seq_backend.prime_display()
+        else:
+            self._seq_backend.resize_display()
 
     def _complete_sequence_metadata(
         self,
@@ -2295,6 +2348,68 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._update_note_frame_hint()
         self._sync_transport_tool_controls()
         self._sync_scrubber_timeline_display()
+
+    def _open_video_player_settings(self) -> None:
+        if self._settings is None:
+            return
+        dialog = VideoPlayerSettingsDialog(
+            self._settings,
+            self,
+            sequence_mode=self._is_sequence_mode(),
+        )
+        dialog.settings_saved.connect(self._reload_player_settings_from_store)
+        dialog.exec()
+
+    def _reload_player_settings_from_store(self) -> None:
+        if self._settings is None:
+            return
+        mode = read_video_preview_time_display(self._settings)
+        if mode != self._time_display_mode:
+            for i in range(self._cmb_time_display.count()):
+                if self._cmb_time_display.itemData(i) == mode:
+                    self._cmb_time_display.setCurrentIndex(i)
+                    break
+
+        loop = read_video_preview_loop(self._settings)
+        self._loop_playback = loop
+        self._chk_loop.blockSignals(True)
+        self._chk_loop.setChecked(loop)
+        self._chk_loop.blockSignals(False)
+        self._sync_sequence_playback_loop()
+
+        precise = read_video_preview_precise_scrub_drag(self._settings)
+        self._chk_precise_scrub.blockSignals(True)
+        self._chk_precise_scrub.setChecked(precise)
+        self._chk_precise_scrub.blockSignals(False)
+        if precise:
+            self._update_scrub_seek_interval()
+
+        scale = read_video_preview_proxy_scale(self._settings)
+        self._proxy_scale = scale
+        for i in range(self._cmb_proxy_scale.count()):
+            if self._cmb_proxy_scale.itemData(i) == scale:
+                self._cmb_proxy_scale.blockSignals(True)
+                self._cmb_proxy_scale.setCurrentIndex(i)
+                self._cmb_proxy_scale.blockSignals(False)
+                break
+
+        if self._is_sequence_mode():
+            if self._seq_backend is not None:
+                self._seq_backend.set_preview_scale(scale)
+                self._seq_backend.invalidate_frame_cache()
+            fps = read_sequence_preview_fps(self._settings)
+            self._fps_spin.blockSignals(True)
+            self._fps_spin.setValue(fps)
+            self._fps_spin.blockSignals(False)
+            self._on_sequence_fps_changed(fps)
+        else:
+            self._proxy_enabled = read_video_preview_proxy_enabled(self._settings)
+            self._chk_proxy.blockSignals(True)
+            self._chk_proxy.setChecked(self._proxy_enabled)
+            self._chk_proxy.blockSignals(False)
+            self._sync_proxy_state()
+
+        self.player_settings_saved.emit()
 
     def _on_sequence_fps_changed(self, value: int) -> None:
         if not self._is_sequence_mode() or self._seq_backend is None:
@@ -2582,6 +2697,8 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._sync_viewer_viewport_transform()
             if self._hud is not None:
                 self._position_hud()
+            if self._is_sequence_mode() and self._seq_backend is not None:
+                self._sync_sequence_viewport_to_backend()
             return
         self._viewer_plate_geom_guard = True
         try:
@@ -2594,7 +2711,7 @@ class VideoPreviewDialog(FramelessMainWindow):
             host = self._viewer_wrap_content_rect()
             host_size = QSize(host.width(), host.height())
             if self._is_sequence_mode() and self._seq_backend is not None:
-                self._seq_backend.resize_display()
+                self._sync_sequence_viewport_to_backend()
             elif self._video_attached and host_size != self._viewer_last_host_size:
                 self._viewer_last_host_size = host_size
                 self._backend.layout_video()
@@ -4451,11 +4568,39 @@ class VideoPreviewDialog(FramelessMainWindow):
         if self._info is not None and self._info.width > 0 and self._info.height > 0:
             return QSize(self._info.width, self._info.height)
         if self._sequence_frames:
-            reader = QImageReader(str(self._sequence_frames[0]))
-            size = reader.size()
-            if size.isValid() and size.width() > 0 and size.height() > 0:
-                return size
+            from monostudio.ui_qt.sequence_preview_decode import probe_preview_image_dimensions
+
+            dims = probe_preview_image_dimensions(self._sequence_frames[0])
+            if dims is not None:
+                return QSize(dims[0], dims[1])
         return None
+
+    def _set_sequence_video_info(self, frames: list[Path], fps: int) -> None:
+        from monostudio.ui_qt.sequence_preview_decode import probe_preview_image_dimensions
+
+        if not frames:
+            self._info = None
+            return
+        dims = probe_preview_image_dimensions(frames[0])
+        if dims is None:
+            self._info = None
+            return
+        w, h = dims
+        n = max(1, len(frames))
+        fp = float(max(1, min(60, int(fps))))
+        self._info = VideoInfo(
+            path=frames[0],
+            duration_sec=n / fp,
+            fps=fp,
+            width=w,
+            height=h,
+            frame_count=n,
+            video_codec="sequence",
+            has_audio=False,
+        )
+
+    def _refresh_sequence_display_resolution(self) -> None:
+        self._sync_sequence_viewport_to_backend(reprime=True)
 
     def _update_window_size_limits(self, bounds: QRect | None = None) -> None:
         media = self._media_pixel_size()
@@ -4637,8 +4782,8 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._resize_chrome_timer.start()
 
     def _flush_resize_chrome_layout(self) -> None:
-        if self._is_sequence_mode() and self._seq_backend is not None:
-            self._seq_backend.resize_display()
+        if self._is_sequence_mode():
+            self._apply_viewer_plate_geometry()
         elif self._video_attached:
             self._backend.layout_video()
         self._position_hud(schedule_stack=True)
@@ -7116,6 +7261,9 @@ class VideoPreviewDialog(FramelessMainWindow):
         return False
 
     def _sync_proxy_state(self) -> None:
+        if self._is_sequence_mode():
+            self._cmb_proxy_scale.setEnabled(True)
+            return
         self._cmb_proxy_scale.setEnabled(self._proxy_enabled)
         self._btn_proxy_menu.setEnabled(self._path is not None)
         if not self._proxy_enabled or self._path is None or self._info is None:
@@ -7189,6 +7337,10 @@ class VideoPreviewDialog(FramelessMainWindow):
         if scale is None:
             return
         self._proxy_scale = float(scale)
+        if self._is_sequence_mode():
+            if self._seq_backend is not None:
+                self._seq_backend.set_preview_scale(self._proxy_scale)
+            return
         if self._proxy_enabled:
             self._sync_proxy_state()
 

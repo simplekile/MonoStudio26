@@ -610,6 +610,16 @@ class _InboxTreeDelegate(QStyledItemDelegate):
             hl_rect = QRect(0, row_rect.y(), full_w, row_rect.height())
             paint_explorer_drop_target_highlight(painter, hl_rect)
 
+        if path is not None:
+            from monostudio.ui_qt.link_reveal import link_reveal, paint_link_reveal_row_overlay
+
+            lr = link_reveal()
+            alpha = lr.alpha_for_path(path) if lr.current_alpha() > 0.01 else 0.0
+            if alpha > 0:
+                full_w = max(int(view.viewport().width()), row_rect.width())
+                hl_rect = QRect(0, row_rect.y(), full_w, row_rect.height())
+                paint_link_reveal_row_overlay(painter, hl_rect, alpha)
+
 
 def _inbox_outbox_type_label(source_type: str) -> str:
     t = (source_type or "").strip()
@@ -1253,6 +1263,13 @@ class _InboxFileGridDelegate(QStyledItemDelegate):
                 radius=_FILE_CARD_RADIUS,
                 width=border_px,
             )
+            if path is not None:
+                from monostudio.ui_qt.link_reveal import link_reveal, paint_link_reveal_card_border
+
+                lr = link_reveal()
+                alpha = lr.alpha_for_path(path) if lr.current_alpha() > 0.01 else 0.0
+                if alpha > 0:
+                    paint_link_reveal_card_border(p, outer, alpha, radius=_FILE_CARD_RADIUS)
         finally:
             p.restore()
 
@@ -1371,6 +1388,7 @@ class InboxTreePane(QWidget):
     external_drop_requested = Signal(object, object, bool)  # list[Path], target folder, copy_only
     video_preview_requested = Signal(object)  # Path
     send_to_delivery_requested = Signal(object)  # list[Path]
+    copy_link_requested = Signal(str, object)  # page name, Path
 
     def __init__(
         self,
@@ -1431,7 +1449,9 @@ class InboxTreePane(QWidget):
 
         if show_toolbar:
             self._content_toolbar = InboxContentToolbar(self)
+            self._content_toolbar.set_sort_settings_key(f"{view_settings_key}/sort")
             self._content_toolbar.view_mode_changed.connect(self._on_view_mode_changed)
+            self._content_toolbar.sort_changed.connect(self._on_explorer_sort_changed)
         else:
             self._content_toolbar = None
 
@@ -1564,6 +1584,9 @@ class InboxTreePane(QWidget):
 
         self._tree.installEventFilter(self)
         self._tree.viewport().installEventFilter(self)
+        from monostudio.ui_qt.link_reveal import link_reveal
+
+        link_reveal().changed.connect(self._on_link_reveal_tick)
         self._middle_drag = MiddleMouseDragTracker()
         self._tree_delegate.set_pane(self)
         self._explorer_drop = ExplorerDropZone(
@@ -1666,7 +1689,24 @@ class InboxTreePane(QWidget):
         )
 
     def _file_entries_for_browse_root(self, root: Path) -> list[_InboxFileEntry]:
-        return _collect_inbox_file_entries(root)
+        return self._sorted_file_entries(_collect_inbox_file_entries(root))
+
+    def _sorted_file_entries(self, entries: list[_InboxFileEntry]) -> list[_InboxFileEntry]:
+        toolbar = self._content_toolbar
+        if toolbar is None:
+            return entries
+        from monostudio.ui_qt.explorer_file_sort import sort_explorer_file_entries
+
+        return list(
+            sort_explorer_file_entries(
+                entries,
+                field=toolbar.sort_field(),
+                ascending=toolbar.sort_ascending(),
+            )
+        )
+
+    def _on_explorer_sort_changed(self, _field: str, _ascending: bool) -> None:
+        self._reload_file_entries()
 
     def _apply_browse_root(self, path: Path) -> None:
         self._grid_browse_root = Path(path)
@@ -1916,6 +1956,20 @@ class InboxTreePane(QWidget):
         targets = self._context_menu_targets(path)
 
         if path is None:
+            sort_section = None
+            if self._show_toolbar and self._content_toolbar is not None:
+                from monostudio.ui_qt.explorer_file_sort import (
+                    add_explorer_sort_submenu,
+                    resolve_explorer_sort_action,
+                )
+
+                sort_section = add_explorer_sort_submenu(
+                    menu,
+                    field=self._content_toolbar.sort_field(),
+                    ascending=self._content_toolbar.sort_ascending(),
+                    sort_icon=icon("sliders-horizontal"),
+                )
+                menu.addSeparator()
             open_folder_act = menu.addAction(icon("folder-open"), "Open folder")
             import_act = menu.addAction(icon("upload"), "Import")
             if self._show_history_action:
@@ -1926,6 +1980,17 @@ class InboxTreePane(QWidget):
             action = menu.exec(viewport.mapToGlobal(pos))
             if action is None:
                 return
+            if sort_section is not None and self._content_toolbar is not None:
+                resolved = resolve_explorer_sort_action(
+                    action,
+                    sort_section,
+                    field=self._content_toolbar.sort_field(),
+                    ascending=self._content_toolbar.sort_ascending(),
+                )
+                if resolved is not None:
+                    new_field, new_asc = resolved
+                    self._content_toolbar.apply_sort_choice(new_field, new_asc)
+                    return
             if action == open_folder_act:
                 target = self._grid_browse_root_path() if self._view_mode == "tile" else self._date_folder_path
                 self.open_folder_requested.emit(target)
@@ -1944,6 +2009,7 @@ class InboxTreePane(QWidget):
         if not multi:
             open_act = menu.addAction(icon("file"), "Open")
             open_folder_act = menu.addAction(icon("folder-open"), "Open folder")
+        copy_link_act = menu.addAction(icon("link"), "Copy MONOS Link")
         rename_act = None
         if not multi and tree_index is not None:
             rename_act = menu.addAction(icon("copy"), "Rename")
@@ -1994,6 +2060,8 @@ class InboxTreePane(QWidget):
             self._tree_open_path(path)
         elif action == open_folder_act:
             self._tree_open_folder(path)
+        elif action == copy_link_act and path is not None:
+            self.copy_link_requested.emit(self._page_name_for_copy_link(), path)
         elif action == rename_act and tree_index is not None:
             self._tree.edit(tree_index)
         elif action == send_delivery_act:
@@ -2004,6 +2072,16 @@ class InboxTreePane(QWidget):
             self.import_requested.emit()
         elif action == history_act and self._show_history_action:
             self.history_requested.emit()
+
+    def _page_name_for_copy_link(self) -> str:
+        if isinstance(self, ProjectGuideTreePane):
+            return "Project Guide"
+        mode = getattr(self, "_selection_hint_mode", "inbox")
+        if mode == "delivery":
+            return "Delivery"
+        if mode == "internal_check":
+            return "Internal check"
+        return "Inbox"
 
     def _tree_open_path(self, path: Path) -> None:
         """Open file with default app or folder in explorer."""
@@ -2561,6 +2639,43 @@ class InboxTreePane(QWidget):
                     return True
         return super().eventFilter(obj, event)
 
+    def _on_link_reveal_tick(self) -> None:
+        from monostudio.ui_qt.link_reveal import link_reveal
+
+        if not self.isVisible():
+            return
+        lr = link_reveal()
+        if not lr.is_active():
+            return
+        path = lr.any_active_path()
+        if path is None:
+            return
+        path = Path(path)
+        if self._show_toolbar and self._view_mode == "tile" and self._file_grid is not None and self._file_model is not None:
+            for row in range(self._file_model.rowCount()):
+                entry = self._file_model.entry_at(row)
+                if entry is None:
+                    continue
+                try:
+                    matches = entry.path.resolve() == path.resolve()
+                except OSError:
+                    matches = entry.path == path
+                if not matches:
+                    continue
+                idx = self._file_model.index(row, 0)
+                if idx.isValid():
+                    self._file_grid.viewport().update(self._file_grid.visualRect(idx))
+                return
+        try:
+            src_idx = self._fs_model.index(str(path.resolve()), 0)
+        except OSError:
+            src_idx = self._fs_model.index(str(path), 0)
+        if not src_idx.isValid():
+            return
+        tree_idx = self._to_tree_index(src_idx)
+        if tree_idx.isValid():
+            self._tree.viewport().update(self._tree.visualRect(tree_idx))
+
     def date_folder_path(self) -> Path:
         return self._date_folder_path
 
@@ -2571,6 +2686,37 @@ class InboxTreePane(QWidget):
         self._reload_fs_tree_root()
         self._reload_file_entries()
         QTimer.singleShot(0, self._sync_empty_overlay)
+
+    def refresh_content_responsive(self, worker_manager, *, on_pump=None) -> None:
+        """Reload explorer content; scan file grid on a worker while the UI event loop keeps running."""
+        from monostudio.ui_qt.ui_worker_loop import run_worker_blocking_ui
+
+        if on_pump is not None:
+            on_pump()
+        self._reload_fs_tree_root()
+        if on_pump is not None:
+            on_pump()
+        self._reload_file_entries_responsive(worker_manager, run_worker_blocking_ui, on_pump=on_pump)
+        QTimer.singleShot(0, self._sync_empty_overlay)
+
+    def _reload_file_entries_responsive(self, worker_manager, run_blocking_ui, *, on_pump=None) -> None:
+        if self._file_model is None:
+            return
+        root = self._grid_browse_root_path()
+        entries, error = run_blocking_ui(
+            worker_manager,
+            f"explorer_entries_{id(self)}",
+            lambda: self._file_entries_for_browse_root(root),
+            on_pump=on_pump,
+        )
+        if error:
+            _log_ref.warning("explorer file entries failed: %s", error)
+            entries = []
+        self._file_model.set_entries(entries or [])
+        self._sync_content_toolbar()
+        if self._view_mode == "tile":
+            self._grid_last = None
+            self._schedule_file_grid_sync()
 
     def select_dropped_paths(self, paths: list[Path]) -> None:
         """Reveal and multi-select items in the tree after a drop (deferred until model reload)."""
@@ -2700,7 +2846,7 @@ class InboxTreePane(QWidget):
             self._file_grid.scrollTo(first_idx)
         return unresolved
 
-    def reveal_path(self, path: Path) -> bool:
+    def reveal_path(self, path: Path, *, link_reveal: bool = False) -> bool:
         """Reveal a file or folder under the current date-folder scope."""
         path = Path(path)
         if not path.exists():
@@ -2709,42 +2855,49 @@ class InboxTreePane(QWidget):
             path.resolve().relative_to(self._date_folder_path.resolve())
         except (OSError, ValueError):
             return False
+        ok = False
         if path.is_dir():
             self.navigate_to_path(path)
-            return True
-        if self._show_toolbar and self._view_mode == "tile":
+            ok = True
+        elif self._show_toolbar and self._view_mode == "tile":
             unresolved = self._select_dropped_paths_in_grid([path], navigate=True)
-            return path not in unresolved
-        parent = path.parent
-        parent_src = self._fs_model.index(str(parent.resolve()), 0) if parent.is_dir() else QModelIndex()
-        if not parent_src.isValid():
-            return False
-        file_src = self._fs_model.index(str(path.resolve()), 0)
-        if not file_src.isValid():
-            return False
-        file_idx = self._to_tree_index(file_src)
-        if not file_idx.isValid():
-            return False
-        parent_src = file_src.parent()
-        while parent_src.isValid():
-            parent_tree = self._to_tree_index(parent_src)
-            if parent_tree == self._tree.rootIndex():
-                break
-            if parent_tree.isValid():
-                self._tree.expand(parent_tree)
-            parent_src = parent_src.parent()
-        self._tree.scrollTo(file_idx)
-        sm = self._tree.selectionModel()
-        if sm is not None:
-            from PySide6.QtCore import QItemSelectionModel
+            ok = path not in unresolved
+        else:
+            parent = path.parent
+            parent_src = self._fs_model.index(str(parent.resolve()), 0) if parent.is_dir() else QModelIndex()
+            if not parent_src.isValid():
+                return False
+            file_src = self._fs_model.index(str(path.resolve()), 0)
+            if not file_src.isValid():
+                return False
+            file_idx = self._to_tree_index(file_src)
+            if not file_idx.isValid():
+                return False
+            parent_src = file_src.parent()
+            while parent_src.isValid():
+                parent_tree = self._to_tree_index(parent_src)
+                if parent_tree == self._tree.rootIndex():
+                    break
+                if parent_tree.isValid():
+                    self._tree.expand(parent_tree)
+                parent_src = parent_src.parent()
+            self._tree.scrollTo(file_idx)
+            sm = self._tree.selectionModel()
+            if sm is not None:
+                from PySide6.QtCore import QItemSelectionModel
 
-            sm.setCurrentIndex(
-                file_idx,
-                QItemSelectionModel.SelectionFlag.ClearAndSelect
-                | QItemSelectionModel.SelectionFlag.Rows,
-            )
-        self._on_tree_selection_changed()
-        return True
+                sm.setCurrentIndex(
+                    file_idx,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            self._on_tree_selection_changed()
+            ok = True
+        if ok and link_reveal:
+            from monostudio.ui_qt.link_reveal import link_reveal as lr
+
+            lr().reveal_path(path)
+        return ok
 
     def navigate_to_path(self, path: Path) -> None:
         """Reveal and select a folder inside the current source tree."""
@@ -3029,6 +3182,37 @@ class ProjectGuideTreePane(InboxTreePane):
         self._sync_tree_to_browse_root()
         QTimer.singleShot(0, self._sync_empty_overlay)
 
+    def refresh_content_responsive(self, worker_manager, *, on_pump=None) -> None:
+        from monostudio.ui_qt.ui_worker_loop import run_worker_blocking_ui
+
+        proxy = getattr(self, "_tag_proxy", None)
+        if proxy is None:
+            super().refresh_content_responsive(worker_manager, on_pump=on_pump)
+            return
+        if on_pump is not None:
+            on_pump()
+        root = self._date_folder_path
+        proxy.set_tree_root_path(root)
+        if root and root.is_dir():
+            root_str = str(root.resolve())
+            self._fs_model.setRootPath("")
+            self._fs_model.setRootPath(root_str)
+            src = self._fs_model.index(root_str)
+            if src.isValid():
+                proxy_idx = proxy.mapFromSource(src)
+                if proxy_idx.isValid():
+                    self._tree.setRootIndex(proxy_idx)
+        else:
+            self._fs_model.setRootPath("")
+            empty = proxy.mapFromSource(self._fs_model.index(""))
+            if empty.isValid():
+                self._tree.setRootIndex(empty)
+        if on_pump is not None:
+            on_pump()
+        self._reload_file_entries_responsive(worker_manager, run_worker_blocking_ui, on_pump=on_pump)
+        self._sync_tree_to_browse_root()
+        QTimer.singleShot(0, self._sync_empty_overlay)
+
     def _sync_empty_overlay(self) -> None:
         if self._tag_proxy is not None and self._tag_proxy._active_tags:
             self._sync_empty_tag_overlay()
@@ -3093,11 +3277,13 @@ class ProjectGuideTreePane(InboxTreePane):
 
     def _file_entries_for_browse_root(self, root: Path) -> list[_InboxFileEntry]:
         if not self._tag_proxy or not self._tag_proxy._active_tags or not self._pg_guide_root:
-            return _collect_inbox_file_entries(root)
+            return self._sorted_file_entries(_collect_inbox_file_entries(root))
         tagged = self._tag_proxy._tagged_paths if self._tag_proxy else set()
         if not tagged:
             return []
-        return _collect_tag_filtered_file_entries(root, self._pg_guide_root, tagged)
+        return self._sorted_file_entries(
+            _collect_tag_filtered_file_entries(root, self._pg_guide_root, tagged)
+        )
 
     def set_tag_data(self, item_tags: dict[str, list[str]]) -> None:
         self._item_tags = item_tags

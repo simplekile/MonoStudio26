@@ -59,6 +59,22 @@ def ensure_internal_check_root(project_root: Path) -> None:
     get_internal_check_root(project_root).mkdir(parents=True, exist_ok=True)
 
 
+def resolve_internal_check_location(project_root: Path, path: Path) -> Path | None:
+    """Return date-folder path for an internal-check item (internal_check/<date>/…)."""
+    root = get_internal_check_root(project_root)
+    try:
+        rel = Path(path).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    parts = rel.parts
+    if not parts:
+        return None
+    date_folder = (root / parts[0]).resolve()
+    if not date_folder.is_dir():
+        return None
+    return date_folder
+
+
 def _meta_path(project_root: Path) -> Path:
     return Path(project_root) / ".monostudio" / INTERNAL_CHECK_META_FILENAME
 

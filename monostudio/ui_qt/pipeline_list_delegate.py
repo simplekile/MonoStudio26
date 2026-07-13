@@ -242,6 +242,14 @@ class PipelineListRowDelegate(QStyledItemDelegate):
                 c = QColor(MONOS_COLORS["amber_400"])
                 c.setAlphaF(0.7)
                 painter.fillRect(option.rect.left(), option.rect.top(), 2, option.rect.height(), c)
+
+            if getattr(item, "path", None):
+                from monostudio.ui_qt.link_reveal import link_reveal, paint_link_reveal_row_overlay
+
+                lr = link_reveal()
+                alpha = lr.alpha_for_path(item.path) if lr.current_alpha() > 0.01 else 0.0
+                if alpha > 0:
+                    paint_link_reveal_row_overlay(painter, option.rect, alpha)
         finally:
             painter.restore()
 

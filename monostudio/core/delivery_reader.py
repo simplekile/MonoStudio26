@@ -74,6 +74,46 @@ def _infer_source_from_relative_path(relative_path: str) -> str | None:
     return None
 
 
+def infer_delivery_source_from_path(project_root: Path, path: Path) -> str | None:
+    """Infer client/freelancer from delivery/<source>/… path or meta."""
+    root = get_delivery_root(project_root)
+    try:
+        rel = Path(path).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    rel_str = rel.as_posix()
+    from_path = _infer_source_from_relative_path(rel_str)
+    if from_path in ("client", "freelancer"):
+        return from_path
+    meta = read_delivery_meta(project_root)
+    entry = meta.get(rel_str) if isinstance(meta.get(rel_str), dict) else None
+    if entry is not None:
+        source = (entry.get(META_KEY_SOURCE) or "").strip().lower()
+        if source in ("client", "freelancer"):
+            return source
+    return None
+
+
+def resolve_delivery_location(project_root: Path, path: Path) -> Path | None:
+    """Return date-folder path for a delivery item (delivery/<source>/<date>/…)."""
+    root = get_delivery_root(project_root)
+    try:
+        rel = Path(path).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    parts = rel.parts
+    if not parts:
+        return None
+    first = parts[0].lower()
+    if first in ("client", "freelancer") and len(parts) >= 2:
+        date_folder = (root / parts[0] / parts[1]).resolve()
+    else:
+        date_folder = (root / parts[0]).resolve()
+    if not date_folder.is_dir():
+        return None
+    return date_folder
+
+
 def _build_delivery_item(
     full_path: Path,
     delivery_root: Path,

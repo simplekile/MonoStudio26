@@ -39,6 +39,18 @@ _SEQUENCE_SUFFIXES = frozenset({
 })
 
 
+def path_matches_sequence_ignore_tokens(
+    path: Path | str,
+    ignore_name_tokens: Iterable[str] | None,
+) -> bool:
+    """True when filename contains any ignore token (case-insensitive substring)."""
+    ign_tok = {str(s).strip().casefold() for s in (ignore_name_tokens or ()) if str(s).strip()}
+    if not ign_tok:
+        return False
+    name_cf = Path(path).name.casefold()
+    return any(t in name_cf for t in ign_tok)
+
+
 def _mtime_key_ns(p: Path) -> int:
     try:
         return int(p.stat().st_mtime_ns)
@@ -202,10 +214,8 @@ def list_sequence_frames(
                     continue
                 if ign_ext and suf in ign_ext:
                     continue
-                if ign_tok:
-                    name_cf = entry.name.casefold()
-                    if any(t in name_cf for t in ign_tok):
-                        continue
+                if ign_tok and path_matches_sequence_ignore_tokens(entry.name, ign_tok):
+                    continue
                 out.append(Path(entry.path))
     except OSError:
         return []
@@ -269,10 +279,8 @@ def quick_sequence_preview_frame(
                     continue
                 if ign_ext and suf in ign_ext:
                     continue
-                if ign_tok:
-                    name_cf = entry.name.casefold()
-                    if any(t in name_cf for t in ign_tok):
-                        continue
+                if ign_tok and path_matches_sequence_ignore_tokens(entry.name, ign_tok):
+                    continue
                 return Path(entry.path)
     except OSError:
         return None

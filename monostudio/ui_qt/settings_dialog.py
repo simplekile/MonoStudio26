@@ -97,21 +97,32 @@ from monostudio.ui_qt.inspector_preview_settings import (
     write_inspector_thumbnail_source,
     write_sequence_preview_fps,
 )
+from monostudio.ui_qt.ocio_preview_settings import (
+    DEFAULT_DISPLAY,
+    DEFAULT_INPUT_COLORSPACE,
+    DEFAULT_VIEW,
+    default_bundled_ocio_config_path,
+    resolve_ocio_config_path,
+    write_ocio_colorspace_triplet,
+    write_ocio_config_path,
+    write_ocio_sequence_enabled,
+)
+from monostudio.core.ocio_display import is_ocio_runtime_available, ocio_runtime_status
 from monostudio.ui_qt.video_preview_settings import (
     BACKEND_AUTO,
     BACKEND_EXTERNAL,
     BACKEND_MPV,
     BACKEND_QT,
     read_mpv_directory,
-    read_openrv_executable,
+    read_djv_executable,
     read_video_external_player_exe,
     read_video_player_backend,
     write_mpv_directory,
-    write_openrv_executable,
+    write_djv_executable,
     write_video_external_player_exe,
     write_video_player_backend,
 )
-from monostudio.core.openrv_launch import is_openrv_available, validate_openrv_executable
+from monostudio.core.djv_launch import is_djv_available, validate_djv_executable
 from monostudio.core.mpv_resolve import format_mpv_detect_status, resolve_mpv_dll
 from monostudio.core.mpv_install import (
     MPV_BUILDS_PAGE,
@@ -691,6 +702,7 @@ class SettingsDialog(MonosDialog):
     access_session_changed = Signal()
     nav_quick_slots_changed = Signal()
     hotkeys_changed = Signal()
+    preview_display_changed = Signal()
 
     def __init__(
         self,
@@ -743,7 +755,10 @@ class SettingsDialog(MonosDialog):
         self._publish_ignore_ext_field: QLineEdit | None = None
         self._inspector_thumb_segment_asset: SettingsSegmentedControl | None = None
         self._inspector_thumb_segment_shot: SettingsSegmentedControl | None = None
-        self._inspector_sequence_fps_spin: QSpinBox | None = None
+        self._video_sequence_fps_spin: QSpinBox | None = None
+        self._ocio_sequence_cb: QCheckBox | None = None
+        self._ocio_status_label: QLabel | None = None
+        self._ocio_config_field: QLineEdit | None = None
         self._inspector_thumb_open_exe_field: QLineEdit | None = None
 
         self._ffmpeg_pending_zip: Path | None = None
@@ -1073,22 +1088,22 @@ class SettingsDialog(MonosDialog):
 
     def _refresh_video_player_tab_status(self) -> None:
         """Deferred disk/path probes for General → Video player."""
-        openrv_helper = getattr(self, "_openrv_helper", None)
-        if openrv_helper is not None:
-            openrv_status = "not configured"
+        djv_helper = getattr(self, "_djv_helper", None)
+        if djv_helper is not None:
+            djv_status = "not configured"
             try:
-                if is_openrv_available(self._settings):
-                    openrv_status = "available"
-                elif getattr(self, "_openrv_exe_field", None) is not None and (
-                    self._openrv_exe_field.text() or ""
+                if is_djv_available(self._settings):
+                    djv_status = "available"
+                elif getattr(self, "_djv_exe_field", None) is not None and (
+                    self._djv_exe_field.text() or ""
                 ).strip():
-                    openrv_status = "path invalid"
+                    djv_status = "path invalid"
             except Exception:
                 pass
-            openrv_helper.setText(
-                "Pro review in OpenRV (sidecar). Install from github.com/AcademySoftwareFoundation/OpenRV "
-                "or point to rv.exe. MONOS in-app player remains the default. "
-                f"Detected: {openrv_status}"
+            djv_helper.setText(
+                "Pro review in DJV (sidecar). Install from github.com/grizzlypeak3d/DJV "
+                "or point to djv.exe. MONOS in-app player remains the default. "
+                f"Detected: {djv_status}"
             )
         mpv_helper = getattr(self, "_mpv_detect_helper", None)
         if mpv_helper is not None:
@@ -1339,17 +1354,6 @@ class SettingsDialog(MonosDialog):
             "Render path: work/render → preview → playblast → flipbook/<work name>/.",
         )
 
-        insp_l.addWidget(settings_divider(insp_card))
-
-        self._inspector_sequence_fps_spin = QSpinBox(insp_card)
-        self._inspector_sequence_fps_spin.setRange(1, 60)
-        style_settings_spin(self._inspector_sequence_fps_spin, width=72)
-        try:
-            self._inspector_sequence_fps_spin.setValue(read_sequence_preview_fps(self._settings))
-        except Exception:
-            self._inspector_sequence_fps_spin.setValue(30)
-        add_settings_field_row(insp_l, "Sequence playback FPS", self._inspector_sequence_fps_spin)
-
         add_settings_subsection_title(insp_l, "Open thumbnail with")
         thumb_app_row = QWidget(insp_card)
         thumb_app_row_l = QHBoxLayout(thumb_app_row)
@@ -1451,7 +1455,7 @@ class SettingsDialog(MonosDialog):
         return scroll
 
     def _build_video_player_tab(self) -> QWidget:
-        """General → Video player: embedded preview, OpenRV, proxy cache."""
+        """General → Video player: embedded preview, DJV, proxy cache."""
         scroll = QScrollArea()
         scroll.setObjectName("SettingsPageScroll")
         scroll.setWidgetResizable(True)
@@ -1466,7 +1470,7 @@ class SettingsDialog(MonosDialog):
         player_card, player_l = add_settings_section(
             inner,
             "Video preview",
-            "In-app playback (libmpv), external fallback, OpenRV sidecar, and review proxy cache.",
+            "In-app playback (libmpv), sequence plate color (OCIO), DJV sidecar, and review proxy cache.",
         )
 
         self._video_player_backend_combo = QComboBox(player_card)
@@ -1532,36 +1536,36 @@ class SettingsDialog(MonosDialog):
         vid_ext_row_l.addWidget(btn_vid_clear, 0)
         add_settings_field_row(player_l, "External player", vid_ext_row)
 
-        openrv_row = QWidget(player_card)
-        openrv_row_l = QHBoxLayout(openrv_row)
-        openrv_row_l.setContentsMargins(0, 0, 0, 0)
-        openrv_row_l.setSpacing(8)
-        self._openrv_exe_field = QLineEdit(openrv_row)
-        style_settings_line_edit(self._openrv_exe_field, min_width=200)
-        self._openrv_exe_field.setPlaceholderText("OpenRV rv.exe (optional sidecar)")
+        djv_row = QWidget(player_card)
+        djv_row_l = QHBoxLayout(djv_row)
+        djv_row_l.setContentsMargins(0, 0, 0, 0)
+        djv_row_l.setSpacing(8)
+        self._djv_exe_field = QLineEdit(djv_row)
+        style_settings_line_edit(self._djv_exe_field, min_width=200)
+        self._djv_exe_field.setPlaceholderText("DJV djv.exe (optional sidecar)")
         try:
-            self._openrv_exe_field.setText(read_openrv_executable(self._settings))
+            self._djv_exe_field.setText(read_djv_executable(self._settings))
         except Exception:
-            self._openrv_exe_field.setText("")
-        btn_openrv_browse = QPushButton("Browse…", openrv_row)
-        btn_openrv_browse.setObjectName("SettingsCategoryActionButton")
-        btn_openrv_browse.clicked.connect(self._browse_openrv_executable)
-        btn_openrv_clear = QPushButton("Clear", openrv_row)
-        btn_openrv_clear.setObjectName("SettingsCategoryActionButton")
-        btn_openrv_clear.clicked.connect(lambda: self._openrv_exe_field.setText(""))
-        openrv_row_l.addWidget(self._openrv_exe_field, 1)
-        openrv_row_l.addWidget(btn_openrv_browse, 0)
-        openrv_row_l.addWidget(btn_openrv_clear, 0)
-        add_settings_field_row(player_l, "OpenRV", openrv_row)
+            self._djv_exe_field.setText("")
+        btn_djv_browse = QPushButton("Browse…", djv_row)
+        btn_djv_browse.setObjectName("SettingsCategoryActionButton")
+        btn_djv_browse.clicked.connect(self._browse_djv_executable)
+        btn_djv_clear = QPushButton("Clear", djv_row)
+        btn_djv_clear.setObjectName("SettingsCategoryActionButton")
+        btn_djv_clear.clicked.connect(lambda: self._djv_exe_field.setText(""))
+        djv_row_l.addWidget(self._djv_exe_field, 1)
+        djv_row_l.addWidget(btn_djv_browse, 0)
+        djv_row_l.addWidget(btn_djv_clear, 0)
+        add_settings_field_row(player_l, "DJV", djv_row)
 
-        self._openrv_helper = QLabel(
-            "Pro review in OpenRV (sidecar). Install from github.com/AcademySoftwareFoundation/OpenRV "
-            "or point to rv.exe. MONOS in-app player remains the default. Detected: …",
+        self._djv_helper = QLabel(
+            "Pro review in DJV (sidecar). Install from github.com/grizzlypeak3d/DJV "
+            "or point to djv.exe. MONOS in-app player remains the default. Detected: …",
             player_card,
         )
-        self._openrv_helper.setWordWrap(True)
-        self._openrv_helper.setObjectName("DialogHelper")
-        player_l.addWidget(self._openrv_helper)
+        self._djv_helper.setWordWrap(True)
+        self._djv_helper.setObjectName("DialogHelper")
+        player_l.addWidget(self._djv_helper)
 
         self._mpv_detect_helper = QLabel(
             "Embedded playback uses libmpv (mpv-2.dll). Install via Settings → Updates → libmpv, "
@@ -1572,6 +1576,72 @@ class SettingsDialog(MonosDialog):
         self._mpv_detect_helper.setWordWrap(True)
         self._mpv_detect_helper.setObjectName("DialogHelper")
         player_l.addWidget(self._mpv_detect_helper)
+
+        player_l.addWidget(settings_divider(player_card))
+        add_settings_subsection_title(player_l, "Image sequences")
+        self._video_sequence_fps_spin = QSpinBox(player_card)
+        self._video_sequence_fps_spin.setRange(1, 60)
+        style_settings_spin(self._video_sequence_fps_spin, width=72)
+        try:
+            self._video_sequence_fps_spin.setValue(read_sequence_preview_fps(self._settings))
+        except Exception:
+            self._video_sequence_fps_spin.setValue(30)
+        add_settings_field_row(player_l, "Default sequence FPS", self._video_sequence_fps_spin)
+        add_settings_helper(
+            player_l,
+            "Default when opening a sequence. Adjust FPS in the review player transport while playing.",
+        )
+
+        player_l.addWidget(settings_divider(player_card))
+        add_settings_subsection_title(player_l, "Sequence plates — OCIO (ACES 1.3)")
+        self._ocio_sequence_cb = QCheckBox("Display transform for EXR / DPX / HDR sequences", player_card)
+        try:
+            from monostudio.ui_qt.ocio_preview_settings import KEY_OCIO_SEQUENCE_ENABLED
+
+            self._ocio_sequence_cb.setChecked(bool(self._settings.value(KEY_OCIO_SEQUENCE_ENABLED, False)))
+        except Exception:
+            self._ocio_sequence_cb.setChecked(False)
+        self._ocio_sequence_cb.toggled.connect(self._sync_ocio_settings_ui)
+        player_l.addWidget(self._ocio_sequence_cb)
+
+        self._ocio_status_label = QLabel("", player_card)
+        self._ocio_status_label.setObjectName("DialogHint")
+        self._ocio_status_label.setWordWrap(True)
+        player_l.addWidget(self._ocio_status_label)
+
+        ocio_cfg_row = QWidget(player_card)
+        ocio_cfg_row_l = QHBoxLayout(ocio_cfg_row)
+        ocio_cfg_row_l.setContentsMargins(0, 0, 0, 0)
+        ocio_cfg_row_l.setSpacing(8)
+        self._ocio_config_field = QLineEdit(ocio_cfg_row)
+        style_settings_line_edit(self._ocio_config_field, min_width=200)
+        self._ocio_config_field.setPlaceholderText("Bundled ACES 1.3 cg-config (leave empty)")
+        try:
+            from monostudio.ui_qt.ocio_preview_settings import KEY_OCIO_CONFIG_PATH
+
+            v = self._settings.value(KEY_OCIO_CONFIG_PATH, "")
+            self._ocio_config_field.setText(v if isinstance(v, str) else str(v or ""))
+        except Exception:
+            pass
+        btn_ocio_browse = QPushButton("Browse…", ocio_cfg_row)
+        btn_ocio_browse.setObjectName("SettingsCategoryActionButton")
+        btn_ocio_browse.clicked.connect(self._browse_ocio_config)
+        btn_ocio_clear = QPushButton("Default", ocio_cfg_row)
+        btn_ocio_clear.setObjectName("SettingsCategoryActionButton")
+        btn_ocio_clear.setToolTip("Use bundled ACES 1.3 config")
+        btn_ocio_clear.clicked.connect(lambda: self._ocio_config_field.setText(""))
+        ocio_cfg_row_l.addWidget(self._ocio_config_field, 1)
+        ocio_cfg_row_l.addWidget(btn_ocio_browse, 0)
+        ocio_cfg_row_l.addWidget(btn_ocio_clear, 0)
+        add_settings_field_row(player_l, "OCIO config", ocio_cfg_row)
+
+        add_settings_helper(
+            player_l,
+            f"Review player + Inspector thumbnails. "
+            f"Input {DEFAULT_INPUT_COLORSPACE} → {DEFAULT_DISPLAY} / {DEFAULT_VIEW}. "
+            "Requires pip package opencolorio.",
+        )
+        self._sync_ocio_settings_ui()
 
         player_l.addWidget(settings_divider(player_card))
 
@@ -1715,6 +1785,58 @@ class SettingsDialog(MonosDialog):
             )
         self._refresh_windows_noti_status()
 
+    def _sync_ocio_settings_ui(self) -> None:
+        enabled = bool(self._ocio_sequence_cb.isChecked()) if self._ocio_sequence_cb is not None else False
+        for w in (self._ocio_config_field,):
+            if w is not None:
+                w.setEnabled(enabled)
+        if self._ocio_status_label is None:
+            return
+        parts: list[str] = [ocio_runtime_status()]
+        bundled = default_bundled_ocio_config_path()
+        if bundled.is_file():
+            parts.append(f"Bundled config: {bundled.name}")
+        else:
+            parts.append("Bundled ACES 1.3 config missing — run scripts/fetch_aces_ocio_config.ps1")
+        if enabled:
+            custom = (self._ocio_config_field.text() or "").strip() if self._ocio_config_field else ""
+            cfg: Path | None = None
+            if custom and Path(custom).is_file():
+                cfg = Path(custom)
+            elif self._settings is not None:
+                cfg = resolve_ocio_config_path(self._settings)
+            if cfg is None:
+                parts.append("No valid OCIO config path.")
+            elif not is_ocio_runtime_available():
+                parts.append("Enable after installing opencolorio.")
+            else:
+                parts.append(
+                    f"Transform: {DEFAULT_INPUT_COLORSPACE} → {DEFAULT_DISPLAY} / {DEFAULT_VIEW}"
+                )
+        self._ocio_status_label.setText("\n".join(parts))
+
+    def _browse_ocio_config(self) -> None:
+        start = ""
+        try:
+            if self._ocio_config_field is not None:
+                t = (self._ocio_config_field.text() or "").strip()
+                if t:
+                    p = Path(t)
+                    start = str(p.parent if p.is_file() else (p if p.is_dir() else p.parent))
+                elif default_bundled_ocio_config_path().parent.is_dir():
+                    start = str(default_bundled_ocio_config_path().parent)
+        except Exception:
+            start = ""
+        path, _flt = QFileDialog.getOpenFileName(
+            self,
+            "Select OCIO config",
+            start,
+            "OCIO config (config.ocio *.ocio);;All files (*.*)",
+        )
+        if path and self._ocio_config_field is not None:
+            self._ocio_config_field.setText(path.strip())
+            self._sync_ocio_settings_ui()
+
     def _browse_inspector_thumbnail_open_exe(self) -> None:
         start = ""
         try:
@@ -1773,11 +1895,11 @@ class SettingsDialog(MonosDialog):
         if path and self._video_external_player_field is not None:
             self._video_external_player_field.setText(path.strip())
 
-    def _browse_openrv_executable(self) -> None:
+    def _browse_djv_executable(self) -> None:
         start = ""
         try:
-            if self._openrv_exe_field is not None:
-                t = (self._openrv_exe_field.text() or "").strip()
+            if self._djv_exe_field is not None:
+                t = (self._djv_exe_field.text() or "").strip()
                 if t:
                     p = Path(t)
                     if p.parent.is_dir():
@@ -1786,12 +1908,12 @@ class SettingsDialog(MonosDialog):
             start = ""
         path, _flt = QFileDialog.getOpenFileName(
             self,
-            "Select OpenRV executable",
+            "Select DJV executable",
             start,
-            "Executable (rv.exe);;All files (*.*)",
+            "Executable (djv.exe);;All files (*.*)",
         )
-        if path and self._openrv_exe_field is not None:
-            self._openrv_exe_field.setText(path.strip())
+        if path and self._djv_exe_field is not None:
+            self._djv_exe_field.setText(path.strip())
 
     def _build_behavior_tab(self) -> QWidget:
         """General → Behavior: global pipeline options (create asset/shot)."""
@@ -4341,18 +4463,32 @@ class SettingsDialog(MonosDialog):
         except Exception:
             pass
 
-        # Inspector preview: thumbnail source (asset vs shot) + sequence playback FPS.
+        # Inspector preview: thumbnail source (asset vs shot).
         try:
             if self._settings is not None:
                 self._write_inspector_thumb_segment(self._inspector_thumb_segment_asset, "asset")
                 self._write_inspector_thumb_segment(self._inspector_thumb_segment_shot, "shot")
-            if self._settings is not None and self._inspector_sequence_fps_spin is not None:
-                write_sequence_preview_fps(self._settings, self._inspector_sequence_fps_spin.value())
+            if self._settings is not None and self._video_sequence_fps_spin is not None:
+                write_sequence_preview_fps(self._settings, self._video_sequence_fps_spin.value())
             if self._settings is not None and self._inspector_thumb_open_exe_field is not None:
                 write_inspector_thumbnail_open_exe(
                     self._settings,
                     (self._inspector_thumb_open_exe_field.text() or "").strip(),
                 )
+            if self._settings is not None and self._ocio_sequence_cb is not None:
+                write_ocio_sequence_enabled(self._settings, self._ocio_sequence_cb.isChecked())
+                if self._ocio_config_field is not None:
+                    write_ocio_config_path(self._settings, (self._ocio_config_field.text() or "").strip())
+                write_ocio_colorspace_triplet(
+                    self._settings,
+                    input_colorspace=DEFAULT_INPUT_COLORSPACE,
+                    display=DEFAULT_DISPLAY,
+                    view=DEFAULT_VIEW,
+                )
+                from monostudio.ui_qt.sequence_preview_decode import invalidate_decoded_frame_cache
+
+                invalidate_decoded_frame_cache()
+                self.preview_display_changed.emit()
             if self._settings is not None and getattr(self, "_video_player_backend_combo", None) is not None:
                 backend = self._video_player_backend_combo.currentData()
                 if isinstance(backend, str):
@@ -4364,19 +4500,19 @@ class SettingsDialog(MonosDialog):
                     self._settings,
                     (self._video_external_player_field.text() or "").strip(),
                 )
-            if self._settings is not None and getattr(self, "_openrv_exe_field", None) is not None:
-                openrv_path = (self._openrv_exe_field.text() or "").strip()
-                if openrv_path:
+            if self._settings is not None and getattr(self, "_djv_exe_field", None) is not None:
+                djv_path = (self._djv_exe_field.text() or "").strip()
+                if djv_path:
                     try:
-                        if not validate_openrv_executable(Path(openrv_path)):
+                        if not validate_djv_executable(Path(djv_path)):
                             QMessageBox.warning(
                                 self,
-                                "OpenRV",
-                                "The selected file does not appear to be a valid OpenRV (rv) executable.",
+                                "DJV",
+                                "The selected file does not appear to be a valid DJV executable.",
                             )
                     except Exception:
                         pass
-                write_openrv_executable(self._settings, openrv_path)
+                write_djv_executable(self._settings, djv_path)
         except Exception:
             pass
 

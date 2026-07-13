@@ -6,6 +6,29 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Set-Location $root
 
+function Assert-Signed {
+    param(
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [string]$Hint
+    )
+    if (-not (Test-Path $FilePath)) {
+        throw "File not found: $FilePath"
+    }
+    $sig = Get-AuthenticodeSignature -FilePath $FilePath
+    if ($sig.Status -ne "Valid") {
+        $msg = @()
+        $msg += "Release publish blocked: installer is NOT signed (status: $($sig.Status))."
+        $msg += "File: $FilePath"
+        if ($Hint) { $msg += $Hint }
+        $msg += ""
+        $msg += "Fix: rebuild with signing enabled, e.g.:"
+        $msg += "  .\build_installer.ps1 -Sign -PfxPath <path-to.pfx> -PfxPassword (Read-Host -AsSecureString)"
+        $msg += "or:"
+        $msg += "  .\build_installer.ps1 -Sign -CertSubject `"CN=Your Company, Inc.`""
+        throw ($msg -join "`n")
+    }
+}
+
 # Tag từ VERSION (vd. 26.1.0 -> v26.1.0)
 $verFile = Join-Path $root "monostudio_data\VERSION"
 if (-not (Test-Path $verFile)) {
@@ -19,13 +42,16 @@ if (-not (Test-Path $exe)) {
     Write-Error "Installer not found: $exe. Run build_installer.ps1 first."
 }
 
+# Rule: ALWAYS require a signed installer for GitHub releases
+Assert-Signed -FilePath $exe -Hint "This is required to reduce Defender/SmartScreen false positives for end users."
+
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Host "GitHub CLI (gh) chua cai. Cai: winget install GitHub.cli"
     Write-Host "Sau do dang nhap: gh auth login"
     exit 1
 }
 
-$auth = gh auth status 2>&1
+gh auth status 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Chua dang nhap GitHub. Chay: gh auth login"
     exit 1

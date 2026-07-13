@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QElapsedTimer, QTimer
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
@@ -26,7 +26,7 @@ class _AnimatedLoadingStrip(QWidget):
 
     _HEIGHT = 4
     _TICK_MS = 16
-    _SPEED = 0.009
+    _LOOP_MS = 1800
     _CHUNK_RATIO = 0.34
     _MIN_CHUNK_PX = 72
 
@@ -34,13 +34,13 @@ class _AnimatedLoadingStrip(QWidget):
         super().__init__(parent)
         self.setFixedHeight(self._HEIGHT)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self._phase = 0.0
+        self._elapsed = QElapsedTimer()
         self._timer = QTimer(self)
         self._timer.setInterval(self._TICK_MS)
-        self._timer.timeout.connect(self._on_tick)
+        self._timer.timeout.connect(self.update)
 
     def start(self) -> None:
-        self._phase = 0.0
+        self._elapsed.start()
         if not self._timer.isActive():
             self._timer.start()
         self.update()
@@ -48,11 +48,10 @@ class _AnimatedLoadingStrip(QWidget):
     def stop(self) -> None:
         self._timer.stop()
 
-    def _on_tick(self) -> None:
-        self._phase += self._SPEED
-        if self._phase >= 1.0:
-            self._phase -= 1.0
-        self.update()
+    def _phase(self) -> float:
+        if not self._elapsed.isValid():
+            return 0.0
+        return (self._elapsed.elapsed() % self._LOOP_MS) / float(self._LOOP_MS)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         w = self.width()
@@ -66,7 +65,7 @@ class _AnimatedLoadingStrip(QWidget):
 
         chunk_w = max(self._MIN_CHUNK_PX, int(w * self._CHUNK_RATIO))
         travel = max(1, w - chunk_w)
-        x = travel * self._phase
+        x = travel * self._phase()
 
         glow_path = QPainterPath()
         glow_path.addRoundedRect(x - 6, -1.5, chunk_w + 12, h + 3, 3, 3)
@@ -138,6 +137,10 @@ class MainViewLoadingPlaceholder(QWidget):
         else:
             self._strip.stop()
 
+    def tick_animation(self) -> None:
+        if self._strip_host.isVisible():
+            self._strip.repaint()
+
 
 class PageLoadingBar(QWidget):
     """Thin animated strip at the top of the content stack (no label — avoids header overlap)."""
@@ -172,6 +175,10 @@ class PageLoadingBar(QWidget):
     def hide_loading(self) -> None:
         self._strip.stop()
         self.hide()
+
+    def tick_animation(self) -> None:
+        if self.isVisible():
+            self._strip.repaint()
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         if obj is self.parentWidget() and event.type() == QEvent.Type.Resize:

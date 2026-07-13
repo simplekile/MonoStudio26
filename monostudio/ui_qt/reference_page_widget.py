@@ -61,6 +61,7 @@ class ReferencePageWidget(QWidget):
     item_tags_changed = Signal()
     video_preview_requested = Signal(object)  # Path
     browse_path_changed = Signal(str, object)  # (department, browse path)
+    copy_link_requested = Signal(str, object)  # page name, Path
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -187,6 +188,7 @@ class ReferencePageWidget(QWidget):
             self._tree_pane.item_tags_changed.connect(self.item_tags_changed.emit)
             self._tree_pane.video_preview_requested.connect(self.video_preview_requested.emit)
             self._tree_pane.browse_path_changed.connect(self._on_browse_path_changed)
+            self._tree_pane.copy_link_requested.connect(self.copy_link_requested.emit)
             self._content_lay.addWidget(self._tree_pane, 1)
             key = self._tree_state_key(self._department)
             saved = self._tree_state_cache.get(key)
@@ -230,16 +232,16 @@ class ReferencePageWidget(QWidget):
     def _on_import_clicked(self) -> None:
         self.import_requested.emit()
 
-    def set_project_root(self, path: Path | None) -> None:
+    def set_project_root(self, path: Path | None, *, refresh: bool = True) -> None:
         self._project_root = Path(path) if path else None
         self._ensure_tree_pane()
-        if self._tree_pane is not None:
+        if self._tree_pane is not None and self._project_root is not None:
             guide_root = get_project_guide_root(self._project_root)
             self._tree_pane.set_project_guide_root(guide_root, self._project_root)
-            if self._project_root:
-                self._tree_pane.set_tag_data(read_all_tags(self._project_root))
-                self._tree_pane.reload_tag_definitions()
-            self._tree_pane.refresh_content()
+            self._tree_pane.set_tag_data(read_all_tags(self._project_root))
+            self._tree_pane.reload_tag_definitions()
+            if refresh:
+                self._tree_pane.refresh_content()
 
     def set_department(self, department_id: str) -> None:
         new_dept = _normalize_department(department_id)
@@ -282,7 +284,7 @@ class ReferencePageWidget(QWidget):
         if self._tree_pane is not None:
             self._tree_pane.navigate_to_path(path)
 
-    def open_item_path(self, project_root: Path, item_path: Path) -> bool:
+    def open_item_path(self, project_root: Path, item_path: Path, *, link_reveal: bool = False) -> bool:
         """Switch department if needed and reveal *item_path* in the Project Guide tree."""
         item_path = Path(item_path)
         from monostudio.core.project_guide_reader import resolve_project_guide_department
@@ -298,12 +300,12 @@ class ReferencePageWidget(QWidget):
 
         def _reveal() -> None:
             if self._tree_pane is not None:
-                self._tree_pane.reveal_path(item_path)
+                self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
 
         if delay_ms > 0:
             QTimer.singleShot(delay_ms, _reveal)
             return True
-        return self._tree_pane.reveal_path(item_path)
+        return self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
 
     def refresh_tree(self) -> None:
         if self._tree_pane is not None:

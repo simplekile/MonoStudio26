@@ -32,17 +32,35 @@ def _quantize_decode_max_side(max_side: int) -> int:
     return max(256, min(2048, ((ms + 31) // 32) * 32))
 
 
-def _decode_cache_key(path: Path, max_side: int) -> tuple[str, int, int] | None:
+def _decode_cache_key(path: Path, max_side: int) -> tuple[str, int, int, str, str] | None:
     try:
         resolved = str(path.resolve())
         st = path.stat()
         mtime_ns = int(getattr(st, "st_mtime_ns", st.st_mtime * 1_000_000_000))
     except OSError:
         return None
-    return (resolved, mtime_ns, _quantize_decode_max_side(max_side))
+    from monostudio.core.ocio_display import PLATE_DECODE_CACHE_REV
+    from monostudio.ui_qt.ocio_preview_settings import ocio_preview_cache_token
+
+    return (
+        resolved,
+        mtime_ns,
+        _quantize_decode_max_side(max_side),
+        ocio_preview_cache_token(),
+        PLATE_DECODE_CACHE_REV,
+    )
 
 
-def _decode_cache_get(key: tuple[str, int, int]) -> QImage | None:
+def invalidate_decoded_frame_cache() -> None:
+    """Drop LRU frame cache (e.g. after OCIO / preview settings change)."""
+    from monostudio.core.ocio_display import invalidate_ocio_processor_cache
+
+    with _decoded_frame_cache_lock:
+        _decoded_frame_cache.clear()
+    invalidate_ocio_processor_cache()
+
+
+def _decode_cache_get(key: tuple[str, int, int, str, str]) -> QImage | None:
     with _decoded_frame_cache_lock:
         img = _decoded_frame_cache.get(key)
         if img is None or img.isNull():
@@ -53,7 +71,7 @@ def _decode_cache_get(key: tuple[str, int, int]) -> QImage | None:
     return copy if not copy.isNull() else None
 
 
-def _decode_cache_put(key: tuple[str, int, int], img: QImage) -> None:
+def _decode_cache_put(key: tuple[str, int, int, str, str], img: QImage) -> None:
     if img.isNull():
         return
     with _qt_image_lock:
@@ -87,7 +105,14 @@ def _load_via_ffmpeg(path: Path, max_side: int) -> QImage | None:
     ffmpeg = resolve_ffmpeg_executable()
     if not ffmpeg:
         return None
-    vf = f"scale='min({max_side},iw)':-1"
+    ext = path.suffix.lower()
+    if ext in (".exr", ".dpx", ".hdr"):
+        vf = (
+            f"scale='min({max_side},iw)':-1:flags=lanczos,"
+            "zscale=transfer=linear:matrix=bt709,tonemap=hable,format=rgb24"
+        )
+    else:
+        vf = f"scale='min({max_side},iw)':-1"
     try:
         proc = subprocess.run(
             [
@@ -124,13 +149,64 @@ def _load_via_ffmpeg(path: Path, max_side: int) -> QImage | None:
 
 
 def _load_preview_frame_qimage_uncached(path: Path, max_side: int) -> QImage | None:
+    import logging
+
+    log = logging.getLogger(__name__)
     ext = path.suffix.lower()
+    plate = ext in (".exr", ".dpx", ".hdr")
+    try:
+        from monostudio.core.ocio_display import load_ocio_preview_qimage, should_apply_ocio_for_path
+        from monostudio.core.sequence_preview import path_matches_sequence_ignore_tokens
+        from monostudio.ui_qt.inspector_preview_settings import default_qsettings
+        from monostudio.ui_qt.ocio_preview_settings import read_ocio_preview_state
+        from monostudio.ui_qt.thumbnails import get_thumbnail_sequence_ignore_tokens
+
+        settings = default_qsettings()
+        state = read_ocio_preview_state(settings)
+        ignore_tokens = get_thumbnail_sequence_ignore_tokens(settings)
+        non_color_aov = path_matches_sequence_ignore_tokens(path, ignore_tokens)
+        if non_color_aov:
+            log.debug("Skipping OCIO for non-color AOV %s", path.name)
+        elif should_apply_ocio_for_path(path, state):
+            ocio_img = load_ocio_preview_qimage(path, max_side, state)
+            if ocio_img is not None and not ocio_img.isNull():
+                return ocio_img
+            if plate:
+                log.warning(
+                    "OCIO preview failed for %s — falling back to ffmpeg tonemap",
+                    path.name,
+                )
+    except Exception as e:
+        log.warning("OCIO preview decode skipped for %s: %s", path.name, e)
+    if plate:
+        return _load_via_ffmpeg(path, max_side)
     with _qt_image_lock:
         img = QImage(str(path))
         if not img.isNull():
             return _scale_qimage(img, max_side)
-    if ext in (".dpx", ".exr", ".hdr"):
-        return _load_via_ffmpeg(path, max_side)
+    return None
+
+
+def probe_preview_image_dimensions(path: Path) -> tuple[int, int] | None:
+    """Native width/height for a sequence frame (Qt reader, then tiny decode for EXR/DPX)."""
+    if not path.is_file():
+        return None
+    with _qt_image_lock:
+        reader_sz = None
+        try:
+            from PySide6.QtGui import QImageReader
+
+            reader = QImageReader(str(path))
+            sz = reader.size()
+            if sz.isValid() and sz.width() > 0 and sz.height() > 0:
+                reader_sz = (sz.width(), sz.height())
+        except Exception:
+            reader_sz = None
+    if reader_sz is not None:
+        return reader_sz
+    img = _load_preview_frame_qimage_uncached(path, 64)
+    if img is not None and not img.isNull() and img.width() > 0 and img.height() > 0:
+        return img.width(), img.height()
     return None
 
 

@@ -1,20 +1,23 @@
-# MonoStudio 26 — Release v26.16.4
+# MonoStudio 26 — Release v26.17.0
 
 ## Highlights
 
-- **Review player**: Frameless resize (WM_NCHITTEST + edge handles); chrome/wheel routing; export progress; review switch popup; footer hint & settings polish.
-- **OpenRV sidecar**: Launch OpenRV (rv.exe) từ review; Settings → path + detect status.
-- **Command palette**: Starred items (persist per project); palette UI/search cải thiện.
-- **Settings / Updates**: Extra-repo checker mở rộng; mpv install tweak; Inspector preview options.
-- **Explorer / Main View**: Thumbnail loader; project guide reader; pipeline view models refresh.
+- **DJV View sidecar**: Thay OpenRV — launch DJV View từ review; Settings → path + detect; registry fallback Windows.
+- **OCIO sequence review**: Display transform ACEScg → view (PyOpenColorIO); bundled ACES 1.3 config; EXR/DPX/HDR plate decode.
+- **Deep links**: `monostudio://` mở rộng — navigate + flash highlight (`link_reveal`); URL protocol & deep_link core.
+- **Async UI workers**: `ui_worker_loop` + `schedule_reload_worker` — background tasks không block loading animation.
+- **Video player settings**: Dialog cấu hình preview/playback; OCIO preview settings.
+- **Explorer**: File sort; inbox/outbox/internal-check toolbar & split view cập nhật.
+- **Build**: Installer script + publish tweaks; `opencolorio` dependency.
 
 ## Changes in this release
 
-- feat: `openrv_launch.py`, `palette_stars_store.py`, `project_guide_reader.py`, `video_review_switch_popup.py`.
-- fix: `video_preview_dialog.py`, `frameless_resize.py`, `command_palette_dialog.py`, `settings_dialog.py`, `main_window.py`.
+- feat: `djv_launch.py`, `ocio_display.py`, `ocio_preview_settings.py`, `video_player_settings_dialog.py`, `link_reveal.py`, `explorer_file_sort.py`.
+- feat: `ui_worker_loop.py`, `schedule_reload_worker.py`, `deep_link.py`, `main_window.py`, `main_view.py`.
+- remove: `openrv_launch.py` (replaced by DJV).
 
 ## Install
 
 Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
 
-**libmpv** / **FFmpeg** / **OpenRV**: Settings → General / Updates.
+**libmpv** / **FFmpeg** / **DJV View**: Settings → General / Updates.

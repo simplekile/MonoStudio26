@@ -743,6 +743,46 @@ class SchedulePageWidget(QWidget):
         self._update_stats()
         self._sync_save_status()
 
+    def refresh_responsive(
+        self,
+        project_index: ProjectIndex | None,
+        worker_manager,
+        *,
+        on_pump=None,
+        on_done=None,
+    ) -> None:
+        """Refresh timeline off the UI thread; call *on_done* when gantt data is applied."""
+        del on_pump  # async path keeps the main event loop free; strip animates on its own timer
+        self._project_index = project_index
+        if self._project_root is None:
+            self.refresh(project_index)
+            if on_done is not None:
+                on_done()
+            return
+
+        def _start_refresh() -> None:
+            self._ensure_schedule_document()
+
+            self._empty.setVisible(False)
+            for w in self._content:
+                w.setVisible(True)
+
+            self._gantt.set_include_shots(self._include_shots)
+            self._gantt.set_include_assets(self._include_assets)
+            self._sync_dept_display_to_gantt(reload_now=False)
+            self._gantt.set_project(self._project_root, project_index, reload_now=False)
+
+            def _after_gantt() -> None:
+                self._apply_filters()
+                QTimer.singleShot(0, self._update_stats)
+                self._sync_save_status()
+                if on_done is not None:
+                    on_done()
+
+            self._gantt.reload_responsive(worker_manager, on_done=_after_gantt)
+
+        QTimer.singleShot(0, _start_refresh)
+
     def _ensure_schedule_document(self) -> None:
         if self._project_root is None:
             return

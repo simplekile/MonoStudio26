@@ -5,12 +5,73 @@
 param(
     [switch]$NoCommit,
     [switch]$NoVersionBump,
-    [switch]$Beta
+    [switch]$Beta,
+
+    # Optional code signing (recommended for release builds).
+    # Examples:
+    #   .\build_installer.ps1 -Sign -PfxPath .\certs\codesign.pfx -PfxPassword (Read-Host -AsSecureString)
+    #   .\build_installer.ps1 -Sign -CertSubject "CN=Your Company, Inc."
+    [switch]$Sign,
+    [string]$PfxPath,
+    [SecureString]$PfxPassword,
+    [string]$CertSubject,
+    [string]$TimestampUrl = "http://timestamp.digicert.com"
 )
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Set-Location $root
+
+function Get-SignTool {
+    if (Get-Command signtool.exe -ErrorAction SilentlyContinue) { return "signtool.exe" }
+    if (Get-Command signtool -ErrorAction SilentlyContinue) { return "signtool" }
+
+    $candidates = @(
+        "$env:ProgramFiles (x86)\Windows Kits\10\bin\x64\signtool.exe",
+        "$env:ProgramFiles (x86)\Windows Kits\10\bin\*\x64\signtool.exe",
+        "$env:ProgramFiles\Windows Kits\10\bin\x64\signtool.exe",
+        "$env:ProgramFiles\Windows Kits\10\bin\*\x64\signtool.exe"
+    )
+    foreach ($p in $candidates) {
+        $match = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
+        if ($match) { return $match.FullName }
+    }
+    return $null
+}
+
+function Sign-File {
+    param(
+        [Parameter(Mandatory=$true)][string]$FilePath
+    )
+    if (-not $Sign) { return }
+    if (-not (Test-Path $FilePath)) { return }
+
+    $tool = Get-SignTool
+    if (-not $tool) {
+        Write-Warning "Signing requested but signtool.exe not found (install Windows SDK or add signtool to PATH). Skipping: $FilePath"
+        return
+    }
+
+    $args = @("sign", "/fd", "sha256", "/tr", $TimestampUrl, "/td", "sha256", "/v")
+    if ($PfxPath) {
+        $resolvedPfx = Resolve-Path -LiteralPath $PfxPath -ErrorAction Stop
+        $args += @("/f", $resolvedPfx.Path)
+        if ($PfxPassword) {
+            $pwd = [Runtime.InteropServices.Marshal]::PtrToStringUni([Runtime.InteropServices.Marshal]::SecureStringToBSTR($PfxPassword))
+            try { $args += @("/p", $pwd) } finally { }
+        }
+    } elseif ($CertSubject) {
+        $args += @("/n", $CertSubject)
+    } else {
+        Write-Warning "Signing requested but no certificate specified (-PfxPath or -CertSubject). Skipping: $FilePath"
+        return
+    }
+
+    $args += @("/as", $FilePath)
+    Write-Host "Signing: $FilePath"
+    & $tool @args
+    if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE) for $FilePath" }
+}
 
 # 0) Commit xong mới build: nếu có thay đổi chưa commit thì tự commit (message ước lượng từ diff)
 if (-not $NoCommit) {
@@ -66,6 +127,10 @@ Write-Host "Building PyInstaller onedir (dist/MonoStudio26/)..."
 python -m PyInstaller --clean --noconfirm monostudio26.spec
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# 4c) Optional signing of the app EXE (helps Defender/SmartScreen reputation)
+$appExe = Join-Path $root "dist\MonoStudio26\MonoStudio26.exe"
+Sign-File -FilePath $appExe
+
 # 4b) Optional bundled libmpv next to onedir (not inside _internal)
 $mpvSrc = Join-Path $root "tools\mpv"
 $mpvDst = Join-Path $root "dist\MonoStudio26\tools\mpv"
@@ -100,6 +165,11 @@ if ($isccExe) {
     Write-Host "Building installer with Inno Setup (version $appVer)..."
     & $isccExe @isccArgs "installer\MonoStudio26.iss"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    # Sign the installer itself (recommended for release builds)
+    $setupName = if ($Beta) { "MonoStudio26_Beta_Setup.exe" } else { "MonoStudio26_Setup.exe" }
+    $setupExe = Join-Path $root ("dist\" + $setupName)
+    Sign-File -FilePath $setupExe
 } else {
     Write-Host "Inno Setup not found. Install from https://jrsoftware.org/isinfo.php then re-run, or open installer\MonoStudio26.iss in Inno Setup Compiler."
 }

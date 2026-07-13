@@ -268,10 +268,26 @@ EXPLORER_PREVIEW_DISK_CACHE_VARIANT = "explorer"
 INSPECTOR_INBOX_PREVIEW_DISK_CACHE_VARIANT = "inbox_hd"
 EXPLORER_GRID_CARD_WIDTH_PX = 200
 
+_PLATE_THUMB_EXTENSIONS = frozenset({".exr", ".dpx", ".hdr"})
+
+
+def _plate_display_cache_token(source_path: Path) -> str:
+    """Bust disk cache when OCIO / plate decode changes (EXR/DPX/HDR thumbs)."""
+    if (source_path.suffix or "").lower() not in _PLATE_THUMB_EXTENSIONS:
+        return ""
+    try:
+        from monostudio.core.ocio_display import PLATE_DECODE_CACHE_REV
+        from monostudio.ui_qt.ocio_preview_settings import ocio_preview_cache_token
+
+        return f"plate|{PLATE_DECODE_CACHE_REV}|{ocio_preview_cache_token()}"
+    except Exception:
+        return "plate"
+
 
 def _disk_cache_path(source_path: Path, mtime_ns: int, size_px: int, *, variant: str = "") -> Path:
     """Path to cached PNG for this source file; same path+mtime+size+variant yields same file."""
-    raw = f"{source_path.resolve()!s}\n{mtime_ns}\n{size_px}\n{variant}"
+    plate_tok = _plate_display_cache_token(source_path)
+    raw = f"{source_path.resolve()!s}\n{mtime_ns}\n{size_px}\n{variant}\n{plate_tok}"
     h = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:32]
     return _thumbnail_disk_cache_dir() / f"{h}.png"
 
@@ -562,13 +578,23 @@ class ThumbnailCache:
                     pass
             return pix
 
-        pix = QPixmap(key)
-        if pix.isNull() and ext in (".dpx", ".exr", ".hdr"):
+        if ext in _PLATE_THUMB_EXTENSIONS:
             from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
 
             img = load_preview_frame_qimage(file_path, self._size_px)
             if img is not None and not img.isNull():
                 pix = QPixmap.fromImage(img)
+                if not pix.isNull():
+                    scaled = _downscale_pixmap_max_side(pix, self._size_px)
+                    self._cache[key] = _CachedPixmap(mtime_ns=mtime_ns, pixmap=scaled)
+                    try:
+                        _write_disk_cache_pixmap(dc_path, scaled)
+                    except OSError:
+                        pass
+                    return scaled
+            return None
+
+        pix = QPixmap(key)
         if pix.isNull():
             return None
 
@@ -664,17 +690,17 @@ def decode_explorer_preview_qimage_worker(
         pix = _load_video_frame_via_ffmpeg(p, side)
         if pix is not None and not pix.isNull():
             img = pix.toImage()
+    elif ext in _PLATE_THUMB_EXTENSIONS:
+        from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+        decoded = load_preview_frame_qimage(p, side)
+        img = decoded if decoded is not None and not decoded.isNull() else None
     else:
         img = QImage(str(p))
         if img.isNull():
             reader = QImageReader(str(p))
             reader.setAutoTransform(True)
             img = reader.read()
-        if img.isNull() and ext in (".dpx", ".exr", ".hdr"):
-            from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
-
-            decoded = load_preview_frame_qimage(p, side)
-            img = decoded if decoded is not None and not decoded.isNull() else QImage()
 
     if img is None or img.isNull():
         return None
@@ -709,17 +735,20 @@ def _load_ref_preview_image_worker(file_path: str, size_px: int) -> tuple[str, Q
         pass
     try:
         ext = (p.suffix or "").strip().lower()
-        img = QImage(str(p))
-        if img.isNull():
-            reader = QImageReader(str(p))
-            reader.setAutoTransform(True)
-            img = reader.read()
-        if img.isNull() and ext in (".dpx", ".exr", ".hdr"):
+        if ext in _PLATE_THUMB_EXTENSIONS:
             from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
 
-            img = load_preview_frame_qimage(p, side) or QImage()
-        if img.isNull():
-            return None
+            img = load_preview_frame_qimage(p, side)
+            if img is None or img.isNull():
+                return None
+        else:
+            img = QImage(str(p))
+            if img.isNull():
+                reader = QImageReader(str(p))
+                reader.setAutoTransform(True)
+                img = reader.read()
+            if img.isNull():
+                return None
         sq = _qimage_cover_square(img, side)
         try:
             _write_disk_cache_qimage(dc_path, sq)
@@ -750,15 +779,16 @@ def _load_thumbnail_image_worker(file_path: str, size_px: int, cache_key: str | 
         return None
     try:
         ext = (p.suffix or "").strip().lower()
-        img = QImage(str(p))
-        if img.isNull():
-            reader = QImageReader(str(p))
-            reader.setAutoTransform(True)
-            img = reader.read()
-        if img.isNull() and ext in (".dpx", ".exr", ".hdr"):
+        if ext in _PLATE_THUMB_EXTENSIONS:
             from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
 
             img = load_preview_frame_qimage(p, size_px) or QImage()
+        else:
+            img = QImage(str(p))
+            if img.isNull():
+                reader = QImageReader(str(p))
+                reader.setAutoTransform(True)
+                img = reader.read()
         if img.isNull():
             return None
         scaled = img.scaled(

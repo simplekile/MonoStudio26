@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, Signal, QSize
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QPushButton,
@@ -14,7 +14,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from monostudio.core.internal_check_reader import ensure_internal_check_root, get_internal_check_root
+from monostudio.core.internal_check_reader import (
+    ensure_internal_check_root,
+    get_internal_check_root,
+    resolve_internal_check_location,
+)
 from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
 from monostudio.ui_qt.sidebar import INTERNAL_CHECK_NAV_ICON
 from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, InboxTreePane
@@ -46,6 +50,7 @@ class InternalCheckPageWidget(QWidget):
     date_folder_entered = Signal(str, object)
     video_preview_requested = Signal(object)
     send_to_delivery_requested = Signal(object)
+    copy_link_requested = Signal(str, object)  # page name, Path
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -165,6 +170,7 @@ class InternalCheckPageWidget(QWidget):
             self._tree_pane.external_drop_requested.connect(self.drop_requested.emit)
             self._tree_pane.video_preview_requested.connect(self.video_preview_requested.emit)
             self._tree_pane.send_to_delivery_requested.connect(self.send_to_delivery_requested.emit)
+            self._tree_pane.copy_link_requested.connect(self.copy_link_requested.emit)
             self._content_lay.addWidget(self._tree_pane, 1)
         else:
             self._tree_pane.set_date_folder_path(root)
@@ -192,14 +198,14 @@ class InternalCheckPageWidget(QWidget):
         self._history_dialog.raise_()
         self._history_dialog.activateWindow()
 
-    def set_project_root(self, path: Path | None) -> None:
+    def set_project_root(self, path: Path | None, *, refresh: bool = True) -> None:
         if self._tree_pane is not None:
             self._tree_state_cache = self._tree_pane.get_tree_state()
         self._project_root = Path(path) if path else None
         if self._project_root is not None:
             ensure_internal_check_root(self._project_root)
         self._ensure_tree_pane()
-        if self._tree_pane is not None:
+        if refresh and self._tree_pane is not None:
             self._tree_pane.refresh_content()
 
     def set_type_filter(self, _source_type: str) -> None:
@@ -216,6 +222,32 @@ class InternalCheckPageWidget(QWidget):
         self._ensure_tree_pane()
         if self._tree_pane is not None:
             self._tree_pane.navigate_to_path(path)
+
+    def open_item_path(self, project_root: Path, item_path: Path, *, link_reveal: bool = False) -> bool:
+        item_path = Path(item_path)
+        self._ensure_tree_pane()
+        if self._tree_pane is None:
+            return False
+        date_folder = resolve_internal_check_location(project_root, item_path)
+        delay_ms = 0
+        if date_folder is not None:
+            current = self._tree_pane.date_folder_path()
+            try:
+                needs_scope = current.resolve() != date_folder.resolve()
+            except OSError:
+                needs_scope = True
+            if needs_scope:
+                self._tree_pane.set_date_folder_path(date_folder)
+                delay_ms = 80
+
+        def _reveal() -> None:
+            if self._tree_pane is not None:
+                self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
+
+        if delay_ms > 0:
+            QTimer.singleShot(delay_ms, _reveal)
+            return True
+        return self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
 
     def refresh_tree(self) -> None:
         if self._tree_pane is not None:

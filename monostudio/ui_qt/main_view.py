@@ -38,6 +38,7 @@ from PySide6.QtGui import (
     QDrag,
     QIcon,
     QKeySequence,
+    QKeyEvent,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -136,6 +137,7 @@ from monostudio.core.fs_reader import (
     work_file_prefix,
 )
 from monostudio.core.workspace_reader import (
+    PROJECT_BROWSER_STATUS_KEYS,
     ProjectQuickStats,
     project_status_color_hex,
     project_status_display_labels,
@@ -3311,6 +3313,14 @@ class _GridCardDelegate(QStyledItemDelegate):
             border_rect = outer.adjusted(stroke_inset, stroke_inset, -stroke_inset, -stroke_inset)
             p.drawRoundedRect(border_rect, 12, 12)
 
+            if getattr(item, "path", None):
+                from monostudio.ui_qt.link_reveal import link_reveal, paint_link_reveal_card_border
+
+                lr = link_reveal()
+                alpha = lr.alpha_for_path(item.path) if lr.current_alpha() > 0.01 else 0.0
+                if alpha > 0:
+                    paint_link_reveal_card_border(p, outer, alpha, radius=12)
+
         finally:
             p.restore()
             try:
@@ -3497,6 +3507,7 @@ class MainView(QWidget):
     refresh_requested = Signal()
     root_context_menu_requested = Signal(object)  # emits global QPoint
     copy_inventory_requested = Signal(object)  # emits ViewItem (asset/shot only)
+    copy_link_requested = Signal(object)  # emits ViewItem
     rename_requested = Signal(object)  # emits ViewItem (asset only)
     palette_star_toggle_requested = Signal(object)  # emits ViewItem (asset / shot)
     item_notes_requested = Signal(object)  # emits ViewItem (asset / shot)
@@ -3519,7 +3530,7 @@ class MainView(QWidget):
     dcc_delete_requested = Signal(object, str, str)  # (ViewItem, dcc_id, department)
     dcc_open_version_requested = Signal(object, str, str, object)  # (ViewItem, dcc_id, department, file_path: Path)
     review_entity_requested = Signal(object)  # ViewItem (asset/shot) — review latest preview
-    open_in_openrv_entity_requested = Signal(object)  # ViewItem (asset/shot)
+    open_in_djv_entity_requested = Signal(object)  # ViewItem (asset/shot)
     active_dcc_changed = Signal(object, str, str)  # (path, department, dcc_id) — đồng bộ Inspector
     production_status_override_chosen = Signal(object, str, object)  # (Path | list[Path], department, status_id | None)
     project_status_chosen = Signal(object, object)  # Path, status_key | None (None = automatic)
@@ -4214,6 +4225,7 @@ class MainView(QWidget):
         self._tile_view.horizontalScrollBar().valueChanged.connect(self._schedule_thumbnail_prefetch)
         self._tile_view.setMouseTracking(True)
         self._tile_view.viewport().installEventFilter(self)
+        self._tile_view.installEventFilter(self)
         # Left/top padding = 24px (right/bottom provided by per-cell gap).
         self._tile_view.setViewportMargins(24, 24, 0, 0)
 
@@ -4265,6 +4277,7 @@ class MainView(QWidget):
         self._list_header.column_resize_finished.connect(self._save_list_column_widths)
         self._list_view.setMouseTracking(True)
         self._list_view.viewport().installEventFilter(self)
+        self._list_view.installEventFilter(self)
         self._list_view.verticalScrollBar().valueChanged.connect(self._schedule_thumbnail_prefetch)
         self._sync_tile_drag_mode()
 
@@ -4316,6 +4329,9 @@ class MainView(QWidget):
         self._deferred_full_repaint_pending = False
         self._list_marquee_cols_hidden = False
         self._tile_selection_chrome_rows: set[int] = set()
+        from monostudio.ui_qt.link_reveal import link_reveal
+
+        link_reveal().changed.connect(self._on_link_reveal_tick)
         self._selection_notify_timer = QTimer(self)
         self._selection_notify_timer.setSingleShot(True)
         self._selection_notify_timer.setInterval(0)
@@ -4378,6 +4394,35 @@ class MainView(QWidget):
             self._set_browser_mode("work")
         else:
             self._set_browser_mode("review")
+
+    def _shortcut_editing_focus(self) -> bool:
+        fw = QApplication.focusWidget()
+        if fw is None:
+            return False
+        if fw is self._search_input:
+            return True
+        if self._search_popup.isVisible() and self._search_popup.isAncestorOf(fw):
+            return True
+        from PySide6.QtWidgets import QAbstractSpinBox, QLineEdit, QPlainTextEdit, QTextEdit
+
+        return isinstance(fw, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox))
+
+    def _key_event_matches_hotkey(self, event: QKeyEvent, action_id: str) -> bool:
+        from monostudio.ui_qt.app_hotkeys import read_hotkey_sequence
+
+        if event.type() != QEvent.Type.KeyPress:
+            return False
+        seq = read_hotkey_sequence(self._settings, action_id)
+        if seq.isEmpty():
+            return False
+        return bool(seq.matches(event.keyCombination()))
+
+    def _add_copy_monos_link_menu_action(self, menu: QMenu):
+        from monostudio.ui_qt.app_hotkeys import read_hotkey_sequence
+
+        act = menu.addAction(self._ctx_menu_icon("link"), "Copy MONOS Link")
+        act.setShortcut(read_hotkey_sequence(self._settings, "main_view.copy_monos_link"))
+        return act
 
     def _bind_view_mode_shortcuts(self) -> None:
         from monostudio.ui_qt.app_hotkeys import bind_hotkey
@@ -4872,8 +4917,30 @@ class MainView(QWidget):
             if callable(cleanup):
                 cleanup()
 
+    def _pipeline_view_watch_targets(self) -> tuple:
+        out: list = []
+        tile = getattr(self, "_tile_view", None)
+        if tile is not None:
+            out.append(tile)
+            out.append(tile.viewport())
+        lst = getattr(self, "_list_view", None)
+        if lst is not None:
+            out.append(lst)
+            out.append(lst.viewport())
+        return tuple(out)
+
+    def _pipeline_viewport_watch_targets(self) -> tuple:
+        out: list = []
+        tile = getattr(self, "_tile_view", None)
+        if tile is not None:
+            out.append(tile.viewport())
+        lst = getattr(self, "_list_view", None)
+        if lst is not None:
+            out.append(lst.viewport())
+        return tuple(out)
+
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
-        if watched in (self._tile_view.viewport(), self._list_view.viewport()):
+        if watched in self._pipeline_viewport_watch_targets():
             et = event.type()
             if et == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
                 if event.button() == Qt.MouseButton.LeftButton:
@@ -6241,6 +6308,11 @@ class MainView(QWidget):
             return
         self._repaint_list_derived_columns()
 
+    def pump_loading_placeholders(self) -> None:
+        for placeholder in (getattr(self, "_tile_placeholder", None), getattr(self, "_list_placeholder", None)):
+            if placeholder is not None and hasattr(placeholder, "tick_animation"):
+                placeholder.tick_animation()
+
     def set_empty_override(self, message: str | None) -> None:
         # Allows higher-level flows (e.g. workspace discovery) to present a neutral empty state.
         self._empty_override = message
@@ -6453,6 +6525,18 @@ class MainView(QWidget):
 
     def _view_item_sort_key(self, vi: ViewItem) -> tuple:
         field = self._sort_field
+        if vi.kind.value == "project":
+            if field == self._SORT_FIELD_DATE:
+                return (self._project_item_mtime_ts(vi), str(vi.path))
+            if field == self._SORT_FIELD_STATUS:
+                stats = vi.ref if isinstance(vi.ref, ProjectQuickStats) else None
+                status = getattr(stats, "status", None) if stats is not None else "WAITING"
+                return (
+                    self._project_status_sort_index(status),
+                    (vi.name or "").casefold(),
+                    str(vi.path),
+                )
+            return ((vi.name or "").casefold(), str(vi.path))
         if field == self._SORT_FIELD_DATE:
             dep = (self._active_department or "").strip() or None
             active_dcc = self.get_active_dcc(vi.path, dep) if vi.path and dep else None
@@ -6512,12 +6596,27 @@ class MainView(QWidget):
         return (display_name_for_item(vi).casefold(), str(vi.path))
 
     def _sort_view_items(self, items: list[ViewItem]) -> list[ViewItem]:
-        if self._browser_context not in ("asset", "shot") or not items:
+        if self._browser_context not in ("asset", "shot", "project") or not items:
             return list(items)
         return sorted(items, key=self._view_item_sort_key, reverse=not self._sort_ascending)
 
+    def _project_status_sort_index(self, status: str | None) -> int:
+        key = (status or "WAITING").strip().upper()
+        try:
+            return PROJECT_BROWSER_STATUS_KEYS.index(key)
+        except ValueError:
+            return len(PROJECT_BROWSER_STATUS_KEYS)
+
+    def _project_item_mtime_ts(self, vi: ViewItem) -> float:
+        if vi.path is None:
+            return 0.0
+        try:
+            return float(Path(vi.path).stat().st_mtime)
+        except OSError:
+            return 0.0
+
     def _insert_view_item_sorted(self, lst: list[ViewItem], vi: ViewItem) -> None:
-        if self._browser_context in ("asset", "shot"):
+        if self._browser_context in ("asset", "shot", "project"):
             new_key = self._view_item_sort_key(vi)
             asc = self._sort_ascending
             insert_row = len(lst)
@@ -6547,7 +6646,7 @@ class MainView(QWidget):
 
     def _resort_main_view_visible(self) -> None:
         """Rebuild visible rows from _items_unfiltered (filter + sort). Preserves selection when still visible."""
-        if self._browser_context not in ("asset", "shot") or not self._items_unfiltered:
+        if self._browser_context not in ("asset", "shot", "project") or not self._items_unfiltered:
             return
         visible = self._prepare_visible_items(self._items_unfiltered)
         if tuple(str(v.path) for v in self._all_items) == tuple(str(v.path) for v in visible):
@@ -6634,8 +6733,34 @@ class MainView(QWidget):
                 self._pipeline_selection_store.set_single(path)
                 self._apply_selection_store_to_views()
                 self.valid_selection_changed.emit(self.has_valid_selection())
+                list_idx = self._list_model.index(row, 0)
+                active = self._tile_view if self._view_mode == "tile" else self._list_view
+                scroll_idx = tile_idx if active is self._tile_view else list_idx
+                if scroll_idx.isValid():
+                    active.scrollTo(scroll_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
                 return True
         return False
+
+    def _on_link_reveal_tick(self) -> None:
+        from monostudio.ui_qt.link_reveal import link_reveal
+
+        lr = link_reveal()
+        if not lr.is_active():
+            return
+        path = lr.any_active_path()
+        if path is None:
+            return
+        for row in range(self._tile_row_count()):
+            tile_idx = self._tile_model._model_index(row, 0)
+            if not tile_idx.isValid():
+                continue
+            item = tile_idx.data(Qt.UserRole)
+            if isinstance(item, ViewItem) and self._paths_equal(item.path, path):
+                self._tile_view.viewport().update(self._tile_view.visualRect(tile_idx))
+                list_idx = self._list_model.index(row, 0)
+                if list_idx.isValid():
+                    self._list_view.viewport().update(self._list_view.visualRect(list_idx))
+                return
 
     def _thumbnail_request_extras(self, item: ViewItem) -> dict:
         """Pipeline ref + active DCC for ThumbnailManager (render-sequence / user_then rules)."""
@@ -6885,27 +7010,34 @@ class MainView(QWidget):
         view_item_resolver: Callable[[str], ViewItem | None],
     ) -> None:
         """Apply diff only: remove, update, add affected items. No full rebuild. Uses _items for O(1) lookup."""
+        saved_paths = list(self._pipeline_selection_store.paths())
+        saved_current = self._pipeline_selection_store.current()
         batch_size = len(added_ids) + len(removed_ids) + len(updated_ids)
         batch_update = batch_size > 8
         if batch_update:
             self._tile_view.setUpdatesEnabled(False)
             self._list_view.setUpdatesEnabled(False)
+        self._in_batch_set_items = True
         try:
             self._apply_assets_diff_impl(
                 added_ids, removed_ids, updated_ids, view_item_resolver
             )
+            if self._browser_context in ("asset", "shot") and self._items_unfiltered and (
+                added_ids or removed_ids or updated_ids
+            ):
+                self._resort_main_view_visible()
+            self._renumber_list_indices()
+            self._update_empty_states()
         finally:
+            self._in_batch_set_items = False
             if batch_update:
                 self._tile_view.setUpdatesEnabled(True)
                 self._list_view.setUpdatesEnabled(True)
                 self._tile_view.viewport().update()
                 self._list_view.viewport().update()
-        if self._browser_context in ("asset", "shot") and self._items_unfiltered and (
-            added_ids or removed_ids or updated_ids
-        ):
-            self._resort_main_view_visible()
-        self._renumber_list_indices()
-        self._update_empty_states()
+        if saved_paths or saved_current:
+            self._pipeline_selection_store.select_many(saved_paths, current=saved_current)
+            self._apply_selection_store_to_views()
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
 
@@ -7144,11 +7276,26 @@ class MainView(QWidget):
         self._chk_dept_status_chips.setChecked(self._show_dept_status_chips)
         self._chk_dept_status_chips.blockSignals(False)
         show_asset_shot_opts = ctx in ("asset", "shot")
+        show_project_opts = ctx == "project"
+        show_sort = show_asset_shot_opts or show_project_opts
         show_metadata = tile and show_asset_shot_opts
         self._filter_sep.setVisible(show_asset_shot_opts)
         self._filter_submenu.setVisible(show_asset_shot_opts)
-        self._sort_sep.setVisible(show_asset_shot_opts)
-        self._sort_submenu.setVisible(show_asset_shot_opts)
+        self._sort_sep.setVisible(show_sort)
+        self._sort_submenu.setVisible(show_sort)
+        self._sort_by_due.setVisible(show_asset_shot_opts)
+        if show_project_opts:
+            self._sort_by_name.setToolTip("Project display name.")
+            self._sort_by_date.setToolTip("Project folder last modified on disk.")
+            self._sort_by_status.setToolTip("Project browser status (Waiting → Done).")
+        elif show_asset_shot_opts:
+            self._sort_by_name.setToolTip("Asset type + name (assets) or shot name.")
+            self._sort_by_date.setToolTip(
+                "Last updated: entity folder in Work mode, latest publish version in Published mode."
+            )
+            self._sort_by_status.setToolTip(
+                "Production status for the focused department (pipeline category order)."
+            )
         self._metadata_sep.setVisible(show_metadata)
         self._metadata_submenu.setVisible(show_metadata)
         if show_asset_shot_opts:
@@ -7161,6 +7308,14 @@ class MainView(QWidget):
             self._sync_filter_work_radios_from_settings()
             self._rebuild_filter_status_dropdown()
             self._sync_main_view_options_popup_geometry()
+            self._sync_sort_radios_from_settings()
+        elif show_project_opts:
+            if self._sort_field not in (
+                self._SORT_FIELD_NAME,
+                self._SORT_FIELD_DATE,
+                self._SORT_FIELD_STATUS,
+            ):
+                self._sort_field = self._SORT_FIELD_NAME
             self._sync_sort_radios_from_settings()
         if show_metadata:
             for chk, val in (
@@ -7375,6 +7530,95 @@ class MainView(QWidget):
         ):
             w.blockSignals(False)
 
+    class _MainViewSortMenuSection(NamedTuple):
+        field_actions: dict[str, QAction]
+        ascending: QAction
+        descending: QAction
+
+    def _valid_sort_fields_for_context(self) -> tuple[str, ...]:
+        if self._browser_context == "project":
+            return (self._SORT_FIELD_NAME, self._SORT_FIELD_DATE, self._SORT_FIELD_STATUS)
+        if self._browser_context in ("asset", "shot"):
+            return (
+                self._SORT_FIELD_NAME,
+                self._SORT_FIELD_DATE,
+                self._SORT_FIELD_STATUS,
+                self._SORT_FIELD_DUE,
+            )
+        return ()
+
+    def apply_sort_field_choice(self, field: str) -> bool:
+        if field not in self._valid_sort_fields_for_context() or field == self._sort_field:
+            return False
+        self._sort_field = field
+        self._settings.setValue(self._SETTINGS_KEY_SORT_FIELD, field)
+        if self._browser_context in ("asset", "shot", "project") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+        return True
+
+    def apply_sort_order_choice(self, ascending: bool) -> bool:
+        if ascending == self._sort_ascending:
+            return False
+        self._sort_ascending = ascending
+        self._settings.setValue(self._SETTINGS_KEY_SORT_ASCENDING, self._sort_ascending)
+        if self._browser_context in ("asset", "shot", "project") and self._items_unfiltered:
+            self._resort_main_view_visible()
+        self._tile_view.viewport().update()
+        self._list_view.viewport().update()
+        return True
+
+    def append_sort_context_submenu(self, menu: QMenu) -> _MainViewSortMenuSection | None:
+        fields = self._valid_sort_fields_for_context()
+        if not fields:
+            return None
+        sub = menu.addMenu(
+            lucide_icon("sliders-horizontal", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Sort",
+        )
+        labels = {
+            self._SORT_FIELD_NAME: "Name",
+            self._SORT_FIELD_DATE: "Date",
+            self._SORT_FIELD_STATUS: "Status",
+            self._SORT_FIELD_DUE: "Due",
+        }
+        active_field = self._sort_field if self._sort_field in fields else self._SORT_FIELD_NAME
+        field_actions: dict[str, QAction] = {}
+        for key in fields:
+            act = sub.addAction(labels[key])
+            act.setCheckable(True)
+            act.setChecked(active_field == key)
+            field_actions[key] = act
+        sub.addSeparator()
+        asc_act = sub.addAction("Ascending")
+        asc_act.setCheckable(True)
+        asc_act.setChecked(self._sort_ascending)
+        desc_act = sub.addAction("Descending")
+        desc_act.setCheckable(True)
+        desc_act.setChecked(not self._sort_ascending)
+        return self._MainViewSortMenuSection(
+            field_actions=field_actions,
+            ascending=asc_act,
+            descending=desc_act,
+        )
+
+    def handle_sort_context_action(
+        self,
+        chosen: QAction | None,
+        section: _MainViewSortMenuSection | None,
+    ) -> bool:
+        if chosen is None or section is None:
+            return False
+        for key, act in section.field_actions.items():
+            if chosen is act:
+                return self.apply_sort_field_choice(key)
+        if chosen is section.ascending:
+            return self.apply_sort_order_choice(True)
+        if chosen is section.descending:
+            return self.apply_sort_order_choice(False)
+        return False
+
     def _on_sort_field_clicked(self, button_id: int) -> None:
         by_id = {
             0: self._SORT_FIELD_NAME,
@@ -7383,25 +7627,10 @@ class MainView(QWidget):
             3: self._SORT_FIELD_DUE,
         }
         field = by_id.get(int(button_id), self._SORT_FIELD_NAME)
-        if field == self._sort_field:
-            return
-        self._sort_field = field
-        self._settings.setValue(self._SETTINGS_KEY_SORT_FIELD, field)
-        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
-            self._resort_main_view_visible()
-        self._tile_view.viewport().update()
-        self._list_view.viewport().update()
+        self.apply_sort_field_choice(field)
 
     def _on_sort_order_clicked(self, button_id: int) -> None:
-        asc = int(button_id) == 0
-        if asc == self._sort_ascending:
-            return
-        self._sort_ascending = asc
-        self._settings.setValue(self._SETTINGS_KEY_SORT_ASCENDING, self._sort_ascending)
-        if self._browser_context in ("asset", "shot") and self._items_unfiltered:
-            self._resort_main_view_visible()
-        self._tile_view.viewport().update()
-        self._list_view.viewport().update()
+        self.apply_sort_order_choice(int(button_id) == 0)
 
     def _sync_filter_work_radios_from_settings(self) -> None:
         by_mode = {
@@ -7443,13 +7672,20 @@ class MainView(QWidget):
     def _update_main_view_options_button(self) -> None:
         if hasattr(self, "_btn_main_view_options") and self._btn_main_view_options is not None:
             pct = int(round(self._card_scale_value * 100))
-            if self._view_mode == "tile":
+            ctx = self._browser_context
+            if ctx == "project":
                 self._btn_main_view_options.setToolTip(
-                    f"View options — card size {pct}%; Assets & Shots: User / Render / Smart (filter & sort later)"
+                    "View options — card size; sort projects by name, modified, or status"
+                    if self._view_mode == "tile"
+                    else "View options — sort projects by name, modified, or status"
+                )
+            elif self._view_mode == "tile":
+                self._btn_main_view_options.setToolTip(
+                    f"View options — card size {pct}%; Assets & Shots: thumbnail source, filter & sort"
                 )
             else:
                 self._btn_main_view_options.setToolTip(
-                    "View options — Assets & Shots: User / Render / Smart (filter & sort later)"
+                    "View options — Assets & Shots: thumbnail source, filter & sort"
                 )
             self._btn_main_view_options.setEnabled(True)
 
@@ -7916,6 +8152,8 @@ class MainView(QWidget):
     ) -> None:
         if getattr(self, "_selection_driven_by_state", False):
             return
+        if getattr(self, "_in_batch_set_items", False):
+            return
         if self._deferring_selection_notify():
             self._selection_notify_pending = True
             return
@@ -8084,6 +8322,87 @@ class MainView(QWidget):
         if self._hint_popup is lbl:
             self._hint_popup = None
 
+    def _ctx_menu_icon(self, name: str, *, dim: bool = False) -> QIcon:
+        color = MONOS_COLORS.get("text_muted", "#52525b") if dim else MONOS_COLORS["text_label"]
+        return lucide_icon(name, size=16, color_hex=color)
+
+    def _resolve_item_open_dcc_icon(
+        self,
+        item: ViewItem,
+        *,
+        has_dept_filter: bool,
+        active_dcc: str | None,
+    ) -> QIcon:
+        _dim = MONOS_COLORS.get("text_muted", "#52525b")
+        if not active_dcc and has_dept_filter and getattr(item.ref, "departments", None):
+            for d in item.ref.departments:
+                if (d.name or "").strip().casefold() == (self._active_department or "").strip().casefold():
+                    if getattr(d, "work_file_exists", False):
+                        active_dcc = getattr(d, "work_file_dcc", None) or (
+                            (d.work_file_dccs[0].strip() if d.work_file_dccs else None)
+                        )
+                    break
+        reg = get_default_dcc_registry()
+        info = reg.get_dcc_info(active_dcc) if active_dcc else {}
+        slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
+        color = info.get("brand_color_hex") if isinstance(info, dict) else None
+        if isinstance(slug, str) and slug.strip():
+            return brand_icon(slug.strip(), size=16, color_hex=(color if isinstance(color, str) else None))
+        return lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim)
+
+    def _list_older_work_versions(
+        self,
+        item: ViewItem,
+        department: str,
+        active_dcc: str,
+    ) -> list[tuple[int, Path]]:
+        if not isinstance(item.ref, (Asset, Shot)) or not self._project_root:
+            return []
+        dep_norm = (department or "").strip().casefold()
+        for d in getattr(item.ref, "departments", ()) or ():
+            if (d.name or "").strip().casefold() != dep_norm:
+                continue
+            use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
+            try:
+                work_path = resolve_work_path(
+                    d.path, active_dcc, use_dcc_folders, get_default_dcc_registry()
+                )
+                prefix = work_file_prefix(
+                    name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
+                    department=department,
+                )
+                return list_work_file_versions(work_path, prefix, active_dcc, get_default_dcc_registry())
+            except Exception:
+                return []
+        return []
+
+    def _append_open_older_version_submenu(
+        self,
+        menu: QMenu,
+        item: ViewItem,
+        *,
+        department: str,
+        active_dcc: str | None,
+        dim: bool = False,
+        badge_mode: bool = False,
+    ) -> None:
+        if not active_dcc:
+            return
+        older_versions = self._list_older_work_versions(item, department, active_dcc)
+        if len(older_versions) < 1:
+            return
+        open_older_menu = menu.addMenu(self._ctx_menu_icon("history", dim=dim), "Open older version")
+        for i, (ver, path) in enumerate(older_versions):
+            if i == 0:
+                act = open_older_menu.addAction(f"v{ver:03d} (newest)")
+                act.setEnabled(False)
+            else:
+                act = open_older_menu.addAction(f"v{ver:03d}")
+                if badge_mode:
+                    act.setData(path)
+                else:
+                    act.setData((path, active_dcc, department or ""))
+
     def _build_dcc_badge_context_menu(self, item: ViewItem, dcc_id: str, department: str) -> QMenu | None:
         """Build context menu for right-click on a DCC badge."""
         try:
@@ -8103,42 +8422,21 @@ class MainView(QWidget):
             dcc_icon = lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"])
 
         menu = QMenu(self)
+        # — Open / versions —
         open_act = menu.addAction(dcc_icon, f"Open with {dcc_label}")
-        # Submenu "Open older version" when multiple work file versions exist
-        older_versions: list[tuple[int, Path]] = []
-        if isinstance(item.ref, (Asset, Shot)) and self._project_root:
-            dep_norm = (department or "").strip().casefold()
-            for d in getattr(item.ref, "departments", ()) or ():
-                if (d.name or "").strip().casefold() == dep_norm:
-                    use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
-                    try:
-                        work_path = resolve_work_path(d.path, dcc_id, use_dcc_folders, reg)
-                        prefix = work_file_prefix(
-                            name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
-                            department=department,
-                        )
-                        older_versions = list_work_file_versions(work_path, prefix, dcc_id, reg)
-                    except Exception:
-                        older_versions = []
-                    break
-        if len(older_versions) >= 1:
-            open_older_menu = QMenu(self)
-            open_older_menu.setTitle("Open older version")
-            for i, (ver, path) in enumerate(older_versions):
-                if i == 0:
-                    act = open_older_menu.addAction(f"v{ver:03d} (newest)")
-                    act.setEnabled(False)
-                else:
-                    act = open_older_menu.addAction(f"v{ver:03d}")
-                    act.setData(path)
-            menu.addMenu(open_older_menu)
+        self._append_open_older_version_submenu(
+            menu, item, department=department, active_dcc=dcc_id, badge_mode=True
+        )
         menu.addSeparator()
+        # — Folder —
         folder_act = menu.addAction(
-            lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+            self._ctx_menu_icon("folder-open"),
             f"Open {dcc_label} Folder",
         )
+        menu.addSeparator()
+        # — Copy / paste —
         copy_act = menu.addAction(
-            dcc_icon,
+            self._ctx_menu_icon("copy"),
             f"Copy {dcc_label} Work Path",
         )
         copy_file_act = menu.addAction(dcc_icon, f"Copy {dcc_label} Work File")
@@ -8263,21 +8561,14 @@ class MainView(QWidget):
         menu = QMenu(self)
 
         if item.kind.value == "project":
-            switch_action = menu.addAction(
-                lucide_icon("arrow-right", size=16, color_hex=MONOS_COLORS["text_label"]),
-                "Switch to Project",
-            )
+            switch_action = menu.addAction(self._ctx_menu_icon("arrow-right"), "Switch to Project")
             menu.addSeparator()
-            copy_full_path = menu.addAction(
-                lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]),
-                "Copy Full Path",
-            )
-            open_folder = menu.addAction(
-                lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
-                "Open Folder",
-            )
+            copy_full_path = menu.addAction(self._ctx_menu_icon("copy"), "Copy Full Path")
+            copy_link = self._add_copy_monos_link_menu_action(menu)
+            open_folder = menu.addAction(self._ctx_menu_icon("folder-open"), "Open Folder")
             menu.setProperty("_act_switch_project", switch_action)
             menu.setProperty("_act_copy_full_path", copy_full_path)
+            menu.setProperty("_act_copy_link", copy_link)
             menu.setProperty("_act_open_folder", open_folder)
             return menu
 
@@ -8286,9 +8577,11 @@ class MainView(QWidget):
         create_new_action = None
         copy_inventory = None
         if item.kind.value == "inbox_item":
-            copy_full_path = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Full Path")
-            open_folder = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Folder")
+            copy_full_path = menu.addAction(self._ctx_menu_icon("copy"), "Copy Full Path")
+            copy_link = self._add_copy_monos_link_menu_action(menu)
+            open_folder = menu.addAction(self._ctx_menu_icon("folder-open"), "Open Folder")
             menu.setProperty("_act_copy_full_path", copy_full_path)
+            menu.setProperty("_act_copy_link", copy_link)
             menu.setProperty("_act_open_folder", open_folder)
             menu.setProperty("_act_open", None)
             menu.setProperty("_act_open_with", None)
@@ -8299,16 +8592,20 @@ class MainView(QWidget):
         has_dept_filter = bool((self._active_department or "").strip())
 
         if item.kind.value in ("asset", "shot") and self._show_publish:
-            open_latest = menu.addAction(lucide_icon("package-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Latest Publish Folder")
-            open_pub_root = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Publish Folder")
+            # — Publish folders —
+            open_latest = menu.addAction(self._ctx_menu_icon("package-open"), "Open Latest Publish Folder")
+            open_pub_root = menu.addAction(self._ctx_menu_icon("folder-open"), "Open Publish Folder")
             menu.addSeparator()
+            # — Copy / link —
             if has_dept_filter:
-                copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Publish Path")
+                copy_ctx = menu.addAction(self._ctx_menu_icon("copy"), "Copy Publish Path")
             else:
-                copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Path")
+                copy_ctx = menu.addAction(self._ctx_menu_icon("copy"), "Copy Path")
+            self._add_copy_monos_link_menu_action(menu)
             menu.addSeparator()
-            open_folder = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Folder")
-            open_work = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Work Folder")
+            # — Entity folders —
+            open_folder = menu.addAction(self._ctx_menu_icon("folder-open"), "Open Folder")
+            open_work = menu.addAction(self._ctx_menu_icon("folder"), "Open Work Folder")
             menu.setProperty("_act_open_latest_publish", open_latest)
             menu.setProperty("_act_open_publish_root", open_pub_root)
             menu.setProperty("_act_copy_context_path", copy_ctx)
@@ -8333,26 +8630,18 @@ class MainView(QWidget):
                             _has_work = True
                         break
             active_dcc = self.get_active_dcc(getattr(item.ref, "path", None), self._active_department) if has_dept_filter else None
-            # Icon for "Open": if user never clicked badge, use DCC from existing work file (same as double-click).
-            if not active_dcc and has_dept_filter and getattr(item.ref, "departments", None):
-                for d in item.ref.departments:
-                    if (d.name or "").strip().casefold() == (self._active_department or "").strip().casefold():
-                        if getattr(d, "work_file_exists", False):
-                            active_dcc = getattr(d, "work_file_dcc", None) or (
-                                (d.work_file_dccs[0].strip() if d.work_file_dccs else None)
-                            )
-                        break
-            reg = get_default_dcc_registry()
-            info = reg.get_dcc_info(active_dcc) if active_dcc else {}
-            slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
-            color = info.get("brand_color_hex") if isinstance(info, dict) else None
-            if isinstance(slug, str) and slug.strip():
-                open_icon = brand_icon(slug.strip(), size=16, color_hex=(color if isinstance(color, str) else None))
-            else:
-                open_icon = lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim)
+            open_icon = self._resolve_item_open_dcc_icon(
+                item, has_dept_filter=has_dept_filter, active_dcc=active_dcc
+            )
+
+            # — Open / review —
             open_action = menu.addAction(open_icon, "Open")
-            open_with_action = menu.addAction(lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim), "Open With…")
-            create_new_action = menu.addAction(lucide_icon("file-plus", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim), "Create New…")
+            open_with_action = menu.addAction(
+                self._ctx_menu_icon("layers", dim=not has_dept_filter), "Open With…"
+            )
+            create_new_action = menu.addAction(
+                self._ctx_menu_icon("file-plus", dim=not has_dept_filter), "Create New…"
+            )
             if not has_dept_filter:
                 open_action.setEnabled(False)
                 open_action.setToolTip(_no_dept_hint)
@@ -8360,67 +8649,25 @@ class MainView(QWidget):
                 open_with_action.setToolTip(_no_dept_hint)
                 create_new_action.setEnabled(False)
                 create_new_action.setToolTip(_no_dept_hint)
-            else:
-                # Disable Open / Open With when no work file in this department.
-                if not _has_work:
-                    open_action.setEnabled(False)
-                    open_action.setToolTip("No work file in this department.")
-                    open_with_action.setEnabled(False)
-                    open_with_action.setToolTip("No work file in this department.")
-            act_review = menu.addAction(
-                lucide_icon("play", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim),
-                "Review latest preview…",
-            )
-            if not has_dept_filter:
-                act_review.setEnabled(False)
-                act_review.setToolTip(_no_dept_hint)
-            from monostudio.core.openrv_launch import is_openrv_available
+            elif not _has_work:
+                open_action.setEnabled(False)
+                open_action.setToolTip("No work file in this department.")
+                open_with_action.setEnabled(False)
+                open_with_action.setToolTip("No work file in this department.")
 
-            act_openrv = menu.addAction(
-                lucide_icon("external-link", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim),
-                "Open in OpenRV…",
-            )
-            if not has_dept_filter:
-                act_openrv.setEnabled(False)
-                act_openrv.setToolTip(_no_dept_hint)
-            elif not is_openrv_available(getattr(self, "_settings", None)):
-                act_openrv.setEnabled(False)
-                act_openrv.setToolTip("Configure OpenRV path in Settings → General → Video player.")
-            # "Open older version" submenu when right-click on thumbnail: use same active_dcc as icon (already resolved above).
-            if has_dept_filter and isinstance(item.ref, (Asset, Shot)) and self._project_root and active_dcc:
-                dep_norm = (self._active_department or "").strip().casefold()
-                for d in getattr(item.ref, "departments", ()) or ():
-                    if (d.name or "").strip().casefold() == dep_norm:
-                        use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
-                        try:
-                            work_path = resolve_work_path(d.path, active_dcc, use_dcc_folders, get_default_dcc_registry())
-                            prefix = work_file_prefix(
-                                name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
-                                department=self._active_department,
-                            )
-                            older_versions = list_work_file_versions(
-                                work_path, prefix, active_dcc, get_default_dcc_registry()
-                            )
-                        except Exception:
-                            older_versions = []
-                        if len(older_versions) >= 1:
-                            open_older_menu = QMenu(self)
-                            open_older_menu.setTitle("Open older version")
-                            for i, (ver, path) in enumerate(older_versions):
-                                if i == 0:
-                                    act = open_older_menu.addAction(f"v{ver:03d} (newest)")
-                                    act.setEnabled(False)
-                                else:
-                                    act = open_older_menu.addAction(f"v{ver:03d}")
-                                    act.setData((path, active_dcc, self._active_department or ""))
-                            menu.addMenu(open_older_menu)
-                        break
-            menu.addSeparator()
             if has_dept_filter:
-                copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Work Path")
-                if not _has_work:
-                    copy_ctx.setEnabled(False)
-                    copy_ctx.setToolTip("No work file in this department.")
+                self._append_open_older_version_submenu(
+                    menu,
+                    item,
+                    department=self._active_department or "",
+                    active_dcc=active_dcc,
+                    dim=False,
+                )
+
+            menu.addSeparator()
+
+            # — Work file clipboard —
+            if has_dept_filter:
                 copy_work_file = menu.addAction(open_icon, "Copy Work File")
                 paste_work_file = menu.addAction(open_icon, "Paste Work File")
                 if not _has_work:
@@ -8434,32 +8681,31 @@ class MainView(QWidget):
                         "Paste as next version. Creates missing DCC subfolder and work folder if needed "
                         "(or only work/ when project uses flat work paths)."
                     )
+                menu.addSeparator()
+
+            # — Copy path / link —
+            if has_dept_filter:
+                copy_ctx = menu.addAction(self._ctx_menu_icon("copy"), "Copy Work Path")
+                if not _has_work:
+                    copy_ctx.setEnabled(False)
+                    copy_ctx.setToolTip("No work file in this department.")
             else:
-                copy_ctx = menu.addAction(lucide_icon("copy", size=16, color_hex=MONOS_COLORS["text_label"]), "Copy Path")
+                copy_ctx = menu.addAction(self._ctx_menu_icon("copy"), "Copy Path")
+            self._add_copy_monos_link_menu_action(menu)
             menu.addSeparator()
 
-        open_folder = menu.addAction(lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Folder")
         open_publish_folder = None
+        open_reference = None
+        open_concept = None
+        open_folder = menu.addAction(self._ctx_menu_icon("folder-open"), "Open Folder")
         if item.kind.value in ("asset", "shot"):
+            open_work = menu.addAction(self._ctx_menu_icon("folder"), "Open Work Folder")
             open_publish_folder = menu.addAction(
-                lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"]),
+                self._ctx_menu_icon("package-open"),
                 "Open Publish Folder",
             )
-            open_work = menu.addAction(
-                lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]),
-                "Open Work Folder",
-            )
-            open_reference = menu.addAction(
-                lucide_icon("eye", size=16, color_hex=MONOS_COLORS["text_label"]),
-                "Open Reference Folder",
-            )
-            open_concept = menu.addAction(
-                lucide_icon("lightbulb", size=16, color_hex=MONOS_COLORS["text_label"]),
-                "Open Concept Folder",
-            )
         else:
-            open_reference = None
-            open_concept = None
+            open_work = None
 
         menu.addSeparator()
 
@@ -8467,7 +8713,6 @@ class MainView(QWidget):
         rename_action = None
         refresh_action = None
         star_action = None
-        open_work = None
         open_publish = None
 
         if item.kind.value in ("asset", "shot"):
@@ -8482,13 +8727,9 @@ class MainView(QWidget):
                 "Unstar" if starred else "Star for Quick Jump",
             )
             menu.addSeparator()
-            menu.addAction(
-                lucide_icon("message-circle", size=16, color_hex=MONOS_COLORS["text_label"]),
-                "Notes…",
-            )
-            refresh_action = menu.addAction(lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]), "Refresh")
+            refresh_action = menu.addAction(self._ctx_menu_icon("refresh-cw"), "Refresh")
             if item.kind.value == "asset":
-                rename_action = menu.addAction(lucide_icon("pencil", size=16, color_hex=MONOS_COLORS["text_label"]), "Rename… (Beta)")
+                rename_action = menu.addAction(self._ctx_menu_icon("pencil"), "Rename… (Beta)")
             kind_word = "Asset" if item.kind.value == "asset" else "Shot"
             ent_name = (item.name or "").strip() or (item.path.name if item.path else "")
             delete_label = f"Move {kind_word} {ent_name} to Trash…" if ent_name else f"Move {kind_word} to Trash…"
@@ -8497,8 +8738,8 @@ class MainView(QWidget):
                 delete_action.setProperty("class", "danger-action")
                 delete_action.setData("delete_asset_or_shot")
         elif item.kind.value == "department":
-            open_work = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Work Folder")
-            open_publish = menu.addAction(lucide_icon("folder", size=16, color_hex=MONOS_COLORS["text_label"]), "Open Publish Folder")
+            open_work = menu.addAction(self._ctx_menu_icon("folder"), "Open Work Folder")
+            open_publish = menu.addAction(self._ctx_menu_icon("package-open"), "Open Publish Folder")
 
         menu.setProperty("_act_open_folder", open_folder)
         menu.setProperty("_act_open_publish_folder", open_publish_folder)
@@ -8533,14 +8774,17 @@ class MainView(QWidget):
         if text == "Review latest preview…":
             self.review_entity_requested.emit(item)
             return
-        if text == "Open in OpenRV…":
-            self.open_in_openrv_entity_requested.emit(item)
+        if text == "Open in DJV…":
+            self.open_in_djv_entity_requested.emit(item)
             return
         if text == "Switch to Project":
             self.switch_project_requested.emit(item)
             return
         if text == "Copy Inventory":
             self.copy_inventory_requested.emit(item)
+            return
+        if text == "Copy MONOS Link":
+            self.copy_link_requested.emit(item)
             return
         if text == "Open":
             self.open_requested.emit(item)

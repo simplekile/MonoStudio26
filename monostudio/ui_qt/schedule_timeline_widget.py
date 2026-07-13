@@ -6201,6 +6201,67 @@ class ScheduleGanttWidget(QWidget):
             wave_rollups=rollups,
         )
 
+    def apply_prepared_reload(self, prepared: object) -> None:
+        from monostudio.ui_qt.schedule_reload_worker import ScheduleReloadPrepared
+
+        if not isinstance(prepared, ScheduleReloadPrepared):
+            self.reload()
+            return
+        if self._project_root is None or self._project_index is None:
+            self.reload()
+            return
+        self._schedule = prepared.schedule
+        self._skip_resolver = ScheduleSkipResolver(self._project_root)
+        self._rebuild_entity_refs()
+        from monostudio.core.department_registry import DepartmentRegistry
+
+        self._dept_reg = DepartmentRegistry.for_project(self._project_root)
+        self._dept_order = list(prepared.dept_order)
+        self._asset_type_by_rel = dict(prepared.asset_type_by_rel)
+        all_groups = self._apply_dept_visibility(prepared.all_groups)
+        self._bars = prepared.bars
+        self._groups = self._filter_groups(all_groups)
+        known = {g.key for g in self._groups}
+        self._expanded = {k for k in self._expanded if k in known}
+        self._apply_canvas_data()
+        QTimer.singleShot(0, self.prefetch_entity_thumbnails)
+
+    def reload_responsive(self, worker_manager, *, on_done=None) -> None:
+        if self._project_root is None or self._project_index is None:
+            self.reload()
+            if on_done is not None:
+                on_done()
+            return
+        from monostudio.ui_qt.schedule_reload_worker import prepare_schedule_reload
+        from monostudio.ui_qt.ui_worker_loop import run_worker_async
+
+        root = self._project_root
+        index = self._project_index
+        include_shots = self._include_shots
+        include_assets = self._include_assets
+        category = f"schedule_gantt_reload_{id(self)}_{root}"
+
+        def _prepare() -> object:
+            return prepare_schedule_reload(
+                root,
+                index,
+                include_shots=include_shots,
+                include_assets=include_assets,
+            )
+
+        def _on_result(prepared: object | None, error: str | None) -> None:
+            if error:
+                self.reload()
+            else:
+                QTimer.singleShot(0, lambda p=prepared: self._apply_prepared_reload_async(p, on_done))
+
+        run_worker_async(worker_manager, category, _prepare, on_result=_on_result)
+
+    def _apply_prepared_reload_async(self, prepared: object, on_done) -> None:
+        self.apply_prepared_reload(prepared)
+        if on_done is not None:
+            on_done()
+
     def reload(self) -> None:
         if self._project_root is None or self._project_index is None:
             self._groups = []
@@ -6219,37 +6280,15 @@ class ScheduleGanttWidget(QWidget):
                 view_end=date.today() + timedelta(days=56),
             )
             return
-        self._schedule = read_project_schedule(self._project_root)
-        self._skip_resolver = ScheduleSkipResolver(self._project_root)
-        self._rebuild_entity_refs()
-        from monostudio.core.department_registry import DepartmentRegistry
+        from monostudio.ui_qt.schedule_reload_worker import prepare_schedule_reload
 
-        dept_reg = DepartmentRegistry.for_project(self._project_root)
-        self._dept_reg = dept_reg
-        self._dept_order = list(dept_reg.get_departments())
-        self._asset_type_by_rel = {}
-        for asset in self._project_index.assets:
-            rel = entity_rel_path(self._project_root, asset.path).replace("\\", "/")
-            self._asset_type_by_rel[rel] = (asset.asset_type or "").strip().casefold()
-        all_groups = build_timeline_entity_groups(
+        prepared = prepare_schedule_reload(
             self._project_root,
             self._project_index,
             include_shots=self._include_shots,
             include_assets=self._include_assets,
         )
-        all_groups = self._apply_dept_visibility(all_groups)
-        self._bars = build_planned_bars(
-            self._project_root,
-            self._project_index,
-            self._schedule,
-            include_shots=self._include_shots,
-            include_assets=self._include_assets,
-        )
-        self._groups = self._filter_groups(all_groups)
-        known = {g.key for g in self._groups}
-        self._expanded = {k for k in self._expanded if k in known}
-        self._apply_canvas_data()
-        QTimer.singleShot(0, self.prefetch_entity_thumbnails)
+        self.apply_prepared_reload(prepared)
 
     def set_thumbnail_manager(self, manager: ThumbnailManager | None) -> None:
         self._thumbnail_manager = manager
@@ -6379,11 +6418,18 @@ class ScheduleGanttWidget(QWidget):
                 self._label_pane.update()
                 return
 
-    def set_project(self, project_root: Path | None, project_index: ProjectIndex | None) -> None:
+    def set_project(
+        self,
+        project_root: Path | None,
+        project_index: ProjectIndex | None,
+        *,
+        reload_now: bool = True,
+    ) -> None:
         self._project_root = Path(project_root) if project_root else None
         self._project_index = project_index
         self.set_markers_unlocked(False)
-        self.reload()
+        if reload_now:
+            self.reload()
 
     def _on_expand_toggled(self, group_key: tuple, expanded: bool) -> None:
         if expanded:

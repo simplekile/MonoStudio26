@@ -169,6 +169,7 @@ class ProjectPickerDialog(MonosDialog):
             lucide_icon("refresh-cw", size=16, color_hex=MONOS_COLORS["text_label"]),
             "Refresh",
         )
+        sort_section = self._main_view.append_sort_context_submenu(menu)
         menu.addSeparator()
         new_proj = menu.addAction(
             lucide_icon("folder-plus", size=16, color_hex=MONOS_COLORS["text_label"]),
@@ -182,6 +183,8 @@ class ProjectPickerDialog(MonosDialog):
             )
         chosen = menu.exec(global_pos)
         if chosen is None:
+            return
+        if self._main_view.handle_sort_context_action(chosen, sort_section):
             return
         if chosen == act_refresh:
             parent = self.parent()

@@ -471,7 +471,8 @@ class InspectorPanel(QWidget):
     video_preview_requested = Signal(object)  # Path — legacy
     sequence_preview_requested = Signal(object)  # legacy
     review_open_requested = Signal(object)  # ReviewOpenRequest
-    open_in_openrv_requested = Signal(object)  # ReviewOpenRequest
+    open_in_djv_requested = Signal(object)  # ReviewOpenRequest
+    copy_link_requested = Signal(object)  # ViewItem (asset / shot)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -529,7 +530,7 @@ class InspectorPanel(QWidget):
         self._preview.remove_requested.connect(self._on_remove_requested)
         self._preview.video_preview_requested.connect(self.video_preview_requested.emit)
         self._preview.review_open_requested.connect(self.review_open_requested.emit)
-        self._preview.open_in_openrv_requested.connect(self.open_in_openrv_requested.emit)
+        self._preview.open_in_djv_requested.connect(self.open_in_djv_requested.emit)
         self._preview.sequence_preview_requested.connect(self.sequence_preview_requested.emit)
         self._show_publish: bool = False
         self._last_focused_department: str | None = None
@@ -2575,7 +2576,7 @@ class _InspectorPreview(QWidget):
     video_preview_requested = Signal(object)  # Path — legacy
     sequence_preview_requested = Signal(object)  # legacy
     review_open_requested = Signal(object)  # ReviewOpenRequest
-    open_in_openrv_requested = Signal(object)  # ReviewOpenRequest
+    open_in_djv_requested = Signal(object)  # ReviewOpenRequest
 
     _PREVIEW_CACHE_MAX = 50
     _PREVIEW_RESIZE_DEBOUNCE_MS = 200
@@ -2738,6 +2739,12 @@ class _InspectorPreview(QWidget):
     def invalidate_settings_dependent_cache(self) -> None:
         self._preview_thumb_cache.clear()
         self._seq_decode_bucket = None
+        try:
+            from monostudio.ui_qt.sequence_preview_decode import invalidate_decoded_frame_cache
+
+            invalidate_decoded_frame_cache()
+        except Exception:
+            pass
 
     def drop_preview_thumb_cache_for_item(self, item_path: Path) -> None:
         """Drop cached inspector preview pixmaps for one entity (e.g. after ``.meta`` thumb change)."""
@@ -3135,13 +3142,33 @@ class _InspectorPreview(QWidget):
             else:
                 break
 
+    def _inspector_seq_decode_bucket(self) -> int:
+        mx = self._inspector_preview_decode_max_side()
+        return max(64, (mx // 64) * 64)
+
+    def _inspector_seq_buffer_side(self, idx: int) -> int:
+        pix = self._seq_buffer.get(idx)
+        if pix is None or pix.isNull():
+            return 0
+        return max(pix.width(), pix.height())
+
+    def _inspector_seq_frame_ok(self, idx: int) -> bool:
+        if idx not in self._seq_buffer:
+            return False
+        bucket = self._inspector_seq_decode_bucket()
+        return self._inspector_seq_buffer_side(idx) >= max(64, bucket - 48)
+
     def _request_inspector_seq_decode(self, idx: int) -> None:
         n = len(self._sequence_frames)
         if idx < 0 or idx >= n:
             return
         if self._preview_resizing:
             return
-        if idx in self._seq_buffer or idx in self._seq_in_flight:
+        if idx in self._seq_buffer:
+            if self._inspector_seq_frame_ok(idx):
+                return
+            del self._seq_buffer[idx]
+        if idx in self._seq_in_flight:
             return
         self._ensure_inspector_seq_pool()
         self._seq_in_flight.add(idx)
@@ -3157,10 +3184,12 @@ class _InspectorPreview(QWidget):
         idx = max(0, min(n - 1, idx))
         self._seq_index = idx
         w = self._container._w
-        if idx in self._seq_buffer:
+        if idx in self._seq_buffer and self._inspector_seq_frame_ok(idx):
             w.set_pixmap(self._seq_buffer[idx], use_fit=self._last_thumb_use_fit)
             self._seq_live_display = True
             return
+        if idx in self._seq_buffer:
+            del self._seq_buffer[idx]
         self._request_inspector_seq_decode(idx)
 
     def _scrub_inspector_seq_to_x(self, lx: int, width: int) -> None:
@@ -3196,6 +3225,12 @@ class _InspectorPreview(QWidget):
         self._seq_in_flight.clear()
         if self._seq_pool is not None:
             self._seq_pool.clear()
+        bucket = self._inspector_seq_decode_bucket()
+        if self._seq_decode_bucket != bucket or any(
+            not self._inspector_seq_frame_ok(k) for k in list(self._seq_buffer)
+        ):
+            self._seq_buffer.clear()
+        self._seq_decode_bucket = bucket
         self._seq_playing = True
         self._request_inspector_seq_decode(self._seq_index)
         pn = self._inspector_seq_prefetch_n()
@@ -3219,7 +3254,7 @@ class _InspectorPreview(QWidget):
         n = len(self._sequence_frames)
         nxt = (self._seq_index + 1) % n
         pn = self._inspector_seq_prefetch_n()
-        if nxt in self._seq_buffer:
+        if nxt in self._seq_buffer and self._inspector_seq_frame_ok(nxt):
             self._show_inspector_seq_frame(nxt)
             for k in range(1, pn + 1):
                 j = (self._seq_index + k) % n
@@ -3239,7 +3274,7 @@ class _InspectorPreview(QWidget):
             if not pix.isNull():
                 self._seq_buffer[idx] = pix
                 self._trim_inspector_seq_buffer()
-        if idx == self._seq_index and idx in self._seq_buffer:
+        if idx == self._seq_index and idx in self._seq_buffer and self._inspector_seq_frame_ok(idx):
             self._container._w.set_pixmap(self._seq_buffer[idx], use_fit=self._last_thumb_use_fit)
             self._seq_live_display = True
 
@@ -3332,10 +3367,10 @@ class _InspectorPreview(QWidget):
             return True
         return False
 
-    def _emit_open_in_openrv(self) -> None:
+    def _emit_open_in_djv(self) -> None:
         request = self._resolve_review_open_request()
         if request is not None:
-            self.open_in_openrv_requested.emit(request)
+            self.open_in_djv_requested.emit(request)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if watched is not self._container._w:
@@ -3810,19 +3845,19 @@ class _InspectorPreview(QWidget):
             )
             act_review.triggered.connect(self._try_emit_review_open)
             menu.insertAction(act_open, act_review)
-            from monostudio.core.openrv_launch import is_openrv_available
+            from monostudio.core.djv_launch import is_djv_available
 
-            act_openrv = QAction(
-                lucide_icon("external-link", size=16, color_hex=MONOS_COLORS["text_label"]),
-                "Open in OpenRV…",
+            act_djv = QAction(
+                lucide_icon("clapperboard", size=16, color_hex=MONOS_COLORS["text_label"]),
+                "Open in DJV…",
                 menu,
             )
-            rv_available = is_openrv_available(self._qsettings)
-            act_openrv.setEnabled(rv_available)
-            if not rv_available:
-                act_openrv.setToolTip("Configure OpenRV path in Settings → General → Video player.")
-            act_openrv.triggered.connect(self._emit_open_in_openrv)
-            menu.insertAction(act_open, act_openrv)
+            djv_available = is_djv_available(self._qsettings)
+            act_djv.setEnabled(djv_available)
+            if not djv_available:
+                act_djv.setToolTip("Configure DJV path in Settings → General → Video player.")
+            act_djv.triggered.connect(self._emit_open_in_djv)
+            menu.insertAction(act_open, act_djv)
 
         seq_dir = self._sequence_folder if (self._sequence_folder is not None and self._sequence_folder.is_dir()) else None
         act_open_render = QAction(
@@ -4431,6 +4466,15 @@ class _InspectorAssetStatusBlock(QWidget):
         self._act_copy_concept_path.triggered.connect(self._on_copy_concept_path_clicked)
         menu.addAction(self._act_copy_concept_path)
 
+        self._act_copy_monos_link = QAction(
+            lucide_icon("link", size=16, color_hex=MONOS_COLORS["text_label"]),
+            "Copy MONOS Link",
+            self,
+        )
+        self._act_copy_monos_link.triggered.connect(self._on_copy_monos_link_clicked)
+        menu.addSeparator()
+        menu.addAction(self._act_copy_monos_link)
+
         self._quick_actions_btn.setMenu(menu)
         row2_l.addWidget(self._quick_actions_btn, 0)
         row2_l.addStretch(1)
@@ -4508,7 +4552,13 @@ class _InspectorAssetStatusBlock(QWidget):
         self._act_copy_publish_path.setEnabled(is_asset_or_shot)
         self._act_copy_reference_path.setEnabled(is_asset_or_shot)
         self._act_copy_concept_path.setEnabled(is_asset_or_shot)
+        self._act_copy_monos_link.setEnabled(is_asset_or_shot)
         self.refresh_notes_display(item if is_asset_or_shot else None)
+
+    def _on_copy_monos_link_clicked(self) -> None:
+        item = self._current_item
+        if item is not None:
+            self.copy_link_requested.emit(item)
 
     def _on_copy_dcc_work_path_clicked(self) -> None:
         item = self._current_item
