@@ -1,20 +1,14 @@
-# MonoStudio 26 — Release v26.17.0
+# MonoStudio 26 — Release v26.17.1
 
 ## Highlights
 
-- **DJV View sidecar**: Thay OpenRV — launch DJV View từ review; Settings → path + detect; registry fallback Windows.
-- **OCIO sequence review**: Display transform ACEScg → view (PyOpenColorIO); bundled ACES 1.3 config; EXR/DPX/HDR plate decode.
-- **Deep links**: `monostudio://` mở rộng — navigate + flash highlight (`link_reveal`); URL protocol & deep_link core.
-- **Async UI workers**: `ui_worker_loop` + `schedule_reload_worker` — background tasks không block loading animation.
-- **Video player settings**: Dialog cấu hình preview/playback; OCIO preview settings.
-- **Explorer**: File sort; inbox/outbox/internal-check toolbar & split view cập nhật.
-- **Build**: Installer script + publish tweaks; `opencolorio` dependency.
+- **Fix explorer thumbnails**: Async decode dùng `Signal` + `QImage` thay `QMetaObject.invokeMethod` — hết crash `Unable to find a QMetaType for "object"` trên Inbox/Outbox/Guide.
+- **v26.17.0** (chưa publish trước đó): DJV sidecar, OCIO sequence review, deep link reveal, async UI workers, video player settings.
 
 ## Changes in this release
 
-- feat: `djv_launch.py`, `ocio_display.py`, `ocio_preview_settings.py`, `video_player_settings_dialog.py`, `link_reveal.py`, `explorer_file_sort.py`.
-- feat: `ui_worker_loop.py`, `schedule_reload_worker.py`, `deep_link.py`, `main_window.py`, `main_view.py`.
-- remove: `openrv_launch.py` (replaced by DJV).
+- fix: `explorer_thumbnail_loader.py` — cross-thread thumbnail decode via queued signal.
+- includes: DJV, OCIO, deep links, explorer sort, `ui_worker_loop` (from v26.17.0).
 
 ## Install
 

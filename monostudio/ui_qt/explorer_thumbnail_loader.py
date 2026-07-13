@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Slot, QMetaObject, Qt, Q_ARG
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Slot, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QAbstractItemView, QWidget
 
@@ -23,32 +23,33 @@ def _path_key(path: Path) -> str:
         return str(path)
 
 
+class _ExplorerThumbDecodeSignaler(QObject):
+    decoded = Signal(str, int, QImage)  # path_key, gen; null QImage = decode failed
+
+
 class _ExplorerThumbDecodeRunnable(QRunnable):
     def __init__(
         self,
         path_key: str,
         size_px: int,
         gen: int,
-        loader: "ExplorerThumbnailLoader",
+        signaler: _ExplorerThumbDecodeSignaler,
     ) -> None:
         super().__init__()
         self.setAutoDelete(True)
         self._path_key = path_key
         self._size_px = size_px
         self._gen = gen
-        self._loader = loader
+        self._signaler = signaler
 
     def run(self) -> None:
         result = decode_explorer_preview_qimage_worker(self._path_key, self._size_px)
-        image: QImage | None = result[1] if result else None
-        QMetaObject.invokeMethod(
-            self._loader,
-            "_apply_decoded",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(str, self._path_key),
-            Q_ARG(int, self._gen),
-            Q_ARG(object, image),
-        )
+        image = result[1] if result else None
+        qimg = image if isinstance(image, QImage) and not image.isNull() else QImage()
+        try:
+            self._signaler.decoded.emit(self._path_key, self._gen, qimg)
+        except RuntimeError:
+            pass
 
 
 class ExplorerThumbnailLoader(QObject):
@@ -70,6 +71,11 @@ class ExplorerThumbnailLoader(QObject):
         self._loading_timer = QTimer(self)
         self._loading_timer.setInterval(50)
         self._loading_timer.timeout.connect(self._on_loading_tick)
+        self._decode_signaler = _ExplorerThumbDecodeSignaler(self)
+        self._decode_signaler.decoded.connect(
+            self._apply_decoded,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     @property
     def loading_angle(self) -> float:
@@ -168,7 +174,7 @@ class ExplorerThumbnailLoader(QObject):
         self._pending.add(key)
         self._start_loading_timer()
         QThreadPool.globalInstance().start(
-            _ExplorerThumbDecodeRunnable(key, decode_px, self._gen, self)
+            _ExplorerThumbDecodeRunnable(key, decode_px, self._gen, self._decode_signaler)
         )
 
     def get_or_request(self, path: Path) -> QPixmap | None:
@@ -177,14 +183,14 @@ class ExplorerThumbnailLoader(QObject):
             self.request(path)
         return pm
 
-    @Slot(str, int, object)
-    def _apply_decoded(self, path_key: str, gen: int, image: object) -> None:
+    @Slot(str, int, QImage)
+    def _apply_decoded(self, path_key: str, gen: int, image: QImage) -> None:
         if gen != self._gen:
             return
         self._pending.discard(path_key)
         path = Path(path_key)
         pm: QPixmap | None = None
-        if isinstance(image, QImage) and not image.isNull():
+        if not image.isNull():
             pm = self._disk_cache.adopt_decoded_thumbnail(path, image)
             if pm is not None and not pm.isNull():
                 pm = self._pixmap_for_ui(pm)
