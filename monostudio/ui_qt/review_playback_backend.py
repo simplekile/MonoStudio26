@@ -277,13 +277,19 @@ class SequenceDecodeBackend(QObject):
     def _frame_meets_target(self, idx: int) -> bool:
         if idx not in self._buffer:
             return False
+        pix = self._buffer.get(idx)
+        if pix is None or pix.isNull():
+            return False
         requested = self._buffer_decode_side.get(idx, 0)
         target = self._target_decode_side()
+        # Viewport grew since this frame was decoded — need a higher-res pass.
         if requested < target - 32:
             return False
         actual = self._buffer_side_for(idx)
-        need = min(requested, target)
-        return actual >= max(64, need - 48)
+        if actual < 8:
+            return False
+        # Plates are never upscaled: a 640px flipbook decoded at a 1088px bucket is final.
+        return True
 
     def _invalidate_decode_cache(self) -> None:
         self._decode_generation.bump()

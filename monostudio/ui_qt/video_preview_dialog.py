@@ -78,7 +78,6 @@ from monostudio.core.video_media import (
     VideoInfo,
     VideoReviewMarker,
     export_sequence_markers_png,
-    export_sequence_ranges,
     export_video_markers_png,
     extract_video_frame_png_bytes,
     fallback_scrub_snap_frames,
@@ -1347,6 +1346,10 @@ class VideoPreviewDialog(FramelessMainWindow):
         )
         tlay.setSpacing(8)
 
+        self._btn_play = self._tool_btn("play", "Play / pause (Space)", compact=True)
+        self._btn_play.clicked.connect(self._toggle_play)
+        tlay.addWidget(self._btn_play)
+
         self._transport_controls = QWidget(self._transport)
         self._transport_controls.setObjectName("VideoPreviewTransportControls")
         transport_btn_lay = QHBoxLayout(self._transport_controls)
@@ -1354,15 +1357,12 @@ class VideoPreviewDialog(FramelessMainWindow):
         transport_btn_lay.setSpacing(2)
         self._btn_prev_file = self._tool_btn("skip-back", "Previous file", compact=True)
         self._btn_prev_file.clicked.connect(self._prev_file)
-        self._btn_play = self._tool_btn("play", "Play / pause (Space)", compact=True)
-        self._btn_play.clicked.connect(self._toggle_play)
         self._btn_next_file = self._tool_btn("skip-forward", "Next file", compact=True)
         self._btn_next_file.clicked.connect(self._next_file)
         self._btn_tools_panel = self._tool_btn("sliders-horizontal", "Tools panel (T)", compact=True)
         self._btn_tools_panel.setCheckable(True)
         self._btn_tools_panel.clicked.connect(self._toggle_tools_workspace)
         transport_btn_lay.addWidget(self._btn_prev_file)
-        transport_btn_lay.addWidget(self._btn_play)
         transport_btn_lay.addWidget(self._btn_next_file)
         transport_btn_lay.addWidget(self._btn_tools_panel)
         tlay.addWidget(self._transport_controls)
@@ -1557,6 +1557,7 @@ class VideoPreviewDialog(FramelessMainWindow):
         tlay.addWidget(self._btn_export)
 
         for w in (
+            self._btn_play,
             self._chk_precise_scrub,
             self._chk_loop,
             self._chk_proxy,
@@ -1737,6 +1738,14 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._chk_loop,
         ]
 
+    def _transport_compact_protected_widgets(self) -> list[QWidget]:
+        """Never auto-hidden when the transport bar is narrow."""
+        return [
+            self._btn_play,
+            self._position_box,
+            self._transport_controls,
+        ]
+
     def _mark_transport_logical_visibility(self) -> None:
         if not hasattr(self, "_transport"):
             return
@@ -1821,9 +1830,13 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._volume_slider.setFixedWidth(80)
 
         self._sync_position_box_width(avail=avail)
+        protected = {id(w) for w in self._transport_compact_protected_widgets()}
         for w in self._transport_layout_widgets():
             wid = id(w)
             w.setVisible(logical.get(wid, True) and wid not in suppressed)
+        for w in self._transport_compact_protected_widgets():
+            if logical.get(id(w), True):
+                w.setVisible(True)
 
     def _sync_transport_bar_layout(self) -> None:
         self._mark_transport_logical_visibility()
@@ -2055,8 +2068,10 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._volume_slider,
             self._btn_prev_file,
             self._btn_next_file,
+            self._cmb_time_display,
         ):
             w.setVisible(not seq)
+        self._btn_play.setVisible(True)
         self._cmb_proxy_scale.setVisible(True)
         if seq:
             self._cmb_proxy_scale.setToolTip(
@@ -2151,12 +2166,37 @@ class VideoPreviewDialog(FramelessMainWindow):
             lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(label, 1)
         self._seq_label_parented = True
+        self._surface.show()
         label.show()
+        label.raise_()
         self._video_attached = False
+
+    def _detach_embedded_video_for_sequence(self) -> None:
+        """Drop mpv/Qt video embed so the sequence QLabel is visible."""
+        if self._video_attached:
+            try:
+                self._backend.stop()
+            except Exception:
+                pass
+        name = getattr(self._backend, "name", "")
+        if name not in ("noop",):
+            from monostudio.ui_qt.video_player_backend import create_sequence_placeholder_backend
+
+            old = self._backend
+            self._backend = create_sequence_placeholder_backend()
+            try:
+                old.release()
+            except Exception:
+                pass
+        self._video_attached = False
+        self._set_surface_native_for_mode()
+        surface = getattr(self, "_surface", None)
+        if surface is not None:
+            surface.show()
 
     def _load_sequence(self, request: ReviewOpenRequest) -> None:
         assert request.sequence_folder is not None
-        self._set_surface_native_for_mode()
+        self._detach_embedded_video_for_sequence()
         self._sequence_load_token += 1
         token = self._sequence_load_token
         folder = request.sequence_folder
@@ -7373,43 +7413,35 @@ class VideoPreviewDialog(FramelessMainWindow):
         if self._is_sequence_mode():
             if not self._sequence_frames or self._sequence_folder is None:
                 return
-            default_dir = self._sequence_folder.parent / f"{self._sequence_folder.name}_cuts"
-            folder = QFileDialog.getExistingDirectory(
-                self,
-                "Export sequence ranges",
-                str(default_dir if default_dir.is_dir() else self._sequence_folder.parent),
+            dlg = VideoExportDialog(
+                self._sequence_folder,
+                self._ranges,
+                fps=self._fps(),
+                sequence_frames=self._sequence_frames,
+                default_output_dir=self._sequence_folder.parent / f"{self._sequence_folder.name}_cuts",
+                settings=self._settings,
+                parent=self,
             )
-            if not folder:
+        else:
+            if self._path is None or self._info is None:
                 return
-            try:
-                outs = export_sequence_ranges(
-                    self._sequence_frames,
-                    self._ranges,
-                    Path(folder),
-                    fps=self._fps(),
-                )
-            except Exception as exc:
-                QMessageBox.warning(self, "Export failed", str(exc))
+            dlg = VideoExportDialog(
+                self._path,
+                self._ranges,
+                fps=self._info.fps,
+                default_output_dir=self._path.parent / f"{self._path.stem}_cuts",
+                settings=self._settings,
+                parent=self,
+            )
+
+        def _on_export_finished(outs: object) -> None:
+            if not isinstance(outs, list) or not outs:
                 return
-            if outs:
-                self._hud.setText(f"Exported {len(outs)} file(s)")
-                self.export_completed.emit(outs)
-            return
-        if self._path is None or self._info is None:
-            return
-        dlg = VideoExportDialog(
-            self._path,
-            self._ranges,
-            fps=self._info.fps,
-            default_output_dir=self._path.parent / f"{self._path.stem}_cuts",
-            settings=self._settings,
-            parent=self,
-        )
-        if dlg.exec() == VideoExportDialog.DialogCode.Accepted:
-            outs = dlg.outputs()
-            if outs:
-                self._hud.setText(f"Exported {len(outs)} file(s)")
-                self.export_completed.emit(outs)
+            self._hud.setText(f"Exported {len(outs)} file(s)")
+            self.export_completed.emit(outs)
+
+        dlg.export_finished.connect(_on_export_finished)
+        dlg.exec()
 
 
 VideoPreviewWindow = VideoPreviewDialog

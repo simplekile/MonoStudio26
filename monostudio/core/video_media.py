@@ -1219,7 +1219,13 @@ def export_sequence_ranges(
             return None
         return frames[frame_idx]
 
-    def _export_range_to_video(rng: VideoFrameRange, dst: Path) -> None:
+    def _export_range_to_video(
+        rng: VideoFrameRange,
+        dst: Path,
+        *,
+        progress_callback: ExportSubProgressCallback | None = None,
+        cancel_check: ExportCancelCheck | None = None,
+    ) -> None:
         in_f = max(0, min(len(frames) - 1, rng.in_frame))
         out_f = max(in_f, min(len(frames) - 1, rng.out_frame))
         seg_dir = output_dir / f".{dst.stem}_frames"
@@ -1238,11 +1244,15 @@ def export_sequence_ranges(
         if last_fp is not None:
             lines.append(f"file '{last_fp.resolve().as_posix()}'")
         list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        duration = max(0.01, (out_f - in_f + 1) / max(1e-6, fps))
         args = [
             ffmpeg,
             "-y",
+            "-hide_banner",
             "-loglevel",
             "error",
+            "-progress",
+            "pipe:1",
             "-f",
             "concat",
             "-safe",
@@ -1254,46 +1264,84 @@ def export_sequence_ranges(
         ]
         args.extend(_ffmpeg_output_args(dst, reencode=reencode, src=frames[0]))
         args.append(str(dst))
-        proc = subprocess.run(
+        _run_ffmpeg_with_progress(
             args,
-            capture_output=True,
-            timeout=600,
-            check=False,
-            **hide_console_subprocess_kwargs(),
+            duration_sec=duration,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
         )
-        if proc.returncode != 0 or not dst.is_file():
-            err = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip()
-            raise RuntimeError(err or f"FFmpeg export failed for range {rng.in_frame}-{rng.out_frame}")
 
     if mode == "separate":
-        total = len(ranges)
+        total_steps = len(ranges)
         for i, rng in enumerate(ranges, start=1):
             if cancel_check and cancel_check():
                 break
-            if progress_callback:
-                progress_callback(i - 1, total, None)
             out_name = _output_name_for_range(stem, suffix, i, rng, name_template, used_names=used_names)
             dst = output_dir / out_name
-            _export_range_to_video(rng, dst)
+            step_base = float(i - 1)
+
+            def _on_sub(
+                sub: float,
+                _base: float = step_base,
+                _dst: Path = dst,
+            ) -> None:
+                _report_export_progress(
+                    progress_callback,
+                    step_done=_base + sub,
+                    total_steps=total_steps,
+                    path=_dst,
+                )
+
+            _export_range_to_video(
+                rng,
+                dst,
+                progress_callback=_on_sub,
+                cancel_check=cancel_check,
+            )
             outputs.append(dst)
-            if progress_callback:
-                progress_callback(i, total, dst)
+            _report_export_progress(
+                progress_callback,
+                step_done=float(i),
+                total_steps=total_steps,
+                path=dst,
+            )
         return outputs
 
-    total = len(ranges) + 1
+    total_steps = len(ranges) + 1
     seg_paths: list[Path] = []
     seg_dir = output_dir / f".{stem}_segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
     for i, rng in enumerate(ranges, start=1):
         if cancel_check and cancel_check():
             break
-        if progress_callback:
-            progress_callback(i - 1, total, None)
         seg = seg_dir / f"seg_{i:03d}{suffix}"
-        _export_range_to_video(rng, seg)
+        step_base = float(i - 1)
+
+        def _on_seg_sub(
+            sub: float,
+            _base: float = step_base,
+            _seg: Path = seg,
+        ) -> None:
+            _report_export_progress(
+                progress_callback,
+                step_done=_base + sub,
+                total_steps=total_steps,
+                path=_seg,
+            )
+
+        _export_range_to_video(
+            rng,
+            seg,
+            progress_callback=_on_seg_sub,
+            cancel_check=cancel_check,
+        )
         seg_paths.append(seg)
-        if progress_callback:
-            progress_callback(i, total, seg)
+        _report_export_progress(
+            progress_callback,
+            step_done=float(i),
+            total_steps=total_steps,
+            path=seg,
+        )
     if not seg_paths:
         return []
     list_file = seg_dir / "concat.txt"
@@ -1302,13 +1350,28 @@ def export_sequence_ranges(
         encoding="utf-8",
     )
     final = output_dir / f"{stem}_concat{suffix}"
-    if progress_callback:
-        progress_callback(len(ranges), total, None)
+    concat_duration = sum(
+        max(0.01, (max(0, min(len(frames) - 1, rng.out_frame)) - max(0, min(len(frames) - 1, rng.in_frame)) + 1)
+        / max(1e-6, fps))
+        for rng in ranges
+    )
+
+    def _on_concat_sub(sub: float) -> None:
+        _report_export_progress(
+            progress_callback,
+            step_done=float(len(ranges)) + sub,
+            total_steps=total_steps,
+            path=final,
+        )
+
     args = [
         ffmpeg,
         "-y",
+        "-hide_banner",
         "-loglevel",
         "error",
+        "-progress",
+        "pipe:1",
         "-f",
         "concat",
         "-safe",
@@ -1318,19 +1381,19 @@ def export_sequence_ranges(
     ]
     args.extend(_ffmpeg_output_args(final, reencode=reencode, src=frames[0]))
     args.append(str(final))
-    proc = subprocess.run(
+    _run_ffmpeg_with_progress(
         args,
-        capture_output=True,
-        timeout=600,
-        check=False,
-        **hide_console_subprocess_kwargs(),
+        duration_sec=max(0.01, concat_duration),
+        progress_callback=_on_concat_sub,
+        cancel_check=cancel_check,
     )
-    if proc.returncode != 0 or not final.is_file():
-        err = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip()
-        raise RuntimeError(err or "FFmpeg concat export failed")
     outputs.append(final)
-    if progress_callback:
-        progress_callback(total, total, final)
+    _report_export_progress(
+        progress_callback,
+        step_done=float(total_steps),
+        total_steps=total_steps,
+        path=final,
+    )
     return outputs
 
 

@@ -4268,10 +4268,10 @@ def apply_dark_theme(app: QApplication) -> None:
         QProgressBar#VideoExportProgress {
             background-color: #27272a;
             border: none;
-            border-radius: 4px;
+            border-radius: 6px;
             text-align: center;
-            min-height: 10px;
-            max-height: 10px;
+            min-height: 20px;
+            max-height: 20px;
             color: #e4e4e7;
             font-family: "Inter";
             font-size: 11px;
@@ -4279,7 +4279,7 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QProgressBar#VideoExportProgress::chunk {
             background-color: #3b82f6;
-            border-radius: 4px;
+            border-radius: 6px;
         }
         QToolButton#DialogSizeGrip {
             background: transparent;

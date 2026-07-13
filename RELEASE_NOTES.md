@@ -1,14 +1,16 @@
-# MonoStudio 26 — Release v26.17.1
+# MonoStudio 26 — Release v26.17.2
 
 ## Highlights
 
-- **Fix explorer thumbnails**: Async decode dùng `Signal` + `QImage` thay `QMetaObject.invokeMethod` — hết crash `Unable to find a QMetaType for "object"` trên Inbox/Outbox/Guide.
-- **v26.17.0** (chưa publish trước đó): DJV sidecar, OCIO sequence review, deep link reveal, async UI workers, video player settings.
+- **Video export**: Progress theo từng range; FFmpeg `-progress pipe:1`; cancel giữa chừng; export nhiều đoạn ổn định hơn.
+- **Sequence flipbook**: Decode bucket theo viewport — chấp nhận plate nhỏ hơn khi đủ sharp; không giữ frame bucket cũ khi resize.
+- **Review player**: Preview dialog & playback backend đồng bộ export/decode.
 
 ## Changes in this release
 
-- fix: `explorer_thumbnail_loader.py` — cross-thread thumbnail decode via queued signal.
-- includes: DJV, OCIO, deep links, explorer sort, `ui_worker_loop` (from v26.17.0).
+- fix: `video_export_dialog.py`, `video_media.py` — ranged export progress + cancel.
+- fix: `review_playback_backend.py`, `video_preview_dialog.py` — sequence decode display bucket.
+- test: `test_sequence_decode_backend.py`.
 
 ## Install
 
