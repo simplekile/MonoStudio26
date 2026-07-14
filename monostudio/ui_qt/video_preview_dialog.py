@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Literal
 
 from PySide6.QtCore import QByteArray, QObject, QPoint, QPointF, QRect, QRectF, QEvent, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCursor, QFont, QGuiApplication, QImageReader, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QColor, QShortcut, QWheelEvent, QAction
+from PySide6.QtGui import QCursor, QFont, QGuiApplication, QImage, QImageReader, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QColor, QShortcut, QWheelEvent, QAction
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -116,7 +117,7 @@ from monostudio.core.video_media import (
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.video_player_settings_dialog import VideoPlayerSettingsDialog
 from monostudio.ui_qt.inspector_preview_settings import read_sequence_preview_fps, write_sequence_preview_fps
-from monostudio.ui_qt.review_draw_overlay import ReviewDrawOverlay
+from monostudio.ui_qt.review_draw_overlay import ReviewDrawOverlay, composite_draw_onto_image
 from monostudio.ui_qt.review_onion_layer import ReviewOnionLayer
 from monostudio.ui_qt.video_review_draw_panel import VideoReviewDrawTransportActions
 from monostudio.ui_qt.video_review_draw_brush_strip import VideoReviewDrawBrushStrip
@@ -202,6 +203,8 @@ from monostudio.ui_qt.video_preview_settings import (
     write_video_preview_always_on_top,
     write_video_preview_playback_speed,
     write_video_preview_precise_scrub_drag,
+    write_video_preview_proxy_enabled,
+    write_video_preview_proxy_scale,
     write_video_preview_time_display,
     write_video_preview_volume,
     TIME_DISPLAY_FRAME,
@@ -308,10 +311,11 @@ def _stack_widget_hwnd_above(upper: QWidget, lower: QWidget) -> bool:
 
 
 class _VideoPreviewTopBar(QWidget):
-    """Top chrome: source switcher, title, window Min/Max/Close (FramelessMainWindow title bar)."""
+    """Top chrome: source switcher, entity playlist, title, window Min/Max/Close."""
 
     always_on_top_toggled = Signal(bool)
     switch_clicked = Signal()
+    entity_playlist_clicked = Signal()
     minimize_clicked = Signal()
     maximize_clicked = Signal()
     close_clicked = Signal()
@@ -335,9 +339,21 @@ class _VideoPreviewTopBar(QWidget):
         self.switch_btn.setFixedSize(_PREVIEW_SWITCH_BTN, _PREVIEW_SWITCH_BTN)
         self.switch_btn.setIcon(lucide_icon("clapperboard", size=16, color_hex="#a1a1aa"))
         self.switch_btn.setIconSize(QSize(16, 16))
-        self.switch_btn.setToolTip("Switch video or review source")
+        self.switch_btn.setToolTip("Switch version or review source")
         self.switch_btn.clicked.connect(self.switch_clicked.emit)
         lay.addWidget(self.switch_btn, 0)
+
+        self.entity_btn = QToolButton(self)
+        self.entity_btn.setObjectName("VideoPreviewSwitchBtn")
+        self.entity_btn.setAutoRaise(False)
+        self.entity_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.entity_btn.setFixedSize(_PREVIEW_SWITCH_BTN, _PREVIEW_SWITCH_BTN)
+        self.entity_btn.setIcon(lucide_icon("film", size=16, color_hex="#a1a1aa"))
+        self.entity_btn.setIconSize(QSize(16, 16))
+        self.entity_btn.setToolTip("Switch shot / asset (Ctrl+[ / Ctrl+])")
+        self.entity_btn.clicked.connect(self.entity_playlist_clicked.emit)
+        self.entity_btn.hide()
+        lay.addWidget(self.entity_btn, 0)
 
         self.title_label = QLabel("", self)
         self.title_label.setObjectName("VideoPreviewTitleLabel")
@@ -410,6 +426,17 @@ class _VideoPreviewTopBar(QWidget):
         self._djv_available = bool(available)
         self._ctx_act_open_djv.setEnabled(self._djv_available)
 
+    def set_switch_enabled(self, enabled: bool) -> None:
+        on = bool(enabled)
+        self.switch_btn.setVisible(on)
+        self.switch_btn.setEnabled(on)
+        self.switch_btn.setToolTip("Switch version or review source" if on else "")
+
+    def set_entity_playlist_enabled(self, enabled: bool) -> None:
+        on = bool(enabled)
+        self.entity_btn.setVisible(on)
+        self.entity_btn.setEnabled(on)
+
     def _on_ctx_always_on_top_toggled(self, checked: bool) -> None:
         self.always_on_top_toggled.emit(checked)
 
@@ -426,7 +453,7 @@ class _VideoPreviewTopBar(QWidget):
         menu.exec(self.mapToGlobal(pos))
 
     def _is_on_window_buttons(self, pos: QPoint) -> bool:
-        for btn in (self.switch_btn, self._btn_min, self._btn_max, self.close_btn):
+        for btn in (self.switch_btn, self.entity_btn, self._btn_min, self._btn_max, self.close_btn):
             if btn.isVisible() and btn.geometry().contains(pos):
                 return True
         return False
@@ -1038,6 +1065,9 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._fs_chrome_hide_timer.timeout.connect(self._on_fullscreen_chrome_hide_timeout)
         self._status_log = ""
         self._footer_pointer_zone = ""
+        self._hud_flash_timer = QTimer(self)
+        self._hud_flash_timer.setSingleShot(True)
+        self._hud_flash_timer.timeout.connect(self._clear_hud_flash)
         self._app_event_filter_installed = False
         self._window_always_on_top = read_video_preview_always_on_top(settings)
         self._main_window_anchor: QWidget | None = None
@@ -1127,9 +1157,11 @@ class VideoPreviewDialog(FramelessMainWindow):
 
         self._top_bar = _VideoPreviewTopBar(central)
         self._switch_btn = self._top_bar.switch_btn
+        self._entity_btn = self._top_bar.entity_btn
         self._title_label = self._top_bar.title_label
         self._file_counter = self._top_bar.file_counter
         self._top_bar.switch_clicked.connect(self._show_title_picker_menu)
+        self._top_bar.entity_playlist_clicked.connect(self._show_entity_playlist_menu)
         self._top_bar.always_on_top_toggled.connect(self._on_always_on_top_toggled)
         self._top_bar.set_always_on_top(self._window_always_on_top)
         self._top_bar.minimize_clicked.connect(self.showMinimized)
@@ -1143,6 +1175,8 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._btn_close = self._top_bar.close_btn
         self._root_layout.addWidget(self._top_bar, 0)
         self._review_switch_popup: VideoReviewSwitchPopup | None = None
+        self._entity_playlist_popup: VideoReviewSwitchPopup | None = None
+        self._peer_entity_provider = None  # Callable[[], list[VideoReviewSwitchItem]] | None
         self._resize_chrome_timer = QTimer(self)
         self._resize_chrome_timer.setSingleShot(True)
         self._resize_chrome_timer.setInterval(16)
@@ -1212,7 +1246,7 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._surface.installEventFilter(self)
         self._surface_wrap.installEventFilter(self)
         self._surface.setToolTip(
-            "Wheel — Zoom · MMB drag — Scrub · Alt+MMB — Pan"
+            "Wheel — Zoom · MMB drag — Scrub · Alt+MMB — Pan · Ctrl+C — Copy frame"
         )
 
         self._onion_layer = ReviewOnionLayer(self._surface_wrap)
@@ -1439,9 +1473,8 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._chk_proxy = QCheckBox("Proxy", self._transport)
         self._chk_proxy.setObjectName("VideoPreviewProxyCheck")
         self._chk_proxy.setToolTip(
-            "Scrub and playback use H.264 proxy when cached. "
-            "No range: full timeline. With range: cached segment (source outside span). "
-            "Export always uses original."
+            "Use H.264 proxy when cached; does not auto-build on open. "
+            "Tick Proxy or use … → Build proxy to create cache. Esc turns proxy off."
         )
         self._chk_proxy.setChecked(self._proxy_enabled)
         self._chk_proxy.toggled.connect(self._on_proxy_toggled)
@@ -2085,10 +2118,13 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._fps_spin.setVisible(seq)
         self._sync_switch_btn_visible()
         if seq:
-            self._surface.setToolTip("Middle-drag horizontally to scrub frames")
+            self._surface.setToolTip(
+                "Middle-drag horizontally to scrub frames · Ctrl+C — Copy frame"
+            )
         else:
             self._surface.setToolTip(
                 "Middle-drag horizontally to scrub — wraps at selected range In/Out or video ends"
+                " · Ctrl+C — Copy frame"
             )
         self._sync_transport_bar_layout()
 
@@ -2826,6 +2862,9 @@ class VideoPreviewDialog(FramelessMainWindow):
         switch = getattr(self, "_switch_btn", None)
         if switch is not None and switch.isVisible():
             rects.append(QRect(switch.mapTo(self, QPoint(0, 0)), switch.size()))
+        entity_btn = getattr(self, "_entity_btn", None)
+        if entity_btn is not None and entity_btn.isVisible():
+            rects.append(QRect(entity_btn.mapTo(self, QPoint(0, 0)), entity_btn.size()))
         return rects
 
     def _frameless_resize_margin(self) -> int:
@@ -2986,6 +3025,11 @@ class VideoPreviewDialog(FramelessMainWindow):
     def set_main_window_anchor(self, main: QWidget | None) -> None:
         self._main_window_anchor = main
 
+    def set_peer_entity_provider(self, provider) -> None:
+        """Optional: ``() -> list[VideoReviewSwitchItem]`` for shot/asset playlist."""
+        self._peer_entity_provider = provider
+        self._sync_entity_playlist_btn()
+
     def stack_under_main(self, main: QWidget | None = None) -> None:
         if self._window_always_on_top or not self.isVisible():
             return
@@ -3079,6 +3123,10 @@ class VideoPreviewDialog(FramelessMainWindow):
             return False
         if not main.frameGeometry().contains(gpos):
             return False
+        # Main owns scrolls inside its bounds whenever it is the active window
+        # (player is typically stacked behind after ActivationChange).
+        if main.isActiveWindow():
+            return True
         top = QApplication.widgetAt(gpos)
         if top is not None:
             player_win = self.window()
@@ -3090,24 +3138,73 @@ class VideoPreviewDialog(FramelessMainWindow):
                     return False
                 w = w.parentWidget()
             return False
-        return main.isActiveWindow()
+        return False
 
     def _cursor_over_review_switch_popup(self, gpos: QPoint) -> bool:
-        popup = self._review_switch_popup
-        if popup is None or not popup.isVisible():
+        for popup in (self._review_switch_popup, getattr(self, "_entity_playlist_popup", None)):
+            if popup is None or not popup.isVisible():
+                continue
+            if popup.frameGeometry().contains(gpos):
+                return True
+        return False
+
+    def _top_level_at_global(self, gpos: QPoint) -> QWidget | None:
+        top = QApplication.widgetAt(gpos)
+        if top is None:
+            return None
+        w: QWidget | None = top
+        while w is not None:
+            parent = w.parentWidget()
+            if parent is None:
+                return w
+            w = parent
+        return None
+
+    def _dialog_or_popup_covers_wheel_at(self, gpos: QPoint) -> bool:
+        """True when a modal/settings dialog or popup above the player owns the wheel."""
+        app = QApplication.instance()
+        if app is None:
             return False
-        return popup.frameGeometry().contains(gpos)
+        for candidate in (app.activeModalWidget(), app.activePopupWidget()):
+            if candidate is None or not candidate.isVisible() or candidate is self:
+                continue
+            try:
+                if candidate.frameGeometry().contains(gpos):
+                    return True
+            except Exception:
+                continue
+        # Settings dialog is parented to the player, so parent-walk hits this window;
+        # still treat any other QDialog under the cursor as owning the scroll.
+        top = QApplication.widgetAt(gpos)
+        w: QWidget | None = top
+        while w is not None:
+            if isinstance(w, QDialog) and w is not self and w.isVisible():
+                return True
+            w = w.parentWidget()
+        return False
 
     def _wheel_should_route_to_player(self, gpos: QPoint, watched: QObject) -> bool:
         if not self.isVisible() or self._closing or self._fullscreen:
             return False
         if self._cursor_over_review_switch_popup(gpos):
             return False
+        if self._dialog_or_popup_covers_wheel_at(gpos):
+            return False
         if self._main_window_covers_wheel_at(gpos):
             return False
         if not self.frameGeometry().contains(gpos):
             return False
-        if self._wheel_belongs_to_player_widget(watched):
+        belongs = self._wheel_belongs_to_player_widget(watched)
+        if not belongs:
+            # App-wide filter: never steal wheels that hit-test to another top-level.
+            top_win = self._top_level_at_global(gpos)
+            if top_win is not None and top_win is not self.window():
+                return False
+            # When no Qt widget under cursor (e.g. native mpv HWND), only claim if
+            # this player is active — avoids zooming a background player.
+            if top_win is None and not self.isActiveWindow() and not self._window_always_on_top:
+                return False
+        if belongs:
             return self._cursor_in_surface_wrap(gpos)
         return True
 
@@ -3148,15 +3245,11 @@ class VideoPreviewDialog(FramelessMainWindow):
             gpos = event.globalPosition().toPoint()
             if self._cursor_over_review_switch_popup(gpos):
                 return False
-            if self._is_sequence_mode():
+            if self._wheel_should_route_to_player(gpos, watched):
                 if self._cursor_in_surface_wrap(gpos):
                     if self._filter_video_surface_wheel(event, self._surface_wrap):
                         return True
-            elif self._wheel_should_route_to_player(gpos, watched):
-                if self._cursor_in_surface_wrap(gpos):
-                    if self._filter_video_surface_wheel(event, self._surface_wrap):
-                        return True
-                elif not self._wheel_belongs_to_player_widget(watched):
+                elif not self._is_sequence_mode() and not self._wheel_belongs_to_player_widget(watched):
                     return self._forward_wheel_to_player_at(event, gpos)
         if (
             self._video_pan_active
@@ -3387,12 +3480,17 @@ class VideoPreviewDialog(FramelessMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, self._on_enter)
         QShortcut(QKeySequence(Qt.Key.Key_A), self, self._add_draft_range)
         QShortcut(QKeySequence(Qt.Key.Key_C), self, self._copy_timecode)
+        sc_copy_frame = QShortcut(QKeySequence.StandardKey.Copy, self)
+        sc_copy_frame.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_copy_frame.activated.connect(self._copy_current_frame_to_clipboard)
         QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self._frame_step(-1))
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self._frame_step(1))
         QShortcut(QKeySequence("Shift+Left"), self, lambda: self._jump_sec(-1))
         QShortcut(QKeySequence("Shift+Right"), self, lambda: self._jump_sec(1))
         QShortcut(QKeySequence(Qt.Key.Key_BracketLeft), self, self._select_prev_list_item)
         QShortcut(QKeySequence(Qt.Key.Key_BracketRight), self, self._select_next_list_item)
+        QShortcut(QKeySequence("Ctrl+["), self, self._prev_peer_entity)
+        QShortcut(QKeySequence("Ctrl+]"), self, self._next_peer_entity)
         QShortcut(QKeySequence(Qt.Key.Key_PageUp), self, self._prev_file)
         QShortcut(QKeySequence(Qt.Key.Key_PageDown), self, self._next_file)
         sc_del = QShortcut(QKeySequence(Qt.Key.Key_Delete), self)
@@ -3841,6 +3939,7 @@ class VideoPreviewDialog(FramelessMainWindow):
                 items.append(
                     VideoReviewSwitchItem(
                         label=src.label,
+                        subtitle=(src.subtitle or "").strip(),
                         checked=key == current_key,
                         thumb_path=thumb_path,
                         sequence_folder=seq_folder,
@@ -3887,8 +3986,80 @@ class VideoPreviewDialog(FramelessMainWindow):
 
     def _sync_switch_btn_visible(self) -> None:
         has_choices = self._title_picker_has_choices()
-        self._switch_btn.setVisible(has_choices)
-        self._switch_btn.setEnabled(has_choices)
+        bar = getattr(self, "_top_bar", None)
+        if bar is not None and hasattr(bar, "set_switch_enabled"):
+            bar.set_switch_enabled(has_choices)
+        else:
+            self._switch_btn.setVisible(has_choices)
+            self._switch_btn.setEnabled(has_choices)
+        self._sync_entity_playlist_btn()
+
+    def _peer_entity_items(self) -> list[VideoReviewSwitchItem]:
+        provider = getattr(self, "_peer_entity_provider", None)
+        if not callable(provider):
+            return []
+        try:
+            items = provider()
+        except Exception:
+            return []
+        if not isinstance(items, list):
+            return []
+        return [i for i in items if isinstance(i, VideoReviewSwitchItem)]
+
+    def _sync_entity_playlist_btn(self) -> None:
+        bar = getattr(self, "_top_bar", None)
+        btn = getattr(self, "_entity_btn", None)
+        if bar is None and btn is None:
+            return
+        enabled = (
+            self._context == PreviewContext.entity
+            and self._entity_path is not None
+            and len(self._peer_entity_items()) > 1
+        )
+        if bar is not None and hasattr(bar, "set_entity_playlist_enabled"):
+            bar.set_entity_playlist_enabled(enabled)
+        elif btn is not None:
+            btn.setVisible(enabled)
+            btn.setEnabled(enabled)
+
+    def _show_entity_playlist_menu(self) -> None:
+        items = self._peer_entity_items()
+        if len(items) <= 1:
+            return
+        popup = self._entity_playlist_popup
+        if popup is None:
+            popup = VideoReviewSwitchPopup(self)
+            self._entity_playlist_popup = popup
+        popup.set_items(items)
+        anchor = self._entity_btn if self._entity_btn.isVisible() else self._switch_btn
+        popup.popup_near_anchor(anchor)
+
+    def _cycle_peer_entity(self, delta: int) -> bool:
+        items = self._peer_entity_items()
+        playable = [i for i in items if i.enabled]
+        if len(playable) <= 1 or delta == 0:
+            return False
+        cur = 0
+        for i, item in enumerate(playable):
+            if item.checked:
+                cur = i
+                break
+        nxt = (cur + int(delta)) % len(playable)
+        cb = playable[nxt].on_activate
+        if cb is None:
+            return False
+        cb()
+        return True
+
+    def _prev_peer_entity(self) -> None:
+        if self._text_editing_focused():
+            return
+        self._cycle_peer_entity(-1)
+
+    def _next_peer_entity(self) -> None:
+        if self._text_editing_focused():
+            return
+        self._cycle_peer_entity(1)
 
     def _entity_review_title(self) -> str:
         parts: list[str] = []
@@ -3924,7 +4095,9 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._file_counter.setVisible(False)
             tip = self._entity_review_title()
             if n_sources > 1:
-                tip += "\nUse the switcher to change review source"
+                tip += "\nSwitcher: change version or review source"
+            if self._entity_btn.isVisible():
+                tip += "\nList button / Ctrl+[ / Ctrl+] — switch shot or asset"
             elif not self._is_sequence_mode() and len(self._paths) > 1:
                 tip += "\nUse the switcher to choose another video in this folder"
             self._title_label.setToolTip(tip)
@@ -3972,12 +4145,13 @@ class VideoPreviewDialog(FramelessMainWindow):
             bar_w = self.width()
         counter_w = self._file_counter.width() if self._file_counter.isVisible() else 0
         switch_w = self._switch_btn.width() if self._switch_btn.isVisible() else 0
+        entity_w = self._entity_btn.width() if getattr(self, "_entity_btn", None) is not None and self._entity_btn.isVisible() else 0
         close_w = self._btn_close.width() if self._btn_close.isVisible() else 0
         lay = self._top_bar.layout()
         if lay is not None:
             m = lay.contentsMargins()
-            bar_w -= m.left() + m.right() + lay.spacing() * 3
-        return max(48, bar_w - counter_w - switch_w - close_w - 16)
+            bar_w -= m.left() + m.right() + lay.spacing() * 4
+        return max(48, bar_w - counter_w - switch_w - entity_w - close_w - 16)
 
     def _refresh_title_elide(self) -> None:
         if self._context == PreviewContext.entity and self._entity_path is not None:
@@ -4100,7 +4274,8 @@ class VideoPreviewDialog(FramelessMainWindow):
         return ", / . — Prev/Next marker"
 
     def _footer_video_navigation_hints(self) -> list[str]:
-        parts = ["Wheel — Zoom", "MMB drag — Scrub", "Alt+MMB — Pan"]
+        # Ctrl+C first so it stays visible when the hint row truncates.
+        parts = ["Ctrl+C — Copy frame", "Wheel — Zoom", "MMB drag — Scrub", "Alt+MMB — Pan"]
         if self._viewer_is_zoomed():
             parts.append("Z — Fit")
         return parts
@@ -4114,7 +4289,7 @@ class VideoPreviewDialog(FramelessMainWindow):
         return parts
 
     def _footer_hints_proxy(self) -> list[str]:
-        parts = ["Space — Play/Pause", "Scrub/play use proxy when cached"]
+        parts = ["Ctrl+C — Copy frame", "Space — Play/Pause", "Scrub/play use proxy when cached"]
         mode = self._tools_panel.tool_mode()
         if mode == ReviewToolMode.draw and self._context == PreviewContext.entity:
             parts.append("D — Exit draw")
@@ -5284,10 +5459,29 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._btn_sync.setToolTip("All ranges, markers, and draw clips synced with project")
 
     def _update_hud(self, frame: int) -> None:
+        if self._hud_flash_timer.isActive():
+            return
         fps = self._fps()
         pos = format_position_display(frame, fps, mode=self._time_display_mode)
         self._hud.setText(f"{pos} · {fps:.3f}fps  ⎘")
         self._position_hud()
+
+    def _flash_player_feedback(self, message: str, *, ms: int = 1800) -> None:
+        """Show brief confirmation on the player HUD + footer (visible while player is focused)."""
+        msg = (message or "").strip()
+        if not msg:
+            return
+        self._hud.setText(msg)
+        self._position_hud()
+        self._status_log = msg
+        self._update_footer_meta()
+        self._hud_flash_timer.start(max(400, int(ms)))
+
+    def _clear_hud_flash(self) -> None:
+        if self._status_log:
+            self._status_log = ""
+            self._update_footer_meta()
+        self._update_hud(self._current_frame())
 
     def _sync_position_controls_visibility(self) -> None:
         frame_mode = self._time_display_mode == TIME_DISPLAY_FRAME
@@ -6521,11 +6715,11 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._sync_viewport_overlay_geometry()
             if active:
                 self._surface.setToolTip(
-                    "Draw — Pen/Arrow/Rect (D to exit) · Wheel — Zoom · Alt+MMB — Pan"
+                    "Draw — Pen/Arrow/Rect (D to exit) · Wheel — Zoom · Alt+MMB — Pan · Ctrl+C — Copy frame"
                 )
             else:
                 self._surface.setToolTip(
-                    "Wheel — Zoom · MMB drag — Scrub · Alt+MMB — Pan"
+                    "Wheel — Zoom · MMB drag — Scrub · Alt+MMB — Pan · Ctrl+C — Copy frame"
                 )
         self._schedule_onion_refresh()
 
@@ -7018,6 +7212,70 @@ class VideoPreviewDialog(FramelessMainWindow):
         if cb:
             cb.setText(text)
 
+    def _capture_sequence_frame_image(self) -> QImage | None:
+        frames = self._sequence_frames
+        idx = self._current_frame()
+        if 0 <= idx < len(frames):
+            from monostudio.ui_qt.sequence_preview_decode import load_preview_frame_qimage
+
+            img = load_preview_frame_qimage(frames[idx], max_side=8192)
+            if img is not None and not img.isNull():
+                return img
+        if self._seq_backend is not None:
+            grab = getattr(self._seq_backend, "current_frame_image", None)
+            if callable(grab):
+                img = grab()
+                if img is not None and not img.isNull():
+                    return img
+        return None
+
+    def _capture_current_frame_image(self) -> QImage | None:
+        if self._is_sequence_mode():
+            img = self._capture_sequence_frame_image()
+        else:
+            img = None
+            capture = getattr(self._backend, "capture_frame_image", None)
+            if callable(capture):
+                try:
+                    img = capture()
+                except Exception:
+                    img = None
+            if img is not None and img.isNull():
+                img = None
+        if img is None:
+            return None
+        return self._composite_draw_onto_captured_frame(img)
+
+    def _composite_draw_onto_captured_frame(self, img: QImage) -> QImage:
+        layers = getattr(self, "_draw_layers", None) or []
+        if not layers:
+            return img
+        frame = self._current_frame()
+        try:
+            return composite_draw_onto_image(
+                img,
+                layers,
+                frame,
+                total_frames=self._total_frames(),
+            )
+        except Exception:
+            return img
+
+    def _copy_current_frame_to_clipboard(self) -> None:
+        if self._text_editing_focused():
+            return
+        img = self._capture_current_frame_image()
+        if img is None or img.isNull():
+            self._flash_player_feedback("Could not copy frame")
+            return
+        cb = QGuiApplication.clipboard()
+        if cb is None:
+            self._flash_player_feedback("Could not copy frame")
+            return
+        cb.setImage(img)
+        frame = self._current_frame()
+        self._flash_player_feedback(f"Frame {frame} copied")
+
     def _prev_file(self) -> None:
         if len(self._paths) <= 1:
             return
@@ -7300,7 +7558,13 @@ class VideoPreviewDialog(FramelessMainWindow):
             return True
         return False
 
-    def _sync_proxy_state(self) -> None:
+    def _persist_proxy_enabled(self, enabled: bool) -> None:
+        self._proxy_enabled = enabled
+        if self._settings is not None:
+            write_video_preview_proxy_enabled(self._settings, enabled)
+
+    def _sync_proxy_state(self, *, allow_build: bool = False) -> None:
+        """Refresh proxy mode vs cache. Build only when ``allow_build`` (user intent)."""
         if self._is_sequence_mode():
             self._cmb_proxy_scale.setEnabled(True)
             return
@@ -7335,16 +7599,20 @@ class VideoPreviewDialog(FramelessMainWindow):
                 self._apply_playback_for_frame(self._current_frame())
             else:
                 self._range_proxy_manifest = None
-                lo, hi = sorted((rng.in_frame, rng.out_frame))
-                fps = max(1e-6, self._fps())
-                range_sec = (hi - lo + 1) / fps
-                heavy, reason = is_heavy_source_for_proxy(
-                    self._info,
-                    file_size_bytes=self._source_file_size(),
-                )
-                if heavy and range_sec > 120:
-                    self._status_log = f"Heavy source — building range proxy ({reason})"
-                self._start_proxy_build("range", rng)
+                if allow_build:
+                    lo, hi = sorted((rng.in_frame, rng.out_frame))
+                    fps = max(1e-6, self._fps())
+                    range_sec = (hi - lo + 1) / fps
+                    heavy, reason = is_heavy_source_for_proxy(
+                        self._info,
+                        file_size_bytes=self._source_file_size(),
+                    )
+                    if heavy and range_sec > 120:
+                        self._status_log = f"Heavy source — building range proxy ({reason})"
+                    self._start_proxy_build("range", rng)
+                else:
+                    if self._playback_path != self._path:
+                        self._reload_source_at_frame(self._current_frame())
         else:
             self._proxy_mode = "full"
             self._range_proxy_manifest = None
@@ -7358,38 +7626,57 @@ class VideoPreviewDialog(FramelessMainWindow):
                 self._full_proxy_ready = False
                 self._full_proxy_manifest = None
                 self._refresh_proxy_ruler()
-                if not self._maybe_confirm_heavy_full():
-                    self._chk_proxy.blockSignals(True)
-                    self._chk_proxy.setChecked(False)
-                    self._chk_proxy.blockSignals(False)
-                    self._proxy_enabled = False
-                    self._sync_proxy_state()
-                    return
-                self._start_proxy_build("full")
+                if allow_build:
+                    if not self._maybe_confirm_heavy_full():
+                        self._chk_proxy.blockSignals(True)
+                        self._chk_proxy.setChecked(False)
+                        self._chk_proxy.blockSignals(False)
+                        self._persist_proxy_enabled(False)
+                        self._sync_proxy_state()
+                        return
+                    self._start_proxy_build("full")
+                else:
+                    if self._playback_path != self._path:
+                        self._reload_source_at_frame(self._current_frame())
         self._update_footer()
 
     def _on_proxy_toggled(self, checked: bool) -> None:
-        self._proxy_enabled = checked
-        self._sync_proxy_state()
+        self._persist_proxy_enabled(checked)
+        self._sync_proxy_state(allow_build=checked)
 
     def _on_proxy_scale_changed(self, _index: int) -> None:
         scale = self._cmb_proxy_scale.currentData()
         if scale is None:
             return
         self._proxy_scale = float(scale)
+        if self._settings is not None:
+            write_video_preview_proxy_scale(self._settings, self._proxy_scale)
         if self._is_sequence_mode():
             if self._seq_backend is not None:
                 self._seq_backend.set_preview_scale(self._proxy_scale)
             return
         if self._proxy_enabled:
-            self._sync_proxy_state()
+            self._sync_proxy_state(allow_build=True)
 
     def _show_proxy_menu(self) -> None:
         menu = MonosMenu(self)
+        if self._path is not None and not self._is_sequence_mode():
+            build_act = menu.addAction("Build proxy…")
+            build_act.triggered.connect(self._build_proxy_now)
         clear_act = menu.addAction("Clear proxy for this video")
         clear_act.triggered.connect(self._clear_proxy_for_current_video)
         position_popup_near_anchor(menu, self._btn_proxy_menu)
         menu.popup(menu.mapToGlobal(QPoint(0, 0)))
+
+    def _build_proxy_now(self) -> None:
+        if self._path is None or self._info is None or self._is_sequence_mode():
+            return
+        if not self._proxy_enabled:
+            self._chk_proxy.blockSignals(True)
+            self._chk_proxy.setChecked(True)
+            self._chk_proxy.blockSignals(False)
+            self._persist_proxy_enabled(True)
+        self._sync_proxy_state(allow_build=True)
 
     def _clear_proxy_for_current_video(self) -> None:
         if self._path is None:
@@ -7401,11 +7688,8 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._range_proxy_manifest = None
         frame = self._current_frame()
         self._reload_source_at_frame(frame)
-        if self._proxy_enabled:
-            self._sync_proxy_state()
-        else:
-            self._refresh_proxy_ruler()
-            self._update_footer()
+        self._refresh_proxy_ruler()
+        self._update_footer()
 
     def _export(self) -> None:
         if not self._ranges:

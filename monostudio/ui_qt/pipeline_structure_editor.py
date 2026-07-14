@@ -1408,6 +1408,44 @@ class PipelineStructureEditorWidget(QWidget):
         self._rebuild_model()
         self.config_changed.emit()
 
+    def _include_dept_in_matching_workflows(self, did: str, *, parent_id: str | None = None) -> None:
+        """Attach a newly added department to type workflows so sidebar can list it after Save.
+
+        Subdepartment: enable on types that already use the parent or any sibling under that parent.
+        Root department: enable on every type (user can uncheck per type).
+        """
+        did = (did or "").strip()
+        if not did:
+            return
+        parent_id = (parent_id or "").strip() or None
+        match_pool: set[str] | None
+        if parent_id:
+            siblings: set[str] = set()
+            for other, raw in self._depts_map.items():
+                if other == did or not isinstance(raw, dict):
+                    continue
+                pr = raw.get("parent")
+                if isinstance(pr, str) and pr.strip() == parent_id:
+                    siblings.add(other)
+            match_pool = siblings | {parent_id}
+        else:
+            match_pool = None
+
+        for tid, tdef in list(self._preset_types.items()):
+            current = [d for d in (tdef.departments or []) if isinstance(d, str) and d.strip()]
+            if did in current:
+                continue
+            if match_pool is None or any(x in match_pool for x in current):
+                current.append(did)
+                self._preset_types[tid] = TypeDef(
+                    tid, tdef.name, tdef.short_name, current, tdef.icon_name
+                )
+
+        fw = getattr(self, "_form_type_workflow", None) or {}
+        fw_tid = fw.get("tid") if isinstance(fw, dict) else None
+        if isinstance(fw_tid, str) and fw_tid.strip() and fw_tid in self._preset_types:
+            self._populate_workflow_panel(fw_tid)
+
     def _on_add_department(self) -> None:
         if not self._project_root:
             return
@@ -1432,6 +1470,7 @@ class PipelineStructureEditorWidget(QWidget):
             "order": n,
         }
         self._preset_depts[did] = DepartmentDef(did, self._depts_map[did]["label"], did[:4], None, None)
+        self._include_dept_in_matching_workflows(did, parent_id=None)
         self._rebuild_model()
         self.config_changed.emit()
 
@@ -1478,6 +1517,7 @@ class PipelineStructureEditorWidget(QWidget):
             ]
         self._depts_map[did] = new_row
         self._preset_depts[did] = DepartmentDef(did, self._depts_map[did]["label"], did[:4], None, parent_id)
+        self._include_dept_in_matching_workflows(did, parent_id=parent_id)
         self._rebuild_model()
         self.config_changed.emit()
 

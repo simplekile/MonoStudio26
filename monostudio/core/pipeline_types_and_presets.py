@@ -213,6 +213,67 @@ def resolve_department_ids_for_ui(
     return out
 
 
+def _attach_orphan_subdepartments_to_matching_types(
+    types: dict[str, TypeDef],
+    *,
+    meta: PipelineTypesAndPresets,
+    registry: DepartmentRegistry | None,
+) -> dict[str, TypeDef]:
+    """
+    Custom / newly added subdepartments that live in the department registry but are not yet
+    listed on any type workflow still need to appear in the sidebar.
+
+    Attach each orphan leaf to types that already reference its parent or any sibling.
+    Does not re-add a department that the user intentionally removed from every type after it
+    had been listed once — only IDs that currently appear on zero types.
+    """
+    listed: set[str] = set()
+    for tdef in types.values():
+        for d in tdef.departments or []:
+            if isinstance(d, str) and d.strip():
+                listed.add(d.strip())
+
+    parent_of: dict[str, str] = {}
+    children_by_parent: dict[str, list[str]] = {}
+
+    def add_child(child: str, parent: str) -> None:
+        c = (child or "").strip()
+        p = (parent or "").strip()
+        if not c or not p:
+            return
+        parent_of[c] = p
+        bucket = children_by_parent.setdefault(p, [])
+        if c not in bucket:
+            bucket.append(c)
+
+    for child_id, ddef in meta.departments.items():
+        if ddef.parent:
+            add_child(child_id, ddef.parent)
+    if registry is not None:
+        for child_id in registry.get_departments():
+            parent = registry.get_parent(child_id)
+            if parent:
+                add_child(child_id, parent)
+
+    orphans = [did for did, parent in parent_of.items() if did not in listed]
+    if not orphans:
+        return types
+
+    out = dict(types)
+    for orphan in orphans:
+        parent = parent_of[orphan]
+        siblings = set(children_by_parent.get(parent, []))
+        match_pool = siblings | {parent}
+        for tid, tdef in list(out.items()):
+            current = [d for d in (tdef.departments or []) if isinstance(d, str) and d.strip()]
+            if orphan in current:
+                continue
+            if any(x in match_pool for x in current):
+                current.append(orphan)
+                out[tid] = TypeDef(tid, tdef.name, tdef.short_name, current, tdef.icon_name)
+    return out
+
+
 def expand_pipeline_types_and_presets_with_registry(
     config: PipelineTypesAndPresets,
     registry: DepartmentRegistry | None,
@@ -220,6 +281,10 @@ def expand_pipeline_types_and_presets_with_registry(
     """
     Expand type department lists (e.g. legacy ``fx`` → FX leaves) and enrich department defs
     from the project registry (factory merge applied in DepartmentRegistry.for_project).
+
+    Also attaches orphan custom subdepartments (in registry, on no type yet) to types that
+    already use that parent's siblings — so adding Trails under FX appears without a manual
+    workflow checkbox.
     """
     if not config.types and not config.departments:
         return config
@@ -233,6 +298,10 @@ def expand_pipeline_types_and_presets_with_registry(
             )
         else:
             new_types[type_id] = tdef
+
+    new_types = _attach_orphan_subdepartments_to_matching_types(
+        new_types, meta=config, registry=registry
+    )
 
     new_depts = dict(config.departments)
     if registry is not None:

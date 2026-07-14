@@ -2247,8 +2247,29 @@ class SidebarWidget(QWidget):
             else:
                 self._visible_departments = cleaned[: self._max_visible]
         else:
-            # Keep only still-valid items (no auto-fill).
+            # Keep only still-valid items (no auto-fill of arbitrary roots).
             self._visible_departments = [v for v in self._visible_departments if v in cleaned]
+            # Auto-pin new siblings under a parent that already has a visible leaf
+            # (e.g. custom Trails under FX when other FX leaves are already pinned).
+            visible_set = set(self._visible_departments)
+            parents_with_visible = {
+                (self._dept_parent.get(d) or "").strip()
+                for d in self._visible_departments
+                if (self._dept_parent.get(d) or "").strip()
+            }
+            if parents_with_visible:
+                pinned_new = False
+                for d in cleaned:
+                    if d in visible_set:
+                        continue
+                    parent = (self._dept_parent.get(d) or "").strip()
+                    if parent and parent in parents_with_visible:
+                        self._visible_departments.append(d)
+                        visible_set.add(d)
+                        pinned_new = True
+                if pinned_new and self._mode in ("assets", "shots", "schedule", "reference"):
+                    self._state_by_mode[self._mode] = self._snapshot_state()
+                    self._save_state_for_mode(self._mode)
 
         visible = self._visible_departments or []
         if self._mode == "schedule":

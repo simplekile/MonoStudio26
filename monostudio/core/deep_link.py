@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlencode
@@ -9,6 +11,10 @@ from urllib.parse import parse_qs, quote, unquote, urlparse, urlencode
 SCHEME = "monostudio"
 ASSIGN_HOST = "assign"
 OPEN_HOST = "open"
+
+# Short query keys / hash length for entity links (no server-side map).
+ENTITY_ID_PARAM = "e"
+ENTITY_SHORT_ID_LEN = 10
 
 PAGE_ALIASES: dict[str, str] = {
     "assets": "Assets",
@@ -27,6 +33,19 @@ PAGE_ALIASES: dict[str, str] = {
     "trash": "Trash",
     "schedule": "Schedule",
     "dashboard": "Dashboard",
+}
+
+# Compact page token when building open links (parse still accepts full names).
+PAGE_BUILD_ALIAS: dict[str, str] = {
+    "Assets": "assets",
+    "Shots": "shots",
+    "Inbox": "inbox",
+    "Project Guide": "guide",
+    "Delivery": "delivery",
+    "Internal check": "internal_check",
+    "Trash": "trash",
+    "Schedule": "schedule",
+    "Dashboard": "dashboard",
 }
 
 OPEN_PAGES: frozenset[str] = frozenset(
@@ -54,7 +73,8 @@ class AssignDeepLink:
 class OpenDeepLink:
     project_id: str
     page: str
-    entity: str | None = None  # posix path relative to project root
+    entity: str | None = None  # posix path relative to project root (legacy long form)
+    entity_id: str | None = None  # sha256 prefix of normalized entity path
     department: str | None = None
     type_id: str | None = None
     trash_id: str | None = None
@@ -88,10 +108,118 @@ def project_relative_path(project_root: Path, path: Path) -> str | None:
         return None
 
 
+def normalize_entity_rel(entity_rel: str | None) -> str:
+    """Canonical project-relative path for hashing / compare."""
+    return (entity_rel or "").strip().replace("\\", "/").strip("/")
+
+
+def entity_path_short_id(entity_rel: str | None) -> str:
+    """Deterministic short id from entity path (sha256 hex prefix)."""
+    rel = normalize_entity_rel(entity_rel)
+    if not rel:
+        return ""
+    digest = hashlib.sha256(rel.encode("utf-8")).hexdigest()
+    return digest[:ENTITY_SHORT_ID_LEN]
+
+
 def resolve_project_root_in_workspace(workspace_root: Path, project_id: str) -> Path | None:
     from monostudio.core.discord_inbox_debounce import resolve_project_root
 
     return resolve_project_root(workspace_root, project_id)
+
+
+def page_entity_scan_root(project_root: Path, page: str) -> Path | None:
+    """Top-level folder to scan when resolving a short entity id for ``page``."""
+    from monostudio.core.structure_registry import StructureRegistry
+
+    root = Path(project_root)
+    page_name = normalize_page_name(page) or (page or "").strip()
+    struct = StructureRegistry.for_project(root)
+    if page_name == "Assets":
+        return root / struct.get_folder("assets")
+    if page_name == "Shots":
+        return root / struct.get_folder("shots")
+    if page_name == "Inbox":
+        return root / struct.get_folder("inbox")
+    if page_name == "Project Guide":
+        return root / struct.get_folder("project_guide")
+    if page_name == "Delivery":
+        return root / struct.get_folder("outbox")
+    if page_name == "Internal check":
+        from monostudio.core.internal_check_reader import get_internal_check_root
+
+        return get_internal_check_root(root)
+    return None
+
+
+def _should_skip_scan_name(name: str) -> bool:
+    n = (name or "").strip()
+    if not n or n in (".", ".."):
+        return True
+    if n.startswith("."):
+        return True
+    return False
+
+
+def iter_entity_rels_for_page(project_root: Path, page: str):
+    """Yield project-relative posix paths that may be deep-linked on ``page``."""
+    root = Path(project_root).resolve()
+    page_name = normalize_page_name(page) or (page or "").strip()
+    scan = page_entity_scan_root(root, page_name)
+    if scan is None or not scan.is_dir():
+        return
+    # Assets / Shots links point at entity folders (type/name or seq/shot) — shallow.
+    if page_name in ("Assets", "Shots"):
+        try:
+            for mid in scan.iterdir():
+                if not mid.is_dir() or _should_skip_scan_name(mid.name):
+                    continue
+                for entity in mid.iterdir():
+                    if not entity.is_dir() or _should_skip_scan_name(entity.name):
+                        continue
+                    try:
+                        yield entity.resolve().relative_to(root).as_posix()
+                    except (OSError, ValueError):
+                        continue
+        except OSError:
+            return
+        return
+
+    # Tree pages: files and folders under the page root.
+    try:
+        for dirpath, dirnames, filenames in os.walk(scan, topdown=True):
+            dirnames[:] = [d for d in dirnames if not _should_skip_scan_name(d)]
+            base = Path(dirpath)
+            try:
+                if base.resolve() != scan.resolve():
+                    yield base.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                pass
+            for name in filenames:
+                if _should_skip_scan_name(name):
+                    continue
+                path = base / name
+                try:
+                    yield path.resolve().relative_to(root).as_posix()
+                except (OSError, ValueError):
+                    continue
+    except OSError:
+        return
+
+
+def resolve_entity_short_id(
+    project_root: Path,
+    page: str,
+    entity_id: str,
+) -> str | None:
+    """Find project-relative path whose short id matches ``entity_id`` (or None)."""
+    eid = (entity_id or "").strip().casefold()
+    if not eid or len(eid) < 8:
+        return None
+    for rel in iter_entity_rels_for_page(project_root, page):
+        if entity_path_short_id(rel).casefold() == eid:
+            return normalize_entity_rel(rel)
+    return None
 
 
 def parse_assign_deep_link(url: str) -> AssignDeepLink | None:
@@ -138,6 +266,9 @@ def parse_open_deep_link(url: str) -> OpenDeepLink | None:
         return None
     entity = (qs.get("entity") or qs.get("path") or [""])[0].strip()
     entity = unquote(entity).replace("\\", "/").strip("/") or None
+    entity_id = (qs.get(ENTITY_ID_PARAM) or qs.get("entity_id") or [""])[0].strip() or None
+    if entity_id:
+        entity_id = entity_id.casefold()
     department = (qs.get("dept") or qs.get("department") or [""])[0].strip() or None
     type_id = (qs.get("type") or qs.get("type_id") or [""])[0].strip() or None
     trash_id = (qs.get("trash") or qs.get("trash_id") or [""])[0].strip() or None
@@ -145,6 +276,7 @@ def parse_open_deep_link(url: str) -> OpenDeepLink | None:
         project_id=project_id,
         page=page,
         entity=entity,
+        entity_id=entity_id,
         department=department,
         type_id=type_id,
         trash_id=trash_id,
@@ -172,15 +304,22 @@ def build_open_deep_link(
     department: str | None = None,
     type_id: str | None = None,
     trash_id: str | None = None,
+    legacy_entity_path: bool = False,
 ) -> str:
     pid = (project_id or "").strip()
     normalized = normalize_page_name(page)
     if not pid or normalized is None:
         raise ValueError("project_id and page are required")
-    params: dict[str, str] = {"project": pid, "page": normalized}
-    ent = (entity or "").strip().replace("\\", "/").strip("/")
+    page_token = PAGE_BUILD_ALIAS.get(normalized, normalized)
+    params: dict[str, str] = {"project": pid, "page": page_token}
+    ent = normalize_entity_rel(entity)
     if ent:
-        params["entity"] = ent
+        if legacy_entity_path:
+            params["entity"] = ent
+        else:
+            short = entity_path_short_id(ent)
+            if short:
+                params[ENTITY_ID_PARAM] = short
     dept = (department or "").strip()
     if dept:
         params["dept"] = dept
@@ -318,6 +457,8 @@ def monos_link_display_label_from_url(url: str) -> str | None:
             primary = open_link.trash_id
         elif open_link.entity:
             primary = primary_label_from_entity_path(open_link.entity)
+        elif open_link.entity_id:
+            primary = open_link.entity_id
         return build_monos_link_label(
             page=open_link.page,
             primary=primary,

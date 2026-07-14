@@ -58,6 +58,32 @@ def set_explorer_drop_highlight(widget: QWidget, on: bool) -> None:
     widget.update()
 
 
+def _accept_explorer_drop_action(
+    event: QDragEnterEvent | QDragMoveEvent | QDropEvent,
+    *,
+    internal_move: bool = False,
+) -> None:
+    """Accept Explorer/OLE drops (frameless Windows needs a valid + proposable action).
+
+    Prefer Move for internal (non-Ctrl) and Copy otherwise; fall back to
+    acceptProposedAction when the preferred action is not in possibleActions
+    (same pattern as MainWindow accept_url_drag / v26.13 Explorer drops).
+    """
+    mods = event.modifiers() if hasattr(event, "modifiers") else event.keyboardModifiers()
+    ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+    want_move = bool(internal_move) and not ctrl
+    possible = event.possibleActions()
+    if want_move and (possible & Qt.DropAction.MoveAction):
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+        return
+    if possible & Qt.DropAction.CopyAction:
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        return
+    event.acceptProposedAction()
+
+
 def accept_explorer_file_drag(
     event: QDragEnterEvent | QDragMoveEvent,
     *,
@@ -65,12 +91,7 @@ def accept_explorer_file_drag(
 ) -> bool:
     if not mime_has_local_files(event.mimeData()):
         return False
-    ctrl = bool(event.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
-    if internal_move and not ctrl:
-        event.setDropAction(Qt.DropAction.MoveAction)
-    else:
-        event.setDropAction(Qt.DropAction.CopyAction)
-    event.accept()
+    _accept_explorer_drop_action(event, internal_move=internal_move)
     return True
 
 
@@ -83,12 +104,7 @@ def finish_explorer_file_drop(
     if not paths:
         event.ignore()
         return []
-    ctrl = bool(event.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
-    if internal_move and not ctrl:
-        event.setDropAction(Qt.DropAction.MoveAction)
-    else:
-        event.setDropAction(Qt.DropAction.CopyAction)
-    event.accept()
+    _accept_explorer_drop_action(event, internal_move=internal_move)
     return paths
 
 
@@ -101,22 +117,21 @@ class _ExplorerDropForwarder(QObject):
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if not isinstance(event, (QDragEnterEvent, QDragMoveEvent, QDropEvent)):
+            if event.type() == QEvent.Type.DragLeave:
+                leave = getattr(self._owner, "dragLeaveEvent", None)
+                if callable(leave):
+                    leave(event)
             return False
         et = event.type()
         if et == QEvent.Type.DragEnter and isinstance(event, QDragEnterEvent):
             self._owner.dragEnterEvent(event)
-            return True
+            return event.isAccepted()
         if et == QEvent.Type.DragMove and isinstance(event, QDragMoveEvent):
             self._owner.dragMoveEvent(event)
-            return True
+            return event.isAccepted()
         if et == QEvent.Type.Drop and isinstance(event, QDropEvent):
             self._owner.dropEvent(event)
-            return True
-        if et == QEvent.Type.DragLeave:
-            leave = getattr(self._owner, "dragLeaveEvent", None)
-            if callable(leave):
-                leave(event)
-            return False
+            return event.isAccepted()
         return False
 
 

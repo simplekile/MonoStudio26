@@ -6744,23 +6744,38 @@ class MainView(QWidget):
     def _on_link_reveal_tick(self) -> None:
         from monostudio.ui_qt.link_reveal import link_reveal
 
+        if not self.isVisible():
+            self._link_reveal_row = None
+            return
         lr = link_reveal()
-        if not lr.is_active():
+        if not lr.is_active() or lr.any_active_path() is None:
+            self._link_reveal_row = None
             return
-        path = lr.any_active_path()
-        if path is None:
-            return
-        for row in range(self._tile_row_count()):
+        rows = self._tile_row_count()
+
+        def _update_row(row: int) -> bool:
+            if row < 0 or row >= rows:
+                return False
             tile_idx = self._tile_model._model_index(row, 0)
             if not tile_idx.isValid():
-                continue
+                return False
             item = tile_idx.data(Qt.UserRole)
-            if isinstance(item, ViewItem) and self._paths_equal(item.path, path):
-                self._tile_view.viewport().update(self._tile_view.visualRect(tile_idx))
-                list_idx = self._list_model.index(row, 0)
-                if list_idx.isValid():
-                    self._list_view.viewport().update(self._list_view.visualRect(list_idx))
+            if not isinstance(item, ViewItem) or not lr.matches_path(item.path):
+                return False
+            self._link_reveal_row = row
+            self._tile_view.viewport().update(self._tile_view.visualRect(tile_idx))
+            list_idx = self._list_model.index(row, 0)
+            if list_idx.isValid():
+                self._list_view.viewport().update(self._list_view.visualRect(list_idx))
+            return True
+
+        cached = getattr(self, "_link_reveal_row", None)
+        if cached is not None and _update_row(int(cached)):
+            return
+        for row in range(rows):
+            if _update_row(row):
                 return
+        self._link_reveal_row = None
 
     def _thumbnail_request_extras(self, item: ViewItem) -> dict:
         """Pipeline ref + active DCC for ThumbnailManager (render-sequence / user_then rules)."""
@@ -8656,6 +8671,10 @@ class MainView(QWidget):
                 open_with_action.setToolTip("No work file in this department.")
 
             if has_dept_filter:
+                from monostudio.ui_qt.app_hotkeys import read_hotkey_sequence
+
+                review_action = menu.addAction(self._ctx_menu_icon("play"), "Review latest preview…")
+                review_action.setShortcut(read_hotkey_sequence(self._settings, "main_view.open_player"))
                 self._append_open_older_version_submenu(
                     menu,
                     item,

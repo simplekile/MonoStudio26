@@ -12,6 +12,7 @@ from PySide6.QtCore import QPointF
 from typing import Callable
 
 from PySide6.QtCore import QSettings, Qt, QTimer, Signal, QUrl
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
 
 from monostudio.core.mpv_resolve import ensure_mpv_dll_path, mpv_available, prepare_mpv_python_bindings
@@ -28,6 +29,60 @@ logger = logging.getLogger(__name__)
 
 PLAYBACK_SPEED_STEPS = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 _SPEED_STEPS = PLAYBACK_SPEED_STEPS
+
+
+def _qimage_from_mpv_screenshot_raw(res: object) -> QImage | None:
+    """Convert mpv ``screenshot-raw`` result (dict or Pillow Image) to ``QImage``."""
+    if res is None:
+        return None
+    # python-mpv ``screenshot_raw()`` may return a Pillow Image directly.
+    if hasattr(res, "mode") and hasattr(res, "size") and hasattr(res, "tobytes"):
+        try:
+            mode = str(getattr(res, "mode", ""))
+            w, h = res.size
+            data = res.tobytes("raw", mode)
+            if mode == "RGB":
+                img = QImage(data, w, h, w * 3, QImage.Format.Format_RGB888)
+                return img.copy()
+            if mode == "RGBA":
+                img = QImage(data, w, h, w * 4, QImage.Format.Format_RGBA8888)
+                return img.copy()
+        except Exception as e:
+            logger.debug("mpv pillow screenshot convert: %s", e)
+            return None
+    if not isinstance(res, dict):
+        return None
+    try:
+        fmt = str(res.get("format") or "")
+        w = int(res["w"])
+        h = int(res["h"])
+        stride = int(res["stride"])
+        data = res["data"]
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        elif not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
+        if w <= 0 or h <= 0 or stride <= 0 or not data:
+            return None
+        if fmt == "bgr0":
+            img = QImage(data, w, h, stride, QImage.Format.Format_RGB32)
+            if img.isNull():
+                return None
+            return img.convertToFormat(QImage.Format.Format_RGB888).copy()
+        if fmt == "bgra":
+            img = QImage(data, w, h, stride, QImage.Format.Format_ARGB32)
+            if img.isNull():
+                return None
+            return img.convertToFormat(QImage.Format.Format_RGB888).copy()
+        if fmt == "rgb0":
+            img = QImage(data, w, h, stride, QImage.Format.Format_RGBX8888)
+            if img.isNull():
+                return None
+            return img.convertToFormat(QImage.Format.Format_RGB888).copy()
+    except Exception as e:
+        logger.debug("mpv screenshot-raw convert: %s", e)
+        return None
+    return None
 
 
 class VideoPlayerBackend(ABC):
@@ -149,6 +204,10 @@ class VideoPlayerBackend(ABC):
         range_end_sec: float | None = None,
     ) -> None:
         """Optional backend-native loop. ``range_end_sec`` is exclusive (past out frame)."""
+
+    def capture_frame_image(self) -> QImage | None:
+        """Snapshot the current decoded video frame for clipboard / export. None if unsupported."""
+        return None
 
     @abstractmethod
     def supports_embed(self) -> bool: ...
@@ -641,6 +700,19 @@ class MpvEmbeddedBackend(VideoPlayerBackend):
             if self._on_error:
                 self._on_error(str(e))
 
+    def capture_frame_image(self) -> QImage | None:
+        if not self._file_ready() or self._player is None:
+            return None
+        try:
+            res = self._player.command("screenshot-raw", "video")
+        except Exception:
+            try:
+                res = self._player.command("screenshot-raw")
+            except Exception as e:
+                logger.debug("mpv screenshot-raw: %s", e)
+                return None
+        return _qimage_from_mpv_screenshot_raw(res)
+
     def release(self) -> None:
         if self._poll:
             self._poll.stop()
@@ -935,6 +1007,21 @@ class QtMultimediaBackend(VideoPlayerBackend):
         fps = 24.0
         step = 1.0 / fps
         self.seek(self.position() + (step if direction >= 0 else -step))
+
+    def capture_frame_image(self) -> QImage | None:
+        if self._video is None:
+            return None
+        try:
+            pm = self._video.grab()
+            if pm is None or pm.isNull():
+                return None
+            img = pm.toImage()
+            if img.isNull():
+                return None
+            return img.copy()
+        except Exception as e:
+            logger.debug("Qt capture_frame_image: %s", e)
+            return None
 
     def release(self) -> None:
         if self._video is not None:

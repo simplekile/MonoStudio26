@@ -192,6 +192,16 @@ class SequenceDecodeBackend(QObject):
     def current_frame(self) -> int:
         return self._current
 
+    def current_frame_image(self) -> QImage | None:
+        """Decoded buffer for the playhead (may be viewport-scaled)."""
+        pix = self._buffer.get(self._current)
+        if pix is None or pix.isNull():
+            pix = self._label_full_pix
+        if pix is None or pix.isNull():
+            return None
+        img = pix.toImage()
+        return None if img.isNull() else img
+
     def display_target(self) -> QWidget:
         return self._label
 

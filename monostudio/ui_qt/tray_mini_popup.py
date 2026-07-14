@@ -766,6 +766,15 @@ class TrayMiniPopup(QFrame):
         return lucide_icon("image", size=_THUMB_W, color_hex=_CLR_MUTED).pixmap(_THUMB_W, _THUMB_H)
 
     def _rebuild_list(self) -> None:
+        if getattr(self, "_rebuild_list_busy", False):
+            return
+        self._rebuild_list_busy = True
+        try:
+            self._rebuild_list_impl()
+        finally:
+            self._rebuild_list_busy = False
+
+    def _rebuild_list_impl(self) -> None:
         if self._list_mode == "noti":
             self._rebuild_noti_list()
             return
@@ -1234,4 +1243,4 @@ class TrayMiniPopup(QFrame):
     def refresh_notifications(self) -> None:
         if not self.isVisible() or self._list_mode != "noti":
             return
-        self._rebuild_noti_list()
+        self._rebuild_list()

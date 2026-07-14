@@ -1602,8 +1602,10 @@ class InboxTreePane(QWidget):
             drop_hosts.append(self._view_stack)
         if self._file_grid is not None:
             drop_hosts.extend([self._file_grid, self._file_grid.viewport()])
+        # Pane itself accepts too — empty chrome / layout gaps still get Explorer drops
+        # (frameless Windows walks to the nearest acceptDrops ancestor).
+        drop_hosts.append(self)
         self._explorer_drop.mount(*drop_hosts)
-        self.setAcceptDrops(False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._reload_fs_tree_root()
         QTimer.singleShot(0, self._sync_empty_overlay)
@@ -2643,31 +2645,44 @@ class InboxTreePane(QWidget):
         from monostudio.ui_qt.link_reveal import link_reveal
 
         if not self.isVisible():
+            self._link_reveal_row = None
             return
         lr = link_reveal()
         if not lr.is_active():
+            self._link_reveal_row = None
             return
         path = lr.any_active_path()
         if path is None:
+            self._link_reveal_row = None
             return
         path = Path(path)
         if self._show_toolbar and self._view_mode == "tile" and self._file_grid is not None and self._file_model is not None:
-            for row in range(self._file_model.rowCount()):
+            rows = self._file_model.rowCount()
+
+            def _update_grid_row(row: int) -> bool:
+                if row < 0 or row >= rows:
+                    return False
                 entry = self._file_model.entry_at(row)
-                if entry is None:
-                    continue
-                try:
-                    matches = entry.path.resolve() == path.resolve()
-                except OSError:
-                    matches = entry.path == path
-                if not matches:
-                    continue
+                if entry is None or not lr.matches_path(entry.path):
+                    return False
+                self._link_reveal_row = row
                 idx = self._file_model.index(row, 0)
                 if idx.isValid():
                     self._file_grid.viewport().update(self._file_grid.visualRect(idx))
+                return True
+
+            cached = getattr(self, "_link_reveal_row", None)
+            if cached is not None and _update_grid_row(int(cached)):
                 return
+            for row in range(rows):
+                if _update_grid_row(row):
+                    return
+            self._link_reveal_row = None
+            return
         try:
-            src_idx = self._fs_model.index(str(path.resolve()), 0)
+            src_idx = self._fs_model.index(str(path), 0)
+            if not src_idx.isValid():
+                src_idx = self._fs_model.index(str(path.resolve()), 0)
         except OSError:
             src_idx = self._fs_model.index(str(path), 0)
         if not src_idx.isValid():
@@ -2862,6 +2877,8 @@ class InboxTreePane(QWidget):
         elif self._show_toolbar and self._view_mode == "tile":
             unresolved = self._select_dropped_paths_in_grid([path], navigate=True)
             ok = path not in unresolved
+            if ok:
+                self._on_tree_selection_changed()
         else:
             parent = path.parent
             parent_src = self._fs_model.index(str(parent.resolve()), 0) if parent.is_dir() else QModelIndex()
@@ -2981,6 +2998,11 @@ class InboxTreePane(QWidget):
         self._grid_browse_root = Path(path)
         self._nav_history = [Path(path)]
         self._nav_index = 0
+        if self._storage_root_override is not None:
+            try:
+                self._storage_root_override = Path(path).resolve()
+            except OSError:
+                self._storage_root_override = Path(path)
         self._reload_fs_tree_root()
         self._reload_file_entries()
         QTimer.singleShot(0, self._sync_empty_overlay)
@@ -3654,8 +3676,8 @@ class ReferenceTreePane(QWidget):
             on_drag_leave=self._clear_drop_hover,
             is_internal_drag=self._is_internal_ref_drag,
         )
-        self._explorer_drop.mount(tree_stack, self._tree, ref_viewport)
-        self.setAcceptDrops(False)
+        self._explorer_drop.mount(tree_stack, self._tree, ref_viewport, self)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._apply_root_index()
 
     # ---- Helpers: proxy-aware index ↔ path ----

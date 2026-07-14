@@ -44,6 +44,8 @@ class VideoReviewSwitchItem:
     thumb_path: Path | None = None
     sequence_folder: Path | None = None
     on_activate: Callable[[], None] | None = None
+    enabled: bool = True
+    thumb_pixmap: QPixmap | None = None
 
 
 def _blank_thumb() -> QPixmap:
@@ -209,17 +211,28 @@ class _VideoReviewSwitchRow(QFrame):
 
     def set_item(self, item: VideoReviewSwitchItem, *, cache_key: str | None = None) -> None:
         self._thumb_cache_key = cache_key
+        self._enabled = bool(item.enabled)
         self._title.setText(item.label)
         if item.subtitle.strip():
             self._subtitle.setText(item.subtitle)
             self._subtitle.show()
         else:
             self._subtitle.hide()
-        self._thumb.setPixmap(_blank_thumb())
+        if item.thumb_pixmap is not None and not item.thumb_pixmap.isNull():
+            self._thumb.setPixmap(_scale_thumb(item.thumb_pixmap, _SWITCH_THUMB_W, _SWITCH_THUMB_H))
+        else:
+            self._thumb.setPixmap(_blank_thumb())
         self.setProperty("active", "true" if item.checked else "false")
-        self._check.setText("●" if item.checked else "")
+        self.setProperty("available", "true" if item.enabled else "false")
+        self._check.setText("●" if item.checked else ("—" if not item.enabled else ""))
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor if item.enabled else Qt.CursorShape.ArrowCursor
+        )
         self.style().unpolish(self)
         self.style().polish(self)
+        for child in (self._title, self._subtitle, self._check, self._thumb):
+            child.style().unpolish(child)
+            child.style().polish(child)
 
     def set_thumb_pixmap(self, pix: QPixmap) -> None:
         if pix.isNull():
@@ -228,7 +241,10 @@ class _VideoReviewSwitchRow(QFrame):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self.activated.emit()
+            if getattr(self, "_enabled", True):
+                self.activated.emit()
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
 
@@ -342,9 +358,13 @@ class VideoReviewSwitchPopup(QFrame):
             row.set_item(entry, cache_key=cache_key)
             row.installEventFilter(self)
             cached = _cached_thumb_pixmap(cache_key)
-            if cached is not None:
+            if entry.thumb_pixmap is not None and not entry.thumb_pixmap.isNull():
+                pass  # already applied in set_item
+            elif cached is not None:
                 row.set_thumb_pixmap(cached)
-            elif cache_key is not None:
+            elif cache_key is not None and (
+                entry.thumb_path is not None or entry.sequence_folder is not None
+            ):
                 self._thumb_pool.start(
                     _SwitchThumbRunnable(
                         token=token,
@@ -370,10 +390,13 @@ class VideoReviewSwitchPopup(QFrame):
 
     def _on_row_activated(self, index: int) -> None:
         if 0 <= index < len(self._items):
-            cb = self._items[index].on_activate
+            entry = self._items[index]
+            if not entry.enabled:
+                return
+            cb = entry.on_activate
             if cb is not None:
                 cb()
-        self.hide()
+            self.hide()
 
     def _adjust_scroll_geometry(self, anchor: QWidget) -> None:
         n = len(self._items)

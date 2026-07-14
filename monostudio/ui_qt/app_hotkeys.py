@@ -77,6 +77,12 @@ HOTKEY_ACTIONS: tuple[HotkeyAction, ...] = (
     HotkeyAction("main_view.search", "Search in current view", "Main View", "Ctrl+F"),
     HotkeyAction("main_view.copy_monos_link", "Copy MONOS link", "Global", "Ctrl+C"),
     HotkeyAction("main_view.paste_monos_link", "Open MONOS link from clipboard", "Global", "Ctrl+V"),
+    HotkeyAction(
+        "main_view.open_player",
+        "Open player (asset / shot / media)",
+        "Main View",
+        "Space",
+    ),
     HotkeyAction("main_view.toggle_publish", "Toggle Work / Published", "Main View", "P"),
     HotkeyAction("main_view.toggle_review", "Toggle Work / Review (Shots)", "Main View", "R"),
     HotkeyAction("main_view.cycle_view_mode", "Cycle grid / list view", "Main View", "Tab"),

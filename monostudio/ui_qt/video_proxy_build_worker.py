@@ -28,6 +28,17 @@ class ProxyBuildSignaler(QObject):
     finished = Signal(object, object)  # ProxyManifest | None, error str | None
 
 
+def _signaler_alive(signaler: QObject | None) -> bool:
+    if signaler is None:
+        return False
+    try:
+        from shiboken6 import isValid
+
+        return bool(isValid(signaler))
+    except Exception:
+        return False
+
+
 class ProxyBuildRunnable(QRunnable):
     def __init__(
         self,
@@ -50,6 +61,23 @@ class ProxyBuildRunnable(QRunnable):
         self._signaler = signaler
         self._cancel_flag = cancel_flag
 
+    def _emit_progress(self, fraction: float) -> None:
+        if not _signaler_alive(self._signaler):
+            return
+        try:
+            self._signaler.progress.emit(float(fraction))
+        except RuntimeError:
+            # Signaler deleted between isValid and emit (dialog closed).
+            return
+
+    def _emit_finished(self, manifest: ProxyManifest | None, error: str | None) -> None:
+        if not _signaler_alive(self._signaler):
+            return
+        try:
+            self._signaler.finished.emit(manifest, error)
+        except RuntimeError:
+            return
+
     def run(self) -> None:
         try:
             digest, mtime_ns, size = source_digest(self._src)
@@ -65,7 +93,7 @@ class ProxyBuildRunnable(QRunnable):
                     mp4,
                     scale=self._scale,
                     src_info=self._src_info,
-                    progress_callback=self._signaler.progress.emit,
+                    progress_callback=self._emit_progress,
                     cancel_check=self._cancelled,
                 )
                 w, h = proxy_scale_dimensions(
@@ -103,7 +131,7 @@ class ProxyBuildRunnable(QRunnable):
                     end_sec=end_sec,
                     scale=self._scale,
                     src_info=self._src_info,
-                    progress_callback=self._signaler.progress.emit,
+                    progress_callback=self._emit_progress,
                     cancel_check=self._cancelled,
                 )
                 w, h = proxy_scale_dimensions(
@@ -128,9 +156,13 @@ class ProxyBuildRunnable(QRunnable):
                     created_at=time.time(),
                 )
             write_manifest(manifest_path, manifest)
-            self._signaler.finished.emit(manifest, None)
+            self._emit_finished(manifest, None)
         except Exception as e:
-            self._signaler.finished.emit(None, str(e))
+            # Cancel / close player → signaler may already be gone; never crash the pool thread.
+            if self._cancelled() or "cancel" in str(e).lower():
+                self._emit_finished(None, "Proxy build cancelled")
+            else:
+                self._emit_finished(None, str(e))
 
     def _cancelled(self) -> bool:
         return bool(self._cancel_flag and self._cancel_flag[0])

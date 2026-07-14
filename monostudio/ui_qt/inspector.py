@@ -463,6 +463,7 @@ class InspectorPanel(QWidget):
     active_dcc_changed = Signal(object, str, str)  # path, department, dcc_id — đồng bộ với main view
     production_status_override_requested = Signal(object, str, object)  # Path, department, status_id | None
     inspector_hidden_departments_changed = Signal(set)
+    department_filter_requested = Signal(str)  # dept_id — double-click card → sidebar filter
     item_notes_dialog_requested = Signal(object)  # ViewItem (asset / shot)
     open_schedule_requested = Signal()
     edit_allocation_requested = Signal()
@@ -523,6 +524,7 @@ class InspectorPanel(QWidget):
 
         self._dept_pipeline.manage_clicked.connect(self.manage_departments_requested.emit)
         self._dept_pipeline.department_focused.connect(self._on_department_focused)
+        self._dept_pipeline.department_filter_requested.connect(self.department_filter_requested.emit)
         self._dept_pipeline.hidden_departments_changed.connect(self._on_hidden_departments_changed)
         self._dept_pipeline.production_status_override_requested.connect(self.production_status_override_requested.emit)
         self._asset_status.item_notes_clicked.connect(self.item_notes_dialog_requested.emit)
@@ -3843,6 +3845,12 @@ class _InspectorPreview(QWidget):
                 "Review latest preview…",
                 menu,
             )
+            try:
+                from monostudio.ui_qt.app_hotkeys import read_hotkey_sequence
+
+                act_review.setShortcut(read_hotkey_sequence(self._qsettings, "main_view.open_player"))
+            except Exception:
+                act_review.setShortcut(QKeySequence(Qt.Key.Key_Space))
             act_review.triggered.connect(self._try_emit_review_open)
             menu.insertAction(act_open, act_review)
             from monostudio.core.djv_launch import is_djv_available
@@ -4708,6 +4716,7 @@ def _dept_status_pill_qss(text_color: str) -> str:
 
 class _DeptCard(QFrame):
     clicked = Signal()
+    double_clicked = Signal()
     production_status_override_requested = Signal(str, object)  # dept_name, status_id | None
 
     def __init__(self, parent=None) -> None:
@@ -4719,6 +4728,7 @@ class _DeptCard(QFrame):
         self.setAttribute(Qt.WA_Hover, True)
         self.setProperty("focused", False)
         self.setProperty("sidebarFocused", False)
+        self.setToolTip("Click to focus · Double-click to filter")
 
         l = QVBoxLayout(self)
         l.setContentsMargins(8, 4, 8, 4)
@@ -4850,11 +4860,36 @@ class _DeptCard(QFrame):
                     return True
         return super().eventFilter(obj, event)
 
+    def _is_interactive_child(self, widget: QWidget | None) -> bool:
+        w = widget
+        while w is not None and w is not self:
+            if w is self._pill or w is self._btn_open:
+                return True
+            w = w.parentWidget()
+        return False
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         # Clicking the card updates Tech row with this department's work path.
         if event and getattr(event, "button", lambda: None)() == Qt.LeftButton:
-            self.clicked.emit()
+            pos = getattr(event, "position", None)
+            if callable(pos):
+                p = pos().toPoint()
+            else:
+                p = event.pos()
+            if not self._is_interactive_child(self.childAt(p)):
+                self.clicked.emit()
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if event and getattr(event, "button", lambda: None)() == Qt.LeftButton:
+            pos = getattr(event, "position", None)
+            if callable(pos):
+                p = pos().toPoint()
+            else:
+                p = event.pos()
+            if not self._is_interactive_child(self.childAt(p)):
+                self.double_clicked.emit()
+        super().mouseDoubleClickEvent(event)
 
     def set_focused(self, focused: bool) -> None:
         self.setProperty("focused", bool(focused))
@@ -4925,6 +4960,7 @@ class _DeptPipelineList(QWidget):
 class _DepartmentPipeline(QWidget):
     manage_clicked = Signal()
     department_focused = Signal(str)
+    department_filter_requested = Signal(str)
     hidden_departments_changed = Signal(set)
     production_status_override_requested = Signal(object, str, object)  # Path, department, status_id | None
 
@@ -4985,12 +5021,14 @@ class _DepartmentPipeline(QWidget):
 
         self._dept_cards: list[_DeptCard] = []
         self._dept_card_slots: list[object] = []
+        self._dept_card_double_slots: list[object] = []
         self._dept_card_production_status_connected: list[bool] = []
         for _ in range(_MAX_DEPT_CARDS):
             card = _DeptCard(self._list)
             card.setVisible(False)
             self._dept_cards.append(card)
             self._dept_card_slots.append(None)
+            self._dept_card_double_slots.append(None)
             self._dept_card_production_status_connected.append(False)
 
         self._empty = QLabel("—", self)
@@ -5246,6 +5284,14 @@ class _DepartmentPipeline(QWidget):
                 except (TypeError, RuntimeError):
                     pass
                 self._dept_card_slots[i] = None
+            double_slot = self._dept_card_double_slots[i] if i < len(self._dept_card_double_slots) else None
+            if double_slot is not None:
+                try:
+                    card.double_clicked.disconnect(double_slot)
+                except (TypeError, RuntimeError):
+                    pass
+                if i < len(self._dept_card_double_slots):
+                    self._dept_card_double_slots[i] = None
             if i < len(self._dept_card_production_status_connected) and self._dept_card_production_status_connected[i]:
                 try:
                     card.production_status_override_requested.disconnect(self._emit_production_status_override_for_card)
@@ -5287,6 +5333,14 @@ class _DepartmentPipeline(QWidget):
                 card.clicked.connect(slot)
                 if card_idx < len(self._dept_card_slots):
                     self._dept_card_slots[card_idx] = slot
+
+                def _emit_filter(dept: str) -> None:
+                    self._on_dept_double_clicked(dept)
+
+                double_slot = lambda _d=dept_name: _emit_filter(_d)
+                card.double_clicked.connect(double_slot)
+                if card_idx < len(self._dept_card_double_slots):
+                    self._dept_card_double_slots[card_idx] = double_slot
                 card.production_status_override_requested.connect(self._emit_production_status_override_for_card)
                 if card_idx < len(self._dept_card_production_status_connected):
                     self._dept_card_production_status_connected[card_idx] = True
@@ -5313,6 +5367,12 @@ class _DepartmentPipeline(QWidget):
             c.set_sidebar_focused(bool(self._sidebar_focused_dept_id and cid == self._sidebar_focused_dept_id))
             c.set_focused(bool(self._focused_dept_id and cid == self._focused_dept_id))
         self.department_focused.emit(self._focused_dept_id or "")
+
+    def _on_dept_double_clicked(self, dept_id: str | None) -> None:
+        dept_id = (dept_id or "").strip()
+        if not dept_id:
+            return
+        self.department_filter_requested.emit(dept_id)
 
     def _on_empty_clicked(self) -> None:
         # Clicking on empty space clears temporary (Inspector) focus.

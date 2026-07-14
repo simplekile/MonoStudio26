@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRect, QRectF, Qt, QTimer, Signal
@@ -10,18 +9,23 @@ from PySide6.QtGui import QColor, QPainter, QPen
 
 from monostudio.ui_qt.style import MONOS_COLORS
 
-_HOLD_MS = 400
-_FADE_INTERVAL_MS = 150
-_FADE_STEPS = 10
-_FLASH_END = 0.18
+# Hold then fade — keep short so ticks stay cheap (≈9 viewport updates total).
+_HOLD_MS = 280
+_FADE_INTERVAL_MS = 50
+_FADE_STEPS = 8
+_FLASH_END = 0.15
+
+
+def _resolved_path(path: Path | str) -> Path:
+    p = Path(path)
+    try:
+        return p.resolve()
+    except OSError:
+        return p
 
 
 def path_reveal_key(path: Path | str) -> str:
-    p = Path(path)
-    try:
-        return f"path:{p.resolve().as_posix()}"
-    except OSError:
-        return f"path:{p.as_posix()}"
+    return f"path:{_resolved_path(path).as_posix()}"
 
 
 def trash_reveal_key(trash_id: str) -> str:
@@ -75,6 +79,8 @@ class LinkRevealController(QObject):
         super().__init__()
         self._path_targets: dict[str, Path] = {}
         self._trash_targets: dict[str, str] = {}
+        # Hot-path set for Path == without resolve() on every painted cell.
+        self._path_match: set[Path] = set()
         self._global_alpha = 0.0
         self._fade_step = 0
         self._fade_timer = QTimer(self)
@@ -98,8 +104,14 @@ class LinkRevealController(QObject):
         return next(iter(self._trash_targets.values()))
 
     def reveal_path(self, path: Path | str) -> None:
-        key = path_reveal_key(path)
-        self._path_targets[key] = Path(path)
+        resolved = _resolved_path(path)
+        key = f"path:{resolved.as_posix()}"
+        self._path_targets[key] = resolved
+        self._path_match.add(resolved)
+        # Also accept the unresolved form when callers pass absolute paths as-is.
+        raw = Path(path)
+        if raw != resolved:
+            self._path_match.add(raw)
         self._begin_flash()
 
     def reveal_trash(self, trash_id: str) -> None:
@@ -111,11 +123,23 @@ class LinkRevealController(QObject):
         self._begin_flash()
 
     def alpha_for_path(self, path: Path | str) -> float:
-        if self._global_alpha <= 0.01:
+        """Paint hot path: Path == first; resolve only if needed."""
+        if self._global_alpha <= 0.01 or not self._path_match:
             return 0.0
-        if path_reveal_key(path) not in self._path_targets:
+        p = path if isinstance(path, Path) else Path(path)
+        # Prefer == over set hash — Windows case-fold equality is not always hash-safe.
+        if any(p == t for t in self._path_match):
+            return self._global_alpha
+        # Slow path (relative vs absolute / symlink)
+        try:
+            resolved = p.resolve()
+        except OSError:
             return 0.0
-        return self._global_alpha
+        if any(resolved == t for t in self._path_match):
+            return self._global_alpha
+        if f"path:{resolved.as_posix()}" in self._path_targets:
+            return self._global_alpha
+        return 0.0
 
     def alpha_for_trash(self, trash_id: str) -> float:
         if self._global_alpha <= 0.01:
@@ -123,6 +147,9 @@ class LinkRevealController(QObject):
         if trash_reveal_key(trash_id) not in self._trash_targets:
             return 0.0
         return self._global_alpha
+
+    def matches_path(self, path: Path | str) -> bool:
+        return self.alpha_for_path(path) > 0.01
 
     def _begin_flash(self) -> None:
         self._fade_timer.stop()
@@ -162,6 +189,7 @@ class LinkRevealController(QObject):
     def _clear(self) -> None:
         self._path_targets.clear()
         self._trash_targets.clear()
+        self._path_match.clear()
         self._global_alpha = 0.0
         self._fade_step = 0
 

@@ -570,7 +570,12 @@ class ItemNotesDialog(MonosDialog):
 
     def _finish_review_jump(self, host) -> None:
         alive = getattr(host, "_alive_review_player", None)
-        player = alive() if callable(alive) else getattr(host, "_review_player_dialog", None)
+        player = alive() if callable(alive) else None
+        if player is None:
+            players = getattr(host, "_alive_review_players", None)
+            if callable(players):
+                lst = players()
+                player = lst[-1] if lst else None
         if player is not None and player.isVisible():
             bring = getattr(host, "_bring_review_player_to_front", None)
             if callable(bring):
@@ -581,7 +586,12 @@ class ItemNotesDialog(MonosDialog):
 
     def _watch_review_player_restore(self, host) -> None:
         alive = getattr(host, "_alive_review_player", None)
-        player = alive() if callable(alive) else getattr(host, "_review_player_dialog", None)
+        player = alive() if callable(alive) else None
+        if player is None:
+            players = getattr(host, "_alive_review_players", None)
+            if callable(players):
+                lst = players()
+                player = lst[-1] if lst else None
         if player is None:
             self._restore_after_review_jump()
             return

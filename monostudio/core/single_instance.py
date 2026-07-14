@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer
@@ -16,6 +17,8 @@ _MSG_RAISE = b"raise"
 _MSG_LINK_PREFIX = b"link:"
 _CONNECT_MS = 800
 _WRITE_MS = 800
+# Keep secondary alive briefly so AllowSetForegroundWindow still applies while primary raises.
+_HANDOFF_HOLD_S = 0.35
 
 
 class SingleInstanceGuard(QObject):
@@ -71,6 +74,13 @@ class SingleInstanceGuard(QObject):
 
     def _signal_existing(self, deep_link: str | None = None) -> bool:
         """Connect to running instance and forward raise/deep link. Return True if signaled."""
+        # Protocol-handler / second launch often owns focus briefly — grant FG to primary.
+        try:
+            from monostudio.core.window_focus import allow_set_foreground_window_any
+
+            allow_set_foreground_window_any()
+        except Exception:
+            pass
         sock = QLocalSocket(self)
         sock.connectToServer(_SERVER_NAME)
         if not sock.waitForConnected(_CONNECT_MS):
@@ -85,6 +95,10 @@ class SingleInstanceGuard(QObject):
         sock.flush()
         sock.waitForBytesWritten(_WRITE_MS)
         sock.disconnectFromServer()
+        try:
+            time.sleep(_HANDOFF_HOLD_S)
+        except Exception:
+            pass
         return True
 
     def _on_new_connection(self) -> None:

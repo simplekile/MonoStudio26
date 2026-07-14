@@ -1,16 +1,16 @@
-# MonoStudio 26 — Release v26.17.2
+# MonoStudio 26 — Release v26.17.3
 
 ## Highlights
 
-- **Video export**: Progress theo từng range; FFmpeg `-progress pipe:1`; cancel giữa chừng; export nhiều đoạn ổn định hơn.
-- **Sequence flipbook**: Decode bucket theo viewport — chấp nhận plate nhỏ hơn khi đủ sharp; không giữ frame bucket cũ khi resize.
-- **Review player**: Preview dialog & playback backend đồng bộ export/decode.
+- **Deep links**: Short entity id (`e=`) thay path dài; page alias ngắn; resolve + tests; foreground focus khi mở từ instance thứ hai (`window_focus`).
+- **Review / preview**: Sequence & review media ổn định hơn; draw overlay; proxy worker; video preview dialog / switch popup / player backend.
+- **Tray & drop**: Tray mini popup; external drop host; link reveal flash.
+- **Pipeline / UI**: Structure presets; hotkeys; inspector / sidebar / inbox-outbox-guide; style tokens.
 
 ## Changes in this release
 
-- fix: `video_export_dialog.py`, `video_media.py` — ranged export progress + cancel.
-- fix: `review_playback_backend.py`, `video_preview_dialog.py` — sequence decode display bucket.
-- test: `test_sequence_decode_backend.py`.
+- feat: `window_focus.py`, short deep-link entity ids, `test_deep_link.py`, `test_external_drop_host.py`.
+- fix: `video_preview_dialog.py`, `review_draw_overlay.py`, `main_window.py`, `sequence_preview.py`, `review_media.py`.
 
 ## Install
 

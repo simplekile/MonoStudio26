@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, Qt, QRectF, Signal
-from PySide6.QtGui import QMouseEvent, QPainter, QPen, QColor, QPolygonF
+from PySide6.QtGui import QImage, QMouseEvent, QPainter, QPen, QColor, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from monostudio.core.review_draw import (
@@ -34,12 +34,98 @@ def _content_rect_f(widget: QWidget) -> QRectF:
     return QRectF(0.0, 0.0, w, h)
 
 
-def _to_widget(widget: QWidget, pt: tuple[float, float]) -> QPointF:
-    content = _content_rect_f(widget)
+def _to_content(content: QRectF, pt: tuple[float, float]) -> QPointF:
     return QPointF(
         content.x() + pt[0] * content.width(),
         content.y() + pt[1] * content.height(),
     )
+
+
+def _to_widget(widget: QWidget, pt: tuple[float, float]) -> QPointF:
+    return _to_content(_content_rect_f(widget), pt)
+
+
+def _draw_arrow_head(painter: QPainter, a: QPointF, b: QPointF, width: float) -> None:
+    import math
+
+    dx = b.x() - a.x()
+    dy = b.y() - a.y()
+    length = math.hypot(dx, dy)
+    if length < 1e-3:
+        return
+    ux, uy = dx / length, dy / length
+    size = max(8.0, width * 3.0)
+    px, py = -uy, ux
+    tip = b
+    left = QPointF(tip.x() - ux * size + px * size * 0.4, tip.y() - uy * size + py * size * 0.4)
+    right = QPointF(tip.x() - ux * size - px * size * 0.4, tip.y() - uy * size - py * size * 0.4)
+    painter.setBrush(painter.pen().color())
+    painter.drawPolygon(QPolygonF([tip, left, right]))
+
+
+def paint_stroke_on(
+    painter: QPainter,
+    stroke: ReviewDrawStroke,
+    content: QRectF,
+    scale: float,
+    *,
+    draft_alpha: int = 255,
+) -> None:
+    """Paint one stroke into ``content`` (normalized 0–1 points → content pixels)."""
+    if not stroke.points or content.width() <= 1e-6 or content.height() <= 1e-6:
+        return
+    width = max(1.0, stroke.width_px * scale)
+    color = QColor(stroke.color)
+    color.setAlpha(draft_alpha)
+    if stroke.tool == "eraser":
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        pen = QPen(Qt.GlobalColor.transparent, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    else:
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    pts = [_to_content(content, p) for p in stroke.points]
+    if stroke.tool == "pen":
+        for i in range(len(pts) - 1):
+            painter.drawLine(pts[i], pts[i + 1])
+        return
+    if stroke.tool in ("arrow", "rect") and len(pts) >= 2:
+        a, b = pts[0], pts[-1]
+        if stroke.tool == "rect":
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(_rectf_from_points(a, b))
+            return
+        painter.drawLine(a, b)
+        _draw_arrow_head(painter, a, b, width)
+        return
+    if len(pts) == 1:
+        painter.drawPoint(pts[0])
+
+
+def composite_draw_onto_image(
+    base: QImage,
+    layers: list[ReviewDrawLayer],
+    frame: int,
+    *,
+    total_frames: int = 0,
+) -> QImage:
+    """Return ``base`` with visible draw strokes composited (full-frame content)."""
+    if base.isNull():
+        return base
+    strokes = composite_strokes_at(layers, int(frame), total_frames=int(total_frames))
+    if not strokes:
+        return base
+    out = base.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied).copy()
+    if out.isNull():
+        return base
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    content = QRectF(0.0, 0.0, float(out.width()), float(out.height()))
+    scale = max(1.0, float(out.height()) / 1080.0)
+    for stroke in strokes:
+        paint_stroke_on(painter, stroke, content, scale)
+    painter.end()
+    return out
 
 
 class ReviewDrawOverlay(QWidget):
@@ -183,6 +269,7 @@ class ReviewDrawOverlay(QWidget):
             painter.translate(-pivot)
         scale = max(1.0, float(self.height()) / 1080.0)
         frame = self._current_frame
+        content = self._video_content_rect_f()
         if self._onion_enabled:
             prev_strokes = onion_strokes_prev(
                 self._layers,
@@ -197,71 +284,17 @@ class ReviewDrawOverlay(QWidget):
                 active_layer_id=self._active_layer_id,
             )
             for stroke in prev_strokes:
-                self._paint_stroke(painter, stroke, scale, draft_alpha=90)
+                paint_stroke_on(painter, stroke, content, scale, draft_alpha=90)
             for stroke in next_strokes:
-                self._paint_stroke(painter, stroke, scale, draft_alpha=60)
+                paint_stroke_on(painter, stroke, content, scale, draft_alpha=60)
         for stroke in composite_strokes_at(self._layers, frame, total_frames=self._total_frames):
-            self._paint_stroke(painter, stroke, scale)
+            paint_stroke_on(painter, stroke, content, scale)
         if self._draft_points:
             draft_tool = "pen" if self._tool == "eraser" else self._tool
             draft = ReviewDrawStroke(draft_tool, self._color, self._width_px, list(self._draft_points))
             draft_alpha = 120 if self._tool == "eraser" else 200
-            self._paint_stroke(painter, draft, scale, draft_alpha=draft_alpha)
+            paint_stroke_on(painter, draft, content, scale, draft_alpha=draft_alpha)
         painter.end()
-
-    def _paint_stroke(
-        self,
-        painter: QPainter,
-        stroke: ReviewDrawStroke,
-        scale: float,
-        *,
-        draft_alpha: int = 255,
-    ) -> None:
-        if not stroke.points:
-            return
-        width = max(1.0, stroke.width_px * scale)
-        color = QColor(stroke.color)
-        color.setAlpha(draft_alpha)
-        if stroke.tool == "eraser":
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            pen = QPen(Qt.GlobalColor.transparent, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-        else:
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        pts = [_to_widget(self, p) for p in stroke.points]
-        if stroke.tool == "pen":
-            for i in range(len(pts) - 1):
-                painter.drawLine(pts[i], pts[i + 1])
-            return
-        if stroke.tool in ("arrow", "rect") and len(pts) >= 2:
-            a, b = pts[0], pts[-1]
-            if stroke.tool == "rect":
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(_rectf_from_points(a, b))
-                return
-            painter.drawLine(a, b)
-            self._draw_arrow_head(painter, a, b, width)
-            return
-        if len(pts) == 1:
-            painter.drawPoint(pts[0])
-
-    def _draw_arrow_head(self, painter: QPainter, a: QPointF, b: QPointF, width: float) -> None:
-        import math
-
-        dx = b.x() - a.x()
-        dy = b.y() - a.y()
-        length = math.hypot(dx, dy)
-        if length < 1e-3:
-            return
-        ux, uy = dx / length, dy / length
-        size = max(8.0, width * 3.0)
-        px, py = -uy, ux
-        tip = b
-        left = QPointF(tip.x() - ux * size + px * size * 0.4, tip.y() - uy * size + py * size * 0.4)
-        right = QPointF(tip.x() - ux * size - px * size * 0.4, tip.y() - uy * size - py * size * 0.4)
-        painter.setBrush(painter.pen().color())
-        painter.drawPolygon(QPolygonF([tip, left, right]))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.RightButton:

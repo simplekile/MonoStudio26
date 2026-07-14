@@ -94,6 +94,111 @@ def work_file_folder_name_candidates(work_file_path: Path | None) -> tuple[str, 
     return tuple(out)
 
 
+_WORKFILE_VERSION_RE = re.compile(r"(?:^|_)v(\d{3,})(?:_|$)", re.IGNORECASE)
+
+
+def work_file_base_prefix(work_file_path: Path | None) -> str:
+    """
+    Base name before ``_v###`` — e.g. ``shot_anim_v003_fix`` → ``shot_anim``.
+    When no version token, returns the stem unchanged.
+    """
+    if work_file_path is None:
+        return ""
+    stem = (work_file_path.stem or "").strip()
+    if not stem:
+        return ""
+    m = _WORKFILE_VERSION_RE.search(stem)
+    if not m:
+        return stem
+    start = int(m.start())
+    if start > 0 and stem[start] == "_":
+        return stem[:start]
+    if start > 0:
+        return stem[:start].rstrip("_")
+    return ""
+
+
+def _parse_workfile_version_from_folder_name(folder_name: str) -> int | None:
+    """
+    Best-effort: parse a version number from a work-named sequence folder.
+    Expected patterns include "..._v001" or "..._v001_fixNecklace".
+    """
+    s = (folder_name or "").strip()
+    if not s:
+        return None
+    m = _WORKFILE_VERSION_RE.search(s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def review_name_matches_work_prefix(name: str, *, base_prefix: str, exact_names: tuple[str, ...]) -> bool:
+    """True when a folder/file name belongs to this work file family (any version)."""
+    n = (name or "").strip()
+    if not n:
+        return False
+    ncf = n.casefold()
+    for ex in exact_names:
+        if ex and ncf == ex.casefold():
+            return True
+    base = (base_prefix or "").strip()
+    if not base:
+        return False
+    prefix_v = base.casefold() + "_v"
+    if not ncf.startswith(prefix_v):
+        return False
+    rest = n[len(base) + 1 :]  # after ``prefix_``
+    if len(rest) < 4 or rest[0] not in ("v", "V"):
+        return False
+    digits = rest[1:4]
+    if not digits.isdigit():
+        return False
+    tail = rest[4:]
+    return (not tail) or tail.startswith("_")
+
+
+def list_versioned_review_name_candidates(
+    work_path: Path,
+    work_file_path: Path | None,
+) -> tuple[str, ...]:
+    """
+    Exact work-file names plus every versioned sibling under sequence roots
+    that share the same base prefix (``shot_anim_v001``, ``shot_anim_v002``, …).
+    Empty tuple when ``work_file_path`` is None (caller lists everything).
+    """
+    exact = work_file_folder_name_candidates(work_file_path)
+    if work_file_path is None:
+        return ()
+    base = work_file_base_prefix(work_file_path)
+    out: list[str] = list(exact)
+    seen = {n.casefold() for n in out}
+    if not work_path.is_dir():
+        return tuple(out)
+    for root in _sequence_roots_by_priority(work_path):
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for c in children:
+            if c.is_dir():
+                name = c.name
+            elif c.is_file():
+                name = c.stem
+            else:
+                continue
+            if not review_name_matches_work_prefix(name, base_prefix=base, exact_names=exact):
+                continue
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+    return tuple(out)
+
+
 def resolve_sequence_folder(work_path: Path, work_file_path: Path | None) -> Path | None:
     """
     Return folder containing sequence frames:
@@ -118,26 +223,6 @@ def resolve_sequence_folder(work_path: Path, work_file_path: Path | None) -> Pat
             if hit is not None:
                 return hit
     return None
-
-
-_WORKFILE_VERSION_RE = re.compile(r"(?:^|_)v(\d{3,})(?:_|$)", re.IGNORECASE)
-
-
-def _parse_workfile_version_from_folder_name(folder_name: str) -> int | None:
-    """
-    Best-effort: parse a version number from a work-named sequence folder.
-    Expected patterns include "..._v001" or "..._v001_fixNecklace".
-    """
-    s = (folder_name or "").strip()
-    if not s:
-        return None
-    m = _WORKFILE_VERSION_RE.search(s)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
 
 
 def resolve_best_available_sequence_folder(work_path: Path) -> Path | None:

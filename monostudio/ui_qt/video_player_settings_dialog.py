@@ -211,6 +211,11 @@ class VideoPlayerSettingsDialog(MonosDialog):
             )
             self._proxy_cb = QCheckBox("Use proxy when available", proxy_card)
             self._proxy_cb.setChecked(read_video_preview_proxy_enabled(settings))
+            self._proxy_cb.setToolTip(
+                "Prefer cached H.264 proxy for scrub/play. "
+                "Does not build proxy automatically when opening a video — "
+                "build from the Proxy checkbox or … menu in the player."
+            )
             proxy_l.addWidget(self._proxy_cb)
             layout.addWidget(proxy_card)
         else:

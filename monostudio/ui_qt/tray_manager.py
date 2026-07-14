@@ -129,6 +129,14 @@ class TrayManager(QObject):
 
     def refresh_menu(self) -> None:
         self._rebuild_menu()
+        # Never rebuild the mini-popup while hidden — creating QListWidgets/QLabels
+        # during processEvents (page switch workers) can SystemError.
+        self._reload_mini_popup_if_visible()
+
+    def _reload_mini_popup_if_visible(self) -> None:
+        popup = self._mini_popup
+        if popup is None or not popup.isVisible():
+            return
         self._reload_mini_popup()
 
     def show_tray_message(self, title: str, message: str) -> None:

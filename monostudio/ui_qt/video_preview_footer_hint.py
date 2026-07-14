@@ -134,6 +134,16 @@ def _token_cap_specs(token: str) -> list[_CapSpec]:
     }
     if t == "Ctrl+Z":
         return [_CapSpec(_CapKind.KEY, "⌃"), _CapSpec(_CapKind.KEY, "Z")]
+    if t == "Ctrl+C":
+        return [_CapSpec(_CapKind.KEY, "⌃"), _CapSpec(_CapKind.KEY, "C")]
+    if t == "Ctrl+Y":
+        return [_CapSpec(_CapKind.KEY, "⌃"), _CapSpec(_CapKind.KEY, "Y")]
+    if t == "Ctrl+Enter":
+        return [_CapSpec(_CapKind.KEY, "⌃"), _CapSpec(_CapKind.KEY, "⏎")]
+    if t == "Ctrl+[":
+        return [_CapSpec(_CapKind.KEY, "⌃"), _CapSpec(_CapKind.KEY, "[")]
+    if t == "Ctrl+]":
+        return [_CapSpec(_CapKind.KEY, "⌃"), _CapSpec(_CapKind.KEY, "]")]
     if t in key_map:
         return [_CapSpec(_CapKind.KEY, key_map[t])]
     return [_CapSpec(_CapKind.KEY, t)]

@@ -389,6 +389,8 @@ class MainWindow(FramelessMainWindow):
         self._pending_deep_link: str | None = None
         self._pending_open_deep_link: object | None = None
         self._pending_pipeline_entity_nav: tuple[Path, str | None, str | None, bool] | None = None
+        # Tree pages (Inbox / Project Guide / …): open path after deferred context switch finishes.
+        self._pending_tree_deep_link: tuple[str, Path, Path] | None = None
         self.launch_hidden_to_tray: bool = False
         self._pending_restore_maximized: bool = False
         self._force_quit: bool = False
@@ -469,7 +471,7 @@ class MainWindow(FramelessMainWindow):
         self._pending_overdue_entities: list[tuple[str, str]] | None = None
         self._active_nav_context: str | None = None
         self._reference_page_widget: ReferencePageWidget | None = None
-        self._review_player_dialog: VideoPreviewDialog | None = None
+        self._review_player_dialogs: list[VideoPreviewDialog] = []
         self._nav_quick_picker_dialog: object | None = None
         self._inspector = InspectorPanel()
         self._inspector.set_app_settings(self._settings)
@@ -663,6 +665,7 @@ class MainWindow(FramelessMainWindow):
         self._inspector.inspector_hidden_departments_changed.connect(
             self._on_inspector_hidden_departments_changed
         )
+        self._inspector.department_filter_requested.connect(self._on_inspector_department_filter_requested)
         self._inspector.production_status_override_requested.connect(self._on_production_status_override)
         self._inspector.item_notes_dialog_requested.connect(self._on_item_notes_dialog_requested)
         self._inspector.open_schedule_requested.connect(self._on_dashboard_open_schedule)
@@ -762,6 +765,16 @@ class MainWindow(FramelessMainWindow):
                 "main_view.paste_monos_link",
                 self,
                 self._try_paste_monos_link_shortcut,
+                context=Qt.ShortcutContext.WindowShortcut,
+                auto_repeat=False,
+            )
+        )
+        self._bound_hotkeys.append(
+            bind_hotkey(
+                self._settings,
+                "main_view.open_player",
+                self,
+                self._try_open_player_shortcut,
                 context=Qt.ShortcutContext.WindowShortcut,
                 auto_repeat=False,
             )
@@ -1717,6 +1730,29 @@ class MainWindow(FramelessMainWindow):
             return
         self._controller.on_department_clicked(department)
 
+    def _on_inspector_department_filter_requested(self, department: str) -> None:
+        """Double-click department card in Inspector → same filter as sidebar DEPARTMENTS."""
+        dept = (department or "").strip() or None
+        if not dept:
+            return
+        ctx = self._nav_rail.current_context()
+        if ctx == "Schedule":
+            filters = self._filter_panel.filters()
+            if dept == filters.current_department():
+                self._on_schedule_sidebar_department_sync(None)
+            else:
+                self._on_schedule_sidebar_department_sync(dept)
+            return
+        if ctx not in ("Assets", "Shots", "Project Guide"):
+            return
+        filters = self._filter_panel.filters()
+        if dept == filters.current_department():
+            if ctx == "Project Guide":
+                return
+            filters.set_selected_department(None, emit=True)
+        else:
+            filters.set_selected_department(dept, emit=True)
+
     def _on_sidebar_type_clicked(self, type_id: object) -> None:
         if self._nav_rail.current_context() == "Schedule":
             self._apply_schedule_sidebar_filters()
@@ -2517,6 +2553,43 @@ class MainWindow(FramelessMainWindow):
         ):
             self._on_copy_link_requested(item)
 
+    def _try_open_player_shortcut(self) -> None:
+        """Space — open review/video player for selected asset, shot, or media file."""
+        from monostudio.ui_qt.nav_quick_view import keyboard_input_blocks_shortcuts
+
+        if keyboard_input_blocks_shortcuts() or self._shortcut_editing_focus():
+            return
+
+        current = self._content_stack.currentWidget()
+
+        if current is self._main_view:
+            item = self._main_view.selected_view_item()
+            if (
+                isinstance(item, ViewItem)
+                and not self._main_view._is_item_dimmed(item)
+                and item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT)
+            ):
+                self._on_review_entity_requested(item)
+                return
+
+        pane = self._explorer_tree_pane_for_current_page()
+        if pane is not None:
+            opener = getattr(pane, "_open_video_if_selected", None)
+            if callable(opener) and opener():
+                return
+
+        item = getattr(self._inspector, "_current_item", None)
+        if isinstance(item, ViewItem):
+            if item.kind in (ViewItemKind.ASSET, ViewItemKind.SHOT):
+                self._on_review_entity_requested(item)
+                return
+            if item.kind == ViewItemKind.INBOX_ITEM:
+                from monostudio.ui_qt.thumbnails import is_video_preview_path
+
+                p = Path(item.path)
+                if p.is_file() and is_video_preview_path(p):
+                    self._open_video_preview_from_inspector(p)
+
     def _try_paste_monos_link_shortcut(self) -> None:
         if self._shortcut_editing_focus():
             return
@@ -2543,11 +2616,10 @@ class MainWindow(FramelessMainWindow):
         signal = getattr(widget, "copy_link_requested", None)
         if signal is None:
             return
-        try:
-            signal.disconnect(self._on_tree_copy_link_requested)
-        except (RuntimeError, TypeError):
-            pass
-        signal.connect(self._on_tree_copy_link_requested)
+        signal.connect(
+            self._on_tree_copy_link_requested,
+            Qt.ConnectionType.UniqueConnection,
+        )
 
     def _on_sidebar_context_menu_requested(self, context_text: str, global_pos) -> None:
         # Contextual inventory (read-only) from existing in-memory index only.
@@ -3237,6 +3309,9 @@ class MainWindow(FramelessMainWindow):
                 return
         self._pending_open_deep_link = None
         QTimer.singleShot(120, lambda l=link, pr=project_root: self._navigate_open_deep_link(l, pr))
+        # Navigation is deferred; re-claim FG after switch (other apps often keep focus).
+        QTimer.singleShot(200, self._present_force_foreground_again)
+        QTimer.singleShot(500, self._present_force_foreground_again)
 
     def _ensure_project_root_for_deep_link(self, project_root: Path) -> None:
         try:
@@ -3245,13 +3320,39 @@ class MainWindow(FramelessMainWindow):
         except OSError:
             self._apply_project_root(str(project_root), save=True)
 
+    def _resolve_open_deep_link_entity_rel(self, link, project_root: Path) -> str | None:
+        """Full entity path from legacy ``entity=`` or short ``e=`` hash."""
+        from monostudio.core.deep_link import normalize_entity_rel, resolve_entity_short_id
+
+        entity = normalize_entity_rel(getattr(link, "entity", None))
+        if entity:
+            return entity
+        entity_id = (getattr(link, "entity_id", None) or "").strip()
+        if not entity_id:
+            return None
+        return resolve_entity_short_id(project_root, link.page, entity_id)
+
     def _navigate_open_deep_link(self, link, project_root: Path) -> None:
         from monostudio.core.notification_copy import pick_copy
 
         page = link.page
+        entity_rel = self._resolve_open_deep_link_entity_rel(link, project_root)
+        wants_entity = bool(
+            (getattr(link, "entity", None) or "").strip()
+            or (getattr(link, "entity_id", None) or "").strip()
+        )
+        if wants_entity and not entity_rel:
+            notification_service.warning(
+                pick_copy(
+                    "Không tìm thấy mục này trong project (đổi tên/move thì link hash hết hạn).",
+                    "Could not find that item in the project (rename/move invalidates hash links).",
+                )
+            )
+            return
+
         if page in ("Assets", "Shots"):
-            if link.entity:
-                entity_path = (project_root / link.entity).resolve()
+            if entity_rel:
+                entity_path = (project_root / entity_rel).resolve()
                 if not entity_path.exists():
                     notification_service.warning(
                         pick_copy(
@@ -3272,31 +3373,35 @@ class MainWindow(FramelessMainWindow):
             return
 
         if page == "Inbox":
-            self._switch_footer_context("Inbox")
-            if link.entity:
-                item_path = (project_root / link.entity).resolve()
-                self._deep_link_open_tree_path("Inbox", project_root, item_path)
+            if entity_rel:
+                item_path = (project_root / entity_rel).resolve()
+                self._queue_or_open_tree_deep_link("Inbox", project_root, item_path)
+            else:
+                self._switch_footer_context("Inbox")
             return
 
         if page == "Project Guide":
-            self._switch_footer_context("Project Guide")
-            if link.entity:
-                item_path = (project_root / link.entity).resolve()
-                self._deep_link_open_tree_path("Project Guide", project_root, item_path)
+            if entity_rel:
+                item_path = (project_root / entity_rel).resolve()
+                self._queue_or_open_tree_deep_link("Project Guide", project_root, item_path)
+            else:
+                self._switch_footer_context("Project Guide")
             return
 
         if page == "Delivery":
-            self._switch_footer_context("Delivery")
-            if link.entity:
-                item_path = (project_root / link.entity).resolve()
-                self._deep_link_open_tree_path("Delivery", project_root, item_path)
+            if entity_rel:
+                item_path = (project_root / entity_rel).resolve()
+                self._queue_or_open_tree_deep_link("Delivery", project_root, item_path)
+            else:
+                self._switch_footer_context("Delivery")
             return
 
         if page == "Internal check":
-            self._switch_footer_context("Internal check")
-            if link.entity:
-                item_path = (project_root / link.entity).resolve()
-                self._deep_link_open_tree_path("Internal check", project_root, item_path)
+            if entity_rel:
+                item_path = (project_root / entity_rel).resolve()
+                self._queue_or_open_tree_deep_link("Internal check", project_root, item_path)
+            else:
+                self._switch_footer_context("Internal check")
             return
 
         if page == "Trash":
@@ -3326,6 +3431,33 @@ class MainWindow(FramelessMainWindow):
         widget = widget_map.get(context_name)
         if widget is not None:
             self._content_stack.setCurrentWidget(widget)
+
+    def _queue_or_open_tree_deep_link(self, page: str, project_root: Path, item_path: Path) -> None:
+        """Open a tree path now, or after deferred page switch (same race as Assets/Shots pending nav)."""
+        page_name = (page or "").strip()
+        if not page_name:
+            return
+        target = Path(item_path)
+        root = Path(project_root)
+        if self._nav_rail.current_context() != page_name:
+            self._pending_tree_deep_link = (page_name, root, target)
+            self._switch_footer_context(page_name)
+            return
+        self._switch_footer_context(page_name)
+        self._deep_link_open_tree_path(page_name, root, target)
+
+    def _consume_pending_tree_deep_link(self) -> None:
+        pending = self._pending_tree_deep_link
+        if pending is None:
+            return
+        page_name, project_root, item_path = pending
+        if self._nav_rail.current_context() != page_name:
+            return
+        self._pending_tree_deep_link = None
+        QTimer.singleShot(
+            0,
+            lambda p=page_name, pr=project_root, ip=item_path: self._deep_link_open_tree_path(p, pr, ip),
+        )
 
     def _ensure_pipeline_entity_selected(self, path: Path, *, attempt: int = 0) -> None:
         target = Path(path)
@@ -3383,12 +3515,43 @@ class MainWindow(FramelessMainWindow):
         QTimer.singleShot(80 + attempt * 40, lambda: self._deep_link_select_trash_entry(tid, attempt=attempt + 1))
 
     def present(self, *, open_notifications: bool = False) -> None:
-        """Raise main window (from tray, toast, or second instance)."""
-        self.showNormal()
+        """Raise main window (from tray, toast, deep link, or second instance)."""
+        if self.isHidden():
+            self.show()
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
         self.raise_()
         self.activateWindow()
+        wh = self.windowHandle()
+        if wh is not None:
+            wh.requestActivate()
+        try:
+            from monostudio.core.window_focus import force_widget_to_foreground
+
+            force_widget_to_foreground(self)
+        except Exception:
+            pass
+        # Second tick: primary often runs after the protocol-handler process exits.
+        QTimer.singleShot(80, self._present_force_foreground_again)
         if open_notifications:
             self._top_bar.open_noti_dropdown()
+
+    def _present_force_foreground_again(self) -> None:
+        if self.isHidden():
+            return
+        self.raise_()
+        self.activateWindow()
+        wh = self.windowHandle()
+        if wh is not None:
+            wh.requestActivate()
+        try:
+            from monostudio.core.window_focus import force_widget_to_foreground
+
+            force_widget_to_foreground(self)
+        except Exception:
+            pass
 
     def request_close(self) -> None:
         """User clicked window close — may hide to tray per settings."""
@@ -3948,8 +4111,9 @@ class MainWindow(FramelessMainWindow):
 
     def _on_tray_notification_count(self, count: int) -> None:
         if self._tray_manager is not None:
+            # Icon/badge only — visible mini-popup listens via unread_count_changed.
+            # Full refresh_menu rebuilds widgets and can crash during event pumps.
             self._tray_manager.set_notification_pending(count > 0)
-            self._tray_manager.refresh_menu()
 
     def _sync_tray_status_badges(self) -> None:
         if self._tray_manager is None:
@@ -4410,9 +4574,9 @@ class MainWindow(FramelessMainWindow):
             self._main_view.invalidate_notes_open_count_cache(p)
         self._inspector.refresh_notes_badge()
 
-    def _on_review_player_notes_changed(self) -> None:
-        dlg = self._alive_review_player()
-        entity_path = getattr(dlg, "_entity_path", None) if dlg is not None else None
+    def _on_review_player_notes_changed(self, dlg: VideoPreviewDialog | None = None) -> None:
+        player = dlg if dlg is not None else self._alive_review_player()
+        entity_path = getattr(player, "_entity_path", None) if player is not None else None
         if entity_path is not None:
             try:
                 self._main_view.invalidate_notes_open_count_cache(Path(entity_path))
@@ -4808,6 +4972,9 @@ class MainWindow(FramelessMainWindow):
 
     def _apply_context_switch_content(self, context_name: str, own_page_loading: bool) -> None:
         deferred_finish = False
+        pending_tree_page = (
+            self._pending_tree_deep_link[0] if self._pending_tree_deep_link is not None else None
+        )
         try:
             self._entered_parent = None
             if context_name not in (
@@ -4868,7 +5035,8 @@ class MainWindow(FramelessMainWindow):
                 self._refresh_tree_pane_responsive(
                     self._inbox_page_widget._tree_pane if self._inbox_page_widget is not None else None
                 )
-                self._restore_inbox_date_folder_state()
+                if pending_tree_page != "Inbox":
+                    self._restore_inbox_date_folder_state()
             elif context_name == "Project Guide":
                 self._sync_filter_state_from_sidebar()
                 if self._reference_page_widget is None:
@@ -4904,7 +5072,8 @@ class MainWindow(FramelessMainWindow):
                 self._refresh_tree_pane_responsive(
                     self._reference_page_widget._tree_pane if self._reference_page_widget is not None else None
                 )
-                self._restore_project_guide_browse_state()
+                if pending_tree_page != "Project Guide":
+                    self._restore_project_guide_browse_state()
                 self._inspector.set_inbox_tree_preview(None)
             elif context_name == SidebarContext.INTERNAL_CHECK.value:
                 self._sync_filter_state_from_sidebar()
@@ -4938,7 +5107,8 @@ class MainWindow(FramelessMainWindow):
                     if self._internal_check_page_widget is not None
                     else None
                 )
-                self._restore_internal_check_date_folder_state()
+                if pending_tree_page != "Internal check":
+                    self._restore_internal_check_date_folder_state()
             elif context_name == "Delivery":
                 self._sync_filter_state_from_sidebar()
                 self._inbox_switch_cooldown = True
@@ -4967,7 +5137,8 @@ class MainWindow(FramelessMainWindow):
                 self._refresh_tree_pane_responsive(
                     self._outbox_page_widget._tree_pane if self._outbox_page_widget is not None else None
                 )
-                self._restore_outbox_date_folder_state()
+                if pending_tree_page != "Delivery":
+                    self._restore_outbox_date_folder_state()
             elif context_name == "Outbox":
                 self._apply_context_switch_content("Delivery", own_page_loading)
                 return
@@ -5121,6 +5292,11 @@ class MainWindow(FramelessMainWindow):
                     snap = self._nav_quick_pending_filters
                     self._nav_quick_pending_filters = None
                     self._apply_nav_quick_filter_snapshot(snap)
+                if (
+                    self._pending_tree_deep_link is not None
+                    and self._pending_tree_deep_link[0] == context_name
+                ):
+                    self._consume_pending_tree_deep_link()
 
     def _command_palette_projects(self) -> list[dict]:
         rows: list[dict] = []
@@ -5407,14 +5583,16 @@ class MainWindow(FramelessMainWindow):
         self._sync_filter_state_from_sidebar()
         self._set_main_view_type()
         self._set_main_view_department(defer_list_rebuild=True)
-        self._app_state.set_selection(str(path))
         target = Path(path)
+        self._app_state.set_selection(str(target))
 
         if switching_context:
             self._pending_pipeline_entity_nav = (target, active_dept, typ, bool(link_reveal))
             self._nav_rail.set_current_context(ctx)
             return True
 
+        # Same page: stamp filter recall so _reload_main_view preserve does not keep the old card.
+        self._main_view_selection_by_filter[self._selection_filter_key()] = str(target)
         self._content_stack.setCurrentWidget(self._main_view)
         self._sync_primary_action()
         self._reload_main_view()
@@ -5428,6 +5606,13 @@ class MainWindow(FramelessMainWindow):
             ),
         )
         return True
+
+    def _commit_pipeline_entity_selection(self, target: Path) -> None:
+        """Persist deep-link / jump selection in AppState and per-filter recall."""
+        sid = str(Path(target))
+        self._app_state.set_selection(sid)
+        if self._nav_rail.current_context() in ("Assets", "Shots"):
+            self._main_view_selection_by_filter[self._selection_filter_key()] = sid
 
     def _complete_pipeline_entity_select(
         self,
@@ -5450,8 +5635,12 @@ class MainWindow(FramelessMainWindow):
         if active_dept:
             filters.set_selected_department(active_dept, emit=False)
             self._controller.sync_filter_state(department=active_dept, type_id=typ)
-        self._set_main_view_department()
+        # defer_list_rebuild: skip _restore_main_view_selection_from_recall() which would
+        # re-apply the previously selected card after select_item_by_path (same-page MONOS link).
+        self._set_main_view_department(defer_list_rebuild=True)
         self._set_main_view_type()
+        self._main_view.select_item_by_path(target)
+        self._commit_pipeline_entity_selection(target)
         if link_reveal:
             from monostudio.ui_qt.link_reveal import link_reveal
 
@@ -7537,15 +7726,14 @@ class MainWindow(FramelessMainWindow):
         return True
 
     def _release_video_preview(self) -> None:
-        dlg = self._alive_review_player()
-        if dlg is None:
-            return
-        try:
-            dlg.release_player()
-            dlg.close()
-        except Exception:
-            pass
-        self._review_player_dialog = None
+        players = list(self._alive_review_players())
+        for dlg in players:
+            try:
+                dlg.release_player()
+                dlg.close()
+            except Exception:
+                pass
+        self._review_player_dialogs.clear()
 
     def _open_video_preview_from_inbox(self, path) -> None:
         p = Path(path) if path is not None else None
@@ -7691,6 +7879,7 @@ class MainWindow(FramelessMainWindow):
             return
         dep = (self._main_view._active_department or "").strip()
         if not dep:
+            notification_service.warning("Select a department first.")
             return
         active_dcc = self._main_view.get_active_dcc(item.path, dep)
         wf = primary_work_file_for_department(ref, dep, active_dcc)
@@ -7849,6 +8038,213 @@ class MainWindow(FramelessMainWindow):
             return resolved.request
         return None
 
+    def _review_peer_entity_paths(self, dlg: VideoPreviewDialog) -> list[tuple[Path, str, object | None]]:
+        """Playlist of peer shots or assets for the open review player (same kind).
+
+        Returns ``(path, label, pipeline_ref)``.
+        """
+        from monostudio.core.models import Asset, Shot
+        from monostudio.ui_qt.view_items import display_name_for_item
+
+        current = getattr(dlg, "_entity_path", None)
+        if current is None:
+            return []
+        try:
+            current_key = str(Path(current).resolve()).casefold()
+        except OSError:
+            current_key = str(current).casefold()
+
+        kind: str | None = None
+        if self._pipeline_ref_for_path(Path(current), "shot") is not None:
+            kind = "shot"
+        elif self._pipeline_ref_for_path(Path(current), "asset") is not None:
+            kind = "asset"
+        if kind is None:
+            return []
+
+        peers: list[tuple[Path, str, object | None]] = []
+        seen: set[str] = set()
+
+        def add_path(path: Path, label: str, ref: object | None = None) -> None:
+            try:
+                key = str(path.resolve()).casefold()
+            except OSError:
+                key = str(path).casefold()
+            if key in seen:
+                return
+            seen.add(key)
+            if ref is None:
+                ref = self._pipeline_ref_for_path(path, kind)
+            peers.append((path, label, ref))
+
+        visible = list(getattr(self._main_view, "_all_items", []) or [])
+        want = ViewItemKind.SHOT if kind == "shot" else ViewItemKind.ASSET
+        from_view = [vi for vi in visible if isinstance(vi, ViewItem) and vi.kind == want]
+        if from_view:
+            for vi in from_view:
+                add_path(
+                    Path(vi.path),
+                    display_name_for_item(vi) or vi.name or Path(vi.path).name,
+                    getattr(vi, "ref", None),
+                )
+        elif self._project_index is not None:
+            if kind == "shot":
+                for shot in self._project_index.shots:
+                    if not isinstance(shot, Shot):
+                        continue
+                    add_path(Path(shot.path), shot.name or Path(shot.path).name, shot)
+            else:
+                for asset in self._project_index.assets:
+                    if not isinstance(asset, Asset):
+                        continue
+                    add_path(Path(asset.path), asset.name or Path(asset.path).name, asset)
+
+        if current_key not in seen:
+            label = Path(current).name
+            ref = self._pipeline_ref_for_path(Path(current), kind)
+            if ref is not None:
+                label = getattr(ref, "name", None) or label
+            add_path(Path(current), label, ref)
+
+        return peers
+
+    def _review_peer_preview_payload(
+        self,
+        entity_path: Path,
+        ref: object | None,
+        *,
+        department_id: str,
+        department_label: str,
+    ) -> tuple[bool, Path | None, Path | None, str, object | None]:
+        """``(has_playable, thumb_path, sequence_folder, subtitle, cached_pixmap)``."""
+        from monostudio.core.models import Asset, Shot
+        from monostudio.core.review_media import ReviewResolveAction, resolve_entity_review_media
+        from monostudio.ui_qt.inspector_preview_settings import read_sequence_preview_fps
+        from monostudio.ui_qt.thumbnail_source_resolve import (
+            primary_work_file_for_department,
+            resolve_department_work_path_for_preview,
+        )
+        from monostudio.ui_qt.thumbnails import resolve_thumbnail_path
+        from monostudio.ui_qt.video_preview_context import PreviewContext, ReviewMediaKind
+
+        dep = (department_id or "").strip()
+        if not dep or not isinstance(ref, (Asset, Shot)):
+            thumb = resolve_thumbnail_path(entity_path, department=dep or None)
+            if thumb is not None and thumb.is_file():
+                return (False, thumb, None, "No preview", None)
+            return (False, None, None, "No preview", None)
+
+        active_dcc = self._main_view.get_active_dcc(str(entity_path), dep)
+        cached_pix = None
+        mgr = getattr(self, "_thumbnail_manager", None)
+        if mgr is not None:
+            try:
+                cached_pix = mgr.request_thumbnail(
+                    str(entity_path),
+                    dep,
+                    pipeline_ref=ref,
+                    active_dcc_id=active_dcc,
+                )
+            except Exception:
+                cached_pix = None
+
+        wf = primary_work_file_for_department(ref, dep, active_dcc)
+        wp = resolve_department_work_path_for_preview(
+            ref,
+            dep,
+            work_file_path=wf,
+            item_root=entity_path,
+            active_dcc_id=active_dcc,
+        )
+        thumb = resolve_thumbnail_path(entity_path, department=dep)
+        fps = read_sequence_preview_fps(self._settings)
+        label = (department_label or "").strip() or self._department_display_label(dep) or dep
+        resolved = resolve_entity_review_media(
+            thumb_path=thumb,
+            work_path=wp,
+            work_file_path=wf,
+            sequence_frames=None,
+            sequence_folder=None,
+            fps=fps,
+            context=PreviewContext.entity,
+            entity_path=entity_path,
+            department_id=dep,
+            department_label=label,
+        )
+        if resolved.action == ReviewResolveAction.open_player and resolved.request is not None:
+            req = resolved.request
+            src = (getattr(req, "source_label", None) or "").strip() or "Has preview"
+            if req.media_kind == ReviewMediaKind.video and req.path is not None:
+                return (True, Path(req.path), None, src, cached_pix)
+            if req.media_kind == ReviewMediaKind.sequence and req.sequence_folder is not None:
+                return (True, None, Path(req.sequence_folder), src, cached_pix)
+            return (True, thumb if thumb and thumb.is_file() else None, None, src, cached_pix)
+
+        if thumb is not None and thumb.is_file():
+            return (False, thumb, None, "No preview", cached_pix)
+        return (False, None, None, "No preview", cached_pix)
+
+    def _review_peer_switch_items(self, dlg: VideoPreviewDialog) -> list:
+        from monostudio.ui_qt.video_review_switch_popup import VideoReviewSwitchItem
+
+        peers = self._review_peer_entity_paths(dlg)
+        current = getattr(dlg, "_entity_path", None)
+        try:
+            current_key = str(Path(current).resolve()).casefold() if current is not None else ""
+        except OSError:
+            current_key = str(current).casefold() if current is not None else ""
+        dep = (getattr(dlg, "_department_id", None) or "").strip()
+        dept_label = (getattr(dlg, "_department_label", None) or "").strip() or self._department_display_label(dep)
+        items: list[VideoReviewSwitchItem] = []
+        for path, label, ref in peers:
+            try:
+                key = str(path.resolve()).casefold()
+            except OSError:
+                key = str(path).casefold()
+            has_preview, thumb_path, seq_folder, subtitle, cached_pix = self._review_peer_preview_payload(
+                path,
+                ref,
+                department_id=dep,
+                department_label=dept_label,
+            )
+            items.append(
+                VideoReviewSwitchItem(
+                    label=label,
+                    subtitle=subtitle,
+                    checked=key == current_key,
+                    thumb_path=thumb_path,
+                    sequence_folder=seq_folder,
+                    enabled=has_preview,
+                    thumb_pixmap=cached_pix,
+                    on_activate=(
+                        (lambda p=path, d=dlg: self._switch_review_player_entity(d, p))
+                        if has_preview
+                        else None
+                    ),
+                )
+            )
+        return items
+
+    def _switch_review_player_entity(self, dlg: VideoPreviewDialog, entity_path: Path) -> None:
+        dep = (getattr(dlg, "_department_id", None) or "").strip()
+        label = (getattr(dlg, "_department_label", None) or "").strip() or self._department_display_label(dep)
+        request = self._resolve_review_request_for_entity_path(
+            Path(entity_path),
+            department_id=dep or None,
+            department_label=label or None,
+        )
+        if request is None:
+            notification_service.warning("No review media found for this department.")
+            return
+        dlg.load_media(request)
+        try:
+            self._main_view.select_item_by_path(Path(entity_path))
+        except Exception:
+            pass
+        sync = getattr(dlg, "_sync_entity_playlist_btn", None)
+        if callable(sync):
+            sync()
+
     def jump_to_note_time_anchor(
         self,
         *,
@@ -7863,8 +8259,8 @@ class MainWindow(FramelessMainWindow):
             return
 
         dep = (department_id or "").strip() or None
-        existing = self._alive_review_player()
-        if existing is not None and self._review_player_matches_entity(existing, entity_path, dep):
+        existing = self._find_review_player_for_entity(entity_path, dep)
+        if existing is not None:
             existing.apply_time_anchor(href)
             self._bring_review_player_to_front(existing)
             return
@@ -7879,20 +8275,73 @@ class MainWindow(FramelessMainWindow):
             return
         self._open_review_player(request, pending_time_anchor=href)
 
-    def _alive_review_player(self) -> VideoPreviewDialog | None:
-        dlg = self._review_player_dialog
-        if dlg is None:
-            return None
+    def _alive_review_players(self) -> list[VideoPreviewDialog]:
         try:
             from shiboken6 import isValid
-
-            if not isValid(dlg):
-                self._review_player_dialog = None
-                return None
         except Exception:
-            self._review_player_dialog = None
+            isValid = None  # type: ignore[assignment]
+        alive: list[VideoPreviewDialog] = []
+        for dlg in self._review_player_dialogs:
+            try:
+                if isValid is not None and not isValid(dlg):
+                    continue
+            except Exception:
+                continue
+            alive.append(dlg)
+        if len(alive) != len(self._review_player_dialogs):
+            self._review_player_dialogs = alive
+        return list(alive)
+
+    def _alive_review_player(self) -> VideoPreviewDialog | None:
+        """Most relevant open player (active window preferred, else last opened)."""
+        players = self._alive_review_players()
+        if not players:
             return None
-        return dlg
+        for dlg in reversed(players):
+            try:
+                if dlg.isVisible() and dlg.isActiveWindow():
+                    return dlg
+            except Exception:
+                continue
+        for dlg in reversed(players):
+            try:
+                if dlg.isVisible():
+                    return dlg
+            except Exception:
+                continue
+        return players[-1]
+
+    def _find_review_player_for_entity(
+        self,
+        entity_path: Path | None,
+        department_id: str | None,
+    ) -> VideoPreviewDialog | None:
+        for dlg in reversed(self._alive_review_players()):
+            try:
+                if dlg.isVisible() and self._review_player_matches_entity(
+                    dlg, entity_path, department_id
+                ):
+                    return dlg
+            except Exception:
+                continue
+        return None
+
+    def _find_review_player_for_media(self, path: Path) -> VideoPreviewDialog | None:
+        for dlg in reversed(self._alive_review_players()):
+            try:
+                if dlg.isVisible() and self._review_player_matches_media_path(dlg, path):
+                    return dlg
+            except Exception:
+                continue
+        return None
+
+    def _unregister_review_player(self, dlg: VideoPreviewDialog | None) -> None:
+        if dlg is None:
+            return
+        try:
+            self._review_player_dialogs = [d for d in self._review_player_dialogs if d is not dlg]
+        except Exception:
+            self._review_player_dialogs = []
 
     def _open_review_player(self, request: object, *, pending_time_anchor: str | None = None) -> None:
         if isinstance(request, VideoPreviewOpenRequest):
@@ -7902,40 +8351,32 @@ class MainWindow(FramelessMainWindow):
         self._record_last_video_preview_open(request)
         href = (pending_time_anchor or "").strip() or None
         if href:
-            existing = self._alive_review_player()
-            if (
-                existing is not None
-                and existing.isVisible()
-                and self._review_player_matches_entity(
-                    existing,
-                    request.entity_path,
-                    request.department_id,
-                )
-            ):
+            existing = self._find_review_player_for_entity(
+                request.entity_path,
+                request.department_id,
+            )
+            if existing is not None:
                 existing.apply_time_anchor(href)
                 self._bring_review_player_to_front(existing)
                 return
         if not href and request.entity_path is not None:
-            existing = self._alive_review_player()
-            if (
-                existing is not None
-                and existing.isVisible()
-                and self._review_player_matches_entity(
-                    existing,
-                    request.entity_path,
-                    request.department_id,
-                )
-            ):
+            existing = self._find_review_player_for_entity(
+                request.entity_path,
+                request.department_id,
+            )
+            if existing is not None:
                 existing.load_media(request)
                 self._bring_review_player_to_front(existing)
                 return
-        existing = self._alive_review_player()
-        if existing is not None and existing.isVisible():
-            try:
-                existing.release_player()
-                existing.close()
-            except Exception:
-                pass
+        if request.path is not None and request.entity_path is None:
+            existing = self._find_review_player_for_media(Path(request.path))
+            if existing is not None and existing.isVisible():
+                if href:
+                    existing.apply_time_anchor(href)
+                else:
+                    existing.load_media(request)
+                self._bring_review_player_to_front(existing)
+                return
         QTimer.singleShot(0, lambda: self._spawn_review_player_dialog(request, href))
 
     def _spawn_review_player_dialog(
@@ -7952,17 +8393,24 @@ class MainWindow(FramelessMainWindow):
             geometry_anchor=self,
         )
         dlg.set_main_window_anchor(self)
+        dlg.set_peer_entity_provider(lambda d=dlg: self._review_peer_switch_items(d))
         if href:
             dlg.set_pending_time_anchor(href)
-        self._review_player_dialog = dlg
-        dlg.destroyed.connect(lambda *_: setattr(self, "_review_player_dialog", None))
-        dlg.closed.connect(self._on_review_player_closed)
+        self._review_player_dialogs.append(dlg)
+        dlg.destroyed.connect(lambda *_, d=dlg: self._unregister_review_player(d))
+        dlg.closed.connect(lambda d=dlg: self._on_review_player_closed(d))
         dlg.export_completed.connect(self._on_video_export_completed)
         dlg.open_all_notes_requested.connect(self._on_video_preview_open_all_notes)
         dlg.open_in_djv_requested.connect(lambda d=dlg: self._open_in_djv_from_player(d))
         dlg.player_settings_saved.connect(self._on_review_player_settings_saved)
-        dlg.notes_changed.connect(lambda: self._on_review_player_notes_changed())
+        dlg.notes_changed.connect(lambda d=dlg: self._on_review_player_notes_changed(d))
         dlg.show()
+        others = [d for d in self._alive_review_players() if d is not dlg and d.isVisible()]
+        if others:
+            offset = 32 * len(others)
+            geo = dlg.geometry()
+            if geo.isValid():
+                dlg.move(geo.x() + offset, geo.y() + offset)
         self._bring_review_player_to_front(dlg)
 
     def _bring_review_player_to_front(self, dlg: VideoPreviewDialog | None = None) -> None:
@@ -7976,12 +8424,10 @@ class MainWindow(FramelessMainWindow):
         QTimer.singleShot(80, lambda p=player: self._raise_review_player_once(p))
 
     def _stack_review_player_behind_main(self) -> None:
-        player = self._alive_review_player()
-        if player is None:
-            return
-        stack = getattr(player, "stack_under_main", None)
-        if callable(stack):
-            stack(self)
+        for player in self._alive_review_players():
+            stack = getattr(player, "stack_under_main", None)
+            if callable(stack):
+                stack(self)
 
     def _raise_review_player_once(self, player: VideoPreviewDialog) -> None:
         try:
@@ -8020,11 +8466,19 @@ class MainWindow(FramelessMainWindow):
                 return True
         return False
 
-    def _on_review_player_closed(self) -> None:
-        self._review_player_dialog = None
+    def _on_review_player_closed(self, dlg: VideoPreviewDialog | None = None) -> None:
+        if dlg is not None:
+            self._unregister_review_player(dlg)
+        else:
+            # Fallback: drop stale entries only
+            self._alive_review_players()
         from monostudio.ui_qt.style import release_stuck_mouse_grab, resync_hover_at_cursor
 
         release_stuck_mouse_grab(force=True)
+        remaining = [d for d in self._alive_review_players() if d is not dlg]
+        if remaining:
+            QTimer.singleShot(0, resync_hover_at_cursor)
+            return
         if not self._item_notes_dialog_awaiting_restore():
             self.activateWindow()
             self.raise_()
@@ -8095,12 +8549,8 @@ class MainWindow(FramelessMainWindow):
             )
             self._sync_review_player_top_bar_hint()
             return
-        existing = self._alive_review_player()
-        if (
-            existing is not None
-            and existing.isVisible()
-            and self._review_player_matches_media_path(existing, path)
-        ):
+        existing = self._find_review_player_for_media(path)
+        if existing is not None:
             self._bring_review_player_to_front(existing)
             return
         ctx_raw = saved.get("context") or PreviewContext.entity.value

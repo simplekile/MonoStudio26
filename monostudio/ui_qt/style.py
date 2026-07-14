@@ -3524,6 +3524,25 @@ def apply_dark_theme(app: QApplication) -> None:
         QFrame#VideoReviewSwitchRow[active="true"] {
             background-color: rgba(37, 99, 235, 0.12);
         }
+        QFrame#VideoReviewSwitchRow[available="false"] {
+            background: transparent;
+        }
+        QFrame#VideoReviewSwitchRow[available="false"]:hover {
+            background-color: rgba(255, 255, 255, 0.02);
+        }
+        QFrame#VideoReviewSwitchRow[available="false"] QLabel#VideoReviewSwitchTitle {
+            color: #71717a;
+        }
+        QFrame#VideoReviewSwitchRow[available="false"] QLabel#VideoReviewSwitchSubtitle {
+            color: #ef4444;
+        }
+        QFrame#VideoReviewSwitchRow[available="false"] QLabel#VideoReviewSwitchThumb {
+            background-color: #0d0d0f;
+            border-color: rgba(255, 255, 255, 0.04);
+        }
+        QFrame#VideoReviewSwitchRow[available="false"] QLabel#VideoReviewSwitchCheck {
+            color: #52525b;
+        }
         QLabel#VideoReviewSwitchThumb {
             background-color: #121214;
             border: 1px solid rgba(255, 255, 255, 0.08);

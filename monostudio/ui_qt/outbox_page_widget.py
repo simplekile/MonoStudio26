@@ -268,7 +268,6 @@ class OutboxPageWidget(QWidget):
         if self._tree_pane is None:
             return False
         date_folder = resolve_delivery_location(project_root, item_path)
-        delay_ms = 0
         if date_folder is not None:
             current = self._tree_pane.date_folder_path()
             try:
@@ -277,15 +276,8 @@ class OutboxPageWidget(QWidget):
                 needs_scope = True
             if needs_scope:
                 self._tree_pane.set_date_folder_path(date_folder)
-                delay_ms = 80
-
-        def _reveal() -> None:
-            if self._tree_pane is not None:
-                self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
-
-        if delay_ms > 0:
-            QTimer.singleShot(delay_ms, _reveal)
-            return True
+                # Scope just changed; deep-link retry loop will reveal when ready.
+                return False
         return self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
 
     def refresh_tree(self) -> None:

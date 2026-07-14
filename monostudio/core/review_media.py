@@ -7,8 +7,10 @@ from enum import StrEnum
 from pathlib import Path
 
 from monostudio.core.sequence_preview import (
+    _parse_workfile_version_from_folder_name,
     _sequence_roots_by_priority,
     list_sequence_frames,
+    list_versioned_review_name_candidates,
     resolve_sequence_folder,
     sequence_folder_has_frames,
     work_file_folder_name_candidates,
@@ -39,6 +41,8 @@ class ReviewResolveResult:
 class EntityReviewSource:
     label: str
     request: object  # ReviewOpenRequest
+    version: int | None = None
+    subtitle: str = ""
 
 
 def _mtime_ns(p: Path) -> int:
@@ -126,7 +130,12 @@ def list_entity_review_sources(
     department_id: str | None = None,
     department_label: str | None = None,
 ) -> list[EntityReviewSource]:
-    """All reviewable videos and image sequences under department work/."""
+    """
+    All reviewable videos and image sequences under department work/.
+
+    When ``work_file_path`` is set, includes every versioned sibling that shares the
+    same base prefix (``…_v001``, ``…_v002``, …), not only the latest work file name.
+    """
     from monostudio.ui_qt.video_preview_context import (
         PreviewContext,
         ReviewMediaKind,
@@ -137,21 +146,45 @@ def list_entity_review_sources(
         return []
 
     ctx = context if isinstance(context, PreviewContext) else PreviewContext.entity
-    names = work_file_folder_name_candidates(work_file_path)
+    if work_file_path is None:
+        names = work_file_folder_name_candidates(work_file_path)
+    else:
+        names = list_versioned_review_name_candidates(work_path, work_file_path)
     sources: list[EntityReviewSource] = []
     seen_keys: set[str] = set()
 
-    def add(req: ReviewOpenRequest, label: str) -> None:
+    def add(
+        req: ReviewOpenRequest,
+        *,
+        label: str,
+        version: int | None = None,
+        subtitle: str = "",
+    ) -> None:
         key = str(req.media_key).casefold()
         if key in seen_keys:
             return
         seen_keys.add(key)
-        sources.append(EntityReviewSource(label=label, request=req))
+        sources.append(
+            EntityReviewSource(
+                label=label,
+                request=req,
+                version=version,
+                subtitle=subtitle,
+            )
+        )
 
     for root in _sequence_roots_by_priority(work_path):
         rd = _root_display_name(root)
         for vid in _collect_videos_in_root(root, names):
-            label = f"{rd} · {vid.name}"
+            ver = _parse_workfile_version_from_folder_name(vid.stem)
+            if ver is not None:
+                label = f"v{ver:03d}"
+                subtitle = f"{rd} · {vid.name}"
+                source_label = f"v{ver:03d} · {rd} · {vid.name}"
+            else:
+                label = f"{rd} · {vid.name}"
+                subtitle = ""
+                source_label = label
             sibs = list_video_siblings(vid)
             add(
                 ReviewOpenRequest(
@@ -164,14 +197,24 @@ def list_entity_review_sources(
                     department_label=department_label,
                     work_path=work_path,
                     work_file_path=work_file_path,
-                    source_label=label,
+                    source_label=source_label,
                 ),
-                label,
+                label=label,
+                version=ver,
+                subtitle=subtitle,
             )
         for folder in _collect_sequence_dirs_in_root(root, names):
             if not sequence_folder_has_frames(folder):
                 continue
-            label = f"{rd} · {folder.name}"
+            ver = _parse_workfile_version_from_folder_name(folder.name)
+            if ver is not None:
+                label = f"v{ver:03d}"
+                subtitle = f"{rd} · {folder.name}"
+                source_label = f"v{ver:03d} · {rd} · {folder.name}"
+            else:
+                label = f"{rd} · {folder.name}"
+                subtitle = ""
+                source_label = label
             add(
                 ReviewOpenRequest(
                     media_kind=ReviewMediaKind.sequence,
@@ -184,10 +227,18 @@ def list_entity_review_sources(
                     department_label=department_label,
                     work_path=work_path,
                     work_file_path=work_file_path,
-                    source_label=label,
+                    source_label=source_label,
                 ),
-                label,
+                label=label,
+                version=ver,
+                subtitle=subtitle,
             )
+
+    def _sort_key(src: EntityReviewSource) -> tuple:
+        ver = src.version if src.version is not None else -1
+        return (-ver, (src.subtitle or src.label).casefold())
+
+    sources.sort(key=_sort_key)
     return sources
 
 

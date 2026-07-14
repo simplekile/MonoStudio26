@@ -6,10 +6,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from monostudio.core.project_guide_tags import read_all_tags
+from monostudio.ui_qt.external_drop import accept_url_drag, paths_from_drop_event
 from monostudio.ui_qt.inbox_page_widget import _header_tool_button
 from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
 from monostudio.ui_qt.inbox_split_view import InboxOutboxTitleRow, ProjectGuideTreePane
@@ -65,7 +67,9 @@ class ReferencePageWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setAcceptDrops(False)
+        # Frameless Windows: page-level AcceptDrops so Explorer drops on header/chrome
+        # still land when children ignore or have no drop zone.
+        self.setAcceptDrops(True)
         self._project_root: Path | None = None
         self._department: str = PROJECT_GUIDE_DEPARTMENTS[0]
         self._header_badge_label: str | None = None
@@ -290,23 +294,59 @@ class ReferencePageWidget(QWidget):
         from monostudio.core.project_guide_reader import resolve_project_guide_department
 
         dept = resolve_project_guide_department(project_root, item_path)
-        delay_ms = 0
         if dept and dept != self._department:
             self.set_department(dept)
-            delay_ms = 80
+            # Folder/model not ready yet; deep-link retry loop will call again.
+            self._ensure_tree_pane()
+            return False
         self._ensure_tree_pane()
         if self._tree_pane is None:
             return False
-
-        def _reveal() -> None:
-            if self._tree_pane is not None:
-                self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
-
-        if delay_ms > 0:
-            QTimer.singleShot(delay_ms, _reveal)
-            return True
         return self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
 
     def refresh_tree(self) -> None:
         if self._tree_pane is not None:
             self._tree_pane.refresh_content()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        pane = self._tree_pane
+        if pane is not None and getattr(pane, "_explorer_drop", None) is not None:
+            if pane._explorer_drop.handle_drag_enter(event):
+                return
+        if accept_url_drag(event):
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        pane = self._tree_pane
+        if pane is not None and getattr(pane, "_explorer_drop", None) is not None:
+            if pane._explorer_drop.handle_drag_move(event):
+                return
+        if accept_url_drag(event):
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        pane = self._tree_pane
+        if pane is not None and getattr(pane, "_explorer_drop", None) is not None:
+            pane._explorer_drop.handle_drag_leave()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        pane = self._tree_pane
+        if pane is not None and getattr(pane, "_explorer_drop", None) is not None:
+            if pane._explorer_drop.handle_drop(event):
+                return
+        paths = paths_from_drop_event(event)
+        if paths:
+            accept_url_drag(event)
+            target = None
+            copy_only = True
+            if pane is not None:
+                from monostudio.ui_qt.external_drop import drop_wants_copy, event_global_pos
+
+                target = pane.drop_target_at_global_pos(event_global_pos(event, self))
+                copy_only = drop_wants_copy(event, paths=paths, storage_root=pane._storage_root())
+            self.drop_requested.emit(paths, target, copy_only)
+            return
+        super().dropEvent(event)
