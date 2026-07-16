@@ -384,6 +384,11 @@ class MainWindow(FramelessMainWindow):
         self._filesystem_scan_soft: bool = False
         # Guard: filter (department/type) changes must never trigger Open DCC flows or spawn dialogs.
         self._filter_switch_in_progress: bool = False
+        # Coalesce Inspector updates so main-view selection paints before heavy set_item body.
+        self._inspector_selection_timer = QTimer(self)
+        self._inspector_selection_timer.setSingleShot(True)
+        self._inspector_selection_timer.setInterval(0)
+        self._inspector_selection_timer.timeout.connect(self._flush_inspector_for_selection)
         self._startup_complete: bool = False
         self._identity_prompt_pending: bool = False
         self._pending_deep_link: str | None = None
@@ -395,6 +400,7 @@ class MainWindow(FramelessMainWindow):
         self._pending_restore_maximized: bool = False
         self._force_quit: bool = False
         self._tray_manager = None
+        self._pomodoro_plugin = None
         self._workspace_root: Path | None = None
         self._workspace_projects: list[DiscoveredProject] = []
         self._workspace_project_status: dict[str, str] = {}
@@ -580,6 +586,7 @@ class MainWindow(FramelessMainWindow):
         self._top_bar.layout_sidebar_clicked.connect(self._on_top_bar_layout_sidebar_clicked)
         self._top_bar.layout_inspector_clicked.connect(self._on_top_bar_layout_inspector_clicked)
         self._top_bar.review_player_clicked.connect(self._on_top_bar_review_player_clicked)
+        self._top_bar.pomodoro_clicked.connect(self._on_top_bar_pomodoro_clicked)
         self._nav_rail.recent_task_clicked.connect(self._on_recent_task_clicked)
         self._nav_rail.recent_task_double_clicked.connect(self._on_recent_task_double_clicked)
         self._nav_rail.clear_recent_tasks_requested.connect(self._on_clear_recent_tasks)
@@ -804,6 +811,7 @@ class MainWindow(FramelessMainWindow):
         self._tray_manager = TrayManager(self, settings=self._settings)
         self._tray_manager.install()
         self._sync_tray_status_badges()
+        self._init_pomodoro_plugin()
         notification_service.set_general_toast_anchor_widget(self._top_bar.get_noti_button())
         # Anchor important banner under the update button so it appears as a callout.
         notification_service.set_important_anchor_widget(self._top_bar.get_update_button())
@@ -2597,20 +2605,24 @@ class MainWindow(FramelessMainWindow):
         if cb is None:
             return
         from monostudio.core.deep_link import (
-            extract_monos_deep_link_from_text,
+            extract_monos_deep_link_from_clipboard,
             resolve_monos_link_paste_label,
         )
 
-        clipboard_text = cb.text() or ""
-        url = extract_monos_deep_link_from_text(clipboard_text)
+        url, label_text = extract_monos_deep_link_from_clipboard(cb)
         if not url:
             return
-        label = resolve_monos_link_paste_label(clipboard_text, url)
-        if (label or "").strip():
-            notification_service.success(f"Opened: {(label or '').strip()}")
+        label = resolve_monos_link_paste_label(label_text, url)
+        self.handle_deep_link(url, opened_label=label)
+
+    def _log_opened_monos_link(self, url: str, opened_label: str | None = None) -> None:
+        from monostudio.core.deep_link import monos_link_display_label_from_url
+
+        label = (opened_label or "").strip() or (monos_link_display_label_from_url(url) or "").strip()
+        if label:
+            notification_service.success(f"Opened: {label}")
         else:
             notification_service.success("Opened MONOS link")
-        self.handle_deep_link(url)
 
     def _connect_page_copy_link(self, widget) -> None:
         signal = getattr(widget, "copy_link_requested", None)
@@ -3186,13 +3198,14 @@ class MainWindow(FramelessMainWindow):
     def set_pending_deep_link(self, url: str) -> None:
         self._pending_deep_link = (url or "").strip() or None
 
-    def handle_deep_link(self, url: str) -> None:
+    def handle_deep_link(self, url: str, *, opened_label: str | None = None) -> None:
         """Open MONOS from monostudio:// links (navigation + Discord assign)."""
         from monostudio.core.deep_link import parse_assign_deep_link, parse_open_deep_link
 
         raw = (url or "").strip()
         assign = parse_assign_deep_link(raw)
         if assign is not None:
+            self._log_opened_monos_link(raw, opened_label)
             if self._startup_complete:
                 QTimer.singleShot(0, lambda: self._run_assign_deep_link(assign))
             else:
@@ -3200,6 +3213,7 @@ class MainWindow(FramelessMainWindow):
             return
         open_link = parse_open_deep_link(raw)
         if open_link is not None:
+            self._log_opened_monos_link(raw, opened_label)
             if self._startup_complete:
                 QTimer.singleShot(0, lambda: self._run_open_deep_link(open_link))
             else:
@@ -4856,6 +4870,7 @@ class MainWindow(FramelessMainWindow):
 
         try:
             if new_path.exists():
+                self._main_view.select_item_by_path(new_path)
                 self._app_state.set_selection(str(new_path))
         except Exception:
             pass
@@ -5937,12 +5952,22 @@ class MainWindow(FramelessMainWindow):
     def _on_valid_selection_changed(self, has_selection: bool) -> None:
         if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
             # During context switches we intentionally keep Inspector cleared and avoid re-entrant UI updates.
+            self._inspector_selection_timer.stop()
             self._inspector.set_item(None)
             return
         ctx = self._nav_rail.current_context()
         if ctx in ("Inbox", "Project Guide", SidebarContext.INTERNAL_CHECK.value, "Delivery", "Outbox"):
             # Explorer tree/grid drives inspector preview on these pages.
             return
+        self._inspector_selection_timer.start()
+
+    def _flush_inspector_for_selection(self) -> None:
+        if getattr(self, "_context_switch_in_progress", False) or getattr(self, "_filter_switch_in_progress", False):
+            return
+        ctx = self._nav_rail.current_context()
+        if ctx in ("Inbox", "Project Guide", SidebarContext.INTERNAL_CHECK.value, "Delivery", "Outbox"):
+            return
+        has_selection = self._main_view.has_valid_selection()
         if not has_selection:
             if getattr(self._inspector, "_current_item", None) is None:
                 return
@@ -6759,6 +6784,10 @@ class MainWindow(FramelessMainWindow):
 
         task = WorkerTask("filesystem_scan", run, manager=self._worker_manager)
         self._worker_manager.submit_task(task, category="filesystem_scan", replace_existing=True)
+
+    def _refresh_project_health_after_cleanup(self) -> None:
+        """After bulk work-folder cleanup from Settings → Project → Health."""
+        self._submit_rescan_task()
 
     def _on_fs_meta_thumbnails_stale(self, stale: object) -> None:
         """Invalidate in-memory thumbnails when ``.meta`` files change (watcher does not rescan thumbs)."""
@@ -8533,6 +8562,61 @@ class MainWindow(FramelessMainWindow):
         except OSError:
             return False
 
+    def _init_pomodoro_plugin(self) -> None:
+        from monostudio.plugins.pomodoro import PomodoroPlugin
+        from monostudio.ui_qt.notification import notify as noti
+
+        def _tray(title: str, message: str) -> None:
+            tm = self._tray_manager
+            if tm is not None:
+                tm.show_tray_message(title, message)
+
+        self._pomodoro_plugin = PomodoroPlugin(
+            settings=self._settings,
+            parent=self,
+            notify_tray=_tray,
+            notify_in_app=lambda msg: noti.info(msg),
+        )
+        self._pomodoro_plugin.state_changed.connect(self._on_pomodoro_state_changed)
+        self._pomodoro_plugin.phase_boundary.connect(self._on_pomodoro_phase_boundary)
+        self._on_pomodoro_state_changed()
+
+    def _on_top_bar_pomodoro_clicked(self) -> None:
+        plugin = self._pomodoro_plugin
+        if plugin is None:
+            self._init_pomodoro_plugin()
+            plugin = self._pomodoro_plugin
+        if plugin is None:
+            return
+        plugin.toggle_window(self._top_bar.get_pomodoro_button())
+
+    def open_pomodoro_timer(self) -> None:
+        """Tray / external entry: show Focus timer window."""
+        plugin = self._pomodoro_plugin
+        if plugin is None:
+            self._init_pomodoro_plugin()
+            plugin = self._pomodoro_plugin
+        if plugin is None:
+            return
+        self.present()
+        plugin.show_window(self._top_bar.get_pomodoro_button())
+
+    def _on_pomodoro_state_changed(self) -> None:
+        plugin = self._pomodoro_plugin
+        if plugin is None:
+            return
+        tip = plugin.topbar_tooltip()
+        self._top_bar.set_pomodoro_tooltip(tip)
+        tm = self._tray_manager
+        if tm is not None:
+            tm.refresh_tooltip()
+
+    def _on_pomodoro_phase_boundary(self) -> None:
+        self._on_pomodoro_state_changed()
+        tm = self._tray_manager
+        if tm is not None:
+            tm.refresh_menu()
+
     def _on_top_bar_review_player_clicked(self) -> None:
         from monostudio.ui_qt.video_preview_settings import read_last_video_preview_open
 
@@ -10120,6 +10204,9 @@ class MainWindow(FramelessMainWindow):
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         self._refresh_user_button()
         if accepted:
+            plugin = self._pomodoro_plugin
+            if plugin is not None:
+                plugin.reload_prefs()
             self._thumbnail_manager.clear_memory_cache()
             self._main_view.invalidate_all_thumbnails_for_source_change()
             self._inspector.invalidate_inspector_preview_settings_cache()

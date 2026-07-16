@@ -185,6 +185,7 @@ class TopBar(QWidget):
     layout_sidebar_clicked = Signal()
     layout_inspector_clicked = Signal()
     review_player_clicked = Signal()
+    pomodoro_clicked = Signal()
     always_on_top_toggled = Signal(bool)
     switch_user_requested = Signal()
     edit_profile_requested = Signal()
@@ -258,6 +259,15 @@ class TopBar(QWidget):
         self._btn_review.setFixedSize(_action_icon_w, _action_icon_h)
         self._btn_review.setToolTip("Review player")
         self._btn_review.clicked.connect(self.review_player_clicked.emit)
+
+        self._btn_pomodoro = QToolButton(self)
+        self._btn_pomodoro.setObjectName("TopBarPomodoroBtn")
+        self._btn_pomodoro.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._btn_pomodoro.setIcon(lucide_icon("timer", size=20, color_hex=_win_icon_color))
+        self._btn_pomodoro.setIconSize(QSize(20, 20))
+        self._btn_pomodoro.setFixedSize(_action_icon_w, _action_icon_h)
+        self._btn_pomodoro.setToolTip("Focus timer")
+        self._btn_pomodoro.clicked.connect(self.pomodoro_clicked.emit)
 
         # Current-user avatar + identity menu (Switch user / Clear identity / Forget device)
         self._user_name: str | None = None
@@ -334,6 +344,7 @@ class TopBar(QWidget):
             action_l,
             [
                 self._btn_review,
+                self._btn_pomodoro,
                 self._btn_update,
                 self._btn_watcher,
                 self._btn_noti,
@@ -602,6 +613,13 @@ class TopBar(QWidget):
             self._btn_review.setToolTip(f"Review player — {name}")
         else:
             self._btn_review.setToolTip("Review player — open most recent clip")
+
+    def get_pomodoro_button(self) -> QToolButton:
+        return self._btn_pomodoro
+
+    def set_pomodoro_tooltip(self, text: str) -> None:
+        tip = (text or "").strip() or "Focus timer"
+        self._btn_pomodoro.setToolTip(tip)
 
     def get_update_button(self) -> QToolButton:
         """Return the update toolbar button (e.g. for showing tooltip at startup)."""

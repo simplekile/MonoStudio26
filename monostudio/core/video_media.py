@@ -753,8 +753,10 @@ def export_video_ranges(
 
 
 def ranges_sidecar_path(video_path: Path) -> Path:
-    """Sidecar next to source video: ``take.mp4.monos.ranges.json``."""
-    return Path(f"{video_path}.monos.ranges.json")
+    """Published ranges live in unified review sidecar under ``.monos/``."""
+    from monostudio.core.review_sidecar import video_review_sidecar_path
+
+    return video_review_sidecar_path(video_path)
 
 
 def ranges_local_draft_path(video_path: Path) -> Path:
@@ -864,7 +866,16 @@ def _write_ranges_file(path: Path, video_path: Path, ranges: Sequence[VideoFrame
 
 
 def load_video_ranges_sidecar(video_path: Path, *, total_frames: int) -> list[VideoFrameRange]:
-    return _read_ranges_file(ranges_sidecar_path(video_path), total_frames=total_frames)
+    from monostudio.core.review_sidecar import (
+        legacy_video_ranges_path,
+        read_json_dict,
+        video_review_sidecar_path,
+    )
+
+    unified = read_json_dict(video_review_sidecar_path(video_path))
+    if unified is not None and "ranges" in unified:
+        return _parse_ranges_payload(unified, total_frames=total_frames)
+    return _read_ranges_file(legacy_video_ranges_path(video_path), total_frames=total_frames)
 
 
 def load_video_ranges_local_draft(
@@ -887,18 +898,22 @@ def save_video_ranges_local_draft(video_path: Path, ranges: Sequence[VideoFrameR
 
 
 def save_video_ranges_sidecar(video_path: Path, ranges: Sequence[VideoFrameRange]) -> None:
-    path = ranges_sidecar_path(video_path)
-    if not ranges:
-        try:
-            if path.is_file():
-                path.unlink()
-        except OSError as e:
-            logger.debug("remove sidecar %s: %s", path, e)
-        return
+    from monostudio.core.review_sidecar import load_video_review_dict, write_video_review_dict
+
     try:
-        _write_ranges_file(path, video_path, ranges)
+        data = load_video_review_dict(video_path)
+        data["ranges"] = [
+            {
+                "id": r.id,
+                "in_frame": r.in_frame,
+                "out_frame": r.out_frame,
+                "label": r.label,
+            }
+            for r in ranges
+        ]
+        write_video_review_dict(video_path, data, unlink_legacy=frozenset({"ranges"}))
     except OSError as e:
-        logger.debug("save sidecar %s: %s", path, e)
+        logger.debug("save sidecar %s: %s", video_path, e)
 
 
 def load_video_ranges_for_preview(
@@ -918,7 +933,9 @@ def load_video_ranges_for_preview(
 
 
 def sequence_ranges_sidecar_path(sequence_folder: Path) -> Path:
-    return sequence_folder / ".monos.seq_ranges.json"
+    from monostudio.core.review_sidecar import sequence_review_sidecar_path
+
+    return sequence_review_sidecar_path(sequence_folder)
 
 
 def sequence_ranges_local_draft_path(sequence_folder: Path) -> Path:
@@ -952,22 +969,35 @@ def save_sequence_ranges_local_draft(sequence_folder: Path, ranges: Sequence[Vid
 
 
 def load_sequence_ranges_sidecar(sequence_folder: Path, *, total_frames: int) -> list[VideoFrameRange]:
-    return _read_ranges_file(sequence_ranges_sidecar_path(sequence_folder), total_frames=total_frames)
+    from monostudio.core.review_sidecar import (
+        legacy_sequence_ranges_path,
+        read_json_dict,
+        sequence_review_sidecar_path,
+    )
+
+    unified = read_json_dict(sequence_review_sidecar_path(sequence_folder))
+    if unified is not None and "ranges" in unified:
+        return _parse_ranges_payload(unified, total_frames=total_frames)
+    return _read_ranges_file(legacy_sequence_ranges_path(sequence_folder), total_frames=total_frames)
 
 
 def save_sequence_ranges_sidecar(sequence_folder: Path, ranges: Sequence[VideoFrameRange]) -> None:
-    path = sequence_ranges_sidecar_path(sequence_folder)
-    if not ranges:
-        try:
-            if path.is_file():
-                path.unlink()
-        except OSError as e:
-            logger.debug("remove seq sidecar %s: %s", path, e)
-        return
+    from monostudio.core.review_sidecar import load_sequence_review_dict, write_sequence_review_dict
+
     try:
-        _write_ranges_file(path, sequence_folder, ranges)
+        data = load_sequence_review_dict(sequence_folder)
+        data["ranges"] = [
+            {
+                "id": r.id,
+                "in_frame": r.in_frame,
+                "out_frame": r.out_frame,
+                "label": r.label,
+            }
+            for r in ranges
+        ]
+        write_sequence_review_dict(sequence_folder, data, unlink_legacy=frozenset({"ranges"}))
     except OSError as e:
-        logger.debug("save seq sidecar %s: %s", path, e)
+        logger.debug("save seq sidecar %s: %s", sequence_folder, e)
 
 
 def load_sequence_ranges_for_preview(
@@ -983,7 +1013,9 @@ def load_sequence_ranges_for_preview(
 
 
 def sequence_markers_sidecar_path(sequence_folder: Path) -> Path:
-    return sequence_folder / ".monos.markers.json"
+    from monostudio.core.review_sidecar import sequence_review_sidecar_path
+
+    return sequence_review_sidecar_path(sequence_folder)
 
 
 def sequence_markers_local_draft_path(sequence_folder: Path) -> Path:
@@ -1038,7 +1070,19 @@ def load_sequence_markers_sidecar(
     *,
     total_frames: int,
 ) -> list[VideoReviewMarker]:
-    return _read_markers_file(sequence_markers_sidecar_path(sequence_folder), total_frames=total_frames)
+    from monostudio.core.review_sidecar import (
+        legacy_sequence_markers_path,
+        read_json_dict,
+        sequence_review_sidecar_path,
+    )
+
+    unified = read_json_dict(sequence_review_sidecar_path(sequence_folder))
+    if unified is not None and "markers" in unified:
+        return _parse_markers_payload(unified, total_frames=total_frames)
+    return _read_markers_file(
+        legacy_sequence_markers_path(sequence_folder),
+        total_frames=total_frames,
+    )
 
 
 def load_sequence_markers_local_draft(
@@ -1070,18 +1114,22 @@ def save_sequence_markers_sidecar(
     sequence_folder: Path,
     markers: Sequence[VideoReviewMarker],
 ) -> None:
-    path = sequence_markers_sidecar_path(sequence_folder)
-    if not markers:
-        try:
-            if path.is_file():
-                path.unlink()
-        except OSError as e:
-            logger.debug("remove seq marker sidecar %s: %s", path, e)
-        return
+    from monostudio.core.review_sidecar import load_sequence_review_dict, write_sequence_review_dict
+
     try:
-        _write_sequence_markers_file(path, sequence_folder, markers)
+        data = load_sequence_review_dict(sequence_folder)
+        data["markers"] = [
+            {
+                "id": m.id,
+                "frame": m.frame,
+                "label": m.label,
+                "created_at": float(m.created_at or 0.0),
+            }
+            for m in markers
+        ]
+        write_sequence_review_dict(sequence_folder, data, unlink_legacy=frozenset({"markers"}))
     except OSError as e:
-        logger.debug("save seq marker sidecar %s: %s", path, e)
+        logger.debug("save seq marker sidecar %s: %s", sequence_folder, e)
 
 
 def load_sequence_markers_for_preview(
@@ -1398,7 +1446,9 @@ def export_sequence_ranges(
 
 
 def markers_sidecar_path(video_path: Path) -> Path:
-    return Path(f"{video_path}.monos.markers.json")
+    from monostudio.core.review_sidecar import video_review_sidecar_path
+
+    return video_review_sidecar_path(video_path)
 
 
 def markers_local_draft_path(video_path: Path) -> Path:
@@ -1500,7 +1550,16 @@ def _write_markers_file(path: Path, video_path: Path, markers: Sequence[VideoRev
 
 
 def load_video_markers_sidecar(video_path: Path, *, total_frames: int) -> list[VideoReviewMarker]:
-    return _read_markers_file(markers_sidecar_path(video_path), total_frames=total_frames)
+    from monostudio.core.review_sidecar import (
+        legacy_video_markers_path,
+        read_json_dict,
+        video_review_sidecar_path,
+    )
+
+    unified = read_json_dict(video_review_sidecar_path(video_path))
+    if unified is not None and "markers" in unified:
+        return _parse_markers_payload(unified, total_frames=total_frames)
+    return _read_markers_file(legacy_video_markers_path(video_path), total_frames=total_frames)
 
 
 def load_video_markers_local_draft(
@@ -1582,18 +1641,22 @@ def save_video_preview_session_local_draft(video_path: Path, *, frame: int) -> N
 
 
 def save_video_markers_sidecar(video_path: Path, markers: Sequence[VideoReviewMarker]) -> None:
-    path = markers_sidecar_path(video_path)
-    if not markers:
-        try:
-            if path.is_file():
-                path.unlink()
-        except OSError as e:
-            logger.debug("remove marker sidecar %s: %s", path, e)
-        return
+    from monostudio.core.review_sidecar import load_video_review_dict, write_video_review_dict
+
     try:
-        _write_markers_file(path, video_path, markers)
+        data = load_video_review_dict(video_path)
+        data["markers"] = [
+            {
+                "id": m.id,
+                "frame": m.frame,
+                "label": m.label,
+                "created_at": float(m.created_at or 0.0),
+            }
+            for m in markers
+        ]
+        write_video_review_dict(video_path, data, unlink_legacy=frozenset({"markers"}))
     except OSError as e:
-        logger.debug("save marker sidecar %s: %s", path, e)
+        logger.debug("save marker sidecar %s: %s", video_path, e)
 
 
 def load_video_markers_for_preview(

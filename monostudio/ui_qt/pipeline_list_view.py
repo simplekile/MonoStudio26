@@ -359,6 +359,11 @@ class PipelineListRowView(RubberBandSelectMixin, QListView):
                 self._apply_rubber_band_row_selection(event.pos())
             event.accept()
             return
+        # Interactive cell hits swallow press in MainView.eventFilter without arming rubber-band.
+        # Do not fall through to QAbstractItemView DragOnly startDrag.
+        if bool(event.buttons() & Qt.MouseButton.LeftButton):
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]

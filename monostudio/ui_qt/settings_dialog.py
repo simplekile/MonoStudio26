@@ -778,6 +778,7 @@ class SettingsDialog(MonosDialog):
         self._access_debug_cb: QCheckBox | None = None
         self._access_splash_spin: QSpinBox | None = None
         self._hotkeys_widget: HotkeysSettingsWidget | None = None
+        self._pomodoro_settings_page = None
 
         self._discord_integrations_banner: QLabel | None = None
         self._discord_enabled_cb: QCheckBox | None = None
@@ -875,11 +876,11 @@ class SettingsDialog(MonosDialog):
         self._content_stack.setCurrentIndex(0)
         stack = getattr(self, "_general_tier2_stack", None)
         buttons = getattr(self, "_general_tier2_buttons", None)
-        if stack is not None and buttons is not None and len(buttons) > 5:
-            self._ensure_tier2_page_built(stack, 5)
-            stack.setCurrentIndex(5)
+        if stack is not None and buttons is not None and len(buttons) > 6:
+            self._ensure_tier2_page_built(stack, 6)
+            stack.setCurrentIndex(6)
             for i, b in enumerate(buttons):
-                b.setChecked(i == 5)
+                b.setChecked(i == 6)
         self._on_updates_tab_shown()
 
     def open_to_video_player_tab(self) -> None:
@@ -1049,7 +1050,7 @@ class SettingsDialog(MonosDialog):
             QTimer.singleShot(0, self._refresh_ui_tab_status)
         if index == 2:
             QTimer.singleShot(0, self._refresh_video_player_tab_status)
-        if index == 5:
+        if index == 6:
             self._on_updates_tab_shown()
 
     def _on_updates_tab_shown(self) -> None:
@@ -1131,13 +1132,14 @@ class SettingsDialog(MonosDialog):
             b.setChecked(i == index)
 
     def _build_general_page(self) -> QWidget:
-        """Tier 2: General → Workspace | UI | Video player | Behavior | Hotkeys | Updates | Access."""
+        """Tier 2: General → Workspace | UI | Video player | Behavior | Focus timer | Hotkeys | Updates | Access."""
         return self._build_tier2_page_buttons(
             [
                 ("Workspace", self._build_app_workspace_tab),
                 ("UI", self._build_ui_tab),
                 ("Video player", self._build_video_player_tab),
                 ("Behavior", self._build_behavior_tab),
+                ("Focus timer", self._build_pomodoro_tab),
                 ("Hotkeys", self._build_hotkeys_tab),
                 ("Updates", self._build_updates_tab),
                 ("Access", self._build_access_tab),
@@ -1947,6 +1949,13 @@ class SettingsDialog(MonosDialog):
         layout.addWidget(grp)
         layout.addStretch(1)
         return root
+
+    def _build_pomodoro_tab(self) -> QWidget:
+        """General → Focus timer: Pomodoro plugin prefs."""
+        from monostudio.plugins.pomodoro.ui.settings_page import PomodoroSettingsPage
+
+        self._pomodoro_settings_page = PomodoroSettingsPage(self._settings, self)
+        return self._pomodoro_settings_page
 
     def _build_hotkeys_tab(self) -> QWidget:
         from monostudio.ui_qt.app_hotkeys import HotkeysSettingsWidget
@@ -3570,12 +3579,61 @@ class SettingsDialog(MonosDialog):
         return self._build_project_integrations_tab()
 
     def _build_project_page(self) -> QWidget:
-        """Tier 2: Project → Overview | Integrations | Advanced (nút page ngang)."""
+        """Tier 2: Project → Health | Integrations | Advanced."""
         return self._build_tier2_page_buttons([
-            ("Overview", lambda: self._placeholder("Project → Overview (placeholder)")),
+            ("Health", self._build_project_health_tab),
             ("Integrations", self._build_workspace_discord_integrations_tab),
             ("Advanced", self._build_project_advanced_tab),
         ])
+
+    def _build_project_health_tab(self) -> QWidget:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        title = QLabel("Work folder health")
+        title.setObjectName("DialogSectionTitle")
+        desc = QLabel(
+            "Find DCC autosaves, stray files, and Houdini backup folders across every "
+            "asset and shot — the same checks as Item Health, without opening each entity.",
+            root,
+        )
+        desc.setWordWrap(True)
+        desc.setObjectName("DialogHint")
+
+        btn = QPushButton("Open project health cleanup…", root)
+        btn.setObjectName("DialogPrimaryButton")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setIcon(lucide_icon("heart-pulse", size=14, color_hex="#fafafa"))
+        btn.setEnabled(self._project_root is not None)
+        if self._project_root is None:
+            btn.setToolTip("Select a project to scan work folders.")
+        btn.clicked.connect(self._open_project_health_dialog)
+
+        layout.addWidget(title, 0)
+        layout.addWidget(desc, 0)
+        layout.addWidget(btn, 0)
+        layout.addStretch(1)
+        return root
+
+    def _open_project_health_dialog(self) -> None:
+        if self._project_root is None:
+            return
+        from monostudio.ui_qt.project_health_dialog import ProjectHealthDialog
+
+        win = self.window()
+        on_cleaned = None
+        refresh = getattr(win, "_refresh_project_health_after_cleanup", None)
+        if callable(refresh):
+            on_cleaned = refresh
+
+        dlg = ProjectHealthDialog(
+            parent=self,
+            project_root=self._project_root,
+            on_cleaned=on_cleaned,
+        )
+        dlg.exec()
 
     def _build_pipeline_scan_rules_tab(self) -> QWidget:
         """Pipeline → Scan rules: rules for file/folder scanning (e.g. ignore extensions per context)."""
@@ -4601,6 +4659,13 @@ class SettingsDialog(MonosDialog):
             if self._settings is not None and self._hotkeys_widget is not None:
                 self._hotkeys_widget.persist(self._settings)
                 self.hotkeys_changed.emit()
+        except Exception:
+            pass
+
+        try:
+            page = getattr(self, "_pomodoro_settings_page", None)
+            if page is not None:
+                page.save()
         except Exception:
             pass
 

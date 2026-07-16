@@ -89,3 +89,11 @@ def test_legacy_entity_path_flag() -> None:
     assert parsed is not None
     assert parsed.entity == rel
     assert parsed.entity_id is None
+
+
+def test_extract_monos_from_html_href() -> None:
+    from monostudio.core.deep_link import extract_monos_deep_link_from_text
+
+    url = "monostudio://open?project=p&page=inbox&entity_id=abcdefghij"
+    html = f'<a href="{url}">Inbox · clip.mov</a>'
+    assert extract_monos_deep_link_from_text(html) == url

@@ -52,11 +52,14 @@ def test_one_keyframe_per_frame_per_layer() -> None:
 
 
 def test_draw_sidecar_v3_roundtrip(tmp_path: Path) -> None:
+    from monostudio.core.review_sidecar import sequence_review_sidecar_path
+
     folder = tmp_path / "seq"
     folder.mkdir()
     stroke = ReviewDrawStroke("arrow", "#ef4444", 3.0, [(0.1, 0.2), (0.5, 0.5)])
     layer = make_draw_layer(name="Notes", keyframes=[make_layer_keyframe(10, strokes=[stroke])])
     save_sequence_draw_sidecar(folder, [layer])
+    assert sequence_review_sidecar_path(folder).is_file()
     pub, work, from_local = load_draw_layers_for_preview(folder, sequence=True, total_frames=100)
     assert not from_local
     assert len(pub) == 1

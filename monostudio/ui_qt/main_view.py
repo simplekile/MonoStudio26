@@ -136,6 +136,16 @@ from monostudio.core.fs_reader import (
     resolve_work_path,
     work_file_prefix,
 )
+from monostudio.core.item_health_scan import (
+    assess_work_naming_for_department,
+    department_for_item as _department_for_item,
+    department_has_houdini_work as _department_has_houdini_work,
+    houdini_backup_folder_paths_for_department as _houdini_backup_folder_paths_for_department,
+    invalid_work_files_split_in_folder as _invalid_work_files_split_in_folder,
+    split_invalid_work_files_for_department as _split_invalid_work_files_for_department,
+    work_paths_for_department as _work_paths_for_department,
+    workfile_extensions_set as _workfile_extensions_set,
+)
 from monostudio.core.workspace_reader import (
     PROJECT_BROWSER_STATUS_KEYS,
     ProjectQuickStats,
@@ -599,103 +609,6 @@ class ItemHealth(NamedTuple):
     issues: tuple[HealthIssue, ...]
 
 
-def _department_for_item(ref: Asset | Shot, active_department: str) -> Department | None:
-    dep_cf = (active_department or "").strip().casefold()
-    if not dep_cf:
-        return None
-    for d in getattr(ref, "departments", ()) or ():
-        if (d.name or "").strip().casefold() == dep_cf:
-            return d
-    return None
-
-
-def _workfile_extensions_set() -> frozenset[str]:
-    exts: set[str] = set()
-    try:
-        reg = get_default_dcc_registry()
-        for dcc_id in reg.get_all_dccs():
-            try:
-                info = reg.get_dcc_info(dcc_id)
-            except Exception:
-                continue
-            raw = info.get("workfile_extensions") if isinstance(info, dict) else None
-            if not isinstance(raw, list):
-                continue
-            for ext in raw:
-                if isinstance(ext, str) and ext.strip().startswith("."):
-                    exts.add(ext.strip().lower())
-    except Exception:
-        pass
-    return frozenset(exts)
-
-
-def _work_paths_for_department(ref: Asset | Shot, dept: Department) -> list[Path]:
-    paths: list[Path] = []
-    seen: set[str] = set()
-    dep_cf = (dept.name or "").strip().casefold()
-
-    def add(p: Path | None) -> None:
-        if p is None:
-            return
-        try:
-            key = str(p.resolve()).casefold()
-        except OSError:
-            key = str(p).casefold()
-        if key in seen:
-            return
-        seen.add(key)
-        if p.is_dir():
-            paths.append(p)
-
-    add(Path(dept.work_path))
-    for (dept_id, _dcc_id), state in getattr(ref, "dcc_work_states", ()) or ():
-        if (dept_id or "").strip().casefold() != dep_cf:
-            continue
-        wfp = getattr(state, "work_file_path", None)
-        if isinstance(wfp, Path):
-            add(wfp.parent)
-    return paths
-
-
-def _invalid_work_files_split_in_folder(
-    work_path: Path,
-    prefix: str,
-    work_exts: frozenset[str],
-) -> tuple[list[Path], list[Path]]:
-    """
-    Files in work folder that look like work files but fail convention.
-    Returns (wrong_name, wrong_ext): wrong_ext = starts with prefix but extension not a work DCC ext.
-    """
-    name_bad: list[Path] = []
-    ext_bad: list[Path] = []
-    if not prefix or not work_path.is_dir():
-        return name_bad, ext_bad
-    try:
-        entries = list(work_path.iterdir())
-    except OSError:
-        return name_bad, ext_bad
-    for p in entries:
-        if not p.is_file():
-            continue
-        ext_lower = (p.suffix or "").lower()
-        starts = p.name.startswith(prefix)
-        if not (starts or ext_lower in work_exts):
-            continue
-        matched = False
-        if ext_lower in work_exts:
-            if _parse_workfile_version(p.name, prefix, ext_lower) is not None:
-                matched = True
-            elif p.name == prefix + ext_lower:
-                matched = True
-        if matched:
-            continue
-        if starts and ext_lower not in work_exts:
-            ext_bad.append(p)
-        else:
-            name_bad.append(p)
-    return name_bad, ext_bad
-
-
 def _invalid_work_files_in_folder(
     work_path: Path,
     prefix: str,
@@ -705,168 +618,6 @@ def _invalid_work_files_in_folder(
     merged = a + b
     merged.sort(key=lambda path: path.name.casefold())
     return merged
-
-
-def _split_invalid_work_files_for_department(
-    ref: Asset | Shot,
-    dept: Department,
-    prefix: str,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Returns (all paths, wrong_name paths, wrong_ext paths) as strings, deduped."""
-    work_exts = _workfile_extensions_set()
-    seen: set[str] = set()
-    name_paths: list[str] = []
-    ext_paths: list[str] = []
-
-    def add_unique(lst: list[str], p: Path) -> None:
-        try:
-            key = str(p.resolve()).casefold()
-        except OSError:
-            key = str(p).casefold()
-        if key in seen:
-            return
-        seen.add(key)
-        lst.append(str(p))
-
-    for wp in _work_paths_for_department(ref, dept):
-        n_bad, e_bad = _invalid_work_files_split_in_folder(wp, prefix, work_exts)
-        for p in n_bad:
-            add_unique(name_paths, p)
-        for p in e_bad:
-            add_unique(ext_paths, p)
-    name_paths.sort(key=lambda s: Path(s).name.casefold())
-    ext_paths.sort(key=lambda s: Path(s).name.casefold())
-    all_paths = sorted(set(name_paths) | set(ext_paths), key=lambda s: Path(s).name.casefold())
-    return tuple(all_paths), tuple(name_paths), tuple(ext_paths)
-
-
-def _assess_work_naming_in_folder(
-    work_path: Path,
-    prefix: str,
-    work_exts: frozenset[str],
-) -> Literal["ok", "warn", "error"]:
-    if not prefix or not work_path.is_dir():
-        return "ok"
-    valid = 0
-    suspect = 0
-    try:
-        entries = list(work_path.iterdir())
-    except OSError:
-        return "ok"
-    for p in entries:
-        if not p.is_file():
-            continue
-        ext_lower = (p.suffix or "").lower()
-        is_candidate = p.name.startswith(prefix) or ext_lower in work_exts
-        if not is_candidate:
-            continue
-        matched = False
-        if ext_lower in work_exts:
-            if _parse_workfile_version(p.name, prefix, ext_lower) is not None:
-                matched = True
-            elif p.name == prefix + ext_lower:
-                matched = True
-        if matched:
-            valid += 1
-        else:
-            suspect += 1
-    if suspect > 0 and valid == 0:
-        return "error"
-    if suspect > 0:
-        return "warn"
-    return "ok"
-
-
-def _assess_work_naming_for_department(
-    ref: Asset | Shot,
-    dept: Department,
-    prefix: str,
-) -> Literal["ok", "warn", "error"]:
-    work_exts = _workfile_extensions_set()
-    worst: Literal["ok", "warn", "error"] = "ok"
-    for wp in _work_paths_for_department(ref, dept):
-        level = _assess_work_naming_in_folder(wp, prefix, work_exts)
-        if level == "error":
-            return "error"
-        if level == "warn":
-            worst = "warn"
-    return worst
-
-
-_HOUDINI_WORK_EXTS = frozenset({".hip", ".hiplc", ".hipnc"})
-
-
-def _is_houdini_work_path(work_path: Path) -> bool:
-    """True when work_path is a Houdini work directory (layout or hip files on disk)."""
-    try:
-        if work_path.parent.name.casefold() == "houdini" and work_path.name.casefold() == "work":
-            return True
-    except Exception:
-        pass
-    if not work_path.is_dir():
-        return False
-    try:
-        for p in work_path.iterdir():
-            if p.is_file() and (p.suffix or "").lower() in _HOUDINI_WORK_EXTS:
-                return True
-    except OSError:
-        pass
-    return False
-
-
-def _department_has_houdini_work(ref: Asset | Shot, dept: Department) -> bool:
-    dep_cf = (dept.name or "").strip().casefold()
-    for (dept_id, dcc_id), _state in getattr(ref, "dcc_work_states", ()) or ():
-        if (dept_id or "").strip().casefold() == dep_cf and (dcc_id or "").strip().casefold() == "houdini":
-            return True
-    for wp in _work_paths_for_department(ref, dept):
-        if _is_houdini_work_path(wp):
-            return True
-    return False
-
-
-def _houdini_backup_folder_paths_for_department(
-    ref: Asset | Shot,
-    dept: Department,
-) -> tuple[str, ...]:
-    """Non-empty Houdini ``backup/`` subfolders under department work paths."""
-    dep_cf = (dept.name or "").strip().casefold()
-    paths: list[str] = []
-    seen: set[str] = set()
-
-    def add_backup_dir(work_path: Path) -> None:
-        if not _is_houdini_work_path(work_path):
-            return
-        backup = work_path / "backup"
-        if not backup.is_dir():
-            return
-        try:
-            if not any(backup.iterdir()):
-                return
-        except OSError:
-            return
-        try:
-            key = str(backup.resolve()).casefold()
-        except OSError:
-            key = str(backup).casefold()
-        if key in seen:
-            return
-        seen.add(key)
-        paths.append(str(backup))
-
-    for wp in _work_paths_for_department(ref, dept):
-        add_backup_dir(wp)
-    for (dept_id, dcc_id), state in getattr(ref, "dcc_work_states", ()) or ():
-        if (dept_id or "").strip().casefold() != dep_cf:
-            continue
-        if (dcc_id or "").strip().casefold() != "houdini":
-            continue
-        wfp = getattr(state, "work_file_path", None)
-        if isinstance(wfp, Path):
-            add_backup_dir(wfp.parent)
-
-    paths.sort(key=lambda s: Path(s).name.casefold())
-    return tuple(paths)
 
 
 def _latest_publish_mtime_for_department(ref: Asset | Shot, active_department: str) -> float | None:
@@ -963,7 +714,7 @@ def assess_view_item_health(
         issues.append(HealthIssue("ok", "Publish", "No publish required until work exists."))
 
     if getattr(dept, "work_exists", False) or _work_paths_for_department(ref, dept):
-        naming = _assess_work_naming_for_department(ref, dept, prefix)
+        naming = assess_work_naming_for_department(ref, dept, prefix)
         bad_all, bad_name, bad_ext = _split_invalid_work_files_for_department(ref, dept, prefix)
         expected = f"{prefix}_v###"
         work_exts = _workfile_extensions_set()
@@ -2175,6 +1926,11 @@ class _ClearOnEmptyClickListView(_RubberBandSelectMixin, QListView):
             if self._rb_selecting:
                 self._rb_update_rubber_band(event.pos())
                 self._apply_rubber_band_row_selection(event.pos())
+            event.accept()
+            return
+        # Thumb interactive hits (DCC badge, health, notes…) swallow press in MainView.eventFilter
+        # without arming rubber-band. Do not fall through to QListView DragOnly startDrag.
+        if bool(event.buttons() & Qt.MouseButton.LeftButton):
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -3558,6 +3314,7 @@ class MainView(QWidget):
     _SETTINGS_KEY_SORT_FIELD = "main_view/sort_field"
     _SETTINGS_KEY_SORT_ASCENDING = "main_view/sort_ascending"
     _SORT_FIELD_NAME = "name"
+    _SORT_FIELD_TYPE = "type"
     _SORT_FIELD_DATE = "date"
     _SORT_FIELD_STATUS = "status"
     _SORT_FIELD_DUE = "due"
@@ -3630,7 +3387,13 @@ class MainView(QWidget):
         _sf_raw = str(self._settings.value(self._SETTINGS_KEY_SORT_FIELD, self._SORT_FIELD_NAME) or "").strip().lower()
         self._sort_field: str = (
             _sf_raw
-            if _sf_raw in (self._SORT_FIELD_DATE, self._SORT_FIELD_STATUS, self._SORT_FIELD_DUE)
+            if _sf_raw
+            in (
+                self._SORT_FIELD_TYPE,
+                self._SORT_FIELD_DATE,
+                self._SORT_FIELD_STATUS,
+                self._SORT_FIELD_DUE,
+            )
             else self._SORT_FIELD_NAME
         )
         self._sort_ascending: bool = bool(self._settings.value(self._SETTINGS_KEY_SORT_ASCENDING, True, type=bool))
@@ -4087,7 +3850,9 @@ class MainView(QWidget):
         _sl.addWidget(_sort_by_lbl)
         self._sort_field_group = QButtonGroup(self._sort_submenu)
         self._sort_by_name = QRadioButton("Name", self._sort_submenu)
-        self._sort_by_name.setToolTip("Asset type + name (assets) or shot name.")
+        self._sort_by_name.setToolTip("Asset or shot name.")
+        self._sort_by_type = QRadioButton("Type", self._sort_submenu)
+        self._sort_by_type.setToolTip("Asset type folder, then name.")
         self._sort_by_date = QRadioButton("Date", self._sort_submenu)
         self._sort_by_date.setToolTip(
             "Last updated: entity folder in Work mode, latest publish version in Published mode."
@@ -4098,15 +3863,23 @@ class MainView(QWidget):
         )
         self._sort_by_due = QRadioButton("Due", self._sort_submenu)
         self._sort_by_due.setToolTip("Schedule due date (active department, else delivery).")
-        for rb in (self._sort_by_name, self._sort_by_date, self._sort_by_status, self._sort_by_due):
+        for rb in (
+            self._sort_by_name,
+            self._sort_by_type,
+            self._sort_by_date,
+            self._sort_by_status,
+            self._sort_by_due,
+        ):
             rb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._sort_field_group.setExclusive(True)
         self._sort_field_group.addButton(self._sort_by_name, 0)
-        self._sort_field_group.addButton(self._sort_by_date, 1)
-        self._sort_field_group.addButton(self._sort_by_status, 2)
-        self._sort_field_group.addButton(self._sort_by_due, 3)
+        self._sort_field_group.addButton(self._sort_by_type, 1)
+        self._sort_field_group.addButton(self._sort_by_date, 2)
+        self._sort_field_group.addButton(self._sort_by_status, 3)
+        self._sort_field_group.addButton(self._sort_by_due, 4)
         self._sort_field_group.idClicked.connect(self._on_sort_field_clicked)
         _sl.addWidget(self._sort_by_name)
+        _sl.addWidget(self._sort_by_type)
         _sl.addWidget(self._sort_by_date)
         _sl.addWidget(self._sort_by_status)
         _sl.addWidget(self._sort_by_due)
@@ -5001,6 +4774,16 @@ class MainView(QWidget):
                 self._complete_active_view_mouse_gesture()
                 event.accept()
                 return True
+            hit_dcc_item, hit_dcc_id, _hit_dcc_dep = self._dcc_badge_hit(event.pos())
+            if hit_dcc_item and hit_dcc_id:
+                self._complete_active_view_mouse_gesture()
+                event.accept()
+                return True
+            if getattr(self._tile_view, "_rb_skip_release_click", False):
+                self._complete_active_view_mouse_gesture()
+                self._tile_view._rb_skip_release_click = False
+                event.accept()
+                return True
 
         # Left-click on production status pill: pick override (before DCC badge handling)
         if (
@@ -5056,6 +4839,8 @@ class MainView(QWidget):
                         return True
                 hit_item, hit_dcc, hit_dep = self._dcc_badge_hit(event.pos())
                 if hit_item and hit_dcc and hit_dep:
+                    # Suppress release click/selection + QListView drag while choosing active DCC.
+                    self._tile_view._rb_skip_release_click = True
                     self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
                     self.active_dcc_changed.emit(hit_item.path, hit_dep, hit_dcc)
                     try:
@@ -5225,6 +5010,16 @@ class MainView(QWidget):
                         self._complete_active_view_mouse_gesture()
                         event.accept()
                         return True
+                    hit_dcc_item, hit_dcc_id, _ = self._list_hit.dcc_hit(event.pos())
+                    if hit_dcc_item and hit_dcc_id:
+                        self._complete_active_view_mouse_gesture()
+                        event.accept()
+                        return True
+                    if getattr(list_view, "_rb_skip_release_click", False):
+                        self._complete_active_view_mouse_gesture()
+                        list_view._rb_skip_release_click = False
+                        event.accept()
+                        return True
             if event.type() == QEvent.MouseButtonPress and self._view_mode == "list":
                 if event.button() == Qt.MouseButton.LeftButton:
                     hit_ref = self._list_hit.ref_hit(event.pos())
@@ -5261,6 +5056,7 @@ class MainView(QWidget):
                         return True
                     hit_item, hit_dcc, hit_dep = self._list_hit.dcc_hit(event.pos())
                     if hit_item and hit_dcc and hit_dep:
+                        list_view._rb_skip_release_click = True
                         self._grid_delegate.set_active_dcc(hit_item.path, hit_dep, hit_dcc)
                         self.active_dcc_changed.emit(hit_item.path, hit_dep, hit_dcc)
                         try:
@@ -6065,6 +5861,9 @@ class MainView(QWidget):
         self._browser_context = context
         self._card_scale_value = self._load_card_scale()
         self._update_main_view_options_button()
+        if self._sort_field not in self._valid_sort_fields_for_context():
+            self._sort_field = self._SORT_FIELD_NAME
+            self._settings.setValue(self._SETTINGS_KEY_SORT_FIELD, self._sort_field)
         if getattr(self, "_work_publish_switch", None) is not None:
             self._work_publish_switch.setVisible(context in ("asset", "shot"))
 
@@ -6589,9 +6388,17 @@ class MainView(QWidget):
                 return (0, due_d, name_key, str(vi.path))
             except ValueError:
                 return (1, date.max, name_key, str(vi.path))
-        if isinstance(vi.ref, Asset):
-            return (vi.ref.asset_type, (vi.ref.name or "").casefold(), str(vi.path))
-        if isinstance(vi.ref, Shot):
+        if field == self._SORT_FIELD_TYPE:
+            if isinstance(vi.ref, Asset):
+                return (
+                    (vi.ref.asset_type or "").casefold(),
+                    (vi.ref.name or "").casefold(),
+                    str(vi.path),
+                )
+            if isinstance(vi.ref, Shot):
+                return ("", (vi.ref.name or "").casefold(), str(vi.path))
+            return ((vi.type_badge or "").casefold(), display_name_for_item(vi).casefold(), str(vi.path))
+        if isinstance(vi.ref, (Asset, Shot)):
             return ((vi.ref.name or "").casefold(), str(vi.path))
         return (display_name_for_item(vi).casefold(), str(vi.path))
 
@@ -6721,8 +6528,13 @@ class MainView(QWidget):
         except (TypeError, OSError):
             return False
 
-    def select_item_by_path(self, path: Path) -> bool:
-        """Select the row whose item has the given path; returns True if found and selected."""
+    def select_item_by_path(self, path: Path, *, scroll: bool = True) -> bool:
+        """Select the row whose item has the given path; returns True if found and selected.
+
+        scroll=True (default) for external jumps (Recent Task, deep-link, restore).
+        Use scroll=False when syncing from AppState after a mouse selection — otherwise
+        click → set_selection → set_selection_from_state re-centers the viewport.
+        """
         path = Path(path)
         for row in range(self._tile_row_count()):
             tile_idx = self._tile_model._model_index(row, 0)
@@ -6732,12 +6544,15 @@ class MainView(QWidget):
             if isinstance(item, ViewItem) and self._paths_equal(item.path, path):
                 self._pipeline_selection_store.set_single(path)
                 self._apply_selection_store_to_views()
-                self.valid_selection_changed.emit(self.has_valid_selection())
-                list_idx = self._list_model.index(row, 0)
-                active = self._tile_view if self._view_mode == "tile" else self._list_view
-                scroll_idx = tile_idx if active is self._tile_view else list_idx
-                if scroll_idx.isValid():
-                    active.scrollTo(scroll_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+                # AppState→view sync emits valid_selection_changed itself when path changes.
+                if not getattr(self, "_selection_driven_by_state", False):
+                    self.valid_selection_changed.emit(self.has_valid_selection())
+                if scroll:
+                    list_idx = self._list_model.index(row, 0)
+                    active = self._tile_view if self._view_mode == "tile" else self._list_view
+                    scroll_idx = tile_idx if active is self._tile_view else list_idx
+                    if scroll_idx.isValid():
+                        active.scrollTo(scroll_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
                 return True
         return False
 
@@ -6996,13 +6811,22 @@ class MainView(QWidget):
             sm = active.selectionModel()
             if sm is not None and len(sm.selectedIndexes()) > 1:
                 return
-            if not selection_id or not selection_id.strip():
+            sid = (selection_id or "").strip() or None
+            # Click already selected this row — do not clearSelection+reselect (flash + lag).
+            if sid and prev_path and self._paths_equal(Path(prev_path), Path(sid)):
+                if self._selected_index_count() == 1:
+                    return
+            if not sid:
+                if prev_path is None:
+                    return
                 self._pipeline_selection_store.clear()
                 self._tile_view.clearSelection()
                 self._list_view.clearSelection()
             else:
                 try:
-                    found = self.select_item_by_path(Path(selection_id))
+                    # Do not scroll: mouse click already selected the row; recentering
+                    # would jump the list under the cursor.
+                    found = self.select_item_by_path(Path(sid), scroll=False)
                     if not found:
                         self._tile_view.clearSelection()
                         self._list_view.clearSelection()
@@ -7298,19 +7122,24 @@ class MainView(QWidget):
         self._filter_submenu.setVisible(show_asset_shot_opts)
         self._sort_sep.setVisible(show_sort)
         self._sort_submenu.setVisible(show_sort)
+        self._sort_by_type.setVisible(ctx == "asset")
         self._sort_by_due.setVisible(show_asset_shot_opts)
         if show_project_opts:
             self._sort_by_name.setToolTip("Project display name.")
             self._sort_by_date.setToolTip("Project folder last modified on disk.")
             self._sort_by_status.setToolTip("Project browser status (Waiting → Done).")
         elif show_asset_shot_opts:
-            self._sort_by_name.setToolTip("Asset type + name (assets) or shot name.")
+            self._sort_by_name.setToolTip("Asset or shot name.")
+            self._sort_by_type.setToolTip("Asset type folder, then name.")
             self._sort_by_date.setToolTip(
                 "Last updated: entity folder in Work mode, latest publish version in Published mode."
             )
             self._sort_by_status.setToolTip(
                 "Production status for the focused department (pipeline category order)."
             )
+            if ctx == "shot" and self._sort_field == self._SORT_FIELD_TYPE:
+                self._sort_field = self._SORT_FIELD_NAME
+                self._settings.setValue(self._SETTINGS_KEY_SORT_FIELD, self._sort_field)
         self._metadata_sep.setVisible(show_metadata)
         self._metadata_submenu.setVisible(show_metadata)
         if show_asset_shot_opts:
@@ -7516,14 +7345,16 @@ class MainView(QWidget):
     def _sync_sort_radios_from_settings(self) -> None:
         by_field = {
             self._SORT_FIELD_NAME: 0,
-            self._SORT_FIELD_DATE: 1,
-            self._SORT_FIELD_STATUS: 2,
-            self._SORT_FIELD_DUE: 3,
+            self._SORT_FIELD_TYPE: 1,
+            self._SORT_FIELD_DATE: 2,
+            self._SORT_FIELD_STATUS: 3,
+            self._SORT_FIELD_DUE: 4,
         }
         field_btn = self._sort_field_group.button(by_field.get(self._sort_field, 0))
         order_btn = self._sort_order_group.button(0 if self._sort_ascending else 1)
         for w in (
             self._sort_by_name,
+            self._sort_by_type,
             self._sort_by_date,
             self._sort_by_status,
             self._sort_by_due,
@@ -7537,6 +7368,7 @@ class MainView(QWidget):
             order_btn.setChecked(True)
         for w in (
             self._sort_by_name,
+            self._sort_by_type,
             self._sort_by_date,
             self._sort_by_status,
             self._sort_by_due,
@@ -7553,7 +7385,15 @@ class MainView(QWidget):
     def _valid_sort_fields_for_context(self) -> tuple[str, ...]:
         if self._browser_context == "project":
             return (self._SORT_FIELD_NAME, self._SORT_FIELD_DATE, self._SORT_FIELD_STATUS)
-        if self._browser_context in ("asset", "shot"):
+        if self._browser_context == "asset":
+            return (
+                self._SORT_FIELD_NAME,
+                self._SORT_FIELD_TYPE,
+                self._SORT_FIELD_DATE,
+                self._SORT_FIELD_STATUS,
+                self._SORT_FIELD_DUE,
+            )
+        if self._browser_context == "shot":
             return (
                 self._SORT_FIELD_NAME,
                 self._SORT_FIELD_DATE,
@@ -7594,6 +7434,7 @@ class MainView(QWidget):
         )
         labels = {
             self._SORT_FIELD_NAME: "Name",
+            self._SORT_FIELD_TYPE: "Type",
             self._SORT_FIELD_DATE: "Date",
             self._SORT_FIELD_STATUS: "Status",
             self._SORT_FIELD_DUE: "Due",
@@ -7637,9 +7478,10 @@ class MainView(QWidget):
     def _on_sort_field_clicked(self, button_id: int) -> None:
         by_id = {
             0: self._SORT_FIELD_NAME,
-            1: self._SORT_FIELD_DATE,
-            2: self._SORT_FIELD_STATUS,
-            3: self._SORT_FIELD_DUE,
+            1: self._SORT_FIELD_TYPE,
+            2: self._SORT_FIELD_DATE,
+            3: self._SORT_FIELD_STATUS,
+            4: self._SORT_FIELD_DUE,
         }
         field = by_id.get(int(button_id), self._SORT_FIELD_NAME)
         self.apply_sort_field_choice(field)
@@ -7786,6 +7628,7 @@ class MainView(QWidget):
         store = self._pipeline_selection_store
         paths = store.path_set()
         current_key = path_key(store.current()) if store.current() else None
+        prev_driven = bool(getattr(self, "_selection_driven_by_state", False))
         self._selection_driven_by_state = True
         try:
             for view in (self._tile_view, self._list_view):
@@ -7808,7 +7651,7 @@ class MainView(QWidget):
                 if current_idx.isValid():
                     sm.setCurrentIndex(current_idx, QItemSelectionModel.SelectionFlag.NoUpdate)
         finally:
-            self._selection_driven_by_state = False
+            self._selection_driven_by_state = prev_driven
         self._tile_view.viewport().update()
         self._list_view.viewport().update()
 
@@ -8181,9 +8024,8 @@ class MainView(QWidget):
         self._sync_selection_store_from_view()
         if self._view_mode == "tile":
             self._begin_tile_selection_chrome(selected, deselected)
-            self._schedule_selection_notify()
-            return
-        self._emit_selection_notify()
+        # Defer AppState + Inspector so selection chrome paints first (list and tile).
+        self._schedule_selection_notify()
 
     def _update_empty_states(self) -> None:
         # Spec: empty states use placeholders; no popup.

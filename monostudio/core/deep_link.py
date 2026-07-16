@@ -420,7 +420,15 @@ def extract_monos_deep_link_from_text(text: str) -> str | None:
         token = (candidate or "").strip()
         if not token:
             return ""
-        return token.split()[0]
+        token = token.split()[0]
+        # Cut before HTML / markdown delimiters (e.g. href="monostudio://…">).
+        for i, ch in enumerate(token):
+            if ch in "\"')]}>":
+                token = token[:i]
+                break
+        while token and token[-1] in ".,;":
+            token = token[:-1]
+        return token
 
     for line in raw.splitlines():
         candidate = _trim_token(line)
@@ -476,3 +484,47 @@ def resolve_monos_link_paste_label(clipboard_text: str, url: str) -> str | None:
     if lab:
         return lab
     return monos_link_display_label_from_url(url)
+
+
+def extract_monos_deep_link_from_clipboard(clipboard) -> tuple[str | None, str]:
+    """Find a ``monostudio://`` URL in a Qt clipboard (plain, HTML, or URI list).
+
+    Returns ``(url, text_for_label)``. ``text_for_label`` prefers plain text so
+    Discord/HTML pastes still resolve the human label when present.
+    """
+    plain = ""
+    try:
+        plain = clipboard.text() or ""
+    except Exception:
+        plain = ""
+    url = extract_monos_deep_link_from_text(plain)
+    if url:
+        return url, plain
+
+    html = ""
+    urls_blob = ""
+    try:
+        md = clipboard.mimeData()
+    except Exception:
+        md = None
+    if md is not None:
+        try:
+            if md.hasHtml():
+                html = md.html() or ""
+        except Exception:
+            html = ""
+        try:
+            if md.hasUrls():
+                urls_blob = "\n".join(u.toString() for u in md.urls() if u is not None)
+        except Exception:
+            urls_blob = ""
+
+    for blob in (html, urls_blob):
+        url = extract_monos_deep_link_from_text(blob)
+        if url:
+            # Keep plain label (if any) above the URL for resolve_monos_link_paste_label.
+            label_src = plain.strip()
+            if label_src and not extract_monos_deep_link_from_text(label_src):
+                return url, f"{label_src}\n{url}"
+            return url, blob
+    return None, plain

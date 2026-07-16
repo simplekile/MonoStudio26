@@ -2871,19 +2871,41 @@ class InboxTreePane(QWidget):
         except (OSError, ValueError):
             return False
         ok = False
-        if path.is_dir():
+        if path.is_dir() and self._show_toolbar and self._view_mode == "tile":
+            # Tile mode: select the folder card in its parent grid (same as files).
+            # navigate_to_path would enter the folder and clear grid selection.
+            unresolved = self._select_dropped_paths_in_grid([path], navigate=True)
+            ok = not unresolved
+            if ok:
+                self._on_tree_selection_changed()
+        elif path.is_dir():
             self.navigate_to_path(path)
             ok = True
         elif self._show_toolbar and self._view_mode == "tile":
             unresolved = self._select_dropped_paths_in_grid([path], navigate=True)
-            ok = path not in unresolved
+            ok = not unresolved
             if ok:
                 self._on_tree_selection_changed()
         else:
             parent = path.parent
+            # QFileSystemModel populates asynchronously — nudge parents before lookup.
+            walk = parent if parent.is_dir() else None
+            while walk is not None:
+                try:
+                    walk.resolve().relative_to(self._date_folder_path.resolve())
+                except (OSError, ValueError):
+                    break
+                src = self._fs_model.index(str(walk.resolve()), 0)
+                if src.isValid() and self._fs_model.canFetchMore(src):
+                    self._fs_model.fetchMore(src)
+                if walk.resolve() == self._date_folder_path.resolve():
+                    break
+                walk = walk.parent if walk.parent != walk else None
             parent_src = self._fs_model.index(str(parent.resolve()), 0) if parent.is_dir() else QModelIndex()
             if not parent_src.isValid():
                 return False
+            if self._fs_model.canFetchMore(parent_src):
+                self._fs_model.fetchMore(parent_src)
             file_src = self._fs_model.index(str(path.resolve()), 0)
             if not file_src.isValid():
                 return False

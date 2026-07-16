@@ -1391,6 +1391,7 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowCloseBtn,
         QToolButton#TopBarNotiBtn,
         QToolButton#TopBarReviewBtn,
+        QToolButton#TopBarPomodoroBtn,
         QToolButton#TopBarUpdateBtn,
         QToolButton#TopBarWatcherBtn,
         QToolButton#TopBarUserBtn {
@@ -1405,6 +1406,7 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WindowMaxBtn:hover,
         QToolButton#TopBarNotiBtn:hover,
         QToolButton#TopBarReviewBtn:hover,
+        QToolButton#TopBarPomodoroBtn:hover,
         QToolButton#TopBarUpdateBtn:hover,
         QToolButton#TopBarWatcherBtn:hover {
             background: rgba(255, 255, 255, 0.08);
@@ -2821,6 +2823,21 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QToolButton#ItemHealthDialogSizeGrip:hover {
             background: rgba(255, 255, 255, 0.08);
+        }
+        QScrollArea#ProjectHealthScroll {
+            background-color: transparent;
+            border: none;
+        }
+        QScrollArea#ProjectHealthScroll::viewport {
+            background-color: transparent;
+        }
+        QWidget#ProjectHealthListHost {
+            background: transparent;
+        }
+        QFrame#ProjectHealthPathSection {
+            background-color: #1e2124;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 8px;
         }
         QScrollArea#ItemNotesScroll {
             background-color: #151618;
@@ -6278,6 +6295,99 @@ def apply_dark_theme(app: QApplication) -> None:
         QLabel#InspectorFieldLabel {
             color: #a1a1aa;
             background: transparent;
+        }
+
+        /* --- Focus timer (Pomodoro plugin) --- */
+        QWidget#PomodoroWindow QLabel#PomodoroTime {
+            background: transparent;
+            font-size: 64px;
+            font-weight: 700;
+            padding: 0;
+            margin: 0;
+        }
+        QWidget#PomodoroWindow QLabel#PomodoroPhase {
+            color: #71717a;
+            background: transparent;
+            letter-spacing: 2px;
+            font-size: 10px;
+            font-weight: 700;
+        }
+        QProgressBar#PomodoroProgress {
+            background: rgba(255, 255, 255, 0.06);
+            border: none;
+            border-radius: 1px;
+            max-height: 3px;
+        }
+        QProgressBar#PomodoroProgress::chunk {
+            background: #3b82f6;
+            border-radius: 1px;
+        }
+        QListWidget#PomodoroChecklist {
+            background: transparent;
+            border: none;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 0;
+            padding: 8px 0 0 0;
+            color: #a1a1aa;
+            font-size: 12px;
+            outline: none;
+        }
+        QListWidget#PomodoroChecklist::item {
+            padding: 4px 2px;
+            border-radius: 4px;
+        }
+        QListWidget#PomodoroChecklist::item:selected {
+            background: rgba(255, 255, 255, 0.04);
+            color: #e4e4e7;
+        }
+        QLineEdit#PomodoroAddEdit {
+            background: transparent;
+            border: none;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 0;
+            padding: 4px 2px;
+            color: #d4d4d8;
+            font-size: 12px;
+        }
+        QLineEdit#PomodoroAddEdit:focus {
+            border-bottom: 1px solid #3b82f6;
+        }
+        QToolButton#PomodoroCloseBtn,
+        QToolButton#PomodoroPinBtn,
+        QToolButton#PomodoroListBtn,
+        QToolButton#PomodoroIconBtn {
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            padding: 0px;
+            margin: 0px;
+        }
+        QToolButton#PomodoroCloseBtn:hover,
+        QToolButton#PomodoroPinBtn:hover,
+        QToolButton#PomodoroListBtn:hover,
+        QToolButton#PomodoroIconBtn:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        QToolButton#PomodoroListBtn:checked {
+            background: rgba(59, 130, 246, 0.12);
+        }
+        QToolButton#PomodoroIconBtn:disabled {
+            opacity: 0.4;
+        }
+        QCheckBox#PomodoroAutoBreakCheck {
+            color: #71717a;
+            font-size: 11px;
+            spacing: 6px;
+        }
+        QPushButton#PomodoroGhostBtn {
+            background: transparent;
+            border: none;
+            color: #71717a;
+            font-size: 11px;
+            padding: 2px 4px;
+        }
+        QPushButton#PomodoroGhostBtn:hover {
+            color: #a1a1aa;
         }
         """
     )

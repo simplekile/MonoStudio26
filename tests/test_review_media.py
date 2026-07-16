@@ -113,6 +113,7 @@ def test_work_file_base_prefix() -> None:
 
 
 def test_sequence_markers_sidecar_path(tmp_path: Path) -> None:
+    from monostudio.core.review_sidecar import sequence_review_sidecar_path
     from monostudio.core.video_media import (
         load_sequence_markers_sidecar,
         save_sequence_markers_sidecar,
@@ -122,6 +123,61 @@ def test_sequence_markers_sidecar_path(tmp_path: Path) -> None:
     folder = tmp_path / "seq"
     folder.mkdir()
     save_sequence_markers_sidecar(folder, [VideoReviewMarker("m1", 5, "note", 0.0)])
+    assert sequence_review_sidecar_path(folder).is_file()
     loaded = load_sequence_markers_sidecar(folder, total_frames=10)
     assert len(loaded) == 1
     assert loaded[0].frame == 5
+
+
+def test_unified_video_review_sidecar(tmp_path: Path) -> None:
+    from monostudio.core.review_draw import ReviewDrawStroke, make_draw_layer, make_layer_keyframe
+    from monostudio.core.review_draw import load_video_draw_sidecar, save_video_draw_sidecar
+    from monostudio.core.review_sidecar import video_review_sidecar_path
+    from monostudio.core.video_media import (
+        VideoFrameRange,
+        VideoReviewMarker,
+        load_video_markers_sidecar,
+        load_video_ranges_sidecar,
+        save_video_markers_sidecar,
+        save_video_ranges_sidecar,
+    )
+
+    video = tmp_path / "take.mp4"
+    video.write_bytes(b"")
+    save_video_ranges_sidecar(video, [VideoFrameRange("r1", 0, 10, "A")])
+    save_video_markers_sidecar(video, [VideoReviewMarker("m1", 3, "hit", 0.0)])
+    stroke = ReviewDrawStroke("pen", "#fafafa", 2.0, [(0.0, 0.0), (1.0, 1.0)])
+    save_video_draw_sidecar(
+        video,
+        [make_draw_layer(keyframes=[make_layer_keyframe(3, strokes=[stroke])])],
+    )
+
+    path = video_review_sidecar_path(video)
+    assert path.is_file()
+    assert path.parent.name == ".monos"
+    assert not (tmp_path / "take.mp4.monos.ranges.json").exists()
+    assert not (tmp_path / "take.mp4.monos.markers.json").exists()
+    assert not (tmp_path / "take.mp4.monos.draw.json").exists()
+
+    assert len(load_video_ranges_sidecar(video, total_frames=100)) == 1
+    assert len(load_video_markers_sidecar(video, total_frames=100)) == 1
+    assert len(load_video_draw_sidecar(video, total_frames=100)) == 1
+
+
+def test_legacy_video_sidecars_still_load(tmp_path: Path) -> None:
+    from monostudio.core.video_media import load_video_markers_sidecar, load_video_ranges_sidecar
+
+    video = tmp_path / "old.mp4"
+    video.write_bytes(b"")
+    (tmp_path / "old.mp4.monos.ranges.json").write_text(
+        '{"version":1,"ranges":[{"id":"r1","in_frame":1,"out_frame":5,"label":"x"}]}',
+        encoding="utf-8",
+    )
+    (tmp_path / "old.mp4.monos.markers.json").write_text(
+        '{"version":1,"markers":[{"id":"m1","frame":2,"label":"y","created_at":0}]}',
+        encoding="utf-8",
+    )
+    ranges = load_video_ranges_sidecar(video, total_frames=50)
+    markers = load_video_markers_sidecar(video, total_frames=50)
+    assert len(ranges) == 1 and ranges[0].label == "x"
+    assert len(markers) == 1 and markers[0].label == "y"

@@ -1,16 +1,18 @@
-# MonoStudio 26 — Release v26.17.3
+# MonoStudio 26 — Release v26.17.4
 
 ## Highlights
 
-- **Deep links**: Short entity id (`e=`) thay path dài; page alias ngắn; resolve + tests; foreground focus khi mở từ instance thứ hai (`window_focus`).
-- **Review / preview**: Sequence & review media ổn định hơn; draw overlay; proxy worker; video preview dialog / switch popup / player backend.
-- **Tray & drop**: Tray mini popup; external drop host; link reveal flash.
-- **Pipeline / UI**: Structure presets; hotkeys; inspector / sidebar / inbox-outbox-guide; style tokens.
+- **Focus timer / Pomodoro**: Plugin mới — engine, utility window, Settings page, TopBar/tray entry, tray + in-app notifications.
+- **Project health**: Scan & cleanup autosaves, Blender backups, wrong-extension work files, Houdini backup dirs; dialog UI.
+- **Review sidecar**: Unified `.monos/*.review.json` cho ranges, markers, draw; migrate legacy review files.
+- **Deep links / reveal**: Link reveal flash, deep-link parsing/tests, foreground/window focus polish.
+- **Review / preview**: Review draw/media tests, video media robustness, preview/proxy/switch popup refinements.
 
 ## Changes in this release
 
-- feat: `window_focus.py`, short deep-link entity ids, `test_deep_link.py`, `test_external_drop_host.py`.
-- fix: `video_preview_dialog.py`, `review_draw_overlay.py`, `main_window.py`, `sequence_preview.py`, `review_media.py`.
+- feat: `monostudio/plugins/pomodoro/*`, `test_pomodoro_engine.py`, `plan_pomodoro_plugin_v1.mdc`.
+- feat: `project_health.py`, `item_health_scan.py`, `project_health_dialog.py`, `test_project_health.py`.
+- fix: `review_sidecar.py`, `review_draw.py`, `review_media.py`, `video_media.py`, `main_window.py`.
 
 ## Install
 

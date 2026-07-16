@@ -9,8 +9,11 @@ from PySide6.QtGui import QColor, QPainter, QPen
 
 from monostudio.ui_qt.style import MONOS_COLORS
 
-# Hold then fade — keep short so ticks stay cheap (≈9 viewport updates total).
-_HOLD_MS = 280
+# Bright → dim pulses, then a short fade-out on the last pulse.
+_FLASH_COUNT = 3
+_HOLD_MS = 220
+_DIM_MS = 140
+_DIM_ALPHA = 0.12
 _FADE_INTERVAL_MS = 50
 _FADE_STEPS = 8
 _FLASH_END = 0.15
@@ -83,6 +86,10 @@ class LinkRevealController(QObject):
         self._path_match: set[Path] = set()
         self._global_alpha = 0.0
         self._fade_step = 0
+        self._pulses_left = 0
+        self._phase_timer = QTimer(self)
+        self._phase_timer.setSingleShot(True)
+        self._phase_timer.timeout.connect(self._on_phase_timeout)
         self._fade_timer = QTimer(self)
         self._fade_timer.setInterval(_FADE_INTERVAL_MS)
         self._fade_timer.timeout.connect(self._on_fade_tick)
@@ -151,12 +158,40 @@ class LinkRevealController(QObject):
     def matches_path(self, path: Path | str) -> bool:
         return self.alpha_for_path(path) > 0.01
 
-    def _begin_flash(self) -> None:
+    def _stop_timers(self) -> None:
+        self._phase_timer.stop()
         self._fade_timer.stop()
+
+    def _begin_flash(self) -> None:
+        self._stop_timers()
         self._fade_step = 0
+        self._pulses_left = max(1, int(_FLASH_COUNT))
+        self._show_bright()
+
+    def _show_bright(self) -> None:
         self._global_alpha = 1.0
         self.changed.emit()
-        QTimer.singleShot(_HOLD_MS, self._begin_fade)
+        self._phase_timer.start(_HOLD_MS)
+
+    def _show_dim(self) -> None:
+        self._global_alpha = _DIM_ALPHA
+        self.changed.emit()
+        self._phase_timer.start(_DIM_MS)
+
+    def _on_phase_timeout(self) -> None:
+        if not self.is_active():
+            self._clear()
+            return
+        # Currently bright → either fade out (last pulse) or dim then pulse again.
+        if self._global_alpha >= 0.99:
+            self._pulses_left -= 1
+            if self._pulses_left <= 0:
+                self._begin_fade()
+                return
+            self._show_dim()
+            return
+        # Currently dim → next bright pulse.
+        self._show_bright()
 
     def _begin_fade(self) -> None:
         if not self.is_active():
@@ -187,11 +222,13 @@ class LinkRevealController(QObject):
             self.changed.emit()
 
     def _clear(self) -> None:
+        self._stop_timers()
         self._path_targets.clear()
         self._trash_targets.clear()
         self._path_match.clear()
         self._global_alpha = 0.0
         self._fade_step = 0
+        self._pulses_left = 0
 
 
 _instance: LinkRevealController | None = None

@@ -785,11 +785,15 @@ def _draft_digest_key(media_key: Path) -> str:
 
 
 def video_draw_sidecar_path(video_path: Path) -> Path:
-    return Path(f"{video_path}.monos.draw.json")
+    from monostudio.core.review_sidecar import video_review_sidecar_path
+
+    return video_review_sidecar_path(video_path)
 
 
 def sequence_draw_sidecar_path(sequence_folder: Path) -> Path:
-    return sequence_folder / ".monos.draw.json"
+    from monostudio.core.review_sidecar import sequence_review_sidecar_path
+
+    return sequence_review_sidecar_path(sequence_folder)
 
 
 def draw_local_draft_path(media_key: Path, *, sequence: bool) -> Path:
@@ -841,32 +845,25 @@ def _draw_payload(media_key: Path, layers: Sequence[ReviewDrawLayer]) -> dict:
     }
 
 
-def _parse_draw_file(path: Path, *, total_frames: int) -> list[ReviewDrawLayer]:
-    if not path.is_file():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    version = int(data.get("version") or 1)
-    if version >= 3:
-        raw = data.get("layers")
-        if not isinstance(raw, list):
-            return []
+def _parse_draw_payload(data: dict, *, total_frames: int) -> list[ReviewDrawLayer]:
+    """Parse draw layers from a draw-only or unified review dict."""
+    # Unified review / v3: ``layers`` present
+    raw = data.get("layers")
+    if isinstance(raw, list):
         out: list[ReviewDrawLayer] = []
         for item in raw:
             layer = ReviewDrawLayer.from_json(item)
             if layer is not None:
                 out.append(layer)
         return _clamp_layers_to_total(out, total_frames)
+
+    version = int(data.get("version") or 1)
     if version >= 2:
-        raw = data.get("keyframes")
-        if not isinstance(raw, list):
+        raw_kf = data.get("keyframes")
+        if not isinstance(raw_kf, list):
             return []
         legacy: list[ReviewDrawKeyframe] = []
-        for item in raw:
+        for item in raw_kf:
             kf = ReviewDrawKeyframe.from_json(item)
             if kf is not None:
                 legacy.append(kf)
@@ -882,6 +879,18 @@ def _parse_draw_file(path: Path, *, total_frames: int) -> list[ReviewDrawLayer]:
     return _clamp_layers_to_total(migrate_clips_to_layers(clips), total_frames)
 
 
+def _parse_draw_file(path: Path, *, total_frames: int) -> list[ReviewDrawLayer]:
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    return _parse_draw_payload(data, total_frames=total_frames)
+
+
 def _layers_nonempty(layers: Sequence[ReviewDrawLayer]) -> bool:
     return any(layer.keyframes for layer in layers)
 
@@ -892,11 +901,29 @@ def _write_draw_file(path: Path, media_key: Path, layers: Sequence[ReviewDrawLay
 
 
 def load_video_draw_sidecar(video_path: Path, *, total_frames: int) -> list[ReviewDrawLayer]:
-    return _parse_draw_file(video_draw_sidecar_path(video_path), total_frames=total_frames)
+    from monostudio.core.review_sidecar import (
+        legacy_video_draw_path,
+        read_json_dict,
+        video_review_sidecar_path,
+    )
+
+    unified = read_json_dict(video_review_sidecar_path(video_path))
+    if unified is not None and "layers" in unified:
+        return _parse_draw_payload(unified, total_frames=total_frames)
+    return _parse_draw_file(legacy_video_draw_path(video_path), total_frames=total_frames)
 
 
 def load_sequence_draw_sidecar(sequence_folder: Path, *, total_frames: int) -> list[ReviewDrawLayer]:
-    return _parse_draw_file(sequence_draw_sidecar_path(sequence_folder), total_frames=total_frames)
+    from monostudio.core.review_sidecar import (
+        legacy_sequence_draw_path,
+        read_json_dict,
+        sequence_review_sidecar_path,
+    )
+
+    unified = read_json_dict(sequence_review_sidecar_path(sequence_folder))
+    if unified is not None and "layers" in unified:
+        return _parse_draw_payload(unified, total_frames=total_frames)
+    return _parse_draw_file(legacy_sequence_draw_path(sequence_folder), total_frames=total_frames)
 
 
 def load_draw_local_draft(media_key: Path, *, sequence: bool, total_frames: int) -> list[ReviewDrawLayer] | None:
@@ -914,33 +941,31 @@ def save_draw_local_draft(media_key: Path, layers: Sequence[ReviewDrawLayer], *,
 
 
 def save_video_draw_sidecar(video_path: Path, layers: Sequence[ReviewDrawLayer]) -> None:
-    path = video_draw_sidecar_path(video_path)
-    if not _layers_nonempty(layers):
-        try:
-            if path.is_file():
-                path.unlink()
-        except OSError as e:
-            logger.debug("remove draw sidecar %s: %s", path, e)
-        return
+    from monostudio.core.review_sidecar import load_video_review_dict, write_video_review_dict
+
     try:
-        _write_draw_file(path, video_path, layers)
+        data = load_video_review_dict(video_path)
+        if _layers_nonempty(layers):
+            data["layers"] = [layer.to_json() for layer in layers]
+        else:
+            data["layers"] = []
+        write_video_review_dict(video_path, data, unlink_legacy=frozenset({"layers"}))
     except OSError as e:
-        logger.debug("save draw sidecar %s: %s", path, e)
+        logger.debug("save draw sidecar %s: %s", video_path, e)
 
 
 def save_sequence_draw_sidecar(sequence_folder: Path, layers: Sequence[ReviewDrawLayer]) -> None:
-    path = sequence_draw_sidecar_path(sequence_folder)
-    if not _layers_nonempty(layers):
-        try:
-            if path.is_file():
-                path.unlink()
-        except OSError as e:
-            logger.debug("remove seq draw sidecar %s: %s", path, e)
-        return
+    from monostudio.core.review_sidecar import load_sequence_review_dict, write_sequence_review_dict
+
     try:
-        _write_draw_file(path, sequence_folder, layers)
+        data = load_sequence_review_dict(sequence_folder)
+        if _layers_nonempty(layers):
+            data["layers"] = [layer.to_json() for layer in layers]
+        else:
+            data["layers"] = []
+        write_sequence_review_dict(sequence_folder, data, unlink_legacy=frozenset({"layers"}))
     except OSError as e:
-        logger.debug("save seq draw sidecar %s: %s", path, e)
+        logger.debug("save seq draw sidecar %s: %s", sequence_folder, e)
 
 
 def load_draw_layers_for_preview(

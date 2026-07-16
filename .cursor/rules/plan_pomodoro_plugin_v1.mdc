@@ -1,0 +1,51 @@
+---
+description: Plan Focus timer (Pomodoro) as internal plugin — UX, package layout, host wiring.
+alwaysApply: false
+globs: monostudio/plugins/pomodoro/**/*
+---
+
+# Plan: Focus timer / Pomodoro plugin (v1)
+
+## Quyết định UX
+
+| Mục | Chốt |
+|-----|------|
+| Auto-start break | Checkbox, **default OFF** (Settings + cửa sổ timer) |
+| Scope | Timer thuần + **checklist user tự ghi** (không gắn asset/dept) |
+| Notify | Tray balloon **và** in-app toast |
+| Global hotkey | Không |
+| Surface | Cửa sổ utility riêng + Settings tab riêng |
+
+## Package
+
+```
+monostudio/plugins/pomodoro/
+  store.py          # QSettings prefix plugins/pomodoro/*
+  engine.py         # Phase FSM + tick
+  plugin.py         # PomodoroPlugin host (timer, notify hooks)
+  ui/window.py      # Focus timer window
+  ui/settings_page.py
+```
+
+MainWindow chỉ mount: TopBar icon, tray menu, Settings → General → Focus timer, notify callbacks.
+
+## Hành vi engine
+
+- Focus kết thúc + auto off → idle + notify
+- Focus kết thúc + auto on → short/long break
+- Skip trong Focus → luôn vào break
+- Break kết thúc → idle (không auto-start focus)
+- Long break mỗi N focuses (default 4)
+
+## Entry
+
+- TopBar `timer` icon → toggle cửa sổ
+- Tray context → “Focus timer…”
+- Settings → General → Focus timer
+
+## Không làm (v1)
+
+- Gắn pipeline / Recent Task
+- Global hotkey
+- Stats / Discord
+- Extra-tool EXE riêng (MonoFXSuite-style)

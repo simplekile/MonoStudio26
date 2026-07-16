@@ -121,6 +121,9 @@ class TrayManager(QObject):
         pr = getattr(self._window, "_project_root", None)
         if pr is not None:
             parts.append(pr.name or str(pr))
+        plugin = getattr(self._window, "_pomodoro_plugin", None)
+        if plugin is not None and plugin.engine().is_active():
+            parts.append(plugin.status_text())
         if self._has_notification:
             parts.append("Unread notifications")
         if self._has_update:
@@ -330,6 +333,19 @@ class TrayManager(QObject):
         )
         noti_act.triggered.connect(lambda: self._window.present(open_notifications=True))
         menu.addAction(noti_act)
+
+        plugin = getattr(self._window, "_pomodoro_plugin", None)
+        pomo_label = "Focus timer…"
+        if plugin is not None and plugin.engine().is_active():
+            pomo_label = f"Focus timer — {plugin.status_text()}"
+        pomo_act = self._menu_action(
+            menu,
+            pomo_label,
+            icon=lucide_icon("timer", size=_ICON_SIZE, color_hex=_CLR_ACTIVE),
+            tooltip="Open Focus timer",
+        )
+        pomo_act.triggered.connect(self._window.open_pomodoro_timer)
+        menu.addAction(pomo_act)
 
         menu.addSeparator()
 

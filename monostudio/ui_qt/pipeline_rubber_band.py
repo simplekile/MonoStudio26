@@ -84,6 +84,8 @@ class RubberBandSelectMixin:
         self._rb_empty_press = False
         self._rb_gesture = False
         self._rb_last_rows = None
+        self._rb_skip_release_click = False
+        self._shift_click_pending = False
 
     def _shift_anchor_model_index(self):
         anchor = getattr(self, "_shift_anchor_index", None)

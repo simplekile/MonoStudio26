@@ -17,7 +17,6 @@ from monostudio.core.inbox_reader import (
     ensure_inbox_source_folders,
     get_inbox_root,
     infer_inbox_source_from_path,
-    resolve_inbox_location,
 )
 from monostudio.ui_qt.inbox_history_dialog import InboxHistoryDialog
 from monostudio.ui_qt.inbox_page_toolbar import bind_explorer_view_mode_tab_shortcut
@@ -187,13 +186,25 @@ class InboxPageWidget(QWidget):
             self._tree_pane.video_preview_requested.connect(self.video_preview_requested.emit)
             self._tree_pane.copy_link_requested.connect(self.copy_link_requested.emit)
             self._content_lay.addWidget(self._tree_pane, 1)
+            key = self._tree_state_key(self._type_filter)
+            saved = self._tree_state_cache.get(key)
+            if saved:
+                self._tree_pane.set_tree_state(saved)
         else:
-            self._tree_pane.set_date_folder_path(root)
             self._tree_pane.set_chrome_context(self._type_filter, None)
-        key = self._tree_state_key(self._type_filter)
-        saved = self._tree_state_cache.get(key)
-        if saved:
-            self._tree_pane.set_tree_state(saved)
+            # Unified tree is rooted at inbox/<source>. Only retarget when leaving that root
+            # (e.g. source switch). Always resetting fought deep-link date narrowing and
+            # prevented selection + link flash.
+            try:
+                needs_root = self._tree_pane.date_folder_path().resolve() != root.resolve()
+            except OSError:
+                needs_root = True
+            if needs_root:
+                self._tree_pane.set_date_folder_path(root)
+                key = self._tree_state_key(self._type_filter)
+                saved = self._tree_state_cache.get(key)
+                if saved:
+                    self._tree_pane.set_tree_state(saved)
         self._refresh_chrome()
 
     def _on_browse_path_changed(self, path: Path) -> None:
@@ -265,17 +276,9 @@ class InboxPageWidget(QWidget):
         self._ensure_tree_pane()
         if self._tree_pane is None:
             return False
-        date_folder = resolve_inbox_location(project_root, item_path)
-        if date_folder is not None:
-            current = self._tree_pane.date_folder_path()
-            try:
-                needs_scope = current.resolve() != date_folder.resolve()
-            except OSError:
-                needs_scope = True
-            if needs_scope:
-                self._tree_pane.set_date_folder_path(date_folder)
-                # Scope just changed; deep-link retry loop will reveal when ready.
-                return False
+        # Keep pane rooted at inbox/<source> (unified tree). Do not narrow to the date
+        # folder — that raced with _ensure_tree_pane and made deep-link retries always fail
+        # (no selection, no flash).
         return self._tree_pane.reveal_path(item_path, link_reveal=link_reveal)
 
     def refresh_tree(self) -> None:

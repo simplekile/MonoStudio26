@@ -768,7 +768,6 @@ class InspectorPanel(QWidget):
             ref=None,
         )
         self.set_item(fake)
-        self.load_inbox_tree_preview_thumb()
         self._asset_status.setVisible(False)
         self._dept_pipeline.setVisible(False)
         self._tech.setVisible(False)
@@ -804,7 +803,7 @@ class InspectorPanel(QWidget):
             ref=None,
         )
         self.set_item(fake)
-        self.load_inbox_tree_preview_thumb()
+        # Thumb loads in deferred _preview.set_item (inbox → load_inbox_item_preview).
 
     def load_inbox_tree_preview_thumb(self) -> None:
         """Load HD preview for explorer file selection (Inbox, Internal check, Delivery, Project Guide)."""
@@ -3520,10 +3519,9 @@ class _InspectorPreview(QWidget):
         mgr = self._worker_manager
 
         if is_inbox:
-            self._sync_sequence_context_for_inspector_preview()
-            if path.is_file():
-                self._apply_inspector_thumb_decode_failure(w, is_inbox=True, path=path)
-            w.set_loading(False)
+            # Must load here: Inspector.set_item defers this call, so callers that
+            # invoke load_inbox_item_preview() immediately would still see the old _item.
+            self.load_inbox_item_preview()
             return
 
         # Đã load rồi thì dùng cache, không load lại
