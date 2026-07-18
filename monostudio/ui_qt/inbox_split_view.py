@@ -1690,22 +1690,34 @@ class InboxTreePane(QWidget):
             can_forward=self._nav_index < len(self._nav_history) - 1,
         )
 
-    def _file_entries_for_browse_root(self, root: Path) -> list[_InboxFileEntry]:
-        return self._sorted_file_entries(_collect_inbox_file_entries(root))
+    def _collect_unsorted_file_entries(self, root: Path) -> list[_InboxFileEntry]:
+        """Filesystem scan only — safe to call from a worker thread."""
+        return _collect_inbox_file_entries(root)
 
-    def _sorted_file_entries(self, entries: list[_InboxFileEntry]) -> list[_InboxFileEntry]:
+    def _file_entries_for_browse_root(self, root: Path) -> list[_InboxFileEntry]:
+        return self._sorted_file_entries(self._collect_unsorted_file_entries(root))
+
+    def _explorer_sort_params(self) -> tuple[str | None, bool]:
         toolbar = self._content_toolbar
         if toolbar is None:
+            return None, True
+        return toolbar.sort_field(), toolbar.sort_ascending()
+
+    def _sorted_file_entries(
+        self,
+        entries: list[_InboxFileEntry],
+        *,
+        field: str | None = None,
+        ascending: bool = True,
+        use_toolbar: bool = True,
+    ) -> list[_InboxFileEntry]:
+        if use_toolbar:
+            field, ascending = self._explorer_sort_params()
+        if field is None:
             return entries
         from monostudio.ui_qt.explorer_file_sort import sort_explorer_file_entries
 
-        return list(
-            sort_explorer_file_entries(
-                entries,
-                field=toolbar.sort_field(),
-                ascending=toolbar.sort_ascending(),
-            )
-        )
+        return list(sort_explorer_file_entries(entries, field=field, ascending=ascending))
 
     def _on_explorer_sort_changed(self, _field: str, _ascending: bool) -> None:
         self._reload_file_entries()
@@ -2702,36 +2714,48 @@ class InboxTreePane(QWidget):
         self._reload_file_entries()
         QTimer.singleShot(0, self._sync_empty_overlay)
 
-    def refresh_content_responsive(self, worker_manager, *, on_pump=None) -> None:
-        """Reload explorer content; scan file grid on a worker while the UI event loop keeps running."""
-        from monostudio.ui_qt.ui_worker_loop import run_worker_blocking_ui
-
-        if on_pump is not None:
-            on_pump()
+    def refresh_content_responsive(self, worker_manager, *, on_done=None) -> None:
+        """Reload explorer content; scan file grid on a worker (main thread stays free)."""
         self._reload_fs_tree_root()
-        if on_pump is not None:
-            on_pump()
-        self._reload_file_entries_responsive(worker_manager, run_worker_blocking_ui, on_pump=on_pump)
-        QTimer.singleShot(0, self._sync_empty_overlay)
+        self._reload_file_entries_responsive(worker_manager, on_done=on_done)
 
-    def _reload_file_entries_responsive(self, worker_manager, run_blocking_ui, *, on_pump=None) -> None:
+    def _reload_file_entries_responsive(self, worker_manager, *, on_done=None) -> None:
+        from monostudio.ui_qt.ui_worker_loop import run_worker_async
+
         if self._file_model is None:
+            if on_done is not None:
+                on_done()
             return
         root = self._grid_browse_root_path()
-        entries, error = run_blocking_ui(
+        sort_field, sort_asc = self._explorer_sort_params()
+
+        def _load():
+            return self._sorted_file_entries(
+                self._collect_unsorted_file_entries(root),
+                field=sort_field,
+                ascending=sort_asc,
+                use_toolbar=False,
+            )
+
+        def _on_result(entries, error) -> None:
+            if error:
+                _log_ref.warning("explorer file entries failed: %s", error)
+                entries = []
+            self._file_model.set_entries(entries or [])
+            self._sync_content_toolbar()
+            if self._view_mode == "tile":
+                self._grid_last = None
+                self._schedule_file_grid_sync()
+            QTimer.singleShot(0, self._sync_empty_overlay)
+            if on_done is not None:
+                on_done()
+
+        run_worker_async(
             worker_manager,
             f"explorer_entries_{id(self)}",
-            lambda: self._file_entries_for_browse_root(root),
-            on_pump=on_pump,
+            _load,
+            on_result=_on_result,
         )
-        if error:
-            _log_ref.warning("explorer file entries failed: %s", error)
-            entries = []
-        self._file_model.set_entries(entries or [])
-        self._sync_content_toolbar()
-        if self._view_mode == "tile":
-            self._grid_last = None
-            self._schedule_file_grid_sync()
 
     def select_dropped_paths(self, paths: list[Path]) -> None:
         """Reveal and multi-select items in the tree after a drop (deferred until model reload)."""
@@ -3226,15 +3250,11 @@ class ProjectGuideTreePane(InboxTreePane):
         self._sync_tree_to_browse_root()
         QTimer.singleShot(0, self._sync_empty_overlay)
 
-    def refresh_content_responsive(self, worker_manager, *, on_pump=None) -> None:
-        from monostudio.ui_qt.ui_worker_loop import run_worker_blocking_ui
-
+    def refresh_content_responsive(self, worker_manager, *, on_done=None) -> None:
         proxy = getattr(self, "_tag_proxy", None)
         if proxy is None:
-            super().refresh_content_responsive(worker_manager, on_pump=on_pump)
+            super().refresh_content_responsive(worker_manager, on_done=on_done)
             return
-        if on_pump is not None:
-            on_pump()
         root = self._date_folder_path
         proxy.set_tree_root_path(root)
         if root and root.is_dir():
@@ -3251,11 +3271,19 @@ class ProjectGuideTreePane(InboxTreePane):
             empty = proxy.mapFromSource(self._fs_model.index(""))
             if empty.isValid():
                 self._tree.setRootIndex(empty)
-        if on_pump is not None:
-            on_pump()
-        self._reload_file_entries_responsive(worker_manager, run_worker_blocking_ui, on_pump=on_pump)
+        self._reload_file_entries_responsive(worker_manager, on_done=on_done)
         self._sync_tree_to_browse_root()
-        QTimer.singleShot(0, self._sync_empty_overlay)
+
+    def _collect_unsorted_file_entries(self, root: Path) -> list[_InboxFileEntry]:
+        if not self._tag_proxy or not self._tag_proxy._active_tags or not self._pg_guide_root:
+            return _collect_inbox_file_entries(root)
+        tagged = self._tag_proxy._tagged_paths if self._tag_proxy else set()
+        if not tagged:
+            return []
+        return _collect_tag_filtered_file_entries(root, self._pg_guide_root, tagged)
+
+    def _file_entries_for_browse_root(self, root: Path) -> list[_InboxFileEntry]:
+        return self._sorted_file_entries(self._collect_unsorted_file_entries(root))
 
     def _sync_empty_overlay(self) -> None:
         if self._tag_proxy is not None and self._tag_proxy._active_tags:
@@ -3318,16 +3346,6 @@ class ProjectGuideTreePane(InboxTreePane):
         except (ValueError, OSError):
             return []
         return get_tags_for_item(self._item_tags, rel)
-
-    def _file_entries_for_browse_root(self, root: Path) -> list[_InboxFileEntry]:
-        if not self._tag_proxy or not self._tag_proxy._active_tags or not self._pg_guide_root:
-            return self._sorted_file_entries(_collect_inbox_file_entries(root))
-        tagged = self._tag_proxy._tagged_paths if self._tag_proxy else set()
-        if not tagged:
-            return []
-        return self._sorted_file_entries(
-            _collect_tag_filtered_file_entries(root, self._pg_guide_root, tagged)
-        )
 
     def set_tag_data(self, item_tags: dict[str, list[str]]) -> None:
         self._item_tags = item_tags

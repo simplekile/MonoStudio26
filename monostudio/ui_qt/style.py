@@ -3457,6 +3457,13 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #a1a1aa;
             font-size: 11px;
         }
+        /* Paste Work File confirm — mono path rows (color via RichText spans) */
+        QLabel#PasteWorkFileFrom,
+        QLabel#PasteWorkFileInto {
+            font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
+            font-size: 13px;
+            font-weight: 500;
+        }
         /* Video preview — BG tiers (light → dark):
            L4 chrome #1e2124  header, transport, tools body
            L3 panel  #18181b  shell, timeline strip

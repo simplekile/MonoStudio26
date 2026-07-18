@@ -615,6 +615,8 @@ def _clear_layout(layout) -> None:
         item = layout.takeAt(0)
         w = item.widget()
         if w is not None:
+            # Hide before orphaning — setParent(None) would otherwise flash a top-level window.
+            w.hide()
             w.setParent(None)
             w.deleteLater()
         else:

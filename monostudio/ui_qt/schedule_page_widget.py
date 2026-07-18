@@ -748,11 +748,9 @@ class SchedulePageWidget(QWidget):
         project_index: ProjectIndex | None,
         worker_manager,
         *,
-        on_pump=None,
         on_done=None,
     ) -> None:
         """Refresh timeline off the UI thread; call *on_done* when gantt data is applied."""
-        del on_pump  # async path keeps the main event loop free; strip animates on its own timer
         self._project_index = project_index
         if self._project_root is None:
             self.refresh(project_index)

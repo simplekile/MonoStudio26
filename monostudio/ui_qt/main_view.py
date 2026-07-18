@@ -8129,6 +8129,41 @@ class MainView(QWidget):
             break
         return None
 
+    def _resolve_paste_destination_path(
+        self,
+        item: ViewItem,
+        *,
+        department: str,
+        dcc_id: str,
+        src: Path,
+    ) -> Path | None:
+        """Next version path for a paste into item/department/dcc. Does not create folders."""
+        if not isinstance(item.ref, (Asset, Shot)) or not getattr(self, "_project_root", None):
+            return None
+        dep_norm = (department or "").strip().casefold()
+        dept_obj = None
+        for d in getattr(item.ref, "departments", ()) or ():
+            if (d.name or "").strip().casefold() == dep_norm:
+                dept_obj = d
+                break
+        if dept_obj is None:
+            return None
+        did = (dcc_id or "").strip()
+        if not did:
+            return None
+        dept_key = (dept_obj.name or "").strip() or (department or "").strip()
+        try:
+            reg = get_default_dcc_registry()
+            use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
+            dst_work = resolve_work_path(dept_obj.path, did, use_dcc_folders, reg)
+            prefix = work_file_prefix(
+                name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
+                department=dept_key,
+            )
+            return _next_workfile_version_path(dst_work, prefix, did, src.suffix)
+        except Exception:
+            return None
+
     def _perform_paste_work_file(
         self,
         item: ViewItem,
@@ -8138,38 +8173,50 @@ class MainView(QWidget):
         src: Path,
     ) -> bool:
         """Copy src into the resolved work folder as the next version. Returns False on failure."""
-        if not isinstance(item.ref, (Asset, Shot)) or not getattr(self, "_project_root", None):
-            return False
-        dep_norm = (department or "").strip().casefold()
-        dept_obj = None
-        for d in getattr(item.ref, "departments", ()) or ():
-            if (d.name or "").strip().casefold() == dep_norm:
-                dept_obj = d
-                break
-        if dept_obj is None:
-            _dcc_debug_log.warning("paste work file: no department %r on item %r", department, getattr(item.ref, "path", None))
-            return False
-        did = (dcc_id or "").strip()
-        if not did:
-            return False
-        dept_key = (dept_obj.name or "").strip() or (department or "").strip()
-        try:
-            reg = get_default_dcc_registry()
-            use_dcc_folders = read_use_dcc_folders(Path(self._project_root))
-            dst_work = resolve_work_path(dept_obj.path, did, use_dcc_folders, reg)
-            dst_work.mkdir(parents=True, exist_ok=True)
-            prefix = work_file_prefix(
-                name=getattr(item.ref, "name", None) or (item.ref.path.name if item.ref.path else ""),
-                department=dept_key,
+        dst_path = self._resolve_paste_destination_path(
+            item, department=department, dcc_id=dcc_id, src=src
+        )
+        if dst_path is None:
+            _dcc_debug_log.warning(
+                "paste work file: could not resolve destination for department %r dcc %r on item %r",
+                department,
+                dcc_id,
+                getattr(getattr(item, "ref", None), "path", None),
             )
-            dst_path = _next_workfile_version_path(dst_work, prefix, did, src.suffix)
+            return False
+        try:
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst_path)
             self.refresh_requested.emit()
             return True
         except Exception:
-            _dcc_debug_log.exception("paste work file failed (dst_work would be under department %r, dcc %r)", department, did)
+            _dcc_debug_log.exception(
+                "paste work file failed (dst_work would be under department %r, dcc %r)",
+                department,
+                dcc_id,
+            )
             return False
 
+    def _confirm_paste_work_file(
+        self,
+        item: ViewItem,
+        *,
+        department: str,
+        dcc_id: str,
+        src: Path,
+    ) -> bool:
+        """Ask user to confirm paste; returns True if they chose Paste."""
+        from monostudio.ui_qt.paste_work_file_confirm_dialog import ask_paste_work_file
+
+        dst_path = self._resolve_paste_destination_path(
+            item, department=department, dcc_id=dcc_id, src=src
+        )
+        destination_name = dst_path.name if dst_path is not None else "(unknown)"
+        return ask_paste_work_file(
+            self,
+            source_name=src.name if isinstance(src, Path) else str(src),
+            destination_name=destination_name,
+        )
     def _dismiss_hint_popup(self, lbl: QLabel) -> None:
         try:
             lbl.hide()
@@ -8183,6 +8230,37 @@ class MainView(QWidget):
         color = MONOS_COLORS.get("text_muted", "#52525b") if dim else MONOS_COLORS["text_label"]
         return lucide_icon(name, size=16, color_hex=color)
 
+    def _icon_for_dcc_id(self, dcc_id: str | None, *, fallback: str = "folder-open", dim: bool = False) -> QIcon:
+        """Brand icon for a DCC id; lucide fallback when unknown."""
+        color = MONOS_COLORS.get("text_muted", "#52525b") if dim else MONOS_COLORS["text_label"]
+        did = (dcc_id or "").strip()
+        if did:
+            try:
+                info = get_default_dcc_registry().get_dcc_info(did) or {}
+            except Exception:
+                info = {}
+            if isinstance(info, dict):
+                slug = info.get("brand_icon_slug")
+                brand_color = info.get("brand_color_hex")
+                if isinstance(slug, str) and slug.strip():
+                    return brand_icon(
+                        slug.strip(),
+                        size=16,
+                        color_hex=(brand_color if isinstance(brand_color, str) else None),
+                    )
+        return lucide_icon(fallback, size=16, color_hex=color)
+
+    def _icon_for_work_file_clipboard(self) -> QIcon:
+        """Icon for Paste Work File: brand of the copied DCC, else clipboard-paste."""
+        clip = getattr(self, "_work_file_clipboard", None)
+        dcc_id = clip.get("dcc_id") if isinstance(clip, dict) else None
+        has_clip = isinstance(clip, dict) and isinstance(dcc_id, str) and bool(dcc_id.strip())
+        return self._icon_for_dcc_id(
+            dcc_id if isinstance(dcc_id, str) else None,
+            fallback="clipboard-paste",
+            dim=not has_clip,
+        )
+
     def _resolve_item_open_dcc_icon(
         self,
         item: ViewItem,
@@ -8190,7 +8268,6 @@ class MainView(QWidget):
         has_dept_filter: bool,
         active_dcc: str | None,
     ) -> QIcon:
-        _dim = MONOS_COLORS.get("text_muted", "#52525b")
         if not active_dcc and has_dept_filter and getattr(item.ref, "departments", None):
             for d in item.ref.departments:
                 if (d.name or "").strip().casefold() == (self._active_department or "").strip().casefold():
@@ -8199,13 +8276,11 @@ class MainView(QWidget):
                             (d.work_file_dccs[0].strip() if d.work_file_dccs else None)
                         )
                     break
-        reg = get_default_dcc_registry()
-        info = reg.get_dcc_info(active_dcc) if active_dcc else {}
-        slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
-        color = info.get("brand_color_hex") if isinstance(info, dict) else None
-        if isinstance(slug, str) and slug.strip():
-            return brand_icon(slug.strip(), size=16, color_hex=(color if isinstance(color, str) else None))
-        return lucide_icon("folder-open", size=16, color_hex=MONOS_COLORS["text_label"] if has_dept_filter else _dim)
+        return self._icon_for_dcc_id(
+            active_dcc,
+            fallback="folder-open",
+            dim=not has_dept_filter,
+        )
 
     def _list_older_work_versions(
         self,
@@ -8266,17 +8341,10 @@ class MainView(QWidget):
             reg = get_default_dcc_registry()
             info = reg.get_dcc_info(dcc_id)
             dcc_label = info.get("label", dcc_id) if isinstance(info, dict) else dcc_id
-            slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
-            color = info.get("brand_color_hex") if isinstance(info, dict) else None
         except Exception:
             dcc_label = dcc_id
-            slug = None
-            color = None
 
-        if isinstance(slug, str) and slug.strip():
-            dcc_icon = brand_icon(slug.strip(), size=16, color_hex=(color if isinstance(color, str) else None))
-        else:
-            dcc_icon = lucide_icon("layers", size=16, color_hex=MONOS_COLORS["text_label"])
+        dcc_icon = self._icon_for_dcc_id(dcc_id, fallback="layers")
 
         menu = QMenu(self)
         # — Open / versions —
@@ -8297,7 +8365,7 @@ class MainView(QWidget):
             f"Copy {dcc_label} Work Path",
         )
         copy_file_act = menu.addAction(dcc_icon, f"Copy {dcc_label} Work File")
-        paste_file_act = menu.addAction(dcc_icon, f"Paste {dcc_label} Work File")
+        paste_file_act = menu.addAction(self._icon_for_work_file_clipboard(), f"Paste {dcc_label} Work File")
         if not getattr(self, "_work_file_clipboard", None):
             paste_file_act.setEnabled(False)
             paste_file_act.setToolTip("No copied work file yet.")
@@ -8349,6 +8417,8 @@ class MainView(QWidget):
             if isinstance(clip, dict):
                 src = clip.get("path")
                 if isinstance(src, Path) and src.is_file():
+                    if not self._confirm_paste_work_file(item, department=department, dcc_id=dcc_id, src=src):
+                        return
                     if not self._perform_paste_work_file(item, department=department, dcc_id=dcc_id, src=src):
                         self._notify_transient_hint("Could not paste work file (check department path and permissions).")
                 else:
@@ -8530,7 +8600,7 @@ class MainView(QWidget):
             # — Work file clipboard —
             if has_dept_filter:
                 copy_work_file = menu.addAction(open_icon, "Copy Work File")
-                paste_work_file = menu.addAction(open_icon, "Paste Work File")
+                paste_work_file = menu.addAction(self._icon_for_work_file_clipboard(), "Paste Work File")
                 if not _has_work:
                     copy_work_file.setEnabled(False)
                     copy_work_file.setToolTip("No work file in this department.")
@@ -8708,6 +8778,8 @@ class MainView(QWidget):
                 self._notify_transient_hint(
                     "Could not determine DCC for paste. Copy a work file first, or use Open With on this asset."
                 )
+                return
+            if not self._confirm_paste_work_file(item, department=dep, dcc_id=paste_dcc, src=src):
                 return
             if not self._perform_paste_work_file(item, department=dep, dcc_id=paste_dcc, src=src):
                 self._notify_transient_hint("Could not paste work file (check department path and permissions).")

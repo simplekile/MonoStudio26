@@ -5047,11 +5047,17 @@ class MainWindow(FramelessMainWindow):
                 self._raise_page_loading_if_visible()
                 self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
-                self._refresh_tree_pane_responsive(
-                    self._inbox_page_widget._tree_pane if self._inbox_page_widget is not None else None
+                deferred_finish = True
+                self._defer_tree_page_refresh(
+                    context_name,
+                    own_page_loading,
+                    self._inbox_page_widget._tree_pane if self._inbox_page_widget is not None else None,
+                    restore_fn=(
+                        None
+                        if pending_tree_page == "Inbox"
+                        else self._restore_inbox_date_folder_state
+                    ),
                 )
-                if pending_tree_page != "Inbox":
-                    self._restore_inbox_date_folder_state()
             elif context_name == "Project Guide":
                 self._sync_filter_state_from_sidebar()
                 if self._reference_page_widget is None:
@@ -5084,12 +5090,18 @@ class MainWindow(FramelessMainWindow):
                 self._update_reference_tag_badge()
                 self._content_stack.setCurrentWidget(self._reference_page_widget)
                 self._raise_page_loading_if_visible()
-                self._refresh_tree_pane_responsive(
-                    self._reference_page_widget._tree_pane if self._reference_page_widget is not None else None
-                )
-                if pending_tree_page != "Project Guide":
-                    self._restore_project_guide_browse_state()
                 self._inspector.set_inbox_tree_preview(None)
+                deferred_finish = True
+                self._defer_tree_page_refresh(
+                    context_name,
+                    own_page_loading,
+                    self._reference_page_widget._tree_pane if self._reference_page_widget is not None else None,
+                    restore_fn=(
+                        None
+                        if pending_tree_page == "Project Guide"
+                        else self._restore_project_guide_browse_state
+                    ),
+                )
             elif context_name == SidebarContext.INTERNAL_CHECK.value:
                 self._sync_filter_state_from_sidebar()
                 self._inbox_switch_cooldown = True
@@ -5117,13 +5129,19 @@ class MainWindow(FramelessMainWindow):
                 self._raise_page_loading_if_visible()
                 self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
-                self._refresh_tree_pane_responsive(
+                deferred_finish = True
+                self._defer_tree_page_refresh(
+                    context_name,
+                    own_page_loading,
                     self._internal_check_page_widget._tree_pane
                     if self._internal_check_page_widget is not None
-                    else None
+                    else None,
+                    restore_fn=(
+                        None
+                        if pending_tree_page == "Internal check"
+                        else self._restore_internal_check_date_folder_state
+                    ),
                 )
-                if pending_tree_page != "Internal check":
-                    self._restore_internal_check_date_folder_state()
             elif context_name == "Delivery":
                 self._sync_filter_state_from_sidebar()
                 self._inbox_switch_cooldown = True
@@ -5149,11 +5167,17 @@ class MainWindow(FramelessMainWindow):
                 self._raise_page_loading_if_visible()
                 self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
-                self._refresh_tree_pane_responsive(
-                    self._outbox_page_widget._tree_pane if self._outbox_page_widget is not None else None
+                deferred_finish = True
+                self._defer_tree_page_refresh(
+                    context_name,
+                    own_page_loading,
+                    self._outbox_page_widget._tree_pane if self._outbox_page_widget is not None else None,
+                    restore_fn=(
+                        None
+                        if pending_tree_page == "Delivery"
+                        else self._restore_outbox_date_folder_state
+                    ),
                 )
-                if pending_tree_page != "Delivery":
-                    self._restore_outbox_date_folder_state()
             elif context_name == "Outbox":
                 self._apply_context_switch_content("Delivery", own_page_loading)
                 return
@@ -5169,11 +5193,23 @@ class MainWindow(FramelessMainWindow):
                 self._raise_page_loading_if_visible()
                 self._inspector.set_inbox_distribute_paths([], None, None)
                 self._inspector.set_inbox_tree_preview(None)
+                deferred_finish = True
+                switch_gen = self._page_switch_generation
+
+                def _trash_switch_done(
+                    own=own_page_loading,
+                    ctx=context_name,
+                    gen=switch_gen,
+                ) -> None:
+                    self._finish_deferred_tree_page_switch(ctx, own, gen)
+
                 if self._trash_page_widget is not None:
                     self._trash_page_widget.refresh_responsive(
                         self._worker_manager,
-                        on_pump=self._tick_page_loading_animation,
+                        on_done=_trash_switch_done,
                     )
+                else:
+                    _trash_switch_done()
             elif context_name == "Dashboard":
                 self._sync_filter_state_from_sidebar()
                 if self._dashboard_page_widget is None:
@@ -5209,9 +5245,9 @@ class MainWindow(FramelessMainWindow):
                         Qt.ConnectionType.UniqueConnection,
                     )
                     self._content_stack.addWidget(self._dashboard_page_widget)
-                self._tick_page_loading_animation()
+                # Refresh while still off-stack / before show so _clear_layout cannot
+                # briefly promote list rows into top-level windows.
                 self._refresh_dashboard_page()
-                self._tick_page_loading_animation()
                 self._content_stack.setCurrentWidget(self._dashboard_page_widget)
                 self._raise_page_loading_if_visible()
                 self._inspector.set_inbox_distribute_paths([], None, None)
@@ -5894,13 +5930,25 @@ class MainWindow(FramelessMainWindow):
                     self._defer_pipeline_browser_reload(context_name, own_page_loading)
             elif context_name == "Inbox":
                 self._sync_filter_state_from_sidebar()
-                self._reload_main_view()
+                if self._inbox_page_widget is not None:
+                    deferred_finish = True
+                    self._defer_tree_page_refresh(
+                        context_name,
+                        own_page_loading,
+                        self._inbox_page_widget._tree_pane,
+                    )
             elif context_name == "Outbox":
                 self._sync_filter_state_from_sidebar()
                 self._reload_main_view()
             elif context_name == "Delivery":
                 self._sync_filter_state_from_sidebar()
-                self._reload_main_view()
+                if self._outbox_page_widget is not None:
+                    deferred_finish = True
+                    self._defer_tree_page_refresh(
+                        context_name,
+                        own_page_loading,
+                        self._outbox_page_widget._tree_pane,
+                    )
             elif context_name == "Project Guide":
                 self._sync_filter_state_from_sidebar()
                 if self._reference_page_widget is not None:
@@ -5908,14 +5956,25 @@ class MainWindow(FramelessMainWindow):
                     self._reference_page_widget.set_department(
                         self._filter_panel.filters().current_department() or "reference"
                     )
-                    self._refresh_tree_pane_responsive(self._reference_page_widget._tree_pane)
+                    deferred_finish = True
+                    self._defer_tree_page_refresh(
+                        context_name,
+                        own_page_loading,
+                        self._reference_page_widget._tree_pane,
+                    )
             elif context_name == "Trash":
                 self._sync_filter_state_from_sidebar()
                 if self._trash_page_widget is not None:
                     self._trash_page_widget.set_project_root(self._project_root, refresh=False)
+                    deferred_finish = True
+                    switch_gen = self._page_switch_generation
+
+                    def _trash_click_done(own=own_page_loading, gen=switch_gen) -> None:
+                        self._finish_deferred_tree_page_switch("Trash", own, gen)
+
                     self._trash_page_widget.refresh_responsive(
                         self._worker_manager,
-                        on_pump=self._tick_page_loading_animation,
+                        on_done=_trash_click_done,
                     )
             else:
                 self._main_view.clear()
@@ -6340,6 +6399,29 @@ class MainWindow(FramelessMainWindow):
                 self._filter_panel.set_project_index(self._project_index)
                 # So new assets/shots (e.g. just created) get their paths watched
                 self._update_fs_watcher_paths()
+            # Work/preview sequence changes often arrive via batchReady → incremental_scan,
+            # not metaThumbnailsStale. Soft-revalidate (mtime fingerprint) so grid picks up
+            # new frames without a full Refresh; skip blind cache clear to avoid thrash on every DCC save.
+            _thumb_entities: list[str] = []
+            for raw in list(requested_asset_ids or []) + list(requested_shot_ids or []):
+                if isinstance(raw, str) and raw.strip():
+                    _thumb_entities.append(raw.strip())
+            for a in new_assets or []:
+                if isinstance(a, Asset):
+                    _thumb_entities.append(str(a.path))
+            for s in new_shots or []:
+                if isinstance(s, Shot):
+                    _thumb_entities.append(str(s.path))
+            seen_ep: set[str] = set()
+            for ep in _thumb_entities:
+                if ep in seen_ep:
+                    continue
+                seen_ep.add(ep)
+            if seen_ep:
+                try:
+                    self._main_view.refresh_thumbnails_for(list(seen_ep))
+                except Exception:
+                    pass
             # Grid already updated via assetsChanged/shotsChanged from commit_immediate(); full reload would clear+repopulate and cause flicker.
             ctx = self._nav_rail.current_context()
             if ctx not in ("Assets", "Shots", "Trash"):
@@ -6348,6 +6430,12 @@ class MainWindow(FramelessMainWindow):
                 self._main_view.repaint_tile_and_list_views()
                 try:
                     self._inspector.refresh_last_modified_display()
+                except Exception:
+                    pass
+                try:
+                    cur = self._main_view.selected_view_item()
+                    if cur is not None and str(cur.path) in seen_ep:
+                        self._inspector.revalidate_thumbnail_for_current()
                 except Exception:
                     pass
 
@@ -6483,12 +6571,53 @@ class MainWindow(FramelessMainWindow):
         finally:
             self._end_deferred_context_switch(own_page_loading)
 
-    def _refresh_tree_pane_responsive(self, pane) -> None:
+    def _refresh_tree_pane_responsive(self, pane, *, on_done=None) -> None:
         if pane is not None and hasattr(pane, "refresh_content_responsive"):
-            pane.refresh_content_responsive(
-                self._worker_manager,
-                on_pump=self._tick_page_loading_animation,
-            )
+            pane.refresh_content_responsive(self._worker_manager, on_done=on_done)
+        elif on_done is not None:
+            on_done()
+
+    def _finish_deferred_tree_page_switch(
+        self,
+        context_name: str,
+        own_page_loading: bool,
+        switch_gen: int,
+        *,
+        restore_fn=None,
+    ) -> None:
+        if self._page_switch_stale(switch_gen):
+            self._end_deferred_context_switch(own_page_loading)
+            return
+        if restore_fn is not None:
+            restore_fn()
+        self._sync_primary_action()
+        self._sync_filter_state_from_sidebar()
+        self._active_nav_context = context_name
+        self._end_deferred_context_switch(own_page_loading)
+        if (
+            self._pending_tree_deep_link is not None
+            and self._pending_tree_deep_link[0] == context_name
+        ):
+            self._consume_pending_tree_deep_link()
+
+    def _defer_tree_page_refresh(
+        self,
+        context_name: str,
+        own_page_loading: bool,
+        pane,
+        *,
+        restore_fn=None,
+    ) -> None:
+        switch_gen = self._page_switch_generation
+        self._refresh_tree_pane_responsive(
+            pane,
+            on_done=lambda: self._finish_deferred_tree_page_switch(
+                context_name,
+                own_page_loading,
+                switch_gen,
+                restore_fn=restore_fn,
+            ),
+        )
 
     def _handle_project_load_failed(self, failed_path: str, error: str, *, save: bool) -> None:
         logging.error("Failed to load project at %s: %s", failed_path, error)
@@ -6518,7 +6647,6 @@ class MainWindow(FramelessMainWindow):
         )
 
     def _complete_project_load(self, index: ProjectIndex) -> None:
-        self._hide_page_loading()
         self._project_index = index
         self._entered_parent = None
         self._app_state.update_assets(list(index.assets))
@@ -6526,10 +6654,13 @@ class MainWindow(FramelessMainWindow):
         self._app_state.commit_immediate()
         self._filter_panel.set_project_index(index)
         self._update_fs_watcher_paths()
-        self._reload_main_view()
+        self._inspector.set_item(None)
+        self._reload_main_view_async(on_ready=self._finish_project_load_ui)
+
+    def _finish_project_load_ui(self) -> None:
+        self._hide_page_loading()
         self._refresh_schedule_cache()
         self._sync_user_inbox_alerts()
-        self._inspector.set_item(None)
         self._refresh_recent_tasks()
         self._sync_primary_action()
         self._sync_top_bar()
@@ -7510,9 +7641,8 @@ class MainWindow(FramelessMainWindow):
         if on_ready is not None:
             on_ready()
 
-    def _reload_main_view_responsive(self, *, on_pump=None) -> None:
-        del on_pump
-        self._reload_main_view_async()
+    def _reload_main_view_responsive(self, *, on_done=None) -> None:
+        self._reload_main_view_async(on_ready=on_done)
 
     def _apply_main_view_items(self, context: str, items: list[ViewItem]) -> None:
         if self._project_root is not None:

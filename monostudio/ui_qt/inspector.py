@@ -102,6 +102,7 @@ from monostudio.ui_qt.thumbnails import (
     is_video_preview_path,
     media_source_max_side,
     resolve_thumbnail_path,
+    thumb_source_fingerprint,
 )
 from monostudio.ui_qt.thumbnail_source_resolve import (
     primary_work_file_for_department,
@@ -1101,6 +1102,22 @@ class InspectorPanel(QWidget):
         # Best-effort; safe no-op if nothing selected.
         try:
             self._preview.refresh_thumbnail()
+        except Exception:
+            pass
+
+    def drop_preview_thumb_cache_for_item(self, item_path: Path) -> None:
+        """Drop inspector RAM preview cache for one entity (e.g. after incremental scan)."""
+        try:
+            self._preview.drop_preview_thumb_cache_for_item(item_path)
+        except Exception:
+            pass
+
+    def revalidate_thumbnail_for_current(self) -> None:
+        """Reload preview only if source fingerprint changed (no forced cache drop)."""
+        if self._current_item is None:
+            return
+        try:
+            self._preview.update_thumbnail_only()
         except Exception:
             pass
 
@@ -2589,7 +2606,7 @@ class _InspectorPreview(QWidget):
         self._worker_manager: object | None = None
         self._active_department: str | None = None
         self._item: ViewItem | None = None
-        self._preview_thumb_cache: OrderedDict[str, tuple[QPixmap, bool]] = OrderedDict()
+        self._preview_thumb_cache: OrderedDict[str, tuple[QPixmap | None, bool, str]] = OrderedDict()
         self._qsettings: QSettings | None = None
         self._sequence_folder: Path | None = None
         self._sequence_frames: list[Path] = []
@@ -2760,6 +2777,76 @@ class _InspectorPreview(QWidget):
         ]
         for k in dead:
             self._preview_thumb_cache.pop(k, None)
+
+    def _unpack_preview_cache_entry(
+        self, entry: object
+    ) -> tuple[QPixmap | None, bool, str]:
+        if isinstance(entry, tuple) and len(entry) == 3:
+            pix, fit, fp = entry
+            return (pix if isinstance(pix, QPixmap) or pix is None else None, bool(fit), str(fp or ""))
+        if isinstance(entry, tuple) and len(entry) == 2:
+            pix, fit = entry
+            return (pix if isinstance(pix, QPixmap) or pix is None else None, bool(fit), "")
+        return (None, False, "")
+
+    def _preview_source_fingerprint_for_item(
+        self,
+        item: ViewItem,
+        *,
+        active_dcc_hint: str | None = None,
+        is_inbox: bool | None = None,
+    ) -> str:
+        """Resolved source path + mtimes; must match what the preview worker would load."""
+        inbox = item.kind == ViewItemKind.INBOX_ITEM if is_inbox is None else is_inbox
+        if inbox:
+            return thumb_source_fingerprint(item.path if item.path.is_file() else None)
+        mode = self._inspector_thumb_source_mode()
+        wp, wf = self._work_paths_for_preview_item(item, active_dcc_hint=active_dcc_hint)
+        ign_ext = get_thumbnail_sequence_ignore_extensions(self._qsettings)
+        ign_tok = get_thumbnail_sequence_ignore_tokens(self._qsettings)
+        src = resolve_entity_thumbnail_source_path(
+            item.path,
+            self._active_department,
+            mode,
+            wp,
+            wf,
+            sequence_ignore_extensions=ign_ext,
+            sequence_ignore_name_tokens=ign_tok,
+        )
+        return thumb_source_fingerprint(src)
+
+    def _preview_cache_entry_is_fresh(
+        self,
+        cache_key: str,
+        item: ViewItem,
+        *,
+        active_dcc_hint: str | None = None,
+        is_inbox: bool | None = None,
+    ) -> tuple[bool, QPixmap | None, bool]:
+        """Return (fresh, pixmap, use_fit). Drops stale entries."""
+        if cache_key not in self._preview_thumb_cache:
+            return (False, None, False)
+        pix, fit, cached_fp = self._unpack_preview_cache_entry(self._preview_thumb_cache[cache_key])
+        live_fp = self._preview_source_fingerprint_for_item(
+            item, active_dcc_hint=active_dcc_hint, is_inbox=is_inbox
+        )
+        if cached_fp and live_fp == cached_fp:
+            self._preview_thumb_cache.move_to_end(cache_key)
+            return (True, pix, fit)
+        self._preview_thumb_cache.pop(cache_key, None)
+        return (False, None, False)
+
+    def _bust_grid_thumb_for_current_item(self) -> None:
+        """When inspector static preview is stale, also drop main-view ThumbnailManager entry."""
+        item = self._item
+        if item is None:
+            return
+        mgr = getattr(self, "_thumbnail_manager", None)
+        if mgr is not None and hasattr(mgr, "invalidate"):
+            try:
+                mgr.invalidate(str(item.path), department=self._active_department)
+            except Exception:
+                pass
 
     def _work_paths_for_preview_item(
         self,
@@ -3103,13 +3190,16 @@ class _InspectorPreview(QWidget):
         if item is None:
             return
         ck = self._preview_cache_key(item.path)
-        t = self._preview_thumb_cache.get(ck)
-        if t is not None:
-            pix, uf = t
+        fresh, pix, uf = self._preview_cache_entry_is_fresh(ck, item)
+        if fresh:
             if pix is not None and not pix.isNull():
                 w.set_pixmap(pix, use_fit=uf)
                 self._seq_live_display = False
                 return
+            return
+        # Stale or missing — reload static preview (play bypassed this cache).
+        self._bust_grid_thumb_for_current_item()
+        self.update_thumbnail_only()
 
     def _ensure_inspector_seq_pool(self) -> None:
         if self._seq_pool is None:
@@ -3451,7 +3541,8 @@ class _InspectorPreview(QWidget):
             self._seq_live_display = False
         while len(self._preview_thumb_cache) >= self._PREVIEW_CACHE_MAX:
             self._preview_thumb_cache.popitem(last=False)
-        self._preview_thumb_cache[cache_key] = (pix, use_fit)
+        fp = self._preview_source_fingerprint_for_item(item)
+        self._preview_thumb_cache[cache_key] = (pix, use_fit, fp)
         self._preview_thumb_cache.move_to_end(cache_key)
         self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
         self._sync_thumbnail_overlay_mode()
@@ -3524,10 +3615,10 @@ class _InspectorPreview(QWidget):
             self.load_inbox_item_preview()
             return
 
-        # Đã load rồi thì dùng cache, không load lại
-        if cache_key in self._preview_thumb_cache:
-            cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
-            self._preview_thumb_cache.move_to_end(cache_key)
+        # Đã load rồi thì dùng cache (revalidate fingerprint — play reads disk, static cache must not stick).
+        had_cached = cache_key in self._preview_thumb_cache
+        fresh, cached_pix, cached_fit = self._preview_cache_entry_is_fresh(cache_key, item)
+        if fresh:
             if cached_pix is not None and not cached_pix.isNull():
                 w.set_pixmap(cached_pix, use_fit=cached_fit)
                 self._seq_live_display = False
@@ -3539,6 +3630,9 @@ class _InspectorPreview(QWidget):
             self._apply_inspector_thumb_decode_failure(w, is_inbox=is_inbox, path=path)
             self._seq_live_display = False
             return
+        if had_cached:
+            # Dropped as stale — also refresh main-view tile cache.
+            self._bust_grid_thumb_for_current_item()
 
         if self._defer_thumb_decode_if_resizing():
             return
@@ -3631,21 +3725,24 @@ class _InspectorPreview(QWidget):
         mgr = self._worker_manager
 
         if cache_key in self._preview_thumb_cache:
-            cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
-            self._preview_thumb_cache.move_to_end(cache_key)
-            if cached_pix is not None and not cached_pix.isNull():
-                w.set_pixmap(cached_pix, use_fit=cached_fit)
-                w.set_unreadable_preview("", "")
-                self._seq_live_display = False
-                self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
+            fresh, cached_pix, cached_fit = self._preview_cache_entry_is_fresh(
+                cache_key, item, is_inbox=True
+            )
+            if fresh:
+                w = self._container._w
+                if cached_pix is not None and not cached_pix.isNull():
+                    w.set_pixmap(cached_pix, use_fit=cached_fit)
+                    w.set_unreadable_preview("", "")
+                    self._seq_live_display = False
+                    self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
+                    self._sync_sequence_context_for_inspector_preview()
+                    self._sync_thumbnail_overlay_mode()
+                    return
                 self._sync_sequence_context_for_inspector_preview()
+                self._apply_inspector_thumb_decode_failure(w, is_inbox=True, path=path)
+                self._seq_live_display = False
                 self._sync_thumbnail_overlay_mode()
                 return
-            self._sync_sequence_context_for_inspector_preview()
-            self._apply_inspector_thumb_decode_failure(w, is_inbox=True, path=path)
-            self._seq_live_display = False
-            self._sync_thumbnail_overlay_mode()
-            return
 
         w.set_loading(True)
         self._sync_thumbnail_overlay_mode()
@@ -3719,21 +3816,26 @@ class _InspectorPreview(QWidget):
         ign_tok = get_thumbnail_sequence_ignore_tokens(self._qsettings)
 
         if cache_key in self._preview_thumb_cache:
-            cached_pix, cached_fit = self._preview_thumb_cache[cache_key]
-            self._preview_thumb_cache.move_to_end(cache_key)
-            w = self._container._w
-            if cached_pix is not None and not cached_pix.isNull():
-                w.set_pixmap(cached_pix, use_fit=cached_fit)
-                self._seq_live_display = False
-                self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
+            had_cached = True
+            fresh, cached_pix, cached_fit = self._preview_cache_entry_is_fresh(
+                cache_key, item, active_dcc_hint=active_dcc_hint
+            )
+            if fresh:
+                w = self._container._w
+                if cached_pix is not None and not cached_pix.isNull():
+                    w.set_pixmap(cached_pix, use_fit=cached_fit)
+                    self._seq_live_display = False
+                    self._thumb_decode_bucket = self._inspector_preview_decode_max_side()
+                    self._sync_sequence_context_for_inspector_preview()
+                    self._sync_thumbnail_overlay_mode()
+                    return
                 self._sync_sequence_context_for_inspector_preview()
+                self._apply_inspector_thumb_decode_failure(w, is_inbox=is_inbox, path=path)
+                self._seq_live_display = False
                 self._sync_thumbnail_overlay_mode()
                 return
-            self._sync_sequence_context_for_inspector_preview()
-            self._apply_inspector_thumb_decode_failure(w, is_inbox=is_inbox, path=path)
-            self._seq_live_display = False
-            self._sync_thumbnail_overlay_mode()
-            return
+            if had_cached:
+                self._bust_grid_thumb_for_current_item()
 
         if self._defer_thumb_decode_if_resizing():
             return

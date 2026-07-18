@@ -420,9 +420,9 @@ def get_default_pipeline_types_and_presets() -> PipelineTypesAndPresets:
     }
     default_types = {
         "shot": TypeDef("shot", "Shot", "sh", ["layout", "anim", "fx", "lighting"], "clapperboard"),
-        "character": TypeDef("character", "Character", "char", ["model", "rig", "surfacing", "grooming", "lookdev"], "user"),
-        "prop": TypeDef("prop", "Prop", "prop", ["model", "surfacing", "grooming", "lookdev"], "package"),
-        "environment": TypeDef("environment", "Environment", "env", ["layout", "model", "lookdev"], "trees"),
+        "character": TypeDef("character", "Character", "char", ["model", "rig", "surfacing", "grooming", "lookdev", "anim"], "user"),
+        "prop": TypeDef("prop", "Prop", "prop", ["model", "rig", "surfacing", "grooming", "lookdev", "anim"], "package"),
+        "environment": TypeDef("environment", "Environment", "env", ["layout", "model", "lookdev", "anim"], "trees"),
     }
     return PipelineTypesAndPresets(types=default_types, departments=default_depts)
 
@@ -470,21 +470,21 @@ def ensure_pipeline_bootstrap() -> None:
                 "name": "Character",
                 "short_name": "char",
                 "icon_name": "user",
-                "departments": ["model", "rig", "surfacing", "grooming", "lookdev"],
+                "departments": ["model", "rig", "surfacing", "grooming", "lookdev", "anim"],
             },
             "prop": {
                 "id": "prop",
                 "name": "Prop",
                 "short_name": "prop",
                 "icon_name": "package",
-                "departments": ["model", "surfacing", "grooming", "lookdev"],
+                "departments": ["model", "rig", "surfacing", "grooming", "lookdev", "anim"],
             },
             "environment": {
                 "id": "environment",
                 "name": "Environment",
                 "short_name": "env",
                 "icon_name": "trees",
-                "departments": ["layout", "model", "lookdev"],
+                "departments": ["layout", "model", "lookdev", "anim"],
             },
         }
     }

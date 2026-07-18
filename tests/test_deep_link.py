@@ -81,8 +81,39 @@ def test_resolve_entity_short_id_assets_shallow(tmp_path: Path) -> None:
     assert resolve_entity_short_id(tmp_path, "Assets", entity_path_short_id(nested_rel)) is None
 
 
+def test_resolve_entity_short_id_shots_flat(tmp_path: Path) -> None:
+    """Shots are direct children of the shots folder (not seq/shot)."""
+    shot = tmp_path / "shots" / "sh005"
+    (shot / "groom" / "work").mkdir(parents=True)
+    rel = "shots/sh005"
+    eid = entity_path_short_id(rel)
+    assert eid == "f334e27982"
+    found = resolve_entity_short_id(tmp_path, "Shots", eid)
+    assert found == rel
+    # Dept folder under the shot must not be matched as the entity
+    nested = "shots/sh005/groom"
+    assert resolve_entity_short_id(tmp_path, "Shots", entity_path_short_id(nested)) is None
+
+
+def test_resolve_entity_short_id_shots_custom_folder(tmp_path: Path) -> None:
+    """StructureRegistry may rename shots → 02_shots (mono2026 preset)."""
+    pipeline = tmp_path / ".monostudio" / "pipeline"
+    pipeline.mkdir(parents=True)
+    (pipeline / "structure.json").write_text(
+        '{"folders":{"shots":{"label":"Shots","folder":"02_shots"}}}',
+        encoding="utf-8",
+    )
+    shot = tmp_path / "02_shots" / "sh005"
+    shot.mkdir(parents=True)
+    rel = "02_shots/sh005"
+    eid = entity_path_short_id(rel)
+    assert eid == "3324aaf353"
+    found = resolve_entity_short_id(tmp_path, "Shots", eid)
+    assert found == rel
+
+
 def test_legacy_entity_path_flag() -> None:
-    rel = "shots/seq01/shot_010"
+    rel = "shots/sh005"
     url = build_open_deep_link("p", "Shots", entity=rel, legacy_entity_path=True)
     assert "entity=" in url
     parsed = parse_open_deep_link(url)

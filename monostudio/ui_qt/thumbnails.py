@@ -436,6 +436,34 @@ def resolve_thumbnail_path(item_root: Path, department: str | None = None) -> Pa
     return None
 
 
+def thumb_source_fingerprint(source: Path | None) -> str:
+    """
+    Cheap identity for a resolved thumbnail source file.
+
+    Includes file mtime and parent-dir mtime so overwritten frames and new
+    sequence files invalidate in-memory pixmap caches (ThumbnailManager / inspector).
+    """
+    if source is None:
+        return ""
+    try:
+        resolved = str(source.resolve())
+    except OSError:
+        resolved = str(source)
+    try:
+        st = source.stat()
+        file_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+    except OSError:
+        file_ns = -1
+    parent_ns = -1
+    try:
+        if source.is_file():
+            pst = source.parent.stat()
+            parent_ns = int(getattr(pst, "st_mtime_ns", int(pst.st_mtime * 1_000_000_000)))
+    except OSError:
+        pass
+    return f"{resolved}|{file_ns}|{parent_ns}"
+
+
 def make_department_cache_key(
     entity_path: str,
     department: str | None,
@@ -827,8 +855,11 @@ class ThumbnailManager(QObject):
         self._size_px = size_px
         self._max_memory = max(1, max_memory)
         self._settings = settings
-        self._cache: OrderedDict[str, QPixmap] = OrderedDict()
+        # cache_key -> (pixmap, source fingerprint, source path str)
+        self._cache: OrderedDict[str, tuple[QPixmap, str, str]] = OrderedDict()
         self._pending: set[str] = set()
+        # cache_key -> resolved source path while load is in flight (for fingerprint on finish).
+        self._pending_source: dict[str, str] = {}
         # Cache keys where resolve_grid_thumbnail_file returned no path, or worker decode failed — avoid prefetch spam.
         self._no_path_keys: set[str] = set()
         self._connect_worker()
@@ -874,16 +905,55 @@ class ThumbnailManager(QObject):
             thumb_scan_rules_sig=self._thumbnail_scan_rules_signature(),
         )
         if cache_key in self._cache:
-            self._cache.move_to_end(cache_key)
-            try:
-                from monostudio.ui_qt.stress_profiler import enabled, record_thumbnail_hit
-                if enabled():
-                    record_thumbnail_hit()
-            except Exception:
-                pass
-            return self._cache[cache_key]
+            entry = self._cache[cache_key]
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                pix = entry[0]
+                cached_fp = str(entry[1] or "")
+                cached_src = str(entry[2]) if len(entry) >= 3 else ""
+            else:
+                pix, cached_fp, cached_src = entry, "", ""  # type: ignore[misc]
+            # Fast path: re-stat the same source file (no sequence resolve).
+            if cached_src and cached_fp:
+                live_fp = thumb_source_fingerprint(Path(cached_src))
+                if live_fp == cached_fp:
+                    self._cache.move_to_end(cache_key)
+                    try:
+                        from monostudio.ui_qt.stress_profiler import enabled, record_thumbnail_hit
+                        if enabled():
+                            record_thumbnail_hit()
+                    except Exception:
+                        pass
+                    return pix
+            # Source mtime changed or path missing — full resolve (may pick a new representative frame).
+            live_fp = self._live_source_fingerprint(
+                str(asset_id).strip(),
+                department,
+                pipeline_ref=pipeline_ref,
+                active_dcc_id=active_dcc_id,
+            )
+            if cached_fp and live_fp == cached_fp:
+                self._cache.move_to_end(cache_key)
+                try:
+                    from monostudio.ui_qt.stress_profiler import enabled, record_thumbnail_hit
+                    if enabled():
+                        record_thumbnail_hit()
+                except Exception:
+                    pass
+                return pix
+            # Source changed on disk — drop and reload.
+            self._cache.pop(cache_key, None)
+            self._no_path_keys.discard(cache_key)
         if cache_key in self._no_path_keys:
-            return None
+            # Re-check: a source may have appeared since we recorded a miss.
+            live_fp = self._live_source_fingerprint(
+                str(asset_id).strip(),
+                department,
+                pipeline_ref=pipeline_ref,
+                active_dcc_id=active_dcc_id,
+            )
+            if not live_fp:
+                return None
+            self._no_path_keys.discard(cache_key)
         try:
             from monostudio.ui_qt.stress_profiler import enabled, record_thumbnail_miss
             if enabled():
@@ -900,6 +970,38 @@ class ThumbnailManager(QObject):
                 active_dcc_id=active_dcc_id,
             )
         return None
+
+    def _live_source_fingerprint(
+        self,
+        entity_path: str,
+        department: str | None,
+        *,
+        pipeline_ref: "Asset | Shot | None" = None,
+        active_dcc_id: str | None = None,
+    ) -> str:
+        from monostudio.core.models import Asset, Shot
+        from monostudio.ui_qt.inspector_preview_settings import (
+            THUMB_SOURCE_USER_THEN_RENDER,
+            read_inspector_thumbnail_source,
+        )
+        from monostudio.ui_qt.thumbnail_source_resolve import resolve_grid_thumbnail_file
+
+        if isinstance(pipeline_ref, Asset):
+            mode = read_inspector_thumbnail_source(self._settings, entity="asset")
+        elif isinstance(pipeline_ref, Shot):
+            mode = read_inspector_thumbnail_source(self._settings, entity="shot")
+        else:
+            mode = THUMB_SOURCE_USER_THEN_RENDER
+        path = resolve_grid_thumbnail_file(
+            Path(entity_path),
+            (department or "").strip() or None,
+            mode=mode,
+            pipeline_ref=pipeline_ref,
+            active_dcc_id=active_dcc_id,
+            sequence_ignore_extensions=get_thumbnail_sequence_ignore_extensions(self._settings),
+            sequence_ignore_name_tokens=get_thumbnail_sequence_ignore_tokens(self._settings),
+        )
+        return thumb_source_fingerprint(path)
 
     def _schedule_load(
         self,
@@ -938,9 +1040,11 @@ class ThumbnailManager(QObject):
         )
         if path is None:
             self._pending.discard(cache_key)
+            self._pending_source.pop(cache_key, None)
             self._no_path_keys.add(cache_key)
             return
         file_path = str(path)
+        self._pending_source[cache_key] = file_path
         size_px = self._size_px
         key = cache_key
 
@@ -962,15 +1066,18 @@ class ThumbnailManager(QObject):
         cache_key = category.replace("thumbnail_load:", "", 1) if ":" in category else ""
         if error is not None:
             self._pending.discard(cache_key)
+            self._pending_source.pop(cache_key, None)
             return
         if result is None:
             self._pending.discard(cache_key)
+            self._pending_source.pop(cache_key, None)
             if cache_key:
                 self._no_path_keys.add(cache_key)
             return
         pair = result if isinstance(result, tuple) and len(result) == 2 else None
         if pair is None:
             self._pending.discard(cache_key)
+            self._pending_source.pop(cache_key, None)
             if cache_key:
                 self._no_path_keys.add(cache_key)
             return
@@ -978,17 +1085,20 @@ class ThumbnailManager(QObject):
         if not isinstance(cache_key, str) or not isinstance(qimg, QImage) or qimg.isNull():
             ck = cache_key if isinstance(cache_key, str) else ""
             self._pending.discard(ck)
+            self._pending_source.pop(ck, None)
             if ck:
                 self._no_path_keys.add(ck)
             return
         self._pending.discard(cache_key)
+        src = self._pending_source.pop(cache_key, None)
         pix = QPixmap.fromImage(qimg)
         if pix.isNull():
             self._pending.discard(cache_key)
             self._no_path_keys.add(cache_key)
             return
         self._no_path_keys.discard(cache_key)
-        self._cache[cache_key] = pix
+        fp = thumb_source_fingerprint(Path(src)) if src else ""
+        self._cache[cache_key] = (pix, fp, src or "")
         self._cache.move_to_end(cache_key)
         while len(self._cache) > self._max_memory:
             self._cache.popitem(last=False)
@@ -1022,6 +1132,7 @@ class ThumbnailManager(QObject):
         for cache_key in keys:
             self._cache.pop(cache_key, None)
             self._pending.discard(cache_key)
+            self._pending_source.pop(cache_key, None)
             self._no_path_keys.discard(cache_key)
         self._app_state.invalidate_thumbnails(keys + [aid] if keys else [aid])
 
@@ -1038,6 +1149,7 @@ class ThumbnailManager(QObject):
             keys.append(cache_key)
             self._cache.pop(cache_key, None)
             self._pending.discard(cache_key)
+            self._pending_source.pop(cache_key, None)
             self._no_path_keys.discard(cache_key)
         self._app_state.invalidate_thumbnails(keys + [aid] if keys else [aid])
 
@@ -1045,6 +1157,7 @@ class ThumbnailManager(QObject):
         """Drop all in-memory thumbnails and pending loads (e.g. thumbnail source mode changed)."""
         self._cache.clear()
         self._pending.clear()
+        self._pending_source.clear()
         self._no_path_keys.clear()
 
     def _thumbnail_scan_rules_signature(self) -> str | None:

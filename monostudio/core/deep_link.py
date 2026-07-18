@@ -168,8 +168,20 @@ def iter_entity_rels_for_page(project_root: Path, page: str):
     scan = page_entity_scan_root(root, page_name)
     if scan is None or not scan.is_dir():
         return
-    # Assets / Shots links point at entity folders (type/name or seq/shot) — shallow.
-    if page_name in ("Assets", "Shots"):
+    # Assets: type/name. Shots: flat shot folders (same as build_project_index).
+    if page_name == "Shots":
+        try:
+            for entity in scan.iterdir():
+                if not entity.is_dir() or _should_skip_scan_name(entity.name):
+                    continue
+                try:
+                    yield entity.resolve().relative_to(root).as_posix()
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            return
+        return
+    if page_name == "Assets":
         try:
             for mid in scan.iterdir():
                 if not mid.is_dir() or _should_skip_scan_name(mid.name):

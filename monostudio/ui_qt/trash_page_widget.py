@@ -166,8 +166,9 @@ class TrashPageWidget(QWidget):
             entries = []
         self._apply_entries(entries)
 
-    def refresh_responsive(self, worker_manager, *, on_pump=None) -> None:
-        from monostudio.ui_qt.ui_worker_loop import run_worker_blocking_ui
+    def refresh_responsive(self, worker_manager, *, on_done=None) -> None:
+        """List trash entries on a worker; call *on_done* on the main thread when applied."""
+        from monostudio.ui_qt.ui_worker_loop import run_worker_async
 
         self._table.setRowCount(0)
         pr = self._project_root
@@ -177,6 +178,8 @@ class TrashPageWidget(QWidget):
             self._btn_restore.setEnabled(False)
             self._btn_delete.setEnabled(False)
             self._btn_empty.setEnabled(False)
+            if on_done is not None:
+                on_done()
             return
 
         def _load():
@@ -185,15 +188,19 @@ class TrashPageWidget(QWidget):
             except OSError:
                 return []
 
-        entries, error = run_worker_blocking_ui(
+        def _on_result(entries, error) -> None:
+            if error:
+                entries = []
+            self._apply_entries(entries or [])
+            if on_done is not None:
+                on_done()
+
+        run_worker_async(
             worker_manager,
             f"trash_list_{id(self)}",
             _load,
-            on_pump=on_pump,
+            on_result=_on_result,
         )
-        if error:
-            entries = []
-        self._apply_entries(entries or [])
 
     def _apply_entries(self, entries) -> None:
         if not entries:

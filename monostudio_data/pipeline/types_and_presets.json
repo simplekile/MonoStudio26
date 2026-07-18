@@ -11,28 +11,28 @@
       "id": "_characters",
       "name": "Character",
       "short_name": "char",
-      "departments": ["sculpt", "retopo", "uv", "geoclean", "rig", "baking", "texturing", "grooming", "lookdev"],
+      "departments": ["sculpt", "retopo", "uv", "geoclean", "rig", "baking", "texturing", "grooming", "lookdev", "anim"],
       "icon_name": "user"
     },
     "prop": {
       "id": "_props",
       "name": "Prop",
       "short_name": "prop",
-      "departments": ["sculpt", "retopo", "uv", "baking", "texturing", "grooming", "lookdev"],
+      "departments": ["sculpt", "retopo", "uv", "geoclean", "rig", "baking", "texturing", "grooming", "lookdev", "anim"],
       "icon_name": "package"
     },
     "environment": {
       "id": "_environment",
       "name": "Environment",
       "short_name": "env",
-      "departments": ["layout", "sculpt", "retopo", "uv", "lookdev"],
+      "departments": ["layout", "sculpt", "retopo", "uv", "lookdev", "anim"],
       "icon_name": "trees"
     },
     "vehicle": {
       "id": "_vehicles",
       "name": "Vehicle",
       "short_name": "veh",
-      "departments": ["sculpt", "retopo", "uv", "geoclean", "rig", "baking", "texturing", "lookdev"],
+      "departments": ["sculpt", "retopo", "uv", "geoclean", "rig", "baking", "texturing", "lookdev", "anim"],
       "icon_name": "car"
     }
   },
