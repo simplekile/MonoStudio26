@@ -13,6 +13,23 @@ from monostudio.core.comp_render_paths import build_comp_saver_spec
 from monostudio.core.comp_saver_io import apply_comp_saver_fix, apply_end_render_script_to_saver_block, read_comp_text
 
 
+def test_write_fusion_render_actor(tmp_path: Path) -> None:
+    import json
+
+    from monostudio.core.comp_fusion_scripts import (
+        fusion_render_actor_path,
+        write_fusion_render_actor,
+    )
+
+    project = tmp_path / "proj"
+    (project / ".monostudio").mkdir(parents=True)
+    write_fusion_render_actor(project)
+    actor = fusion_render_actor_path(project)
+    assert actor.is_file()
+    data = json.loads(actor.read_text(encoding="utf-8"))
+    assert str(data.get("display_name") or "").strip()
+
+
 def test_refresh_fusion_discord_webhooks_for_workspace(tmp_path: Path) -> None:
     import json
 

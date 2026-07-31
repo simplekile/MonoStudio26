@@ -51,6 +51,23 @@ def _load_webhook_urls() -> list[str]:
     return urls
 
 
+def _load_render_actor_display_name() -> str:
+    try:
+        raw = json.loads(
+            (_script_dir() / "render_actor.json").read_text(encoding="utf-8"),
+        )
+        if isinstance(raw, dict):
+            name = str(raw.get("display_name") or "").strip()
+            if name:
+                return name
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        return getpass.getuser() or "Artist"
+    except Exception:
+        return "Artist"
+
+
 WEBHOOKS = _load_webhook_urls()
 
 render_file = sys.argv[1] if len(sys.argv) > 1 else "Unknown"
@@ -68,7 +85,7 @@ if not WEBHOOKS:
     sys.exit(0)
 
 computer = socket.gethostname()
-user = getpass.getuser()
+user = _load_render_actor_display_name()
 
 folder = os.path.dirname(render_file)
 filename = os.path.basename(render_file)

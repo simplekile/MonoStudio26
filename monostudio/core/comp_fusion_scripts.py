@@ -40,6 +40,32 @@ def project_fusion_discord_script_path(project_root: Path) -> Path:
     return project_root / ".monostudio" / "fusion" / "discord.py"
 
 
+FUSION_RENDER_ACTOR_FILENAME = "render_actor.json"
+
+
+def fusion_render_actor_path(project_root: Path) -> Path:
+    return project_root / ".monostudio" / "fusion" / FUSION_RENDER_ACTOR_FILENAME
+
+
+def write_fusion_render_actor(
+    project_root: Path,
+    *,
+    workspace_root: Path | None = None,
+) -> None:
+    """Persist MonoStudio signed-in user for Fusion end-render Discord notify."""
+    from monostudio.core.user_identity import get_current_user, get_current_user_display_name
+
+    ws = workspace_root or find_workspace_root_from_project(project_root)
+    user = get_current_user(ws) if ws is not None else None
+    data = {
+        "display_name": get_current_user_display_name(ws),
+        "user_id": user.id if user is not None else "",
+    }
+    dest = fusion_render_actor_path(project_root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def _bundled_discord_script_template() -> Path:
     return get_app_base_path() / "monostudio_data" / "fusion" / "discord.py"
 
@@ -122,6 +148,7 @@ def ensure_project_fusion_discord_script(
     )
     first = urls[0] if urls else ""
     (dest_dir / "webhook.url").write_text(f"{first}\n", encoding="utf-8")
+    write_fusion_render_actor(project_root, workspace_root=workspace_root)
     return dest_py
 
 

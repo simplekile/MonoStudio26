@@ -18,6 +18,7 @@
 
 ## Integrations
 - **Discord webhook channels** editor trong Settings — nhiều kênh, toggle sự kiện từng kênh
+- **Fusion render notify** — Discord dùng tên user MonoStudio (render_actor.json), không còn Windows username
 - `integrations_config` mở rộng validation + mask URL
 
 ## Pipeline UI

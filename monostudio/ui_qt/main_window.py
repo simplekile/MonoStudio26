@@ -3832,6 +3832,20 @@ class MainWindow(FramelessMainWindow):
         self._refresh_user_button()
         self._refresh_dashboard_if_visible()
         self._reload_mention_alerts_for_current_user()
+        self._refresh_fusion_render_actor_for_open_project()
+
+    def _refresh_fusion_render_actor_for_open_project(self) -> None:
+        if self._project_root is None or self._workspace_root is None:
+            return
+        try:
+            from monostudio.core.comp_fusion_scripts import write_fusion_render_actor
+
+            write_fusion_render_actor(
+                self._project_root,
+                workspace_root=self._workspace_root,
+            )
+        except OSError:
+            pass
 
     def _on_clear_identity(self) -> None:
         from monostudio.core.user_identity import session_sign_out
