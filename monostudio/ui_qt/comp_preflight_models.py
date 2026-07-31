@@ -22,6 +22,14 @@ def is_upstream_version_upgrade(issue: UpstreamRenderIssue) -> bool:
     )
 
 
+def is_upstream_wrong_entity_fixable(issue: UpstreamRenderIssue) -> bool:
+    """True when a wrong-entity Loader can be retargeted to the comp shot."""
+    return (
+        issue.status == UpstreamRenderStatus.WRONG_ENTITY
+        and bool(issue.expected_entity_name.strip())
+    )
+
+
 @dataclass(frozen=True)
 class CompPreflightApplyResult:
     ok: bool
@@ -64,7 +72,12 @@ class CompPreflightScan:
         return [
             i
             for i in self.upstream_issues
-            if i.status in (UpstreamRenderStatus.STALE, UpstreamRenderStatus.MISSING_ON_DISK)
+            if i.status
+            in (
+                UpstreamRenderStatus.STALE,
+                UpstreamRenderStatus.MISSING_ON_DISK,
+                UpstreamRenderStatus.WRONG_ENTITY,
+            )
         ]
 
     @property
@@ -103,7 +116,9 @@ class CompPreflightPlan:
 
     def init_upstream_defaults(self, scan: CompPreflightScan) -> None:
         self.upstream_selected = [
-            i for i in scan.upstream_actionable if is_upstream_version_upgrade(i)
+            i
+            for i in scan.upstream_actionable
+            if is_upstream_version_upgrade(i) or is_upstream_wrong_entity_fixable(i)
         ]
         self.sync_loader_range = False
 

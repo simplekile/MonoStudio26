@@ -6,6 +6,7 @@ from pathlib import Path
 
 from monostudio.core.comp_upstream_render_check import (
     UpstreamRenderStatus,
+    apply_upstream_render_updates,
     audit_comp_upstream_renders,
     find_latest_render_version,
     parse_pipeline_render_loader_path,
@@ -433,3 +434,72 @@ def test_audit_respects_department_filter(tmp_path: Path) -> None:
     issues = audit_comp_upstream_renders(comp, entity_name="sh009", departments=("lighting",))
     assert len(issues) == 1
     assert issues[0].department == "lighting"
+
+
+def test_audit_wrong_entity_loader(tmp_path: Path) -> None:
+    work = tmp_path / "04_comp" / "fusion" / "work"
+    sh002_render = tmp_path / "02_shots" / "sh002" / "03_lighting" / "houdini" / "work" / "render"
+    sh003_render = tmp_path / "02_shots" / "sh003" / "03_lighting" / "houdini" / "work" / "render"
+    for render, prefix in (
+        (sh002_render, "sh002_lighting"),
+        (sh003_render, "sh003_lighting"),
+    ):
+        folder = render / f"{prefix}_v001"
+        folder.mkdir(parents=True)
+        (folder / f"{prefix}_v001.0001.exr").write_bytes(b"x")
+    comp = work / "sh002_comp_v001.comp"
+    comp.parent.mkdir(parents=True)
+    wrong_loader = str((sh003_render / "sh003_lighting_v001" / "sh003_lighting_v001.0001.exr")).replace(
+        "\\", "\\\\"
+    )
+    right_loader = str((sh002_render / "sh002_lighting_v001" / "sh002_lighting_v001.0001.exr")).replace(
+        "\\", "\\\\"
+    )
+    comp.write_text(
+        f'Composition {{\n\tTools = {{\n'
+        f'\t\tL_wrong = Loader {{\n\t\t\tClips = {{ Clip {{ Filename = "{wrong_loader}", }} }},\n\t\t}},\n'
+        f'\t\tL_ok = Loader {{\n\t\t\tClips = {{ Clip {{ Filename = "{right_loader}", }} }},\n\t\t}},\n'
+        f"\t}},\n}}\n",
+        encoding="utf-8",
+    )
+    issues = audit_comp_upstream_renders(comp, entity_name="sh002")
+    wrong = [i for i in issues if i.status == UpstreamRenderStatus.WRONG_ENTITY]
+    assert len(wrong) == 1
+    assert wrong[0].entity_name == "sh003"
+    assert wrong[0].expected_entity_name == "sh002"
+    assert wrong[0].base_prefix == "sh003_lighting"
+    assert wrong[0].loader_count == 1
+    assert not [i for i in issues if i.status == UpstreamRenderStatus.STALE]
+
+
+def test_apply_wrong_entity_loader_retarget(tmp_path: Path) -> None:
+    work = tmp_path / "04_comp" / "fusion" / "work"
+    sh002_render = tmp_path / "02_shots" / "sh002" / "03_lighting" / "houdini" / "work" / "render"
+    sh003_render = tmp_path / "02_shots" / "sh003" / "03_lighting" / "houdini" / "work" / "render"
+    for render, prefix in (
+        (sh002_render, "sh002_lighting"),
+        (sh003_render, "sh003_lighting"),
+    ):
+        folder = render / f"{prefix}_v001"
+        folder.mkdir(parents=True)
+        (folder / f"{prefix}_v001.0001.exr").write_bytes(b"x")
+    comp = work / "sh002_comp_v001.comp"
+    comp.parent.mkdir(parents=True)
+    wrong_loader = str((sh003_render / "sh003_lighting_v001" / "sh003_lighting_v001.0001.exr")).replace(
+        "\\", "\\\\"
+    )
+    comp.write_text(
+        f'Composition {{\n\tTools = {{\n'
+        f'\t\tL_wrong = Loader {{\n\t\t\tClips = {{ Clip {{ Filename = "{wrong_loader}", }} }},\n\t\t}},\n'
+        f"\t}},\n}}\n",
+        encoding="utf-8",
+    )
+    issues = audit_comp_upstream_renders(comp, entity_name="sh002")
+    wrong = [i for i in issues if i.status == UpstreamRenderStatus.WRONG_ENTITY]
+    assert len(wrong) == 1
+
+    result = apply_upstream_render_updates(comp, issues, selected_issues=wrong)
+    assert result == "updated"
+    text = comp.read_text(encoding="utf-8")
+    assert "sh002_lighting_v001" in text
+    assert "sh003_lighting" not in text

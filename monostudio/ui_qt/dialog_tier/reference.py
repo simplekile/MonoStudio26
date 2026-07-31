@@ -82,6 +82,7 @@ T_METRICS: dict = {
     "field_label_gap": 8,
     "field_hint_gap": 6,
     "field_readonly_block_gap": 16,
+    "scroll_gutter": 4,
     "close_idle_a": 0.55,
     "close_hover_bg_a": 0.05,
     "hairline_a": 0.05,
@@ -100,7 +101,20 @@ T_METRICS: dict = {
     "l2_h": 500,
     "l2_h_compact": 460,
     "l2_h_tall": 540,
+    "l2_compact_w": 420,
+    "l2_compact_h": 400,
+    "l2_compact_topbar_h": 60,
+    "l2_compact_badge_size": 36,
+    "l2_compact_badge_icon": 20,
+    "l2_compact_badge_radius": 10,
+    "l2_compact_pad_x": 24,
+    "l2_compact_form_pad_top": 12,
+    "l2_compact_form_spacing_y": 20,
+    "l2_compact_footer_pad_b": 20,
     "l2_topbar_h": 96,
+    "l2_badge_size": 52,
+    "l2_badge_icon": 28,
+    "l2_badge_radius": 14,
     "l1_grad_fps": 16,
     "l1_grad_drift": 0.028,
     "l1_grad_stops": 20,
@@ -2314,13 +2328,19 @@ class _DialogHero:
     """Approved brand block — gradient badge + title + subtitle (L1 sidebar / L2 top bar)."""
 
     @staticmethod
-    def make_badge(icon: str, *, icon_size: int = 28) -> QFrame:
+    def make_badge(
+        icon: str,
+        *,
+        icon_size: int = 28,
+        badge_size: int = 52,
+        badge_radius: int = 14,
+    ) -> QFrame:
         badge = QFrame()
-        badge.setFixedSize(52, 52)
+        badge.setFixedSize(badge_size, badge_size)
         badge.setStyleSheet(
             f"background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
             f"stop:0 {T['blue']}, stop:1 {T['purple']});"
-            f"border-radius: 14px; border: none;"
+            f"border-radius: {badge_radius}px; border: none;"
         )
         bl = QHBoxLayout(badge)
         bl.setContentsMargins(0, 0, 0, 0)
@@ -2369,12 +2389,21 @@ class _DialogHero:
         title: str,
         subtitle: str,
         icon_size: int = 28,
+        badge_size: int = 52,
+        badge_radius: int = 14,
     ) -> None:
         while badge_lay.count():
             item = badge_lay.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        badge_lay.addWidget(cls.make_badge(icon, icon_size=icon_size))
+        badge_lay.addWidget(
+            cls.make_badge(
+                icon,
+                icon_size=icon_size,
+                badge_size=badge_size,
+                badge_radius=badge_radius,
+            )
+        )
         title_lbl.setText(title)
         subtitle_lbl.setText(subtitle)
 
@@ -2851,17 +2880,39 @@ class Tier2Dialog(MonosDialog):
     """L2 shell: L1 vocabulary with contextual top bar (sidebar → horizontal strip) + form + footer.
 
     Height is content-tiered (compact / standard / tall) — narrower than L1, not a fixed square.
-  """
+    Use ``profile="compact"`` or ``Tier2CompactDialog`` for resolver flows (Create New / Open With).
+    """
 
     _tier_radius = T["radius_l2"]
 
-    def __init__(self, parent: QWidget | None = None, *, l2_height: int | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        l2_height: int | None = None,
+        profile: str = "full",
+    ) -> None:
         super().__init__(parent)
         self.set_dialog_border_overlay_enabled(False)
         self.setModal(True)
         self.setObjectName("TierRoot")
-        self._l2_content_h = int(l2_height if l2_height is not None else T["l2_h"])
+        self._l2_profile = "compact" if profile == "compact" else "full"
+        default_h = T["l2_compact_h"] if self._l2_profile == "compact" else T["l2_h"]
+        self._l2_content_h = int(l2_height if l2_height is not None else default_h)
         self._apply_l2_size(self._l2_content_h)
+
+        pad_x = self._l2_pad_x()
+        topbar_h = self._l2_topbar_height()
+        form_pad_top = (
+            T["l2_compact_form_pad_top"] if self._l2_profile == "compact" else T["form_pad_top"]
+        )
+        form_spacing = (
+            T["l2_compact_form_spacing_y"] if self._l2_profile == "compact" else T["form_spacing_y"]
+        )
+        footer_pad_b = (
+            T["l2_compact_footer_pad_b"] if self._l2_profile == "compact" else 24
+        )
+        title_px = 15 if self._l2_profile == "compact" else 17
 
         outer = QVBoxLayout(self)
         shadow_m = _tier_dialog_shadow_margin()
@@ -2869,22 +2920,22 @@ class Tier2Dialog(MonosDialog):
         outer.setSpacing(0)
 
         top_drag = _DragZone(self)
-        top_drag.setFixedHeight(T["l2_topbar_h"])
+        top_drag.setFixedHeight(topbar_h)
         self._topbar_drag = top_drag
         top_lay = QHBoxLayout(top_drag)
-        top_lay.setContentsMargins(T["chrome_pad_x"], 0, T["chrome_pad_x"], 0)
-        top_lay.setSpacing(14)
+        top_lay.setContentsMargins(pad_x, 0, pad_x, 0)
+        top_lay.setSpacing(14 if self._l2_profile == "full" else 10)
         top_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self._topbar = _TopBarPanel()
         self._topbar_body = QHBoxLayout(self._topbar)
         self._topbar_body.setContentsMargins(0, 0, 0, 0)
-        self._topbar_body.setSpacing(14)
+        self._topbar_body.setSpacing(14 if self._l2_profile == "full" else 10)
         self._topbar_text = QVBoxLayout()
-        self._topbar_text.setSpacing(4)
+        self._topbar_text.setSpacing(4 if self._l2_profile == "full" else 2)
         self._topbar_text.setContentsMargins(0, 0, 0, 0)
         self._topbar_title = QLabel("")
-        self._topbar_title.setFont(_tier_inter_font(17, 700))
+        self._topbar_title.setFont(_tier_inter_font(title_px, 700))
         self._topbar_title.setStyleSheet(_text_style(color=T["text"]))
         self._topbar_subtitle = QLabel("")
         self._topbar_subtitle.setWordWrap(True)
@@ -2912,20 +2963,20 @@ class Tier2Dialog(MonosDialog):
         fw = QWidget()
         fw.setStyleSheet("background: transparent;")
         fw.setLayout(self._form)
-        self._form.setContentsMargins(T["chrome_pad_x"], T["form_pad_top"], T["chrome_pad_x"], 8)
-        self._form.setSpacing(T["form_spacing_y"])
+        self._form.setContentsMargins(pad_x, form_pad_top, pad_x, 8)
+        self._form.setSpacing(form_spacing)
         body_lay.addWidget(fw, stretch=1)
 
         foot = QWidget()
         foot.setStyleSheet("background: transparent;")
         foot_lay = QVBoxLayout(foot)
-        foot_lay.setContentsMargins(T["chrome_pad_x"], 0, T["chrome_pad_x"], 24)
+        foot_lay.setContentsMargins(pad_x, 0, pad_x, footer_pad_b)
         foot_lay.setSpacing(0)
         foot_lay.addWidget(_tier_footer_divider())
         btn_row = QWidget()
         btn_row.setStyleSheet("background: transparent;")
         fl = QHBoxLayout(btn_row)
-        fl.setContentsMargins(0, 16, 0, 0)
+        fl.setContentsMargins(0, 16 if self._l2_profile == "full" else 12, 0, 0)
         fl.addStretch()
         self._foot = QHBoxLayout()
         self._foot.setSpacing(16)
@@ -2942,13 +2993,27 @@ class Tier2Dialog(MonosDialog):
         self._topbar_grad_timer.setInterval(max(16, int(1000 / T["l1_grad_fps"])))
         self._topbar_grad_timer.timeout.connect(self._tick_topbar_grad)
 
+    def _l2_profile_is_compact(self) -> bool:
+        return self._l2_profile == "compact"
+
+    def _l2_shell_width(self) -> int:
+        return int(T["l2_compact_w"] if self._l2_profile_is_compact() else T["l2_w"])
+
+    def _l2_topbar_height(self) -> int:
+        return int(T["l2_compact_topbar_h"] if self._l2_profile_is_compact() else T["l2_topbar_h"])
+
+    def _l2_pad_x(self) -> int:
+        return int(T["l2_compact_pad_x"] if self._l2_profile_is_compact() else T["chrome_pad_x"])
+
     def _apply_l2_size(self, content_h: int) -> None:
         shadow_m = _tier_dialog_shadow_margin()
-        self._l2_content_h = max(int(T["l2_topbar_h"]) + 120, int(content_h))
-        self.resize(T["l2_w"] + 2 * shadow_m, self._l2_content_h + 2 * shadow_m)
+        topbar_h = self._l2_topbar_height()
+        shell_w = self._l2_shell_width()
+        self._l2_content_h = max(topbar_h + 120, int(content_h))
+        self.resize(shell_w + 2 * shadow_m, self._l2_content_h + 2 * shadow_m)
 
     def set_l2_height(self, content_h: int) -> None:
-        """Resize L2 shell — use ``l2_h_compact`` / ``l2_h`` / ``l2_h_tall`` from ``T``."""
+        """Resize L2 shell — use ``l2_h_*`` or ``l2_compact_h`` tokens from ``T``."""
         self._apply_l2_size(content_h)
 
     def _tick_topbar_grad(self) -> None:
@@ -2978,8 +3043,16 @@ class Tier2Dialog(MonosDialog):
         icon: str,
         title: str,
         subtitle: str,
-        icon_size: int = 28,
+        icon_size: int | None = None,
     ) -> None:
+        compact = self._l2_profile_is_compact()
+        resolved_icon = int(
+            icon_size
+            if icon_size is not None
+            else (T["l2_compact_badge_icon"] if compact else T["l2_badge_icon"])
+        )
+        badge_size = int(T["l2_compact_badge_size"] if compact else T["l2_badge_size"])
+        badge_radius = int(T["l2_compact_badge_radius"] if compact else T["l2_badge_radius"])
         _DialogHero.apply_topbar(
             self._topbar_badge_lay,
             self._topbar_title,
@@ -2987,7 +3060,9 @@ class Tier2Dialog(MonosDialog):
             icon=icon,
             title=title,
             subtitle=subtitle,
-            icon_size=icon_size,
+            icon_size=resolved_icon,
+            badge_size=badge_size,
+            badge_radius=badge_radius,
         )
 
     def set_hero(self, *, icon: str, title: str, subtitle: str) -> None:
@@ -3041,6 +3116,11 @@ class Tier2Dialog(MonosDialog):
         super(MonosDialog, self).paintEvent(event)
 
 
+class Tier2CompactDialog(Tier2Dialog):
+    """L2 resolver shell — Create New / Open With (420px, short top bar, content-fit height)."""
+
+    def __init__(self, parent: QWidget | None = None, *, l2_height: int | None = None) -> None:
+        super().__init__(parent, l2_height=l2_height, profile="compact")
 
 
 # ---------------------------------------------------------------------------
@@ -3090,6 +3170,7 @@ __all__ = [
     "configure_tier_text_rendering",
     "Tier1Dialog",
     "Tier2Dialog",
+    "Tier2CompactDialog",
     "GradientPrimaryButton",
     "GhostButton",
     "DialogCloseButton",

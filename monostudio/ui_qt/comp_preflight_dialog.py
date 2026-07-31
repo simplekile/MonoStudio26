@@ -82,6 +82,7 @@ class _LoaderIssueCard(QFrame):
         issue: UpstreamRenderIssue,
         checked: bool,
         parent: QWidget | None = None,
+        apply_enabled: bool = True,
     ) -> None:
         super().__init__(parent)
         self.issue = issue
@@ -95,25 +96,49 @@ class _LoaderIssueCard(QFrame):
         header = QHBoxLayout()
         header.setSpacing(8)
         dept = (issue.department or "upstream").title()
-        self._cb = QCheckBox(dept, self)
-        self._cb.setChecked(checked)
-        header.addWidget(self._cb, 0)
+        self._cb: QCheckBox | None
+        if apply_enabled:
+            self._cb = QCheckBox(dept, self)
+            self._cb.setChecked(checked)
+            header.addWidget(self._cb, 0)
+        else:
+            self._cb = None
+            dept_lbl = QLabel(dept, self)
+            dept_lbl.setObjectName("DialogBody")
+            header.addWidget(dept_lbl, 0)
 
         header.addStretch(1)
 
-        latest = issue.latest_version
-        if latest is not None:
-            version_lbl = QLabel(f"v{issue.comp_version:03d} → v{latest:03d}", self)
-            version_lbl.setObjectName("CompPreflightVersionBadge")
-            downgrade = latest < issue.comp_version
-            if downgrade:
-                version_lbl.setProperty("warning", True)
-                version_lbl.setToolTip(
-                    "Latest render on disk is older than what the comp references."
+        if issue.status == UpstreamRenderStatus.WRONG_ENTITY:
+            latest = issue.latest_version
+            if latest is not None:
+                badge_text = (
+                    f"{issue.entity_name} → {issue.expected_entity_name} · "
+                    f"v{issue.comp_version:03d} → v{latest:03d}"
                 )
-                version_lbl.style().unpolish(version_lbl)
-                version_lbl.style().polish(version_lbl)
-            header.addWidget(version_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+            else:
+                badge_text = f"{issue.entity_name} → {issue.expected_entity_name}"
+            mismatch_lbl = QLabel(badge_text, self)
+            mismatch_lbl.setObjectName("CompPreflightVersionBadge")
+            mismatch_lbl.setProperty("warning", True)
+            mismatch_lbl.setToolTip(issue.message)
+            mismatch_lbl.style().unpolish(mismatch_lbl)
+            mismatch_lbl.style().polish(mismatch_lbl)
+            header.addWidget(mismatch_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        else:
+            latest = issue.latest_version
+            if latest is not None:
+                version_lbl = QLabel(f"v{issue.comp_version:03d} → v{latest:03d}", self)
+                version_lbl.setObjectName("CompPreflightVersionBadge")
+                downgrade = latest < issue.comp_version
+                if downgrade:
+                    version_lbl.setProperty("warning", True)
+                    version_lbl.setToolTip(
+                        "Latest render on disk is older than what the comp references."
+                    )
+                    version_lbl.style().unpolish(version_lbl)
+                    version_lbl.style().polish(version_lbl)
+                header.addWidget(version_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
         count_lbl = QLabel(f"{issue.loader_count} loader(s)", self)
         count_lbl.setObjectName("CompPreflightLoaderCount")
@@ -126,7 +151,14 @@ class _LoaderIssueCard(QFrame):
         path_row.addWidget(path_lbl, 1)
         root.addLayout(path_row)
 
-        if latest is not None and latest < issue.comp_version and issue.message:
+        if issue.message and (
+            not apply_enabled
+            or issue.status == UpstreamRenderStatus.WRONG_ENTITY
+            or (
+                issue.latest_version is not None
+                and issue.latest_version < issue.comp_version
+            )
+        ):
             hint_row = QHBoxLayout()
             hint_row.setContentsMargins(_CONTENT_INDENT, 0, 0, 0)
             hint = QLabel(issue.message, self)
@@ -136,10 +168,11 @@ class _LoaderIssueCard(QFrame):
             root.addLayout(hint_row)
 
     def is_checked(self) -> bool:
-        return self._cb.isChecked()
+        return bool(self._cb and self._cb.isChecked())
 
     def set_checked(self, checked: bool) -> None:
-        self._cb.setChecked(checked)
+        if self._cb is not None:
+            self._cb.setChecked(checked)
 
 
 class _SaverPathCompareCard(QFrame):
@@ -204,7 +237,11 @@ class UpstreamPreflightDetailDialog(MonosDialog):
 
         self._plan = plan
         self._issues = issues
+        self._wrong_entity_issues = [
+            i for i in issues if i.status == UpstreamRenderStatus.WRONG_ENTITY
+        ]
         self._stale_issues = [i for i in issues if i.status == UpstreamRenderStatus.STALE]
+        self._path_update_issues = self._wrong_entity_issues + self._stale_issues
 
         global_range = None
         try:
@@ -222,10 +259,10 @@ class UpstreamPreflightDetailDialog(MonosDialog):
         intro.setWordWrap(True)
         root.addWidget(intro)
 
-        if self._stale_issues:
-            loader_total = sum(i.loader_count for i in self._stale_issues)
+        if self._path_update_issues:
+            loader_total = sum(i.loader_count for i in self._path_update_issues)
             summary = QLabel(
-                f"{len(self._stale_issues)} department(s) · {loader_total} loader(s)"
+                f"{len(self._path_update_issues)} update(s) · {loader_total} loader(s)"
             )
             summary.setObjectName("DialogHint")
             root.addWidget(summary)
@@ -243,7 +280,7 @@ class UpstreamPreflightDetailDialog(MonosDialog):
         body_layout.setSpacing(16)
 
         self._issue_cards: list[_LoaderIssueCard] = []
-        if self._stale_issues:
+        if self._path_update_issues:
             paths_header = QHBoxLayout()
             paths_header.addWidget(_section_title("Update loader paths"))
             paths_header.addStretch(1)
@@ -259,7 +296,7 @@ class UpstreamPreflightDetailDialog(MonosDialog):
 
             cards_col = QVBoxLayout()
             cards_col.setSpacing(8)
-            for issue in self._stale_issues:
+            for issue in self._path_update_issues:
                 card = _LoaderIssueCard(
                     issue=issue,
                     checked=issue in plan.upstream_selected,
@@ -272,7 +309,11 @@ class UpstreamPreflightDetailDialog(MonosDialog):
             select_all_btn.clicked.connect(lambda: self._set_all_issues(True))
             clear_btn.clicked.connect(lambda: self._set_all_issues(False))
 
-        info_issues = [i for i in issues if i.status != UpstreamRenderStatus.STALE]
+        info_issues = [
+            i
+            for i in issues
+            if i.status not in (UpstreamRenderStatus.STALE, UpstreamRenderStatus.WRONG_ENTITY)
+        ]
         if info_issues:
             body_layout.addWidget(_section_title("Other issues"))
             for issue in info_issues:

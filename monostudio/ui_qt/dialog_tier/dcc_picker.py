@@ -38,7 +38,7 @@ from monostudio.ui_qt.lucide_icons import _read_svg_text, _render_lucide_pixmap
 from monostudio.ui_qt.surfaces import SURFACE_DIALOG, SURFACE_POPUP, SURFACE_TOOLTIP, surface_border_color
 
 
-_DCC_COLS = 3
+_DCC_COLS = 4
 _DCC_CARD_SIZE = 72  # design reference at ~456px field width
 _DCC_CARD_SIZE_MIN = 48
 _DCC_ICON_REF = 26
@@ -320,6 +320,7 @@ class DccPickerGrid(QWidget):
         self._scroll.setWidgetResizable(True)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setViewportMargins(0, 0, T["scroll_gutter"], 0)
         self._scroll.setStyleSheet("background: transparent; border: none;")
         self._scroll.viewport().setAutoFillBackground(False)
         self._scroll.viewport().setStyleSheet("background: transparent;")

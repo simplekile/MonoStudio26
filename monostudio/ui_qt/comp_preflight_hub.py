@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QRadioButton,
     QSizePolicy,
@@ -50,14 +49,13 @@ PreflightHubResult = Literal["apply", "skip", "cancel"]
 
 
 class _CompPreflightInplaceConfirmDialog(MonosDialog):
-    """Require typing the comp filename before overwriting the current version."""
+    """Confirm overwriting the current comp version in place."""
 
     def __init__(self, *, parent=None, comp_path: Path) -> None:
         super().__init__(parent)
         self.setWindowTitle("Modify current comp version?")
         self.setModal(True)
         self.setMinimumWidth(480)
-        self._expected = comp_path.name
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -72,31 +70,18 @@ class _CompPreflightInplaceConfirmDialog(MonosDialog):
         body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(body)
 
-        prompt = QLabel("Type the comp filename to confirm:")
-        prompt.setObjectName("DialogHint")
-        root.addWidget(prompt)
-
-        self._input = QLineEdit(self)
-        self._input.setPlaceholderText(self._expected)
-        self._input.textChanged.connect(self._update_ok_enabled)
-        root.addWidget(self._input)
-
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         cancel_btn = QPushButton("Cancel", self)
         cancel_btn.setObjectName("DialogSecondaryButton")
-        self._ok_btn = QPushButton("Modify current version", self)
-        self._ok_btn.setObjectName("DialogPrimaryButton")
-        self._ok_btn.setEnabled(False)
+        ok_btn = QPushButton("Modify current version", self)
+        ok_btn.setObjectName("DialogPrimaryButton")
         btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(self._ok_btn)
+        btn_row.addWidget(ok_btn)
         root.addLayout(btn_row)
 
         cancel_btn.clicked.connect(self.reject)
-        self._ok_btn.clicked.connect(self.accept)
-
-    def _update_ok_enabled(self) -> None:
-        self._ok_btn.setEnabled(self._input.text().strip() == self._expected)
+        ok_btn.clicked.connect(self.accept)
 
 
 def scan_comp_preflight(
@@ -393,8 +378,16 @@ class CompPreflightHubDialog(MonosDialog):
         )
 
     def _make_upstream_row(self) -> _IssueRow:
-        n = len(self._scan.upstream_actionable)
-        summary = f"{n} Loader issue(s) — versioned render folders under work/render."
+        actionable = self._scan.upstream_actionable
+        n = len(actionable)
+        wrong_n = sum(1 for i in actionable if i.status == UpstreamRenderStatus.WRONG_ENTITY)
+        if wrong_n:
+            summary = (
+                f"{n} Loader issue(s) — incl. {wrong_n} wrong shot/asset "
+                f"+ versioned render folders under work/render."
+            )
+        else:
+            summary = f"{n} Loader issue(s) — versioned render folders under work/render."
         skipped = not self._plan.upstream_apply_enabled
         if skipped:
             status = "Skipped"

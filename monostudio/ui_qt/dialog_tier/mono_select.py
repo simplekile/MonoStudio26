@@ -457,6 +457,7 @@ class _MonoSelectPopup(QFrame):
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setViewportMargins(0, 0, T["scroll_gutter"], 0)
         self._scroll.setWidgetResizable(True)
         self._scroll.setStyleSheet("background: transparent; border: none;")
         self._scroll.viewport().setAutoFillBackground(False)

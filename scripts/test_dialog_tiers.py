@@ -39,6 +39,7 @@ from monostudio.ui_qt.dialog_tier import (
     T,
     Tier1Dialog,
     Tier2Dialog,
+    Tier2CompactDialog,
     WorkspacePicker,
     apply_tier_app_theme,
     configure_tier_text_rendering,
@@ -226,24 +227,14 @@ def _mock_dcc_picker_items() -> list[DccPickerItem]:
     ]
 
 
-class CreateNewDccTier2Demo(Tier2Dialog):
+class CreateNewDccTier2Demo(Tier2CompactDialog):
     def __init__(self, parent=None) -> None:
-        super().__init__(parent, l2_height=T["l2_h_tall"])
+        super().__init__(parent)
         self.setWindowTitle("Create New")
         self.set_topbar_brand(
             icon="file-plus",
             title="Create New",
             subtitle="char_aya · Modeling",
-            icon_size=28,
-        )
-
-        self.add_field(
-            MetadataCard(
-                "Context",
-                value="char_aya",
-                footnote="Department · Modeling · Type · character",
-                mono=True,
-            )
         )
 
         self._dcc_grid = DccPickerGrid()
@@ -294,7 +285,7 @@ class TierLauncher(QWidget):
 
         self._sub_lbl = QLabel(
             "Tier 1 — major workspace actions (New Project).\n"
-            "Tier 2 — in-project creates · compact / standard / tall height by content."
+            "Tier 2 — in-project creates · L2 Compact — resolver / picker (Create New)."
         )
         self._sub_lbl.setWordWrap(True)
         self._sub_lbl.setFont(tier_font(13))
@@ -315,8 +306,8 @@ class TierLauncher(QWidget):
         self._cards.append(
             self._make_card(
                 "Create New (DCC)",
-                "DCC picker grid · context card · import source row",
-                "Tier 2",
+                "L2 Compact · DCC picker · import toggle · context in top bar",
+                "L2 Compact",
                 CreateNewDccTier2Demo,
             )
         )

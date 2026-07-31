@@ -39,6 +39,7 @@ class UpstreamRenderStatus(str, Enum):
     OK = "ok"
     STALE = "stale"
     MISSING_ON_DISK = "missing_on_disk"
+    WRONG_ENTITY = "wrong_entity"
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class UpstreamRenderIssue:
     sample_loader_path: str
     loader_count: int
     message: str
+    expected_entity_name: str = ""
 
 
 def _base_prefix_from_version_folder(folder_name: str) -> str | None:
@@ -210,6 +212,89 @@ def find_latest_render_version(render_root: Path, base_prefix: str) -> tuple[int
     return best_ver, best_path
 
 
+def _target_base_prefix(expected_entity_name: str, department: str) -> str:
+    return work_file_prefix(name=expected_entity_name, department=department)
+
+
+def repoint_pipeline_render_loader_path(
+    path_str: str,
+    *,
+    from_prefix: str,
+    to_prefix: str,
+    from_entity: str,
+    to_entity: str,
+    target_version: int | None = None,
+) -> str:
+    """Rewrite loader path from one pipeline entity/prefix to another."""
+    out = path_str
+    if from_prefix.casefold() != to_prefix.casefold():
+        prefix_pat = re.compile(re.escape(from_prefix), re.IGNORECASE)
+        out = prefix_pat.sub(to_prefix, out)
+    if from_entity.casefold() != to_entity.casefold():
+        entity_pat = re.compile(
+            rf"([/\\]){re.escape(from_entity)}([/\\])",
+            re.IGNORECASE,
+        )
+        out = entity_pat.sub(rf"\1{to_entity}\2", out)
+    if target_version is not None:
+        out = normalize_render_path_versions(out, to_prefix, target_version)
+    return out
+
+
+def _append_wrong_entity_issues(
+    issues: list[UpstreamRenderIssue],
+    grouped: dict[tuple[str, str], list[tuple[str, str]]],
+    *,
+    expected_entity_name: str,
+) -> None:
+    for (_prefix_key, _entity_key), entries in grouped.items():
+        sample = entries[0][1]
+        parsed = parse_pipeline_render_loader_path(sample)
+        if parsed is None:
+            continue
+        target_prefix = _target_base_prefix(expected_entity_name, parsed.department)
+        repointed = repoint_pipeline_render_loader_path(
+            sample,
+            from_prefix=parsed.base_prefix,
+            to_prefix=target_prefix,
+            from_entity=parsed.entity_name,
+            to_entity=expected_entity_name,
+        )
+        parsed_target = parse_pipeline_render_loader_path(repointed)
+        latest_ver: int | None = None
+        latest_folder: Path | None = None
+        if parsed_target is not None:
+            latest = find_latest_render_version(parsed_target.render_root, target_prefix)
+            if latest is not None:
+                latest_ver, latest_folder = latest
+        if latest_ver is not None:
+            message = (
+                f"Retarget {parsed.base_prefix} → {target_prefix} "
+                f"(v{parsed.version:03d} → v{latest_ver:03d})."
+            )
+        else:
+            message = (
+                f"Retarget {parsed.entity_name} → {expected_entity_name} "
+                f"({parsed.base_prefix} → {target_prefix}); "
+                f"no render frames found for {target_prefix} on disk."
+            )
+        issues.append(
+            UpstreamRenderIssue(
+                status=UpstreamRenderStatus.WRONG_ENTITY,
+                base_prefix=parsed.base_prefix,
+                department=parsed.department,
+                entity_name=parsed.entity_name,
+                expected_entity_name=expected_entity_name,
+                comp_version=parsed.version,
+                latest_version=latest_ver,
+                latest_folder=latest_folder,
+                sample_loader_path=sample,
+                loader_count=len(entries),
+                message=message,
+            )
+        )
+
+
 def audit_comp_upstream_renders(
     comp_path: Path,
     *,
@@ -229,13 +314,20 @@ def audit_comp_upstream_renders(
         return []
 
     grouped: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    wrong_entity_grouped: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    expected_cf = entity_name.strip().casefold() if entity_name else ""
     for tool_name, path_str in loader_paths_from_comp_text(text):
         parsed = parse_pipeline_render_loader_path(path_str)
         if parsed is None:
             continue
-        if entity_name and parsed.entity_name.casefold() != entity_name.strip().casefold():
-            continue
         if not _matches_department_filter(parsed.department, departments):
+            continue
+        if expected_cf and parsed.entity_name.casefold() != expected_cf:
+            wrong_key = (
+                parsed.base_prefix.casefold(),
+                parsed.entity_name.casefold(),
+            )
+            wrong_entity_grouped.setdefault(wrong_key, []).append((tool_name, path_str))
             continue
         key = (
             str(parsed.render_root).casefold(),
@@ -244,6 +336,12 @@ def audit_comp_upstream_renders(
         grouped.setdefault(key, []).append((tool_name, path_str))
 
     issues: list[UpstreamRenderIssue] = []
+    if expected_cf:
+        _append_wrong_entity_issues(
+            issues,
+            wrong_entity_grouped,
+            expected_entity_name=entity_name.strip(),
+        )
     for (_root_key, _prefix_key), entries in grouped.items():
         sample = entries[0][1]
         parsed = parse_pipeline_render_loader_path(sample)
@@ -351,7 +449,13 @@ def audit_comp_upstream_renders(
                     message="Referenced render file is missing on disk.",
                 )
             )
-    issues.sort(key=lambda i: (i.department, i.comp_version))
+    issues.sort(
+        key=lambda i: (
+            0 if i.status == UpstreamRenderStatus.WRONG_ENTITY else 1,
+            i.department,
+            i.comp_version,
+        )
+    )
     return issues
 
 
@@ -370,7 +474,12 @@ def apply_upstream_render_updates(
         for i in (selected_issues or [])
         if i.status == UpstreamRenderStatus.STALE and i.latest_version
     ]
-    if not path_issues and not sync_loader_range:
+    wrong_entity_issues = [
+        i
+        for i in (selected_issues or [])
+        if i.status == UpstreamRenderStatus.WRONG_ENTITY and i.expected_entity_name
+    ]
+    if not path_issues and not wrong_entity_issues and not sync_loader_range:
         return "unchanged"
     try:
         text = read_comp_text(comp_path)
@@ -398,6 +507,40 @@ def apply_upstream_render_updates(
             if not _loader_needs_path_update(path_str, parsed.base_prefix, latest_ver):
                 continue
             new_path = normalize_render_path_versions(path_str, parsed.base_prefix, latest_ver)
+            if new_path != path_str:
+                new_text = replace_loader_path_in_comp_text(new_text, path_str, new_path)
+
+    if wrong_entity_issues:
+        wrong_keys = {
+            (i.base_prefix.casefold(), i.entity_name.casefold()): i
+            for i in wrong_entity_issues
+        }
+        seen_paths: set[str] = set()
+        for _tool, path_str in loader_paths_from_comp_text(new_text):
+            key = path_str.casefold()
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            parsed = parse_pipeline_render_loader_path(path_str)
+            if parsed is None:
+                continue
+            issue = wrong_keys.get(
+                (parsed.base_prefix.casefold(), parsed.entity_name.casefold())
+            )
+            if issue is None:
+                continue
+            target_prefix = _target_base_prefix(
+                issue.expected_entity_name,
+                parsed.department,
+            )
+            new_path = repoint_pipeline_render_loader_path(
+                path_str,
+                from_prefix=parsed.base_prefix,
+                to_prefix=target_prefix,
+                from_entity=parsed.entity_name,
+                to_entity=issue.expected_entity_name,
+                target_version=issue.latest_version,
+            )
             if new_path != path_str:
                 new_text = replace_loader_path_in_comp_text(new_text, path_str, new_path)
 
