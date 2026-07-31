@@ -2126,6 +2126,41 @@ def _thumb_button_style() -> str:
     )
 
 
+class _SequencePlayButton(QToolButton):
+    """Center play/pause control with optional circular progress on the button rim."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._playback_progress = -1.0
+
+    def set_playback_progress(self, fraction: float | None) -> None:
+        f = -1.0 if fraction is None else max(0.0, min(1.0, float(fraction)))
+        if abs(f - self._playback_progress) > 1e-4:
+            self._playback_progress = f
+            self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self._playback_progress < 0.0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        ring_w = 4
+        inset = ring_w // 2 + 1
+        c = QColor(MONOS_COLORS.get("blue_400", "#60a5fa"))
+        c.setAlpha(72)
+        pen = QPen(c)
+        pen.setWidth(ring_w)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        rect = self.rect().adjusted(inset, inset, -inset, -inset)
+        start = 90 * 16
+        span = int(-360 * 16 * self._playback_progress)
+        p.drawArc(rect, start, span)
+        p.end()
+
+
 class _PreviewContainer(QWidget):
     """Container for thumbnail with Fill/Fit, Paste and Remove buttons at top-left."""
     paste_requested = Signal()
@@ -2219,7 +2254,7 @@ class _PreviewContainer(QWidget):
         self._btn_cancel.setVisible(False)
         self._btn_cancel.installEventFilter(self)
 
-        self._btn_seq_play = QToolButton(self)
+        self._btn_seq_play = _SequencePlayButton(self)
         self._btn_seq_play.setMouseTracking(True)
         self._btn_seq_play.setCursor(Qt.PointingHandCursor)
         self._btn_seq_play.setIconSize(QSize(24, 24))
@@ -2231,6 +2266,8 @@ class _PreviewContainer(QWidget):
         self._btn_seq_play.setVisible(False)
         self._btn_seq_play.installEventFilter(self)
         self._sequence_play_available = False
+        self._sequence_scrubbing = False
+        self._sequence_playing = False
 
         self._btn_info = QToolButton(self)
         self._btn_info.setMouseTracking(True)
@@ -2324,6 +2361,7 @@ class _PreviewContainer(QWidget):
         show = not self._inbox_mode and has_image
         self.set_show_fill_fit(show)
         self.set_show_remove(show)
+        self._apply_sequence_play_visibility()
 
     def _layout_thumb_overlay_buttons(self) -> None:
         r = self._w.geometry()
@@ -2360,13 +2398,33 @@ class _PreviewContainer(QWidget):
         if not self._sequence_play_available:
             self._btn_seq_play.setVisible(False)
             return
-        self._btn_seq_play.setVisible(bool(self._hovered))
+        if self._sequence_scrubbing:
+            self._btn_seq_play.setVisible(False)
+            return
+        if self._sequence_playing:
+            self._btn_seq_play.setVisible(True)
+            self._btn_seq_play.raise_()
+            return
+        show = bool(self._hovered)
+        self._btn_seq_play.setVisible(show)
+        if show:
+            self._btn_seq_play.raise_()
 
-    def update_sequence_play_control(self, *, available: bool, playing: bool) -> None:
-        """Có sequence thì bật nút play/pause (hiện khi hover); icon theo trạng thái phát."""
+    def update_sequence_play_control(
+        self,
+        *,
+        available: bool,
+        playing: bool,
+        scrubbing: bool = False,
+        progress: float = -1.0,
+    ) -> None:
+        """Sequence play/pause — hidden while scrubbing; rim shows thumb progress."""
         self._sequence_play_available = bool(available)
+        self._sequence_scrubbing = bool(scrubbing)
+        self._sequence_playing = bool(playing)
         if not available:
             self._btn_seq_play.setVisible(False)
+            self._btn_seq_play.set_playback_progress(None)
             return
         if playing:
             self._btn_seq_play.setIcon(lucide_icon("pause", size=24, color_hex=MONOS_COLORS["text_label"]))
@@ -2374,6 +2432,8 @@ class _PreviewContainer(QWidget):
         else:
             self._btn_seq_play.setIcon(lucide_icon("play", size=24, color_hex=MONOS_COLORS["text_label"]))
             self._btn_seq_play.setToolTip("Play sequence")
+        show_progress = not scrubbing and progress >= 0.0
+        self._btn_seq_play.set_playback_progress(progress if show_progress else None)
         self._apply_sequence_play_visibility()
 
     def set_paste_enabled(self, enabled: bool) -> None:
@@ -2392,7 +2452,7 @@ class _PreviewContainer(QWidget):
         self._btn_remove.setVisible(self._hovered and self._show_remove and not self._render_sequence_hide_controls)
 
     def set_render_sequence_hide_controls(self, hide: bool) -> None:
-        """When True (Settings: render sequence only), hide paste/fill/remove; play vẫn theo hover."""
+        """When True (Settings: render sequence only), hide paste/fill/remove; play giữ khi đang playback."""
         self._render_sequence_hide_controls = bool(hide)
         if hide:
             self._pending_action = None
@@ -2420,7 +2480,13 @@ class _PreviewContainer(QWidget):
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         # Only hide when mouse truly leaves the whole overlay area (image + buttons).
         if not self._any_under_mouse():
-            self._set_hovered(False)
+            if self._sequence_playing:
+                if self._hovered:
+                    self._leave_thumb_hover_keep_play()
+                else:
+                    self._apply_sequence_play_visibility()
+            else:
+                self._set_hovered(False)
         super().leaveEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
@@ -2428,8 +2494,12 @@ class _PreviewContainer(QWidget):
         # Mouse move is always delivered when tracking is enabled.
         if self._any_under_mouse():
             self._set_hovered(True)
-        else:
+        elif not self._sequence_playing:
             self._set_hovered(False)
+        elif self._hovered:
+            self._leave_thumb_hover_keep_play()
+        else:
+            self._apply_sequence_play_visibility()
         super().mouseMoveEvent(event)
 
     def _any_under_mouse(self) -> bool:
@@ -2467,20 +2537,25 @@ class _PreviewContainer(QWidget):
                 return True
         return False
 
+    def _hide_thumb_overlay_buttons(self) -> None:
+        self._btn_fill_fit.setVisible(False)
+        self._btn_paste.setVisible(False)
+        self._btn_remove.setVisible(False)
+        self._btn_confirm.setVisible(False)
+        self._btn_cancel.setVisible(False)
+
+    def _leave_thumb_hover_keep_play(self) -> None:
+        """Mouse left thumb while playing — hide hover chrome, keep pause control."""
+        self._hovered = False
+        self._hide_thumb_overlay_buttons()
+        self._apply_sequence_play_visibility()
+
     def _set_hovered(self, on: bool) -> None:
         self._hovered = bool(on)
         if self._render_sequence_hide_controls:
-            self._btn_fill_fit.setVisible(False)
-            self._btn_paste.setVisible(False)
-            self._btn_remove.setVisible(False)
-            self._btn_confirm.setVisible(False)
-            self._btn_cancel.setVisible(False)
+            self._hide_thumb_overlay_buttons()
         elif not self._hovered:
-            self._btn_fill_fit.setVisible(False)
-            self._btn_paste.setVisible(False)
-            self._btn_remove.setVisible(False)
-            self._btn_confirm.setVisible(False)
-            self._btn_cancel.setVisible(False)
+            self._hide_thumb_overlay_buttons()
         else:
             if self._show_fill_fit:
                 self._btn_fill_fit.setVisible(True)
@@ -2507,7 +2582,13 @@ class _PreviewContainer(QWidget):
                 if self.isVisible() and self._cursor_in_hover_region():
                     self._set_hovered(True)
                 elif self._hovered and not self._cursor_in_hover_region():
-                    self._set_hovered(False)
+                    if self._sequence_playing:
+                        if self._hovered:
+                            self._leave_thumb_hover_keep_play()
+                        else:
+                            self._apply_sequence_play_visibility()
+                    else:
+                        self._set_hovered(False)
             return super().eventFilter(watched, event)
 
         if watched in (
@@ -2528,7 +2609,13 @@ class _PreviewContainer(QWidget):
                     self._set_hovered(True)
             elif et in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
                 if not self._any_under_mouse():
-                    self._set_hovered(False)
+                    if self._sequence_playing:
+                        if self._hovered:
+                            self._leave_thumb_hover_keep_play()
+                        else:
+                            self._apply_sequence_play_visibility()
+                    else:
+                        self._set_hovered(False)
 
         return super().eventFilter(watched, event)
 
@@ -2636,10 +2723,12 @@ class _InspectorPreview(QWidget):
         self._seq_tick.setSingleShot(True)
         self._seq_tick.timeout.connect(self._on_inspector_seq_tick)
         self._seq_poll = QTimer(self)
-        self._seq_poll.setSingleShot(True)
-        self._seq_poll.timeout.connect(self._on_inspector_seq_tick)
+        self._seq_poll.setInterval(16)
+        self._seq_poll.timeout.connect(self._on_inspector_seq_poll)
         self._seq_buffer: dict[int, QPixmap] = {}
         self._seq_in_flight: set[int] = set()
+        self._seq_pending_next: int | None = None
+        self._seq_proxy_paths: list[Path] | None = None
         self._seq_playing = False
         self._seq_index = 0
         self._seq_scrubbing = False
@@ -2670,6 +2759,60 @@ class _InspectorPreview(QWidget):
         dpr = max(1.0, float(wgt.devicePixelRatioF()))
         side = int(max(w, h) * dpr)
         return max(64, min(2048, ((side + 31) // 32) * 32))
+
+    def _inspector_seq_decode_max_side(self) -> int:
+        """Flipbook decode — viewport bucket × preview resolution scale from settings."""
+        from monostudio.ui_qt.video_preview_settings import read_video_preview_proxy_scale
+
+        base = self._inspector_preview_decode_max_side()
+        scale = read_video_preview_proxy_scale(self._qsettings)
+        side = int(base * max(0.125, min(1.0, float(scale))))
+        return max(64, min(2048, ((side + 31) // 32) * 32))
+
+    def _refresh_inspector_seq_proxy_paths(self) -> None:
+        self._seq_proxy_paths = None
+        if not self._sequence_frames or not self._inspector_seq_is_heavy():
+            return
+        from monostudio.core.sequence_proxy_cache import (
+            expected_proxy_frame_paths,
+            lookup_sequence_proxy,
+        )
+        from monostudio.ui_qt.ocio_preview_settings import ocio_preview_cache_token
+        from monostudio.ui_qt.video_preview_settings import read_video_preview_proxy_scale
+
+        scale = read_video_preview_proxy_scale(self._qsettings)
+        ocio = ocio_preview_cache_token(self._qsettings)
+        manifest = lookup_sequence_proxy(
+            self._sequence_frames,
+            scale=scale,
+            ocio_token=ocio,
+        )
+        if manifest is not None:
+            self._seq_proxy_paths = manifest.proxy_frame_paths()
+            return
+        _root, paths = expected_proxy_frame_paths(
+            self._sequence_frames,
+            scale=scale,
+            ocio_token=ocio,
+        )
+        if any(p.is_file() for p in paths):
+            self._seq_proxy_paths = list(paths)
+
+    def _inspector_seq_path_for(self, idx: int) -> tuple[Path, bool]:
+        if self._seq_proxy_paths and 0 <= idx < len(self._seq_proxy_paths):
+            p = self._seq_proxy_paths[idx]
+            try:
+                if p.is_file() and p.stat().st_size >= 32:
+                    return p, True
+            except OSError:
+                pass
+        return self._sequence_frames[idx], False
+
+    def _inspector_seq_decode_side_for(self, idx: int) -> int:
+        _path, is_proxy = self._inspector_seq_path_for(idx)
+        if is_proxy:
+            return self._inspector_preview_decode_max_side()
+        return self._inspector_seq_decode_max_side()
 
     def _decode_side_for_current_item(self) -> int:
         """Preview-sized decode, capped to native source resolution."""
@@ -3011,6 +3154,7 @@ class _InspectorPreview(QWidget):
         listed = frames if isinstance(frames, list) else []
         self._sequence_frames = listed
         self._seq_index = (len(listed) // 2) if listed else 0
+        self._refresh_inspector_seq_proxy_paths()
         self._update_sequence_play_button()
         self._sync_inspector_thumb_tooltip()
 
@@ -3050,10 +3194,20 @@ class _InspectorPreview(QWidget):
         lines.append("Right-click: menu (paste, remove, open file…).")
         self._container.set_preview_help_text("\n".join(lines))
 
+    def _sequence_play_progress_fraction(self) -> float:
+        n = len(self._sequence_frames)
+        if n <= 0:
+            return 0.0
+        if n == 1:
+            return 1.0
+        return max(0.0, min(1.0, self._seq_index / float(n - 1)))
+
     def _update_sequence_play_button(self) -> None:
         self._container.update_sequence_play_control(
             available=bool(self._sequence_frames),
             playing=self._seq_playing,
+            scrubbing=self._seq_scrubbing,
+            progress=self._sequence_play_progress_fraction(),
         )
 
     def _inspector_thumb_hit_test_blocks_scrub(self, pos: QPoint) -> bool:
@@ -3177,7 +3331,8 @@ class _InspectorPreview(QWidget):
         self._mmb_folder_drag_start = None
         self._seq_live_display = False
         self._seq_tick.stop()
-        self._seq_poll.stop()
+        self._stop_inspector_seq_poll()
+        self._seq_pending_next = None
         self._seq_buffer.clear()
         self._seq_in_flight.clear()
         if self._seq_pool is not None:
@@ -3204,10 +3359,10 @@ class _InspectorPreview(QWidget):
     def _ensure_inspector_seq_pool(self) -> None:
         if self._seq_pool is None:
             self._seq_pool = QThreadPool(self)
-            self._seq_pool.setMaxThreadCount(4)
+        self._seq_pool.setMaxThreadCount(6)
 
     def _inspector_seq_is_heavy(self) -> bool:
-        heavy = {".exr", ".hdr"}
+        heavy = {".exr", ".hdr", ".dpx"}
         if not self._sequence_frames:
             return False
         for p in (self._sequence_frames[0], self._sequence_frames[-1]):
@@ -3216,15 +3371,42 @@ class _InspectorPreview(QWidget):
         return True
 
     def _inspector_seq_prefetch_n(self) -> int:
-        return 1 if self._inspector_seq_is_heavy() else 3
+        if not self._inspector_seq_is_heavy():
+            return 4
+        from monostudio.ui_qt.video_preview_settings import read_video_preview_proxy_scale
+
+        scale = read_video_preview_proxy_scale(self._qsettings)
+        if self._seq_proxy_paths:
+            return 6
+        if scale <= 0.125:
+            return 3
+        if scale <= 0.25:
+            return 4
+        if scale <= 0.5:
+            return 3
+        return 2
+
+    def _inspector_seq_buffer_evict_distance(self, k: int) -> int:
+        n = len(self._sequence_frames)
+        if n <= 1:
+            return 0
+        linear = abs(k - self._seq_index)
+        if self._seq_playing:
+            return min(linear, n - linear)
+        return linear
 
     def _trim_inspector_seq_buffer(self) -> None:
-        cap = 6
+        cap = 12 if self._seq_playing else 8
+        protected = {self._seq_index}
+        if self._seq_pending_next is not None:
+            protected.add(self._seq_pending_next)
         while len(self._seq_buffer) > cap:
             best_k = None
             best_d = -1
             for k in self._seq_buffer:
-                d = abs(k - self._seq_index)
+                if k in protected:
+                    continue
+                d = self._inspector_seq_buffer_evict_distance(k)
                 if d > best_d:
                     best_d = d
                     best_k = k
@@ -3234,7 +3416,7 @@ class _InspectorPreview(QWidget):
                 break
 
     def _inspector_seq_decode_bucket(self) -> int:
-        mx = self._inspector_preview_decode_max_side()
+        mx = self._inspector_seq_decode_side_for(self._seq_index)
         return max(64, (mx // 64) * 64)
 
     def _inspector_seq_buffer_side(self, idx: int) -> int:
@@ -3246,8 +3428,19 @@ class _InspectorPreview(QWidget):
     def _inspector_seq_frame_ok(self, idx: int) -> bool:
         if idx not in self._seq_buffer:
             return False
-        bucket = self._inspector_seq_decode_bucket()
+        bucket = max(64, (self._inspector_seq_decode_side_for(idx) // 64) * 64)
         return self._inspector_seq_buffer_side(idx) >= max(64, bucket - 48)
+
+    def _prefetch_inspector_seq_from(self, base: int) -> None:
+        n = len(self._sequence_frames)
+        if n <= 0:
+            return
+        pn = self._inspector_seq_prefetch_n()
+        for k in range(1, pn + 1):
+            j = (base + k) % n
+            self._request_inspector_seq_decode(j)
+        if n > 1 and base >= n - 1:
+            self._request_inspector_seq_decode(0)
 
     def _request_inspector_seq_decode(self, idx: int) -> None:
         n = len(self._sequence_frames)
@@ -3263,9 +3456,10 @@ class _InspectorPreview(QWidget):
             return
         self._ensure_inspector_seq_pool()
         self._seq_in_flight.add(idx)
-        mx = self._inspector_preview_decode_max_side()
+        path, _is_proxy = self._inspector_seq_path_for(idx)
+        mx = self._inspector_seq_decode_side_for(idx)
         self._seq_pool.start(
-            _InspectorSeqDecodeRunnable(idx, self._sequence_frames[idx], mx, self._seq_sig)
+            _InspectorSeqDecodeRunnable(idx, path, mx, self._seq_sig)
         )
 
     def _show_inspector_seq_frame(self, idx: int) -> None:
@@ -3278,10 +3472,12 @@ class _InspectorPreview(QWidget):
         if idx in self._seq_buffer and self._inspector_seq_frame_ok(idx):
             w.set_pixmap(self._seq_buffer[idx], use_fit=self._last_thumb_use_fit)
             self._seq_live_display = True
+            self._update_sequence_play_button()
             return
         if idx in self._seq_buffer:
             del self._seq_buffer[idx]
         self._request_inspector_seq_decode(idx)
+        self._update_sequence_play_button()
 
     def _scrub_inspector_seq_to_x(self, lx: int, width: int) -> None:
         n = len(self._sequence_frames)
@@ -3289,7 +3485,8 @@ class _InspectorPreview(QWidget):
             return
         self._seq_playing = False
         self._seq_tick.stop()
-        self._seq_poll.stop()
+        self._stop_inspector_seq_poll()
+        self._seq_pending_next = None
         ww = max(1, width)
         frac = max(0.0, min(1.0, lx / float(ww)))
         idx = int(round(frac * (n - 1)))
@@ -3307,28 +3504,24 @@ class _InspectorPreview(QWidget):
             # Pause: giữ frame + index; lần play sau tiếp từ đây.
             self._seq_playing = False
             self._seq_tick.stop()
-            self._seq_poll.stop()
+            self._stop_inspector_seq_poll()
+            self._seq_pending_next = None
             self._update_sequence_play_button()
             return
         self._seq_playing = False
         self._seq_tick.stop()
-        self._seq_poll.stop()
-        self._seq_in_flight.clear()
-        if self._seq_pool is not None:
-            self._seq_pool.clear()
+        self._stop_inspector_seq_poll()
+        self._seq_pending_next = None
         bucket = self._inspector_seq_decode_bucket()
         if self._seq_decode_bucket != bucket or any(
             not self._inspector_seq_frame_ok(k) for k in list(self._seq_buffer)
         ):
             self._seq_buffer.clear()
         self._seq_decode_bucket = bucket
+        self._refresh_inspector_seq_proxy_paths()
         self._seq_playing = True
         self._request_inspector_seq_decode(self._seq_index)
-        pn = self._inspector_seq_prefetch_n()
-        n = len(self._sequence_frames)
-        for k in range(1, min(pn + 1, n)):
-            j = (self._seq_index + k) % n
-            self._request_inspector_seq_decode(j)
+        self._prefetch_inspector_seq_from(self._seq_index)
         self._schedule_inspector_seq_tick()
         self._update_sequence_play_button()
 
@@ -3339,21 +3532,56 @@ class _InspectorPreview(QWidget):
         ms = max(1, round(1000 / max(1, min(60, int(fps)))))
         self._seq_tick.start(ms)
 
+    def _stop_inspector_seq_poll(self) -> None:
+        self._seq_poll.stop()
+
+    def _ensure_inspector_seq_poll(self) -> None:
+        if not self._seq_playing or self._seq_pending_next is None:
+            return
+        if not self._seq_poll.isActive():
+            self._seq_poll.start()
+
+    def _inspector_seq_next_index(self, current: int) -> int:
+        n = len(self._sequence_frames)
+        if n <= 0:
+            return 0
+        return (int(current) + 1) % n
+
+    def _advance_inspector_seq_playback(self) -> None:
+        if not self._seq_playing or not self._sequence_frames or self._seq_scrubbing:
+            return
+        nxt = self._inspector_seq_next_index(self._seq_index)
+        self._seq_pending_next = nxt
+        if nxt in self._seq_buffer and self._inspector_seq_frame_ok(nxt):
+            self._seq_pending_next = None
+            self._stop_inspector_seq_poll()
+            self._show_inspector_seq_frame(nxt)
+            self._prefetch_inspector_seq_from(self._seq_index)
+            self._schedule_inspector_seq_tick()
+            return
+        self._request_inspector_seq_decode(nxt)
+        self._prefetch_inspector_seq_from(nxt)
+        self._ensure_inspector_seq_poll()
+
+    def _on_inspector_seq_poll(self) -> None:
+        if not self._seq_playing or self._seq_pending_next is None:
+            self._stop_inspector_seq_poll()
+            return
+        pending = self._seq_pending_next
+        if pending in self._seq_buffer and self._inspector_seq_frame_ok(pending):
+            self._seq_pending_next = None
+            self._stop_inspector_seq_poll()
+            self._show_inspector_seq_frame(pending)
+            self._prefetch_inspector_seq_from(self._seq_index)
+            self._schedule_inspector_seq_tick()
+            return
+        self._request_inspector_seq_decode(pending)
+        self._prefetch_inspector_seq_from(pending)
+
     def _on_inspector_seq_tick(self) -> None:
         if not self._seq_playing or not self._sequence_frames or self._seq_scrubbing:
             return
-        n = len(self._sequence_frames)
-        nxt = (self._seq_index + 1) % n
-        pn = self._inspector_seq_prefetch_n()
-        if nxt in self._seq_buffer and self._inspector_seq_frame_ok(nxt):
-            self._show_inspector_seq_frame(nxt)
-            for k in range(1, pn + 1):
-                j = (self._seq_index + k) % n
-                self._request_inspector_seq_decode(j)
-            self._schedule_inspector_seq_tick()
-        else:
-            self._request_inspector_seq_decode(nxt)
-            self._seq_poll.start(16)
+        self._advance_inspector_seq_playback()
 
     def _on_inspector_seq_frame_ready(self, idx: int, image: object) -> None:
         self._seq_in_flight.discard(idx)
@@ -3365,15 +3593,30 @@ class _InspectorPreview(QWidget):
             if not pix.isNull():
                 self._seq_buffer[idx] = pix
                 self._trim_inspector_seq_buffer()
+        pending = self._seq_pending_next
+        if self._seq_playing and pending is not None and idx == pending:
+            if self._inspector_seq_frame_ok(idx):
+                self._seq_pending_next = None
+                self._stop_inspector_seq_poll()
+                self._show_inspector_seq_frame(idx)
+                self._prefetch_inspector_seq_from(self._seq_index)
+                self._schedule_inspector_seq_tick()
+            else:
+                if idx in self._seq_buffer:
+                    del self._seq_buffer[idx]
+                self._request_inspector_seq_decode(idx)
+                self._ensure_inspector_seq_poll()
+            return
         if idx == self._seq_index and idx in self._seq_buffer and self._inspector_seq_frame_ok(idx):
             self._container._w.set_pixmap(self._seq_buffer[idx], use_fit=self._last_thumb_use_fit)
             self._seq_live_display = True
+            self._update_sequence_play_button()
 
     def _on_inspector_preview_resize(self) -> None:
         if not self._sequence_frames:
             self._seq_decode_bucket = None
             return
-        mx = self._inspector_preview_decode_max_side()
+        mx = self._inspector_seq_decode_max_side()
         b = max(64, (mx // 64) * 64)
         if b == self._seq_decode_bucket:
             return
@@ -3386,11 +3629,7 @@ class _InspectorPreview(QWidget):
             self._seq_pool.clear()
         self._show_inspector_seq_frame(self._seq_index)
         if self._seq_playing:
-            pn = self._inspector_seq_prefetch_n()
-            n = len(self._sequence_frames)
-            for k in range(1, min(pn + 1, n)):
-                j = (self._seq_index + k) % n
-                self._request_inspector_seq_decode(j)
+            self._prefetch_inspector_seq_from(self._seq_index)
 
     def _department_label_for_active(self) -> str | None:
         dept_id = self._active_department
@@ -3451,7 +3690,8 @@ class _InspectorPreview(QWidget):
             if self._seq_playing:
                 self._seq_playing = False
                 self._seq_tick.stop()
-                self._seq_poll.stop()
+                self._stop_inspector_seq_poll()
+                self._seq_pending_next = None
                 self._restore_static_thumb_from_cache()
             self._open_inspector_thumbnail_externally()
             self._update_sequence_play_button()
@@ -3486,6 +3726,7 @@ class _InspectorPreview(QWidget):
             if event.button() == Qt.MouseButton.LeftButton and self._sequence_frames:
                 if not self._inspector_thumb_hit_test_blocks_scrub(mpos):
                     self._seq_scrubbing = True
+                    self._update_sequence_play_button()
                     self._scrub_inspector_seq_from_event(event)
                     return True
             if event.button() == Qt.MouseButton.MiddleButton and self._sequence_folder and self._sequence_folder.is_dir():
@@ -3509,6 +3750,7 @@ class _InspectorPreview(QWidget):
         elif et == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
             if event.button() == Qt.MouseButton.LeftButton and self._seq_scrubbing:
                 self._seq_scrubbing = False
+                self._update_sequence_play_button()
                 return True
             if event.button() == Qt.MouseButton.MiddleButton:
                 self._mmb_folder_drag_start = None

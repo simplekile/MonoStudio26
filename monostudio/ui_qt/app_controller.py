@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 from monostudio.core.dcc_blender import BlenderDccAdapter
 from monostudio.core.dcc_affinity import AffinityDccAdapter
+from monostudio.core.comp_render_paths import build_comp_saver_spec
 from monostudio.core.dcc_fusion import FusionDccAdapter
 from monostudio.core.dcc_houdini import HoudiniDccAdapter
 from monostudio.core.dcc_maya import MayaDccAdapter
@@ -348,7 +349,7 @@ class AppController(QObject):
             raise RuntimeError("No project is selected; cannot open DCC.")
         if not file_path.is_file():
             raise RuntimeError(f"Work file does not exist: {file_path!s}")
-        ctx = self._build_context(item=item, department=department, dcc=dcc)
+        ctx = self._build_context(item=item, department=department, dcc=dcc, work_file=file_path)
         adapter = self._dcc_adapter(dcc)
         if adapter is None:
             raise RuntimeError(f"Unsupported DCC: {dcc!r}")
@@ -609,7 +610,7 @@ class AppController(QObject):
                 work_dir.mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 raise RuntimeError(f"Cannot create work folder: {work_dir!r}") from e
-        ctx = self._build_context(item=item, department=department, dcc=dcc)
+        ctx = self._build_context(item=item, department=department, dcc=dcc, work_file=work_file)
         adapter = self._dcc_adapter(dcc)
         if adapter is None:
             raise RuntimeError(f"Unsupported DCC: {dcc!r}")
@@ -685,7 +686,7 @@ class AppController(QObject):
         shutil.copy2(str(src_path), str(work_file))
 
         pending_create_add(str(item.path), department, dcc)
-        ctx = self._build_context(item=item, department=department, dcc=dcc)
+        ctx = self._build_context(item=item, department=department, dcc=dcc, work_file=work_file)
         adapter = self._dcc_adapter(dcc)
         if adapter is None:
             raise RuntimeError(f"Unsupported DCC: {dcc!r}")
@@ -720,18 +721,46 @@ class AppController(QObject):
         prefix = work_file_prefix(name=item.name, department=department)
         return get_work_file_path(item.path / department / "work", prefix, ext)
 
-    def _build_context(self, *, item: Asset | Shot, department: str, dcc: str) -> dict[str, Any]:
+    def _build_context(
+        self,
+        *,
+        item: Asset | Shot,
+        department: str,
+        dcc: str,
+        work_file: Path | None = None,
+    ) -> dict[str, Any]:
         project_id = self._project_root.name if self._project_root else ""
         if not project_id:
             raise RuntimeError("Cannot resolve project_id from project root.")
         entity_type = "asset" if isinstance(item, Asset) else "shot"
-        return {
+        ctx: dict[str, Any] = {
             "project_id": project_id,
             "entity_type": entity_type,
             "entity_id": item.name,
             "department": department,
             "dcc": dcc,
         }
+        if self._project_root is not None:
+            ctx["project_root"] = str(self._project_root)
+        ws = self._settings.value("workspace/root", "", str) if self._settings is not None else ""
+        if ws and str(ws).strip():
+            ctx["workspace_root"] = str(ws).strip()
+        if (
+            work_file is not None
+            and self._project_root is not None
+            and (dcc or "").strip().casefold() == "fusion"
+            and (department or "").strip().casefold() == "comp"
+        ):
+            spec = build_comp_saver_spec(
+                entity_name=item.name,
+                department=department,
+                work_file=work_file,
+                work_path=work_file.parent,
+            )
+            ctx["work_file"] = str(work_file)
+            ctx["work_path"] = str(work_file.parent)
+            ctx["comp_render"] = spec.as_context_dict()
+        return ctx
 
     def _dcc_workfile_extension(self, dcc_id: str) -> str:
         """
@@ -850,7 +879,11 @@ class AppController(QObject):
             return "Fusion"
 
     def _fusion_adapter(self) -> FusionDccAdapter:
-        return FusionDccAdapter(fusion_executable=self._fusion_executable(), repo_root=self._repo_root)
+        return FusionDccAdapter(
+            fusion_executable=self._fusion_executable(),
+            repo_root=self._repo_root,
+            settings=self._settings,
+        )
 
     def _dcc_adapter(
         self, dcc: str

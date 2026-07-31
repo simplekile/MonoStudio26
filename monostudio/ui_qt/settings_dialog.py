@@ -187,6 +187,10 @@ from monostudio.core.ffmpeg_resolve import (
     write_ffmpeg_executable_path,
 )
 from monostudio.core.video_proxy_cache import clear_all_proxy_cache, proxy_cache_disk_usage
+from monostudio.core.sequence_proxy_cache import (
+    clear_all_sequence_proxy_cache,
+    sequence_proxy_cache_disk_usage,
+)
 from monostudio.core.version import get_app_version
 from monostudio.ui_qt.delete_confirm_dialog import ask_delete
 from monostudio.ui_qt.force_rename_project_id_dialog import ForceRenameProjectIdDialog
@@ -703,6 +707,7 @@ class SettingsDialog(MonosDialog):
     nav_quick_slots_changed = Signal()
     hotkeys_changed = Signal()
     preview_display_changed = Signal()
+    fusion_comp_preflight_changed = Signal()
 
     def __init__(
         self,
@@ -744,6 +749,7 @@ class SettingsDialog(MonosDialog):
         self._substance_painter_exe_field: QLineEdit | None = None
         self._affinity_exe_field: QLineEdit | None = None
         self._rizomuv_exe_field: QLineEdit | None = None
+        self._fusion_comp_preflight_cb: QCheckBox | None = None
         self._pipeline_editor: PipelineStructureEditorWidget | None = None
         self._create_default_combos: dict[str, QComboBox] = {}
         self._create_default_form_layout: QFormLayout | None = None
@@ -782,18 +788,8 @@ class SettingsDialog(MonosDialog):
 
         self._discord_integrations_banner: QLabel | None = None
         self._discord_enabled_cb: QCheckBox | None = None
-        self._discord_webhook_field: QLineEdit | None = None
-        self._discord_url_replace_btn: QPushButton | None = None
-        self._discord_label_field: QLineEdit | None = None
-        self._discord_mention_cb: QCheckBox | None = None
-        self._discord_note_done_cb: QCheckBox | None = None
-        self._discord_inbox_cb: QCheckBox | None = None
-        self._discord_schedule_cb: QCheckBox | None = None
-        self._discord_schedule_assigned_cb: QCheckBox | None = None
-        self._discord_test_btn: QPushButton | None = None
+        self._discord_channels_editor: QWidget | None = None
         self._discord_test_notifications_btn: QPushButton | None = None
-        self._discord_stored_url: str = ""
-        self._discord_url_editing: bool = False
 
         # Tier 1: left nav — General | Pipeline | DCCs | Project (other scopes lazy-built)
         self._content_stack = QStackedWidget(self)
@@ -2133,22 +2129,13 @@ class SettingsDialog(MonosDialog):
 
     def _refresh_integrations_access_lock(self) -> None:
         admin_ok = is_admin_capable()
-        widgets = (
-            self._discord_enabled_cb,
-            self._discord_webhook_field,
-            self._discord_url_replace_btn,
-            self._discord_label_field,
-            self._discord_mention_cb,
-            self._discord_note_done_cb,
-            self._discord_inbox_cb,
-            self._discord_schedule_cb,
-            self._discord_schedule_assigned_cb,
-            self._discord_test_btn,
-            self._discord_test_notifications_btn,
-        )
-        for w in widgets:
-            if w is not None:
-                w.setEnabled(admin_ok)
+        if self._discord_enabled_cb is not None:
+            self._discord_enabled_cb.setEnabled(admin_ok)
+        if self._discord_test_notifications_btn is not None:
+            self._discord_test_notifications_btn.setEnabled(admin_ok)
+        editor = self._discord_channels_editor
+        if editor is not None and hasattr(editor, "set_admin_enabled"):
+            editor.set_admin_enabled(admin_ok)
         if self._discord_integrations_banner is not None:
             if has_access_restrictions() and not admin_ok:
                 self._discord_integrations_banner.setText(
@@ -2159,100 +2146,41 @@ class SettingsDialog(MonosDialog):
                 self._discord_integrations_banner.setVisible(False)
 
     def _refresh_discord_integrations_ui(self) -> None:
-        from monostudio.core.integrations_config import (
-            get_primary_webhook,
-            is_event_enabled,
-            load_integrations,
-            mask_webhook_url,
-        )
+        from monostudio.core.integrations_config import load_integrations
+        from monostudio.ui_qt.discord_webhook_channels_editor import DiscordWebhookChannelsEditor
 
-        if self._discord_enabled_cb is None:
+        if self._discord_enabled_cb is None or not isinstance(
+            self._discord_channels_editor, DiscordWebhookChannelsEditor
+        ):
             return
+        editor = self._discord_channels_editor
         if self._workspace_root is None:
-            self._discord_stored_url = ""
-            self._discord_url_editing = False
             self._discord_enabled_cb.setChecked(False)
-            if self._discord_mention_cb is not None:
-                self._discord_mention_cb.setChecked(True)
-            if self._discord_note_done_cb is not None:
-                self._discord_note_done_cb.setChecked(False)
-            if self._discord_inbox_cb is not None:
-                self._discord_inbox_cb.setChecked(False)
-            if self._discord_schedule_cb is not None:
-                self._discord_schedule_cb.setChecked(False)
-            if self._discord_schedule_assigned_cb is not None:
-                self._discord_schedule_assigned_cb.setChecked(False)
-            if self._discord_label_field is not None:
-                self._discord_label_field.clear()
-            if self._discord_webhook_field is not None:
-                self._discord_webhook_field.clear()
-                self._discord_webhook_field.setReadOnly(True)
-                self._discord_webhook_field.setPlaceholderText("Select a workspace first")
+            editor.load_webhooks([])
             return
 
         config = load_integrations(self._workspace_root)
         discord = config.get("discord") if isinstance(config.get("discord"), dict) else {}
-        wh = get_primary_webhook(config)
-        self._discord_stored_url = str(wh.get("url") or "").strip() if wh else ""
-        self._discord_url_editing = False
+        webhooks = discord.get("webhooks") if isinstance(discord.get("webhooks"), list) else []
         self._discord_enabled_cb.setChecked(bool(discord.get("enabled")))
-        if self._discord_mention_cb is not None:
-            self._discord_mention_cb.setChecked(is_event_enabled(config, "mention"))
-        if self._discord_note_done_cb is not None:
-            self._discord_note_done_cb.setChecked(is_event_enabled(config, "note_done"))
-        if self._discord_inbox_cb is not None:
-            self._discord_inbox_cb.setChecked(
-                is_event_enabled(config, "inbox_received")
-                or is_event_enabled(config, "inbox_distributed")
-                or is_event_enabled(config, "outbox_received")
-            )
-        if self._discord_schedule_cb is not None:
-            self._discord_schedule_cb.setChecked(is_event_enabled(config, "schedule_due"))
-        if self._discord_schedule_assigned_cb is not None:
-            self._discord_schedule_assigned_cb.setChecked(is_event_enabled(config, "schedule_assigned"))
-        if self._discord_label_field is not None:
-            self._discord_label_field.setText(str(wh.get("label") or "").strip() if wh else "")
-        if self._discord_webhook_field is not None:
-            if self._discord_stored_url:
-                self._discord_webhook_field.setText(mask_webhook_url(self._discord_stored_url))
-                self._discord_webhook_field.setReadOnly(True)
-                self._discord_webhook_field.setPlaceholderText("")
-            else:
-                self._discord_webhook_field.clear()
-                self._discord_webhook_field.setReadOnly(False)
-                self._discord_webhook_field.setPlaceholderText(
-                    "https://discord.com/api/webhooks/…"
-                )
+        editor.load_webhooks(webhooks)
 
     def _discord_effective_webhook_url(self) -> str:
-        from monostudio.core.integrations_config import is_valid_discord_webhook_url
+        from monostudio.ui_qt.discord_webhook_channels_editor import DiscordWebhookChannelsEditor
 
-        if self._discord_url_editing and self._discord_webhook_field is not None:
-            candidate = (self._discord_webhook_field.text() or "").strip()
-            if is_valid_discord_webhook_url(candidate):
-                return candidate
-        if self._discord_stored_url:
-            return self._discord_stored_url
-        if self._discord_webhook_field is not None:
-            candidate = (self._discord_webhook_field.text() or "").strip()
-            if is_valid_discord_webhook_url(candidate):
-                return candidate
+        editor = self._discord_channels_editor
+        if isinstance(editor, DiscordWebhookChannelsEditor):
+            return editor.first_valid_url()
         return ""
 
-    def _on_discord_replace_url(self) -> None:
-        if self._discord_webhook_field is None:
-            return
-        self._discord_url_editing = True
-        self._discord_webhook_field.setReadOnly(False)
-        self._discord_webhook_field.clear()
-        self._discord_webhook_field.setPlaceholderText("https://discord.com/api/webhooks/…")
-        self._discord_webhook_field.setFocus()
-
-    def _on_discord_send_test(self) -> None:
+    def _on_discord_channel_send_test(self, row) -> None:
         from monostudio.core.discord_webhook import send_test_webhook
         from monostudio.core.user_identity import get_current_user_display_name
 
-        url = self._discord_effective_webhook_url()
+        if row is None:
+            QMessageBox.warning(self, "Discord", "Add a valid webhook URL first.")
+            return
+        url = row.effective_url()
         ok, err = send_test_webhook(
             self._workspace_root,
             user_name=get_current_user_display_name(self._workspace_root),
@@ -2277,42 +2205,31 @@ class SettingsDialog(MonosDialog):
 
     def _persist_discord_integrations(self) -> bool:
         from monostudio.core.integrations_config import (
-            build_integrations_from_ui,
-            is_valid_discord_webhook_url,
+            build_integrations_from_webhooks,
             load_integrations,
             write_integrations,
         )
+        from monostudio.ui_qt.discord_webhook_channels_editor import DiscordWebhookChannelsEditor
 
         if self._workspace_root is None or self._discord_enabled_cb is None:
             return True
+        if not isinstance(self._discord_channels_editor, DiscordWebhookChannelsEditor):
+            return True
+
         enabled = self._discord_enabled_cb.isChecked()
-        url = self._discord_effective_webhook_url()
-        label = (self._discord_label_field.text() or "").strip() if self._discord_label_field else ""
-        mention = bool(self._discord_mention_cb and self._discord_mention_cb.isChecked())
-        note_done = bool(self._discord_note_done_cb and self._discord_note_done_cb.isChecked())
-        inbox_enabled = bool(self._discord_inbox_cb and self._discord_inbox_cb.isChecked())
-        schedule_due = bool(self._discord_schedule_cb and self._discord_schedule_cb.isChecked())
-        schedule_assigned = bool(
-            self._discord_schedule_assigned_cb and self._discord_schedule_assigned_cb.isChecked()
-        )
-        if enabled and not is_valid_discord_webhook_url(url):
+        webhooks = self._discord_channels_editor.to_webhook_dicts()
+        if enabled and not webhooks:
             QMessageBox.warning(
                 self,
                 "Discord",
-                "Enable Discord requires a valid webhook URL.\n"
+                "Enable Discord requires at least one valid webhook URL.\n"
                 "Create an Incoming Webhook in Discord channel settings, then paste the URL here.",
             )
             return False
         existing = load_integrations(self._workspace_root)
-        config = build_integrations_from_ui(
+        config = build_integrations_from_webhooks(
             enabled=enabled,
-            webhook_url=url,
-            label=label,
-            mention_enabled=mention,
-            inbox_enabled=inbox_enabled,
-            schedule_due_enabled=schedule_due,
-            schedule_assigned_enabled=schedule_assigned,
-            note_done_enabled=note_done,
+            webhooks=webhooks,
             existing=existing,
         )
         try:
@@ -2327,8 +2244,12 @@ class SettingsDialog(MonosDialog):
         except OSError as ex:
             QMessageBox.warning(self, "Discord", str(ex) or "Could not save integrations.")
             return False
-        self._discord_stored_url = url
-        self._discord_url_editing = False
+        try:
+            from monostudio.core.comp_fusion_scripts import refresh_fusion_discord_webhooks_for_workspace
+
+            refresh_fusion_discord_webhooks_for_workspace(self._workspace_root)
+        except Exception:
+            pass
         self._refresh_discord_integrations_ui()
         return True
 
@@ -2766,7 +2687,7 @@ class SettingsDialog(MonosDialog):
         lab = getattr(self, "_video_proxy_cache_size_label", None)
         if lab is None:
             return
-        nbytes = proxy_cache_disk_usage()
+        nbytes = proxy_cache_disk_usage() + sequence_proxy_cache_disk_usage()
         if nbytes <= 0:
             lab.setText("Empty")
             return
@@ -2788,6 +2709,7 @@ class SettingsDialog(MonosDialog):
         if not ask_delete(self, "Clear video proxy cache", msg):
             return
         clear_all_proxy_cache()
+        clear_all_sequence_proxy_cache()
         self._refresh_video_proxy_cache_row()
 
     def _refresh_mpv_update_row(self) -> None:
@@ -4235,6 +4157,18 @@ class SettingsDialog(MonosDialog):
         row_rz_l.addWidget(btn_browse_rz, 0)
         form.addRow("RizomUV Executable", row_rz)
 
+        self._fusion_comp_preflight_cb = QCheckBox(
+            "Check comp before opening Fusion (Saver path + upstream Loader renders)",
+            grp,
+        )
+        if self._settings is not None:
+            from monostudio.ui_qt.comp_saver_preflight import fusion_comp_preflight_enabled
+
+            self._fusion_comp_preflight_cb.setChecked(fusion_comp_preflight_enabled(self._settings))
+        else:
+            self._fusion_comp_preflight_cb.setEnabled(False)
+        form.addRow(self._fusion_comp_preflight_cb)
+
         hint = QLabel(
             "If empty, MonoStudio will try to auto-detect Blender, Maya, Houdini, Substance Painter, Affinity, and RizomUV.\n"
             "Env vars: MONOSTUDIO_BLENDER_EXE, MONOSTUDIO_MAYA_EXE, MONOSTUDIO_HOUDINI_EXE, "
@@ -4249,6 +4183,8 @@ class SettingsDialog(MonosDialog):
         return root
 
     def _build_workspace_discord_integrations_tab(self) -> QWidget:
+        from monostudio.ui_qt.discord_webhook_channels_editor import DiscordWebhookChannelsEditor
+
         scroll = QScrollArea()
         scroll.setObjectName("SettingsPageScroll")
         scroll.setWidgetResizable(True)
@@ -4269,58 +4205,24 @@ class SettingsDialog(MonosDialog):
         card, card_l = add_settings_section(
             inner,
             "Discord",
-            "Post pipeline alerts to a Discord channel via Incoming Webhook. "
-            "URL is stored in workspace .monostudio/integrations.json (synced).",
+            "Post pipeline alerts to Discord channels via Incoming Webhook. "
+            "Each channel can subscribe to different events. "
+            "URLs are stored in workspace .monostudio/integrations.json (synced).",
         )
 
         self._discord_enabled_cb = QCheckBox("Enable Discord notifications", card)
         card_l.addWidget(self._discord_enabled_cb)
 
-        self._discord_webhook_field = QLineEdit(card)
-        self._discord_webhook_field.setProperty("mono", True)
-        style_settings_line_edit(self._discord_webhook_field, min_width=320)
-        self._discord_url_replace_btn = QPushButton("Replace…", card)
-        self._discord_url_replace_btn.setObjectName("SettingsInlineActionButton")
-        self._discord_url_replace_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._discord_url_replace_btn.clicked.connect(self._on_discord_replace_url)
-        url_row = QWidget(card)
-        url_row_l = QHBoxLayout(url_row)
-        url_row_l.setContentsMargins(0, 0, 0, 0)
-        url_row_l.setSpacing(8)
-        url_row_l.addWidget(self._discord_webhook_field, 1)
-        url_row_l.addWidget(self._discord_url_replace_btn, 0)
-        add_settings_field_row(card_l, "Webhook URL", url_row)
-
-        self._discord_label_field = QLineEdit(card)
-        self._discord_label_field.setPlaceholderText("#pipeline-general")
-        style_settings_line_edit(self._discord_label_field, min_width=200)
-        add_settings_field_row(card_l, "Channel label", self._discord_label_field)
-
-        add_settings_subsection_title(card_l, "Events")
-        self._discord_mention_cb = QCheckBox("@mentions in notes", card)
-        self._discord_mention_cb.setChecked(True)
-        card_l.addWidget(self._discord_mention_cb)
-
-        self._discord_note_done_cb = QCheckBox("Note marked done", card)
-        card_l.addWidget(self._discord_note_done_cb)
-
-        self._discord_inbox_cb = QCheckBox("Inbox & Outbox (drop & distribute)", card)
-        card_l.addWidget(self._discord_inbox_cb)
-
-        self._discord_schedule_cb = QCheckBox("Schedule due reminders (daily)", card)
-        card_l.addWidget(self._discord_schedule_cb)
-
-        self._discord_schedule_assigned_cb = QCheckBox("Schedule assignments", card)
-        card_l.addWidget(self._discord_schedule_assigned_cb)
+        add_settings_subsection_title(card_l, "Channels")
+        self._discord_channels_editor = DiscordWebhookChannelsEditor(card)
+        self._discord_channels_editor.channel_test_requested.connect(
+            self._on_discord_channel_send_test
+        )
+        card_l.addWidget(self._discord_channels_editor)
 
         test_row = QWidget(card)
         test_row_l = QHBoxLayout(test_row)
         test_row_l.setContentsMargins(0, 4, 0, 0)
-        self._discord_test_btn = QPushButton("Send test message", test_row)
-        self._discord_test_btn.setObjectName("SettingsInlineActionButton")
-        self._discord_test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._discord_test_btn.clicked.connect(self._on_discord_send_test)
-        test_row_l.addWidget(self._discord_test_btn, 0)
         self._discord_test_notifications_btn = QPushButton("Test notifications…", test_row)
         self._discord_test_notifications_btn.setObjectName("SettingsInlineActionButton")
         self._discord_test_notifications_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4652,6 +4554,12 @@ class SettingsDialog(MonosDialog):
                 )
             if self._settings is not None and self._rizomuv_exe_field is not None:
                 self._settings.setValue("integrations/rizomuv_exe", (self._rizomuv_exe_field.text() or "").strip())
+            if self._settings is not None and self._fusion_comp_preflight_cb is not None:
+                enabled = self._fusion_comp_preflight_cb.isChecked()
+                self._settings.setValue("integrations/fusion_comp_preflight", enabled)
+                self._settings.setValue("integrations/fusion_saver_preflight", enabled)
+                self._settings.setValue("integrations/fusion_upstream_render_preflight", enabled)
+                self.fusion_comp_preflight_changed.emit()
         except Exception:
             pass
 

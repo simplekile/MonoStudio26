@@ -1,20 +1,28 @@
-# MonoStudio 26 — Release v26.17.5
+# MonoStudio 26.18.0
 
-## Highlights
+## Dialog tier design system
+- **Tier 1 / Tier 2** dialog shells (`dialog_tier/`) — frozen golden reference cho New Project, Create Asset/Shot flows
+- **MonoSelect**, **FieldShell**, **MetadataCard**, **DccPicker** — selector và field chrome thống nhất
+- **Elevation + surface tokens** (`elevation.py`, `surfaces.py`) — depth qua luminance, không hardcode hex rải rác
+- **iOS switch** component; Settings dialog refactor theo design system
+- Global QSS/tooltip/scrollbar cập nhật theo surface ladder
 
-- **Paste work file**: Confirm dialog trước khi paste work file thành version mới.
-- **Deep links**: Resolve entity trên Shots (flat folders) ổn định hơn; tests cập nhật.
-- **Page loading**: Deferred tree refresh cho Inbox / Project Guide — ít jank khi đổi trang.
-- **Thumbnails / Inspector / Main View**: Preview & list polish; trash page; worker loop đơn giản hóa.
-- **Pipeline presets**: `types_and_presets.json` / registry tweaks.
+## Fusion comp preflight
+- **Comp loader / saver I/O**, render paths, upstream render check
+- **Preflight hub + dialog** — audit comp savers, upstream issues, apply plan trước khi render
+- Fusion integration mở rộng (`dcc_fusion.py`, `comp_fusion_scripts.py`)
 
-## Changes in this release
+## Video / sequence
+- **Sequence proxy** — PNG flipbook cache cho EXR/DPX/HDR nặng; worker nền + manifest
+- Video preview: proxy build UX, playback backend cải thiện
 
-- feat: `paste_work_file_confirm_dialog.py`.
-- fix: `deep_link.py`, `main_window.py`, `thumbnails.py`, `inspector.py`, `inbox_split_view.py`, `ui_worker_loop.py`.
+## Integrations
+- **Discord webhook channels** editor trong Settings — nhiều kênh, toggle sự kiện từng kênh
+- `integrations_config` mở rộng validation + mask URL
 
-## Install
+## Pipeline UI
+- Inspector comp/review blocks; main view comp preflight entry
+- Shot review card cập nhật; popup position helpers mở rộng
 
-Tải **MonoStudio26_Setup.exe** từ GitHub Releases và chạy. Installer sẽ đóng app nếu đang mở để cập nhật.
-
-**libmpv** / **FFmpeg** / **DJV View**: Settings → General / Updates.
+## Tests
+- Comp I/O, render paths, upstream check, preflight, elevation, surfaces, sequence proxy cache, integrations config

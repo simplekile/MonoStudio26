@@ -1,0 +1,113 @@
+---
+description: Dialog content flow — Hero → Input → Result → Explanation → Action (canonical MonoStudio pattern)
+globs: monostudio/ui_qt/*dialog*.py,monostudio/ui_qt/dialog_tier/**,scripts/test_dialog_tiers.py
+alwaysApply: false
+---
+
+# MONOS — Dialog Content Flow (v1)
+
+**Canonical cognitive model for every MonoStudio dialog.**
+
+Visual chrome is frozen (`plan_dialog_tier_golden_reference_v1.mdc`). This rule governs **information hierarchy** — what the user reads, in what order.
+
+---
+
+## The flow
+
+```
+Hero
+  ↓
+Editable fields        ← INPUT     (what the user provides)
+  ↓
+Generated metadata     ← RESULT    (what the system derives)
+  ↓
+Information            ← EXPLAIN   (what will happen — not a duplicate of result)
+  ↓
+Footer                 ← ACTION    (confirm or cancel)
+```
+
+Mental model for the user:
+
+1. **What do I enter?**
+2. **What does the system produce?**
+3. **What happens when I confirm?**
+4. **Do I proceed?**
+
+---
+
+## Layer → components
+
+| Layer | Role | Approved components |
+|-------|------|---------------------|
+| **Hero** | Context + title | `DialogHero` via `set_sidebar_brand` (L1) or `set_topbar_brand` (L2) |
+| **Input** | User-editable | `FieldRow` + `PlainFieldInput`, `ComboField`, `DateField`, `PathField`, `WorkspacePicker`, … |
+| **Result** | System-generated, read-only | `ProjectIdMetadataCard`, `MetadataCard` (value + mono footnote e.g. “Generated from…”) |
+| **Explain** | Consequences, scope, side effects | `FieldRow` **hint** (when tied to an input) **or** `MetadataCard` **body** (standalone) |
+| **Action** | Commit / dismiss | `GhostButton` Cancel + `GradientPrimaryButton` CTA (`add_footer_btn` / `add_footer_cta`) |
+
+Use `add_form_stretch()` before **Result** so generated output sits in the lower “read” zone (see New Project).
+
+---
+
+## Reference mappings
+
+### New Project (L1 — golden)
+
+| Layer | Content |
+|-------|---------|
+| Hero | New Project · create in workspace |
+| Input | Project name, Start date |
+| Result | `PROJECT ID` card |
+| Explain | Workspace picker + hint: *“All project data will be created in this workspace.”* |
+| Action | Ghost Cancel · Gradient Create Project |
+
+### Create Asset (L2)
+
+| Layer | Content |
+|-------|---------|
+| Hero | Create Asset · add folder to project |
+| Input | Type / Preset, Asset name |
+| Result | `ASSET FOLDER` card (live from preset + name) |
+| Explain | `MetadataCard` *On create* — work/publish subfolders from preset |
+| Action | Ghost Cancel · Gradient Create Asset |
+
+### Create Shot (L2)
+
+| Layer | Content |
+|-------|---------|
+| Hero | Create Shot · add to sequence |
+| Input | Sequence, Shot name |
+| Result | `SHOT FOLDER` card |
+| Explain | `MetadataCard` *On create* — department folders from shot preset |
+| Action | Ghost Cancel · Gradient Create Shot |
+
+---
+
+## Anti-patterns
+
+| Don't | Why |
+|-------|-----|
+| Repeat folder name in field hint **and** result card | Result layer already shows it |
+| Use “Preset” card heading when Type / Preset field exists | Label duplication; use **On create** for explanation |
+| Put explanation **before** generated result | Breaks Input → Result → Explain order |
+| `InfoStrip` / new card chrome for explain | Use `MetadataCard` body or `FieldRow` hint |
+| Skip Explain when side effects exist | User confirms blind |
+
+---
+
+## Checklist (new dialog)
+
+- [ ] Hero names the flow in one line
+- [ ] All user inputs are above `add_form_stretch()`
+- [ ] Exactly one **Result** block per generated artifact (card language matches Project ID)
+- [ ] **Explain** is unique — not repeated in hints, titles, or result footnotes
+- [ ] Footer uses ghost + gradient CTA (L1/L2 create flows)
+- [ ] Compared against New Project content order, not only pixels
+
+---
+
+## Future dialogs
+
+Apply the same flow to **Import Asset**, **Publish**, **Settings** sections, etc.
+
+Tier shell may differ; **content order must not.**

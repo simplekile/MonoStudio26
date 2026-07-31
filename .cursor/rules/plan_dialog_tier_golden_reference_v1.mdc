@@ -1,0 +1,110 @@
+---
+description: Dialog Tier golden reference — FROZEN visual design, design system map, production checklist
+globs: monostudio/ui_qt/dialog_tier/**,scripts/test_dialog_tiers.py,monostudio/ui_qt/*dialog*.py
+alwaysApply: false
+---
+
+# MONOS — Dialog Tier Golden Reference (FROZEN)
+
+**Status:** Visual design **approved** and **frozen** (Jul 2026).
+
+**Golden reference:** `scripts/test_dialog_tiers.py` (harness) + `monostudio/ui_qt/dialog_tier/` (implementation).
+
+**Do not** redesign, “improve”, or tweak layout, spacing, typography, radius, colors, hierarchy, or visual language unless a **real production bug** is found.
+
+---
+
+## Allowed changes only
+
+- Bugs · accessibility · DPI · keyboard navigation · performance · maintainability · code quality · design-system consistency
+
+**Never** visual changes for personal preference.
+
+---
+
+## Tiers
+
+| Tier | Shell | Use case | Harness demo |
+|------|-------|----------|--------------|
+| **L1** | `Tier1Dialog` | Major workspace actions (New Project) | `NewProjectTier1Demo` |
+| **L2** | `Tier2Dialog` | In-project creates (Asset / Shot) | `NewAssetTier2Demo`, `NewShotTier2Demo` |
+
+---
+
+## Component map (public API)
+
+| Design system name | Module | Notes |
+|--------------------|--------|-------|
+| `Tier1Dialog` / `Tier2Dialog` | `dialog_tier` | Shells — shadow, chrome, footer API |
+| `GradientPrimaryButton` | `dialog_tier` | L1 CTA (`add_footer_cta`) |
+| `GhostButton` | `dialog_tier` | L1 Cancel (text-only hover) |
+| `DialogCloseButton` | `dialog_tier` | Chrome × overlay |
+| `FieldShell` | `dialog_tier` | Focus-owned field chrome |
+| `FieldRow` | `dialog_tier` | Label + control + optional hint |
+| `PlainFieldInput` | `dialog_tier` | Single-line in `FieldShell` |
+| `PathField` | `dialog_tier` | Path + browse |
+| `DateField` | `dialog_tier` | Date picker row |
+| `ComboField` | `dialog_tier` | Legacy preset select — prefer `MonoSelect` |
+| `MonoSelect` | `dialog_tier` | Standard selector (E2 popup) |
+| `MetadataCard` / `ProjectIdMetadataCard` | `dialog_tier` | Read-only ID block |
+| `WorkspacePicker` | `dialog_tier` | Workspace path card |
+| `InfoStrip` | `dialog_tier` | Inline help strip |
+| `DialogHairline` | `dialog_tier` | Footer divider |
+| L2 header block | `Tier2Dialog.set_hero()` | Icon badge + title + subtitle |
+
+**Footer pattern (not a separate widget):** `add_footer_btn` / `add_footer_cta` on tier shells.
+
+**Tokens:** `monostudio/ui_qt/dialog_tier/tokens.py` → `T`, `T_METRICS`, `set_tier_theme()`.
+
+**Elevation:** `monostudio/ui_qt/elevation.py` — lightness ladder (`elev_0`…`elev_3`).
+
+**Surface tokens:** `monostudio/ui_qt/surfaces.py` — `SURFACE_*` semantic fills. See `plan_surface_tokens_v1.mdc`.
+
+---
+
+## Key tokens (do not drift)
+
+- **Spacing:** `chrome_pad_x` 32 · `form_spacing_y` 24 · `field_label_gap` 8 · footer pad bottom 24
+- **Radius:** `radius_l1` / `radius_l2` 16 · `radius_sm` 8
+- **Shadow:** 3 layers — ambient (0,12) blur 48 @ 0.10 · middle (0,4) blur 20 @ 0.08 · contact (0,1) blur 4 @ 0.06
+- **Border:** rim overlay > shadow visually; `border_idle_a` / `border_hover_a` on chroma
+- **Focus:** `focus_blue_a` · shell owns stroke (not inner `QLineEdit` border)
+
+---
+
+## Production review (baseline)
+
+| Area | Status | Notes |
+|------|--------|-------|
+| Initial focus | OK | Demos focus first editable field + L1 select-all |
+| Tab order | Default Qt | No custom `setTabOrder` — verify when porting to production |
+| Esc / dismiss | Partial | Close × + Cancel; confirm `MonosDialog` Esc policy per flow |
+| DPI | OK | Device-pixel snap, shadow pixmap cache, Round scale policy |
+| Repaint | Note | L1 sidebar nebula timer repaints dialog — acceptable for harness |
+| Long text | OK | `wordWrap` on subtitles; `_ElidedPathLabel` on paths |
+| Localization | Gap | English hardcoded — use `tr()` when shipping |
+| Resize | Fixed size | Intentional for tier shells |
+| A11y | Gap | Icon-only controls need `setAccessibleName` / descriptions in production |
+| Keyboard | Gap | CTA default button + Enter accept not wired in harness |
+
+**When porting:** fix gaps above without changing golden visuals.
+
+---
+
+## Reviewing new dialogs
+
+1. Read `rule_dialog_design_system_v1.mdc` — never invent visual style.
+2. Read `plan_dialog_content_flow_v1.mdc` — Hero → Input → Result → Explain → Action.
+3. Use `Tier1Dialog` or `Tier2Dialog` + components from `dialog_tier`.
+3. Compare spacing, field shells, footer, shadow, typography against harness demos.
+4. **Do not** change the golden reference to match a new dialog — raise the new dialog to this bar.
+
+---
+
+## Regenerating `reference.py`
+
+If harness still owns edits temporarily, run:
+
+`python tools/_extract_dialog_tier.py`
+
+Then verify: `python scripts/test_dialog_tiers.py`

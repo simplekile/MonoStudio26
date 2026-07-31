@@ -158,7 +158,7 @@ class VideoPlayerSettingsDialog(MonosDialog):
         add_settings_field_row(seq_l, "Preview resolution", self._preview_scale_combo)
         add_settings_helper(
             seq_l,
-            "Decode scale for EXR/DPX sequences — lower is faster. Also used as video proxy scale.",
+            "Decode scale for EXR/DPX sequences. With Proxy on in Video Preview, builds PNG flipbook cache.",
         )
 
         seq_l.addWidget(settings_divider(seq_card))

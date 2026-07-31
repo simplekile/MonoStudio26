@@ -1,0 +1,108 @@
+---
+description: MONOS Elevation System — depth via luminance; surfaces, borders, shadows
+globs: monostudio/ui_qt/**,scripts/test_dialog_tiers.py,.cursor/rules/**
+alwaysApply: false
+---
+
+# MONOS — Elevation System (v1)
+
+**Core principle:** depth is communicated primarily through **surface luminance**, not shadow.
+
+| Rule | Detail |
+|------|--------|
+| Higher elevation | Slightly **brighter** surface |
+| Lower elevation | Slightly **darker** surface |
+| Hue | **Unchanged** — adjust lightness only (~3–5% per level) |
+| Shadow | **Reinforces** elevation — never the primary depth cue |
+| Border | Follows elevation — higher levels use slightly stronger chroma alpha |
+
+**Module:** [`monostudio/ui_qt/elevation.py`](monostudio/ui_qt/elevation.py)
+
+---
+
+## Levels
+
+| Level | Name | Token | Derivation |
+|-------|------|-------|------------|
+| **-1** | Recessed | `SURFACE_FIELD` | `depress(SURFACE_DIALOG, 1)` |
+| **0** | App | `SURFACE_APP` | theme `bg` |
+| **1** | Dialog / Card | `SURFACE_DIALOG`, `SURFACE_CARD` | `elevate(SURFACE_APP, 1)` |
+| **2** | Floating | `SURFACE_POPUP` | `elevate(SURFACE_DIALOG, 1)` — **not** above card |
+| **3** | Transient | `SURFACE_TOOLTIP` | `elevate(SURFACE_POPUP, 1)` |
+
+Future components in the same family:
+
+- `MonoSelect` · `MonoMenu` · `MonoContextMenu` · `MonoCommandPalette` — shared elevation language, different roles.
+
+**MonoSelect:** trigger = `SURFACE_FIELD` (recessed); popup = `SURFACE_POPUP` (one step above dialog). Difference is subtle (~4% lightness) — hierarchy is felt when open beside the field, not shouted.
+
+---
+
+## Tokens
+
+**Use semantic surface tokens in components** — see [`plan_surface_tokens_v1.mdc`](plan_surface_tokens_v1.mdc).
+
+Internal elevation ladder (`elev_0`…`elev_3`) is built at theme init; components read `SURFACE_*` instead.
+
+```python
+from monostudio.ui_qt.surfaces import SURFACE_POPUP, surface_border_color
+from monostudio.ui_qt.dialog_tier import T
+
+fill = T[SURFACE_POPUP]
+stroke = surface_border_color(SURFACE_POPUP, T)
+```
+
+| Token | Meaning |
+|-------|---------|
+| `elev_0` … `elev_3` | Internal lightness steps |
+| `elev_border_idle_N` | Chroma border alpha (idle) |
+| `elev_border_hover_N` | Chroma border alpha (hover) |
+| `elevation_step` | One ``elevate(..., 1)`` HSL lightness delta (default `0.04`) |
+
+Semantic ladder built by ``build_semantic_surface_ladder()`` — see ``plan_surface_tokens_v1.mdc``.
+
+---
+
+## Shadows (reinforcement only)
+
+| Level | Shadow weight |
+|-------|----------------|
+| 0 | None |
+| 1 | Full dialog stack (`dialog_shadow_layers`) |
+| 2 | Light (`mono_select_shadow_layers`) |
+| 3 | Minimal or none — luminance carries depth |
+
+Do **not** use heavy shadow on E3. Do **not** rely on shadow alone for E1/E2.
+
+---
+
+## Component checklist
+
+| Component | Surface | Border |
+|-----------|---------|--------|
+| Dialog shell | `SURFACE_DIALOG` | E1 |
+| `MetadataCard` | `SURFACE_CARD` | E1 (same fill as dialog; border hover +delta) |
+| `MonoSelect` popup | `SURFACE_POPUP` | E2 |
+| `QToolTip` (global) | `SURFACE_TOOLTIP` | E3 |
+| Input `FieldShell` | `SURFACE_FIELD` | field focus rules |
+
+**Recessed inputs** (`SURFACE_FIELD`) are one ``depress()`` step below dialog — darker than `SURFACE_DIALOG`, not a separate hardcoded hex.
+
+---
+
+## When building new UI
+
+1. Pick the **surface token** from the table — do not invent a new surface hex.
+2. Use `T[SURFACE_*]` for fill and `surface_border_color(SURFACE_*, T)` for borders.
+3. Add shadow only if the level calls for it — lighter as elevation rises.
+4. Never change hue for depth; never use bright blue fills for “lifted” surfaces.
+5. Promote repeated patterns to `monostudio/ui_qt/elevation.py` or `dialog_tier/` — not one-off dialog code.
+
+---
+
+## Related rules
+
+- `rule_dialog_design_system_v1.mdc` — compose dialogs from tier + elevation
+- `plan_dialog_tier_golden_reference_v1.mdc` — frozen dialog chrome
+- `tooltip_qss_v1.mdc` — tooltips at E3
+- `rule_popover_position_v1.mdc` — floating placement (E2)

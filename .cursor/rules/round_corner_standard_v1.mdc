@@ -13,31 +13,20 @@ Công thức thống nhất để cửa sổ/popup **bo góc thật** (không g�
 - QSS `border-radius` chỉ áp dụng cho **nội bộ widget**; với top-level (QDialog, QMenu popup), OS vẫn vẽ nền/viền window → góc dễ bị **đen** hoặc vuông.
 - Cần **tắt khung OS** và **cho phép trong suốt**, rồi **tự vẽ shape** bằng mask + paint.
 
-## Công thức bắt buộc
+## Công thức bắt buộc (dialog AA — cập nhật 2026)
 
 | Yêu cầu | Cách làm |
 |--------|----------|
 | Tắt khung OS | `setWindowFlags(windowFlags() \| Qt.FramelessWindowHint)` |
 | Cho phép trong suốt | `setAttribute(Qt.WA_TranslucentBackground, True)` |
-| Bo góc thật (shape) | Tạo mask bằng **QBitmap** + `drawRoundedRect`, rồi `setMask(bitmap)` |
-| Khi nào set mask | Sau khi widget **đã có kích thước**: trong **showEvent** và **resizeEvent** |
-| Vẽ nền/viền mượt | Trong **paintEvent**: vẽ rounded rect (Antialiasing), rồi `super().paintEvent(event)` |
+| Bo góc mượt | **`clearMask()`** — **không** `setMask(QBitmap)` (1-bit → răng cưa). Chi tiết: **`rule_dialog_rounded_border_v1.mdc`** |
+| Viền | Overlay widget con vẽ stroke trên cùng (`raise_` sau content) |
+| Nền multi-pane | Một `paintEvent` dialog + clip outer rounded + pane transparent |
+| Khi nào refresh shape | `showEvent` / `resizeEvent`: overlay geometry + (nếu cần) `clearMask()` |
 
-## Tạo mask (QBitmap)
+## Tạo mask (QBitmap) — deprecated cho dialog
 
-```cpp
-// Pseudocode — trong showEvent / resizeEvent, khi rect() đã có size:
-QBitmap bitmap(width, height);
-bitmap.fill(Qt::color0);   // vùng trong suốt
-QPainter p(&bitmap);
-p.setRenderHint(QPainter::Antialiasing);
-p.setBrush(Qt::color1);
-p.setPen(Qt::NoPen);
-p.drawRoundedRect(rect(), radius, radius);
-setMask(bitmap);
-```
-
-Trong Python (PySide6): `QBitmap(w, h)`, `fill(Qt.GlobalColor.color0)`, vẽ `color1` rounded rect, `setMask(bitmap)`.
+~~Dùng QBitmap + setMask cho dialog mới.~~ Chỉ giữ cho menu/popup nếu chấp nhận jaggy; dialog ưu tiên **paint-only AA** (xem `rule_dialog_rounded_border_v1.mdc`).
 
 ## Vẽ nền + viền (paintEvent)
 
@@ -58,6 +47,8 @@ Trong Python (PySide6): `QBitmap(w, h)`, `fill(Qt.GlobalColor.color0)`, vẽ `co
 ## Tóm tắt
 
 1. **FramelessWindowHint** + **WA_TranslucentBackground**.
-2. **setMask(QBitmap)** với rounded rect, gọi trong **showEvent** / **resizeEvent**.
-3. **paintEvent**: vẽ nền rounded (antialiasing) → super().paintEvent() → (tùy chọn) vẽ viền trên cùng hoặc overlay.
-4. QSS cho widget đó: **background transparent** để không vẽ đè lên paintEvent.
+2. Dialog: **`clearMask()`** + **paintEvent AA** + **border overlay** (không QBitmap mask).
+3. **paintEvent**: vẽ nền rounded (antialiasing) → `super().paintEvent()`; viền qua overlay trên cùng.
+4. QSS pane/dialog: **background transparent** khi nền do dialog vẽ.
+
+→ Dialog tier đầy đủ: **`rule_dialog_rounded_border_v1.mdc`**

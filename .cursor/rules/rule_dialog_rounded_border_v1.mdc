@@ -1,0 +1,97 @@
+---
+description: MONOS — Dialog bo góc AA mượt (không setMask), border overlay, nền multi-pane
+globs: monostudio/ui_qt/style.py, monostudio/ui_qt/**/*dialog*.py, scripts/test_dialog_tiers.py
+alwaysApply: false
+---
+
+# MONOS — Dialog Rounded Border (v1)
+
+Chuẩn đã validate trên `scripts/test_dialog_tiers.py` (Tier 1/2). Dùng khi dialog **frameless + bo góc + viền** phải **mượt**, không răng cưa, không tràn nền ở góc.
+
+## Không làm
+
+| Cách | Vì sao |
+|------|--------|
+| `setMask(QBitmap)` / `setMask(QRegion)` | Mask **1-bit** → góc **răng cưa** dù bật AA khi vẽ mask |
+| Viền chỉ trong `paintEvent` dialog (không overlay) | Child widget opaque **đè** viền khi repaint |
+| Mỗi pane tự vẽ nền vuông full rect | Gradient/nebula **tràn** ra ngoài góc bo dialog |
+| `arcTo` thủ công sai sweep | Fill **xiên chéo** / khe đen ở góc trái |
+
+## Công thức bắt buộc
+
+### 1. `MonosDialog` base (`style.py`)
+
+- `FramelessWindowHint` + `WA_TranslucentBackground`
+- `_update_rounded_mask()` → **`clearMask()`** (không QBitmap)
+- `paintEvent`: vẽ nền `drawRoundedRect` + **Antialiasing**
+- Gọi `super(MonosDialog, self).paintEvent(event)` khi subclass override để tránh vẽ nền radius cũ 12px chồng lên tier 16px
+
+### 2. Viền — `_TierBorderOverlay` (hoặc tương đương)
+
+Widget con **full rect**, `WA_TransparentForMouseEvents`, vẽ **stroke** `drawRoundedRect` inset `0.5px`, `pen.setCosmetic(True)`.
+
+- Tạo trong `__init__`, `raise_()` trong `showEvent` + `resizeEvent`
+- `set_dialog_border_overlay_enabled(False)` nếu dùng overlay tier riêng
+
+### 3. Nền — một lớp trên dialog (multi-pane)
+
+Vẽ trong **`Dialog.paintEvent` trước** `super().paintEvent()`:
+
+1. **Clip ngoài**: `addRoundedRect(bounds, radius, radius)` → `setClipPath`
+2. **Sidebar** (nếu có): `fillPath(_rounded_rect_left(...))`
+3. **Gradient/decoration**: clip kép `IntersectClip` với shape sidebar
+4. **Divider** + **right pane**: `fillPath(_rounded_rect_right(...))`
+5. Pane con: `setAutoFillBackground(False)`, nền **transparent** (QSS)
+
+**Không** vẽ nền opaque trên từng pane con full-bleed.
+
+### 4. Path bo một phía — `arcTo` đúng (PySide6 không có `addRoundedRect(corners=…)`)
+
+Góc **trái** (sweep **-90°**):
+
+```python
+path.moveTo(x + r, y)
+path.lineTo(x + w, y)
+path.lineTo(x + w, y + h)
+path.lineTo(x + r, y + h)
+path.arcTo(x, y + h - 2 * r, 2 * r, 2 * r, 270.0, -90.0)  # bottom-left
+path.lineTo(x, y + r)
+path.arcTo(x, y, 2 * r, 2 * r, 180.0, -90.0)               # top-left
+path.closeSubpath()
+```
+
+Góc **phải**:
+
+```python
+path.moveTo(x, y)
+path.lineTo(x + w - r, y)
+path.arcTo(x + w - 2 * r, y, 2 * r, 2 * r, 90.0, -90.0)
+path.lineTo(x + w, y + h - r)
+path.arcTo(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0.0, -90.0)
+path.lineTo(x, y + h)
+path.closeSubpath()
+```
+
+Luôn clamp: `r = min(radius, w/2, h/2)`.
+
+## Tham chiếu triển khai
+
+| Thành phần | File |
+|------------|------|
+| `clearMask`, `MonosDialog.paintEvent` | `monostudio/ui_qt/style.py` |
+| `_TierBorderOverlay`, `_paint_l1_dialog_background`, path helpers | `scripts/test_dialog_tiers.py` |
+| Tier 1 demo hoàn chỉnh | `Tier1Dialog`, `NewProjectTier1Demo` |
+
+## Checklist dialog mới
+
+- [ ] Không `setMask` / QBitmap mask
+- [ ] Nền AA trong `paintEvent` (hoặc helper `_paint_*_background`)
+- [ ] Border overlay widget `raise_()` sau layout
+- [ ] Child pane transparent; decoration clip theo outer rounded rect
+- [ ] `arcTo` sweep âm cho góc trái; test góc trên-trái + dưới-trái
+- [ ] Radius dialog = radius border = radius clip ngoài (vd. 16px tier)
+
+## Liên quan
+
+- Bo góc tổng quát (cập nhật): `round_corner_standard_v1.mdc`
+- Borderless main window (khác dialog): `plan_borderless_windows_v1.mdc`

@@ -118,7 +118,12 @@ from monostudio.ui_qt.top_bar import TopBar
 from monostudio.ui_qt.view_items import ViewItem, ViewItemKind, display_name_for_item
 from monostudio.ui_qt.delete_confirm_dialog import DeleteConfirmDialog, ask_delete_folder
 from monostudio.ui_qt.rename_asset_dialog import RenameAssetDialog
-from monostudio.ui_qt.page_loading_bar import PageLoadingBar, SCANNING_EMPTY_MESSAGE
+from monostudio.ui_qt.page_loading_bar import (
+    FINISHING_SETUP_MESSAGE,
+    PREPARING_VIEW_MESSAGE,
+    PageLoadingBar,
+    SCANNING_EMPTY_MESSAGE,
+)
 from monostudio.ui_qt.app_controller import AppController
 from monostudio.ui_qt.app_state import AppState
 from monostudio.ui_qt.recent_tasks_store import RecentTasksStore
@@ -525,6 +530,8 @@ class MainWindow(FramelessMainWindow):
         self._page_loading_pump_timer: QTimer | None = None
         self._page_switch_generation = 0
         self._project_load_save_on_complete = False
+        self._project_load_finalize_generation = 0
+        self._project_load_view_settled_cb: Callable[[], None] | None = None
 
         self._main_splitter = QSplitter(Qt.Horizontal)
         self._main_splitter.setObjectName("MainSplitter")
@@ -908,6 +915,9 @@ class MainWindow(FramelessMainWindow):
         )
         dialog.hotkeys_changed.connect(self._reload_app_hotkeys)
         dialog.preview_display_changed.connect(self._on_preview_display_settings_changed)
+        dialog.fusion_comp_preflight_changed.connect(
+            self._main_view.sync_fusion_comp_preflight_toggle
+        )
         dialog.open_to_updates_tab()
         dialog.exec()
         self._refresh_user_button()
@@ -3732,6 +3742,9 @@ class MainWindow(FramelessMainWindow):
         dialog.access_session_changed.connect(self._refresh_user_button)
         dialog.hotkeys_changed.connect(self._reload_app_hotkeys)
         dialog.preview_display_changed.connect(self._on_preview_display_settings_changed)
+        dialog.fusion_comp_preflight_changed.connect(
+            self._main_view.sync_fusion_comp_preflight_toggle
+        )
         dialog.open_to_ui_tab()
         dialog.exec()
         self._refresh_user_button()
@@ -6646,24 +6659,71 @@ class MainWindow(FramelessMainWindow):
             f"Could not open project:\n{failed_path}\n\n{error}\n\nOpen Settings to choose another project.",
         )
 
+    def _bump_project_load_finalize_generation(self) -> int:
+        self._project_load_finalize_generation = (
+            getattr(self, "_project_load_finalize_generation", 0) + 1
+        ) % 1_000_000
+        return self._project_load_finalize_generation
+
+    def _project_load_finalize_stale(self, generation: int) -> bool:
+        return generation != getattr(self, "_project_load_finalize_generation", 0)
+
+    def _set_project_load_phase(self, message: str) -> None:
+        """Keep top loading strip + placeholder shimmer until project setup finishes."""
+        if not getattr(self, "_page_loading_visible", False):
+            self._show_page_loading(message)
+        self._main_view.set_empty_override(message)
+        self._raise_page_loading_if_visible()
+        self._tick_page_loading_animation()
+
     def _complete_project_load(self, index: ProjectIndex) -> None:
+        gen = self._bump_project_load_finalize_generation()
         self._project_index = index
         self._entered_parent = None
         self._app_state.update_assets(list(index.assets))
         self._app_state.update_shots(list(index.shots))
         self._app_state.commit_immediate()
         self._filter_panel.set_project_index(index)
-        self._update_fs_watcher_paths()
         self._inspector.set_item(None)
-        self._reload_main_view_async(on_ready=self._finish_project_load_ui)
+        self._set_project_load_phase(PREPARING_VIEW_MESSAGE)
 
-    def _finish_project_load_ui(self) -> None:
-        self._hide_page_loading()
-        self._refresh_schedule_cache()
-        self._sync_user_inbox_alerts()
+        def _begin_finalize() -> None:
+            self._begin_project_load_finalize(gen)
+
+        context = self._nav_rail.current_context()
+        if context in ("Assets", "Shots"):
+            self._project_load_view_settled_cb = _begin_finalize
+            self._reload_main_view_async()
+        else:
+            self._reload_main_view_async(on_ready=_begin_finalize)
+
+    def _begin_project_load_finalize(self, gen: int) -> None:
+        if self._project_load_finalize_stale(gen):
+            return
+        self._set_project_load_phase(FINISHING_SETUP_MESSAGE)
         self._refresh_recent_tasks()
         self._sync_primary_action()
         self._sync_top_bar()
+        QTimer.singleShot(0, lambda: self._run_project_load_finalize_watcher(gen))
+
+    def _run_project_load_finalize_watcher(self, gen: int) -> None:
+        if self._project_load_finalize_stale(gen):
+            return
+        self._update_fs_watcher_paths()
+        QTimer.singleShot(0, lambda: self._run_project_load_finalize_tail(gen))
+
+    def _run_project_load_finalize_tail(self, gen: int) -> None:
+        if self._project_load_finalize_stale(gen):
+            return
+        self._refresh_schedule_cache()
+        self._sync_user_inbox_alerts()
+        self._finish_project_load_ui(gen)
+
+    def _finish_project_load_ui(self, gen: int | None = None) -> None:
+        if gen is not None and self._project_load_finalize_stale(gen):
+            return
+        self._main_view.set_empty_override(None)
+        self._hide_page_loading()
         if self._project_root is not None:
             QTimer.singleShot(2500, self._maybe_discord_schedule_due)
         if self._tray_manager is not None:
@@ -6707,6 +6767,9 @@ class MainWindow(FramelessMainWindow):
 
         self._worker_manager.cancel_category("project_load")
         self._hide_page_loading()
+        self._bump_project_load_finalize_generation()
+        self._project_load_view_settled_cb = None
+        self._main_view.cancel_incremental_set_items()
 
         self._project_root = Path(folder) if folder else None
         self._controller.set_project_root(self._project_root)
@@ -7648,7 +7711,7 @@ class MainWindow(FramelessMainWindow):
         if self._project_root is not None:
             if not items and (self.current_search_query or "").strip():
                 self._main_view.set_empty_override('No matches for "' + self.current_search_query.strip() + '"')
-            else:
+            elif not getattr(self, "_page_loading_visible", False):
                 self._main_view.set_empty_override(None)
         if context in ("Assets", "Shots"):
             self._sync_main_view_header()
@@ -7675,7 +7738,10 @@ class MainWindow(FramelessMainWindow):
         if getattr(self, "_page_loading_visible", False):
             self._tick_page_loading_animation()
             QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-        self._main_view.set_items(items, preserve_selection_id=preserve)
+        on_settled = getattr(self, "_project_load_view_settled_cb", None)
+        if on_settled is not None:
+            self._project_load_view_settled_cb = None
+        self._main_view.set_items(items, preserve_selection_id=preserve, on_settled=on_settled)
         if getattr(self, "_page_loading_visible", False):
             self._tick_page_loading_animation()
         if preserve is None and (recalled or current_id):
@@ -10331,6 +10397,9 @@ class MainWindow(FramelessMainWindow):
         )
         dialog.hotkeys_changed.connect(self._reload_app_hotkeys)
         dialog.preview_display_changed.connect(self._on_preview_display_settings_changed)
+        dialog.fusion_comp_preflight_changed.connect(
+            self._main_view.sync_fusion_comp_preflight_toggle
+        )
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         self._refresh_user_button()
         if accepted:

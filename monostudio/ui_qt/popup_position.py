@@ -175,6 +175,89 @@ def position_popup_above_rect(
     popup.move(int(x), int(y))
 
 
+def position_popup_below_anchor_aligned(
+    popup: QWidget,
+    anchor: QWidget,
+    *,
+    content_inset: int,
+    gap: int = 3,
+    seam_overlap: int = 0,
+    margin: int = DEFAULT_POPUP_MARGIN,
+    bounds: QRect | None = None,
+) -> None:
+    """Place *popup* so inner content aligns with *anchor* and sits *gap* px below it.
+
+    *content_inset* is the margin between the popup widget edge and the visible card
+    (shadow bleed). The card's left edge matches the anchor's left; vertical gap is
+    measured card-to-anchor, not widget-to-anchor.
+
+    *seam_overlap* pulls the popup upward (px) so attached surfaces share a seam.
+    """
+    if anchor is None or not anchor.isVisible():
+        return
+    popup.adjustSize()
+    anchor_rect = QRect(anchor.mapToGlobal(QPoint(0, 0)), anchor.size())
+    w, h = popup.width(), popup.height()
+    content_h = max(1, h - 2 * content_inset)
+
+    content_x = anchor_rect.left()
+    content_y = anchor_rect.bottom() + gap - seam_overlap
+    x = content_x - content_inset
+    y = content_y - content_inset
+
+    ag = _bounds_for_point(QPoint(int(x), int(y)), bounds)
+    if ag.isValid():
+        if y + h > ag.bottom() - margin:
+            content_y = anchor_rect.top() - gap - content_h
+            y = content_y - content_inset
+        if x + w > ag.right() - margin:
+            x = ag.right() - w - margin
+        if x < ag.left() + margin:
+            x = ag.left() + margin
+        y = max(ag.top() + margin, min(y, ag.bottom() - h - margin))
+
+    popup.move(int(x), int(y))
+
+
+def position_overlay_below_anchor_aligned(
+    popup: QWidget,
+    anchor: QWidget,
+    host: QWidget,
+    *,
+    content_inset: int,
+    gap: int = 3,
+    seam_overlap: int = 0,
+    margin: int = DEFAULT_POPUP_MARGIN,
+    bounds: QRect | None = None,
+) -> None:
+    """Place overlay *popup* (child of *host*) below *anchor* using parent-local coordinates."""
+    if anchor is None or not anchor.isVisible() or host is None:
+        return
+    popup.adjustSize()
+    anchor_rect = QRect(anchor.mapToGlobal(QPoint(0, 0)), anchor.size())
+    w, h = popup.width(), popup.height()
+    content_h = max(1, h - 2 * content_inset)
+
+    content_x = anchor_rect.left()
+    content_y = anchor_rect.bottom() + gap - seam_overlap
+    x = content_x - content_inset
+    y = content_y - content_inset
+
+    ag = _bounds_for_point(QPoint(int(x), int(y)), bounds)
+    if ag.isValid():
+        if y + h > ag.bottom() - margin:
+            content_y = anchor_rect.top() - gap - content_h
+            y = content_y - content_inset
+        if x + w > ag.right() - margin:
+            x = ag.right() - w - margin
+        if x < ag.left() + margin:
+            x = ag.left() + margin
+        y = max(ag.top() + margin, min(y, ag.bottom() - h - margin))
+
+    local = host.mapFromGlobal(QPoint(int(x), int(y)))
+    popup.move(local)
+
+
 def max_popup_height_in_widget(
     host: QWidget,
     *,

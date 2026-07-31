@@ -6,6 +6,8 @@ globs: monostudio/ui_qt/*dialog*.py
 
 # MONOS — Dialog UI (v1)
 
+> **New dialogs (L1/L2):** use `monostudio/ui_qt/dialog_tier/` and `rule_dialog_design_system_v1.mdc` — do not invent visual style. This rule covers **legacy** `MonosDialog` + `style.py` patterns until migration.
+
 Dialog phải đồng bộ với Main UI: cùng palette, typography, spacing. Style **luôn** đặt trong global stylesheet (`monostudio/ui_qt/style.py`), không viết QSS rải rác trong từng dialog.
 
 ## Nguyên tắc

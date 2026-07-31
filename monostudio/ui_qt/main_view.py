@@ -109,7 +109,11 @@ from monostudio.ui_qt.inspector_preview_settings import (
     write_inspector_thumbnail_source,
 )
 from monostudio.ui_qt.inbox_list_row_paint import paint_inbox_list_row_chrome
-from monostudio.ui_qt.page_loading_bar import MainViewLoadingPlaceholder, is_scanning_empty_message
+from monostudio.ui_qt.page_loading_bar import (
+    MainViewLoadingPlaceholder,
+    is_loading_empty_message,
+    is_scanning_empty_message,
+)
 from monostudio.ui_qt.style import (
     CARD_THUMB_DEPT_BADGE_ICON_COLOR,
     CARD_THUMB_TYPE_BADGE_ICON_COLOR,
@@ -3558,6 +3562,29 @@ class MainView(QWidget):
         )
         self._sync_work_publish_pill()
 
+        from monostudio.ui_qt.comp_saver_preflight import (
+            FUSION_COMP_PREFLIGHT_ICON,
+            fusion_comp_preflight_enabled,
+        )
+        from monostudio.ui_qt.ios_switch import IosSwitch
+
+        self._comp_preflight_block = QWidget(header)
+        self._comp_preflight_block.setObjectName("MainViewCompPreflightBlock")
+        comp_preflight_l = QHBoxLayout(self._comp_preflight_block)
+        comp_preflight_l.setContentsMargins(0, 0, 0, 0)
+        comp_preflight_l.setSpacing(6)
+        self._comp_preflight_icon = QLabel(self._comp_preflight_block)
+        self._comp_preflight_icon.setFixedSize(16, 16)
+        self._comp_preflight_icon_name = FUSION_COMP_PREFLIGHT_ICON
+        self._comp_preflight_switch = IosSwitch(
+            checked=fusion_comp_preflight_enabled(self._settings),
+            parent=self._comp_preflight_block,
+        )
+        self._comp_preflight_switch.toggled.connect(self._on_comp_preflight_toggled)
+        comp_preflight_l.addWidget(self._comp_preflight_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        comp_preflight_l.addWidget(self._comp_preflight_switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._comp_preflight_sep = vertical_icon_separator(header, height=20)
+
         # Center: View toggle (Grid | List) — pill UI same as Settings Tier3 (Asset Depts | Shot Depts)
         toggle = QWidget(header)
         toggle.setObjectName("Tier3Container")
@@ -4087,6 +4114,8 @@ class MainView(QWidget):
         header_layout.addWidget(title_row, 0, Qt.AlignVCenter)
         header_layout.addStretch(1)
         _header_align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
+        header_layout.addWidget(self._comp_preflight_block, 0, _header_align)
+        header_layout.addWidget(self._comp_preflight_sep, 0, Qt.AlignmentFlag.AlignVCenter)
         header_layout.addWidget(toggle, 0, _header_align)
         header_layout.addWidget(vertical_icon_separator(header, height=20), 0, Qt.AlignmentFlag.AlignVCenter)
         header_layout.addWidget(self._btn_main_view_options, 0, _header_align)
@@ -4097,6 +4126,7 @@ class MainView(QWidget):
 
         self.set_selected_asset_type(None)
         self._work_publish_switch.setVisible(self._browser_context in ("asset", "shot"))
+        self._sync_comp_preflight_toggle_visibility()
 
         self._selection_notify_pending = False
         self._deferred_full_repaint_pending = False
@@ -5319,6 +5349,62 @@ class MainView(QWidget):
                 self._resort_main_view_visible()
         else:
             self._schedule_thumbnail_prefetch()
+        self._sync_comp_preflight_toggle_visibility()
+
+    def _is_comp_department_active(self) -> bool:
+        return (self._active_department or "").strip().casefold() == "comp"
+
+    def _sync_comp_preflight_toggle_visibility(self) -> None:
+        visible = self._browser_context in ("asset", "shot") and self._is_comp_department_active()
+        block = getattr(self, "_comp_preflight_block", None)
+        sep = getattr(self, "_comp_preflight_sep", None)
+        if block is not None:
+            block.setVisible(visible)
+        if sep is not None:
+            sep.setVisible(visible)
+        if visible:
+            self._sync_comp_preflight_toggle_tooltip()
+
+    def _sync_comp_preflight_toggle_tooltip(self) -> None:
+        switch = getattr(self, "_comp_preflight_switch", None)
+        if switch is None:
+            return
+        if switch.isChecked():
+            tip = "Check comp before Fusion opens (Saver + Loader paths)"
+        else:
+            tip = "Open Fusion without comp check"
+        switch.setToolTip(tip)
+        block = getattr(self, "_comp_preflight_block", None)
+        if block is not None:
+            block.setToolTip(tip)
+        icon = getattr(self, "_comp_preflight_icon", None)
+        if icon is not None:
+            icon.setToolTip(tip)
+            color = (
+                MONOS_COLORS["blue_400"]
+                if switch.isChecked()
+                else MONOS_COLORS["text_label"]
+            )
+            name = getattr(self, "_comp_preflight_icon_name", "shield-check")
+            icon.setPixmap(lucide_icon(name, size=16, color_hex=color).pixmap(16, 16))
+
+    def _on_comp_preflight_toggled(self, enabled: bool) -> None:
+        self._settings.setValue("integrations/fusion_comp_preflight", enabled)
+        self._settings.setValue("integrations/fusion_saver_preflight", enabled)
+        self._settings.setValue("integrations/fusion_upstream_render_preflight", enabled)
+        self._sync_comp_preflight_toggle_tooltip()
+
+    def sync_fusion_comp_preflight_toggle(self) -> None:
+        """Reload switch state from QSettings (e.g. after Settings dialog save)."""
+        switch = getattr(self, "_comp_preflight_switch", None)
+        if switch is None:
+            return
+        from monostudio.ui_qt.comp_saver_preflight import fusion_comp_preflight_enabled
+
+        switch.blockSignals(True)
+        switch.setChecked(fusion_comp_preflight_enabled(self._settings), emit=False)
+        switch.blockSignals(False)
+        self._sync_comp_preflight_toggle_tooltip()
 
     def get_active_dcc(self, item_path: Path | None, department: str | None) -> str | None:
         """Forward to grid delegate (cache + persistence)."""
@@ -5866,6 +5952,7 @@ class MainView(QWidget):
             self._settings.setValue(self._SETTINGS_KEY_SORT_FIELD, self._sort_field)
         if getattr(self, "_work_publish_switch", None) is not None:
             self._work_publish_switch.setVisible(context in ("asset", "shot"))
+        self._sync_comp_preflight_toggle_visibility()
 
         title = "Projects" if context == "project" else ("Shots" if context == "shot" else "Assets")
         self.set_context_title(title)
@@ -6479,7 +6566,40 @@ class MainView(QWidget):
             self._show_list_content(force=True)
             QTimer.singleShot(0, self._finish_list_view_layout)
 
-    def set_items(self, items: list[ViewItem], preserve_selection_id: str | None = None) -> None:
+    _SET_ITEMS_CHUNK_THRESHOLD = 100
+    _SET_ITEMS_CHUNK_SIZE = 50
+
+    def cancel_incremental_set_items(self) -> None:
+        self._set_items_chunk_gen = (getattr(self, "_set_items_chunk_gen", 0) + 1) % 1_000_000
+
+    def set_items(
+        self,
+        items: list[ViewItem],
+        preserve_selection_id: str | None = None,
+        *,
+        on_settled: Callable[[], None] | None = None,
+    ) -> None:
+        self.cancel_incremental_set_items()
+        if len(items) > self._SET_ITEMS_CHUNK_THRESHOLD:
+            self._set_items_chunked(items, preserve_selection_id=preserve_selection_id, on_settled=on_settled)
+            return
+        self._set_items_impl(items, preserve_selection_id=preserve_selection_id)
+        self._schedule_set_items_settled(on_settled)
+
+    def _schedule_set_items_settled(self, on_settled: Callable[[], None] | None) -> None:
+        def _reenable_and_update() -> None:
+            self.setUpdatesEnabled(True)
+            self._update_empty_states()
+            self._schedule_grid_layout_sync()
+            if self._browser_context == "project":
+                self._refresh_list_status_column()
+            self._schedule_thumbnail_prefetch()
+            if on_settled is not None:
+                on_settled()
+
+        QTimer.singleShot(0, _reenable_and_update)
+
+    def _set_items_impl(self, items: list[ViewItem], *, preserve_selection_id: str | None = None) -> None:
         # Caller supplies the full list; Filter submenu may trim visible rows when a department is focused.
         # Avoid "all items disappear then reappear": freeze view + block model signals, re-enable next frame.
         self._in_batch_set_items = True
@@ -6504,16 +6624,115 @@ class MainView(QWidget):
             self._list_model.blockSignals(False)
             self._in_batch_set_items = False
 
-        def _reenable_and_update():
-            self.setUpdatesEnabled(True)
-            self._update_empty_states()
-            self._schedule_grid_layout_sync()
-            if self._browser_context == "project":
-                self._refresh_list_status_column()
-            # Schedule thumbnail prefetch after stack has switched to tile view (fixes missing thumbnails on type/department toggle).
-            self._schedule_thumbnail_prefetch()
+    def _set_items_chunked(
+        self,
+        items: list[ViewItem],
+        *,
+        preserve_selection_id: str | None = None,
+        on_settled: Callable[[], None] | None = None,
+    ) -> None:
+        gen = self._set_items_chunk_gen
+        self._in_batch_set_items = True
+        self.setUpdatesEnabled(False)
+        self._tile_model.blockSignals(True)
+        self._list_model.blockSignals(True)
+        try:
+            self.invalidate_notes_open_count_cache()
+            self._items_unfiltered = list(items)
+            visible = self._prepare_visible_items(self._items_unfiltered)
+            self._chunk_settle_preserve_id = preserve_selection_id
+            self._chunk_settle_on_done = on_settled
+            self._chunk_visible_target = visible
+            self._chunk_visible_pos = 0
+            self._all_items = []
+            self._order = []
+        finally:
+            self._tile_model.blockSignals(False)
+            self._list_model.blockSignals(False)
+            self._in_batch_set_items = False
+        QTimer.singleShot(0, lambda: self._apply_next_set_items_chunk(gen))
 
-        QTimer.singleShot(0, _reenable_and_update)
+    def _apply_next_set_items_chunk(self, gen: int) -> None:
+        if gen != getattr(self, "_set_items_chunk_gen", 0):
+            return
+        visible = getattr(self, "_chunk_visible_target", None) or []
+        pos = int(getattr(self, "_chunk_visible_pos", 0) or 0)
+        chunk_size = self._SET_ITEMS_CHUNK_SIZE
+        chunk = visible[pos : pos + chunk_size]
+        if not chunk:
+            self._finish_set_items_chunked(gen)
+            return
+
+        self._in_batch_set_items = True
+        self._tile_model.blockSignals(True)
+        self._list_model.blockSignals(True)
+        try:
+            if pos == 0:
+                self._all_items = list(chunk)
+                self._tile_model.bind_rows(self._all_items)
+                self._list_model.reset_structure()
+                self._apply_list_column_defaults()
+                dep_list_status = (self._active_department or "").strip()
+                fm_list_pill = QFontMetrics(monos_font("Inter", 10, QFont.Weight.DemiBold))
+                if self._browser_context == "project":
+                    list_pill_max_natural = max(
+                        (_list_status_pill_natural_width(lbl, fm_list_pill) for lbl in project_status_display_labels()),
+                        default=88,
+                    )
+                    self._list_status_pill_layout_width = list_pill_max_natural + 16
+                    self._apply_list_status_column_width()
+                elif dep_list_status:
+                    reg_list_status = self._production_status_registry_cached()
+                    list_pill_max_natural = self._list_status_pill_max_natural_width_for_registry(
+                        fm_list_pill, reg_list_status
+                    )
+                    self._list_status_pill_layout_width = list_pill_max_natural + 16
+                    self._apply_list_status_column_width()
+                else:
+                    self._list_status_pill_layout_width = 0
+                    self._apply_list_status_column_width()
+            else:
+                insert_at = len(self._all_items)
+                self._all_items.extend(chunk)
+                self._tile_model.append_rows(chunk)
+                self._list_model.notify_insert_rows(insert_at, len(chunk))
+        finally:
+            self._tile_model.blockSignals(False)
+            self._list_model.blockSignals(False)
+            self._in_batch_set_items = False
+
+        self._chunk_visible_pos = pos + len(chunk)
+        self._update_empty_states()
+        self.valid_selection_changed.emit(self.has_valid_selection())
+        if self._chunk_visible_pos < len(visible):
+            QTimer.singleShot(0, lambda: self._apply_next_set_items_chunk(gen))
+        else:
+            QTimer.singleShot(0, lambda: self._finish_set_items_chunked(gen))
+
+    def _finish_set_items_chunked(self, gen: int) -> None:
+        if gen != getattr(self, "_set_items_chunk_gen", 0):
+            return
+        preserve_selection_id = getattr(self, "_chunk_settle_preserve_id", None)
+        on_settled = getattr(self, "_chunk_settle_on_done", None)
+        self._chunk_settle_preserve_id = None
+        self._chunk_settle_on_done = None
+        self._chunk_visible_target = []
+        self._chunk_visible_pos = 0
+
+        self._in_batch_set_items = True
+        self.setUpdatesEnabled(False)
+        try:
+            self._order = [str(vi.path) for vi in self._all_items]
+            self._rebuild_items_from_order()
+            if preserve_selection_id and str(preserve_selection_id).strip():
+                try:
+                    self.select_item_by_path(Path(preserve_selection_id))
+                except (TypeError, OSError):
+                    pass
+        finally:
+            self._in_batch_set_items = False
+
+        self._schedule_set_items_settled(on_settled)
 
     def _paths_equal(self, a: Path | str, b: Path | str) -> bool:
         """Compare paths for equality (resolved when possible so absolute/relative match)."""
@@ -8036,7 +8255,7 @@ class MainView(QWidget):
         else:
             empty_text = "Select a project root to begin"
 
-        loading = is_scanning_empty_message(empty_text)
+        loading = is_loading_empty_message(empty_text)
         self._tile_placeholder.set_content(empty_text, loading=loading)
         self._list_placeholder.set_content(empty_text, loading=loading)
 

@@ -99,3 +99,21 @@ def test_scan_light_then_merge_render(tmp_path: Path) -> None:
     assert merged.has_render is True
     assert merged.has_review is True
     assert merged.has_media is True
+
+
+def test_merge_mixed_naive_and_aware_review_dates(tmp_path: Path) -> None:
+    from monostudio.core.models import DepartmentReviewIndex
+
+    aware = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
+    index = DepartmentReviewIndex(
+        has_review=True,
+        review_date=aware,
+        has_notes=True,
+        open_note_count=1,
+    )
+    work = tmp_path / "work"
+    render = work / "render" / "shot_v001"
+    render.mkdir(parents=True)
+    (render / "shot.1001.png").write_bytes(b"x")
+    merged = merge_department_review_render(index, work, None)
+    assert merged.review_date is not None

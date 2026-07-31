@@ -9,6 +9,15 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWi
 from monostudio.ui_qt.style import MONOS_COLORS, monos_font
 
 SCANNING_EMPTY_MESSAGE = "Scanning project…"
+PREPARING_VIEW_MESSAGE = "Preparing view…"
+FINISHING_SETUP_MESSAGE = "Finishing setup…"
+
+_LOADING_EMPTY_PREFIXES = (
+    "scanning project",
+    "preparing view",
+    "finishing setup",
+    "loading ",
+)
 
 _TRACK_COLOR = QColor("#3f3f46")
 _GLOW_COLOR = QColor(37, 99, 235, 72)
@@ -17,8 +26,14 @@ _CHUNK_BRIGHT = QColor("#60a5fa")
 
 
 def is_scanning_empty_message(message: str | None) -> bool:
+    return is_loading_empty_message(message)
+
+
+def is_loading_empty_message(message: str | None) -> bool:
     text = (message or "").strip().lower()
-    return text.startswith("scanning project")
+    if not text:
+        return False
+    return any(text.startswith(prefix) for prefix in _LOADING_EMPTY_PREFIXES)
 
 
 class _AnimatedLoadingStrip(QWidget):

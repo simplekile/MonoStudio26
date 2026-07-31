@@ -10,7 +10,7 @@ alwaysApply: true
 - **Luôn** style tooltip bằng **global app stylesheet** (`monostudio/ui_qt/style.py`), không QSS rải rác.
 
 ## Chuẩn visual
-- Nền: `#18181b`, viền `1px solid #3f3f46`, `border-radius: 8px`
+- Nền: `elev_3` từ elevation system (`#18181b` legacy fallback), viền chroma E3
 - Padding: `8px 12px` (8px grid)
 - Font: Inter 12px, weight 500, màu `#fafafa`
 - Chi tiết đầy đủ: `.cursor/rules/plan_tooltip_design_v1.mdc`

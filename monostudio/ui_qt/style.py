@@ -357,21 +357,9 @@ class MonosDialog(QDialog):
         super().paintEvent(event)
 
     def _update_rounded_mask(self) -> None:
-        # Frameless + WA_TranslucentBackground + mask bo góc (QBitmap + drawRoundedRect).
-        # Mask phải set sau khi dialog đã có kích thước (showEvent / resizeEvent).
-        r = self.rect()
-        if r.isEmpty():
-            return
-        w, h = r.width(), r.height()
-        bitmap = QBitmap(w, h)
-        bitmap.fill(Qt.GlobalColor.color0)
-        painter = QPainter(bitmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(Qt.GlobalColor.color1)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(r, _MONOS_DIALOG_RADIUS, _MONOS_DIALOG_RADIUS)
-        painter.end()
-        self.setMask(bitmap)
+        # QBitmap/QRegion masks are 1-bit — corners stay jaggy even with AA hints.
+        # Rely on WA_TranslucentBackground + antialiased paintEvent instead.
+        self.clearMask()
 
     def _resolve_overlay_host(self) -> QWidget | None:
         """Dim layer target: nested modal host, else top-level window (incl. frameless title bar)."""
@@ -866,15 +854,15 @@ def monos_font(
 ) -> QFont:
     """
     QFont với hinting + antialiasing chuẩn MONOS (giảm răng cưa).
-    - PreferVerticalHinting: chữ sắc trên màn hình, layout vẫn scale được.
-    - PreferAntialias: bật khử răng cưa.
+    - PreferDefaultHinting: Qt chọn hinting phù hợp DPI (tốt hơn vertical-only ở 125–150%).
+    - PreferAntialias: bật khử răng cưa (giữ subpixel/ClearType trên Windows LCD).
     """
     f = QFont(family, point_size)
     if weight is not None:
         f.setWeight(weight)
     if italic:
         f.setItalic(True)
-    f.setHintingPreference(QFont.HintingPreference.PreferVerticalHinting)
+    f.setHintingPreference(QFont.HintingPreference.PreferDefaultHinting)
     f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     return f
 
@@ -953,6 +941,12 @@ def apply_dark_theme(app: QApplication) -> None:
     palette.setColor(QPalette.Highlight, accent)
     palette.setColor(QPalette.HighlightedText, text)
     palette.setColor(QPalette.PlaceholderText, placeholder)
+
+    from monostudio.ui_qt.surfaces import SURFACE_TOOLTIP, build_app_token_stack, surface_border_rgba
+
+    _app_tokens = build_app_token_stack("#09090b", theme="dark")
+    palette.setColor(QPalette.ToolTipBase, QColor(_app_tokens[SURFACE_TOOLTIP]))
+    palette.setColor(QPalette.ToolTipText, text)
 
     app.setPalette(palette)
 
@@ -3457,6 +3451,90 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #a1a1aa;
             font-size: 11px;
         }
+        QPushButton#DialogHintButton {
+            color: #71717a;
+            font-size: 11px;
+            font-weight: 500;
+            padding: 0 4px;
+            border: none;
+            background: transparent;
+        }
+        QPushButton#DialogHintButton:hover {
+            color: #a1a1aa;
+        }
+        QFrame#CompPreflightLoaderCard {
+            background-color: #1e2124;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 8px;
+        }
+        QCheckBox#CompPreflightOptionCheck {
+            color: #d4d4d8;
+            font-family: "Inter";
+            font-size: 13px;
+            font-weight: 500;
+            spacing: 8px;
+        }
+        QCheckBox#CompPreflightOptionCheck:hover {
+            color: #e4e4e7;
+        }
+        QCheckBox#CompPreflightOptionCheck::indicator {
+            width: 14px;
+            height: 14px;
+            border-radius: 3px;
+            border: 1px solid #52525b;
+            background: #27272a;
+        }
+        QCheckBox#CompPreflightOptionCheck::indicator:checked {
+            background: #3b82f6;
+            border-color: #3b82f6;
+        }
+        QCheckBox#CompPreflightOptionCheck:disabled {
+            color: #71717a;
+        }
+        QCheckBox#CompPreflightOptionCheck:disabled:hover {
+            color: #71717a;
+        }
+        QCheckBox#CompPreflightOptionCheck:disabled::indicator {
+            border-color: #3f3f46;
+            background: #1c1c1f;
+        }
+        QCheckBox#CompPreflightOptionCheck:disabled::indicator:checked {
+            background: #3f3f46;
+            border-color: #3f3f46;
+        }
+        QLabel#CompPreflightVersionBadge {
+            color: #a1a1aa;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        QLabel#CompPreflightVersionBadge[warning="true"] {
+            color: #fbbf24;
+        }
+        QLabel#CompPreflightLoaderCount {
+            color: #71717a;
+            font-size: 11px;
+        }
+        QLabel#DialogHint[warning="true"] {
+            color: #fbbf24;
+        }
+        QFrame#CompPreflightIssueRow {
+            background-color: #1e2124;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 8px;
+        }
+        QFrame#CompPreflightIssueRow[skipped="true"] {
+            opacity: 0.55;
+        }
+        QScrollArea#CompPreflightScroll,
+        QScrollArea#CompPreflightScroll::viewport,
+        QScrollArea#CompPreflightScroll QWidget#qt_scrollarea_viewport {
+            background: transparent;
+            border: none;
+        }
+        QScrollArea#CompPreflightScroll > QWidget > QWidget,
+        QWidget#CompPreflightScrollBody {
+            background: transparent;
+        }
         /* Paste Work File confirm — mono path rows (color via RichText spans) */
         QLabel#PasteWorkFileFrom,
         QLabel#PasteWorkFileInto {
@@ -4543,6 +4621,11 @@ def apply_dark_theme(app: QApplication) -> None:
             background-color: #18181b;
             border: 1px solid rgba(39, 39, 42, 0.55);
             border-radius: 10px;
+        }
+        QFrame#SettingsWebhookChannelCard {
+            background-color: #1e2124;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 8px;
         }
         QLabel#SettingsSectionTitle {
             color: #fafafa;
@@ -6396,6 +6479,17 @@ def apply_dark_theme(app: QApplication) -> None:
         QPushButton#PomodoroGhostBtn:hover {
             color: #a1a1aa;
         }
+        """
+    )
+
+    app.setStyleSheet(
+        app.styleSheet()
+        + f"""
+        /* MONOS :: Tooltip — SURFACE_TOOLTIP */
+        QToolTip {{
+            background-color: {_app_tokens[SURFACE_TOOLTIP]};
+            border: 1px solid {surface_border_rgba(SURFACE_TOOLTIP, _app_tokens)};
+        }}
         """
     )
 

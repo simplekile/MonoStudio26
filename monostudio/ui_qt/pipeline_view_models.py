@@ -91,6 +91,16 @@ class PipelineTileModel(QAbstractListModel):
         self.beginResetModel()
         self.endResetModel()
 
+    def append_rows(self, items: list[ViewItem]) -> None:
+        """Incremental row insert without resetting the whole model."""
+        if not items:
+            return
+        first = len(self._rows)
+        last = first + len(items) - 1
+        self.beginInsertRows(QModelIndex(), first, last)
+        self._rows.extend(items)
+        self.endInsertRows()
+
     def remove_row_at(self, row: int) -> None:
         if row < 0 or row >= len(self._rows):
             return
@@ -227,8 +237,15 @@ class PipelineListModel(QAbstractListModel):
         return self.createIndex(row, column)
 
     def notify_insert_rows(self, row: int, count: int = 1) -> None:
-        """No-op — tile model bind_rows() + reset_structure() refresh both views."""
-        return
+        """Mirror tile model insertRows for list view."""
+        if count <= 0:
+            return
+        first = max(0, int(row))
+        last = first + int(count) - 1
+        if last < first:
+            return
+        self.beginInsertRows(QModelIndex(), first, last)
+        self.endInsertRows()
 
     def notify_remove_rows(self, row: int, count: int = 1) -> None:
         """No-op — tile model bind_rows() + reset_structure() refresh both views."""

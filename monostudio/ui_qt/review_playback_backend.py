@@ -93,10 +93,13 @@ class SequenceDecodeBackend(QObject):
         frames: list[Path],
         *,
         fps: int,
+        proxy_paths: list[Path] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        self._frames = list(frames)
+        self._source_frames = list(frames)
+        self._proxy_paths = list(proxy_paths) if proxy_paths else None
+        self._frames = self._source_frames
         self._fps = max(1, min(60, int(fps)))
         self._n = len(self._frames)
         self._current = 0
@@ -189,6 +192,17 @@ class SequenceDecodeBackend(QObject):
         self._invalidate_decode_cache()
         self._request_decode(self._current)
 
+    def notify_proxy_frame_ready(self, frame: int) -> None:
+        """Hybrid proxy build — prefer newly cached PNG on next decode."""
+        idx = max(0, min(self._n - 1, int(frame)))
+        if idx in self._buffer:
+            del self._buffer[idx]
+            self._buffer_decode_side.pop(idx, None)
+        self._in_flight.discard(idx)
+        self._in_flight_decode_side.pop(idx, None)
+        if idx == self._current or idx == self._pending_next:
+            self._request_decode(idx)
+
     def current_frame(self) -> int:
         return self._current
 
@@ -278,6 +292,10 @@ class SequenceDecodeBackend(QObject):
             return self._decode_bucket
         return self._decode_bucket_for_label()
 
+    def _target_decode_side_for(self, idx: int) -> int:
+        side = self._decode_max_side_for_frame(idx)
+        return max(64, (side // 64) * 64)
+
     def _buffer_side_for(self, idx: int) -> int:
         pix = self._buffer.get(idx)
         if pix is None or pix.isNull():
@@ -291,7 +309,7 @@ class SequenceDecodeBackend(QObject):
         if pix is None or pix.isNull():
             return False
         requested = self._buffer_decode_side.get(idx, 0)
-        target = self._target_decode_side()
+        target = self._target_decode_side_for(idx)
         # Viewport grew since this frame was decoded — need a higher-res pass.
         if requested < target - 32:
             return False
@@ -339,13 +357,39 @@ class SequenceDecodeBackend(QObject):
         return self._buffer.get(idx)
 
     def _detect_heavy_sequence(self) -> bool:
-        heavy = {".exr", ".hdr"}
-        if not self._frames:
+        heavy = {".exr", ".hdr", ".dpx"}
+        if not self._source_frames:
             return False
-        for p in (self._frames[0], self._frames[-1]):
+        for p in (self._source_frames[0], self._source_frames[-1]):
             if p.suffix.lower() not in heavy:
                 return False
         return True
+
+    def _proxy_png_ready(self, idx: int) -> bool:
+        if self._proxy_paths is None or idx < 0 or idx >= len(self._proxy_paths):
+            return False
+        p = self._proxy_paths[idx]
+        try:
+            return p.is_file() and p.stat().st_size >= 32
+        except OSError:
+            return False
+
+    def _path_for_frame(self, idx: int) -> Path:
+        if self._proxy_png_ready(idx):
+            return self._proxy_paths[idx]  # type: ignore[index]
+        return self._source_frames[idx]
+
+    def _decode_max_side_for_frame(self, idx: int) -> int:
+        if self._proxy_png_ready(idx):
+            w, h = self._display_logical_size()
+            dpr = (
+                self._viewport_dpr
+                if self._viewport_dpr > 0
+                else max(1.0, float(self._label.devicePixelRatioF()))
+            )
+            side = int(max(w, h) * dpr)
+            return max(64, min(PREVIEW_MAX_SIDE_DEFAULT, ((side + 31) // 32) * 32))
+        return self._decode_max_side()
 
     def _display_logical_size(self) -> tuple[int, int]:
         if self._viewport_w > 0 and self._viewport_h > 0:
@@ -383,13 +427,13 @@ class SequenceDecodeBackend(QObject):
         if idx in self._in_flight:
             return
         self._in_flight.add(idx)
-        decode_side = self._target_decode_side()
+        decode_side = self._decode_max_side_for_frame(idx)
         self._in_flight_decode_side[idx] = decode_side
         gen = self._decode_generation.value
         self._pool.start(
             _DecodeRunnable(
                 idx,
-                self._frames[idx],
+                self._path_for_frame(idx),
                 decode_side,
                 self._signaler,
                 self._decode_generation,

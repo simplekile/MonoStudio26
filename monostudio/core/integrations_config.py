@@ -126,6 +126,7 @@ def _normalize_discord_block(discord: dict[str, Any]) -> dict[str, Any]:
                             if "schedule_assigned" in events_raw
                             else events_raw.get("schedule_due")
                         ),
+                        "fusion_render_finished": bool(events_raw.get("fusion_render_finished")),
                     },
                 }
             )
@@ -145,13 +146,19 @@ def get_primary_webhook(config: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def is_event_enabled(config: dict[str, Any], event: str) -> bool:
-    wh = get_primary_webhook(config)
-    if wh is None:
+    discord = config.get("discord")
+    if not isinstance(discord, dict) or not discord.get("enabled"):
         return False
-    events = wh.get("events")
-    if not isinstance(events, dict):
+    webhooks = discord.get("webhooks")
+    if not isinstance(webhooks, list):
         return False
-    return bool(events.get(event))
+    for wh in webhooks:
+        if not isinstance(wh, dict):
+            continue
+        events = wh.get("events")
+        if isinstance(events, dict) and events.get(event):
+            return True
+    return False
 
 
 def webhook_urls_for_event(config: dict[str, Any], event: str) -> list[str]:
@@ -203,6 +210,59 @@ def discord_defaults(config: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def build_integrations_from_webhooks(
+    *,
+    enabled: bool,
+    webhooks: list[dict[str, Any]],
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build integrations dict from one or more webhook channel configs."""
+    base = load_integrations(None) if existing is None else dict(existing)
+    base["schema"] = INTEGRATIONS_SCHEMA
+    base["updated_at"] = _utc_now_iso()
+
+    normalized_webhooks: list[dict[str, Any]] = []
+    for wh in webhooks:
+        if not isinstance(wh, dict):
+            continue
+        url = str(wh.get("url") or "").strip()
+        if not is_valid_discord_webhook_url(url):
+            continue
+        events_raw = wh.get("events") if isinstance(wh.get("events"), dict) else {}
+        inbox_on = bool(
+            events_raw.get("inbox_received")
+            or events_raw.get("inbox_distributed")
+            or events_raw.get("outbox_received")
+        )
+        normalized_webhooks.append(
+            {
+                "id": str(wh.get("id") or f"wh_{uuid.uuid4().hex[:6]}"),
+                "label": str(wh.get("label") or "").strip(),
+                "url": url,
+                "events": {
+                    "mention": bool(events_raw.get("mention")),
+                    "note_done": bool(events_raw.get("note_done")),
+                    "inbox_received": inbox_on,
+                    "inbox_distributed": inbox_on,
+                    "outbox_received": inbox_on,
+                    "schedule_due": bool(events_raw.get("schedule_due")),
+                    "schedule_assigned": bool(events_raw.get("schedule_assigned")),
+                    "fusion_render_finished": bool(events_raw.get("fusion_render_finished")),
+                },
+            }
+        )
+
+    discord = _normalize_discord_block(
+        {
+            "enabled": bool(enabled) and bool(normalized_webhooks),
+            "webhooks": normalized_webhooks,
+            "defaults": discord_defaults(base),
+        }
+    )
+    base["discord"] = discord
+    return base
+
+
 def build_integrations_from_ui(
     *,
     enabled: bool,
@@ -215,20 +275,15 @@ def build_integrations_from_ui(
     note_done_enabled: bool = False,
     existing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build integrations dict from Settings UI fields."""
-    base = load_integrations(None) if existing is None else dict(existing)
-    base["schema"] = INTEGRATIONS_SCHEMA
-    base["updated_at"] = _utc_now_iso()
-
+    """Build integrations dict from legacy single-webhook Settings UI fields."""
     url = (webhook_url or "").strip()
-    wh_id = f"wh_{uuid.uuid4().hex[:6]}"
-    if existing:
-        prev = get_primary_webhook(existing)
-        if prev:
-            wh_id = str(prev.get("id") or wh_id)
-
     webhooks: list[dict[str, Any]] = []
     if url and is_valid_discord_webhook_url(url):
+        wh_id = f"wh_{uuid.uuid4().hex[:6]}"
+        if existing:
+            prev = get_primary_webhook(existing)
+            if prev:
+                wh_id = str(prev.get("id") or wh_id)
         webhooks.append(
             {
                 "id": wh_id,
@@ -245,16 +300,11 @@ def build_integrations_from_ui(
                 },
             }
         )
-
-    discord = _normalize_discord_block(
-        {
-            "enabled": bool(enabled) and bool(webhooks),
-            "webhooks": webhooks,
-            "defaults": discord_defaults(base),
-        }
+    return build_integrations_from_webhooks(
+        enabled=enabled,
+        webhooks=webhooks,
+        existing=existing,
     )
-    base["discord"] = discord
-    return base
 
 
 def write_integrations(

@@ -30,6 +30,20 @@ class ReviewCardSummary:
     has_review_status: bool
 
 
+def _utc_aware(dt: datetime) -> datetime:
+    """Normalize for safe comparison (note ISO timestamps vs filesystem mtimes)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _max_datetime(*values: datetime | None) -> datetime | None:
+    candidates = [v for v in values if v is not None]
+    if not candidates:
+        return None
+    return max(_utc_aware(v) for v in candidates)
+
+
 def format_review_card_date(dt: datetime | None) -> str:
     if dt is None:
         return "—"
@@ -58,7 +72,7 @@ def _latest_note_ts(item_root: Path, department_id: str | None) -> datetime | No
         dt = _parse_iso_ts(entry.at)
         if dt is None:
             continue
-        if best is None or dt > best:
+        if best is None or _utc_aware(dt) > _utc_aware(best):
             best = dt
     return best
 
@@ -161,12 +175,7 @@ def scan_department_review_light(
         status_dt = _status_json_mtime(item_root)
 
     has_review = has_notes or has_review_status
-    candidates: list[datetime] = []
-    if note_ts is not None:
-        candidates.append(note_ts)
-    if has_review_status and status_dt is not None:
-        candidates.append(status_dt)
-    review_date = max(candidates) if candidates else None
+    review_date = _max_datetime(note_ts, status_dt if has_review_status else None)
 
     return DepartmentReviewIndex(
         has_render=False,
@@ -194,12 +203,7 @@ def merge_department_review_render(
     has_render = media_ns > 0
     has_media = has_render
 
-    candidates: list[datetime] = []
-    if index.review_date is not None:
-        candidates.append(index.review_date)
-    if render_date is not None:
-        candidates.append(render_date)
-    review_date = max(candidates) if candidates else None
+    review_date = _max_datetime(index.review_date, render_date)
     has_review = index.has_notes or index.has_review_status or has_media
 
     return replace(

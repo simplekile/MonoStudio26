@@ -1,0 +1,92 @@
+---
+description: New dialogs — reuse MonoStudio Design System; never invent visual style
+globs: monostudio/ui_qt/*dialog*.py,monostudio/ui_qt/dialog_tier/**,scripts/test_dialog_tiers.py
+alwaysApply: false
+---
+
+# MONOS — Dialog Design System (v1)
+
+**MonoStudio must feel like one application, not a collection of individually designed screens.**
+
+---
+
+## Golden reference (start here)
+
+| Resource | Path |
+|----------|------|
+| Implementation | `monostudio/ui_qt/dialog_tier/` |
+| Harness / demos | `scripts/test_dialog_tiers.py` |
+| Freeze + component map | `plan_dialog_tier_golden_reference_v1.mdc` |
+
+**L1** major workspace flows → `Tier1Dialog` · **L2** in-project creates → `Tier2Dialog`.
+
+**Content order (all dialogs):** see `plan_dialog_content_flow_v1.mdc` — Hero → Input → Result → Explain → Action.
+
+---
+
+## Rules when creating any dialog
+
+### Never
+
+- Invent a new visual style, spacing rhythm, radius, or button look
+- Inline one-off QSS for patterns that already exist in the design system
+- Copy-paste widget paint code from another dialog file
+- “Improve” the golden reference to match a new screen
+
+### Always
+
+Reuse from the approved reference:
+
+- **Spacing** — `T` / `T_METRICS` tokens (`chrome_pad_x`, `form_spacing_y`, 8px grid)
+- **Typography** — Inter UI, JetBrains Mono for paths/IDs; see `typography_font_stack_v1.mdc`
+- **Radius** — `radius_l1` / `radius_l2` / `radius_sm`
+- **Hierarchy** — L1 sidebar brand vs L2 hero; label styles `l1` vs `l2`
+- **Interaction** — `FieldShell` focus chrome, ghost/secondary/gradient CTA roles
+- **Elevation** — `SURFACE_*` tokens + elevation ladder; see `plan_surface_tokens_v1.mdc`
+- **Motion** — state communicates only; 120–220ms if animated (see `ui_design.md`)
+- **Buttons** — `GradientPrimaryButton`, `GhostButton`, `tier_btn` roles
+- **Cards** — `MetadataCard`, `WorkspacePicker`, `InfoStrip`
+- **Selectors** — `MonoSelect` (never bespoke dropdowns / ComboBox popups)
+- **Field shells** — `PlainFieldInput`, `PathField`, `DateField`, `MonoSelect` in `FieldRow`
+
+```python
+# ✅ GOOD — compose from design system
+from monostudio.ui_qt.dialog_tier import Tier2Dialog, FieldRow, PlainFieldInput, tier_btn
+
+# ❌ BAD — bespoke dialog styling
+btn.setStyleSheet("background: #333; border-radius: 12px; padding: 14px;")
+```
+
+---
+
+## New visual pattern?
+
+If the flow **cannot** be built from existing components:
+
+1. **Stop** — do not ship a one-off in a single dialog file
+2. **Decide** — does this pattern belong in the shared design system?
+3. **If yes** — extract to `monostudio/ui_qt/dialog_tier/` (component + token), validate in harness, **then** use it
+4. **If no** — escalate for design review before implementing
+
+Repeat twice → promote to design system.
+
+---
+
+## Legacy dialogs
+
+Older dialogs using `MonosDialog` + `style.py` QSS (`dialog_ui_v1.mdc`) remain valid until migrated.
+
+**New work** and **major redesigns** must adopt `dialog_tier`, not extend legacy one-off patterns.
+
+---
+
+## Checklist before merge
+
+- [ ] Shell is `Tier1Dialog` or `Tier2Dialog` (or justified exception documented)
+- [ ] Fields use `FieldShell` / `FieldRow` — not raw `QLineEdit` chrome
+- [ ] Footer uses `add_footer_btn` / `add_footer_cta` with correct roles
+- [ ] No new hardcoded colors/spacing outside `T` tokens
+- [ ] Surfaces use `T[SURFACE_*]` — not ad-hoc hex or raw `elev_N`
+- [ ] Compared side-by-side with harness demo for same tier
+- [ ] Content flow: Hero → Input → Result → Explain → Action (`plan_dialog_content_flow_v1.mdc`)
+- [ ] New reusable pieces live in `dialog_tier/`, not only in the new dialog file

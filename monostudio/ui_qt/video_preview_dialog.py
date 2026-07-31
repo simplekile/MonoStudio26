@@ -62,6 +62,14 @@ from monostudio.core.review_draw import (
     set_layer_default_hold,
 )
 from monostudio.core.review_media import EntityReviewSource, list_entity_review_sources
+from monostudio.core.sequence_proxy_cache import (
+    SequenceProxyManifest,
+    clear_sequence_proxy_for_frames,
+    count_ready_proxy_frames,
+    expected_proxy_frame_paths,
+    is_heavy_plate_sequence,
+    lookup_sequence_proxy,
+)
 from monostudio.core.video_proxy import (
     format_heavy_proxy_message,
     is_heavy_source_for_proxy,
@@ -159,6 +167,10 @@ from monostudio.ui_qt.style import MONOS_COLORS, MonosMenu, monos_font
 from qframelesswindow import FramelessMainWindow
 from monostudio.ui_qt.video_export_dialog import VideoExportDialog
 from monostudio.ui_qt.video_preview_footer_hint import VideoPreviewFooterHintBar
+from monostudio.ui_qt.sequence_proxy_build_worker import (
+    SequenceProxyBuildRunnable,
+    SequenceProxyBuildSignaler,
+)
 from monostudio.ui_qt.video_proxy_build_worker import ProxyBuildRunnable, ProxyBuildSignaler
 from monostudio.ui_qt.video_proxy_heavy_dialog import ask_build_full_proxy
 from monostudio.ui_qt.video_player_backend import (
@@ -954,6 +966,17 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._proxy_build_active_token = 0
         self._proxy_cancel_flag: list[bool] = [False]
         self._proxy_heavy_ack_key: str | None = None
+        self._sequence_proxy_manifest: SequenceProxyManifest | None = None
+        self._sequence_proxy_active = False
+        self._sequence_proxy_building = False
+        self._sequence_proxy_partial_paths: list[Path] = []
+        self._sequence_proxy_build_token = 0
+        self._sequence_proxy_build_active_token = 0
+        self._sequence_proxy_cancel_flag: list[bool] = [False]
+        self._sequence_proxy_build_signaler = SequenceProxyBuildSignaler(self)
+        self._sequence_proxy_build_signaler.progress.connect(self._on_sequence_proxy_build_progress)
+        self._sequence_proxy_build_signaler.frame_built.connect(self._on_sequence_proxy_frame_built)
+        self._sequence_proxy_build_signaler.finished.connect(self._on_sequence_proxy_build_finished)
         self._proxy_build_signaler = ProxyBuildSignaler(self)
         self._proxy_build_signaler.progress.connect(self._on_proxy_build_progress)
         self._proxy_build_signaler.finished.connect(self._on_proxy_build_finished)
@@ -1750,9 +1773,15 @@ class VideoPreviewDialog(FramelessMainWindow):
                 widgets.append(w)
         return widgets
 
+    def _sequence_proxy_transport_widgets(self) -> list[QWidget]:
+        if self._is_sequence_mode() and is_heavy_plate_sequence(self._sequence_frames):
+            return [self._chk_proxy, self._cmb_proxy_scale, self._btn_proxy_menu]
+        return []
+
     def _transport_compact_optional_widgets(self) -> list[QWidget]:
         """Lowest priority first — hidden first when the bar is too narrow."""
-        return [
+        protected_ids = {id(w) for w in self._sequence_proxy_transport_widgets()}
+        optional = [
             self._btn_export,
             self._btn_sync,
             self._chk_precise_scrub,
@@ -1764,12 +1793,14 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._btn_in,
             self._draw_transport,
             self._chk_proxy,
+            self._cmb_proxy_scale,
             self._volume_slider,
             self._speed_icon,
             self._fps_spin,
             self._fps_label,
             self._chk_loop,
         ]
+        return [w for w in optional if id(w) not in protected_ids]
 
     def _transport_compact_protected_widgets(self) -> list[QWidget]:
         """Never auto-hidden when the transport bar is narrow."""
@@ -1777,6 +1808,7 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._btn_play,
             self._position_box,
             self._transport_controls,
+            *self._sequence_proxy_transport_widgets(),
         ]
 
     def _mark_transport_logical_visibility(self) -> None:
@@ -2091,9 +2123,8 @@ class VideoPreviewDialog(FramelessMainWindow):
 
     def _sync_media_capabilities(self) -> None:
         seq = self._is_sequence_mode()
+        heavy_seq = seq and is_heavy_plate_sequence(self._sequence_frames)
         for w in (
-            self._chk_proxy,
-            self._btn_proxy_menu,
             self._chk_precise_scrub,
             self._speed_icon,
             self._cmb_speed,
@@ -2104,13 +2135,31 @@ class VideoPreviewDialog(FramelessMainWindow):
             self._cmb_time_display,
         ):
             w.setVisible(not seq)
+        self._chk_proxy.setVisible(not seq or heavy_seq)
+        self._btn_proxy_menu.setVisible(not seq or heavy_seq)
         self._btn_play.setVisible(True)
         self._cmb_proxy_scale.setVisible(True)
         if seq:
-            self._cmb_proxy_scale.setToolTip(
-                "Preview decode resolution — lower is faster for heavy EXR/DPX sequences"
-            )
+            if heavy_seq:
+                self._chk_proxy.setToolTip(
+                    "Use cached PNG proxy when built — much faster EXR/DPX playback. "
+                    "Esc turns proxy off. Scale applies to live decode when proxy is off."
+                )
+                self._cmb_proxy_scale.setToolTip(
+                    "Proxy / preview decode resolution — lower is faster for heavy plates"
+                )
+            else:
+                self._chk_proxy.setToolTip(
+                    "PNG proxy is available for EXR/DPX/HDR sequences"
+                )
+                self._cmb_proxy_scale.setToolTip(
+                    "Preview decode resolution — lower is faster for heavy EXR/DPX sequences"
+                )
         else:
+            self._chk_proxy.setToolTip(
+                "Use H.264 proxy when cached; does not auto-build on open. "
+                "Tick Proxy or use … → Build proxy to create cache. Esc turns proxy off."
+            )
             self._cmb_proxy_scale.setToolTip("Proxy resolution scale")
         self._btn_player_settings.setVisible(True)
         self._cmb_proxy_scale.setEnabled(True)
@@ -2306,6 +2355,27 @@ class VideoPreviewDialog(FramelessMainWindow):
         n = len(frames)
         fps = max(1, min(60, int(request.fps)))
         self._set_sequence_video_info(frames, fps)
+        self._sync_media_capabilities()
+        heavy = is_heavy_plate_sequence(frames)
+        if heavy:
+            cached = lookup_sequence_proxy(
+                frames,
+                scale=self._proxy_scale,
+                ocio_token=self._sequence_ocio_cache_token(),
+            )
+            use_proxy = bool(cached)
+            self._proxy_enabled = use_proxy
+            self._sequence_proxy_manifest = cached
+            if cached:
+                self._sequence_proxy_partial_paths = cached.proxy_frame_paths()
+            self._chk_proxy.blockSignals(True)
+            self._chk_proxy.setChecked(use_proxy)
+            self._chk_proxy.blockSignals(False)
+        else:
+            self._proxy_enabled = False
+            self._chk_proxy.blockSignals(True)
+            self._chk_proxy.setChecked(False)
+            self._chk_proxy.blockSignals(False)
         if not self._geometry_restored_from_settings:
             self._fit_dialog_to_current_media()
         self._apply_viewer_plate_geometry()
@@ -2328,14 +2398,21 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._range_list().set_fps(float(fps))
         self._scrubber.set_frame_count(total, refit_view=True)
         self._scrubber.clear_overlap_cycle()
-        self._seq_backend = SequenceDecodeBackend(frames, fps=fps, parent=self)
-        self._seq_backend.set_preview_scale(self._proxy_scale)
-        self._seq_backend.frame_changed.connect(self._on_seq_frame_changed)
-        self._seq_backend.playback_ended.connect(self._on_seq_playback_ended)
-        self._attach_sequence_display()
-        self._sync_sequence_playback_loop()
+        if self._sequence_proxy_manifest is not None:
+            self._rebuild_sequence_backend(frame=0)
+        else:
+            self._seq_backend = SequenceDecodeBackend(frames, fps=fps, parent=self)
+            self._seq_backend.set_preview_scale(self._proxy_scale)
+            self._sequence_proxy_active = False
+            self._seq_backend.frame_changed.connect(self._on_seq_frame_changed)
+            self._seq_backend.playback_ended.connect(self._on_seq_playback_ended)
+            self._attach_sequence_display()
+            self._sync_sequence_playback_loop()
         self._show_media_loading(False)
         QTimer.singleShot(0, self._finalize_sequence_viewport)
+        self._sync_media_capabilities()
+        QTimer.singleShot(0, lambda: self._sync_sequence_proxy_state(allow_build=False))
+        self._refresh_sequence_proxy_ruler()
         if self._work_path is not None and folder is not None:
             from monostudio.core.review_media import _sequence_source_label_for_folder
 
@@ -2360,6 +2437,239 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._apply_viewer_plate_geometry()
         self._sync_sequence_viewport_to_backend(reprime=True)
         self._seek_frame(0)
+
+    def _sequence_ocio_cache_token(self) -> str:
+        from monostudio.ui_qt.ocio_preview_settings import ocio_preview_cache_token
+
+        return ocio_preview_cache_token(self._settings)
+
+    def _rebuild_sequence_backend(self, *, frame: int | None = None) -> None:
+        if not self._is_sequence_mode() or not self._sequence_frames:
+            return
+        idx = 0
+        was_playing = False
+        if self._seq_backend is not None:
+            idx = self._seq_backend.current_frame()
+            was_playing = self._seq_backend.is_playing()
+        if frame is not None:
+            idx = max(0, min(len(self._sequence_frames) - 1, int(frame)))
+        fps = max(1, min(60, int(self._fps_spin.value())))
+        proxy_paths: list[Path] | None = None
+        using_full_proxy = False
+        if self._proxy_enabled and self._sequence_proxy_manifest is not None:
+            if len(self._sequence_frames) == self._sequence_proxy_manifest.frame_count:
+                proxy_paths = self._sequence_proxy_manifest.proxy_frame_paths()
+                using_full_proxy = True
+        elif self._proxy_enabled and self._sequence_proxy_partial_paths:
+            proxy_paths = list(self._sequence_proxy_partial_paths)
+        self._sequence_proxy_active = using_full_proxy
+        self._release_sequence_backend()
+        self._seq_backend = SequenceDecodeBackend(
+            self._sequence_frames,
+            fps=fps,
+            proxy_paths=proxy_paths,
+            parent=self,
+        )
+        preview_scale = self._proxy_scale
+        if using_full_proxy or (proxy_paths and count_ready_proxy_frames(proxy_paths) > 0):
+            preview_scale = 1.0
+        self._seq_backend.set_preview_scale(preview_scale)
+        self._seq_backend.frame_changed.connect(self._on_seq_frame_changed)
+        self._seq_backend.playback_ended.connect(self._on_seq_playback_ended)
+        self._attach_sequence_display()
+        self._sync_sequence_playback_loop()
+        self._sync_sequence_viewport_to_backend(reprime=True)
+        self._seq_backend.seek_frame(idx)
+        self._apply_playhead_ui(idx)
+        if was_playing:
+            self._seq_backend.play()
+            self._set_play_icon(True)
+
+    def _refresh_sequence_proxy_ruler(self) -> None:
+        if not self._is_sequence_mode():
+            return
+        if not self._proxy_enabled or not is_heavy_plate_sequence(self._sequence_frames):
+            self._scrubber.set_proxy_full_timeline(ready=False)
+            self._scrubber.clear_proxy_build_progress()
+            self._scrubber.set_proxy_spans([])
+            return
+        total = max(1, len(self._sequence_frames))
+        if self._sequence_proxy_manifest is not None:
+            self._scrubber.clear_proxy_build_progress()
+            self._scrubber.set_proxy_spans([])
+            self._scrubber.set_proxy_full_timeline(ready=True)
+            return
+        if self._sequence_proxy_building:
+            lo, hi = 0, max(0, total - 1)
+            ready = count_ready_proxy_frames(self._sequence_proxy_partial_paths)
+            frac = ready / total
+            self._scrubber.set_proxy_full_timeline(ready=False)
+            self._scrubber.set_proxy_build_progress(lo, hi, frac)
+            return
+        self._scrubber.set_proxy_full_timeline(ready=False)
+        self._scrubber.clear_proxy_build_progress()
+        self._scrubber.set_proxy_spans([])
+
+    def _sync_sequence_proxy_state(self, *, allow_build: bool = False) -> None:
+        """PNG proxy for heavy plate sequences — rebuild backend when cache state changes."""
+        if not self._is_sequence_mode() or not self._sequence_frames:
+            return
+        heavy = is_heavy_plate_sequence(self._sequence_frames)
+        self._cmb_proxy_scale.setEnabled(True)
+        if not heavy:
+            self._sequence_proxy_manifest = None
+            self._cancel_sequence_proxy_build()
+            if self._sequence_proxy_active:
+                self._rebuild_sequence_backend(frame=self._current_frame())
+            elif self._seq_backend is not None:
+                self._seq_backend.set_preview_scale(self._proxy_scale)
+            return
+        self._btn_proxy_menu.setEnabled(True)
+        ocio_token = self._sequence_ocio_cache_token()
+        cur = self._current_frame()
+        if not self._proxy_enabled:
+            self._sequence_proxy_manifest = None
+            self._cancel_sequence_proxy_build()
+            if self._sequence_proxy_active:
+                self._rebuild_sequence_backend(frame=cur)
+            elif self._seq_backend is not None:
+                self._seq_backend.set_preview_scale(self._proxy_scale)
+            self._refresh_sequence_proxy_ruler()
+            self._update_footer()
+            return
+
+        manifest = lookup_sequence_proxy(
+            self._sequence_frames,
+            scale=self._proxy_scale,
+            ocio_token=ocio_token,
+        )
+        if manifest:
+            prev = self._sequence_proxy_manifest
+            self._sequence_proxy_manifest = manifest
+            self._sequence_proxy_building = False
+            self._sequence_proxy_partial_paths = manifest.proxy_frame_paths()
+            if not self._sequence_proxy_active or prev != manifest:
+                self._rebuild_sequence_backend(frame=cur)
+            self._refresh_sequence_proxy_ruler()
+            self._status_log = ""
+            self._update_footer()
+            return
+
+        self._sequence_proxy_manifest = None
+        if self._sequence_proxy_active:
+            self._rebuild_sequence_backend(frame=cur)
+        elif self._seq_backend is not None:
+            self._seq_backend.set_preview_scale(self._proxy_scale)
+        if allow_build:
+            if not self._maybe_confirm_sequence_proxy_build():
+                self._chk_proxy.blockSignals(True)
+                self._chk_proxy.setChecked(False)
+                self._chk_proxy.blockSignals(False)
+                self._persist_proxy_enabled(False)
+                self._sync_sequence_proxy_state()
+                return
+            self._start_sequence_proxy_build()
+        else:
+            self._refresh_sequence_proxy_ruler()
+        self._update_footer()
+
+    def _maybe_confirm_sequence_proxy_build(self) -> bool:
+        n = len(self._sequence_frames)
+        if n <= 120:
+            return True
+        scale_lbl = _PROXY_SCALE_LABELS.get(self._proxy_scale, str(self._proxy_scale))
+        ext = self._sequence_frames[0].suffix.lower() if self._sequence_frames else ""
+        detail = (
+            f"Build PNG proxy for {n} {ext} frames at {scale_lbl}? "
+            "This may take several minutes and uses disk cache."
+        )
+        return (
+            QMessageBox.question(
+                self,
+                "Build sequence proxy",
+                detail,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            == QMessageBox.StandardButton.Yes
+        )
+
+    def _cancel_sequence_proxy_build(self) -> None:
+        self._sequence_proxy_cancel_flag[0] = True
+        self._sequence_proxy_build_token += 1
+        self._sequence_proxy_building = False
+        self._refresh_sequence_proxy_ruler()
+
+    def _start_sequence_proxy_build(self) -> None:
+        if not self._sequence_frames:
+            return
+        ocio_token = self._sequence_ocio_cache_token()
+        _root, partial_paths = expected_proxy_frame_paths(
+            self._sequence_frames,
+            scale=self._proxy_scale,
+            ocio_token=ocio_token,
+        )
+        self._sequence_proxy_partial_paths = list(partial_paths)
+        self._sequence_proxy_building = True
+        self._proxy_enabled = True
+        self._chk_proxy.blockSignals(True)
+        self._chk_proxy.setChecked(True)
+        self._chk_proxy.blockSignals(False)
+        cur = self._current_frame()
+        self._rebuild_sequence_backend(frame=cur)
+        self._sequence_proxy_cancel_flag[0] = True
+        self._sequence_proxy_build_token += 1
+        token = self._sequence_proxy_build_token
+        self._sequence_proxy_build_active_token = token
+        self._sequence_proxy_cancel_flag[0] = False
+        lo, hi = 0, max(0, len(self._sequence_frames) - 1)
+        ready = count_ready_proxy_frames(self._sequence_proxy_partial_paths)
+        total = max(1, len(self._sequence_frames))
+        self._scrubber.set_proxy_build_progress(lo, hi, ready / total)
+        label = f"Building PNG proxy ({len(self._sequence_frames)} frames)…"
+        self._status_log = label
+        self._update_footer()
+        QThreadPool.globalInstance().start(
+            SequenceProxyBuildRunnable(
+                frames=self._sequence_frames,
+                scale=self._proxy_scale,
+                ocio_token=ocio_token,
+                signaler=self._sequence_proxy_build_signaler,
+                cancel_flag=self._sequence_proxy_cancel_flag,
+            )
+        )
+
+    def _on_sequence_proxy_build_progress(self, fraction: float) -> None:
+        frac = max(0.0, min(1.0, float(fraction)))
+        self._scrubber.set_proxy_build_fraction(frac)
+
+    def _on_sequence_proxy_frame_built(self, frame_idx: int, fraction: float) -> None:
+        frac = max(0.0, min(1.0, float(fraction)))
+        self._scrubber.set_proxy_build_fraction(frac)
+        if self._seq_backend is not None:
+            self._seq_backend.notify_proxy_frame_ready(int(frame_idx))
+
+    def _on_sequence_proxy_build_finished(self, manifest_obj: object, error: object) -> None:
+        token = self._sequence_proxy_build_active_token
+        self._sequence_proxy_building = False
+        if error:
+            self._refresh_sequence_proxy_ruler()
+            self._status_log = str(error)[:240]
+            self._update_footer()
+            if self._proxy_enabled and "cancel" not in str(error).lower():
+                QMessageBox.warning(self, "Sequence proxy build", str(error))
+            return
+        if token != self._sequence_proxy_build_active_token:
+            return
+        if not isinstance(manifest_obj, SequenceProxyManifest):
+            return
+        self._sequence_proxy_manifest = manifest_obj
+        self._sequence_proxy_partial_paths = manifest_obj.proxy_frame_paths()
+        self._status_log = ""
+        cur = self._current_frame()
+        self._rebuild_sequence_backend(frame=cur)
+        self._refresh_sequence_proxy_ruler()
+        self._update_footer()
 
     def _sync_sequence_viewport_to_backend(self, *, reprime: bool = False) -> None:
         if not self._is_sequence_mode() or self._seq_backend is None:
@@ -2470,9 +2780,11 @@ class VideoPreviewDialog(FramelessMainWindow):
                 break
 
         if self._is_sequence_mode():
-            if self._seq_backend is not None:
-                self._seq_backend.set_preview_scale(scale)
-                self._seq_backend.invalidate_frame_cache()
+            self._proxy_enabled = read_video_preview_proxy_enabled(self._settings)
+            self._chk_proxy.blockSignals(True)
+            self._chk_proxy.setChecked(self._proxy_enabled)
+            self._chk_proxy.blockSignals(False)
+            self._sync_sequence_proxy_state(allow_build=False)
             fps = read_sequence_preview_fps(self._settings)
             self._fps_spin.blockSignals(True)
             self._fps_spin.setValue(fps)
@@ -4289,6 +4601,12 @@ class VideoPreviewDialog(FramelessMainWindow):
         return parts
 
     def _footer_hints_proxy(self) -> list[str]:
+        if self._is_sequence_mode():
+            parts = ["Ctrl+C — Copy frame", "Space — Play/Pause"]
+            if is_heavy_plate_sequence(self._sequence_frames):
+                parts.append("Proxy — PNG cache (build via … menu)")
+            parts.append("Esc — Turn off proxy")
+            return parts
         parts = ["Ctrl+C — Copy frame", "Space — Play/Pause", "Scrub/play use proxy when cached"]
         mode = self._tools_panel.tool_mode()
         if mode == ReviewToolMode.draw and self._context == PreviewContext.entity:
@@ -7464,6 +7782,7 @@ class VideoPreviewDialog(FramelessMainWindow):
     def _cancel_proxy_build(self) -> None:
         self._proxy_cancel_flag[0] = True
         self._proxy_build_token += 1
+        self._cancel_sequence_proxy_build()
         self._scrubber.clear_proxy_build_progress()
         self._set_proxy_build_overlay(False)
 
@@ -7566,7 +7885,7 @@ class VideoPreviewDialog(FramelessMainWindow):
     def _sync_proxy_state(self, *, allow_build: bool = False) -> None:
         """Refresh proxy mode vs cache. Build only when ``allow_build`` (user intent)."""
         if self._is_sequence_mode():
-            self._cmb_proxy_scale.setEnabled(True)
+            self._sync_sequence_proxy_state(allow_build=allow_build)
             return
         self._cmb_proxy_scale.setEnabled(self._proxy_enabled)
         self._btn_proxy_menu.setEnabled(self._path is not None)
@@ -7652,21 +7971,41 @@ class VideoPreviewDialog(FramelessMainWindow):
         if self._settings is not None:
             write_video_preview_proxy_scale(self._settings, self._proxy_scale)
         if self._is_sequence_mode():
-            if self._seq_backend is not None:
+            if self._seq_backend is not None and not self._sequence_proxy_active:
                 self._seq_backend.set_preview_scale(self._proxy_scale)
+            if self._proxy_enabled and is_heavy_plate_sequence(self._sequence_frames):
+                self._sync_sequence_proxy_state(allow_build=True)
+            elif self._seq_backend is not None and not self._sequence_proxy_active:
+                self._seq_backend.invalidate_frame_cache()
             return
         if self._proxy_enabled:
             self._sync_proxy_state(allow_build=True)
 
     def _show_proxy_menu(self) -> None:
         menu = MonosMenu(self)
-        if self._path is not None and not self._is_sequence_mode():
+        if self._is_sequence_mode():
+            if self._sequence_frames and is_heavy_plate_sequence(self._sequence_frames):
+                build_act = menu.addAction("Build PNG proxy…")
+                build_act.triggered.connect(self._build_sequence_proxy_now)
+                clear_act = menu.addAction("Clear proxy for this sequence")
+                clear_act.triggered.connect(self._clear_proxy_for_current_video)
+        elif self._path is not None:
             build_act = menu.addAction("Build proxy…")
             build_act.triggered.connect(self._build_proxy_now)
-        clear_act = menu.addAction("Clear proxy for this video")
-        clear_act.triggered.connect(self._clear_proxy_for_current_video)
+            clear_act = menu.addAction("Clear proxy for this video")
+            clear_act.triggered.connect(self._clear_proxy_for_current_video)
         position_popup_near_anchor(menu, self._btn_proxy_menu)
         menu.popup(menu.mapToGlobal(QPoint(0, 0)))
+
+    def _build_sequence_proxy_now(self) -> None:
+        if not self._sequence_frames or not is_heavy_plate_sequence(self._sequence_frames):
+            return
+        if not self._proxy_enabled:
+            self._chk_proxy.blockSignals(True)
+            self._chk_proxy.setChecked(True)
+            self._chk_proxy.blockSignals(False)
+            self._persist_proxy_enabled(True)
+        self._sync_sequence_proxy_state(allow_build=True)
 
     def _build_proxy_now(self) -> None:
         if self._path is None or self._info is None or self._is_sequence_mode():
@@ -7679,6 +8018,17 @@ class VideoPreviewDialog(FramelessMainWindow):
         self._sync_proxy_state(allow_build=True)
 
     def _clear_proxy_for_current_video(self) -> None:
+        if self._is_sequence_mode():
+            if not self._sequence_frames:
+                return
+            self._cancel_proxy_build()
+            clear_sequence_proxy_for_frames(self._sequence_frames)
+            self._sequence_proxy_manifest = None
+            cur = self._current_frame()
+            if self._sequence_proxy_active:
+                self._rebuild_sequence_backend(frame=cur)
+            self._update_footer()
+            return
         if self._path is None:
             return
         self._cancel_proxy_build()

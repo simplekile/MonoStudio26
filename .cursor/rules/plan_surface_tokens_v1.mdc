@@ -1,0 +1,115 @@
+---
+description: MONOS Surface Tokens — semantic fills; never hardcode surface hex in components
+globs: monostudio/ui_qt/**,scripts/test_dialog_tiers.py,.cursor/rules/**
+alwaysApply: false
+---
+
+# MONOS — Surface Tokens (v1)
+
+**Rule:** components use **semantic surface tokens** — never raw hex, never `elev_N` directly in UI code.
+
+**Module:** [`monostudio/ui_qt/surfaces.py`](monostudio/ui_qt/surfaces.py)
+
+Elevation defines *how* surfaces brighten ([`plan_elevation_system_v1.mdc`](plan_elevation_system_v1.mdc)).  
+Surface tokens define *what role* a fill plays.
+
+---
+
+## Derivation graph (relationships in code)
+
+Each token is derived from its **parent** via ``elevate()`` or ``depress()`` — not a single linear ladder:
+
+```python
+from monostudio.ui_qt.surfaces import (
+    SURFACE_DERIVATION,
+    SURFACE_ELEVATION_LEVEL,
+    build_semantic_surfaces,
+    elevate,
+    depress,
+)
+
+# E-1  SURFACE_FIELD   = depress(SURFACE_DIALOG, 1)   # recessed inputs
+#  E0  SURFACE_APP     — root (theme bg)
+#  E1  SURFACE_DIALOG  = elevate(SURFACE_APP, 1)
+#  E1  SURFACE_CARD    = elevate(SURFACE_APP, 1)      # same tier as dialog
+#  E2  SURFACE_POPUP   = elevate(SURFACE_DIALOG, 1)   # one step above dialog
+#  E3  SURFACE_TOOLTIP = elevate(SURFACE_POPUP, 1)
+```
+
+**MonoSelect rule:** ``SURFACE_FIELD < SURFACE_DIALOG < SURFACE_POPUP`` — popup parent is **dialog**, not card.
+
+Tune the entire UI tone: change ``elevation_step`` in theme — all tiers keep their visual hierarchy.
+
+---
+
+## Tokens
+
+| Token | Key | Component examples |
+|-------|-----|-----|
+| `SURFACE_APP` | `surface_app` | App / dialog backdrop, launcher |
+| `SURFACE_DIALOG` | `surface_dialog` | `Tier1Dialog` / `Tier2Dialog` panel |
+| `SURFACE_CARD` | `surface_card` | `MetadataCard`, `WorkspacePicker` — same E1 tier as dialog |
+| `SURFACE_FIELD` | `surface_field` | `FieldShell`, `PlainFieldInput`, `MonoSelect` trigger |
+| `SURFACE_POPUP` | `surface_popup` | `MonoSelect` popup, `MonoMenu`, popovers |
+| `SURFACE_TOOLTIP` | `surface_tooltip` | `QToolTip`, inline hints |
+| `SURFACE_OVERLAY` | `surface_overlay` | Modal scrim, command palette backdrop |
+
+```python
+from monostudio.ui_qt.surfaces import SURFACE_CARD, SURFACE_POPUP, surface_color, surface_border_color
+from monostudio.ui_qt.dialog_tier import T
+
+fill = QColor(T[SURFACE_POPUP])
+stroke = surface_border_color(SURFACE_CARD, T, hover=True)
+```
+
+---
+
+## Component mapping (mandatory)
+
+| Component | Surface token |
+|-----------|---------------|
+| `FieldShell` | `SURFACE_FIELD` |
+| `MonoSelect` popup | `SURFACE_POPUP` |
+| `MetadataCard` | `SURFACE_CARD` |
+| Dialog chrome body | `SURFACE_DIALOG` |
+| Tooltip | `SURFACE_TOOLTIP` |
+
+Future: `MonoMenu` → `SURFACE_POPUP` · `MonoCommandPalette` → `SURFACE_TOOLTIP` + `SURFACE_OVERLAY`
+
+---
+
+## Theme init
+
+```python
+from monostudio.ui_qt.surfaces import inject_design_system_tokens
+
+# Dialog tier (set_tier_theme does this automatically):
+inject_design_system_tokens(T, theme="dark")
+
+# App shell:
+from monostudio.ui_qt.surfaces import build_app_token_stack
+tokens = build_app_token_stack("#09090b")
+```
+
+**Tuning the whole UI:** adjust `bg`, `elevation_step`, or `overlay_scrim` in theme source — all `SURFACE_*` values recompute. Do **not** hunt scattered hex in components. Do **not** hardcode `field` / `panel` surface hex in theme dicts.
+
+---
+
+## Legacy aliases (do not use in new code)
+
+| Legacy | Maps to |
+|--------|---------|
+| `bg` | `SURFACE_APP` |
+| `panel` | `SURFACE_DIALOG` |
+| `field` | `SURFACE_FIELD` |
+| `field_readonly` | `SURFACE_CARD` |
+| `elev_0`…`elev_3` | Internal — use surface tokens |
+
+---
+
+## Checklist (new component)
+
+- [ ] Fill uses `T[SURFACE_*]` — not `#1c1f28` or `T["elev_2"]`
+- [ ] Border uses `surface_border_color(SURFACE_*, T)`
+- [ ] Token choice matches component table above
+- [ ] New surface role? Add token in `surfaces.py` + doc — not a one-off hex
