@@ -22,7 +22,11 @@ from monostudio.core.comp_loader_io import parse_comp_global_range, read_comp_te
 from monostudio.core.comp_fusion_scripts import find_project_root, fusion_render_webhook_urls
 from monostudio.core.comp_render_paths import CompSaverSpec
 from monostudio.core.comp_saver_io import CompSaverAudit, CompSaverAuditStatus
-from monostudio.core.comp_upstream_render_check import UpstreamRenderIssue, UpstreamRenderStatus
+from monostudio.core.comp_upstream_render_check import (
+    UpstreamRenderIssue,
+    UpstreamRenderStatus,
+    resolve_comp_range_from_disk,
+)
 from monostudio.ui_qt.comp_preflight_models import CompPreflightPlan
 from monostudio.ui_qt.style import MonosDialog
 
@@ -125,6 +129,38 @@ class _LoaderIssueCard(QFrame):
             mismatch_lbl.style().unpolish(mismatch_lbl)
             mismatch_lbl.style().polish(mismatch_lbl)
             header.addWidget(mismatch_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        elif issue.status == UpstreamRenderStatus.RANGE_MISMATCH:
+            l0 = issue.loader_range_start
+            l1 = issue.loader_range_end
+            g0 = issue.comp_range_start
+            g1 = issue.comp_range_end
+            if None not in (l0, l1, g0, g1):
+                disk_frames = max(0, l1 - l0 + 1)
+                comp_frames = max(0, g1 - g0 + 1)
+                badge_text = f"disk {l0}–{l1} ({disk_frames}f) · comp {g0}–{g1} ({comp_frames}f)"
+            else:
+                badge_text = "Range mismatch"
+            range_lbl = QLabel(badge_text, self)
+            range_lbl.setObjectName("CompPreflightVersionBadge")
+            range_lbl.setProperty("warning", True)
+            range_lbl.setToolTip(issue.message)
+            range_lbl.style().unpolish(range_lbl)
+            range_lbl.style().polish(range_lbl)
+            header.addWidget(range_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        elif issue.status == UpstreamRenderStatus.FRAME_REF:
+            ref_f = issue.referenced_frame
+            repair_f = issue.repair_frame
+            if ref_f is not None and repair_f is not None:
+                badge_text = f"frame {ref_f} → {repair_f}"
+            else:
+                badge_text = "missing frame file"
+            frame_lbl = QLabel(badge_text, self)
+            frame_lbl.setObjectName("CompPreflightVersionBadge")
+            frame_lbl.setProperty("warning", True)
+            frame_lbl.setToolTip(issue.message)
+            frame_lbl.style().unpolish(frame_lbl)
+            frame_lbl.style().polish(frame_lbl)
+            header.addWidget(frame_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
         else:
             latest = issue.latest_version
             if latest is not None:
@@ -151,9 +187,20 @@ class _LoaderIssueCard(QFrame):
         path_row.addWidget(path_lbl, 1)
         root.addLayout(path_row)
 
+        if issue.apply_summary and apply_enabled:
+            apply_row = QHBoxLayout()
+            apply_row.setContentsMargins(_CONTENT_INDENT, 0, 0, 0)
+            apply_lbl = QLabel(issue.apply_summary, self)
+            apply_lbl.setObjectName("DialogBody")
+            apply_lbl.setWordWrap(True)
+            apply_row.addWidget(apply_lbl, 1)
+            root.addLayout(apply_row)
+
         if issue.message and (
             not apply_enabled
             or issue.status == UpstreamRenderStatus.WRONG_ENTITY
+            or issue.status == UpstreamRenderStatus.RANGE_MISMATCH
+            or issue.status == UpstreamRenderStatus.FRAME_REF
             or (
                 issue.latest_version is not None
                 and issue.latest_version < issue.comp_version
@@ -227,6 +274,7 @@ class UpstreamPreflightDetailDialog(MonosDialog):
         *,
         parent=None,
         comp_path: Path,
+        entity_name: str | None,
         issues: list[UpstreamRenderIssue],
         plan: CompPreflightPlan,
     ) -> None:
@@ -237,24 +285,38 @@ class UpstreamPreflightDetailDialog(MonosDialog):
 
         self._plan = plan
         self._issues = issues
+        self._entity_name = entity_name
         self._wrong_entity_issues = [
             i for i in issues if i.status == UpstreamRenderStatus.WRONG_ENTITY
         ]
         self._stale_issues = [i for i in issues if i.status == UpstreamRenderStatus.STALE]
-        self._path_update_issues = self._wrong_entity_issues + self._stale_issues
+        self._frame_ref_issues = [i for i in issues if i.status == UpstreamRenderStatus.FRAME_REF]
+        self._path_update_issues = (
+            self._wrong_entity_issues + self._stale_issues + self._frame_ref_issues
+        )
+        self._range_mismatch_issues = [
+            i for i in issues if i.status == UpstreamRenderStatus.RANGE_MISMATCH
+        ]
 
         global_range = None
+        disk_range = None
         try:
-            global_range = parse_comp_global_range(read_comp_text(comp_path))
+            comp_text = read_comp_text(comp_path)
+            global_range = parse_comp_global_range(comp_text)
+            disk_range = resolve_comp_range_from_disk(
+                comp_text,
+                entity_name=entity_name,
+                retarget_wrong_entity=bool(self._wrong_entity_issues),
+            )
         except OSError:
-            global_range = None
+            comp_text = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(16)
 
         intro = QLabel(
-            "Choose departments to update. Changes apply when you confirm on the main dialog."
+            "Choose departments to update. Each card shows what Apply will change."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
@@ -312,7 +374,13 @@ class UpstreamPreflightDetailDialog(MonosDialog):
         info_issues = [
             i
             for i in issues
-            if i.status not in (UpstreamRenderStatus.STALE, UpstreamRenderStatus.WRONG_ENTITY)
+            if i.status
+            not in (
+                UpstreamRenderStatus.STALE,
+                UpstreamRenderStatus.FRAME_REF,
+                UpstreamRenderStatus.WRONG_ENTITY,
+                UpstreamRenderStatus.RANGE_MISMATCH,
+            )
         ]
         if info_issues:
             body_layout.addWidget(_section_title("Other issues"))
@@ -324,9 +392,57 @@ class UpstreamPreflightDetailDialog(MonosDialog):
 
         body_layout.addWidget(_section_title("Frame range"))
 
-        self._sync_range_cb = _preflight_option_checkbox("Sync frame range to comp GlobalRange", body)
+        if self._range_mismatch_issues:
+            mismatch_total = sum(i.loader_count for i in self._range_mismatch_issues)
+            mismatch_summary = QLabel(
+                f"{len(self._range_mismatch_issues)} department(s) · {mismatch_total} loader(s) "
+                f"— comp GlobalRange does not match frames on disk."
+            )
+            mismatch_summary.setObjectName("DialogHint")
+            body_layout.addWidget(mismatch_summary)
+            mismatch_col = QVBoxLayout()
+            mismatch_col.setSpacing(8)
+            for issue in self._range_mismatch_issues:
+                mismatch_col.addWidget(
+                    _LoaderIssueCard(
+                        issue=issue,
+                        checked=False,
+                        apply_enabled=False,
+                        parent=body,
+                    )
+                )
+            body_layout.addLayout(mismatch_col)
+
+        self._clamp_disk_cb = None
+        if self._range_mismatch_issues and disk_range is not None:
+            d0, d1 = disk_range
+            self._clamp_disk_cb = _preflight_option_checkbox(
+                f"Match GlobalRange to disk ({d0}–{d1})",
+                body,
+            )
+            self._clamp_disk_cb.setChecked(plan.clamp_comp_range_to_disk)
+            self._clamp_disk_cb.setToolTip(
+                "Update comp GlobalRange and all pipeline Loader trims to the frame span "
+                "available on disk."
+            )
+            body_layout.addWidget(self._clamp_disk_cb)
+            clamp_hint_row = QHBoxLayout()
+            clamp_hint_row.setContentsMargins(_CONTENT_INDENT, 0, 0, 0)
+            clamp_hint = QLabel(
+                "Uses render folders on disk after retargeting wrong-entity loaders."
+                if self._wrong_entity_issues
+                else "Uses the intersection of all referenced render folders on disk."
+            )
+            clamp_hint.setObjectName("DialogHint")
+            clamp_hint_row.addWidget(clamp_hint)
+            body_layout.addLayout(clamp_hint_row)
+
+        self._sync_range_cb = _preflight_option_checkbox("Sync loader trim to comp GlobalRange", body)
         self._sync_range_cb.setChecked(plan.sync_loader_range)
-        if global_range is not None:
+        range_hint: QLabel | None = None
+        if self._clamp_disk_cb is not None:
+            self._sync_range_cb.setVisible(False)
+        elif global_range is not None:
             g0, g1 = global_range
             range_hint = QLabel(f"{g0}–{g1} · all versioned render Loaders")
             range_hint.setObjectName("DialogHint")
@@ -335,11 +451,13 @@ class UpstreamPreflightDetailDialog(MonosDialog):
             self._sync_range_cb.setToolTip("Comp GlobalRange not found in file.")
             range_hint = QLabel("GlobalRange not found in comp file.")
             range_hint.setObjectName("DialogHint")
-        body_layout.addWidget(self._sync_range_cb)
-        range_hint_row = QHBoxLayout()
-        range_hint_row.setContentsMargins(_CONTENT_INDENT, 0, 0, 0)
-        range_hint_row.addWidget(range_hint)
-        body_layout.addLayout(range_hint_row)
+        if self._clamp_disk_cb is None:
+            body_layout.addWidget(self._sync_range_cb)
+            if range_hint is not None:
+                range_hint_row = QHBoxLayout()
+                range_hint_row.setContentsMargins(_CONTENT_INDENT, 0, 0, 0)
+                range_hint_row.addWidget(range_hint)
+                body_layout.addLayout(range_hint_row)
 
         scroll.setWidget(body)
         scroll.setWidgetResizable(True)
@@ -369,11 +487,11 @@ class UpstreamPreflightDetailDialog(MonosDialog):
         back_btn.clicked.connect(self.reject)
         btn_row.addWidget(back_btn)
         btn_row.addStretch(1)
-        done_btn = QPushButton("Done", self)
-        done_btn.setObjectName("DialogPrimaryButton")
-        done_btn.setDefault(True)
-        done_btn.clicked.connect(self._on_done)
-        btn_row.addWidget(done_btn)
+        confirm_btn = QPushButton("Confirm", self)
+        confirm_btn.setObjectName("DialogPrimaryButton")
+        confirm_btn.setDefault(True)
+        confirm_btn.clicked.connect(self._on_done)
+        btn_row.addWidget(confirm_btn)
         root.addLayout(btn_row)
 
         self.adjustSize()
@@ -385,7 +503,12 @@ class UpstreamPreflightDetailDialog(MonosDialog):
 
     def _on_done(self) -> None:
         self._plan.upstream_selected = [card.issue for card in self._issue_cards if card.is_checked()]
-        self._plan.sync_loader_range = self._sync_range_cb.isChecked()
+        if self._clamp_disk_cb is not None:
+            self._plan.clamp_comp_range_to_disk = self._clamp_disk_cb.isChecked()
+            self._plan.sync_loader_range = False
+        else:
+            self._plan.clamp_comp_range_to_disk = False
+            self._plan.sync_loader_range = self._sync_range_cb.isChecked()
         self.accept()
 
 
@@ -529,11 +652,11 @@ class SaverPreflightDetailDialog(MonosDialog):
         back_btn.clicked.connect(self.reject)
         btn_row.addWidget(back_btn)
         btn_row.addStretch(1)
-        done_btn = QPushButton("Done", self)
-        done_btn.setObjectName("DialogPrimaryButton")
-        done_btn.setDefault(True)
-        done_btn.clicked.connect(self._on_done)
-        btn_row.addWidget(done_btn)
+        confirm_btn = QPushButton("Confirm", self)
+        confirm_btn.setObjectName("DialogPrimaryButton")
+        confirm_btn.setDefault(True)
+        confirm_btn.clicked.connect(self._on_done)
+        btn_row.addWidget(confirm_btn)
         root.addLayout(btn_row)
 
         self.adjustSize()

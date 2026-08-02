@@ -19,6 +19,11 @@ _LOADER_ASSIGN_RE = re.compile(
     re.IGNORECASE,
 )
 _GLOBAL_RANGE_RE = re.compile(r"GlobalRange\s*=\s*\{\s*(\d+)\s*,\s*(\d+)\s*\}")
+_RENDER_RANGE_RE = re.compile(r"RenderRange\s*=\s*\{\s*(\d+)\s*,\s*(\d+)\s*\}")
+_TRIM_IN_RE = re.compile(r"TrimIn\s*=\s*(-?\d+)", re.IGNORECASE)
+_TRIM_OUT_RE = re.compile(r"TrimOut\s*=\s*(-?\d+)", re.IGNORECASE)
+_GLOBAL_START_RE = re.compile(r"GlobalStart\s*=\s*(-?\d+)", re.IGNORECASE)
+_GLOBAL_END_RE = re.compile(r"GlobalEnd\s*=\s*(-?\d+)", re.IGNORECASE)
 
 
 def _iter_loader_blocks(comp_text: str) -> list[tuple[str, str]]:
@@ -122,6 +127,50 @@ def parse_comp_global_range(comp_text: str) -> tuple[int, int] | None:
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
+
+
+def replace_comp_global_range(comp_text: str, start: int, end: int) -> str:
+    """Update composition GlobalRange (and RenderRange when present)."""
+    out = _GLOBAL_RANGE_RE.sub(f"GlobalRange = {{ {start}, {end} }}", comp_text, count=1)
+    if _RENDER_RANGE_RE.search(out):
+        out = _RENDER_RANGE_RE.sub(f"RenderRange = {{ {start}, {end} }}", out, count=1)
+    return out
+
+
+def intersect_frame_ranges(ranges: list[tuple[int, int]]) -> tuple[int, int] | None:
+    """Intersection of inclusive frame ranges; None when disjoint or empty."""
+    if not ranges:
+        return None
+    start = max(r[0] for r in ranges)
+    end = min(r[1] for r in ranges)
+    if start > end:
+        return None
+    return start, end
+
+
+def parse_loader_block_clip_range(block: str) -> tuple[int, int] | None:
+    """Return (start, end) trim range from the first Clip in a Loader block."""
+    trim_in = _TRIM_IN_RE.search(block)
+    trim_out = _TRIM_OUT_RE.search(block)
+    if trim_in and trim_out:
+        return int(trim_in.group(1)), int(trim_out.group(1))
+    g0 = _GLOBAL_START_RE.search(block)
+    g1 = _GLOBAL_END_RE.search(block)
+    if g0 and g1:
+        return int(g0.group(1)), int(g1.group(1))
+    return None
+
+
+def loader_block_range_matches_global(
+    block: str,
+    global_start: int,
+    global_end: int,
+) -> bool:
+    clip_range = parse_loader_block_clip_range(block)
+    if clip_range is None:
+        return True
+    start, end = clip_range
+    return start == global_start and end == global_end
 
 
 def sync_loader_block_range(block: str, global_start: int, global_end: int) -> str:

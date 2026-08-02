@@ -68,6 +68,10 @@ _END_RENDER_SCRIPTS_ENABLE_RE = re.compile(
     r"EndRenderScripts\s*=\s*Input\s*\{\s*Value\s*=\s*1\s*,?\s*\}",
     re.IGNORECASE,
 )
+_END_RENDER_SCRIPTS_MISSING_FIELD_COMMA_RE = re.compile(
+    r"(EndRenderScripts\s*=\s*Input\s*\{\s*Value\s*=\s*1\s*,?\s*\})(?!\s*,)(\s*\r?\n\s*EndRenderScript)",
+    re.IGNORECASE,
+)
 _SAVER_VIEW_GAP_X = 200.0
 _DEFAULT_SAVER_POS = (200.0, 0.0)
 _MANAGED_SAVER_ASSIGN_RE = re.compile(
@@ -237,16 +241,170 @@ def _ensure_field_comma_before(block: str, idx: int) -> str:
     return stripped + "," + trailing + block[idx:]
 
 
+def repair_end_render_script_field_comma(text: str) -> str:
+    """Fix missing comma between EndRenderScripts and EndRenderScript Saver fields."""
+    return _END_RENDER_SCRIPTS_MISSING_FIELD_COMMA_RE.sub(r"\1,\2", text)
+
+
+def repair_end_render_script_value(text: str) -> str:
+    """Re-escape EndRenderScript when a prior re.sub write left literal newlines in the value."""
+    hit = _managed_saver_block(text)
+    if hit is None:
+        return text
+    _tool_var, block, start, end = hit
+    m = _END_RENDER_SCRIPT_RE.search(block)
+    if not m:
+        return text
+    raw = m.group(1)
+    if "\n" not in raw and "\r" not in raw:
+        return text
+    lua = raw.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+    fixed_block = apply_end_render_script_to_saver_block(block, lua)
+    if fixed_block == block:
+        return text
+    return text[:start] + fixed_block + text[end:]
+
+
+def _saver_inputs_close_index(block: str) -> int | None:
+    """Index of the ``}`` that closes the Saver ``Inputs = {`` block."""
+    m = re.search(r"Inputs\s*=\s*\{", block, re.IGNORECASE)
+    if not m:
+        return None
+    brace_idx = block.find("{", m.start())
+    if brace_idx < 0:
+        return None
+    _chunk, end_idx = _extract_braced_block(block, brace_idx)
+    if end_idx <= brace_idx:
+        return None
+    return end_idx - 1
+
+
+def _insert_into_saver_inputs(block: str, text_to_insert: str) -> str:
+    insert_at = _saver_inputs_close_index(block)
+    if insert_at is None:
+        return block
+    line_start = block.rfind("\n", 0, insert_at)
+    if line_start < 0:
+        line_start = 0
+    else:
+        line_start += 1
+    close_indent = block[line_start:insert_at]
+    prefix = block[:line_start].rstrip(" \t\r\n")
+    if prefix and not prefix.endswith(","):
+        prefix += ","
+    insert = text_to_insert.rstrip("\n") + "\n"
+    return prefix + "\n" + insert + close_indent + "}" + block[insert_at + 1 :]
+
+
+def _end_render_script_inside_inputs(block: str) -> bool:
+    script_m = _END_RENDER_SCRIPT_RE.search(block)
+    if script_m is None:
+        enable_m = _END_RENDER_SCRIPTS_ENABLE_RE.search(block)
+        if enable_m is None:
+            return True
+        script_m = enable_m
+    inputs_m = re.search(r"Inputs\s*=\s*\{", block, re.IGNORECASE)
+    if inputs_m is None:
+        return False
+    view_m = re.search(r"ViewInfo\s*=\s*", block, re.IGNORECASE)
+    if view_m is not None and script_m.start() >= view_m.start():
+        return False
+    return script_m.start() > inputs_m.start()
+
+
+def _strip_end_render_script_fields(block: str) -> str:
+    out = _END_RENDER_SCRIPT_RE.sub("", block)
+    out = _END_RENDER_SCRIPTS_ENABLE_RE.sub("", out)
+    out = re.sub(r",(\s*,)+", ",", out)
+    out = re.sub(r"(\{\s*),", r"\1", out)
+    out = re.sub(r",(\s*\n\s*),", r",\1", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+
+def repair_misplaced_saver_end_render_script_block(block: str) -> str:
+    """Move EndRenderScript fields from ViewInfo back into Saver Inputs."""
+    if _end_render_script_inside_inputs(block):
+        return block
+    script_m = _END_RENDER_SCRIPT_RE.search(block)
+    lua: str | None = None
+    if script_m is not None:
+        raw = script_m.group(1)
+        lua = raw.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+    elif not _END_RENDER_SCRIPTS_ENABLE_RE.search(block):
+        return block
+    cleaned = _strip_end_render_script_fields(block)
+    if not lua:
+        return cleaned
+    return apply_end_render_script_to_saver_block(cleaned, lua)
+
+
+def repair_misplaced_saver_end_render_script_in_text(text: str) -> str:
+    hit = _managed_saver_block(text)
+    if hit is None:
+        return text
+    _tool_var, block, start, end = hit
+    fixed = repair_misplaced_saver_end_render_script_block(block)
+    if fixed == block:
+        return text
+    return text[:start] + fixed + text[end:]
+
+
+def apply_end_render_script_to_all_savers_in_text(comp_text: str, lua: str) -> str:
+    """Attach the same EndRenderScript Lua to every root Tools Saver."""
+    spans = _iter_saver_blocks(comp_text)
+    if not spans:
+        return comp_text
+    out = comp_text
+    for _name, block, start, end in reversed(spans):
+        updated = apply_end_render_script_to_saver_block(block, lua)
+        if updated != block:
+            out = out[:start] + updated + out[end:]
+    return out
+
+
+def repair_saver_end_render_notify_invoke_in_text(text: str, comp_path: Path) -> str:
+    """Refresh every Saver EndRenderScript to call notify.cmd (Fusion often lacks python on PATH)."""
+    spans = _iter_saver_blocks(text)
+    if not spans:
+        return text
+    from monostudio.core.comp_fusion_scripts import (
+        build_saver_end_render_lua,
+        ensure_project_fusion_discord_script,
+        find_project_root,
+    )
+
+    root = find_project_root(comp_path)
+    if root is None:
+        return text
+    discord_py = ensure_project_fusion_discord_script(root)
+    lua = build_saver_end_render_lua(discord_py)
+
+    def _needs_refresh(block: str) -> bool:
+        script_m = _END_RENDER_SCRIPT_RE.search(block)
+        if script_m is None:
+            return True
+        raw = script_m.group(0)
+        if "notify.cmd" not in raw or "cmd /c python" in raw:
+            return True
+        return "fusion_end_render.log" not in raw
+
+    has_any_script = any(_END_RENDER_SCRIPT_RE.search(block) for _name, block, _s, _e in spans)
+    if not has_any_script:
+        return text
+    if any(_needs_refresh(block) for _name, block, _s, _e in spans):
+        return apply_end_render_script_to_all_savers_in_text(text, lua)
+    return text
+
+
 def apply_end_render_script_to_saver_block(block: str, lua: str) -> str:
     """Insert or replace Saver EndRenderScript fields."""
     escaped = escape_lua_for_comp_value(lua)
     script_line = f'\t\t\t\tEndRenderScript = Input {{ Value = "{escaped}", }},\n'
+    script_field = f'EndRenderScript = Input {{ Value = "{escaped}", }}'
     if _END_RENDER_SCRIPT_RE.search(block):
-        out = _END_RENDER_SCRIPT_RE.sub(
-            f'EndRenderScript = Input {{ Value = "{escaped}", }}',
-            block,
-            count=1,
-        )
+        # Use callable repl — re.sub treats backslashes in string replacements specially.
+        out = _END_RENDER_SCRIPT_RE.sub(lambda _m: script_field, block, count=1)
         if not _END_RENDER_SCRIPTS_ENABLE_RE.search(out):
             enable = "\t\t\t\tEndRenderScripts = Input { Value = 1, },\n"
             m = _END_RENDER_SCRIPT_RE.search(out)
@@ -259,14 +417,15 @@ def apply_end_render_script_to_saver_block(block: str, lua: str) -> str:
         line_end = block.find("\n", insert_at)
         if line_end < 0:
             line_end = len(block)
-        return block[:line_end] + "\n" + script_line + block[line_end:]
+        head = block[:line_end].rstrip(" \t\r\n")
+        tail = block[line_end:]
+        if head and not head.endswith(","):
+            head = head + ","
+        if tail.startswith("\n"):
+            return head + "\n" + script_line + tail[1:]
+        return head + "\n" + script_line + tail
     fields = _format_end_render_script_inputs(lua)
-    marker = "\t\t\t},"
-    idx = block.rfind(marker)
-    if idx < 0:
-        return block
-    block = _ensure_field_comma_before(block, idx)
-    return block[:idx] + fields + block[idx:]
+    return _insert_into_saver_inputs(block, fields)
 
 
 def _replace_filename_in_block(block: str, new_path: str) -> str:
@@ -693,13 +852,9 @@ def apply_comp_saver_fix(
             return "failed"
         discord_py = ensure_project_fusion_discord_script(root, workspace_root=workspace_root)
         lua = build_saver_end_render_lua(discord_py)
-        hit = _managed_saver_block(new_text)
-        if hit is None:
-            return "failed"
-        tool_var, block, start, end = hit
-        updated_block = apply_end_render_script_to_saver_block(block, lua)
-        if updated_block != block:
-            new_text = new_text[:start] + updated_block + new_text[end:]
+        updated_text = apply_end_render_script_to_all_savers_in_text(new_text, lua)
+        if updated_text != new_text:
+            new_text = updated_text
 
     if new_text == text:
         return "unchanged"
@@ -728,6 +883,10 @@ def repair_comp_file(comp_path: Path) -> bool:
         return False
     fixed = trim_comp_text_to_valid_composition(raw)
     fixed = strip_misplaced_managed_savers(fixed)
+    fixed = repair_end_render_script_field_comma(fixed)
+    fixed = repair_end_render_script_value(fixed)
+    fixed = repair_misplaced_saver_end_render_script_in_text(fixed)
+    fixed = repair_saver_end_render_notify_invoke_in_text(fixed, comp_path)
     if fixed == raw:
         return False
     backup = comp_path.with_suffix(comp_path.suffix + ".monos.bak")

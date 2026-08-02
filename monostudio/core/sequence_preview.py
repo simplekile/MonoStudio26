@@ -322,6 +322,29 @@ def sequence_folder_has_frames(sequence_folder: Path) -> bool:
     return False
 
 
+def sequence_folder_frame_extent(
+    sequence_folder: Path,
+    *,
+    base_prefix: str,
+) -> tuple[int, int] | None:
+    """Return (min_frame, max_frame) for pipeline sequence files in a render folder."""
+    prefix_cf = f"{base_prefix}_v".casefold()
+    nums: list[int] = []
+    for path in list_sequence_frames(sequence_folder):
+        if not path.stem.casefold().startswith(prefix_cf):
+            continue
+        m = re.search(r"(\d+)$", path.stem)
+        if not m:
+            continue
+        try:
+            nums.append(int(m.group(1)))
+        except ValueError:
+            continue
+    if not nums:
+        return None
+    return min(nums), max(nums)
+
+
 def count_sequence_frames(sequence_folder: Path) -> int:
     """Frame count without sorting (for labels / picker)."""
     if not sequence_folder.is_dir():

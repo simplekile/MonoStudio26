@@ -381,9 +381,15 @@ class CompPreflightHubDialog(MonosDialog):
         actionable = self._scan.upstream_actionable
         n = len(actionable)
         wrong_n = sum(1 for i in actionable if i.status == UpstreamRenderStatus.WRONG_ENTITY)
+        range_n = sum(1 for i in actionable if i.status == UpstreamRenderStatus.RANGE_MISMATCH)
+        parts: list[str] = []
         if wrong_n:
+            parts.append(f"{wrong_n} wrong shot/asset")
+        if range_n:
+            parts.append(f"{range_n} frame range")
+        if parts:
             summary = (
-                f"{n} Loader issue(s) — incl. {wrong_n} wrong shot/asset "
+                f"{n} Loader issue(s) — incl. {' + '.join(parts)} "
                 f"+ versioned render folders under work/render."
             )
         else:
@@ -394,8 +400,16 @@ class CompPreflightHubDialog(MonosDialog):
             configured = False
         elif self._plan.upstream_reviewed:
             selected = len(self._plan.upstream_selected)
-            sync = " + range sync" if self._plan.sync_loader_range else ""
-            status = f"Configured ({selected} path update(s){sync})"
+            sync = ""
+            if self._plan.clamp_comp_range_to_disk:
+                sync = " + range from disk"
+            elif self._plan.sync_loader_range:
+                sync = " + range sync"
+            range_only = selected == 0 and (self._plan.sync_loader_range or self._plan.clamp_comp_range_to_disk)
+            if range_only:
+                status = "Configured (range from disk)" if self._plan.clamp_comp_range_to_disk else "Configured (range sync)"
+            else:
+                status = f"Configured ({selected} path update(s){sync})"
             configured = True
         else:
             status = "Configure"
@@ -441,6 +455,7 @@ class CompPreflightHubDialog(MonosDialog):
         dialog = UpstreamPreflightDetailDialog(
             parent=self,
             comp_path=self._scan.comp_path,
+            entity_name=self._scan.entity_name,
             issues=self._scan.upstream_actionable,
             plan=self._plan,
         )
@@ -547,6 +562,7 @@ def apply_preflight_plan(
             scan.upstream_actionable,
             selected_issues=plan.upstream_selected,
             sync_loader_range=plan.sync_loader_range,
+            clamp_comp_range_to_disk=plan.clamp_comp_range_to_disk,
             entity_name=scan.entity_name,
         )
         if result == "failed":

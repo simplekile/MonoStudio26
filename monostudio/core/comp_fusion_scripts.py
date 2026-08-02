@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from pathlib import Path
 
 from monostudio.core.app_paths import get_app_base_path
@@ -41,10 +42,41 @@ def project_fusion_discord_script_path(project_root: Path) -> Path:
 
 
 FUSION_RENDER_ACTOR_FILENAME = "render_actor.json"
+FUSION_PYTHON_PATH_FILENAME = "python.path"
+FUSION_NOTIFY_CMD_FILENAME = "notify.cmd"
 
 
 def fusion_render_actor_path(project_root: Path) -> Path:
     return project_root / ".monostudio" / "fusion" / FUSION_RENDER_ACTOR_FILENAME
+
+
+def fusion_notify_cmd_path(project_root: Path) -> Path:
+    return project_root / ".monostudio" / "fusion" / FUSION_NOTIFY_CMD_FILENAME
+
+
+def write_fusion_python_path(project_root: Path) -> Path:
+    """Persist the Python executable MonoStudio uses (Fusion often lacks python on PATH)."""
+    dest = project_root / ".monostudio" / "fusion" / FUSION_PYTHON_PATH_FILENAME
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(f"{Path(sys.executable).resolve()}\n", encoding="utf-8")
+    return dest
+
+
+def write_fusion_notify_cmd(project_root: Path) -> Path:
+    """Batch wrapper for discord.py — logs invocations and uses python.path."""
+    dest = fusion_notify_cmd_path(project_root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        "@echo off\r\n"
+        'set "LOG=%~dp0discord_invoke.log"\r\n'
+        "echo %DATE% %TIME% %*>>\"%LOG%\"\r\n"
+        'set "PY=%~dp0python.path"\r\n'
+        "set \"PYEXE=python\"\r\n"
+        'if exist "%PY%" set /p PYEXE=<"%PY%"\r\n'
+        '"%PYEXE%" "%~dp0discord.py" %*>>"%LOG%" 2>&1\r\n',
+        encoding="utf-8",
+    )
+    return dest
 
 
 def write_fusion_render_actor(
@@ -149,13 +181,16 @@ def ensure_project_fusion_discord_script(
     first = urls[0] if urls else ""
     (dest_dir / "webhook.url").write_text(f"{first}\n", encoding="utf-8")
     write_fusion_render_actor(project_root, workspace_root=workspace_root)
+    write_fusion_python_path(project_root)
+    write_fusion_notify_cmd(project_root)
     return dest_py
 
 
 def build_saver_end_render_lua(discord_py: Path) -> str:
-    """Lua run by Fusion Saver after render — resolves Comp: paths, calls project discord.py."""
-    # Inside Lua [[...]] long strings, Windows paths do not need backslash doubling.
-    py_path = str(discord_py.resolve())
+    """Lua run by Fusion Saver after render — resolves Comp: paths, calls notify.cmd."""
+    fusion_dir = discord_py.parent.resolve()
+    notify_cmd = str((fusion_dir / FUSION_NOTIFY_CMD_FILENAME).resolve())
+    debug_log = str((fusion_dir / "fusion_end_render.log").resolve())
     return (
         "local output = tostring(self.Clip.Filename)\n\n"
         'if output:match("^Comp:[/\\\\]") then\n'
@@ -166,8 +201,13 @@ def build_saver_end_render_lua(discord_py: Path) -> str:
         "end\n\n"
         "local saver = tostring(self.Name)\n"
         "local compname = tostring(comp.Name)\n\n"
+        f'local logf = io.open("{debug_log}", "a")\n'
+        "if logf then\n"
+        '    logf:write(os.date() .. " saver=" .. saver .. " comp=" .. compname .. "\\n")\n'
+        "    logf:close()\n"
+        "end\n\n"
         "local cmd = string.format(\n"
-        f'    [[cmd /c python "{py_path}" "%s" "%s" "%s"]],\n'
+        f'    [[cmd /c call "{notify_cmd}" "%s" "%s" "%s"]],\n'
         "    output,\n"
         "    saver,\n"
         "    compname\n"

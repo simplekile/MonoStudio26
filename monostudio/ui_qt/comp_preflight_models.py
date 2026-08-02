@@ -13,6 +13,14 @@ from monostudio.core.comp_upstream_render_check import UpstreamRenderIssue, Upst
 CompPreflightApplyMode = Literal["new_version", "current_version"]
 
 
+def is_upstream_frame_ref_fixable(issue: UpstreamRenderIssue) -> bool:
+    """True when loader paths can be repointed to an existing frame in the version folder."""
+    return (
+        issue.status == UpstreamRenderStatus.FRAME_REF
+        and issue.latest_folder is not None
+    )
+
+
 def is_upstream_version_upgrade(issue: UpstreamRenderIssue) -> bool:
     """True when applying would bump Loader paths to a newer render folder on disk."""
     return (
@@ -27,6 +35,19 @@ def is_upstream_wrong_entity_fixable(issue: UpstreamRenderIssue) -> bool:
     return (
         issue.status == UpstreamRenderStatus.WRONG_ENTITY
         and bool(issue.expected_entity_name.strip())
+    )
+
+
+def has_upstream_range_mismatch(scan: CompPreflightScan) -> bool:
+    return any(i.status == UpstreamRenderStatus.RANGE_MISMATCH for i in scan.upstream_issues)
+
+
+def should_default_sync_loader_range(scan: CompPreflightScan) -> bool:
+    from monostudio.core.comp_upstream_render_check import has_loader_trim_mismatch_with_global
+
+    return has_loader_trim_mismatch_with_global(
+        scan.comp_path,
+        entity_name=scan.entity_name,
     )
 
 
@@ -75,8 +96,10 @@ class CompPreflightScan:
             if i.status
             in (
                 UpstreamRenderStatus.STALE,
+                UpstreamRenderStatus.FRAME_REF,
                 UpstreamRenderStatus.MISSING_ON_DISK,
                 UpstreamRenderStatus.WRONG_ENTITY,
+                UpstreamRenderStatus.RANGE_MISMATCH,
             )
         ]
 
@@ -102,6 +125,7 @@ class CompPreflightPlan:
 
     upstream_selected: list[UpstreamRenderIssue] = field(default_factory=list)
     sync_loader_range: bool = False
+    clamp_comp_range_to_disk: bool = False
     upstream_reviewed: bool = False
     upstream_apply_enabled: bool = True
 
@@ -112,15 +136,19 @@ class CompPreflightPlan:
             self.saver_update_path = True
         self.saver_create_folder = True
         self.saver_connect_rightmost = not scan.saver_already_connected
-        self.saver_end_render_script = False
+        self.saver_end_render_script = scan.saver_missing_end_render_script
 
     def init_upstream_defaults(self, scan: CompPreflightScan) -> None:
         self.upstream_selected = [
             i
             for i in scan.upstream_actionable
-            if is_upstream_version_upgrade(i) or is_upstream_wrong_entity_fixable(i)
+            if is_upstream_version_upgrade(i) or is_upstream_wrong_entity_fixable(i) or is_upstream_frame_ref_fixable(i)
         ]
-        self.sync_loader_range = False
+        self.clamp_comp_range_to_disk = has_upstream_range_mismatch(scan)
+        if self.clamp_comp_range_to_disk:
+            self.sync_loader_range = False
+        else:
+            self.sync_loader_range = should_default_sync_loader_range(scan)
 
     def saver_will_apply(self) -> bool:
         if not self.saver_apply_enabled:
@@ -137,7 +165,7 @@ class CompPreflightPlan:
             return False
         if not self.upstream_reviewed:
             return False
-        return bool(self.upstream_selected) or self.sync_loader_range
+        return bool(self.upstream_selected) or self.sync_loader_range or self.clamp_comp_range_to_disk
 
     @property
     def apply_to_new_version(self) -> bool:

@@ -61,11 +61,13 @@ def test_build_saver_end_render_lua_format_string(tmp_path: Path) -> None:
     py = tmp_path / ".monostudio" / "fusion" / "discord.py"
     py.parent.mkdir(parents=True)
     py.write_text("# stub\n", encoding="utf-8")
+    (py.parent / "notify.cmd").write_text("@echo off\n", encoding="utf-8")
     lua = build_saver_end_render_lua(py)
-    assert 'string.format(\n    [[cmd /c python "' in lua
+    assert 'string.format(\n    [[cmd /c call "' in lua
+    assert "notify.cmd" in lua
     assert '"%s" "%s" "%s"]],\n' in lua
     assert "]]]," not in lua
-    assert "\\\\Dropbox\\\\" not in lua
+    assert "cmd /c python" not in lua
 
 
 def test_ensure_project_fusion_discord_script(tmp_path: Path) -> None:
@@ -76,6 +78,8 @@ def test_ensure_project_fusion_discord_script(tmp_path: Path) -> None:
     assert py.is_file()
     assert (py.parent / "webhook.url").is_file()
     assert (py.parent / "webhooks.json").is_file()
+    assert (py.parent / "notify.cmd").is_file()
+    assert (py.parent / "python.path").is_file()
 
 
 def test_ensure_project_fusion_discord_script_multi_webhook(tmp_path: Path) -> None:
@@ -145,6 +149,113 @@ def test_apply_end_render_script_when_enable_already_present() -> None:
     assert 'Input { Value = 4, }' in out
 
 
+def test_apply_end_render_script_when_enable_line_missing_field_comma() -> None:
+    """Fusion may save EndRenderScripts without a trailing field comma."""
+    block = (
+        "\t\tMONOS_Output = Saver {\n"
+        "\t\t\tInputs = {\n"
+        '\t\t\t\tClip = Input { Value = Clip { Filename = "x.exr", }, },\n'
+        "\t\t\t\tInput = Input { SourceOp = \"Merge2\", },\n"
+        "\t\t\t\tEndRenderScripts = Input { Value = 1, }\n"
+        "\t\t\t},\n"
+        "\t\t},\n"
+    )
+    lua = 'print("hi")'
+    out = apply_end_render_script_to_saver_block(block, lua)
+    assert "EndRenderScripts = Input { Value = 1, }," in out
+    assert "EndRenderScript = Input { Value =" in out
+
+
+def test_repair_end_render_script_field_comma() -> None:
+    from monostudio.core.comp_saver_io import repair_end_render_script_field_comma
+
+    broken = (
+        "\t\t\t\tEndRenderScripts = Input { Value = 1, }\n"
+        '\t\t\t\tEndRenderScript = Input { Value = "x", },\n'
+    )
+    fixed = repair_end_render_script_field_comma(broken)
+    assert "EndRenderScripts = Input { Value = 1, },\n" in fixed
+
+
+def test_apply_end_render_script_into_inputs_not_viewinfo() -> None:
+    block = (
+        "\t\tMONOS_Output = Saver {\n"
+        "\t\t\tInputs = {\n"
+        '\t\t\t\tClip = Input { Value = Clip { Filename = "x.exr", }, },\n'
+        '\t\t\t\tInput = Input { SourceOp = "Merge2", },\n'
+        "\t\t\t},\n"
+        "\t\t\tViewInfo = OperatorInfo {\n"
+        "\t\t\t\tPos = { 1, 2 },\n"
+        "\t\t\t\tFlags = { ShowPic = true },\n"
+        "\t\t\t},\n"
+        "\t\t},\n"
+    )
+    out = apply_end_render_script_to_saver_block(block, 'print("hi")')
+    inputs_part = out.split("ViewInfo", 1)[0]
+    assert "EndRenderScript" in inputs_part
+    assert "EndRenderScripts" in inputs_part
+    assert "EndRenderScript" not in out.split("ViewInfo", 1)[1]
+
+
+def test_repair_misplaced_end_render_script_block() -> None:
+    from monostudio.core.comp_saver_io import repair_misplaced_saver_end_render_script_block
+
+    misplaced = (
+        "\t\tMONOS_Output = Saver {\n"
+        "\t\t\tInputs = {\n"
+        '\t\t\t\tClip = Input { Value = Clip { Filename = "x.exr", }, },\n'
+        "\t\t\t},\n"
+        "\t\t\tViewInfo = OperatorInfo {\n"
+        "\t\t\t\tPos = { 1, 2 },\n"
+        "\t\t\t\tFlags = { ShowPic = true },\t\t\t\tEndRenderScripts = Input { Value = 1, },\n"
+        '\t\t\t\tEndRenderScript = Input { Value = "print(\\\"hi\\\")", },\n'
+        "\n"
+        "\t\t\t},\n"
+        "\t\t},\n"
+    )
+    fixed = repair_misplaced_saver_end_render_script_block(misplaced)
+    inputs_part = fixed.split("ViewInfo", 1)[0]
+    viewinfo_part = fixed.split("ViewInfo", 1)[1]
+    assert "EndRenderScript" in inputs_part
+    assert "EndRenderScript" not in viewinfo_part
+    assert "\t\t\t}," in fixed
+    assert ",\n\t\t\t\t," not in fixed
+
+
+def test_apply_end_render_script_re_sub_preserves_escaped_newlines() -> None:
+    lua = 'print("hi")\nsecond line'
+    block = (
+        "\t\tSaver1 = Saver {\n"
+        "\t\t\tInputs = {\n"
+        '\t\t\t\tEndRenderScript = Input { Value = "old", },\n'
+        "\t\t\t},\n"
+        "\t\t},\n"
+    )
+    out = apply_end_render_script_to_saver_block(block, lua)
+    value_line = [ln for ln in out.splitlines() if "EndRenderScript = Input" in ln][0]
+    assert value_line.count('"') >= 2
+    assert "\\n" in value_line
+    assert value_line.strip().endswith('", },') or value_line.strip().endswith('", }')
+
+
+def test_repair_end_render_script_multiline_value() -> None:
+    from monostudio.core.comp_saver_io import repair_end_render_script_value
+
+    broken = (
+        "Composition {\n\tTools = {\n"
+        "\t\tMONOS_Output = Saver {\n"
+        "\t\t\tInputs = {\n"
+        '\t\t\t\tEndRenderScript = Input { Value = "line1\n\nline2", },\n'
+        "\t\t\t},\n"
+        "\t\t},\n"
+        "\t},\n"
+        "}\n"
+    )
+    fixed = repair_end_render_script_value(broken)
+    assert "line1\\n\\nline2" in fixed
+    assert 'Value = "line1\n\nline2"' not in fixed
+
+
 def test_apply_end_render_script_on_comp(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     work = project / "04_comp" / "fusion" / "work"
@@ -175,10 +286,11 @@ def test_apply_end_render_script_on_comp(tmp_path: Path) -> None:
     assert result == "updated"
     text = read_comp_text(comp)
     assert "EndRenderScript = Input" in text
-    assert "discord.py" in text
+    assert "notify.cmd" in text
     assert project_fusion_discord_script_path(project).is_file()
     lua = build_saver_end_render_lua(project_fusion_discord_script_path(project))
     assert "Comp:[/\\\\]" in lua
-    assert '[[cmd /c python "' in lua
+    assert '[[cmd /c call "' in lua
+    assert "notify.cmd" in lua
     assert ']]],' not in lua
     assert lua.count("]],") == 1
