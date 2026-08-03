@@ -1,0 +1,558 @@
+---
+description: Plan rebuild Main View — Design spine + Snapshot + QML (bắt buộc), dialog tier anchor, thumb/badge UX. Handoff review hiệu năng & UI.
+alwaysApply: false
+---
+
+# Plan — Main View Engine v2 (Pipeline Presentation Layer)
+
+Tài liệu tổng hợp review Main View (grid card + list row + badge), quyết định kiến trúc, và lộ trình triển khai để đạt **đẹp · mượt · ổn định**.
+
+**Liên quan:**
+- `plan_dialog_tier_golden_reference_v1.mdc` + `scripts/test_dialog_tiers.py` — **anchor visual** (FROZEN)
+- `plan_list_view_v2.mdc` (Widget list — **deprecate** sau QML list)
+- `docs/ARCHITECTURE.md`, `docs/ui_ux_spec_v1.md`, `monostudio.md`, `ui_design.md`
+- Plan này: **Design spine → Snapshot + QML hybrid**; không web/Electron
+
+---
+
+## 1. Mục tiêu (đo được)
+
+| Mục tiêu | Tiêu chí |
+|----------|----------|
+| **Mượt** | Scroll 500+ items ≥ 55fps; QML frame p95 < **16ms**; thumb fade QML |
+| **Ổn định** | Grid ↔ List giữ selection; không flash khi filter; update 1 entity không repaint cả view |
+| **Đẹp** | Badge tier rõ (`production_ui_v1`); thumb không “sticker collage”; motion tinh tế (fade/hover) |
+
+**Không mục tiêu v1:** sort cột list, QML toàn app (shell/Inspector/dialog giữ Widgets), rewrite Electron/web.
+
+**Bắt buộc:** Main View (grid + list) **Qt Quick / QML** — không kết thúc migration bằng Widget delegate làm đích cuối.
+
+---
+
+## 2. Hiện trạng (đã có)
+
+### Kiến trúc view
+
+```
+MainView (~9k dòng main_view.py)
+├── Grid: QListView IconMode + _GridCardDelegate (paint ~700 dòng/row path)
+├── List: PipelineListRowView + PipelineListRowDelegate (plan_list_view_v2)
+├── Model: PipelineTileModel + PipelineListModel → shared _all_items
+├── Thumb: ThumbnailManager (async worker) + prefetch chunk 48 rows
+└── Badge: QPainter custom (không QLabel trên card) — pipeline_row_paint.py helpers
+```
+
+### Điểm đã làm đúng
+
+- `QListView` virtualization — **giữ**
+- `ThumbnailManager` decode worker thread + LRU + disk cache
+- Prefetch chunked; list `_scroll_busy` 120ms defer
+- `pipeline_row_paint.py` shared helpers; list thumb DPR-aware
+- `interaction_fast_paint` khi rubber-band (band-aid tạm thời)
+
+---
+
+## 3. Chẩn đoán — nguyên nhân lag & bất ổn
+
+### 3.1 Compute-on-paint (lỗi kiến trúc chính)
+
+Mỗi repaint visible row gọi trên **UI thread**:
+
+- `assess_view_item_health()` — duyệt work/publish, naming rules
+- `dcc_badges_for_item()` — registry + `resolve_dcc_status` per DCC
+- `notes_badge_state()` qua MainWindow
+- `lucide_icon()` / `brand_icon()` per paint (type/dept)
+
+**Hệ quả:** 20 card visible × nhiều call/frame khi scroll → vượt 16ms budget.
+
+### 3.2 Paint path quá dày
+
+- Grid: clip, rounded rect, opacity dim, nhiều badge layer
+- Dead code trong hot path (`status_key`, `draw_thumb_tag` — allocate mỗi paint, không dùng)
+- List: `paintEvent` ×3 (background + delegate + sticky overlay) — sticky cột vẽ **hai lần**
+
+### 3.3 Invalidation quá rộng
+
+- `repaint_tile_and_list_views()` → `dataChanged` **tất cả rows** + full viewport
+- `bind_rows()` / `remove_row_at()` → `beginResetModel()` thay vì incremental
+- Đổi department → reset **mọi** thumb slot
+
+### 3.4 Thumbnail — async nhưng chưa mượt end-to-end
+
+| Đúng | Sai (còn lại) |
+|------|----------------|
+| Decode EXR/PNG/video trong worker | `resolve_grid_thumbnail_file` trên UI khi cache miss |
+| Coalesce request per cache_key | Grid `_cached_thumb_crop`: smooth-scale trên UI mỗi miss |
+| Chunk prefetch 48 | Legacy `ThumbnailCache.load_thumbnail_pixmap` sync trong prefetch fallback |
+| | Thumb pop-in đột ngột (không fade) |
+| | Burst nhiều thumb về → nhiều `dataChanged` liên tiếp |
+
+### 3.5 Badge sprawl (UX + perf)
+
+Trên một thumb grid có thể có: type, dept, health, notes, DCC×N, publish version, review render + schedule, status pill — vi phạm “status đọc trong ~3s” (`production_ui_v1`).
+
+### 3.6 God file
+
+`main_view.py` chứa delegate, health, hit-test, set_items, prefetch, context menu — khó profile, test, tối ưu.
+
+---
+
+## 4. Quyết định kiến trúc
+
+### 4.1 Giữ PySide6 — không rebuild web/Electron
+
+| Lý do | Chi tiết |
+|-------|----------|
+| Root cause không phải framework | Lag do compute trong paint, không do QWidget |
+| Desktop integration | `shell_open`, DCC, filesystem scan, drag-drop — đã gắn Qt |
+| Chi phí migration | Web = 2 runtime + bridge; ROI thấp cho local-first pipeline tool |
+| Virtualization đã đúng | Chỉ thiếu presentation snapshot |
+
+**Web phù hợp sau này** cho surface riêng (review browser, dashboard multi-user) — **không** thay Main View desktop.
+
+### 4.2 QML — **bắt buộc** cho Main View (grid + list)
+
+**Quyết định:** Pipeline browser (grid card + list row) render bằng **Qt Quick (QML)** nhúng trong shell Widgets.
+
+| Vùng | Công nghệ | Ghi chú |
+|------|-----------|---------|
+| MainWindow, Sidebar, Inspector, Dialogs | **Qt Widgets** | Giữ `style.py`, `dialog_tier` |
+| Main View grid + list | **QML** (`QQuickWidget`) | Đích cuối — bắt buộc |
+| Data / logic | **Python** | Snapshot, model, services — không đổi |
+
+**Lý do chốt QML:**
+- Motion (thumb fade, hover, selection) native GPU — không phụ thuộc `QPropertyAnimation` trên delegate
+- Tách UI khai báo (`.qml`) khỏi Python orchestration
+- Tránh tiếp tục đầu tư vào `_GridCardDelegate` / `PipelineListRowDelegate` làm long-term solution
+- Snapshot layer vẫn cần — QML **bind** snapshot, không thay thế precompute
+
+**Không làm:** QML cho Inspector, inbox, schedule, video preview (Widgets đủ).
+
+### 4.3 Chiến lược: MONOS View Engine v2 (Widgets + QML hybrid)
+
+**Làm lại presentation layer**, giữ domain + shell Widgets:
+
+```
+┌─────────────────────────────────────────┐
+│ Qt Widgets Shell (giữ)                  │
+│ MainWindow, Sidebar, Inspector, Dialogs │
+├─────────────────────────────────────────┤
+│ PipelineViewHost (Widgets)              │
+│ QStackedWidget: GridQuick / ListQuick   │
+│   └── QQuickWidget → root PipelineView  │
+├─────────────────────────────────────────┤
+│ Qt Quick (QML) — BẮT BUỘC               │
+│ PipelineGridView.qml / PipelineListView │
+│ PipelineCard.qml / PipelineListRow.qml  │
+│ BadgeChip.qml, DccStack.qml, …          │
+├─────────────────────────────────────────┤
+│ Presentation Engine (Python)            │
+│ SnapshotBuilder → Store → Model roles   │
+│ PipelineQmlBridge (expose model + API)  │
+├─────────────────────────────────────────┤
+│ Domain (giữ)                            │
+│ AppState, Index, Scan, ThumbnailManager │
+└─────────────────────────────────────────┘
+```
+
+### 4.4 Design spine — hoàn thiện thiết kế **trước** skin QML / redesign page
+
+**Nguyên tắc:** Hoàn thiện **design system + archetype**, **không** mockup pixel-perfect mọi page trong Figma rồi mới code.
+
+Theo `ui_design.md` + `monostudio.md`:
+
+```
+Tier 1 Primitives   → style.py, MONOS_COLORS, dialog_tier T tokens
+Tier 2 Components   → extract khi pattern ≥ 2 lần; prove trong harness
+Tier 3 Screens      → compose từ Tier 1/2; không one-off chrome
+```
+
+#### 4.4.1 Anchor hiện có — Dialog tier (đang làm)
+
+| Tài nguyên | Vai trò |
+|------------|---------|
+| `scripts/test_dialog_tiers.py` | Golden harness — L1/L2 demos |
+| `monostudio/ui_qt/dialog_tier/` | Implementation FROZEN |
+| `plan_dialog_tier_golden_reference_v1.mdc` | Không “improve” golden để khớp dialog xấu |
+
+**Rule:** Dialog production port lên L1/L2; thay đổi visual system → cập nhật harness + tokens, không patch rải rác.
+
+#### 4.4.2 Token map thống nhất (bắt buộc trước QML Sprint 2)
+
+Một nguồn màu/spacing/typography cho Widgets + QML:
+
+| Layer | Nguồn | Consumer |
+|-------|--------|----------|
+| App shell Widgets | `style.py` → `MONOS_COLORS`, QSS | Sidebar, TopBar, Inspector frame |
+| Dialog | `dialog_tier/tokens.py` → `T`, `T_METRICS` | L1/L2 dialogs |
+| Main View QML | `PipelineTheme.qml` singleton | Grid/list/card — **sync từ Python** |
+
+**Deliverable:** `docs/DESIGN_SYSTEM_MAP.md` — bảng `MONOS_COLORS` ↔ `T` ↔ `SURFACE_*` ↔ `PipelineTheme` property.
+
+**Cấm:** hardcode hex lẻ trong `.qml` hoặc dialog mới khi token đã tồn tại.
+
+#### 4.4.3 Page archetypes (4 loại — không cần 20 mockup)
+
+| ID | Archetype | Ví dụ app | Harness đề xuất | Công nghệ |
+|----|-----------|-----------|-----------------|-----------|
+| **A** | Shell chrome | TopBar, Sidebar, NavRail, Inspector frame | `scripts/test_shell_chrome.py` | Widgets |
+| **B** | Pipeline browser | Main View grid/list | `scripts/test_pipeline_qml.py` | **QML** |
+| **C** | Data pane | Inspector blocks, Settings section | `scripts/test_inspector_card.py` (tùy chọn) | Widgets + `MetadataCard` |
+| **D** | Explorer | Inbox, Project Guide tree | reuse C + list patterns | Widgets |
+
+Mỗi archetype = **1 harness reference** (giống `test_dialog_tiers.py`), không Figma full app.
+
+#### 4.4.4 Thứ tự redesign page (sau dialog)
+
+```
+1. Dialog tier (đang làm)           ← visual anchor
+2. Token map + PipelineTheme.qml    ← chặn QML skin
+3. Shell chrome (archetype A)       ← Sidebar, TopBar, Inspector frame
+4. Main View QML (archetype B)      ← §6 badge contract; không redesign Widget grid
+5. Inspector content (archetype C)  ← production_ui_v1 cards
+6. Settings                         ← settings_three_tier_ux_v1
+7. Inbox / Schedule / … (D)         ← từng page, reuse tokens
+```
+
+**Không làm:** “làm lại UI Widget” Main View trước QML — waste; đi thẳng QML sau token map.
+
+#### 4.4.5 Song song vs chặn
+
+| Việc | Song song được? | Ghi chú |
+|------|-----------------|---------|
+| Port dialog production → L1/L2 | — | Ưu tiên, đang làm |
+| `PipelineRowSnapshot` + builder | Có | Không phụ thuộc pixel |
+| `pipeline_presentation_model.py` | Có | Roles trước skin |
+| `PipelineCard.qml` pixel-perfect | **Chặn** | Cần `PipelineTheme` + §6 contract |
+| Redesign Schedule/Inbox full | **Không urgent** | Sau archetype A–C |
+| Widget delegate refactor lớn | **Không** | Phase 0 bridge tạm only |
+
+#### 4.4.6 Design checklist (gate trước Sprint 2 QML grid)
+
+- [ ] Dialog flows chính (New Project, Create Asset/Shot) trên L1/L2 production hoặc harness parity
+- [x] `docs/DESIGN_SYSTEM_MAP.md` có ít nhất: bg, panel, card, border, text_primary/label/meta, blue accent, radius 8/12/16
+- [x] `PipelineTheme.qml` đọc/sync token — verified trong `test_pipeline_qml.py`
+- [x] `PipelineCard.qml` stub khớp §6 layout (badge tier) trong harness
+- [ ] Không thêm pattern visual mới ngoài token map (promote vào `dialog_tier` hoặc `style.py` trước)
+
+---
+
+## 5. Kiến trúc cốt lõi
+
+### 5.1 `PipelineRowSnapshot`
+
+Immutable struct — **precompute khi data đổi**, không trong `paint()`:
+
+```python
+@dataclass(frozen=True)
+class PipelineRowSnapshot:
+    path: str
+    display_name: str
+    dim: Literal["none", "no_work", "no_publish"]
+    thumb_token: str              # key thumb cache / opacity state
+    status: StatusChip | None     # Tier 2
+    alerts: AlertChip | None      # health HOẶC notes (1 slot)
+    dcc_stack: tuple[DccBadge, ...]  # max 3 + "+N"
+    meta: tuple[str, ...]
+```
+
+**Rule:** QML **chỉ bind** snapshot roles từ model — không gọi Python health/DCC per frame. Widget delegate (giai đoạn chuyển) cũng chỉ đọc snapshot.
+
+### 5.2 `SnapshotStore` — invalidation theo facet
+
+| Event | Invalidate |
+|-------|------------|
+| Scan / DCC | `path` → DCC, HEALTH, DIM |
+| Notes | `path` → ALERTS |
+| Status | `path` → STATUS |
+| Thumb ready | `path` → THUMB |
+| Dept / Work-Publish-Review mode | rebuild batch (idle, 50 rows/frame) |
+
+Build chạy idle timer / worker batch — **không** block scroll.
+
+### 5.3 `PipelinePresentationModel` (QAbstractListModel → QML)
+
+- Kế thừa `QAbstractListModel`, đăng ký với QML qua `setContextProperty` hoặc `qmlRegisterType`
+- Roles (QML `model.roleNames()`):
+  - `snapshot` — QVariantMap từ `PipelineRowSnapshot` (display, badges, dim, status…)
+  - `thumbSource` — `image://thumb/` provider hoặc `QUrl` từ `ThumbnailManager`
+  - `selected`, `hovered`, `thumbOpacity` (0→1 animation trong QML)
+  - `path` — stable key
+- `dataChanged(row, row, [roles])` surgical
+- Grid + List **cùng model**; QML `GridView` / `ListView` khác `delegate` component
+- Structural: `insertRows`/`removeRows`; `beginResetModel` chỉ khi đổi context (asset↔shot↔project)
+
+### 5.4 `PipelineSelectionStore`
+
+- `set[Path]` — single source of truth
+- Sync grid ↔ list ↔ inspector selection
+- (Bổ sung từ `plan_list_view_v2` nếu chưa hoàn thiện)
+
+### 5.5 Module mới / tách từ `main_view.py`
+
+| File | Trách nhiệm |
+|------|-------------|
+| `pipeline_snapshot.py` | Types, `PipelineRowSnapshot`, chip structs |
+| `pipeline_snapshot_builder.py` | Build từ ViewItem + AppState + dept/mode |
+| `pipeline_snapshot_store.py` | Cache + invalidation map |
+| `pipeline_presentation_model.py` | `QAbstractListModel` expose roles cho QML |
+| `pipeline_qml_bridge.py` | `QQuickWidget` host, load QML, intent signals ↔ MainWindow |
+| `pipeline_thumb_image_provider.py` | `QQuickImageProvider` cho thumb async |
+| `pipeline_view_host.py` | Widget shell: mode grid/list, embed QQuickWidget |
+| `pipeline_selection.py` | Selection theo Path; sync QML ↔ Widgets |
+| `ui_qt/qml/pipeline/` | **QML components** (xem §5.6) |
+| `pipeline_row_paint.py` | **Deprecate** sau QML ship — chỉ giữ cho bridge tạm |
+| `pipeline_list_*.py` | **Deprecate** sau QML list ship — giữ đến cutover |
+
+### 5.6 QML module layout (`monostudio/ui_qt/qml/pipeline/`)
+
+| File QML | Vai trò |
+|----------|---------|
+| `qmldir` | Module `Monos.Pipeline` |
+| `PipelineTheme.qml` | Singleton — colors từ `MONOS_COLORS` (sync token Python) |
+| `PipelineGridView.qml` | `GridView` + card delegate |
+| `PipelineListView.qml` | `ListView` + sticky header row (hoặc 2-column Flickable) |
+| `PipelineCard.qml` | Grid card — badge contract §6 |
+| `PipelineListRow.qml` | List row — column layout |
+| `BadgeChip.qml`, `DccStack.qml`, `StatusPill.qml` | Badge primitives |
+| `ThumbImage.qml` | Async thumb + `Behavior on opacity` fade-in |
+
+### 5.7 QML rules
+
+- **Không** `JavaScript` nặng trong delegate — chỉ bind `model.snapshot.*`
+- Icon: `Image { source: "image://icons/" + slug }` qua `QQuickImageProvider` hoặc prebaked atlas URL
+- Input: `MouseArea` / tap → signal lên `PipelineQmlBridge` → intent giống MainView hiện tại
+- Rubber-band multi-select: `PipelineQmlBridge` + overlay Item; parity `pipeline_selection.py`
+- HiDPI: `sourceSize` theo `Screen.devicePixelRatio`
+- Theme: đọc `PipelineTheme` — **không** hardcode hex lẻ trong QML (map từ `style.py` tokens)
+- **Cấm** thêm feature badge mới vào Widget delegate sau Sprint 2 — chỉ QML
+
+---
+
+## 6. Badge UX contract
+
+Áp dụng `production_ui_v1`, `table_deep_dark_monos_v1`, typography rules.
+
+### 6.1 Grid card — layout cố định
+
+```
+┌──────────────────────────┐
+│ [T]              [alert] │  type (1) + 1 alert (health hoặc notes)
+│      thumbnail 16:9      │
+│              [DCC DCC +] │  max 3 + overflow
+├──────────────────────────┤
+│ ● IN PROGRESS            │  status pill (Tier 2)
+│ Aya                      │  name Tier 1
+└──────────────────────────┘
+```
+
+- **Bỏ** dept chip trên thumb (dept đã có sidebar/header)
+- Review mode: **1 pill** (render hoặc deadline), không 2 góc cùng lúc trừ critical
+
+### 6.2 List row — Finder-style
+
+Sticky: INDEX · THUMB · NAME | STATUS · DCC · ALERTS · meta (Due, Version, …)
+
+- STATUS = cột scan đầu tiên (Tier 2)
+- Cân nhắc gộp Health + Notes → cột ALERTS
+
+### 6.3 Mapping badge (parity)
+
+| Badge | Grid | List |
+|-------|------|------|
+| Type | thumb TL | — |
+| Alerts | thumb TR (1) | column |
+| DCC | thumb BR | column |
+| Status | meta below thumb | STATUS column |
+| Review | 1 thumb pill | — |
+
+---
+
+## 7. Animation & motion (QML)
+
+### 7.1 Hiện trạng Main View (Widgets)
+
+- **Không** thumb fade-in, hover transition trên card
+- `fast_paint` = cắt vẽ — **loại bỏ** sau QML cutover
+
+### 7.2 Bắt buộc trong QML
+
+| Animation | QML | Duration |
+|-----------|-----|----------|
+| Thumb load | `Behavior on opacity` | 120ms `OutCubic` |
+| Hover border | `border.color` + `Behavior` | 150ms |
+| Selection | `border.width` / color | 100ms |
+| Scroll | `GridView`/`ListView` built-in cache | — |
+
+```qml
+// ThumbImage.qml — pattern bắt buộc
+opacity: model.thumbOpacity
+Behavior on opacity { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+```
+
+**Rule:** không animate layout (`width`/`height` card); không animate khi `view.scrolling`.
+
+### 7.3 Điều kiện
+
+Snapshot + model roles trước QML skin. Animation trong QML **không** thay thế precompute.
+
+---
+
+## 8. Thumbnail pipeline v2
+
+### 8.1 Target flow
+
+```
+Worker: resolve path → decode → scale/crop (final DPR size) → QImage → disk cache
+Main:   PipelineThumbImageProvider cache
+        → model.dataChanged(THUMB_ROLE) + thumbOpacity 0→1 (QML Behavior)
+```
+
+### 8.2 Thay đổi cụ thể
+
+| # | Thay đổi | File / vùng |
+|---|----------|-------------|
+| 1 | Move `resolve_grid_thumbnail_file` vào worker | `thumbnails.py`, builder task |
+| 2 | Worker trả **cropped size sẵn** (grid 16:9 + list 40px DPR) | `_load_thumbnail_image_worker` |
+| 3 | Bỏ grid `_cached_thumb_crop` smooth trên UI | Xóa khi Widget grid deprecated |
+| 4 | Priority queue: visible → near viewport → far | prefetch + ThumbnailManager |
+| 5 | Batch apply: max **8 thumb/frame** trên main thread | `pipeline_presentation_model` |
+| 6 | Thumb fade-in | `thumbOpacity` role + QML `Behavior on opacity` |
+| 7 | Xóa legacy sync `ThumbnailCache.load_thumbnail_pixmap` trong prefetch | `main_view._prefetch_thumbnails_chunk` |
+| 8 | Department change: invalidate snapshot thumb facet, không reset toàn model nếu có thể | snapshot store |
+
+### 8.3 Nghẽn cần tránh
+
+1. **UI thread paint** (snapshot fix)
+2. **Worker pool flood** — cap concurrent thumb loads; visible-first
+3. **Burst dataChanged** — batch range update
+
+---
+
+## 9. Ổn định — rules không thương lượng
+
+1. Selection = `set[Path]` (`PipelineSelectionStore`) — sync QML selection model
+2. Không `beginResetModel` trừ đổi browser context
+3. Thumbnail async — `QQuickImageProvider`, không decode trong QML thread
+4. Unit test **snapshot builder** (không cần QML)
+5. Profile: QML frame time p95 scroll 500 items < 16ms (Qt Quick profiler / `stress_profiler`)
+6. **Main View mới chỉ QML** — không merge feature vào Widget delegate sau Sprint 2
+
+---
+
+## 10. Lộ trình triển khai
+
+### Phase D — Design spine (tuần 0–1, song song / trước Sprint 2)
+
+**Mục tiêu:** Đóng băng token + harness; không block engineering snapshot.
+
+- [ ] Kết thúc / tiếp tục port dialog quan trọng lên `dialog_tier` (so `test_dialog_tiers.py`)
+- [x] Viết `docs/DESIGN_SYSTEM_MAP.md` (`MONOS_COLORS` ↔ `T` ↔ `PipelineTheme`)
+- [x] `PipelineTheme.qml` + `pipeline_qml_theme.py`
+- [x] Harness `scripts/test_pipeline_qml.py` — `PipelineGridHarness` + `PipelineCard`
+- [ ] (Tùy chọn) Harness `scripts/test_shell_chrome.py` — Sidebar + TopBar + 1 Inspector card frame
+- [ ] **Gate:** Sprint 2 không bắt đầu skin grid production cho đến khi §4.4.6 checklist xong
+
+### Phase 0 — Quick wins (1–2 ngày, bridge tạm Widgets)
+
+- [ ] Cache `health_level` / `dcc_badges` per `(path, dept, dcc)` — tạm ra khỏi paint
+- [ ] Granular `dataChanged` thay `repaint_tile_and_list_views` full grid
+- [ ] **Không** đầu tư refactor delegate lớn — chỉ unblock scroll đến Sprint 1
+
+### Sprint 1 — Snapshot + model (tuần 1)
+
+- [ ] `pipeline_snapshot.py` + builder + store + unit tests
+- [ ] `pipeline_presentation_model.py` — roles cho QML
+- [x] `PipelineTheme.qml` singleton — map `MONOS_COLORS`
+- [x] Harness: `scripts/test_pipeline_qml.py` — load QML grid 1 card stub
+
+### Sprint 2 — QML bridge + grid (tuần 2)
+
+- [ ] `pipeline_qml_bridge.py` + `pipeline_view_host.py` (`QQuickWidget`)
+- [ ] `pipeline_thumb_image_provider.py`
+- [ ] `PipelineGridView.qml` + `PipelineCard.qml` + badges
+- [ ] Intent signals parity (open, context menu, selection)
+- [ ] Feature flag: `pipeline_use_qml_grid` — A/B với Widget grid
+
+### Sprint 3 — QML list + selection (tuần 3)
+
+- [ ] `PipelineListView.qml` + `PipelineListRow.qml` — sticky columns
+- [ ] `PipelineSelectionStore` sync QML multi-select + rubber band
+- [ ] Feature flag: `pipeline_use_qml_list`
+- [ ] Grid ↔ List mode switch giữ selection path
+
+### Sprint 4 — Thumb pipeline + cutover (tuần 4)
+
+- [ ] Worker crop final size; priority prefetch; batch 8/frame
+- [ ] Thumb fade-in QML; badge UX §6
+- [ ] **Xóa** Widget grid/list khỏi default path (`main_view.py` thu gọn)
+- [ ] Stress 1000 items; department switch; scan burst
+- [ ] Deprecate `_GridCardDelegate`, `PipelineListRowDelegate` (giữ file 1 release fallback)
+
+### Sprint 5 — Polish + page migration tiếp theo (tuần 5)
+
+- [ ] Keyboard nav, context menu, drag-out parity
+- [ ] `main_view.py` < 2000 dòng (host + signals only)
+- [ ] `docs/QML_PIPELINE.md` — component map + theme sync
+- [ ] Bắt đầu archetype **C** (Inspector blocks) hoặc **A** (shell chrome) theo §4.4.4 — **không** block Main View QML
+
+### Sau Sprint 5 — App UI rollout (ongoing)
+
+| Page | Archetype | Ghi chú |
+|------|-----------|---------|
+| Inspector content | C | `MetadataCard`, `production_ui_v1` |
+| Settings | C | `settings_three_tier_ux_v1` |
+| Sidebar / TopBar | A | Token từ `style.py` |
+| Inbox | D | Sau Main View QML stable |
+| Schedule | D | God file — migrate incremental |
+| Video Preview | — | Widgets; scope riêng |
+
+---
+
+## 11. So sánh phương án (đã chốt)
+
+| Phương án | Đẹp | Mượt | Ổn định | Chi phí | Verdict |
+|-----------|-----|------|---------|---------|---------|
+| **Snapshot + QML hybrid** | Rất tốt | Rất tốt | Cao | TB | **Chọn — bắt buộc** |
+| Snapshot + Widgets only | Tốt | Tốt | Cao | Thấp | Bridge tạm Phase 0–1 |
+| QML toàn app | Tốt | Tốt | TB | Rất cao | Không |
+| Web/Electron | Tốt tooling | Phụ thuộc bridge | Thấp | Rất cao | Không |
+
+---
+
+## 12. File touch summary
+
+| Khu vực | File |
+|---------|------|
+| Mới Python | `pipeline_snapshot*.py`, `pipeline_presentation_model.py`, `pipeline_qml_bridge.py`, `pipeline_thumb_image_provider.py`, `pipeline_view_host.py` |
+| Mới QML | `ui_qt/qml/pipeline/*.qml`, `qmldir` |
+| Sửa lớn | `main_view.py` (thu gọn host), `main_window.py` (wire bridge), `thumbnails.py` |
+| Deprecate | `pipeline_list_delegate.py`, `_GridCardDelegate` trong `main_view.py`, `pipeline_row_paint.py` |
+| Giữ | `ThumbnailManager`, `WorkerManager`, `pipeline_selection.py`, `view_items.py` |
+| Doc mới | `docs/QML_PIPELINE.md`, `docs/DESIGN_SYSTEM_MAP.md` |
+| Harness | `scripts/test_dialog_tiers.py` (anchor), `scripts/test_pipeline_qml.py`, `scripts/test_shell_chrome.py` (optional) |
+| Rules UI | `plan_dialog_tier_golden_reference_v1.mdc`, `production_ui_v1.mdc`, `ui_design.md`, `monostudio.md` |
+
+---
+
+## 13. Handoff checklist
+
+Trước khi coi migration **xong** (QML là default):
+
+- [ ] Grid + List chạy QML mặc định (feature flag off)
+- [ ] Không `assess_view_item_health` trong QML delegate / Widget paint (grep = 0)
+- [ ] Grid ↔ List selection giữ path khi switch mode
+- [ ] Thumb qua `QQuickImageProvider`; fade-in QML
+- [ ] Intent signals parity với MainView cũ (open, delete, context menu, DCC badge click)
+- [ ] Scroll 500 items p95 frame < 16ms
+- [ ] Badge count trên thumb ≤ 4 layers (§6)
+- [ ] `main_view.py` < 2000 dòng
+- [ ] `docs/QML_PIPELINE.md` + theme sync documented
+- [ ] `docs/DESIGN_SYSTEM_MAP.md` — token parity Widgets ↔ QML
+- [ ] §4.4.6 design gate passed trước Sprint 2 (harness card khớp §6)
+
+---
+
+## 14. Tóm tắt một dòng
+
+**Dialog tier anchor → token map → Snapshot (Python) → QML Main View (bắt buộc) → shell/page redesign theo archetype; Widgets shell; không web.**
