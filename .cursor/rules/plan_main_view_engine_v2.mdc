@@ -15,6 +15,74 @@ Tài liệu tổng hợp review Main View (grid card + list row + badge), quyế
 
 ---
 
+## 0. Lộ trình thực hiện & hướng dẫn test
+
+**Đọc theo thứ tự.** Sau mỗi bước chạy phần **Test** trước khi sang bước kế tiếp.
+
+| Bước | Phase | Hạng mục | Trạng thái |
+|------|-------|----------|------------|
+| **0** | Anchor | Dialog tier FROZEN (`test_dialog_tiers.py`) | Đang làm |
+| **1** | D | `DESIGN_SYSTEM_MAP.md` + `PipelineTheme.qml` + harness | ✅ |
+| **2** | D | Gate §4.4.6 — dialog L1/L2 port + card stub §6 | ⏳ dialog |
+| **3** | 0 | Cache health/DCC ra khỏi paint | ✅ |
+| **4** | 0 | Granular `dataChanged` / `repaint_rows_for_paths` | ✅ |
+| **5** | 1 | `pipeline_snapshot.py` + builder + store + tests | ✅ |
+| **6** | 1 | `pipeline_presentation_model.py` | ✅ |
+| **7** | 2 | QML bridge + grid production (`pipeline_use_qml_grid`) | ⬇️ tiếp theo |
+| **8** | 3 | QML list + selection | |
+| **9** | 4 | Thumb pipeline + cutover Widget delegates | |
+| **10** | 5 | Polish + archetype A/C rollout | |
+
+### Test theo bước
+
+**Bước 0 — Dialog anchor**
+```powershell
+python scripts/test_dialog_tiers.py
+```
+- L1/L2 mở được; không lệch spacing/radius so golden.
+
+**Bước 1 — Design spine (Phase D)**
+```powershell
+python scripts/test_pipeline_qml.py --verify-theme
+python scripts/test_pipeline_qml.py
+```
+- `--verify-theme` exit 0; harness hiện grid vài card stub.
+
+**Bước 2 — Gate design**
+- New Project / Create Asset/Shot trên `dialog_tier` L1/L2 (hoặc harness parity).
+- `PipelineCard.qml` khớp §6 trong harness.
+
+**Bước 3 — Cache health/DCC (Phase 0a)**
+```powershell
+python -m pytest tests/test_pipeline_row_presentation_cache.py -q
+```
+- Mở app → Assets grid → scroll nhanh; health/DCC badge vẫn đúng sau đổi department.
+- Profiler: `assess_view_item_health` không gọi trong `paint` (grep delegate hot path).
+
+**Bước 4 — Granular repaint (Phase 0b)**
+```powershell
+python -m pytest tests/test_main_view_repaint.py -q
+```
+- Lưu work file DCC → chỉ card đó đổi badge (incremental scan), không flash cả grid.
+- Đổi department → full invalidation vẫn đúng.
+
+**Bước 5–6 — Snapshot + model (Sprint 1)**
+```powershell
+python -m pytest tests/test_pipeline_snapshot.py -q
+```
+- Builder unit tests pass; model roles map đủ §5.3.
+
+**Bước 7+ — QML production**
+```powershell
+python scripts/test_pipeline_qml.py --verify-theme
+# Feature flag pipeline_use_qml_grid=1 trong settings/dev
+```
+- Grid QML parity selection/context menu; scroll 500 items mượt hơn Widget.
+
+**Tài liệu kèm:** `docs/ARCHITECTURE.md` · `docs/DESIGN_SYSTEM_MAP.md` · `docs/QML_PIPELINE.md`
+
+---
+
 ## 1. Mục tiêu (đo được)
 
 | Mục tiêu | Tiêu chí |
@@ -455,14 +523,14 @@ Main:   PipelineThumbImageProvider cache
 
 ### Phase 0 — Quick wins (1–2 ngày, bridge tạm Widgets)
 
-- [ ] Cache `health_level` / `dcc_badges` per `(path, dept, dcc)` — tạm ra khỏi paint
-- [ ] Granular `dataChanged` thay `repaint_tile_and_list_views` full grid
+- [x] Cache `health_level` / `dcc_badges` per `(path, dept, dcc)` — tạm ra khỏi paint
+- [x] Granular `dataChanged` thay `repaint_tile_and_list_views` full grid (incremental scan paths)
 - [ ] **Không** đầu tư refactor delegate lớn — chỉ unblock scroll đến Sprint 1
 
 ### Sprint 1 — Snapshot + model (tuần 1)
 
-- [ ] `pipeline_snapshot.py` + builder + store + unit tests
-- [ ] `pipeline_presentation_model.py` — roles cho QML
+- [x] `pipeline_snapshot.py` + builder + store + unit tests
+- [x] `pipeline_presentation_model.py` — roles cho QML
 - [x] `PipelineTheme.qml` singleton — map `MONOS_COLORS`
 - [x] Harness: `scripts/test_pipeline_qml.py` — load QML grid 1 card stub
 
