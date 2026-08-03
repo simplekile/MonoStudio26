@@ -2535,11 +2535,15 @@ class _GridCardDelegate(QStyledItemDelegate):
                     if getattr(item, "path", None)
                     else None
                 )
-                health_obj = assess_view_item_health(
-                    item.ref,
-                    dept_focus,
-                    active_dcc_id=active_dcc,
-                )
+                mw = self._main_view
+                if mw is not None and hasattr(mw, "cached_item_health_for"):
+                    health_obj = mw.cached_item_health_for(item, active_dcc_id=active_dcc)
+                else:
+                    health_obj = assess_view_item_health(
+                        item.ref,
+                        dept_focus,
+                        active_dcc_id=active_dcc,
+                    )
                 if health_obj is not None:
                     health_rect = QRect(
                         thumb.right() - 12 - chip_sz,
@@ -2610,71 +2614,7 @@ class _GridCardDelegate(QStyledItemDelegate):
                     p.drawEllipse(QPoint(cx, cy), chip_r, chip_r)
                     p.drawPixmap(ix + pad, iy + pad, dept_pix)
 
-            # DCC badges (bottom-right of thumb) — filesystem-driven; "exists" = icon, "creating" = "Creating…"
-            # Prefer dcc_work_states (scan) so subdepartments show badges; fallback to registry for "creating" only.
-            def dcc_badges_for_item() -> list[tuple[QIcon | None, str, str]]:
-                """Returns (icon or None, dcc_id, status) with status in ("exists", "creating")."""
-                out: list[tuple[QIcon | None, str, str]] = []
-                ref = item.ref
-                if not isinstance(ref, (Asset, Shot)):
-                    return out
-                try:
-                    reg = get_default_dcc_registry()
-                except Exception:
-                    return out
-                active_key = self._norm((self._active_department or "").strip())
-                states = getattr(ref, "dcc_work_states", ()) or ()
-                seen: set[tuple[str, str]] = set()
-
-                def add_badge(dept_id: str, dcc_id: str, status: str) -> None:
-                    if (dept_id, dcc_id) in seen:
-                        return
-                    seen.add((dept_id, dcc_id))
-                    if status == "creating":
-                        out.append((None, dcc_id, "creating"))
-                        return
-                    if status != "exists":
-                        return
-                    try:
-                        info = reg.get_dcc_info(dcc_id) if dcc_id else None
-                    except Exception:
-                        info = None
-                    slug = info.get("brand_icon_slug") if isinstance(info, dict) else None
-                    color = info.get("brand_color_hex") if isinstance(info, dict) else None
-                    if isinstance(slug, str) and slug.strip():
-                        ic = brand_icon(slug.strip(), size=14, color_hex=(color if isinstance(color, str) else None))
-                    else:
-                        ic = lucide_icon("layers", size=14, color_hex=MONOS_COLORS["text_label"])
-                    out.append((ic, dcc_id, "exists"))
-
-                for (dept_id, dcc_id), _state in states:
-                    dept_id = (dept_id or "").strip()
-                    dcc_id = (dcc_id or "").strip()
-                    if not dept_id or not dcc_id:
-                        continue
-                    if active_key and self._norm(dept_id) != active_key:
-                        continue
-                    status = resolve_dcc_status(ref, dept_id, dcc_id)
-                    if status in ("exists", "creating"):
-                        add_badge(dept_id, dcc_id, status)
-                for d in getattr(ref, "departments", ()) or ():
-                    dept_name = getattr(d, "name", "") or ""
-                    if active_key and self._norm(dept_name) != active_key:
-                        continue
-                    dre = self._dept_registry
-                    if dre is not None:
-                        dcc_ids = dre.supported_dcc_ids(reg, dept_name)
-                    else:
-                        dcc_ids = reg.get_available_dccs(dept_name) or []
-                    for dcc_id in dcc_ids:
-                        dcc_id = (dcc_id or "").strip()
-                        if not dcc_id:
-                            continue
-                        status = resolve_dcc_status(ref, dept_name, dcc_id)
-                        if status == "creating":
-                            add_badge(dept_name, dcc_id, "creating")
-                return out
-
+            # DCC badges (bottom-right of thumb) — cached off paint path (plan_main_view_engine_v2 Phase 0).
             if self._show_publish:
                 # Published mode: show version pill instead of DCC badges
                 if isinstance(item.ref, (Asset, Shot)):
@@ -2748,7 +2688,11 @@ class _GridCardDelegate(QStyledItemDelegate):
                             hovered=sched_hover,
                         )
             else:
-                dcc_list = dcc_badges_for_item()
+                mw = self._main_view
+                if mw is not None and hasattr(mw, "cached_dcc_badges_for") and isinstance(item.ref, (Asset, Shot)):
+                    dcc_list = list(mw.cached_dcc_badges_for(item))
+                else:
+                    dcc_list = []
                 if dcc_list:
                     size = 16
                     pad = 4
@@ -3410,6 +3354,9 @@ class MainView(QWidget):
         self._note_preview_cache: dict[str, tuple[str, bool]] = {}
         self._entity_reference_cache: dict[str, bool] = {}
         self._entity_concept_cache: dict[str, bool] = {}
+        from monostudio.ui_qt.pipeline_row_presentation_cache import PipelineRowPresentationCache
+
+        self._row_presentation_cache = PipelineRowPresentationCache()
         # Precomputed list Status column width (pill); avoids resizeColumnToContents × N rows.
         self._list_status_pill_layout_width: int = 0
         self._schedule_bars: BarStore = {}
@@ -5325,6 +5272,7 @@ class MainView(QWidget):
         except Exception:
             pass
         if prev_dept != self._active_department:
+            self.invalidate_row_presentation_cache()
             self.invalidate_review_card_cache()
             self._grid_delegate.set_hovered_pill_row(None)
             self._grid_delegate.set_hovered_health_row(None)
@@ -5563,6 +5511,49 @@ class MainView(QWidget):
         stale_prev = [k for k in self._note_preview_cache if k.startswith(prefix)]
         for k in stale_prev:
             self._note_preview_cache.pop(k, None)
+
+    def invalidate_row_presentation_cache(self, path: str | None = None) -> None:
+        """Clear health/DCC badge cache (department change, scan, or single entity)."""
+        cache = getattr(self, "_row_presentation_cache", None)
+        if cache is None:
+            return
+        if path is None:
+            cache.clear()
+        else:
+            cache.invalidate_path(path)
+
+    def cached_item_health_for(
+        self,
+        item: ViewItem,
+        *,
+        active_dcc_id: str | None = None,
+    ):
+        """Item health for grid/list — cached per (path, dept, dcc)."""
+        if not isinstance(item.ref, (Asset, Shot)) or not getattr(item, "path", None):
+            return None
+        dept = (self._active_department or "").strip()
+        if not dept:
+            return None
+        dcc = active_dcc_id
+        if dcc is None and item.path:
+            dcc = self._grid_delegate.get_active_dcc(item.path, dept)
+        return self._row_presentation_cache.health_for(
+            item.ref,
+            path=str(item.path),
+            active_department=dept,
+            active_dcc_id=dcc,
+        )
+
+    def cached_dcc_badges_for(self, item: ViewItem):
+        """DCC badge tuples for grid — cached per (path, dept)."""
+        if not isinstance(item.ref, (Asset, Shot)) or not getattr(item, "path", None):
+            return ()
+        return self._row_presentation_cache.dcc_badges_for(
+            item.ref,
+            path=str(item.path),
+            active_department=self._active_department,
+            dept_registry=self._dept_registry,
+        )
 
     def _repaint_notes_row_for_path(self, path_key: str) -> None:
         row = self._row_for_item_id(path_key)
@@ -6890,8 +6881,39 @@ class MainView(QWidget):
             return
         self._tile_view.viewport().update()
 
+    def repaint_rows_for_paths(self, paths: list[str] | set[str]) -> None:
+        """Granular grid/list refresh for specific entity paths (incremental scan)."""
+        if not paths:
+            return
+        path_list = [p for p in paths if p and str(p).strip()]
+        if not path_list:
+            return
+        for p in path_list:
+            self.invalidate_row_presentation_cache(p)
+        if self.interaction_fast_paint():
+            self._deferred_full_repaint_pending = True
+            return
+        rows: list[int] = []
+        for p in path_list:
+            row = self._row_for_item_id(p)
+            if row is not None and row >= 0:
+                rows.append(row)
+        if not rows:
+            return
+        rows = sorted(set(rows))
+        for row in rows:
+            if row < self._tile_row_count():
+                ix = self._tile_model._model_index(row, 0)
+                self._tile_model.dataChanged.emit(ix, ix, [Qt.UserRole])
+            self._list_model.refresh_row(row)
+        self._tile_view.viewport().update()
+        lv = getattr(self, "_list_view", None)
+        if lv is not None:
+            lv.viewport().update()
+
     def repaint_tile_and_list_views(self) -> None:
         """Force repaint of grid and list so DCC status badges reflect latest AppState after scan."""
+        self.invalidate_row_presentation_cache()
         if self.interaction_fast_paint():
             self._deferred_full_repaint_pending = True
             return

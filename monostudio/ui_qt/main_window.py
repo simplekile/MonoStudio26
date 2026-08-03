@@ -6454,7 +6454,10 @@ class MainWindow(FramelessMainWindow):
             if ctx not in ("Assets", "Shots", "Trash"):
                 self._reload_main_view()
             def _repaint_after_scan() -> None:
-                self._main_view.repaint_tile_and_list_views()
+                if seen_ep and ctx in ("Assets", "Shots"):
+                    self._main_view.repaint_rows_for_paths(seen_ep)
+                else:
+                    self._main_view.repaint_tile_and_list_views()
                 try:
                     self._inspector.refresh_last_modified_display()
                 except Exception:

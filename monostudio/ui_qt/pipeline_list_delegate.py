@@ -327,13 +327,21 @@ class PipelineListRowDelegate(QStyledItemDelegate):
         dep = (getattr(main, "_active_department", None) or "").strip()
         if not dep or not isinstance(item.ref, (Asset, Shot)):
             return
-        from monostudio.ui_qt.main_view import _item_active_dcc, assess_view_item_health
+        if hasattr(main, "cached_item_health_for"):
+            from monostudio.ui_qt.main_view import _item_active_dcc
 
-        health = assess_view_item_health(
-            item.ref,
-            dep,
-            active_dcc_id=_item_active_dcc(item.path, dep) if item.path else None,
-        )
+            health = main.cached_item_health_for(
+                item,
+                active_dcc_id=_item_active_dcc(item.path, dep) if item.path else None,
+            )
+        else:
+            from monostudio.ui_qt.main_view import _item_active_dcc, assess_view_item_health
+
+            health = assess_view_item_health(
+                item.ref,
+                dep,
+                active_dcc_id=_item_active_dcc(item.path, dep) if item.path else None,
+            )
         if health is None:
             return
         paint_health_icon_chip(
