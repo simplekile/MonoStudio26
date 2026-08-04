@@ -6,6 +6,8 @@ GridView {
     property int cardWidth: 200
     property int cardGap: 16
 
+    signal rowActivated(int rowIndex)
+
     cellWidth: cardWidth + cardGap
     cellHeight: Math.round(cardWidth * 9 / 16) + 72 + cardGap
     clip: true
@@ -22,5 +24,14 @@ GridView {
         thumbOpacity: model.thumbOpacity
         selected: GridView.isCurrentItem
         hovered: grid.currentIndex === index
+
+        TapHandler {
+            acceptedButtons: Qt.LeftButton
+            onDoubleTapped: grid.rowActivated(index)
+        }
+        TapHandler {
+            acceptedButtons: Qt.RightButton
+            onTapped: grid.rowActivated(index)
+        }
     }
 }

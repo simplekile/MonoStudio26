@@ -3241,6 +3241,7 @@ class MainView(QWidget):
     type_badge_clicked = Signal()
     department_badge_clicked = Signal()
 
+    _SETTINGS_KEY_USE_QML_GRID = "main_view/use_qml_grid"
     _SETTINGS_KEY_VIEW_MODE_PREFIX = "main_view/mode"
     _SETTINGS_KEY_CARD_SIZE_PREFIX = "main_view/card_size"
     _SETTINGS_KEY_BROWSER_MODE_PREFIX = "main_view/browser_mode"
@@ -3992,9 +3993,28 @@ class MainView(QWidget):
         self._tile_placeholder.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tile_placeholder.customContextMenuRequested.connect(self._on_tile_placeholder_context_menu)
 
+        from monostudio.ui_qt.pipeline_qml_bridge import read_pipeline_use_qml_grid
+        from monostudio.ui_qt.pipeline_view_host import PipelineGridViewHost
+
+        self._use_qml_grid = read_pipeline_use_qml_grid(self._settings)
+        self._qml_grid_host: PipelineGridViewHost | None = None
+        if self._use_qml_grid:
+            self._qml_grid_host = PipelineGridViewHost(self)
+            self._qml_grid_host.bridge.rowActivated.connect(self._on_qml_grid_row_activated)
+            card_w = int(round(self._CARD_REFERENCE_WIDTH * self._card_scale_value))
+            self._qml_grid_host.set_card_width(card_w)
+
+        self._tile_inner = QStackedWidget()
+        self._tile_inner.addWidget(self._tile_view)
+        if self._qml_grid_host is not None:
+            self._tile_inner.addWidget(self._qml_grid_host)
+            self._tile_inner.setCurrentIndex(1)
+        else:
+            self._tile_inner.setCurrentIndex(0)
+
         tile_page = QStackedWidget()
         tile_page.addWidget(self._tile_placeholder)
-        tile_page.addWidget(self._tile_view)
+        tile_page.addWidget(self._tile_inner)
         tile_page.setCurrentIndex(0)
         self._tile_page = tile_page
 
@@ -5241,6 +5261,8 @@ class MainView(QWidget):
 
         self._tile_view.setGridSize(QSize(cell_w, card_h + gap))
         self._grid_delegate.set_card_size(QSize(card_w, card_h))
+        if self._qml_grid_enabled():
+            self._qml_grid_host.set_card_width(card_w)
         # Thumbnail prefetch uses visualRect; it often runs in the same singleShot(0) tick before IconMode
         # lays out wrapped cells, so only the first row intersects the viewport. Prefetch again after grid size.
         self._schedule_thumbnail_prefetch(force=True)
@@ -5274,6 +5296,9 @@ class MainView(QWidget):
         if prev_dept != self._active_department:
             self.invalidate_row_presentation_cache()
             self.invalidate_review_card_cache()
+            self._sync_qml_snapshot_context()
+            if self._qml_grid_enabled() and self._all_items:
+                self._sync_qml_grid_items(self._all_items)
             self._grid_delegate.set_hovered_pill_row(None)
             self._grid_delegate.set_hovered_health_row(None)
             self._grid_delegate.set_hovered_notes_row(None)
@@ -5978,6 +6003,72 @@ class MainView(QWidget):
     def set_thumbnail_manager(self, manager: object | None) -> None:
         """Use ThumbnailManager for async loading; None to use legacy ThumbnailCache only."""
         self._thumbnail_manager = manager
+        if self._qml_grid_enabled():
+            self._qml_grid_host.set_thumb_resolver(self._resolve_qml_thumb_token)
+
+    def _qml_grid_enabled(self) -> bool:
+        return bool(getattr(self, "_use_qml_grid", False)) and getattr(self, "_qml_grid_host", None) is not None
+
+    def _sync_qml_snapshot_context(self) -> None:
+        host = getattr(self, "_qml_grid_host", None)
+        if host is None:
+            return
+        from monostudio.ui_qt.pipeline_snapshot_builder import SnapshotBuildContext
+
+        ctx = SnapshotBuildContext(
+            active_department=self._active_department,
+            browser_mode=self._browser_mode,
+            show_publish=self._show_publish,
+            dept_registry=self._dept_registry,
+            get_active_dcc=self._grid_delegate.get_active_dcc,
+            notes_badge_state=self.notes_badge_state,
+        )
+        host.presentation_model.snapshot_store.set_context(ctx)
+
+    def _sync_qml_grid_items(self, items: list[ViewItem]) -> None:
+        if not self._qml_grid_enabled():
+            return
+        self._sync_qml_snapshot_context()
+        self._qml_grid_host.presentation_model.set_items(list(items))
+
+    def _resolve_qml_thumb_token(self, token: str):
+        from PySide6.QtGui import QPixmap
+
+        mgr = getattr(self, "_thumbnail_manager", None)
+        if mgr is None or not hasattr(mgr, "request_thumbnail"):
+            return None
+        active_dept = (self._active_department or "").strip() or None
+        for row in range(self._tile_row_count()):
+            idx = self._tile_model._model_index(row, 0)
+            if not idx.isValid():
+                continue
+            item = idx.data(Qt.UserRole)
+            if not isinstance(item, ViewItem):
+                continue
+            if str(item.path) != token:
+                continue
+            pix = mgr.request_thumbnail(
+                token,
+                department=active_dept,
+                **self._thumbnail_request_extras(item),
+            )
+            if isinstance(pix, QPixmap) and not pix.isNull():
+                return pix
+            break
+        return None
+
+    def _on_qml_grid_row_activated(self, row: int) -> None:
+        if not self._qml_grid_enabled():
+            return
+        item = self._qml_grid_host.presentation_model.item_at(row)
+        if item is None:
+            return
+
+        class _FakeIndex:
+            def data(self, role: int):
+                return item if role == Qt.UserRole else None
+
+        self._on_tile_activated(_FakeIndex())
 
     def _production_status_registry_cached(self):
         """Status registry for pills/filters: dept-specific when a department is focused."""
@@ -6906,6 +6997,10 @@ class MainView(QWidget):
                 ix = self._tile_model._model_index(row, 0)
                 self._tile_model.dataChanged.emit(ix, ix, [Qt.UserRole])
             self._list_model.refresh_row(row)
+            if self._qml_grid_enabled():
+                item = self._tile_model._model_index(row, 0).data(Qt.UserRole)
+                if isinstance(item, ViewItem) and item.path:
+                    self._qml_grid_host.presentation_model.notify_path_changed(str(item.path))
         self._tile_view.viewport().update()
         lv = getattr(self, "_list_view", None)
         if lv is not None:
@@ -7275,6 +7370,7 @@ class MainView(QWidget):
         self._update_empty_states()
         self.valid_selection_changed.emit(self.has_valid_selection())
         self._schedule_thumbnail_prefetch()
+        self._sync_qml_grid_items(items)
 
     def _settings_key_view_mode(self) -> str:
         return f"{self._SETTINGS_KEY_VIEW_MODE_PREFIX}/{self._browser_context}"

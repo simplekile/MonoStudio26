@@ -57,4 +57,18 @@ See plan §6.1 — type TL, alert TR, DCC BR, status pill + name below 16:9 thum
 
 ---
 
-*Scaffold Phase D — expand in Sprint 2–5.*
+## Enable QML grid (Sprint 2)
+
+**Settings:** `main_view/use_qml_grid` = `true` in `QSettings`
+
+**Env (dev):**
+```powershell
+$env:MONOS_PIPELINE_USE_QML_GRID = "1"
+python app.py
+```
+
+Widget grid remains default when flag is off.
+
+---
+
+*Sprint 2: production host `PipelineGridHost.qml` via `PipelineGridViewHost`.*

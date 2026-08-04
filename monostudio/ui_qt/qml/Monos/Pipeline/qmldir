@@ -6,4 +6,5 @@ BadgeChip 1.0 BadgeChip.qml
 StatusPill 1.0 StatusPill.qml
 DccStack 1.0 DccStack.qml
 PipelineGridView 1.0 PipelineGridView.qml
+PipelineGridHost 1.0 PipelineGridHost.qml
 PipelineGridHarness 1.0 PipelineGridHarness.qml

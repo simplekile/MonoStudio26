@@ -28,7 +28,7 @@ Tài liệu tổng hợp review Main View (grid card + list row + badge), quyế
 | **4** | 0 | Granular `dataChanged` / `repaint_rows_for_paths` | ✅ |
 | **5** | 1 | `pipeline_snapshot.py` + builder + store + tests | ✅ |
 | **6** | 1 | `pipeline_presentation_model.py` | ✅ |
-| **7** | 2 | QML bridge + grid production (`pipeline_use_qml_grid`) | ⬇️ tiếp theo |
+| **7** | 2 | QML bridge + grid production (`pipeline_use_qml_grid`) | ✅ scaffold |
 | **8** | 3 | QML list + selection | |
 | **9** | 4 | Thumb pipeline + cutover Widget delegates | |
 | **10** | 5 | Polish + archetype A/C rollout | |
@@ -536,11 +536,11 @@ Main:   PipelineThumbImageProvider cache
 
 ### Sprint 2 — QML bridge + grid (tuần 2)
 
-- [ ] `pipeline_qml_bridge.py` + `pipeline_view_host.py` (`QQuickWidget`)
-- [ ] `pipeline_thumb_image_provider.py`
-- [ ] `PipelineGridView.qml` + `PipelineCard.qml` + badges
+- [x] `pipeline_qml_bridge.py` + `pipeline_view_host.py` (`QQuickWidget`)
+- [x] `pipeline_thumb_image_provider.py`
+- [x] `PipelineGridHost.qml` + wire `PipelineGridView.qml` + badges
 - [ ] Intent signals parity (open, context menu, selection)
-- [ ] Feature flag: `pipeline_use_qml_grid` — A/B với Widget grid
+- [x] Feature flag: `main_view/use_qml_grid` + env `MONOS_PIPELINE_USE_QML_GRID`
 
 ### Sprint 3 — QML list + selection (tuần 3)
 
